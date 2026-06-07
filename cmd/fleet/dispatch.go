@@ -659,23 +659,31 @@ func runDispatch(opts *dispatchOpts, stdout io.Writer) error {
 	// attaching. We additionally print a human attach hint to stderr (not
 	// stdout, so it can't pollute the parse target).
 	//
-	// Prompt-failure gate (codex iter-3 P2): require coordStateFresh — a
-	// FRESH coord-state.json proves the live session has actually ticked
-	// /coordinator at least once. Without this gate, a prior coord-spawn
-	// whose initial prompt failed to deliver (a live tmux session running
-	// plain Claude that never started /coordinator) would be caught here
-	// and reported as a clean `agent <id> spawned`; the TUI's
-	// startCoordSpawn would then see no "initial prompt not delivered"
-	// marker, set promptDelivered=true, write the coord-spawn marker, and
-	// PROMOTE a non-coordinator session as the project's coord instead of
-	// respawning. Gating on coordStateFresh routes the not-yet-ticking and
-	// prompt-failed sessions to the veto/recovery path below: a genuinely
+	// Prompt-failure + candidate-freshness gate (codex iter-3 + iter-7
+	// P2): the fast path may PROMOTE a specific live record to the caller
+	// (exit 0, `agent <id> spawned` → TUI/attach attach to it), so it must
+	// prove THAT record has actually ticked /coordinator — not merely that
+	// SOME coord ticked for the project. coordStateTickedAfter checks the
+	// SELECTED record: coord-state.json exists, is fresh, AND its mtime
+	// post-dates the record's spawn (the coord writes coord-state on its
+	// first tick, strictly after spawn). This rejects two ways a
+	// project-level freshness check would lie:
+	//   - a prompt-failed session that never ticked (iter-3): its mtime
+	//     is absent or predates its spawn → not promoted; the TUI's
+	//     respawn recovery runs instead of promoting a non-coordinator.
+	//   - coord-state fresh from a now-archived PREDECESSOR while the
+	//     selected live record is a brand-new not-yet-ticked session
+	//     (iter-7): predecessor's mtime predates the new record's spawn
+	//     → not promoted.
+	// coordStateTickedAfter fails CLOSED toward NOT promoting (returns
+	// false on absent/stat-error/stale/older-than-spawn), so anything
+	// unproven falls through to the veto/recovery path below — a genuinely
 	// booting coord is held by the cold-start pending-claim veto (retry),
-	// and a prompt-failed session (never ticks → never writes coord-state)
-	// falls through to a fresh respawn. The fast path therefore fires only
-	// for a coord that has PROVEN it is supervising the project.
-	if opts.coordSpawn && coordStateFresh(opts.project) {
-		if live := liveCoordForAttach(opts.taskID, opts.project, coordRecords, tmuxHasSession); live != nil {
+	// a prompt-failed session respawns. The fast path fires ONLY for a
+	// coord that has PROVEN it is supervising the project since it spawned.
+	if opts.coordSpawn {
+		if live := liveCoordForAttach(opts.taskID, opts.project, coordRecords, tmuxHasSession); live != nil &&
+			coordStateTickedAfter(opts.project, live.SpawnedAt) {
 			_, _ = fmt.Fprintf(os.Stderr,
 				"coord %s already alive for project %s; attaching to the existing session\n",
 				live.ID, opts.project)

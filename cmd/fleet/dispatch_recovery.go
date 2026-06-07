@@ -224,6 +224,51 @@ func coordStateFresh(project string) bool {
 	return time.Since(fi.ModTime()) <= coordFreshnessWindow
 }
 
+// coordStateTickedAfter reports whether coord-state.json proves that the
+// SPECIFIC coord spawned at `recordSpawnedAt` has itself ticked — i.e.
+// the file exists, its mtime is within the freshness window, AND that
+// mtime POST-DATES the record's spawn time. This is the candidate-
+// specific freshness gate the idempotent-attach fast path requires
+// (codex iter-7 P2).
+//
+// Why project-level coordStateFresh is insufficient for the fast path:
+// coordStateFresh only asks "did SOME coord tick recently for this
+// project". The fast path then PROMOTES a specific live record (exit 0,
+// `agent <id> spawned`) — so it needs proof that THAT record ticked, not
+// just any coord. Two ways project-level freshness lies about a record:
+//   - Stale-from-predecessor: coord-state.json is fresh from a now-dead
+//     predecessor whose record was archived; the live record the fast
+//     path selected is a NEW session that hasn't ticked. mtime predates
+//     the new record's spawn → this returns false → no false promotion.
+//   - Fail-closed stat error: coordStateFresh returns true on a transient
+//     stat error (safe for the VETO, but the fast path must not PROMOTE
+//     on an unverified signal). Here a stat error returns false → the
+//     fast path is skipped and the dispatch falls to the (safe) veto.
+//
+// Fail-CLOSED for the fast path means returning FALSE (skip the promote,
+// fall through to the veto/recovery) — the opposite polarity from
+// coordStateFresh, whose fail-closed returns true to make the VETO fire.
+func coordStateTickedAfter(project string, recordSpawnedAt time.Time) bool {
+	pdir, err := state.ProjectDir(project)
+	if err != nil {
+		return false
+	}
+	fi, err := os.Stat(filepath.Join(pdir, "coord-state.json"))
+	if err != nil {
+		// Absent OR transient error: cannot PROVE this record ticked,
+		// so do not promote it. The veto below still guards correctness.
+		return false
+	}
+	mtime := fi.ModTime()
+	if time.Since(mtime) > coordFreshnessWindow {
+		return false // stale: nobody ticked recently
+	}
+	// The tick must have happened AFTER this record spawned. A coord
+	// writes coord-state.json on its first tick, strictly after spawn.
+	// !Before is >= (tolerates same-instant clocks).
+	return !mtime.Before(recordSpawnedAt)
+}
+
 // coordRecordExistsInList reports whether the given pre-fetched
 // records slice contains an unarchived agent record for this task_id
 // + project. The dispatch-side live-coord veto pairs this with

@@ -262,21 +262,28 @@ func TestRunDispatch_AttachFastPathEmitsSpawnLine(t *testing.T) {
 		t.Fatalf("mkdir agents: %v", err)
 	}
 	const liveID = "abcd1234"
+	spawnedAt := time.Now().UTC().Add(-10 * time.Second)
 	rec := &agent.Record{
 		ID:          liveID,
 		TaskID:      CoordTaskIDPrefix + "aliveproj",
 		Project:     "aliveproj",
 		TmuxSession: "fleet-" + liveID,
-		SpawnedAt:   time.Now().UTC(),
+		SpawnedAt:   spawnedAt,
 	}
 	if werr := rec.Write(); werr != nil {
 		t.Fatalf("seed live coord record: %v", werr)
 	}
-	// Fresh coord-state.json proves the live coord has ticked — required
-	// by the prompt-failure gate (codex iter-3 P2) for the fast path to
-	// fire. A just-written file is well within coordFreshnessWindow.
-	if err := os.WriteFile(filepath.Join(pdir, "coord-state.json"), []byte("{}"), 0o644); err != nil {
+	// Fresh coord-state.json whose mtime POST-DATES the record's spawn —
+	// proves THIS coord ticked (codex iter-3 + iter-7 P2 gate). Chtimes to
+	// a deterministic instant after spawnedAt so sub-second clock skew
+	// can't flip mtime.Before(spawnedAt).
+	statePath := filepath.Join(pdir, "coord-state.json")
+	if err := os.WriteFile(statePath, []byte("{}"), 0o644); err != nil {
 		t.Fatalf("seed coord-state.json: %v", err)
+	}
+	ticked := spawnedAt.Add(3 * time.Second)
+	if err := os.Chtimes(statePath, ticked, ticked); err != nil {
+		t.Fatalf("chtimes coord-state.json: %v", err)
 	}
 
 	// Report ONLY the live coord's session as alive.
@@ -440,6 +447,123 @@ func TestClearClaimOnPromptFailure(t *testing.T) {
 	}, "")
 	if !claimExists(t) {
 		t.Errorf("empty preAllocatedID must NOT clear the claim (guard mismatch)")
+	}
+}
+
+// ---- P2 (codex iter-7): candidate-specific freshness for the fast path ----
+
+// coordStateTickedAfter must prove the SELECTED record ticked: file
+// present + fresh + mtime post-dates the record's spawn. It fails CLOSED
+// (false) on absent / stale / mtime-older-than-spawn.
+func TestCoordStateTickedAfter(t *testing.T) {
+	pdir := newPendingClaimHome(t, "tickedafter")
+	statePath := filepath.Join(pdir, "coord-state.json")
+	spawnedAt := time.Now().UTC()
+
+	// No coord-state.json yet → false.
+	if coordStateTickedAfter("tickedafter", spawnedAt) {
+		t.Errorf("absent coord-state must be NOT-ticked")
+	}
+
+	// Write coord-state then set its mtime to AFTER the record spawned →
+	// true (the record ticked).
+	if err := os.WriteFile(statePath, []byte("{}"), 0o644); err != nil {
+		t.Fatalf("write coord-state: %v", err)
+	}
+	after := spawnedAt.Add(2 * time.Second)
+	if err := os.Chtimes(statePath, after, after); err != nil {
+		t.Fatalf("chtimes: %v", err)
+	}
+	if !coordStateTickedAfter("tickedafter", spawnedAt) {
+		t.Errorf("fresh coord-state mtime after spawn must be ticked")
+	}
+
+	// mtime BEFORE the record spawned (stale-from-predecessor) → false.
+	before := spawnedAt.Add(-2 * time.Second)
+	if err := os.Chtimes(statePath, before, before); err != nil {
+		t.Fatalf("chtimes: %v", err)
+	}
+	if coordStateTickedAfter("tickedafter", spawnedAt) {
+		t.Errorf("coord-state mtime predating spawn must be NOT-ticked (predecessor staleness)")
+	}
+
+	// Fresh mtime but OLDER than the freshness window → false.
+	old := time.Now().UTC().Add(-10 * time.Minute)
+	if err := os.Chtimes(statePath, old, old); err != nil {
+		t.Fatalf("chtimes: %v", err)
+	}
+	if coordStateTickedAfter("tickedafter", old.Add(-time.Minute)) {
+		t.Errorf("stale coord-state (past freshness window) must be NOT-ticked")
+	}
+}
+
+// TestRunDispatch_FastPathSkipsStalePredecessorState pins iter-7 at the
+// dispatch level: coord-state.json is fresh from a now-archived
+// PREDECESSOR (mtime predates the live record's spawn), so the fast path
+// must NOT promote the new-but-not-yet-ticked live record. It falls
+// through to the veto/recovery path instead.
+func TestRunDispatch_FastPathSkipsStalePredecessorState(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("FLEET_HOME", root)
+	t.Setenv("FLEET_TMUX_SOCKET", "")
+
+	pdir, err := state.ProjectDir("staleproj")
+	if err != nil {
+		t.Fatalf("ProjectDir: %v", err)
+	}
+	if err := os.MkdirAll(pdir, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Join(root, "agents"), 0o755); err != nil {
+		t.Fatalf("mkdir agents: %v", err)
+	}
+
+	// The live record spawned NOW.
+	const liveID = "cafe9999"
+	now := time.Now().UTC()
+	rec := &agent.Record{
+		ID:          liveID,
+		TaskID:      CoordTaskIDPrefix + "staleproj",
+		Project:     "staleproj",
+		TmuxSession: "fleet-" + liveID,
+		SpawnedAt:   now,
+	}
+	if werr := rec.Write(); werr != nil {
+		t.Fatalf("seed live coord record: %v", werr)
+	}
+	// coord-state.json is FRESH (within window) but its mtime PREDATES the
+	// new record's spawn — it belongs to a now-gone predecessor.
+	statePath := filepath.Join(pdir, "coord-state.json")
+	if err := os.WriteFile(statePath, []byte("{}"), 0o644); err != nil {
+		t.Fatalf("write coord-state: %v", err)
+	}
+	predecessor := now.Add(-30 * time.Second)
+	if err := os.Chtimes(statePath, predecessor, predecessor); err != nil {
+		t.Fatalf("chtimes: %v", err)
+	}
+
+	prev := tmuxHasSession
+	tmuxHasSession = func(s string) bool { return s == "fleet-"+liveID }
+	t.Cleanup(func() { tmuxHasSession = prev })
+
+	opts := &dispatchOpts{
+		taskID:          CoordTaskIDPrefix + "staleproj",
+		project:         "staleproj",
+		projectExplicit: true,
+		coordSpawn:      true,
+		command:         []string{"sleep", "30"},
+		commandExplicit: true,
+	}
+	var out bytes.Buffer
+	derr := runDispatch(opts, &out)
+	// The fast path must NOT promote the not-yet-ticked record. (Whatever
+	// the downstream outcome — veto or spawn-fail — the live ID must never
+	// appear as a successful spawn line from the fast path.)
+	if derr == nil {
+		t.Fatalf("expected fast path skipped → downstream refusal/spawn-fail, got nil")
+	}
+	if got := parseSpawnedAgentID(out.String()); got == liveID {
+		t.Fatalf("fast path promoted a record whose coord-state is stale-from-predecessor (%q); out=%q", liveID, out.String())
 	}
 }
 
