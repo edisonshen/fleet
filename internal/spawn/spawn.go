@@ -871,13 +871,31 @@ func Spawn(opts Options) (*agent.Record, error) {
 	//
 	//	execArgv = ["<fleetBin>","coord-run","--agent",<id>,
 	//	            "--project",<p>,"--", <prev execArgv ...>]
+	leaseWrapped := false
 	if leaseFailoverEnabled() && isCoordSpawn(rec.TaskID, rec.Project) && !alreadyCoordRunWrapped(execArgv) {
 		if fleetBin, exeErr := os.Executable(); exeErr == nil && fleetBin != "" {
 			execArgv = coordRunWrap(fleetBin, id, rec.Project, execArgv)
+			leaseWrapped = true
 		} else {
 			_, _ = fmt.Fprintf(os.Stderr,
 				"warning: FLEET_LEASE_FAILOVER set but os.Executable() failed (%v); "+
 					"spawning coord %s WITHOUT the coord-run lease supervisor\n", exeErr, id)
+		}
+	}
+
+	// PRE-LAUNCH record write for lease-wrapped coords (codex PR2 iter-2
+	// [P1]). The wrapped `fleet coord-run` supervisor stamps its identity
+	// (pid/start/exe) into THIS record at startup so the STONITH primitive
+	// can authenticate a takeover. But coord-run starts the moment
+	// tmux.Spawn launches it — BEFORE the post-pid-resolve rec.Write below
+	// (resolveEnginePid blocks seconds). Without the record on disk first,
+	// the supervisor's stamp hits ErrNotFound and the identity is never
+	// recorded -> takeover can't authenticate the hung holder. So write
+	// the record (provisional engine PID) BEFORE launch; the final write
+	// merges back the supervisor fields the coord-run process added.
+	if leaseWrapped {
+		if err := rec.Write(); err != nil {
+			return nil, fmt.Errorf("pre-launch write agent record for lease coord %s: %w", id, err)
 		}
 	}
 
@@ -918,6 +936,21 @@ func Spawn(opts Options) (*agent.Record, error) {
 			session, resolveErr)
 	} else if resolvedPid > 0 {
 		rec.PID = resolvedPid
+	}
+
+	// Merge back supervisor identity the coord-run process may have
+	// stamped between the pre-launch write and now (codex PR2 iter-2
+	// [P1]). Our in-memory rec has empty supervisor fields; clobbering
+	// the disk record with it would erase the stamp the supervisor wrote,
+	// re-breaking STONITH authentication. Re-load + carry the three
+	// supervisor fields forward. Best-effort: a load failure leaves the
+	// fields empty (same as off-flag) rather than aborting the spawn.
+	if leaseWrapped {
+		if onDisk, lerr := agent.Load(id); lerr == nil {
+			rec.SupervisorPID = onDisk.SupervisorPID
+			rec.SupervisorPidStart = onDisk.SupervisorPidStart
+			rec.SupervisorExePath = onDisk.SupervisorExePath
+		}
 	}
 
 	if err := rec.Write(); err != nil {

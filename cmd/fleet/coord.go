@@ -60,9 +60,7 @@ import (
 	"github.com/spf13/cobra"
 
 	fleet "github.com/edisonshen/fleet"
-	"github.com/edisonshen/fleet/internal/agent"
 	"github.com/edisonshen/fleet/internal/coord"
-	"github.com/edisonshen/fleet/internal/coordlock"
 	"github.com/edisonshen/fleet/internal/install"
 	"github.com/edisonshen/fleet/internal/tmux"
 )
@@ -292,16 +290,17 @@ func runCoordRun(ctx context.Context, opts coordRunOpts, stdout, stderr io.Write
 	//     (runs on EVERY exit path alongside coord.Cleanup —
 	//     fleet-owns-its-resources), start the heartbeat, then start the
 	//     child.
-	//   - failover OFF (ErrFailoverDisabled) -> skip all lease behavior;
-	//     run the legacy bare-child path (byte-identical to today).
+	//   - failover OFF/unsupported -> skip all lease behavior; run the
+	//     legacy bare-child path (byte-identical to today).
 	acquire := opts.acquireLease
 	if acquire == nil {
-		acquire = productionAcquireLease(opts, stderr)
+		acquire = defaultAcquireLease(opts, stderr)
 	}
 	lease, acquired, lerr := acquire()
 	switch {
-	case errors.Is(lerr, coordlock.ErrFailoverDisabled):
-		// Flag OFF — no lease, legacy path. Fall through to child start.
+	case leaseDisabledOrUnsupported(lerr):
+		// Flag OFF (or platform without the lease primitive) — no lease,
+		// legacy path. Fall through to child start.
 	case lerr != nil:
 		// A real acquire/takeover fault. Surface-don't-silo: refuse to
 		// start a child that would have no lease holder rather than
@@ -361,119 +360,4 @@ func runCoordRun(ctx context.Context, opts coordRunOpts, stdout, stderr io.Write
 		return err
 	}
 	return nil
-}
-
-// productionAcquireLease builds the real lease-acquire closure for
-// `fleet coord-run`. It is the seam runCoordRun uses when opts.acquire-
-// Lease is nil. Steps, in order:
-//
-//  1. Stamp THIS supervisor's identity (pid + pid_start + exe_path) into
-//     the agent record so the authenticated STONITH primitive can target
-//     us by the lease-holder pid, NOT the engine child. Done BEFORE the
-//     acquire so a candidate that fences us mid-acquire can still find a
-//     valid kill target. Best-effort: a stamp failure is surfaced but
-//     does not abort (the lease still protects exclusion; the kill
-//     primitive simply refuses on an unstamped record).
-//  2. coordlock.AcquireLeaseWithKill, injecting the authenticated
-//     internal/coord.KillCoordIfIdentityMatches as the takeover STONITH.
-//  3. On acquire, run the new-leader competitor SWEEP: enumerate
-//     same-project coord supervisors and reap any stale straggler (a
-//     pre-lease or cross-socket coord the flock alone wouldn't catch)
-//     through the SAME authenticated primitive. The flock is the primary
-//     singleton; the sweep is belt-and-braces.
-//
-// All of this is behind FLEET_LEASE_FAILOVER inside coordlock (Acquire-
-// LeaseWithKill returns ErrFailoverDisabled when off), so off-flag the
-// closure is a cheap no-op that signals "legacy path" to runCoordRun.
-func productionAcquireLease(opts coordRunOpts, stderr io.Writer) func() (coordLease, bool, error) {
-	return func() (coordLease, bool, error) {
-		// Step 1: stamp supervisor identity (best-effort, only when the
-		// flag is on — off-flag we skip to keep records byte-identical).
-		if leaseFailoverEnabled() {
-			pid := os.Getpid()
-			pidStart, ok := coordlock.PidStartNanos(pid)
-			exe, exeErr := os.Executable()
-			if !ok || exeErr != nil {
-				_, _ = fmt.Fprintf(stderr,
-					"coord-run: WARNING: could not read supervisor identity (pid_start ok=%v exe err=%v); "+
-						"STONITH of this coord will refuse until re-stamped\n", ok, exeErr)
-			} else if serr := agent.StampSupervisorIdentity(opts.agentID, pid, pidStart, exe); serr != nil {
-				_, _ = fmt.Fprintf(stderr,
-					"coord-run: WARNING: stamp supervisor identity for agent %s failed: %v "+
-						"(continuing; STONITH may refuse on the unstamped record)\n", opts.agentID, serr)
-			}
-		}
-
-		// Step 2: acquire with the authenticated kill injected.
-		lease, acquired, err := coordlock.AcquireLeaseWithKill(
-			opts.project, opts.agentID,
-			func(t coordlock.KillTarget) error {
-				return coord.KillCoordIfIdentityMatches(coord.KillTarget{
-					Pid:         t.Pid,
-					PidStart:    t.PidStart,
-					AgentID:     t.AgentID,
-					Project:     t.Project,
-					FencerEpoch: t.FencerEpoch,
-				})
-			})
-		if err != nil || !acquired {
-			return nil, acquired, err
-		}
-
-		// Step 3: new-leader competitor sweep. Best-effort: a sweep error
-		// is surfaced but does NOT fail the acquire — we already hold the
-		// flock, so we are the leader regardless.
-		sweepStaleCompetitors(opts.agentID, opts.project, stderr)
-		return lease, true, nil
-	}
-}
-
-// leaseFailoverEnabled mirrors coordlock's internal failover gate for the
-// supervisor-side identity stamp (coordlock keeps its predicate
-// unexported). Any non-empty, non-"0"/"false" value enables it.
-func leaseFailoverEnabled() bool {
-	v := os.Getenv(coordlock.FailoverEnvVar)
-	return v != "" && v != "0" && v != "false"
-}
-
-// sweepStaleCompetitors reaps any OTHER same-project coord supervisor
-// through the authenticated kill primitive after we win the lease. The
-// flock is the primary singleton; this catches a pre-lease or
-// cross-tmux-socket straggler the flock alone can't see. The primitive
-// re-validates every target (pid-reuse, exe-path, epoch, self) and
-// refuses unless it is provably a stale same-project coord-run — so this
-// can never shoot the new leader (us) or a different project's coord.
-func sweepStaleCompetitors(selfAgentID, project string, stderr io.Writer) {
-	recs, err := agent.List()
-	if err != nil {
-		_, _ = fmt.Fprintf(stderr, "coord-run: sweep: list records: %v (skipping)\n", err)
-		return
-	}
-	self := os.Getpid()
-	for _, r := range recs {
-		if r == nil || r.Project != project {
-			continue
-		}
-		if r.ID == selfAgentID {
-			continue // never target our own record
-		}
-		if r.SupervisorPID <= 0 || r.SupervisorPID == self {
-			continue // no supervisor identity, or it's us
-		}
-		if err := coord.KillCoordIfIdentityMatches(coord.KillTarget{
-			Pid:      r.SupervisorPID,
-			PidStart: r.SupervisorPidStart,
-			AgentID:  r.ID,
-			Project:  project,
-			// The sweep runs AFTER we became the active owner, so any
-			// other coord is fenced by construction; the primitive's
-			// "never shoot the current active owner" gate protects us.
-			FencerEpoch: 0,
-		}); err != nil && !errors.Is(err, coord.ErrKillRefused) {
-			// A refusal is expected + benign (most records won't match);
-			// only surface real signal/infra faults.
-			_, _ = fmt.Fprintf(stderr, "coord-run: sweep reap pid=%d agent=%s: %v\n",
-				r.SupervisorPID, r.ID, err)
-		}
-	}
 }
