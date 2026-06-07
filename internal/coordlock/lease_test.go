@@ -1536,3 +1536,140 @@ func TestResumeTakeoverKillsCandidateWithoutFlockBody(t *testing.T) {
 	}
 	defer lease.Release()
 }
+
+// ---- codex iter-15 [P2] #1: candidate resumes its OWN fencing record ----
+
+// After casFencingToActive hits errSerializerBusy and releases the flock,
+// acquireLease retries; the candidate then sees its OWN fresh fencing
+// record. transientResumable must return true for the candidate's own
+// record (else it stands down with no active leader until TTL).
+func TestTransientResumable_OwnFencingRecord(t *testing.T) {
+	clk := &fakeClock{}
+	live := newFakeLiveness()
+	cfg := testCfg(clk, live)
+	self := identity{Pid: os.Getpid(), PidStart: selfStart, AgentID: "me", Project: "rainier"}
+	l := &Lease{cfg: cfg, self: self, boot: "test-boot-1"}
+
+	// Our OWN fresh fencing record (candidate == self, alive, within TTL).
+	own := epochRecord{
+		Epoch: 6, State: stateFencing,
+		Owner:         identity{Pid: 9999, AgentID: "old", Project: "rainier"},
+		Candidate:     self,
+		BootID:        "test-boot-1",
+		RenewedAtMono: clk.now(),
+	}
+	if !l.transientResumable(own) {
+		t.Fatal("a candidate must always be able to resume its OWN fencing record")
+	}
+
+	// A DIFFERENT live candidate's fresh record is NOT resumable.
+	other := own
+	other.Candidate = identity{Pid: 6000, PidStart: 660000, AgentID: "other", Project: "rainier"}
+	live.set(6000, 660000)
+	if l.transientResumable(other) {
+		t.Fatal("a different live candidate's fresh record must NOT be resumable")
+	}
+}
+
+// End-to-end: a candidate whose fencing CAS lost the serializer (busy) on
+// the first pass must still converge to active leadership on retry, not
+// stand down. We simulate by pre-writing the candidate's own fresh fencing
+// record with a FREE flock; acquireLease must promote it (resume own
+// takeover via the free-flock path), not stand down.
+func TestAcquireResumesOwnFencingAfterSerializerBusy(t *testing.T) {
+	setupHome(t)
+	const project = "rainier"
+	clk := &fakeClock{}
+	live := newFakeLiveness()
+
+	self := identity{Pid: os.Getpid(), PidStart: selfStart, AgentID: "me", Project: project}
+	// Free flock + our own fresh fencing record (candidate == self).
+	writeEpochRaw(t, project, epochRecord{
+		Epoch: 6, State: stateFencing,
+		Owner:         identity{Pid: 9999, PidStart: 333333, AgentID: "old", Project: project},
+		Candidate:     self,
+		BootID:        "test-boot-1",
+		RenewedAtMono: clk.now(),
+	})
+
+	lease, acquired, err := acquireLease(project, "me", testCfg(clk, live))
+	if err != nil {
+		t.Fatalf("acquireLease: %v", err)
+	}
+	if !acquired {
+		t.Fatal("a candidate must resume its OWN fencing record to active, not stand down")
+	}
+	defer lease.Release()
+	rec := readEpochFor(t, project)
+	if rec.State != stateActive || rec.Owner.AgentID != "me" {
+		t.Fatalf("expected active me after resuming own fencing, got %s/%s", rec.State, rec.Owner.AgentID)
+	}
+}
+
+// ---- codex iter-15 [P2] #2: Release demote retries past serializer contention ----
+
+// If epoch.lock is briefly contended during Release, the demote must RETRY
+// and still land (record -> released, token invalid), not silently leave a
+// stale `active` record. We hold epoch.lock from another fd, start Release
+// (which polls within its bounded budget), release the holder, and assert
+// the record demoted and the token invalidated.
+func TestReleaseDemoteRetriesPastSerializerContention(t *testing.T) {
+	setupHome(t)
+	t.Setenv(FailoverEnvVar, "1")
+	const project = "rainier"
+
+	cfg := defaultLeaseConfig()
+	lease, acquired, err := acquireLease(project, "me", cfg)
+	if err != nil || !acquired {
+		t.Fatalf("acquire: acquired=%v err=%v", acquired, err)
+	}
+	tok := lease.Token()
+	paths, _ := resolvePaths(project)
+
+	// Shrink the per-attempt serializer budget so the 5-attempt retry loop
+	// spans a short, deterministic window.
+	prevBudget := epochLockBudget
+	epochLockBudget = 60 * time.Millisecond
+	t.Cleanup(func() { epochLockBudget = prevBudget })
+
+	// Hold epoch.lock from a separate fd, then release it shortly so an
+	// in-flight Release retry can win.
+	holder, err := os.OpenFile(paths.epochLock, os.O_CREATE|os.O_RDWR, 0o644)
+	if err != nil {
+		t.Fatalf("open epoch.lock: %v", err)
+	}
+	defer func() { _ = holder.Close() }()
+	if err := syscall.Flock(int(holder.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		t.Fatalf("flock holder: %v", err)
+	}
+
+	releaseDone := make(chan struct{})
+	go func() {
+		lease.Release()
+		close(releaseDone)
+	}()
+
+	// Let Release exhaust at least one serializer-busy attempt, then free
+	// the serializer so a subsequent retry demotes the record.
+	time.Sleep(80 * time.Millisecond)
+	if err := syscall.Flock(int(holder.Fd()), syscall.LOCK_UN); err != nil {
+		t.Fatalf("unlock holder: %v", err)
+	}
+
+	select {
+	case <-releaseDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Release did not complete")
+	}
+
+	rec, rerr := readEpoch(paths.epoch)
+	if rerr != nil {
+		t.Fatalf("readEpoch: %v", rerr)
+	}
+	if rec.State != stateReleased {
+		t.Fatalf("Release must demote to released after the serializer frees, got %s", rec.State)
+	}
+	if tok.StillOwned() {
+		t.Fatal("token must be invalid after a (retried) Release demote")
+	}
+}

@@ -381,13 +381,21 @@ func (l *Lease) tryAcquireOnce() (done, acquired bool, err error) {
 // fenced_not_acquired is handled separately (always resumable) — it is a
 // gave-up escalation, not an in-progress takeover.
 func (l *Lease) transientResumable(rec epochRecord) bool {
+	// Our OWN in-progress fencing record is always resumable by us — this
+	// is the retry after a serializer-busy release in casFencingToActive
+	// (we released the flock + are retrying our own takeover). Without this
+	// a candidate would stand down on its own fresh record (live candidate
+	// = self) and leave NO active leader until TTL.
+	if rec.Candidate.equal(l.self) {
+		return true
+	}
 	if rec.BootID != l.boot {
 		return true // previous boot -> stale
 	}
 	if l.cfg.nowMono()-rec.RenewedAtMono > int64(l.cfg.ttl) {
 		return true // stalled past TTL
 	}
-	// Fresh record: resumable only if the candidate driving it is dead.
+	// Fresh record from ANOTHER candidate: resumable only if it is dead.
 	return !l.pidAlive(rec.Candidate)
 }
 
@@ -705,21 +713,50 @@ func (l *Lease) Release() {
 	}
 	// Demote the record to `released` while we still hold the flock (so a
 	// successor can't have advanced the epoch under us yet). Only if it is
-	// still exactly ours — never stomp a successor's record. Best-effort:
-	// the kernel flock release below is the hard guarantee; this just makes
-	// token invalidation immediate.
+	// still exactly ours — never stomp a successor's record. This is what
+	// makes outstanding tokens invalid IMMEDIATELY (state != active).
+	//
+	// The demote is RETRIED across transient epoch.lock contention because
+	// leaving the record `active` after we drop the flock would keep a
+	// racing goroutine's token valid until TTL — the exact guarantee we
+	// promise. Epoch.lock writers hold it only for one fast write, so a
+	// bounded retry reliably wins. If it ultimately cannot demote, SURFACE
+	// it (surface-don't-silo) rather than silently leaving a stale-active
+	// record; the TTL is then the fallback bound.
 	if l.flock != nil {
-		_, _ = l.withEpochLock(func() (bool, error) {
-			cur, err := readEpoch(l.paths.epoch)
-			if err != nil {
-				return false, err //nolint:nilerr // best-effort; flock release below is the guarantee.
+		demoted := false
+		for attempt := 0; attempt < 5 && !demoted; attempt++ {
+			ok, err := l.withEpochLock(func() (bool, error) {
+				cur, rerr := readEpoch(l.paths.epoch)
+				if rerr != nil {
+					return false, rerr
+				}
+				if cur.State != stateActive || cur.Epoch != l.epoch || !cur.Owner.equal(l.self) {
+					return false, nil // not ours anymore -> nothing to demote
+				}
+				cur.State = stateReleased
+				return true, l.writeEpochLocked(cur)
+			})
+			switch {
+			case errors.Is(err, errSerializerBusy):
+				continue // transient -> retry
+			case err != nil:
+				demoted = true // a real read/write fault: stop retrying, surface below
+			default:
+				// ok==true: demoted. ok==false: record already not ours
+				// (a successor took over) — both mean no stale-active record
+				// of OURS remains, so the token-invalidation guarantee holds.
+				demoted = true
+				_ = ok
 			}
-			if cur.State != stateActive || cur.Epoch != l.epoch || !cur.Owner.equal(l.self) {
-				return false, nil // not ours anymore -> leave it
-			}
-			cur.State = stateReleased
-			return true, l.writeEpochLocked(cur)
-		})
+		}
+		if !demoted {
+			fmt.Fprintf(os.Stderr,
+				"coordlock: WARNING: could not demote released lease for project %q "+
+					"(epoch.lock contended); outstanding tokens stay valid until TTL (~%s). "+
+					"agent=%s epoch=%d\n",
+				l.self.Project, l.cfg.ttl, l.self.AgentID, l.epoch)
+		}
 	}
 	if l.flock != nil {
 		_ = releaseFlock(l.flock)
