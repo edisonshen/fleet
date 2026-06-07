@@ -244,9 +244,11 @@ func TestRunGC_Worktrees_SkipsOnLockTimeout(t *testing.T) {
 
 	var stdout, stderr bytes.Buffer
 	start := time.Now()
+	// Include worker-records: it depends on the worktrees pass populating
+	// dirtyParkedInRun, so a timeout must drop BOTH (codex iter-7 [P2]).
 	if err := runGC(&stdout, &stderr, &gcFlags{
 		maxAge:   gcDefaultMaxAge,
-		kindsCSV: "worktrees",
+		kindsCSV: "worktrees,worker-records",
 		project:  project,
 	}); err != nil {
 		t.Fatalf("runGC: %v", err)
@@ -255,8 +257,9 @@ func TestRunGC_Worktrees_SkipsOnLockTimeout(t *testing.T) {
 		t.Fatalf("runGC blocked %s; bounded acquire should time out near 150ms", elapsed)
 	}
 	se := stderr.String()
-	if !strings.Contains(se, "held by another GC") || !strings.Contains(se, "skipping worktrees kind") {
-		t.Fatalf("expected skip-worktrees warning on lock timeout; got stderr:\n%s", se)
+	if !strings.Contains(se, "held by another GC") ||
+		!strings.Contains(se, "skipping worktrees + worker-records kinds") {
+		t.Fatalf("expected skip-worktrees+worker-records warning on lock timeout; got stderr:\n%s", se)
 	}
 	// It must NOT have fallen back to the unlocked path.
 	if strings.Contains(se, "proceeding unlocked") {

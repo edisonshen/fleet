@@ -174,9 +174,16 @@ func runGC(stdout, stderr io.Writer, f *gcFlags) error {
 	// Two failure modes, two handlings (the lock is now bounded, not
 	// blocking-forever):
 	//   - ErrLockTimeout → another GC is provably mid-scan. SKIP the
-	//     worktrees kind (drop it from opts.Kinds) so this run does NOT
-	//     scan/re-check/remove worktrees unlocked — that would reintroduce
-	//     the exact race the lock prevents. The other classifiers still run.
+	//     worktrees kind AND its dependent worker-records kind (drop both
+	//     from opts.Kinds) so this run does NOT scan/re-check/remove
+	//     worktrees unlocked — that would reintroduce the race the lock
+	//     prevents. worker-records is dropped too because reconcileWorker-
+	//     Records relies on the worktrees pass populating dirtyParkedInRun
+	//     (in-run suppression of recovery-context worker dirs for
+	//     dirty-parked trees); without that pass it could remove a worker
+	//     record the OTHER, running GC is dirty-parking. Other classifiers
+	//     (sockets, orphan-agents/tmux, coord-locks, invalid-projects) are
+	//     independent and still run.
 	//   - any other (open/path) fault → genuine error; surface a warning
 	//     and proceed (the worktrees pass is best-effort, the rest must run).
 	if hasKind(kinds, gc.KindWorktrees) && strings.TrimSpace(f.project) != "" {
@@ -186,9 +193,11 @@ func runGC(stdout, stderr io.Writer, f *gcFlags) error {
 			defer release()
 		case errors.Is(lerr, state.ErrLockTimeout):
 			_, _ = fmt.Fprintf(stderr,
-				"warning: worktree-gc lock for %q held by another GC: %v (skipping worktrees kind this run)\n",
+				"warning: worktree-gc lock for %q held by another GC: %v "+
+					"(skipping worktrees + worker-records kinds this run)\n",
 				f.project, lerr)
 			kinds = dropKind(kinds, gc.KindWorktrees)
+			kinds = dropKind(kinds, gc.KindWorkerRecords)
 			opts.Kinds = kinds
 		default:
 			_, _ = fmt.Fprintf(stderr,
