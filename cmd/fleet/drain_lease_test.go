@@ -51,16 +51,18 @@ func oldCoordRec() *agent.Record {
 	return r
 }
 
-// T13: a healthy leader holds the lease and no barrier is present — drain
-// STANDS DOWN: prints "coord live", returns nil, kills nothing, spawns
-// nothing, holds no lock.
-func TestDrainLease_StandDownUnderLiveLeader(t *testing.T) {
+// T13: a healthy leader holds the lease, no barrier, and OLD is ALREADY
+// ARCHIVED (the handoff already completed — the queue file is a stale
+// leftover) — drain STANDS DOWN: cleans the stale queue, kills nothing,
+// spawns nothing.
+func TestDrainLease_StandDownStaleQueueUnderLiveLeader(t *testing.T) {
 	var killed, resumed int32
 	out := &bytes.Buffer{}
 	d := drainLeaseDeps{
 		LeaderPresent: func(string) bool { return true },
 		CurrentEpoch:  func(string) (int64, bool) { return 5, true },
 		BarrierExists: func(string, int64) bool { return false },
+		LoadAgent:     func(string) (*agent.Record, error) { return nil, state.ErrNotFound }, // OLD archived
 		KillCoord:     func(coord.KillTarget) error { atomic.AddInt32(&killed, 1); return nil },
 		Resume: func(queue.SpawnFresh, string, int, io.Writer, io.Writer) error {
 			atomic.AddInt32(&resumed, 1)
@@ -68,18 +70,50 @@ func TestDrainLease_StandDownUnderLiveLeader(t *testing.T) {
 		},
 	}
 
-	err := drainOneLeaseAwareWith(leaseDrainReq(), "/tmp/q.json", 0, 1000, out, out, d)
+	err := drainOneLeaseAwareWith(leaseDrainReq(), "/tmp/does-not-exist-q.json", 0, 1000, out, out, d)
 	if err != nil {
-		t.Fatalf("stand-down must return nil, got %v", err)
+		t.Fatalf("stale-queue stand-down must return nil, got %v", err)
 	}
-	if !strings.Contains(out.String(), "coord live") {
-		t.Errorf("expected 'coord live' stand-down message, got: %q", out.String())
+	if !strings.Contains(out.String(), "already retired") {
+		t.Errorf("expected stale-queue stand-down message, got: %q", out.String())
 	}
 	if atomic.LoadInt32(&killed) != 0 {
-		t.Errorf("kill ran %d times under a live leader, want 0", killed)
+		t.Errorf("kill ran %d times, want 0", killed)
 	}
 	if atomic.LoadInt32(&resumed) != 0 {
-		t.Errorf("Resume ran %d times under a live leader, want 0", resumed)
+		t.Errorf("Resume ran %d times, want 0", resumed)
+	}
+}
+
+// codex PR3 iter-5 [P1]: a healthy leader, no barrier, but OLD STILL LIVE +
+// a pending coord handoff queue file — the graceful producer hasn't written a
+// barrier yet, so drain must COMPLETE the handoff via the legacy Resume
+// fallback (under a per-agent lock), NOT stand down and strand the queue.
+func TestDrainLease_LiveLeaderPendingHandoff_FallsBackToResume(t *testing.T) {
+	var resumed, locked int32
+	out := &bytes.Buffer{}
+	d := drainLeaseDeps{
+		LeaderPresent: func(string) bool { return true },
+		CurrentEpoch:  func(string) (int64, bool) { return 5, true },
+		BarrierExists: func(string, int64) bool { return false },
+		LoadAgent:     func(string) (*agent.Record, error) { return oldCoordRec(), nil }, // OLD still live
+		LockAgent: func(string) (func(), error) {
+			atomic.AddInt32(&locked, 1)
+			return func() {}, nil
+		},
+		Resume: func(queue.SpawnFresh, string, int, io.Writer, io.Writer) error {
+			atomic.AddInt32(&resumed, 1)
+			return nil
+		},
+	}
+	if err := drainOneLeaseAwareWith(leaseDrainReq(), "/tmp/q.json", 0, 1000, out, out, d); err != nil {
+		t.Fatalf("fallback resume returned %v, want nil", err)
+	}
+	if atomic.LoadInt32(&resumed) != 1 {
+		t.Errorf("legacy Resume fallback ran %d times, want 1 (queue must not be stranded)", resumed)
+	}
+	if atomic.LoadInt32(&locked) != 1 {
+		t.Errorf("fallback Resume took the per-agent lock %d times, want 1", locked)
 	}
 }
 

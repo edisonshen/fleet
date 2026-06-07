@@ -201,13 +201,20 @@ func drainOneLeaseAwareWith(req queue.SpawnFresh, path string, graceMillis, resu
 		return drainGraceful(req, path, epoch, deadline, stdout, stderr, d)
 
 	case leaderHealthy:
-		// T13: a healthy heartbeating leader holds the lease and no graceful
-		// handoff has completed (no barrier). Nothing to drain — STAND DOWN.
-		// We do NOT kill a live leader, and we hold no lock. If the queue
-		// file is a stale leftover from a completed handoff it is left in
-		// place (a future drain after the leader exits handles it).
-		_, _ = fmt.Fprintf(stdout, "fleet drain: coord live for %s; nothing to drain\n", project)
-		return nil
+		// A healthy heartbeating leader holds the lease and no completion
+		// barrier exists yet. Two sub-cases (codex PR3 iter-5 [P1]):
+		//   - OLD already archived -> the handoff already completed; the queue
+		//     file is a stale leftover. STAND DOWN (clean the queue, spawn
+		//     nothing). This is the true "nothing to drain" case (T13).
+		//   - OLD still live -> a handoff was requested (the queue file exists)
+		//     but the in-process GRACEFUL producer (GracefulHandoff) has not
+		//     run to write the barrier. We must still COMPLETE the handoff
+		//     rather than strand the queue forever: fall back to the LEGACY
+		//     Resume path (the proven spawn+retire flow), under a short
+		//     per-agent lock. (When the graceful producer is the trigger — the
+		//     flag-flip is PR4 — the barrier case above handles it lock-free;
+		//     until then this fallback keeps failover-on handoffs working.)
+		return drainLiveLeaderFallback(req, path, graceMillis, resumeTimeoutMillis, stdout, stderr, d)
 
 	case !hasEpoch:
 		// COLD recovery: failover is on but there is NO lease epoch for this
@@ -374,6 +381,43 @@ func drainWaitBarrierOrEscalate(req queue.SpawnFresh, path string, deadline time
 	// Signal (not a hard error): we escalated cleanly. The drain did not
 	// block and held no lock; the takeover handles recovery.
 	return ErrEscalatedToTakeOver
+}
+
+// drainLiveLeaderFallback handles a coord handoff queue file while a healthy
+// leader still holds the lease and no completion barrier exists. If OLD is
+// already archived the handoff completed and the queue is a stale leftover
+// (stand down, clean it). Otherwise the graceful producer has not written a
+// barrier yet, so complete the handoff via the LEGACY Resume path under a
+// short per-agent lock (codex PR3 iter-5 [P1]) rather than stranding the
+// queue. coldResume provides the locked Resume.
+func drainLiveLeaderFallback(req queue.SpawnFresh, path string, graceMillis, resumeTimeoutMillis int,
+	stdout, stderr io.Writer, d drainLeaseDeps) error {
+
+	_, err := d.LoadAgent(req.OldAgentID)
+	if errors.Is(err, state.ErrNotFound) {
+		// OLD already archived -> handoff already completed; stale queue.
+		_, _ = fmt.Fprintf(stdout,
+			"fleet drain: coord live for %s and %s already retired; cleaning stale queue\n",
+			req.Project, req.OldAgentID)
+		return queue.Delete(path)
+	}
+	// OLD still present (or load error) -> complete the handoff the proven
+	// way. Delegate to the LEGACY drain (LockAgent + handoffop.Resume), which
+	// is byte-identical to the flag-off path: it spawns + retires the
+	// successor exactly as production does today. The successor is therefore
+	// NOT lease-wrapped here — that is the same PR2-documented gap that exists
+	// flag-off, NOT a regression this PR introduces. The lease-correct
+	// successor transfer is the warm-standby flow (GracefulHandoff spawns a
+	// `coord-run --standby` successor that polls + acquires after OLD exits);
+	// its TRIGGER wiring + the flag flip are PR4. So under failover a live
+	// coord handoff completes via the proven legacy flow until PR4 routes it
+	// through the standby producer (codex PR3 iter-5 [P1]).
+	// coldResume runs d.Resume (production: handoffop.Resume) under d.LockAgent
+	// (production: state.LockAgent) — byte-equivalent to drainOneLegacy.
+	_, _ = fmt.Fprintf(stderr,
+		"fleet drain: coord handoff pending for %s with no barrier yet; completing via legacy resume\n",
+		req.Project)
+	return coldResume(req, path, graceMillis, resumeTimeoutMillis, stdout, stderr, d)
 }
 
 // coldResume runs handoffop.Resume to spawn a successor for a STEALABLE
