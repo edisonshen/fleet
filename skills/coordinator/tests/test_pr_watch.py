@@ -3471,3 +3471,32 @@ def test_floor_gate_fires_for_unenrolled_pr_task(tmp_path: Path) -> None:
     # No tasks, no watch -> inert.
     _write_tasks(project_dir, [])
     assert loop._pr_watch_floor_due(project_dir, tasks_path) is False
+
+
+def test_stale_conflict_breadcrumb_not_reused_on_new_head(tmp_path: Path) -> None:
+    """codex P2: after a rebase conflict on head H1 (last_outcome set), if the
+    branch later moves to H2 with a fresh DIRTY, the ladder must try a CLEAN
+    REBASE for H2 first — NOT inherit the H1 conflict and jump to re-derive
+    (rederive_for_head pins the breadcrumb to the head that produced it)."""
+    tasks = [_task("a", pr_url=_pr_url(195), branch="worker/a")]
+    disp = _DispatchRecorder()
+    # tick 1: DIRTY on H1 -> rebase (running).
+    _run2(tasks, tmp_path, FakeProber(snaps={195: _dirty_snap(195, head="H1")},
+          fresh_base="B", ancestors=set()), dispatch=disp,
+          agent_outcome=lambda _a: "running", tick_count=1)
+    assert disp.calls[-1].kind == pw.ACTION_REBASE
+    # tick 2: rebase conflicted on H1 -> last_outcome + rederive_for_head=H1.
+    _run2(tasks, tmp_path, FakeProber(snaps={195: _dirty_snap(195, head="H1")},
+          fresh_base="B", ancestors=set()), dispatch=disp,
+          agent_outcome=lambda _a: pw.OUTCOME_REBASE_CONFLICTED,
+          agent_conflicts=lambda _a: ["x.py"], tick_count=2)
+    assert disp.calls[-1].kind == pw.ACTION_REDERIVE
+    w = pw.load_watches(tmp_path)["watches"]["195"]
+    assert w["remediation"]["rederive_for_head"] == "H1"
+    # tick 3: a HUMAN pushed a NEW head H2 that is ALSO DIRTY. The stale H1
+    # conflict breadcrumb must NOT make H2 jump to re-derive — try rebase.
+    _run2(tasks, tmp_path, FakeProber(snaps={195: _dirty_snap(195, head="H2")},
+          fresh_base="B", ancestors=set()), dispatch=disp,
+          agent_outcome=lambda _a: "gone", tick_count=10)
+    assert disp.calls[-1].kind == pw.ACTION_REBASE, \
+        "a fresh head's DIRTY must try a clean rebase, not inherit a stale conflict"

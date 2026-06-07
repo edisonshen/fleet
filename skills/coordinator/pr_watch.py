@@ -473,6 +473,12 @@ def _reclaim_lease(
     if reported == OUTCOME_REBASE_CONFLICTED and not head_moved:
         rem = _remediation(watch)
         rem["last_outcome"] = OUTCOME_REBASE_CONFLICTED
+        # Key the re-derive breadcrumb to the HEAD that produced the conflict
+        # (codex P2): if the branch later moves (a human push, or a failed
+        # re-derive) the new head's DIRTY must try a CLEAN REBASE first, not
+        # inherit this stale conflict and jump straight to the more-invasive
+        # re-derive. The want_rederive gate checks this matches the live head.
+        rem["rederive_for_head"] = current_head
         # Persist the conflicted paths the rebase subagent reported onto the
         # snapshot so the next pass's DIRTY signature/frontier reflect them
         # (§2.1 — the coord has no conflicted index of its own). Keyed to the
@@ -601,6 +607,7 @@ def _new_remediation() -> dict:
         "ladder_step": "",
         "last_outcome": "",
         "escalated": False,
+        "rederive_for_head": "",
     }
 
 
@@ -619,6 +626,7 @@ def _remediation(watch: dict) -> dict:
     rem.setdefault("ladder_step", "")
     rem.setdefault("last_outcome", "")
     rem.setdefault("escalated", False)
+    rem.setdefault("rederive_for_head", "")
     rem["max_attempts"] = env_max_remediation_attempts()
     rem["max_series"] = env_max_remediation_series()
     return rem
@@ -2425,9 +2433,15 @@ def _dispatch_actions(
             # first-time DIRTY -> a clean rebase (clean rebase of an approved
             # PR is allowed but noted).
             human_approved = bool(snap.get("human_approved"))
+            # want_rederive only when the recorded conflict was for the
+            # CURRENT head (codex P2): a stale rebase_conflicted_needs_rederive
+            # from an earlier head must NOT make a fresh DIRTY on a new head
+            # skip the safe clean-rebase step. rederive_for_head pins the
+            # breadcrumb to the head that produced it.
             want_rederive = (
                 event == EVENT_DIRTY
                 and rem.get("last_outcome") == OUTCOME_REBASE_CONFLICTED
+                and rem.get("rederive_for_head") == head
             )
             if want_rederive and human_approved:
                 # Escalate, don't re-derive (§2.3 rule 1). One raise per head.
