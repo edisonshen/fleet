@@ -5667,12 +5667,20 @@ def _reconcile_pr_watches(
         try:
             agent_id = dispatch_mod.mint_agent_id()
             label = f"pr-{action.kind}-{action.pr_number}"
+            # Pass the minted agent_id into the prompt so the subagent knows
+            # WHICH agent record to write its remediation outcome /
+            # conflicted_paths into — the coord reads ~/.fleet/agents/<id>.json
+            # by exactly this id, and register:false PR-watch dispatches have
+            # no other channel to learn it (codex P1).
             if action.kind == pr_watch_mod.ACTION_REBASE:
-                prompt = dispatch_mod.build_rebase_prompt(action, standards_md=_standards())
+                prompt = dispatch_mod.build_rebase_prompt(
+                    action, standards_md=_standards(), agent_id=agent_id)
             elif action.kind == pr_watch_mod.ACTION_REDERIVE:
-                prompt = dispatch_mod.build_rederive_prompt(action, standards_md=_standards())
+                prompt = dispatch_mod.build_rederive_prompt(
+                    action, standards_md=_standards(), agent_id=agent_id)
             else:
-                prompt = dispatch_mod.build_fix_prompt(action, standards_md=_standards())
+                prompt = dispatch_mod.build_fix_prompt(
+                    action, standards_md=_standards(), agent_id=agent_id)
             # acquire-prompt mints the journal at ExecPending gen 0 and
             # writes the inbox atomically; the DISPATCH block carries gen 0
             # so `mark-launch-attempted <id> 0` returns ok.

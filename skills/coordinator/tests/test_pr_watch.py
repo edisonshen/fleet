@@ -3330,19 +3330,45 @@ def test_event_open_resets_remediation_budget(tmp_path: Path) -> None:
 
 
 def test_rebase_prompt_requires_agent_record_outcome() -> None:
-    """codex P2: the rebase prompt must instruct writing the conflict
+    """codex P2/P1: the rebase prompt must instruct writing the conflict
     outcome into the AGENT RECORD (the only channel the coord reads), not
-    just a WIP note."""
+    just a WIP note — AND substitute the minted agent_id so a register:false
+    subagent knows WHICH record to write (codex P1)."""
     import dispatch as dispatch_mod
     act = pw.ActionDispatch(
         kind=pw.ACTION_REBASE, event=pw.EVENT_DIRTY, pr_number=195,
         pr_url=_pr_url(195), branch="worker/a", base="main",
         head_sha="H1", base_sha="B", key="k",
     )
-    p = dispatch_mod.build_rebase_prompt(act, standards_md="S")
-    assert "agents/<your-agent-id>.json" in p
+    # No agent_id -> placeholder.
+    p0 = dispatch_mod.build_rebase_prompt(act, standards_md="S")
+    assert "agents/<your-agent-id>.json" in p0
+    # WITH agent_id -> the exact record path is substituted (codex P1).
+    p = dispatch_mod.build_rebase_prompt(act, standards_md="S", agent_id="aaaa0001")
+    assert "agents/aaaa0001.json" in p
+    assert "<your-agent-id>" not in p
     assert '"remediation_outcome"' in p
     assert '"conflicted_paths"' in p
+
+
+def test_fix_and_rederive_prompts_carry_agent_id() -> None:
+    """codex P1: the fix + re-derive prompts substitute the minted agent_id
+    into the agent-record path the subagent writes BLOCKED into."""
+    import dispatch as dispatch_mod
+    fix_act = pw.ActionDispatch(
+        kind=pw.ACTION_FIX, event=pw.EVENT_CI_FAILED, pr_number=195,
+        pr_url=_pr_url(195), branch="worker/a", base="main",
+        head_sha="H1", base_sha="", key="k",
+    )
+    p_fix = dispatch_mod.build_fix_prompt(fix_act, standards_md="S", agent_id="bbbb0002")
+    assert "agents/bbbb0002.json" in p_fix
+    rd_act = pw.ActionDispatch(
+        kind=pw.ACTION_REDERIVE, event=pw.EVENT_DIRTY, pr_number=195,
+        pr_url=_pr_url(195), branch="worker/a", base="main",
+        head_sha="H1", base_sha="B", key="k", task_slugs=("a",),
+    )
+    p_rd = dispatch_mod.build_rederive_prompt(rd_act, standards_md="S", agent_id="cccc0003")
+    assert "agents/cccc0003.json" in p_rd
 
 
 def test_rederive_ladder_persists_across_failed_launch(tmp_path: Path) -> None:

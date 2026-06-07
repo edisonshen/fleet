@@ -998,7 +998,15 @@ def _bound_note(action) -> str:
     )
 
 
-def build_rebase_prompt(action, *, standards_md: str = "") -> str:
+def _agent_record_path(agent_id: str) -> str:
+    """The agent-record path a PR-watch subagent must write its remediation
+    outcome into, with the minted agent_id substituted when known (codex P1:
+    a register:false subagent has no other way to learn it)."""
+    return (f"~/.fleet/agents/{agent_id}.json" if agent_id
+            else "~/.fleet/agents/<your-agent-id>.json")
+
+
+def build_rebase_prompt(action, *, standards_md: str = "", agent_id: str = "") -> str:
     """Assemble the rebase subagent's first-turn prompt (§5.1c).
 
     `action` is a pr_watch.ActionDispatch carrying the PR number, url,
@@ -1050,7 +1058,7 @@ def build_rebase_prompt(action, *, standards_md: str = "") -> str:
         "   On ANY conflict: `git rebase --abort` (NEVER auto-resolve — no",
         "   --theirs/--ours, no half-resolved commits). Then DO NOT block.",
         "   You MUST write the conflict outcome into your FLEET AGENT RECORD",
-        "   (~/.fleet/agents/<your-agent-id>.json) — the coordinator reads",
+        f"   ({_agent_record_path(agent_id)}) — the coordinator reads",
         "   ONLY the agent record to advance the ladder; a WIP-note-only",
         "   report is INVISIBLE and would strand the PR. Set, in the record:",
         '     "remediation_outcome": "rebase_conflicted_needs_rederive",',
@@ -1101,7 +1109,7 @@ def build_rebase_prompt(action, *, standards_md: str = "") -> str:
     return out
 
 
-def build_fix_prompt(action, *, standards_md: str = "") -> str:
+def build_fix_prompt(action, *, standards_md: str = "", agent_id: str = "") -> str:
     """Assemble the fix subagent's first-turn prompt (§5 fix dispatch).
 
     Covers two events: EVENT_CI_FAILED (re-run / repair failing checks) and
@@ -1171,10 +1179,12 @@ def build_fix_prompt(action, *, standards_md: str = "") -> str:
         "## BLOCKED vs clean-exit (DESIGN-pr-watch-autoremediate §2.4)",
         "Two distinct exits — pick the right one:",
         "- BLOCKED = 'I definitively cannot do this safely' (a substantive /",
-        "  design review ask, a failure needing a product decision). This",
-        "  latches after ONE attempt + raises to the operator immediately —",
-        "  it does NOT ride out the retry bound. Use it only when you can",
-        "  PROVE it's hopeless.",
+        "  design review ask, a failure needing a product decision). Signal it",
+        f"  by writing `\"blocked\": true` into your agent record",
+        f"  ({_agent_record_path(agent_id)}) — that is the channel the",
+        "  coordinator reads. It latches after ONE attempt + raises to the",
+        "  operator immediately — it does NOT ride out the retry bound. Use it",
+        "  only when you can PROVE it's hopeless.",
         "- Clean exit WITHOUT push = 'this attempt didn't land but isn't",
         "  definitively hopeless' (gates still red, fix didn't take). No",
         "  blocked latch; the watch re-dispatches, bounded by the retry +",
@@ -1195,7 +1205,7 @@ def build_fix_prompt(action, *, standards_md: str = "") -> str:
     return out
 
 
-def build_rederive_prompt(action, *, standards_md: str = "") -> str:
+def build_rederive_prompt(action, *, standards_md: str = "", agent_id: str = "") -> str:
     """Assemble the RE-DERIVE subagent's first-turn prompt (DESIGN-pr-watch-
     autoremediate §2.2/§2.3). Reached ONLY for an UNAPPROVED DIRTY PR whose
     clean rebase conflicted. The subagent regenerates the change from the
@@ -1237,6 +1247,13 @@ def build_rederive_prompt(action, *, standards_md: str = "") -> str:
         "",
         f"Backing task slug(s): {slug_hint}",
         f"Conflicted paths from the failed rebase: {conflict_hint}",
+        "",
+        "## How you signal BLOCKED",
+        "Whenever a step below says 'report BLOCKED', do it by writing",
+        f"`\"blocked\": true` into your agent record",
+        f"({_agent_record_path(agent_id)}) — that is the ONLY channel the",
+        "coordinator reads (this is a register:false dispatch). A WIP-note-only",
+        "report is invisible.",
         "",
         "## SPEC GATE (DESIGN §2.2 — re-derive needs the spec)",
         "Re-derive requires the original task spec(s) to still be",
