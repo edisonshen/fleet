@@ -15,9 +15,17 @@ import (
 
 	"github.com/edisonshen/fleet/internal/agent"
 	"github.com/edisonshen/fleet/internal/gc"
+	"github.com/edisonshen/fleet/internal/rc"
 	"github.com/edisonshen/fleet/internal/state"
 	"github.com/edisonshen/fleet/internal/version"
 )
+
+// rcSweepFn is the package-level seam for rc.SweepAllProjects. status
+// invokes it to reap stale-version + dead-owner RC daemons (the
+// 2026-05-29 OOM root cause). Tests swap it for a no-op + counter.
+// leak-rc-daemon-lifecycle PR-B: SweepAllProjects had zero production
+// callers before this seam.
+var rcSweepFn = rc.SweepAllProjects
 
 // statusReconcileFn is the package-level seam for the auto-reconcile
 // pass that runs at the end of runStatus. Production wraps
@@ -97,6 +105,18 @@ func runStatus(opts *statusOpts, stdout, stderr io.Writer, current string) error
 	sort.Slice(records, func(i, j int) bool {
 		return records[i].SpawnedAt.After(records[j].SpawnedAt)
 	})
+
+	// RC daemon sweep (leak-rc-daemon-lifecycle PR-B). Reaps stale-
+	// version + dead-owner daemons across all projects. Mutates only
+	// fleet's own resources (kills the orphan PID, removes the
+	// per-project rc-state.json) — matches the fleet-owns-its-resources
+	// rule. Runs on BOTH the table and --json paths (codex P2: the JSON
+	// branch returns early, so placing the sweep here is the only way it
+	// fires for machine-readable callers like dashboards / coord ticks).
+	// Surface-don't-silo: errors log to stderr — stdout stays valid JSON.
+	if err := rcSweepFn(); err != nil {
+		_, _ = fmt.Fprintf(stderr, "warning: rc sweep failed: %v (continuing)\n", err)
+	}
 
 	if opts.jsonOut {
 		if records == nil {
@@ -301,13 +321,14 @@ func orphanCleanupHint(a gc.Action, rec *agent.Record) string {
 			return fmt.Sprintf("fleet rm %s  (preserve for dead-coord recovery; do NOT run `fleet gc --apply --kinds=orphan-agents`)", a.Target)
 		}
 		return fmt.Sprintf("fleet rm %s  (per-record; verify FLEET_TMUX_SOCKET matches agent's spawn socket before running)", a.Target)
-	case gc.KindSockets, gc.KindWorktrees, gc.KindCoordLocks, gc.KindWorkerRecords, gc.KindInvalidProjects:
-		// coord-locks + worker-records + invalid-projects share the
-		// global-gc hint shape (sockets + worktrees) because the remove is
-		// project-scoped to the parent project's tree — no per-record
-		// FLEET_TMUX_SOCKET caveat applies. See cmd/fleet/gc.go's --kinds
-		// wiring (fleet#172 for coord-locks, fleet#177 for worker-records,
-		// invalid-project-dir-guar-d636 for invalid-projects).
+	case gc.KindSockets, gc.KindWorktrees, gc.KindCoordLocks, gc.KindWorkerRecords, gc.KindInvalidProjects, gc.KindOrphanRCDaemons:
+		// coord-locks + worker-records + invalid-projects + orphan-rc-daemons
+		// share the global-gc hint shape (sockets + worktrees) because the
+		// remove is project-scoped to the parent project's tree — no
+		// per-record FLEET_TMUX_SOCKET caveat applies. See cmd/fleet/gc.go's
+		// --kinds wiring (fleet#172 for coord-locks, fleet#177 for
+		// worker-records, invalid-project-dir-guar-d636 for invalid-projects,
+		// leak-rc-daemon-lifecycle PR-B for orphan-rc-daemons).
 		return fmt.Sprintf("fleet gc --apply --kinds=%s", a.Kind)
 	default:
 		return "(unknown — run `fleet gc` for details)"

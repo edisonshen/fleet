@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"os"
+	"strings"
 	"testing"
 
 	"github.com/edisonshen/fleet/internal/rc"
@@ -39,7 +40,7 @@ func TestRCCLI_UpEmitsJSONEnvelope(t *testing.T) {
 	// We use the explicit --cwd flag to short-circuit.
 
 	out := &bytes.Buffer{}
-	if err := runRCUp(out, "demo", t.TempDir(), false, false); err != nil {
+	if err := runRCUp(out, "demo", t.TempDir(), false, false, ""); err != nil {
 		// runRCUp returns errRC sentinels for non-zero exit outcomes
 		// (not_owned/contested). acquired/already_acquired return nil.
 		// If we got an error, the JSON envelope is already on stdout.
@@ -58,6 +59,60 @@ func TestRCCLI_UpEmitsJSONEnvelope(t *testing.T) {
 	}
 	if resp.Outcome != rc.OutcomeAcquired && resp.Outcome != rc.OutcomeAlreadyAcquired {
 		t.Errorf("response outcome=%q want acquired/already_acquired", resp.Outcome)
+	}
+}
+
+// TestRCCLI_UpRejectsInvalidCoordID (codex P2): a malformed --coord-id
+// must be rejected BEFORE rc.Up persists it as owning_coord_id; otherwise
+// defaultOwnerAlive treats the (missing) record as dead-owner and reaps +
+// respawns the daemon repeatedly with the same poison owner. Expect a
+// non-nil error and an error JSON envelope, with no listener spawned.
+func TestRCCLI_UpRejectsInvalidCoordID(t *testing.T) {
+	rcTestFleetHome(t)
+	spawned := false
+	restoreSpawn := rc.SetSpawnerForTest(func(workingDir string) (int, error) {
+		spawned = true
+		return os.Getpid(), nil
+	})
+	defer restoreSpawn()
+
+	out := &bytes.Buffer{}
+	err := runRCUp(out, "demo", t.TempDir(), false, false, "NOT-HEX!!")
+	if err == nil {
+		t.Fatalf("expected error for invalid --coord-id")
+	}
+	if spawned {
+		t.Fatalf("listener must NOT spawn when --coord-id is invalid")
+	}
+	var resp rcResponse
+	if jerr := json.Unmarshal(out.Bytes(), &resp); jerr != nil {
+		t.Fatalf("invalid JSON envelope: %v\nstdout:\n%s", jerr, out.String())
+	}
+	if resp.Outcome != rc.OutcomeError {
+		t.Fatalf("outcome=%q want error", resp.Outcome)
+	}
+	if !strings.Contains(resp.Error, "invalid --coord-id") {
+		t.Fatalf("error %q must mention invalid --coord-id", resp.Error)
+	}
+}
+
+// TestRCCLI_UpAcceptsValidCoordID confirms the validation gate doesn't
+// reject a legitimate 8-hex agent ID — it must reach rc.Up and acquire.
+func TestRCCLI_UpAcceptsValidCoordID(t *testing.T) {
+	rcTestFleetHome(t)
+	restoreSpawn := rc.SetSpawnerForTest(func(workingDir string) (int, error) {
+		return os.Getpid(), nil
+	})
+	defer restoreSpawn()
+
+	out := &bytes.Buffer{}
+	_ = runRCUp(out, "demo", t.TempDir(), false, false, "abcd1234")
+	var resp rcResponse
+	if jerr := json.Unmarshal(out.Bytes(), &resp); jerr != nil {
+		t.Fatalf("invalid JSON envelope: %v\nstdout:\n%s", jerr, out.String())
+	}
+	if resp.Outcome != rc.OutcomeAcquired && resp.Outcome != rc.OutcomeAlreadyAcquired {
+		t.Fatalf("valid coord-id outcome=%q want acquired/already_acquired", resp.Outcome)
 	}
 }
 
@@ -141,6 +196,8 @@ func TestRCCLI_ExitCodeMappingStable(t *testing.T) {
 		{rc.OutcomeReleased, 0},
 		{rc.OutcomeAlreadyReleased, 0},
 		{rc.OutcomeConnected, 0},
+		{rc.OutcomeRespawnedStaleVersion, 0},
+		{rc.OutcomeRespawnedDeadOwner, 0},
 		{rc.OutcomeNotEnabled, 10},
 		{rc.OutcomeNotOwned, 10},
 		{rc.OutcomeAbsent, 11},
@@ -152,6 +209,22 @@ func TestRCCLI_ExitCodeMappingStable(t *testing.T) {
 		got := rcExitCode(c.outcome)
 		if got != c.want {
 			t.Errorf("rcExitCode(%q)=%d want %d", c.outcome, got, c.want)
+		}
+	}
+}
+
+// TestRCCLI_EmitRC_SelfHealOutcomesReturnNil (codex P3): emitRC must treat
+// the self-heal respawn outcomes as successes (return nil), consistent with
+// rcExitCode mapping them to 0. Otherwise an in-process caller of
+// runRCUp/Cobra Execute sees an error for a SUCCESSFUL respawn.
+func TestRCCLI_EmitRC_SelfHealOutcomesReturnNil(t *testing.T) {
+	for _, outcome := range []string{
+		rc.OutcomeRespawnedStaleVersion,
+		rc.OutcomeRespawnedDeadOwner,
+	} {
+		var buf bytes.Buffer
+		if err := emitRC(&buf, rcResponse{Outcome: outcome, Cmd: "up", Project: "demo"}); err != nil {
+			t.Errorf("emitRC(%q) returned error %v; want nil (self-heal is a success)", outcome, err)
 		}
 	}
 }

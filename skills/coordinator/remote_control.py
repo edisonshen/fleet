@@ -245,6 +245,35 @@ def bootstrap_remote_control(
     home = _resolve_home(fleet_home)
     marker = _marker_path(home, project, coord_id)
     if marker.exists():
+        # Already bootstrapped (inbox seeded once). BUT the respawn tick
+        # must keep firing: SweepAllProjects reaps a stale/dead-owner
+        # daemon while PRESERVING the project RC marker, expecting the next
+        # coord tick to respawn it. If we returned here unconditionally,
+        # existing coords would never re-run `fleet rc up --respawn-only
+        # --coord-id`, leaving the project marker-present/no-state until the
+        # operator runs `fleet rc up` by hand. So re-run the (idempotent,
+        # respawn-only) spawn on every post-bootstrap tick. --respawn-only
+        # is a no-op when the project RC marker is absent, so this never
+        # auto-enables RC for an opted-out project.
+        respawn_status = spawn_daemon_status(project, coord_id)
+        # codex P2 (surface-don't-silo): if the respawn FAILED transiently
+        # (fleet binary missing, timeout, contested replacement after a sweep
+        # removed rc-state.json), don't silently return SKIPPED_MARKER — that
+        # makes loop.tick treat the coord as healthy and leaves the project
+        # marker-present/no-state with no breadcrumb. Log it and return the
+        # retry-next-tick status so `fleet status` shows an actionable line.
+        if respawn_status == SPAWN_TRANSIENT_ERROR:
+            _bootstrap_log(
+                STATUS_FAILED_SEED,  # reuse the "retry-next-tick" log status.
+                project=project,
+                coord_id=coord_id,
+                detail=(
+                    f"post-bootstrap respawn of project {project!r} returned "
+                    f"transient_error (fleet binary / timeout / contested "
+                    f"replacement after a sweep); will retry next tick"
+                ),
+            )
+            return STATUS_FAILED_SEED
         return STATUS_SKIPPED_MARKER
     # Pre-check the inbox path: if an operator queued a message via
     # `fleet message <coord_id>` between dispatch and this tick, the
@@ -279,7 +308,7 @@ def bootstrap_remote_control(
     #   - SPAWN_TRANSIENT_ERROR → log, DON'T write marker so next tick
     #                           retries (fleet binary missing /
     #                           timeout / lock contest etc.).
-    spawn_status = spawn_daemon_status(project)
+    spawn_status = spawn_daemon_status(project, coord_id)
     if spawn_status == SPAWN_NOT_ENABLED:
         _bootstrap_log(
             STATUS_NOT_ENABLED,
@@ -342,21 +371,34 @@ SPAWN_NOT_ENABLED = "not_enabled"
 SPAWN_TRANSIENT_ERROR = "transient_error"
 
 
-def spawn_daemon_status(project: str = "") -> str:
+def spawn_daemon_status(project: str = "", coord_id: str = "") -> str:
     """Tri-state version of spawn_daemon_if_needed (codex round-6 P2).
     Returns SPAWN_OK / SPAWN_NOT_ENABLED / SPAWN_TRANSIENT_ERROR so
     callers can distinguish "operator hasn't opted in" (quiet steady-
     state) from "fleet binary missing / timeout / lock contest" (must
     retry next tick).
+
+    coord_id (leak-rc-daemon-lifecycle): when non-empty and well-shaped,
+    threaded to `fleet rc up --coord-id <id>` so the spawned daemon's
+    rc-state.json records the OWNING coord. Without this, the Go-side
+    dead-owner self-heal (rc.computeHealReason) skips its check on an
+    empty owner, leaving orphaned daemons unreaped after a coord crash —
+    the very leak this change exists to close. A coord_id failing the
+    canonical 8-lowercase-hex shape is dropped (not passed) rather than
+    used as an argument; the daemon still spawns, just without owner
+    tracking for that tick.
     """
     if not project:
         return SPAWN_OK
     if os.environ.get("FLEET_RC_BOOTSTRAP_DISABLED", ""):
         return SPAWN_OK
     fleet_bin = os.environ.get("FLEET_BIN") or "fleet"
+    cmd = [fleet_bin, "rc", "up", project, "--respawn-only", "--idempotent"]
+    if coord_id and _COORD_ID_RE.match(coord_id):
+        cmd += ["--coord-id", coord_id]
     try:
         result = subprocess.run(
-            [fleet_bin, "rc", "up", project, "--respawn-only", "--idempotent"],
+            cmd,
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
@@ -401,7 +443,7 @@ def spawn_daemon_status(project: str = "") -> str:
         return SPAWN_TRANSIENT_ERROR
 
 
-def spawn_daemon_if_needed(project: str = "") -> bool:
+def spawn_daemon_if_needed(project: str = "", coord_id: str = "") -> bool:
     """v0.12 (DESIGN-rc-listener-lifecycle.md §"Attach-surface gates"
     S1): shell out to `fleet rc up <project> --respawn-only
     --idempotent` so the Go controller (internal/rc) is the SINGLE
@@ -444,7 +486,7 @@ def spawn_daemon_if_needed(project: str = "") -> bool:
     # need to distinguish should use spawn_daemon_status directly
     # (codex round-6 P2). Tests that pre-date the split also use
     # this entry point.
-    status = spawn_daemon_status(project)
+    status = spawn_daemon_status(project, coord_id)
     return status == SPAWN_OK
 
 
