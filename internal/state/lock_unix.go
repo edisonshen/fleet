@@ -83,6 +83,19 @@ const defaultLockTimeout = 30 * time.Second
 // timeout-skip path without a 5-minute wait. Production never reassigns it.
 var worktreeGCLockTimeout = 5 * time.Minute
 
+// agentLockTimeout bounds LockAgent. Like worktree-GC (and UNLIKE the fast
+// per-record state lock), the agent lock is held across a whole handoff
+// `Resume` — which includes spawn.WaitForReadyToPrompt (~30s default) plus
+// post-ready buffer and grace/kill/archive steps — so a 30s bound would
+// make a legitimate concurrent same-agent op (a second `fleet handoff`/
+// `fleet drain`/`fleet rm`) FAIL with ErrLockTimeout mid-handoff instead
+// of serializing. The generous bound preserves serialization for a normal
+// slow handoff while still ruling out the forever-hang incident (a wedged
+// holder past this bound surfaces ErrLockTimeout naming the stale pid,
+// rather than blocking silently forever). PR3 removes LockAgent-across-
+// Resume entirely; until then this keeps existing behavior intact.
+const agentLockTimeout = 5 * time.Minute
+
 // LockProjectState takes an exclusive flock on
 // ~/.fleet/projects/<project>/.locks/state.lock — the v0.2 single
 // state-lock per project state-dir (Q1 decision). Held briefly during
@@ -162,8 +175,13 @@ func LockProjectWorktreeGC(project string) (func(), error) {
 //
 // Compare to LockProject (broader scope, used for project-manifest
 // mutations in 4b+ when many agents share one manifest).
+//
+// Uses the generous agentLockTimeout (NOT the short state-lock default):
+// the handoff Resume holds this across a slow spawn-and-wait, so a tighter
+// bound would turn legitimate same-agent serialization into spurious
+// ErrLockTimeout failures (see agentLockTimeout).
 func LockAgent(id string) (func(), error) {
-	return acquireFlock(AgentLockPath, id, defaultLockTimeout)
+	return acquireFlock(AgentLockPath, id, agentLockTimeout)
 }
 
 // acquireFlock is the shared body for the per-scope lock helpers.
