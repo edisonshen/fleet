@@ -286,6 +286,93 @@ func TestKillCoord_SuccessfulReap_TermThenKill(t *testing.T) {
 	}
 }
 
+// P2 regression: the target becomes the current active lease owner during
+// the grace delay (it won the lease). The pre-grace gates passed, but the
+// re-validation before SIGTERM must REFUSE rather than shoot the new
+// leader.
+func TestKillCoord_P2_BecomesLeaderDuringGrace(t *testing.T) {
+	const (
+		project = "proj-p2leader"
+		selfPid = 1000
+		pid     = 11000
+	)
+	recs := []*agent.Record{coordRec("p2l00001", project, pid, 1212, "/usr/local/bin/fleet")}
+	live := map[int]int64{selfPid: 111, pid: 1212}
+	rec := &killRecorder{}
+	leader := 0 // no leader at the static-gate check...
+	d := testKillDeps(rec, recs, live, leader, selfPid)
+	// ...but the grace Sleep flips the target into the active-owner role.
+	d.Grace = time.Millisecond
+	d.Sleep = func(time.Duration) { leader = pid }
+	d.CurrentLeaderPID = func(string) (int, bool) {
+		if leader <= 0 {
+			return 0, false
+		}
+		return leader, true
+	}
+
+	err := killCoord(KillTarget{Pid: pid, PidStart: 1212, AgentID: "p2l00001", Project: project, FencerEpoch: 9}, d)
+	if !errors.Is(err, ErrKillRefused) {
+		t.Fatalf("became-leader-during-grace: want ErrKillRefused, got %v", err)
+	}
+	if rec.count() != 0 {
+		t.Errorf("must NOT signal a target that became the leader; got %d signals", rec.count())
+	}
+}
+
+// P2 regression: the PID is reused during the grace delay (the original
+// coord exited and the kernel handed its number to an unrelated process
+// with a different start time). The pre-signal re-validation must REFUSE.
+func TestKillCoord_P2_PidReusedDuringGrace(t *testing.T) {
+	const (
+		project = "proj-p2reuse"
+		selfPid = 1000
+		pid     = 12000
+	)
+	recs := []*agent.Record{coordRec("p2r00001", project, pid, 3434, "/usr/local/bin/fleet")}
+	live := map[int]int64{selfPid: 111, pid: 3434}
+	rec := &killRecorder{}
+	d := testKillDeps(rec, recs, live, 0, selfPid)
+	d.Grace = time.Millisecond
+	// During grace the pid is recycled: same pid, NEW start time.
+	d.Sleep = func(time.Duration) { live[pid] = 7878 }
+	d.PidStart = func(p int) (int64, bool) { st, ok := live[p]; return st, ok }
+	d.Alive = func(p int) bool { _, ok := live[p]; return ok }
+
+	err := killCoord(KillTarget{Pid: pid, PidStart: 3434, AgentID: "p2r00001", Project: project, FencerEpoch: 4}, d)
+	if !errors.Is(err, ErrKillRefused) {
+		t.Fatalf("pid-reused-during-grace: want ErrKillRefused, got %v", err)
+	}
+	if rec.count() != 0 {
+		t.Errorf("must NOT signal a recycled pid; got %d signals", rec.count())
+	}
+}
+
+// P2: the target exits cleanly during the grace delay -> benign no-op
+// (no signal, no error).
+func TestKillCoord_P2_ExitsDuringGrace(t *testing.T) {
+	const (
+		project = "proj-p2exit"
+		selfPid = 1000
+		pid     = 13000
+	)
+	recs := []*agent.Record{coordRec("p2e00001", project, pid, 5656, "/usr/local/bin/fleet")}
+	live := map[int]int64{selfPid: 111, pid: 5656}
+	rec := &killRecorder{}
+	d := testKillDeps(rec, recs, live, 0, selfPid)
+	d.Grace = time.Millisecond
+	d.Sleep = func(time.Duration) { delete(live, pid) } // exited during grace
+	d.PidStart = func(p int) (int64, bool) { st, ok := live[p]; return st, ok }
+	d.Alive = func(p int) bool { _, ok := live[p]; return ok }
+
+	if err := killCoord(KillTarget{Pid: pid, PidStart: 5656, AgentID: "p2e00001", Project: project}, d); err != nil {
+		t.Fatalf("exits-during-grace: want nil no-op, got %v", err)
+	}
+	if rec.count() != 0 {
+		t.Errorf("must NOT signal an exited target; got %d signals", rec.count())
+	}
+}
+
 // isFleetCoordRunBinary classifier unit coverage (W9 helper).
 func TestIsFleetCoordRunBinary(t *testing.T) {
 	cases := map[string]bool{

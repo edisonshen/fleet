@@ -19,6 +19,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/edisonshen/fleet/internal/agent"
@@ -157,6 +158,49 @@ var propagatedRuntimeEnv = []string{
 	// reviewer-subagent-arch builders to decide which engine the
 	// reviewer subagent runs (claude pinch-hits when coord=codex).
 	"FLEET_ENGINE",
+	// FLEET_LEASE_FAILOVER must reach the agent's tmux session so the
+	// wrapped `fleet coord-run` supervisor sees the same flag the
+	// operator's fleet was started with (DESIGN-handoff-drain-storm-leak
+	// PR2). tmux strips non-`-e` vars against an already-running server,
+	// so without this the supervisor would read the flag as OFF, return
+	// ErrFailoverDisabled, and run the child WITHOUT acquiring or
+	// heartbeating the lease — the failover path would silently no-op in
+	// the common case (codex PR2 iter-1 [P1]). It also propagates so a
+	// `fleet drain` / handoff-spawned replacement launched from inside
+	// the pane inherits the same failover state.
+	"FLEET_LEASE_FAILOVER",
+}
+
+// leaseFailoverEnabled mirrors coordlock's failover gate (kept here to
+// avoid importing coordlock just for the predicate; coordlock keeps its
+// own copy unexported). Any non-empty, non-"0"/"false" value enables it.
+// DESIGN-handoff-drain-storm-leak PR2.
+func leaseFailoverEnabled() bool {
+	v := os.Getenv("FLEET_LEASE_FAILOVER")
+	return v != "" && v != "0" && v != "false"
+}
+
+// coordRunWrap builds the lease-failover exec argv: the engine argv
+// supervised by `fleet coord-run` (DESIGN-handoff-drain-storm-leak PR2).
+// Pure + does not mutate argv. The persisted rec.Command stays clean;
+// only the EXECUTION argv is wrapped.
+//
+//	["<fleetBin>","coord-run","--agent",<id>,"--project",<p>,"--",<argv...>]
+func coordRunWrap(fleetBin, agentID, project string, argv []string) []string {
+	wrapped := make([]string, 0, len(argv)+7)
+	wrapped = append(wrapped, fleetBin, "coord-run",
+		"--agent", agentID, "--project", project, "--")
+	return append(wrapped, argv...)
+}
+
+// alreadyCoordRunWrapped reports whether argv already starts a
+// `fleet coord-run` supervisor (basename "fleet"-ish + the "coord-run"
+// subcommand). Idempotency guard so a caller that pre-wrapped the
+// ExecCommand isn't double-wrapped, and so a buggy re-spawn can't nest
+// coord-run inside coord-run.
+func alreadyCoordRunWrapped(argv []string) bool {
+	return len(argv) >= 2 && argv[1] == "coord-run" &&
+		strings.Contains(strings.ToLower(filepath.Base(argv[0])), "fleet")
 }
 
 func envDuration(key string, fallback time.Duration) time.Duration {
@@ -814,6 +858,29 @@ func Spawn(opts Options) (*agent.Record, error) {
 	if len(opts.ExecCommand) > 0 {
 		execArgv = opts.ExecCommand
 	}
+
+	// Lease-failover supervisor wrap (DESIGN-handoff-drain-storm-leak
+	// PR2). Applied HERE — not at the dispatch call site — so EVERY
+	// coord spawn gets it: fresh `fleet dispatch --coord-spawn`, AND the
+	// handoff / drain replacements that bypass dispatch by passing
+	// oldRec.Command (codex PR2 iter-1 [P1] — otherwise the lease
+	// guarantee evaporates after the first handoff). Wrapping the
+	// EXECUTION argv only (rc-rewrite preserved as the tail) keeps the
+	// persisted rec.Command clean so the NEXT handoff re-wraps from the
+	// clean argv rather than nesting coord-run inside coord-run.
+	//
+	//	execArgv = ["<fleetBin>","coord-run","--agent",<id>,
+	//	            "--project",<p>,"--", <prev execArgv ...>]
+	if leaseFailoverEnabled() && isCoordSpawn(rec.TaskID, rec.Project) && !alreadyCoordRunWrapped(execArgv) {
+		if fleetBin, exeErr := os.Executable(); exeErr == nil && fleetBin != "" {
+			execArgv = coordRunWrap(fleetBin, id, rec.Project, execArgv)
+		} else {
+			_, _ = fmt.Fprintf(os.Stderr,
+				"warning: FLEET_LEASE_FAILOVER set but os.Executable() failed (%v); "+
+					"spawning coord %s WITHOUT the coord-run lease supervisor\n", exeErr, id)
+		}
+	}
+
 	if err := tmux.Spawn(session, cwd, execArgv, extraEnv); err != nil {
 		return nil, err
 	}

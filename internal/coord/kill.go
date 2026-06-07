@@ -239,24 +239,53 @@ func killCoord(target KillTarget, d KillDeps) error {
 			ErrKillRefused, target.Pid, target.Project)
 	}
 
-	// All gates passed. Grace delay (Consul lock-delay) so a briefly-
-	// paused coord self-demotes before we signal, then SIGTERM ->
-	// poll -> SIGKILL.
+	// safeToSignal RE-VALIDATES the time-sensitive gates immediately
+	// before each signal (codex PR2 iter-1 [P2]): the static gates above
+	// were checked BEFORE the grace delay + the SIGTERM->SIGKILL poll, so
+	// across those windows the target could exit + its PID be reused, or
+	// it could win the lease and become the active leader. Re-reading the
+	// PID start time and the active-owner gate right before signaling
+	// makes a reused PID, a now-dead pid, or a target-became-leader case
+	// abort instead of shooting the wrong process. Returns (ok, reason):
+	// ok=false with reason="" means "already gone" (benign no-op),
+	// reason!="" means "refuse + log".
+	safeToSignal := func() (ok bool, reason string) {
+		st, alive := d.PidStart(target.Pid)
+		if !alive {
+			return false, "" // exited — benign
+		}
+		if match.SupervisorPidStart != 0 && st != match.SupervisorPidStart {
+			return false, "PID reuse detected before signal (start-time changed)"
+		}
+		if target.PidStart != 0 && st != target.PidStart {
+			return false, "PID reuse detected before signal (fenced start-time changed)"
+		}
+		if leaderPid, hasLeader := d.CurrentLeaderPID(target.Project); hasLeader && leaderPid == target.Pid {
+			return false, "target became the current active lease owner before signal"
+		}
+		return true, ""
+	}
+
+	// All static gates passed. Grace delay (Consul lock-delay) so a
+	// briefly-paused coord self-demotes before we signal.
 	if d.Grace > 0 {
 		d.Sleep(d.Grace)
 	}
-	// Re-check liveness after the grace delay: the coord may have already
-	// self-demoted + exited. If so, nothing to do (benign).
-	if !d.Alive(target.Pid) {
-		_, _ = fmt.Fprintf(stderr,
-			"coord.KillCoordIfIdentityMatches: supervisor pid=%d (agent %s) exited during grace delay; nothing to reap\n",
-			target.Pid, match.ID)
-		return nil
-	}
 
+	// SIGTERM — re-validate first.
+	if ok, reason := safeToSignal(); !ok {
+		if reason == "" {
+			_, _ = fmt.Fprintf(stderr,
+				"coord.KillCoordIfIdentityMatches: supervisor pid=%d (agent %s) exited during grace delay; nothing to reap\n",
+				target.Pid, match.ID)
+			return nil
+		}
+		return fmt.Errorf("%w: %s (pid %d agent %s)", ErrKillRefused, reason, target.Pid, match.ID)
+	}
 	if err := d.Signal(target.Pid, syscall.SIGTERM); err != nil && !errors.Is(err, syscall.ESRCH) {
 		return fmt.Errorf("coord.KillCoordIfIdentityMatches: SIGTERM pid %d: %w", target.Pid, err)
 	}
+
 	deadline := time.Now().Add(d.KillTimeout)
 	for time.Now().Before(deadline) {
 		if !d.Alive(target.Pid) {
@@ -264,7 +293,20 @@ func killCoord(target KillTarget, d KillDeps) error {
 		}
 		d.Sleep(50 * time.Millisecond)
 	}
+
+	// SIGKILL escalation — re-validate AGAIN (the poll window is another
+	// reuse opportunity). A target that exited cleanly under SIGTERM is
+	// the happy path: nothing more to do.
 	if d.Alive(target.Pid) {
+		if ok, reason := safeToSignal(); !ok {
+			if reason == "" {
+				_, _ = fmt.Fprintf(stderr,
+					"coord.KillCoordIfIdentityMatches: supervisor pid=%d (agent %s) exited before SIGKILL; reaped\n",
+					target.Pid, match.ID)
+				return nil
+			}
+			return fmt.Errorf("%w: %s before SIGKILL (pid %d agent %s)", ErrKillRefused, reason, target.Pid, match.ID)
+		}
 		if err := d.Signal(target.Pid, syscall.SIGKILL); err != nil && !errors.Is(err, syscall.ESRCH) {
 			return fmt.Errorf("coord.KillCoordIfIdentityMatches: SIGKILL pid %d: %w", target.Pid, err)
 		}
