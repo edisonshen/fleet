@@ -24,6 +24,7 @@ import (
 
 	"github.com/edisonshen/fleet/internal/agent"
 	"github.com/edisonshen/fleet/internal/coordlock"
+	"github.com/edisonshen/fleet/internal/coordrepo"
 	"github.com/edisonshen/fleet/internal/handoff"
 	"github.com/edisonshen/fleet/internal/queue"
 	"github.com/edisonshen/fleet/internal/rc"
@@ -645,10 +646,26 @@ func spawnAndRetire(req queue.SpawnFresh, queuePath string,
 		}
 	}
 
+	// COORD drain handoffs resolve the repo binding via the shared
+	// resolver, NOT the old coord's stored Cwd (DESIGN-coord-repo-
+	// binding-from-project.md PR3). Same rationale as the manual
+	// cmd/fleet/handoff.go path: a wrong-repo coord must not hand off
+	// into the same wrong tree. Resolve fresh and REFUSE on an
+	// unresolvable project. persist=true (handoff is operator-initiated).
+	// Worker handoffs keep inheriting oldRec.Cwd.
+	spawnCwd := oldRec.Cwd
+	if spawn.IsCoordSpawn(oldRec.TaskID, oldRec.Project) {
+		resolved, rerr := coordrepo.ResolveProjectRepo(oldRec.Project, true)
+		if rerr != nil {
+			return fmt.Errorf("resume: coord handoff for project %q: %w", oldRec.Project, rerr)
+		}
+		spawnCwd = resolved
+	}
+
 	newRec, err := spawn.Spawn(spawn.Options{
 		OldRecord:      oldRec,
 		NewDocPath:     req.HandoffDoc,
-		Cwd:            oldRec.Cwd,
+		Cwd:            spawnCwd,
 		Command:        oldRec.Command,
 		ExecCommand:    rewrittenExecArgv,
 		PreAllocatedID: req.NewAgentID,

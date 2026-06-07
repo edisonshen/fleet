@@ -788,7 +788,22 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			return m, loadAgentsCmd()
 		}
-		cwd := coordCwdForProject(m.records, msg.projectName)
+		// Resolve the repo binding via the shared resolver before the
+		// fresh-coord respawn (DESIGN-coord-repo-binding-from-project.md
+		// PR3). [r] reset respawns a coord, so it binds through the same
+		// resolver as [a] attach — never the launch cwd. Refuse (flash,
+		// no respawn) when the project cannot be resolved.
+		cwd, rerr := coordRepoForProject(msg.projectName)
+		if rerr != nil {
+			m.clearOpInFlight(msg.projectName)
+			m.flash = &flashMsg{
+				text: fmt.Sprintf(
+					"reset project %s reaped %d coord record(s) + cleared lock, but repo bind failed: %v",
+					msg.projectName, msg.reaped, rerr),
+				isErr: true,
+			}
+			return m, loadAgentsCmd()
+		}
 		m.flash = &flashMsg{
 			text: fmt.Sprintf(
 				"reset project %s — reaped %d coord record(s), cleared stale lock, spawning fresh coord",

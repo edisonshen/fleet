@@ -16,8 +16,8 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/edisonshen/fleet/internal/agent"
+	"github.com/edisonshen/fleet/internal/coordrepo"
 	"github.com/edisonshen/fleet/internal/projectlookup"
-	"github.com/edisonshen/fleet/internal/projects"
 	"github.com/edisonshen/fleet/internal/state"
 	"github.com/edisonshen/fleet/internal/tmux"
 )
@@ -936,9 +936,12 @@ const dispatchVetoExitCode = 75
 //     can consume. Without the explicit stamp, an operator in
 //     `fleet -codex attach ...` would propagate FLEET_ENGINE=codex into
 //     dispatch, which today rejects coord-spawn with a different engine.
-//   - --cwd suffix only appears when meta.json registers a repo_path;
-//     legacy projects without meta.json fall back to dispatch's
-//     caller-cwd resolution.
+//   - --cwd carries the resolver-validated repo (NOT the raw
+//     meta.json::repo_path). DESIGN-coord-repo-binding-from-project.md
+//     PR3: this path resolves through coordrepo.ResolveProjectRepo, so a
+//     stale/mismatched-fingerprint meta (cross-machine same-path,
+//     different repo) is REFUSED here rather than passed as an unverified
+//     --cwd that dispatch would honor. cwd is never a binding tier.
 func buildCoordSpawnArgs(project string) ([]string, error) {
 	args := []string{
 		"dispatch",
@@ -948,24 +951,18 @@ func buildCoordSpawnArgs(project string) ([]string, error) {
 		"--prompt", projectlookup.CoordSpawnPrompt(project),
 		"--engine", "claude-code",
 	}
-	// Codex review iter-7 P2: distinguish ENOENT (legacy project, OK to
-	// proceed without --cwd) from parse error / read error (malformed
-	// meta.json — must fail closed). The old version silently swallowed
-	// both as "no meta" and could respawn the coord in the operator's
-	// shell cwd instead of the project's registered repo, leaving the
-	// coord in the wrong checkout.
-	meta, mErr := projects.Read(project)
-	switch {
-	case mErr == nil:
-		if meta.RepoPath != "" {
-			args = append(args, "--cwd", meta.RepoPath)
-		}
-	case errors.Is(mErr, projects.ErrNotFound):
-		// Legacy project, no meta.json — proceed without --cwd; dispatch
-		// resolves cwd from the caller. Same behavior as before iter-7.
-	default:
-		return nil, fmt.Errorf("meta.json for project %s is unreadable: %w — inspect ~/.fleet/projects/%s/meta.json and re-run after repair (don't respawn coord in the wrong checkout)", project, mErr, project)
+	// Resolve the repo binding through the shared resolver (codex PR3
+	// review [P1]): reading meta.RepoPath raw would bypass fingerprint
+	// validation, so a stale cross-machine pin (path exists locally but is
+	// a DIFFERENT repo) would be passed as --cwd and dispatch would treat
+	// it as an operator override — spawning the coord in the wrong
+	// checkout. Resolving here makes the stale pin REFUSE with the
+	// surfaced hint instead. persist=true (attach is operator-initiated).
+	repo, rErr := coordrepo.ResolveProjectRepo(project, true)
+	if rErr != nil {
+		return nil, fmt.Errorf("cannot attach a coordinator to project %s: %w", project, rErr)
 	}
+	args = append(args, "--cwd", repo)
 	return args, nil
 }
 

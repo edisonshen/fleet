@@ -1354,9 +1354,23 @@ func TestKeyA_ProjectRow_DeadCoordSession_ResumesViaDispatch(t *testing.T) {
 	}
 	stub.install(t)
 
+	// E6 — dead-session recovery binds via the resolver (meta repo_path),
+	// NOT the dead coord's rec.Cwd. Seed a CORRECT meta repo and give the
+	// dead coord a WRONG Cwd; the resume must use the meta repo.
+	resolvedRepo := t.TempDir()
+	if err := projects.Write("demo", projects.Meta{
+		Schema:   projects.SchemaVersion,
+		RepoPath: resolvedRepo,
+		AddedAt:  time.Now().UTC(),
+		IsGit:    projects.BoolPtr(false),
+	}); err != nil {
+		t.Fatalf("write project meta: %v", err)
+	}
+
 	coord := sampleAgent("coord001")
 	coord.Project = "demo"
 	coord.TaskID = "coord-demo"
+	coord.Cwd = "/dead/coord/wrong/tree" // resolver must ignore this
 	m := New("test")
 	m.records = []*agent.Record{coord}
 	m.dashboard = &Snapshot{
@@ -1412,44 +1426,31 @@ func TestKeyA_ProjectRow_DeadCoordSession_ResumesViaDispatch(t *testing.T) {
 	if len(args) < 2 || args[1] != "coord-demo" {
 		t.Errorf("dispatch task_id (args[1]) = %q; want coord-demo (stable per-project)", argString(args, 1))
 	}
+	// E6 — the resume binds the resolver's repo, NOT the dead coord's
+	// (wrong) rec.Cwd.
+	if got := cwdArg(args); got != resolvedRepo {
+		t.Errorf("dead-session resume --cwd = %q; want %q (resolver meta repo, not dead rec.Cwd)", got, resolvedRepo)
+	}
 }
 
-// TestKeyA_ProjectRow_DeadCoordSession_PassesDeadCoordCwd pins codex
-// review iter-11 P2: the resume-dispatch's --cwd arg comes from the
-// DEAD COORD's recorded Cwd, not from coordCwdForProject (which
-// returns the first same-project record's Cwd — could be a worker
-// in a different worktree). The dead coord's Cwd is the
-// authoritative starting checkout for the recovery.
-func TestKeyA_ProjectRow_DeadCoordSession_PassesDeadCoordCwd(t *testing.T) {
+// E6 (refuse) — dead-session recovery REFUSES (flash, no respawn) when
+// the resolver cannot bind. It does NOT fall back to the dead coord's
+// rec.Cwd even though that path exists.
+func TestKeyA_ProjectRow_DeadCoordSession_RefusesWhenUnresolvable(t *testing.T) {
 	withFleetHome(t)
 	(&stubSessionAlive{dead: map[string]bool{"fleet-coord001": true}}).install(t)
 	(&stubSessionProbe{dead: map[string]bool{"fleet-coord001": true}}).install(t)
-
-	stub := &stubFleetCmd{
-		stubbed: func(args []string) tea.Msg {
-			out := "agent abcd1234 spawned\n  task: coord-demo\n  project: demo\n  tmux: fleet-abcd1234\n"
-			return coordSpawnDoneMsgFromArgs(args, out, nil)
-		},
-	}
+	stub := &stubFleetCmd{}
 	stub.install(t)
 
-	// Dead coord with a specific Cwd.
-	const deadCoordCwd = "/Users/op/projects/demo-main"
+	// NO meta.json, no worktrees → resolver refuses. The dead coord has a
+	// live rec.Cwd the OLD code would have reused.
 	coord := sampleAgent("coord001")
 	coord.Project = "demo"
 	coord.TaskID = "coord-demo"
-	coord.Cwd = deadCoordCwd
-
-	// Decoy: another agent for the same project in a DIFFERENT
-	// worktree. coordCwdForProject would return this one's Cwd
-	// (first match) — but the resume MUST use the dead coord's Cwd.
-	decoy := sampleAgent("decoy001")
-	decoy.Project = "demo"
-	decoy.TaskID = "worker-some-other"
-	decoy.Cwd = "/Users/op/projects/demo-worker-worktree"
-
+	coord.Cwd = t.TempDir() // live, but resolver must ignore it
 	m := New("test")
-	m.records = []*agent.Record{decoy, coord} // decoy first → coordCwdForProject would return its Cwd
+	m.records = []*agent.Record{coord}
 	m.dashboard = &Snapshot{
 		Projects: []*ProjectRow{{Name: "demo", CoordID: "coord001"}},
 	}
@@ -1462,27 +1463,88 @@ func TestKeyA_ProjectRow_DeadCoordSession_PassesDeadCoordCwd(t *testing.T) {
 
 	updated, cmd := m.Update(keyMsg("a"))
 	mm := updated.(Model)
+	if cmd != nil {
+		t.Error("dead-session recovery must NOT respawn when the resolver refuses")
+	}
+	if len(stub.calls) != 0 {
+		t.Errorf("refused recovery must NOT shell out; got %v", stub.calls)
+	}
+	if mm.flash == nil || !mm.flash.isErr {
+		t.Fatalf("expected error flash on unresolvable dead-session recovery, got %+v", mm.flash)
+	}
+	if !strings.Contains(mm.flash.text, "no usable checkout") {
+		t.Errorf("refusal should surface the resolver hint; got %q", mm.flash.text)
+	}
+}
+
+// TestKeyA_ProjectRow_DeadCoordSession_PassesDeadCoordCwd pins codex
+// E6 (resolver wins over both rec.Cwd and decoy) — superseding the old
+// iter-11 P2 behavior: dead-session recovery binds the resolver's repo
+// (meta repo_path), NOT the dead coord's rec.Cwd and NOT any decoy
+// worker's Cwd. DESIGN-coord-repo-binding-from-project.md PR3.
+func TestKeyA_ProjectRow_DeadCoordSession_ResolverWinsOverRecCwd(t *testing.T) {
+	withFleetHome(t)
+	(&stubSessionAlive{dead: map[string]bool{"fleet-coord001": true}}).install(t)
+	(&stubSessionProbe{dead: map[string]bool{"fleet-coord001": true}}).install(t)
+
+	stub := &stubFleetCmd{
+		stubbed: func(args []string) tea.Msg {
+			out := "agent abcd1234 spawned\n  task: coord-demo\n  project: demo\n  tmux: fleet-abcd1234\n"
+			return coordSpawnDoneMsgFromArgs(args, out, nil)
+		},
+	}
+	stub.install(t)
+
+	// The CORRECT binding comes from meta repo_path.
+	resolvedRepo := t.TempDir()
+	if err := projects.Write("demo", projects.Meta{
+		Schema:   projects.SchemaVersion,
+		RepoPath: resolvedRepo,
+		AddedAt:  time.Now().UTC(),
+		IsGit:    projects.BoolPtr(false),
+	}); err != nil {
+		t.Fatalf("write project meta: %v", err)
+	}
+
+	// Dead coord with a WRONG Cwd the OLD code would have reused.
+	coord := sampleAgent("coord001")
+	coord.Project = "demo"
+	coord.TaskID = "coord-demo"
+	coord.Cwd = "/Users/op/projects/demo-main"
+
+	// Decoy worker in yet another tree — also ignored.
+	decoy := sampleAgent("decoy001")
+	decoy.Project = "demo"
+	decoy.TaskID = "worker-some-other"
+	decoy.Cwd = "/Users/op/projects/demo-worker-worktree"
+
+	m := New("test")
+	m.records = []*agent.Record{decoy, coord}
+	m.dashboard = &Snapshot{
+		Projects: []*ProjectRow{{Name: "demo", CoordID: "coord001"}},
+	}
+	for i, r := range m.dashboardRows() {
+		if r.kind == rowProject && r.project != nil && r.project.Name == "demo" {
+			m.dashCursor = i
+			break
+		}
+	}
+
+	updated, cmd := m.Update(keyMsg("a"))
+	_ = updated
 	if cmd == nil {
 		t.Fatalf("expected resume-dispatch cmd")
 	}
 	cmd() // fire
-	_ = mm
 
 	if len(stub.calls) != 1 {
 		t.Fatalf("expected one dispatch call; got %d", len(stub.calls))
 	}
 	args := stub.calls[0]
-	// Find --cwd in args.
-	var cwdArg string
-	for i, a := range args {
-		if a == "--cwd" && i+1 < len(args) {
-			cwdArg = args[i+1]
-			break
-		}
-	}
-	if cwdArg != deadCoordCwd {
-		t.Errorf("--cwd should be dead coord's Cwd (%q), not the decoy's; got %q (args=%v)",
-			deadCoordCwd, cwdArg, args)
+	got := cwdArg(args)
+	if got != resolvedRepo {
+		t.Errorf("--cwd should be the resolver repo (%q), not rec.Cwd/decoy; got %q (args=%v)",
+			resolvedRepo, got, args)
 	}
 }
 
@@ -1649,6 +1711,7 @@ func TestKeyA_ProjectRow_DeadCoord_InFlightGuardBlocksDoubleSpawn(t *testing.T) 
 // lock-poll — attach immediately after dispatch returns.
 func TestKeyA_ProjectRow_NoCoord_SpawnsAndAttaches(t *testing.T) {
 	withFleetHome(t)
+	seedProjectMeta(t, "demo", t.TempDir()) // resolver binds via meta (PR3)
 	(&stubSessionAlive{}).install(t)
 
 	stub := &stubFleetCmd{
@@ -1769,6 +1832,7 @@ func argString(args []string, i int) string {
 // support (MVP scope, memory project_codex_multi_engine.md).
 func TestKeyA_CoordSpawn_AlwaysClaudeCodeEngine(t *testing.T) {
 	withFleetHome(t)
+	seedProjectMeta(t, "demo", t.TempDir()) // resolver binds via meta (PR3)
 	(&stubSessionAlive{}).install(t)
 	// Operator launched fleet with -codex.
 	t.Setenv("FLEET_ENGINE", "codex")
@@ -1856,6 +1920,7 @@ func argValue(args []string, flag string) string {
 // and Update surfaces it as a flash. pendingAttach stays empty.
 func TestKeyA_ProjectRow_DispatchErr(t *testing.T) {
 	withFleetHome(t)
+	seedProjectMeta(t, "demo", t.TempDir()) // resolver binds via meta (PR3)
 	stub := &stubFleetCmd{
 		stubbed: func(args []string) tea.Msg {
 			return coordSpawnDoneMsgFromArgs(args, "boom\n", fmt.Errorf("exit 1"))
@@ -1900,6 +1965,7 @@ func TestKeyA_ProjectRow_DispatchErr(t *testing.T) {
 // than silently attaching to a wrong/empty session.
 func TestKeyA_ProjectRow_DispatchOutputUnparseable(t *testing.T) {
 	withFleetHome(t)
+	seedProjectMeta(t, "demo", t.TempDir()) // resolver binds via meta (PR3)
 	stub := &stubFleetCmd{
 		stubbed: func(args []string) tea.Msg {
 			return coordSpawnDoneMsgFromArgs(args, "weird unexpected output\n", nil)
@@ -2023,84 +2089,61 @@ func TestHelpOverlay_HandoffDescriptionMentionsProjects(t *testing.T) {
 	}
 }
 
-// TestCoordCwdForProject_ProjectMetaBeatsAgentRecordCwd pins fresh
-// coord spawns after PLAN-DOC/TASK-PLAN-DOC: worker records may point
-// at worktrees, so the registered project repo path must win.
-func TestCoordCwdForProject_ProjectMetaBeatsAgentRecordCwd(t *testing.T) {
-	withFleetHome(t)
-	r := agent.New("a1")
-	r.Project = "demo"
-	r.Cwd = "/Users/op/projects/demo-worktree"
-	repo := t.TempDir()
-	if err := projects.Write("demo", projects.Meta{
-		Schema:   projects.SchemaVersion,
-		RepoPath: repo,
-		AddedAt:  time.Now().UTC(),
-		IsGit:    projects.BoolPtr(true),
-	}); err != nil {
-		t.Fatalf("write project meta: %v", err)
-	}
-	got := coordCwdForProject([]*agent.Record{r}, "demo")
-	if got != repo {
-		t.Errorf("coordCwdForProject should prefer meta repo_path over agent Cwd; got %q want %q", got, repo)
-	}
-}
-
-// TestCoordCwdForProject_PrefersAgentRecordWhenMetaAbsent verifies the
-// legacy fallback: projects registered before meta.json still reuse a
-// same-project agent cwd before falling back to the TUI process cwd.
-func TestCoordCwdForProject_PrefersAgentRecordWhenMetaAbsent(t *testing.T) {
-	withFleetHome(t)
-	r := agent.New("a1")
-	r.Project = "demo"
-	r.Cwd = "/Users/op/projects/demo"
-	got := coordCwdForProject([]*agent.Record{r}, "demo")
-	if got != "/Users/op/projects/demo" {
-		t.Errorf("coordCwdForProject should use agent record Cwd when meta is absent; got %q", got)
-	}
-}
-
-// TestCoordCwdForProject_UsesProjectMetaRepoPath pins fresh coord
-// spawns: when no same-project agent record exists, the coord must
-// start in the registered repo so PLAN-DOC/TASK-PLAN-DOC writes land
-// in that project's docs/ directory rather than the dashboard cwd.
-func TestCoordCwdForProject_UsesProjectMetaRepoPath(t *testing.T) {
+// TestCoordRepoForProject_UsesProjectMetaRepoPath pins fresh coord
+// spawns: the binding comes from the registered repo_path so PLAN-DOC/
+// TASK-PLAN-DOC writes land in that project's docs/ directory.
+// DESIGN-coord-repo-binding-from-project.md PR3: resolved via the shared
+// resolver (meta tier 1), NEVER the launch cwd.
+func TestCoordRepoForProject_UsesProjectMetaRepoPath(t *testing.T) {
 	withFleetHome(t)
 	repo := t.TempDir()
 	if err := projects.Write("demo", projects.Meta{
 		Schema:   projects.SchemaVersion,
 		RepoPath: repo,
 		AddedAt:  time.Now().UTC(),
-		IsGit:    projects.BoolPtr(true),
+		IsGit:    projects.BoolPtr(false), // non-git: bind on dir existence
 	}); err != nil {
 		t.Fatalf("write project meta: %v", err)
 	}
 
-	got := coordCwdForProject(nil, "demo")
+	got, err := coordRepoForProject("demo")
+	if err != nil {
+		t.Fatalf("coordRepoForProject: %v", err)
+	}
 	if got != repo {
-		t.Errorf("coordCwdForProject should use meta repo_path; got %q want %q", got, repo)
+		t.Errorf("coordRepoForProject should use meta repo_path; got %q want %q", got, repo)
 	}
 }
 
-// TestCoordCwdForProject_FallsBackToWd: with no matching agent record,
-// or project metadata, we fall through to os.Getwd().
-func TestCoordCwdForProject_FallsBackToWd(t *testing.T) {
+// TestCoordRepoForProject_RefusesWhenUnresolvable pins the deleted cwd
+// tiers: with NO meta.json, NO worktrees, and an agent record carrying a
+// Cwd, the resolver REFUSES — it does NOT fall back to the agent record's
+// Cwd nor to os.Getwd(). cwd is no longer a binding tier anywhere.
+func TestCoordRepoForProject_RefusesWhenUnresolvable(t *testing.T) {
 	withFleetHome(t)
-	got := coordCwdForProject(nil, "ghost-project")
-	wd, _ := os.Getwd()
-	if got != wd {
-		t.Errorf("coordCwdForProject with no records should fall back to os.Getwd(); got %q want %q",
-			got, wd)
+	// A same-project agent record with a Cwd that the OLD code would have
+	// reused. The resolver must ignore it.
+	_, err := coordRepoForProject("ghost-project")
+	if err == nil {
+		t.Fatal("coordRepoForProject must refuse an unresolvable project, got nil error")
+	}
+	if !strings.Contains(err.Error(), "no usable checkout") {
+		t.Errorf("refusal should surface the resolver hint; got %v", err)
+	}
+	// The hint must NOT name os.Getwd as a binding — it appears only as a
+	// candidate suggestion. Assert the cwd-ignored line is present.
+	if !strings.Contains(err.Error(), "launch cwd was intentionally ignored") {
+		t.Errorf("refusal hint must state cwd was ignored; got %v", err)
 	}
 }
 
-// TestKeyA_ProjectRow_ForwardsCwdFromAgentRecord pins the wiring:
-// when an existing agent record carries a Cwd matching the project,
-// the spawned coord's `fleet dispatch` invocation must include
-// --cwd <that path>. Otherwise the coord lands in the TUI's cwd
-// (often a worktree dir for fleet developers) and /coordinator's
-// directory-relative shell calls resolve to the wrong place.
-func TestKeyA_ProjectRow_ForwardsCwdFromAgentRecord(t *testing.T) {
+// TestKeyA_ProjectRow_ForwardsResolvedRepoAsCwd pins the wiring:
+// DESIGN-coord-repo-binding-from-project.md PR3 — the spawned coord's
+// `fleet dispatch` invocation includes --cwd <resolved repo> from the
+// shared resolver (meta repo_path), NOT from any agent record's Cwd and
+// NOT the launch cwd. A same-project worker carrying a DIFFERENT Cwd must
+// be ignored.
+func TestKeyA_ProjectRow_ForwardsResolvedRepoAsCwd(t *testing.T) {
 	withFleetHome(t)
 	(&stubSessionAlive{}).install(t)
 
@@ -2112,11 +2155,22 @@ func TestKeyA_ProjectRow_ForwardsCwdFromAgentRecord(t *testing.T) {
 	}
 	stub.install(t)
 
-	// Existing worker agent for "demo" carries Cwd = a known path.
-	// coordCwdForProject should pick this path and forward it as --cwd.
+	// The CORRECT binding comes from meta repo_path (resolver tier 1).
+	repo := t.TempDir()
+	if err := projects.Write("demo", projects.Meta{
+		Schema:   projects.SchemaVersion,
+		RepoPath: repo,
+		AddedAt:  time.Now().UTC(),
+		IsGit:    projects.BoolPtr(false),
+	}); err != nil {
+		t.Fatalf("write project meta: %v", err)
+	}
+
+	// A same-project worker with a DIFFERENT Cwd the OLD code would have
+	// forwarded. The resolver must ignore it.
 	worker := sampleAgent("worker01")
 	worker.Project = "demo"
-	worker.Cwd = "/Users/op/projects/demo"
+	worker.Cwd = "/Users/op/projects/demo-worktree"
 
 	m := New("test")
 	m.records = []*agent.Record{worker}
@@ -2139,16 +2193,12 @@ func TestKeyA_ProjectRow_ForwardsCwdFromAgentRecord(t *testing.T) {
 	if len(stub.calls) != 1 {
 		t.Fatalf("expected 1 fleet call; got %d", len(stub.calls))
 	}
-	args := stub.calls[0]
-	hasCwd := false
-	for i, a := range args {
-		if a == "--cwd" && i+1 < len(args) && args[i+1] == "/Users/op/projects/demo" {
-			hasCwd = true
-			break
-		}
+	got := cwdArg(stub.calls[0])
+	if got != repo {
+		t.Errorf("dispatch --cwd = %q; want %q (resolver meta repo, not worker Cwd)", got, repo)
 	}
-	if !hasCwd {
-		t.Errorf("dispatch args missing --cwd /Users/op/projects/demo: %v", args)
+	if got == worker.Cwd {
+		t.Errorf("dispatch forwarded the worker's Cwd %q — must use the resolver", worker.Cwd)
 	}
 }
 
@@ -2277,6 +2327,7 @@ func TestKeyA_ProjectRow_FindsExistingCoordByTaskID(t *testing.T) {
 // pendingAttach. No lock-poll, no timeout banner under normal operation.
 func TestKeyA_ProjectRow_AttachesImmediatelyAfterDispatch(t *testing.T) {
 	withFleetHome(t)
+	seedProjectMeta(t, "demo", t.TempDir()) // resolver binds via meta (PR3)
 	(&stubSessionAlive{}).install(t)
 
 	stub := &stubFleetCmd{
@@ -2325,6 +2376,7 @@ func TestKeyA_ProjectRow_AttachesImmediatelyAfterDispatch(t *testing.T) {
 // flash a "spawn in flight" hint and let the operator wait.
 func TestKeyA_ProjectRow_InFlightSpawn_RejectsDuplicate(t *testing.T) {
 	withFleetHome(t)
+	seedProjectMeta(t, "demo", t.TempDir()) // resolver binds via meta (PR3)
 	(&stubSessionAlive{}).install(t)
 	(&stubProjectTreeExists{}).install(t)
 
@@ -2505,6 +2557,7 @@ func TestKeyA_ProjectRow_InitErrShowsBanner(t *testing.T) {
 // session — surface a flash and stay in the TUI.
 func TestKeyA_ProjectRow_DeadSessionAfterSpawn_FlashesNoAttach(t *testing.T) {
 	withFleetHome(t)
+	seedProjectMeta(t, "demo", t.TempDir()) // resolver binds via meta (PR3)
 	// Spawn writes a session name, but our liveness probe says it's
 	// already dead — claude exited between dispatch returning and the
 	// coordSpawnDoneMsg arriving in Update.
@@ -2668,6 +2721,7 @@ func TestFindExistingCoordForProject_NoMarker_FallsThroughToSpawn(t *testing.T) 
 // coordSpawnDoneMsg, and the marker write must be skipped.
 func TestKeyA_ProjectRow_PromptFailedDispatch_NoMarker(t *testing.T) {
 	withFleetHome(t)
+	seedProjectMeta(t, "demo", t.TempDir()) // resolver binds via meta (PR3)
 	(&stubSessionAlive{}).install(t)
 	markerStub := &stubWriteCoordSpawnMarker{}
 	markerStub.install(t)
@@ -2716,6 +2770,7 @@ func TestKeyA_ProjectRow_PromptFailedDispatch_NoMarker(t *testing.T) {
 // prefix. Without the flag, runDispatch rejects the prefix.
 func TestKeyA_ProjectRow_DispatchInvocationCarriesCoordSpawnFlag(t *testing.T) {
 	withFleetHome(t)
+	seedProjectMeta(t, "demo", t.TempDir()) // resolver binds via meta (PR3)
 	(&stubSessionAlive{}).install(t)
 
 	stub := &stubFleetCmd{
@@ -2776,6 +2831,7 @@ func TestKeyA_ProjectRow_DispatchPassesTargetProjectExplicitly(t *testing.T) {
 	stub.install(t)
 
 	const targetProject = "projects-tatoosh"
+	seedProjectMeta(t, targetProject, t.TempDir()) // resolver binds via meta (PR3)
 	m := New("test")
 	m.dashboard = &Snapshot{Projects: []*ProjectRow{{Name: targetProject}}}
 	for i, r := range m.dashboardRows() {
@@ -2832,6 +2888,7 @@ func TestKeyA_ProjectRow_DispatchedAgentRecordHasTargetProject(t *testing.T) {
 	stub.install(t)
 
 	const targetProject = "projects-tatoosh"
+	seedProjectMeta(t, targetProject, t.TempDir()) // resolver binds via meta (PR3)
 	m := New("test")
 	m.dashboard = &Snapshot{Projects: []*ProjectRow{{Name: targetProject}}}
 	for i, r := range m.dashboardRows() {

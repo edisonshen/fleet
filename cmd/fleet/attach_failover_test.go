@@ -469,39 +469,37 @@ func TestBuildCoordSpawnArgs_ShapeAndTaskID(t *testing.T) {
 	// prompt (so /coordinator runs) AND be forced to engine claude-code
 	// (so DISPATCH blocks work). The full argv shape is asserted below.
 	wantPrompt := projectlookup.CoordSpawnPrompt("projects-fleet")
-	// No meta.json: argv should be dispatch <task-id> --coord-spawn
-	// --project <p> --prompt <p> --engine claude-code (no --cwd suffix).
+	// DESIGN-coord-repo-binding-from-project.md PR3: buildCoordSpawnArgs
+	// now resolves via the shared resolver. No meta.json + no worktrees =
+	// unresolvable → REFUSE (no args, surfaced hint). cwd is no longer a
+	// fallback, so the old "args without --cwd" shape is gone.
+	_, err := buildCoordSpawnArgs("projects-fleet")
+	if err == nil {
+		t.Fatal("buildCoordSpawnArgs(no meta) must refuse an unresolvable project, got nil")
+	}
+	if !strings.Contains(err.Error(), "no usable checkout") {
+		t.Errorf("buildCoordSpawnArgs(no meta) should surface the resolver hint; got %v", err)
+	}
+	// With a usable meta.json (real dir, non-git → bind on existence):
+	// --cwd <resolved repo> appended after the prompt/engine.
+	repo := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(tmp, "projects", "projects-fleet"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	metaPath := filepath.Join(tmp, "projects", "projects-fleet", "meta.json")
+	if err := os.WriteFile(metaPath, []byte(`{"schema":"v1","is_git":false,"repo_path":"`+repo+`","added_at":"2026-01-01T00:00:00Z"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
 	got, err := buildCoordSpawnArgs("projects-fleet")
 	if err != nil {
-		t.Fatalf("buildCoordSpawnArgs(no meta) err: %v", err)
+		t.Fatalf("buildCoordSpawnArgs(with meta) err: %v", err)
 	}
 	want := []string{
 		"dispatch", "coord-projects-fleet",
 		"--coord-spawn", "--project", "projects-fleet",
 		"--prompt", wantPrompt,
 		"--engine", "claude-code",
-	}
-	if !stringSlicesEqual(got, want) {
-		t.Errorf("buildCoordSpawnArgs(no meta): got %v want %v", got, want)
-	}
-	// With meta.json: --cwd <repo_path> appended after the prompt/engine.
-	if err := os.MkdirAll(filepath.Join(tmp, "projects", "projects-fleet"), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	metaPath := filepath.Join(tmp, "projects", "projects-fleet", "meta.json")
-	if err := os.WriteFile(metaPath, []byte(`{"schema":"v1","repo_path":"/repos/projects-fleet","added_at":"2026-01-01T00:00:00Z"}`), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	got, err = buildCoordSpawnArgs("projects-fleet")
-	if err != nil {
-		t.Fatalf("buildCoordSpawnArgs(with meta) err: %v", err)
-	}
-	want = []string{
-		"dispatch", "coord-projects-fleet",
-		"--coord-spawn", "--project", "projects-fleet",
-		"--prompt", wantPrompt,
-		"--engine", "claude-code",
-		"--cwd", "/repos/projects-fleet",
+		"--cwd", repo,
 	}
 	if !stringSlicesEqual(got, want) {
 		t.Errorf("buildCoordSpawnArgs(with meta): got %v want %v", got, want)

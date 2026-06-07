@@ -10,6 +10,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/edisonshen/fleet/internal/agent"
+	"github.com/edisonshen/fleet/internal/coordrepo"
 	"github.com/edisonshen/fleet/internal/handoff"
 	"github.com/edisonshen/fleet/internal/handoffop"
 	"github.com/edisonshen/fleet/internal/queue"
@@ -579,7 +580,24 @@ func runHandoff(opts *handoffOpts, stdout, stderr io.Writer) error {
 	//    writes means a refusal leaves zero on-disk artifacts.
 	cwd := opts.cwd
 	if cwd == "" {
-		cwd = oldRec.Cwd
+		// COORD handoffs resolve the repo binding via the shared
+		// resolver, NOT the old coord's stored Cwd (DESIGN-coord-repo-
+		// binding-from-project.md PR3). A wrong-repo coord handing off
+		// to itself would otherwise perpetuate the cwd bug — the
+		// replacement inherits the same wrong tree and keeps stamping
+		// coord-config.json wrong. Resolve fresh and REFUSE on an
+		// unresolvable project. persist=true (handoff is operator-
+		// initiated). Worker handoffs keep inheriting oldRec.Cwd —
+		// workers legitimately follow their dispatch tree.
+		if spawn.IsCoordSpawn(oldRec.TaskID, oldRec.Project) {
+			resolved, rerr := coordrepo.ResolveProjectRepo(oldRec.Project, true)
+			if rerr != nil {
+				return fmt.Errorf("coord handoff for project %q: %w", oldRec.Project, rerr)
+			}
+			cwd = resolved
+		} else {
+			cwd = oldRec.Cwd
+		}
 	}
 	if cwd == "" {
 		return fmt.Errorf("agent %s is a legacy record with no stored cwd; pass --cwd <path> explicitly", opts.oldID)

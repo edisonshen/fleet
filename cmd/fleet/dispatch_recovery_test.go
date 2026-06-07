@@ -33,6 +33,27 @@ func fakeAgentRecord(id, taskID, project string, pid int, session string) *agent
 	return r
 }
 
+// seedRecoveryRepo writes a meta.json under projects/<project> pinning
+// repo_path to a real temp directory, so coord recovery's repo binding
+// (DESIGN-coord-repo-binding-from-project.md PR3) resolves via tier 1
+// instead of refusing. Returns the bound repo path. The recovery-
+// inheritance tests below verify command/engine/prompt behavior, not the
+// binding itself, so they just need the resolver to succeed. The cwd-
+// binding behavior is covered separately by E4/E5.
+func seedRecoveryRepo(t *testing.T, root, project string) string {
+	t.Helper()
+	repo := t.TempDir()
+	pdir := filepath.Join(root, "projects", project)
+	if err := os.MkdirAll(pdir, 0o755); err != nil {
+		t.Fatalf("mkdir project dir: %v", err)
+	}
+	meta := `{"schema":"v1","is_git":false,"repo_path":"` + repo + `","added_at":"2026-01-01T00:00:00Z"}`
+	if err := os.WriteFile(filepath.Join(pdir, "meta.json"), []byte(meta), 0o644); err != nil {
+		t.Fatalf("write meta.json: %v", err)
+	}
+	return repo
+}
+
 // TestFindRecoveryCandidate_DeadPidAndDeadTmuxIsCandidate pins the core
 // detection rule: when a record's pid is dead AND its tmux session is
 // gone, the helper returns that record as a recovery candidate.
@@ -427,6 +448,7 @@ func TestRunDispatch_DeadCoord_Recovers(t *testing.T) {
 	}
 	// Seed minimal project state so synth has something to describe.
 	root := os.Getenv("FLEET_HOME")
+	seedRecoveryRepo(t, root, "myproj") // coord recovery binds via resolver (PR3)
 	pdir := filepath.Join(root, "projects", "myproj")
 	if err := os.MkdirAll(pdir, 0o755); err != nil {
 		t.Fatalf("mkdir project dir: %v", err)
@@ -574,6 +596,7 @@ func TestRunDispatch_DeadCoord_SendsResumePromptToSuccessor(t *testing.T) {
 		t.Fatalf("seed dead record: %v", err)
 	}
 	root := os.Getenv("FLEET_HOME")
+	seedRecoveryRepo(t, root, "myproj") // coord recovery binds via resolver (PR3)
 	pdir := filepath.Join(root, "projects", "myproj")
 	if err := os.MkdirAll(pdir, 0o755); err != nil {
 		t.Fatalf("mkdir project dir: %v", err)
@@ -685,6 +708,7 @@ func TestRunDispatch_DeadCoord_NoAutoResumeSkipsPromptSwap(t *testing.T) {
 		t.Fatalf("seed dead record: %v", err)
 	}
 	root := os.Getenv("FLEET_HOME")
+	seedRecoveryRepo(t, root, "myproj") // coord recovery binds via resolver (PR3)
 	pdir := filepath.Join(root, "projects", "myproj")
 	if err := os.MkdirAll(pdir, 0o755); err != nil {
 		t.Fatalf("mkdir project dir: %v", err)
@@ -802,6 +826,7 @@ func TestRunDispatch_DeadCoord_EngineClampOverridesInheritedCodex(t *testing.T) 
 		t.Fatalf("seed dead record: %v", err)
 	}
 	root := os.Getenv("FLEET_HOME")
+	seedRecoveryRepo(t, root, "myproj") // coord recovery binds via resolver (PR3)
 	pdir := filepath.Join(root, "projects", "myproj")
 	if err := os.MkdirAll(pdir, 0o755); err != nil {
 		t.Fatalf("mkdir project dir: %v", err)
@@ -880,6 +905,7 @@ func TestRunDispatch_DeadCoord_CodexRecoveryRejected(t *testing.T) {
 		t.Fatalf("seed dead record: %v", err)
 	}
 	root := os.Getenv("FLEET_HOME")
+	seedRecoveryRepo(t, root, "myproj") // coord recovery binds via resolver (PR3)
 	pdir := filepath.Join(root, "projects", "myproj")
 	if err := os.MkdirAll(pdir, 0o755); err != nil {
 		t.Fatalf("mkdir project dir: %v", err)
@@ -951,6 +977,7 @@ func TestRunDispatch_DeadCoord_FreshMtimeBlocksDispatch(t *testing.T) {
 		t.Fatalf("seed dead record: %v", err)
 	}
 	root := os.Getenv("FLEET_HOME")
+	seedRecoveryRepo(t, root, "myproj") // coord recovery binds via resolver (PR3)
 	pdir := filepath.Join(root, "projects", "myproj")
 	if err := os.MkdirAll(pdir, 0o755); err != nil {
 		t.Fatalf("mkdir project dir: %v", err)
@@ -1007,32 +1034,32 @@ func TestRunDispatch_DeadCoord_FreshMtimeBlocksDispatch(t *testing.T) {
 }
 
 // TestRunDispatch_DeadCoord_InheritsCwdFromOldRecord pins codex review
-// iter-9 P2: when the operator runs a recovery dispatch from a
-// different shell/repo than where the dead coord ran, the successor
-// must restart in the dead coord's recorded cwd. Without this, a
-// recovery launched from /tmp would put the coord in /tmp instead of
-// the project checkout, breaking relative git/test commands.
-func TestRunDispatch_DeadCoord_InheritsCwdFromOldRecord(t *testing.T) {
+// E4 — DESIGN-coord-repo-binding-from-project.md PR3: coord recovery
+// resolves the repo binding via the shared resolver (meta.json pin), NOT
+// the dead coord's recorded Cwd. The dead coord's Cwd may itself be a
+// cwd-bug victim pointing at the WRONG tree; inheriting it would
+// perpetuate the corruption across the resume. This test sets a WRONG
+// dead.Cwd and a CORRECT meta.json repo_path and asserts the successor
+// binds the resolver's repo, never the stale dead.Cwd.
+func TestRunDispatch_DeadCoord_ResolvesRepoNotOldRecordCwd(t *testing.T) {
 	requireTmux(t)
 	setupFleetHome(t)
 
-	// Real directory the dead coord supposedly ran from. We use a
-	// t.TempDir to avoid touching shared filesystem state.
-	deadCoordCwd := t.TempDir()
+	// The dead coord's recorded cwd is a WRONG/stale tree.
+	wrongCwd := t.TempDir()
 	deadRec := agent.New("cwd1cwd1")
 	deadRec.TaskID = "coord-myproj"
 	deadRec.Project = "myproj"
 	deadRec.PID = 99999
 	deadRec.TmuxSession = "fleet-cwd1cwd1"
-	deadRec.Cwd = deadCoordCwd
+	deadRec.Cwd = wrongCwd
 	if err := deadRec.Write(); err != nil {
 		t.Fatalf("seed dead record: %v", err)
 	}
 	root := os.Getenv("FLEET_HOME")
+	// The CORRECT binding comes from meta.json (resolver tier 1).
+	correctRepo := seedRecoveryRepo(t, root, "myproj")
 	pdir := filepath.Join(root, "projects", "myproj")
-	if err := os.MkdirAll(pdir, 0o755); err != nil {
-		t.Fatalf("mkdir project dir: %v", err)
-	}
 	cs := map[string]any{"worker_agent_ids": map[string]string{}}
 	csData, _ := json.Marshal(cs)
 	csPath := filepath.Join(pdir, "coord-state.json")
@@ -1044,8 +1071,8 @@ func TestRunDispatch_DeadCoord_InheritsCwdFromOldRecord(t *testing.T) {
 		t.Fatalf("chtimes: %v", err)
 	}
 
-	// No --cwd on this dispatch — the runtime cwd is whatever the test
-	// runner picked. The recovery path must fall back to oldRecord.Cwd.
+	// No --cwd on this dispatch — the recovery path must resolve via the
+	// resolver (meta), NOT fall back to the dead coord's wrong cwd.
 	opts := &dispatchOpts{
 		taskID:          "coord-myproj",
 		project:         "myproj",
@@ -1071,9 +1098,72 @@ func TestRunDispatch_DeadCoord_InheritsCwdFromOldRecord(t *testing.T) {
 	if successor == nil {
 		t.Fatalf("expected successor record; got none")
 	}
-	if successor.Cwd != deadCoordCwd {
-		t.Errorf("cwd inheritance: successor.Cwd = %q; want %q (dead coord's recorded cwd)",
-			successor.Cwd, deadCoordCwd)
+	if successor.Cwd != correctRepo {
+		t.Errorf("coord recovery bound the wrong tree: successor.Cwd = %q; want %q (resolver meta repo)",
+			successor.Cwd, correctRepo)
+	}
+	if successor.Cwd == wrongCwd {
+		t.Errorf("coord recovery reused the dead coord's stale Cwd %q — must resolve via meta", wrongCwd)
+	}
+}
+
+// E5 — coord recovery REFUSES (no spawn) when the resolver cannot bind:
+// no meta.json, no worktrees. It must NOT fall back to oldRecord.Cwd
+// even though the dead coord has a live recorded cwd.
+func TestRunDispatch_DeadCoord_RefusesWhenUnresolvable(t *testing.T) {
+	requireTmux(t)
+	setupFleetHome(t)
+
+	liveButWrongCwd := t.TempDir()
+	deadRec := agent.New("refuse01")
+	deadRec.TaskID = "coord-myproj"
+	deadRec.Project = "myproj"
+	deadRec.PID = 99999
+	deadRec.TmuxSession = "fleet-refuse01"
+	deadRec.Cwd = liveButWrongCwd
+	if err := deadRec.Write(); err != nil {
+		t.Fatalf("seed dead record: %v", err)
+	}
+	root := os.Getenv("FLEET_HOME")
+	// NO seedRecoveryRepo — no meta.json, no worktrees → resolver refuses.
+	pdir := filepath.Join(root, "projects", "myproj")
+	if err := os.MkdirAll(pdir, 0o755); err != nil {
+		t.Fatalf("mkdir project dir: %v", err)
+	}
+	cs := map[string]any{"worker_agent_ids": map[string]string{}}
+	csData, _ := json.Marshal(cs)
+	csPath := filepath.Join(pdir, "coord-state.json")
+	if err := os.WriteFile(csPath, csData, 0o644); err != nil {
+		t.Fatalf("write coord-state: %v", err)
+	}
+	stale := time.Now().Add(-2 * coordFreshnessWindow)
+	if err := os.Chtimes(csPath, stale, stale); err != nil {
+		t.Fatalf("chtimes: %v", err)
+	}
+
+	opts := &dispatchOpts{
+		taskID:          "coord-myproj",
+		project:         "myproj",
+		projectExplicit: true,
+		coordSpawn:      true,
+		command:         []string{"sleep", "60"},
+		commandExplicit: true,
+	}
+	var out bytes.Buffer
+	err := runDispatch(opts, &out)
+	if err == nil {
+		t.Fatal("coord recovery must REFUSE when the resolver cannot bind, got nil error")
+	}
+	if !strings.Contains(err.Error(), "no usable checkout") {
+		t.Errorf("refusal should surface the resolver hint, got: %v", err)
+	}
+	// No successor must have been spawned.
+	live, _ := agent.List()
+	for _, r := range live {
+		if r.TaskID == "coord-myproj" && r.Project == "myproj" && r.ID != "refuse01" {
+			t.Cleanup(func() { _ = tmux.Kill(r.TmuxSession) })
+			t.Errorf("coord recovery spawned a successor %q despite refusal — must not bind a wrong tree", r.ID)
+		}
 	}
 }
 
@@ -1101,6 +1191,7 @@ func TestRunDispatch_DeadCoord_InheritsCommandWhenEngineMatchesExplicit(t *testi
 		t.Fatalf("seed dead record: %v", err)
 	}
 	root := os.Getenv("FLEET_HOME")
+	seedRecoveryRepo(t, root, "myproj") // coord recovery binds via resolver (PR3)
 	pdir := filepath.Join(root, "projects", "myproj")
 	if err := os.MkdirAll(pdir, 0o755); err != nil {
 		t.Fatalf("mkdir project dir: %v", err)
@@ -1183,6 +1274,7 @@ func TestRunDispatch_DeadCoord_InheritsDisableAutoResume(t *testing.T) {
 		t.Fatalf("seed dead record: %v", err)
 	}
 	root := os.Getenv("FLEET_HOME")
+	seedRecoveryRepo(t, root, "myproj") // coord recovery binds via resolver (PR3)
 	pdir := filepath.Join(root, "projects", "myproj")
 	if err := os.MkdirAll(pdir, 0o755); err != nil {
 		t.Fatalf("mkdir project dir: %v", err)
@@ -1305,6 +1397,7 @@ func TestRunDispatch_DeadCoord_InheritsCommandFromOldRecord(t *testing.T) {
 		t.Fatalf("seed dead record: %v", err)
 	}
 	root := os.Getenv("FLEET_HOME")
+	seedRecoveryRepo(t, root, "myproj") // coord recovery binds via resolver (PR3)
 	pdir := filepath.Join(root, "projects", "myproj")
 	if err := os.MkdirAll(pdir, 0o755); err != nil {
 		t.Fatalf("mkdir project dir: %v", err)
@@ -1382,6 +1475,7 @@ func TestRunDispatch_DeadCoord_EngineClampSkipsCommandInherit(t *testing.T) {
 		t.Fatalf("seed dead record: %v", err)
 	}
 	root := os.Getenv("FLEET_HOME")
+	seedRecoveryRepo(t, root, "myproj") // coord recovery binds via resolver (PR3)
 	pdir := filepath.Join(root, "projects", "myproj")
 	if err := os.MkdirAll(pdir, 0o755); err != nil {
 		t.Fatalf("mkdir project dir: %v", err)
@@ -1469,6 +1563,7 @@ func TestRunDispatch_DeadCoord_LegacyRecordSkipsCommandInherit(t *testing.T) {
 		t.Fatalf("seed dead record: %v", err)
 	}
 	root := os.Getenv("FLEET_HOME")
+	seedRecoveryRepo(t, root, "myproj") // coord recovery binds via resolver (PR3)
 	pdir := filepath.Join(root, "projects", "myproj")
 	if err := os.MkdirAll(pdir, 0o755); err != nil {
 		t.Fatalf("mkdir project dir: %v", err)

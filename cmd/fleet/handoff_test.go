@@ -489,6 +489,116 @@ func agentSpawnForTest(t *testing.T, cwd string, command []string, project, task
 	})
 }
 
+// E7 (manual handoff) — DESIGN-coord-repo-binding-from-project.md PR3: a
+// COORD handoff resolves the replacement's Cwd via the shared resolver
+// (meta repo_path), NOT the outgoing coord's possibly-wrong Cwd. The
+// outgoing coord here is seeded in a WRONG tree; meta pins the correct
+// repo; the replacement must land in the meta repo.
+func TestHandoff_CoordResolvesRepoNotOldCwd(t *testing.T) {
+	requireTmux(t)
+	root := setupFleetHome(t)
+
+	const project = "rainier"
+	correctRepo := seedRecoveryRepo(t, root, project) // resolver tier 1
+
+	// Outgoing COORD (task_id = coord-<project>) seeded in a WRONG tree.
+	wrongCwd := t.TempDir()
+	first, err := agentSpawnForTest(t, wrongCwd,
+		[]string{"sh", "-c", "exec sleep 120"}, project, "coord-"+project)
+	if err != nil {
+		t.Fatalf("seed coord spawn: %v", err)
+	}
+	t.Cleanup(func() { _ = tmux.Kill(first.TmuxSession) })
+
+	// Handoff WITHOUT --cwd → coord path must resolve via the resolver.
+	out := &bytes.Buffer{}
+	if err := runHandoff(&handoffOpts{oldID: first.ID, graceMillis: 0}, out, out); err != nil {
+		t.Fatalf("coord handoff: %v\n%s", err, out.String())
+	}
+	live := listLive(t)
+	if len(live) != 1 {
+		t.Fatalf("expected 1 live agent, got %d", len(live))
+	}
+	rep := live[0]
+	t.Cleanup(func() { _ = tmux.Kill(rep.TmuxSession) })
+	if rep.Cwd != correctRepo {
+		t.Errorf("coord handoff bound wrong tree: rep.Cwd = %q; want %q (resolver meta repo, not old coord Cwd %q)",
+			rep.Cwd, correctRepo, wrongCwd)
+	}
+}
+
+// E7 (manual handoff, refuse) — a COORD handoff REFUSES when the resolver
+// cannot bind, rather than falling back to the outgoing coord's Cwd.
+func TestHandoff_CoordRefusesWhenUnresolvable(t *testing.T) {
+	requireTmux(t)
+	setupFleetHome(t)
+
+	const project = "ghostproj" // NO meta.json, no worktrees → refuse
+
+	wrongCwd := t.TempDir()
+	first, err := agentSpawnForTest(t, wrongCwd,
+		[]string{"sh", "-c", "exec sleep 120"}, project, "coord-"+project)
+	if err != nil {
+		t.Fatalf("seed coord spawn: %v", err)
+	}
+	t.Cleanup(func() { _ = tmux.Kill(first.TmuxSession) })
+
+	out := &bytes.Buffer{}
+	err = runHandoff(&handoffOpts{oldID: first.ID, graceMillis: 0}, out, out)
+	if err == nil {
+		t.Fatal("coord handoff must REFUSE when resolver cannot bind, got nil")
+	}
+	if !strings.Contains(err.Error(), "no usable checkout") {
+		t.Errorf("refusal should surface the resolver hint; got %v", err)
+	}
+	// No replacement must have spawned (refusal is before any side effect).
+	for _, l := range listLive(t) {
+		if l.ID != first.ID {
+			t.Cleanup(func() { _ = tmux.Kill(l.TmuxSession) })
+			t.Errorf("coord handoff spawned a replacement %q despite refusal", l.ID)
+		}
+	}
+}
+
+// E8 (manual handoff) — a WORKER handoff (task_id is a real slug, NOT
+// coord-<project>) keeps inheriting the outgoing record's Cwd. The
+// resolver is COORD-only; workers legitimately follow their dispatch
+// tree. Guards against the coord-binding change leaking into workers.
+func TestHandoff_WorkerStillInheritsOldCwd(t *testing.T) {
+	requireTmux(t)
+	root := setupFleetHome(t)
+
+	const project = "rainier"
+	// Seed meta pointing at a DIFFERENT repo to prove the worker path
+	// does NOT consult the resolver (it would bind this otherwise).
+	otherRepo := seedRecoveryRepo(t, root, project)
+
+	workerCwd := t.TempDir()
+	first, err := agentSpawnForTest(t, workerCwd,
+		[]string{"sh", "-c", "exec sleep 120"}, project, "auth-fix") // worker slug
+	if err != nil {
+		t.Fatalf("seed worker spawn: %v", err)
+	}
+	t.Cleanup(func() { _ = tmux.Kill(first.TmuxSession) })
+
+	out := &bytes.Buffer{}
+	if err := runHandoff(&handoffOpts{oldID: first.ID, graceMillis: 0}, out, out); err != nil {
+		t.Fatalf("worker handoff: %v\n%s", err, out.String())
+	}
+	live := listLive(t)
+	if len(live) != 1 {
+		t.Fatalf("expected 1 live agent, got %d", len(live))
+	}
+	rep := live[0]
+	t.Cleanup(func() { _ = tmux.Kill(rep.TmuxSession) })
+	if rep.Cwd != workerCwd {
+		t.Errorf("worker handoff Cwd: got %q want %q (inherited, NOT resolver)", rep.Cwd, workerCwd)
+	}
+	if rep.Cwd == otherRepo {
+		t.Errorf("worker handoff incorrectly used the resolver meta repo %q", otherRepo)
+	}
+}
+
 func TestHandoff_ResumeHandoff_CoordMarker_WritesBeforeReadinessWait(t *testing.T) {
 	requireTmux(t)
 	setupFleetHome(t)
