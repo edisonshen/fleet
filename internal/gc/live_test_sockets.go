@@ -259,17 +259,24 @@ const ownerProbeFailedPID = -1
 
 // anyGoTestRunning reports whether at least one `go test` / test-binary
 // process is alive on the host. It probes pgrep for the canonical test
-// process shapes (the needles are EREs — pgrep -f treats the pattern as
-// a regular expression, so dots etc. must be escaped/anchored, codex
-// iter-2 [P2]):
+// process shapes.
 //
-//   - `go test`  — the driver while compiling + running a package's tests.
-//     The space makes it specific; no metachars to escape.
-//   - `\.test([ /]|$)` — a compiled `pkg.test` binary. go builds these to a
+// pgrep -f treats the needle as a regex. macOS pgrep is BSD and uses
+// BRE (basic regex): alternation `\|` and groups `(...)` are NOT
+// portable, but `\.` (escaped dot) and `[ /]` (character class) are. The
+// needles below are therefore written in the BRE/ERE common subset
+// (codex iter-2 [P2] flagged the unescaped dot; the first fix used an
+// ERE-only `(...|$)` group that silently matched nothing under BSD
+// pgrep — codex iter-3 caught the test-flakiness, this is the BRE-safe
+// form):
+//
+//   - `go test`   — the driver while compiling + running a package's
+//     tests. The space makes it specific; no metachars to escape.
+//   - `\.test[ /]` — a compiled `pkg.test` binary. go builds these to a
 //     temp dir and execs them as `/tmp/go-build.../pkg.test -test.*`, so
-//     the argv carries a path component ending in `.test` followed by a
-//     space (flags), a slash, or end-of-string. The `\.` escape + the
-//     trailing boundary class prevent the old bare `.test` ERE from
+//     the argv always carries a path component ending in `.test` followed
+//     by a space (the -test.* flags) or a slash. The escaped dot + the
+//     trailing boundary class prevent the old bare `.test` regex from
 //     matching unrelated argv like `pytest`, `latest`, or `contest`
 //     (which would pin anyGoTestRunning()==true forever and silently
 //     defeat the reaper on any host running pytest).
@@ -283,11 +290,17 @@ const ownerProbeFailedPID = -1
 //   - pgrep missing (*exec.Error) → return true (unknown → spare). A host
 //     without pgrep cannot prove quiescence, so we never reap there.
 //   - any other pgrep error → return true (spare).
+//
+// goTestPgrepNeedles are the BRE/ERE-common-subset patterns fed to
+// `pgrep -f`. Exposed (package-level) so a unit test can validate the
+// patterns' INTENT against representative argv strings without depending
+// on pgrep's cross-process visibility (which some sandboxes restrict).
+var goTestPgrepNeedles = []string{"go test", `\.test[ /]`}
+
 func anyGoTestRunning() bool {
-	// pgrep -f matches the ERE against the full argv. "-x" is NOT used
+	// pgrep -f matches the regex against the full argv. "-x" is NOT used
 	// because the argv carries package paths / flags after the needle.
-	needles := []string{"go test", `\.test([ /]|$)`}
-	for _, needle := range needles {
+	for _, needle := range goTestPgrepNeedles {
 		out, err := exec.Command("pgrep", "-f", needle).Output()
 		if err != nil {
 			if exitErr, ok := err.(*exec.ExitError); ok && exitErr.ExitCode() == 1 {

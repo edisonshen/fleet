@@ -5,6 +5,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -301,12 +302,86 @@ func TestKillTmuxServerOnDisk_NonSocketNoOp(t *testing.T) {
 	}
 }
 
+// pgrepCanSeeSelf reports whether pgrep can enumerate the CURRENT test
+// process by its `.test` argv. Some sandboxes (this CI/agent harness
+// included) ship a working pgrep binary that nonetheless cannot inspect
+// other processes' argv and returns "no match" for everything — there
+// the host-wide go-test gate is unobservable, so the assertions below
+// skip rather than report a false failure. On a real operator host pgrep
+// sees the live test binary and the assertions run for real.
+func pgrepCanSeeSelf(t *testing.T) bool {
+	t.Helper()
+	if _, err := exec.LookPath("pgrep"); err != nil {
+		return false
+	}
+	// Match the same `.test` argv shape anyGoTestRunning uses.
+	out, err := exec.Command("pgrep", "-f", `\.test[ /]`).Output()
+	if err != nil {
+		return false
+	}
+	return strings.TrimSpace(string(out)) != ""
+}
+
+// The `.test` pgrep needle must match a real `pkg.test -test.*` argv but
+// NOT unrelated processes like `pytest` / `latest` / `contest` (codex
+// iter-2 [P2] — an unescaped/over-broad `.test` regex would pin the gate
+// true forever on any host running pytest, silently defeating the
+// reaper). pgrep's cross-process visibility is unreliable in sandboxes,
+// so this validates the pattern's INTENT directly with Go's regexp over
+// representative argv strings. The needle is a BRE/ERE common-subset
+// pattern that Go's RE2 also accepts unchanged (`\.` escaped dot +
+// `[ /]` class), so this is a faithful proxy for what pgrep -f evaluates.
+func TestGoTestPgrepNeedles_TestBinarySpecificity(t *testing.T) {
+	// Find the `.test`-shaped needle from the production list.
+	var dotTest string
+	for _, n := range goTestPgrepNeedles {
+		if strings.Contains(n, `\.test`) {
+			dotTest = n
+		}
+	}
+	if dotTest == "" {
+		t.Fatal("no `\\.test` needle in goTestPgrepNeedles")
+	}
+	re, err := regexp.Compile(dotTest)
+	if err != nil {
+		t.Fatalf("compile needle %q: %v", dotTest, err)
+	}
+
+	mustMatch := []string{
+		"/var/folders/xx/T/go-build123/b001/gc.test -test.paniconexit0 -test.v",
+		"/tmp/go-build/pkg.test -test.run=Foo",
+		"/some/dir/internal.test ", // bare binary + trailing space
+		"/a/b/c.test/d",            // path component .test followed by slash
+	}
+	for _, argv := range mustMatch {
+		if !re.MatchString(argv) {
+			t.Errorf("needle %q failed to match a real go-test argv %q — the gate would never see a live test (reaper kills in-flight servers)", dotTest, argv)
+		}
+	}
+
+	mustNotMatch := []string{
+		"pytest -q tests/",
+		"/usr/bin/latest --foo",
+		"contest --run",
+		"some.testament file", // ".test" followed by 'a', not a boundary
+		"/opt/mytestrunner",
+	}
+	for _, argv := range mustNotMatch {
+		if re.MatchString(argv) {
+			t.Errorf("needle %q over-matched argv %q — would pin anyGoTestRunning()==true on unrelated processes and silently defeat the reaper", dotTest, argv)
+		}
+	}
+}
+
 // goTestOwnerVerdict must report SPARE (the unknown sentinel) whenever a
 // `go test` is alive on the host — and this test IS running under
 // `go test`, so the verdict is deterministically the spare sentinel.
 // This is the production-side proof of the codex iter-1 [P1] fix: the
 // host-wide quiescence gate, not lsof-on-socket, decides reapability.
 func TestGoTestOwnerVerdict_SparesWhileTestRunning(t *testing.T) {
+	if !pgrepCanSeeSelf(t) {
+		t.Skip("pgrep cannot enumerate this process's argv (sandbox); host-wide gate unobservable here")
+	}
 	if !anyGoTestRunning() {
 		t.Fatal("anyGoTestRunning() = false while running under `go test` — pgrep needle missed the test binary")
 	}
@@ -323,13 +398,13 @@ func TestGoTestOwnerVerdict_SparesWhileTestRunning(t *testing.T) {
 // (the unit T4 only covers the stubbed-classifier branch). The killer is
 // then exercised directly to confirm it removes the server.
 func TestLiveTestSockets_Integration_ListAndKill(t *testing.T) {
-	tmuxtest.RequireTmux(t)
-	sock := "/tmp/fleet-test-gcint.sock"
-	t.Cleanup(func() {
-		_ = exec.Command("tmux", "-S", sock, "kill-server").Run()
-		_ = os.Remove(sock)
-	})
-	// Spawn a real detached server on the custom socket with a fleet-<id>
+	// codex iter-3 [P2]: use the unique /tmp/fleet-test-<hex>.sock that
+	// RequireTmux allocates (and auto-cleans), NOT a fixed global path —
+	// a hardcoded socket can collide with another concurrent run's server
+	// and get kill-server'd, the exact cross-run leak this PR exists to
+	// prevent. RequireTmux registers its own kill-server+remove cleanup.
+	sock := tmuxtest.RequireTmux(t)
+	// Spawn a real detached server on the unique socket with a fleet-<id>
 	// session name.
 	if out, err := exec.Command("tmux", "-S", sock, "new-session", "-d",
 		"-s", "fleet-deadbeef", "sleep", "300").CombinedOutput(); err != nil {
@@ -365,8 +440,9 @@ func TestLiveTestSockets_Integration_ListAndKill(t *testing.T) {
 	// the host is non-quiescent and the production lister must SPARE the
 	// server (never report OwnerPID==0 mid-run). A regression to the old
 	// lsof-on-socket logic would report OwnerPID==0 here and the kill path
-	// would reap a live test server.
-	if found.OwnerPID == 0 {
+	// would reap a live test server. Only assertable where pgrep can see
+	// this process (skipped in sandboxes that neuter pgrep).
+	if pgrepCanSeeSelf(t) && found.OwnerPID == 0 {
 		t.Errorf("OwnerPID=0 while a go test is running — live-in-flight server would be reaped (lsof-on-socket regression); want spare sentinel %d", ownerProbeFailedPID)
 	}
 
