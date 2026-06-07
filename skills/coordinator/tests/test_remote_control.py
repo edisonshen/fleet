@@ -536,6 +536,33 @@ class TestBootstrap:
         assert "--respawn-only" in up_calls[0]
         assert up_calls[0][-2:] == ["--coord-id", "abcd1234"]
 
+    def test_marker_present_respawn_transient_error_surfaces(
+        self, fleet_home: Path, monkeypatch: pytest.MonkeyPatch,
+        isolated_bootstrap_log: Path,
+    ) -> None:
+        """codex P2: when the post-bootstrap respawn tick fails transiently
+        (fleet binary missing / timeout / contested replacement after a
+        sweep), bootstrap must NOT silently return SKIPPED_MARKER — it must
+        log + return the retry-next-tick status so `fleet status` surfaces a
+        breadcrumb instead of leaving the project marker-present/no-state."""
+        _enable_rc_bootstrap_for_test(monkeypatch)
+
+        # Stub `fleet rc up` to a transient failure (exit 1, not 10).
+        def _fake_run(args, **kwargs):
+            return type("R", (), {"returncode": 1})()
+
+        monkeypatch.setattr(remote_control.subprocess, "run", _fake_run)
+        proj_dir = fleet_home / "projects" / "myproj"
+        proj_dir.mkdir(parents=True)
+        (proj_dir / ".remote-control-bootstrap-abcd1234").touch()
+
+        status = remote_control.bootstrap_remote_control(
+            "myproj", "abcd1234", fleet_home=fleet_home,
+        )
+        assert status == remote_control.STATUS_FAILED_SEED
+        # Breadcrumb written for the operator.
+        assert isolated_bootstrap_log.exists()
+
     def test_per_coord_marker_isolation(
         self, fleet_home: Path, fake_popen: _FakePopen,
         monkeypatch: pytest.MonkeyPatch,

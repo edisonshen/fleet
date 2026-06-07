@@ -255,7 +255,25 @@ def bootstrap_remote_control(
         # respawn-only) spawn on every post-bootstrap tick. --respawn-only
         # is a no-op when the project RC marker is absent, so this never
         # auto-enables RC for an opted-out project.
-        spawn_daemon_status(project, coord_id)
+        respawn_status = spawn_daemon_status(project, coord_id)
+        # codex P2 (surface-don't-silo): if the respawn FAILED transiently
+        # (fleet binary missing, timeout, contested replacement after a sweep
+        # removed rc-state.json), don't silently return SKIPPED_MARKER — that
+        # makes loop.tick treat the coord as healthy and leaves the project
+        # marker-present/no-state with no breadcrumb. Log it and return the
+        # retry-next-tick status so `fleet status` shows an actionable line.
+        if respawn_status == SPAWN_TRANSIENT_ERROR:
+            _bootstrap_log(
+                STATUS_FAILED_SEED,  # reuse the "retry-next-tick" log status.
+                project=project,
+                coord_id=coord_id,
+                detail=(
+                    f"post-bootstrap respawn of project {project!r} returned "
+                    f"transient_error (fleet binary / timeout / contested "
+                    f"replacement after a sweep); will retry next tick"
+                ),
+            )
+            return STATUS_FAILED_SEED
         return STATUS_SKIPPED_MARKER
     # Pre-check the inbox path: if an operator queued a message via
     # `fleet message <coord_id>` between dispatch and this tick, the
