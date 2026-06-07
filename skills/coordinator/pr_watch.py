@@ -383,6 +383,22 @@ def _lease_head(key: str) -> str:
     return ""
 
 
+def _restore_rederive_ladder(watch: dict, inflight: dict) -> None:
+    """When a RE-DERIVE lease is reclaimed WITHOUT a push (head unchanged:
+    gates failed / crashed pre-push), keep the ladder on the re-derive step
+    (codex P2). Dispatching the re-derive overwrote remediation.last_outcome
+    to `running`; if we leave it there, the next pass's `want_rederive` gate
+    (last_outcome == rebase_conflicted_needs_rederive) fails and the ladder
+    falls back to a plain rebase that re-hits the same conflict. Restoring it
+    keeps re-derive selected until it succeeds (head moves) or BLOCKS; the
+    §2.1 bounds still cap the retries."""
+    if not isinstance(inflight, dict) or inflight.get("kind") != ACTION_REDERIVE:
+        return
+    rem = watch.get("remediation")
+    if isinstance(rem, dict) and rem.get("last_outcome") == OUTCOME_RUNNING:
+        rem["last_outcome"] = OUTCOME_REBASE_CONFLICTED
+
+
 def _reclaim_lease(
     watch: dict,
     *,
@@ -513,6 +529,12 @@ def _reclaim_lease(
         if within_grace:
             return None, None  # pending startup; keep the lease, suppress
         watch["inflight_action"] = None
+        # A re-derive that exited WITHOUT pushing (head unchanged: gates
+        # failed / crashed pre-push) must KEEP the ladder on the re-derive
+        # step, else the next pass falls back to a rebase that hits the same
+        # conflict (codex P2). Restore last_outcome so want_rederive stays
+        # true; the §2.1 bounds still cap the retries.
+        _restore_rederive_ladder(watch, inflight)
         return f"reclaimed dead-agent lease {key!r} (agent {agent_id} not alive)", None
 
     # 3b. UNVERIFIED-running (codex iter-20 [P1]): the journal says the Agent
@@ -530,6 +552,7 @@ def _reclaim_lease(
         )
         if stale:
             watch["inflight_action"] = None
+            _restore_rederive_ladder(watch, inflight)
             return (
                 f"reclaimed stale unverified-launch lease {key!r} "
                 f"(no head move + no agent record after {_LEASE_STALE_LAUNCH_TICKS} ticks)"
@@ -712,14 +735,17 @@ def account_progress(watch: dict, event: str) -> None:
     rem = _remediation(watch)
     snap = watch.get("last_snapshot") or {}
     if event == EVENT_READY or event == EVENT_OPEN:
-        # Quiescent: episode over (or never started). Re-baseline so the
-        # NEXT failure episode starts from a fresh series budget. READY is
-        # the canonical "merged-ready" end; plain OPEN (green, up-to-date,
-        # required review pending) is also quiescent/non-failing.
-        if event == EVENT_READY:
-            rem["series_dispatches"] = 0
-            rem["escalated"] = False
-            rem["best_signal"] = _FRONTIER_UNSET
+        # Quiescent / non-failing: the failure EPISODE is over (or never
+        # started). Re-baseline so the NEXT independent failure starts from a
+        # fresh series budget + a cleared escalation latch. READY is the
+        # canonical "merge-ready" end; plain EVENT_OPEN (green but not yet
+        # READY — required review pending, draft, green-not-yet) is ALSO
+        # quiescent: a failing PR that goes green-but-not-READY has ended its
+        # failure episode, so a later unrelated failure must NOT inherit the
+        # prior budget/escalation latch (codex P2). Both reset identically.
+        rem["series_dispatches"] = 0
+        rem["escalated"] = False
+        rem["best_signal"] = _FRONTIER_UNSET
         return
     frontier = _frontier(event, snap)
     best = rem.get("best_signal", _FRONTIER_UNSET)

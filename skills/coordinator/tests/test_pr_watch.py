@@ -3241,3 +3241,96 @@ def test_e2e_human_approved_conflict_escalates(
         r2 = loop.tick("fleet", coord_id="cccccc01", cwd="/repo", fleet_home=str(it_home))
     assert not any("pr-rederive-195" in b for b in r2.dispatch_instructions)
     assert any("human APPROVED" in e for e in r2.errors)
+
+
+# --- codex P2 regressions (auto-remediation ladder + budget) ----------------
+
+
+def test_rederive_ladder_persists_across_nonpushed_retry(tmp_path: Path) -> None:
+    """codex P2: a re-derive that exits clean WITHOUT pushing (gates failed,
+    head unchanged) must KEEP the ladder on re-derive — the next pass must
+    re-dispatch a RE-DERIVE, not fall back to a rebase that re-hits the same
+    conflict."""
+    import os
+    os.environ["PR_WATCH_MAX_REMEDIATION_ATTEMPTS"] = "9"
+    os.environ["PR_WATCH_MAX_REMEDIATION_SERIES"] = "9"
+    try:
+        tasks = [_task("a", pr_url=_pr_url(195), branch="worker/a")]
+        snaps = {195: _dirty_snap(195, head="H1")}
+        disp = _DispatchRecorder()
+        # tick 1: rebase dispatched (running).
+        _run2(tasks, tmp_path, FakeProber(snaps=snaps, fresh_base="B",
+              ancestors=set()), dispatch=disp,
+              agent_outcome=lambda _a: "running", tick_count=1)
+        assert disp.calls[-1].kind == pw.ACTION_REBASE
+        # tick 2: rebase conflicted -> ladder advances to RE-DERIVE.
+        _run2(tasks, tmp_path, FakeProber(snaps=snaps, fresh_base="B",
+              ancestors=set()), dispatch=disp,
+              agent_outcome=lambda _a: pw.OUTCOME_REBASE_CONFLICTED,
+              agent_conflicts=lambda _a: ["x.py"], tick_count=2)
+        assert disp.calls[-1].kind == pw.ACTION_REDERIVE
+        # tick 3: the re-derive DIED without pushing (gone, head unchanged,
+        # past launch grace) -> reclaim keeps the ladder on re-derive.
+        _run2(tasks, tmp_path, FakeProber(snaps=snaps, fresh_base="B",
+              ancestors=set()), dispatch=disp,
+              agent_outcome=lambda _a: "gone", tick_count=10)
+        # the NEXT dispatch must be a RE-DERIVE again, NOT a rebase.
+        assert disp.calls[-1].kind == pw.ACTION_REDERIVE, \
+            "a non-pushed re-derive must re-dispatch re-derive, not rebase"
+    finally:
+        del os.environ["PR_WATCH_MAX_REMEDIATION_ATTEMPTS"]
+        del os.environ["PR_WATCH_MAX_REMEDIATION_SERIES"]
+
+
+def test_event_open_resets_remediation_budget(tmp_path: Path) -> None:
+    """codex P2: a failing PR that goes green-but-not-READY (EVENT_OPEN —
+    required review pending) ends its failure episode: series_dispatches +
+    escalated reset, so a LATER unrelated failure starts from a fresh budget
+    rather than an inherited near-exhausted / escalated one."""
+    import os
+    os.environ["PR_WATCH_MAX_REMEDIATION_ATTEMPTS"] = "99"
+    os.environ["PR_WATCH_MAX_REMEDIATION_SERIES"] = "2"
+    try:
+        tasks = [_task("a", pr_url=_pr_url(195), branch="worker/a")]
+        disp = _DispatchRecorder()
+        # 2 failing dispatches (series climbs to 2) on moving heads.
+        for i in (1, 2):
+            head = f"H{i}"
+            _run2(tasks, tmp_path, FakeProber(
+                snaps={195: _ci_named_snap(195, head=head, failing=("x",))},
+                fresh_base="B", ancestors={("B", head)}),
+                dispatch=disp, agent_outcome=lambda _a: "gone", tick_count=i)
+        # Now green-but-not-READY: REVIEW_REQUIRED -> EVENT_OPEN (up-to-date,
+        # green, required review pending) -> Pass A resets the budget.
+        open_snap = pw.PRSnapshot(number=195, pr_state="OPEN",
+                                  merge_state_status="CLEAN",
+                                  review_decision="REVIEW_REQUIRED",
+                                  checks="SUCCESS", head_ref_oid="HG",
+                                  base_ref_name="main")
+        _run2(tasks, tmp_path, FakeProber(snaps={195: open_snap},
+              fresh_base="B", ancestors={("B", "HG")}),
+              dispatch=disp, agent_outcome=lambda _a: "gone", tick_count=5)
+        w = pw.load_watches(tmp_path)["watches"]["195"]
+        assert w["last_event"] == pw.EVENT_OPEN
+        assert w["remediation"]["series_dispatches"] == 0
+        assert w["remediation"]["escalated"] is False
+        assert w["remediation"]["best_signal"] == pw._FRONTIER_UNSET
+    finally:
+        del os.environ["PR_WATCH_MAX_REMEDIATION_ATTEMPTS"]
+        del os.environ["PR_WATCH_MAX_REMEDIATION_SERIES"]
+
+
+def test_rebase_prompt_requires_agent_record_outcome() -> None:
+    """codex P2: the rebase prompt must instruct writing the conflict
+    outcome into the AGENT RECORD (the only channel the coord reads), not
+    just a WIP note."""
+    import dispatch as dispatch_mod
+    act = pw.ActionDispatch(
+        kind=pw.ACTION_REBASE, event=pw.EVENT_DIRTY, pr_number=195,
+        pr_url=_pr_url(195), branch="worker/a", base="main",
+        head_sha="H1", base_sha="B", key="k",
+    )
+    p = dispatch_mod.build_rebase_prompt(act, standards_md="S")
+    assert "agents/<your-agent-id>.json" in p
+    assert '"remediation_outcome"' in p
+    assert '"conflicted_paths"' in p
