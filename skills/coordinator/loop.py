@@ -438,6 +438,30 @@ def tick(
         configured = _load_parallelism(project_dir)
         if configured > 0:
             cap = configured
+    # RE-FENCE before the mutation phase (codex PR4 [P1]). The step-0.5 proof
+    # ran before _try_lock + the repo-resolve shellout, which take real
+    # wall-clock time; a successor could fence this coord in that window. The
+    # Python mutations inside _tick_locked do NOT individually go through the
+    # Go GuardWithLease boundary, so re-proving ownership here — after the lock
+    # is held, immediately before _tick_locked — narrows the zombie-write
+    # window from the whole tick to just the lock/resolve steps. A fence now
+    # aborts WITHOUT entering the mutation phase; the coord self-demotes.
+    if _lease_check_fn(project, home=home, fleet_bin=fleet_bin) == "fenced":
+        msg = (
+            f"[coord] lease fenced after lock acquire: agent {coord_id or '?'} "
+            f"for {project!r} lost the lease before mutating; self-demoting "
+            f"(tick wrote nothing). Run `fleet doctor` if no successor serves."
+        )
+        sys.stderr.write(msg + "\n")
+        result.errors.append(msg)
+        result.skipped = True
+        result.self_exit = True
+        result.reason = "lease-fenced-self-exit"
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        finally:
+            os.close(lock_fd)
+        return result
     try:
         return _tick_locked(
             result, project, project_dir, coord_id, cwd, cap,

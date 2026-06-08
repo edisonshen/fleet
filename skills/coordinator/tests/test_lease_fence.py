@@ -112,11 +112,42 @@ def test_proven_tick_proceeds(
         cwd="/tmp/anywhere", fleet_home=str(fleet_home),
     )
 
-    assert proof_calls == ["fleet"], "the tick must prove ownership exactly once"
+    # Proven TWICE: once at step 0.5 (before lock), once after lock acquire +
+    # repo resolve, immediately before the mutation phase (codex PR4 [P1]).
+    assert proof_calls == ["fleet", "fleet"], (
+        f"the tick must prove ownership before lock AND before mutating; got {proof_calls}"
+    )
     assert result.reason != "lease-fenced-self-exit", (
         f"a proven tick must not self-fence; got {result.reason!r}"
     )
     assert result.self_exit is False
+
+
+def test_fence_after_lock_acquire_self_demotes(
+    fleet_home: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # codex PR4 [P1]: ownership proven at step 0.5 (before lock) but FENCED by
+    # the post-lock re-check (a successor took the lease during lock-acquire /
+    # repo-resolve). The tick must self-demote WITHOUT entering _tick_locked.
+    agent_id = "racecond"
+    _seed_agent_record(fleet_home, agent_id, project="fleet")
+    _minimal_project(fleet_home, project="fleet")
+
+    calls = {"n": 0}
+
+    def _flip(project, *, home, fleet_bin="fleet"):
+        calls["n"] += 1
+        return "owner" if calls["n"] == 1 else "fenced"  # 2nd call = fenced
+
+    monkeypatch.setattr(loop, "_lease_check_fn", _flip)
+
+    result = loop.tick(
+        project="fleet", coord_id=agent_id,
+        cwd="/tmp/anywhere", fleet_home=str(fleet_home),
+    )
+    assert calls["n"] == 2, "must re-check after lock acquire"
+    assert result.self_exit is True
+    assert result.reason == "lease-fenced-self-exit"
 
 
 # ---------- the proof helper maps `fleet lease-check` exit codes ----------

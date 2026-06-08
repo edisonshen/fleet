@@ -559,6 +559,22 @@ def _do_handoff(record: dict[str, Any], session: str,
     new_id = ids.new_id()
     ts = datetime.now(timezone.utc)
 
+    # RE-FENCE immediately before publishing (codex PR4 [P1]). capture_recent
+    # + the subagent/PR collectors above take real wall-clock time (tmux
+    # capture, `gh` shellouts); a successor could take the lease in that
+    # window. Re-proving ownership right before write_doc/write_queue narrows
+    # the fenced-producer race to the minimum — without it a fenced old coord
+    # could still publish a zombie handoff doc/queue (the exact corruption
+    # this guard prevents). Coord producers only (workers don't hold the lease).
+    if is_coord and _producer_fenced(project):
+        print(
+            f"fleet-guard: handoff producer for coord agent {agent_id} "
+            f"(project {project!r}) was FENCED while preparing the handoff; "
+            f"refusing to publish a zombie doc/queue",
+            file=sys.stderr,
+        )
+        return False
+
     doc_path = write_doc(
         agent_id=agent_id,
         task_id=task_id,

@@ -371,19 +371,25 @@ func drainOneLeaseAwareWith(req queue.SpawnFresh, path string, graceMillis, resu
 	//     supervisor identity to authenticate a kill) -> queue stranded forever;
 	//   - default  -> safety-net takeover acquires the orphan flock + spawns a
 	//     successor WITHOUT killing the live bare OLD -> TWO coordinators.
-	// A bare coord holds no lease, so its handoff always completes via the
-	// legacy coldResume (loads OLD by id, retires/kills it via Resume). Only
-	// when OLD is the CURRENT healthy lease owner do we skip this (it is a
-	// genuine lease-wrapped coord mid-self-handoff, e.g. a standby already
-	// acquired and re-stamped — let the lease branches handle it).
-	if !leaderHealthy {
-		if oldRec, lerr := d.LoadAgent(req.OldAgentID); lerr == nil &&
-			oldRec != nil && oldRec.SupervisorPID == 0 {
-			_, _ = fmt.Fprintf(stderr,
-				"fleet drain: %s is a bare (non-lease-wrapped) coord; completing via legacy resume "+
-					"(no takeover/graceful-reap — its epoch belongs to an older generation)\n", req.OldAgentID)
-			return coldResume(req, path, graceMillis, resumeTimeoutMillis, stdout, stderr, d)
-		}
+	// A bare coord (SupervisorPID==0) holds NO lease and is NEVER the recorded
+	// lease owner (the owner is always a coord-run with a SupervisorPID). So a
+	// bare OLD's handoff must ALWAYS complete via the legacy coldResume (loads
+	// OLD by id, retires/kills it via Resume) — regardless of whether some
+	// OTHER coord-run currently holds the project lease (codex PR4 [P1]/[P2]).
+	// Routing it through the lease branches is wrong in every case:
+	//   - leaderHealthy (a different coord-run leads) -> drainLiveLeaderFallback
+	//     polls a barrier OLD will never write, then legacy-Resumes anyway
+	//     (best case) or spawns a duplicate;
+	//   - barrierUp on a stale epoch -> drainGraceful -> drainReapOld REFUSES
+	//     (no supervisor identity) -> queue stranded;
+	//   - default -> safety-net takeover acquires the orphan flock + RecoverSpawn
+	//     without killing the live bare OLD -> TWO coordinators.
+	if oldRec, lerr := d.LoadAgent(req.OldAgentID); lerr == nil &&
+		oldRec != nil && oldRec.SupervisorPID == 0 {
+		_, _ = fmt.Fprintf(stderr,
+			"fleet drain: %s is a bare (non-lease-wrapped) coord; completing via legacy resume "+
+				"(holds no lease — no takeover/graceful-reap/standby-wait)\n", req.OldAgentID)
+		return coldResume(req, path, graceMillis, resumeTimeoutMillis, stdout, stderr, d)
 	}
 
 	switch {
