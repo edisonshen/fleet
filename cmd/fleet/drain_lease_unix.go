@@ -290,18 +290,29 @@ func deliverRecoverResumePrompt(rec *agent.Record, docPath string, disableAutoRe
 			"fleet drain: recovered successor %s not visibly ready (%v) but session alive; sending resume prompt anyway\n",
 			rec.ID, werr)
 	}
-	if serr := spawn.SendPromptKeys(rec.TmuxSession, handoff.ResumePrompt(docPath)); serr != nil {
+	// Use the VERIFIED send (codex PR4 [P2]): SendPromptKeys returns nil even
+	// when the prompt is left sitting UNSUBMITTED in the input box (its
+	// contract is "attach anyway"). For an unattended recovery there is no
+	// operator to press Enter, so an unsubmitted prompt == not delivered.
+	submitted, serr := spawn.SendPromptKeysVerified(rec.TmuxSession, handoff.ResumePrompt(docPath))
+	if serr != nil {
 		return fmt.Errorf(
 			"fleet drain: resume prompt to recovered successor %s failed: %w "+
 				"(queue preserved for retry; doc: %s)", rec.ID, serr, docPath)
 	}
-	// Mark AFTER a SUCCESSFUL send (codex PR4 [P2]). The sentinel must mean
-	// "definitely delivered" — writing it before the send would, on a crash
-	// between the marker and the send, make the retry skip delivery and
-	// strand the successor (a hard failure). The opposite risk — a crash
-	// between send and queue.Delete re-sending on retry — is a benign,
-	// effectively-idempotent duplicate ("read your doc and continue"). Prefer
-	// at-least-once delivery over a silent strand.
+	if !submitted {
+		// Reached tmux but the prompt didn't submit. Do NOT mark the sentinel
+		// and DO return an error so the queue is preserved — a later drain
+		// adopts the live successor and re-attempts delivery rather than
+		// leaving it idle.
+		return fmt.Errorf(
+			"fleet drain: resume prompt to recovered successor %s reached tmux but was not submitted "+
+				"(queue preserved for retry; doc: %s)", rec.ID, docPath)
+	}
+	// Mark AFTER a VERIFIED-SUBMITTED send (codex PR4 [P2]). The sentinel
+	// means "definitely delivered". A crash between this mark and
+	// queue.Delete would re-send on retry — a benign, idempotent duplicate
+	// ("read your doc and continue") — which is preferable to a silent strand.
 	if sentinel != "" {
 		_ = os.WriteFile(sentinel, []byte(docPath+"\n"), 0o644)
 	}
