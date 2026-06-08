@@ -502,19 +502,29 @@ func quarantineFile(dir, path string, reason error) (string, error) {
 var ErrNotLeaseOwner = errors.New(
 	"coordlock: caller is not under the active lease owner (fenced/stale coord) — refuse mutation")
 
-// LeaseCheckByAncestor proves that the calling process (startPid, normally
-// os.Getpid()) descends from the project's CURRENT active lease owner. It
-// is the executable form of the design's skill-side ownership proof:
+// LeaseCheckByAncestor decides whether the calling process (startPid,
+// normally os.Getpid()) may mutate, given the project's lease state. It is
+// the executable form of the design's skill-side ownership proof, and is
+// careful to FENCE only the actual split-brain case — not every coord that
+// happens to lack a lease parent:
 //
-//	read coordinator.epoch -> state must be active AND healthy (TTL/pid)
-//	walk startPid's getppid chain -> one ancestor must equal owner.pid AND
-//	    its live pid_start must equal owner.pid_start (PID-reuse-safe)
+//	read coordinator.epoch
+//	  ├─ NO healthy active owner (no record / released / expired / hung)
+//	  │     -> NO lease is in play -> PROCEED (nil). A legacy non-wrapped
+//	  │        coord, or a live `fleet handoff` successor running before any
+//	  │        coord-run supervisor re-acquires, is NOT a zombie — there is
+//	  │        no successor holding the lease to protect. (codex PR4 [P1].)
+//	  └─ a HEALTHY active owner exists
+//	        ├─ an ancestor of startPid IS that owner (pid+pid_start match)
+//	        │     -> PROVEN -> PROCEED (nil).
+//	        └─ no ancestor is that owner
+//	              -> someone ELSE provably holds the active lease and this
+//	                 caller does not descend from it -> FENCE (ErrNotLeaseOwner).
 //
-// A fenced old coord's Python tick fails BOTH ways: either the epoch is no
-// longer active/healthy, or its parent supervisor's pid is no longer the
-// recorded owner. Returns nil iff the proof holds; ErrNotLeaseOwner
-// otherwise (or a read error). The walk is bounded so an unexpected
-// ppid cycle / very deep tree can't spin.
+// This is exactly the split-brain guard: the fence fires iff a DIFFERENT
+// live leader holds the lease (a successor stole it from this coord's
+// retired parent). The walk is bounded so an unexpected ppid cycle / deep
+// tree can't spin.
 func LeaseCheckByAncestor(project string, startPid int) error {
 	return leaseCheckByAncestorWithCfg(project, startPid, defaultLeaseConfig())
 }
@@ -529,20 +539,28 @@ func leaseCheckByAncestorWithCfg(project string, startPid int, cfg leaseConfig) 
 	rec, err := readEpoch(paths.epoch)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
-			return fmt.Errorf("%w: no active lease record for project %q", ErrNotLeaseOwner, project)
+			// No lease record at all -> no lease in play -> proceed. This is
+			// a legacy / non-lease-wrapped coord; fencing it would wedge the
+			// pre-lease path the reversibility contract preserves.
+			return nil
 		}
 		return fmt.Errorf("coordlock.LeaseCheck: read epoch: %w", err)
 	}
-	// The owner must be a HEALTHY active leader (same predicate the acquire
-	// path uses) — a fenced/stale/hung record is not a valid parent to
-	// prove ownership against.
+	// Only a HEALTHY active leader can fence anyone. A released / expired /
+	// hung / fencing record means NO live successor currently holds the
+	// lease, so there is no split-brain to guard against -> proceed. (This
+	// is the codex PR4 [P1] fix: a live `fleet handoff` successor running
+	// after the old coord retired but before a coord-run re-acquires must
+	// NOT self-demote — nobody else owns the lease.)
 	l := &Lease{cfg: cfg, paths: paths, boot: cfg.boot()}
 	if !l.holderHealthy(rec) {
-		return fmt.Errorf("%w: lease owner is not a healthy active leader (state=%s)",
-			ErrNotLeaseOwner, rec.State)
+		return nil
 	}
-	// Walk the ancestor chain from startPid; one ancestor must BE the owner
-	// (pid + pid_start match, PID-reuse-safe).
+	// A healthy active owner exists. Walk the ancestor chain from startPid;
+	// if one ancestor IS that owner (pid + pid_start match, PID-reuse-safe)
+	// the caller is legitimately under the live leader -> proceed. Otherwise
+	// a DIFFERENT live leader holds the lease and this caller is the zombie
+	// -> FENCE.
 	ppidFn := cfg.ppid
 	if ppidFn == nil {
 		ppidFn = ppidOf
