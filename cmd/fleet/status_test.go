@@ -826,6 +826,40 @@ func TestStatus_SurfacesInvalidProject_HintActionable(t *testing.T) {
 	}
 }
 
+// TestStatus_SurfacesWedgedDrain_HintActionable pins codex iter-3 [P2]:
+// adding KindDrainProcs to gc.AllKinds makes `fleet status` surface
+// drain-procs actions, so orphanCleanupHint must offer the actionable
+// `fleet gc --apply --kinds=drain-procs` command rather than the
+// unknown-Kind fallback.
+func TestStatus_SurfacesWedgedDrain_HintActionable(t *testing.T) {
+	stubEnsureFresh(t)
+	dir := t.TempDir()
+	t.Setenv("FLEET_HOME", dir)
+
+	report := gc.Report{Actions: []gc.Action{{
+		Kind:   gc.KindDrainProcs,
+		Target: "drain pid=4242",
+		Verb:   gc.VerbSurface,
+		Reason: "WEDGED fleet drain (pid=4242, heartbeat 10m ago > TTL 2m)",
+	}}}
+	stubStatusReconcile(t, report, nil)
+
+	var stdout, stderr bytes.Buffer
+	if err := runStatus(&statusOpts{}, &stdout, &stderr, "dev"); err != nil {
+		t.Fatalf("runStatus: %v", err)
+	}
+	out := stdout.String()
+	if !strings.Contains(out, "drain pid=4242") {
+		t.Errorf("stdout should name the wedged drain; got:\n%s", out)
+	}
+	if !strings.Contains(out, "fleet gc --apply --kinds=drain-procs") {
+		t.Errorf("wedged drain row must suggest the actionable gc command; got:\n%s", out)
+	}
+	if strings.Contains(out, "unknown — run `fleet gc` for details") {
+		t.Errorf("wedged drain row hit the unknown-Kind fallback; got:\n%s", out)
+	}
+}
+
 // TestStatus_ReconcileError_LoggedNotReturned pins the
 // surface-don't-silo contract: a reconcile error must reach stderr
 // AND status must still exit 0 (informational view). Returning err
@@ -869,5 +903,87 @@ func TestStatusReconcileFn_DefaultsToGCReconcile(t *testing.T) {
 	}
 	if len(rep.Actions) != 0 {
 		t.Errorf("empty kinds should yield empty report; got %d actions", len(rep.Actions))
+	}
+}
+
+// TestStatus_InvokesRCSweepAllProjects (T8 leak-rc-daemon-lifecycle PR-B):
+// fleet status must invoke rc.SweepAllProjects so the orphan-rc-daemon
+// reconcile path actually runs. SweepAllProjects had ZERO production
+// callers before this PR; wiring it into the status path means the
+// reconcile happens on every operator triage and on every coord tick
+// that calls `fleet status` for the dashboard view.
+func TestStatus_InvokesRCSweepAllProjects(t *testing.T) {
+	stubEnsureFresh(t)
+	dir := t.TempDir()
+	t.Setenv("FLEET_HOME", dir)
+
+	var sweepCalls int
+	prev := rcSweepFn
+	rcSweepFn = func() error {
+		sweepCalls++
+		return nil
+	}
+	t.Cleanup(func() { rcSweepFn = prev })
+
+	var stdout, stderr bytes.Buffer
+	if err := runStatus(&statusOpts{}, &stdout, &stderr, "dev"); err != nil {
+		t.Fatalf("runStatus: %v", err)
+	}
+	if sweepCalls != 1 {
+		t.Fatalf("expected exactly one rc.SweepAllProjects call from fleet status; got %d", sweepCalls)
+	}
+}
+
+// TestStatus_InvokesRCSweepAllProjects_JSONPath (codex P2): the --json
+// branch returns early, so the sweep must run BEFORE that return or it
+// never fires for machine-readable callers (dashboards, coord ticks using
+// --json). Assert the sweep runs AND stdout stays a valid JSON array
+// (sweep diagnostics go to stderr, never stdout).
+func TestStatus_InvokesRCSweepAllProjects_JSONPath(t *testing.T) {
+	stubEnsureFresh(t)
+	dir := t.TempDir()
+	t.Setenv("FLEET_HOME", dir)
+
+	var sweepCalls int
+	prev := rcSweepFn
+	rcSweepFn = func() error {
+		sweepCalls++
+		return nil
+	}
+	t.Cleanup(func() { rcSweepFn = prev })
+
+	var stdout, stderr bytes.Buffer
+	if err := runStatus(&statusOpts{jsonOut: true}, &stdout, &stderr, "dev"); err != nil {
+		t.Fatalf("runStatus: %v", err)
+	}
+	if sweepCalls != 1 {
+		t.Fatalf("expected exactly one rc.SweepAllProjects call on --json path; got %d", sweepCalls)
+	}
+	var arr []json.RawMessage
+	if err := json.Unmarshal(stdout.Bytes(), &arr); err != nil {
+		t.Fatalf("--json stdout must remain a valid JSON array after sweep; got %q err=%v", stdout.String(), err)
+	}
+}
+
+// TestStatus_RCSweepError_LoggedToStderr_DoesNotBlockStatus: when
+// SweepAllProjects errors (filesystem hiccup, e.g. ~/.fleet/projects/
+// briefly unreadable), runStatus must NOT propagate the error.
+// Status is informational; the operator still sees agents + orphan
+// reconcile output. surface-don't-silo: error goes to stderr.
+func TestStatus_RCSweepError_LoggedToStderr_DoesNotBlockStatus(t *testing.T) {
+	stubEnsureFresh(t)
+	dir := t.TempDir()
+	t.Setenv("FLEET_HOME", dir)
+
+	prev := rcSweepFn
+	rcSweepFn = func() error { return errors.New("disk full") }
+	t.Cleanup(func() { rcSweepFn = prev })
+
+	var stdout, stderr bytes.Buffer
+	if err := runStatus(&statusOpts{}, &stdout, &stderr, "dev"); err != nil {
+		t.Errorf("rc sweep error must not propagate; got %v", err)
+	}
+	if !strings.Contains(stderr.String(), "disk full") {
+		t.Errorf("rc sweep error must be logged to stderr; got:\n%s", stderr.String())
 	}
 }

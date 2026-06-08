@@ -1,0 +1,456 @@
+package gc
+
+import (
+	"errors"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"regexp"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/edisonshen/fleet/internal/testutil/tmuxtest"
+)
+
+// TDD suite for leak-gc-live-testsock (PR-D, DESIGN-lifecycle-leak-recurrence.md).
+//
+// A LIVE `fleet-<id>` tmux server bound to /tmp/fleet-test-*.sock whose
+// owning `go test` process is gone is the resource the operator had to
+// kill BY HAND during the 2026-05-29 OOM. This classifier closes that
+// gap: surface such orphans by default, kill them only under
+// --apply --aggressive. A socket still owned by a live `go test` process
+// is NEVER touched (in-flight tests are protected).
+//
+// The classifier runs as part of the orphan-tmux kind (Action.Kind =
+// KindOrphanTmux) so `fleet gc --kinds orphan-tmux` covers it.
+
+// withLiveTestSocketStubs wires the live-test-socket classifier deps on
+// top of stubDeps. Tests override individual hooks to exercise specific
+// branches.
+func withLiveTestSocketStubs(d Deps) Deps {
+	d.ListLiveTestSockets = func() ([]LiveTestSocket, error) { return nil, nil }
+	d.KillTmuxServer = func(string) error {
+		return errors.New("stubDeps: KillTmuxServer should not run")
+	}
+	return d
+}
+
+// T1 — orphan test-sock tmux surfaced in dry-run (default, no kill).
+func TestReconcile_LiveTestSock_OrphanSurfacedDryRun(t *testing.T) {
+	now := time.Date(2026, 5, 29, 12, 0, 0, 0, time.UTC)
+	deps := withLiveTestSocketStubs(stubDeps(now))
+	killed := false
+	deps.ListLiveTestSockets = func() ([]LiveTestSocket, error) {
+		return []LiveTestSocket{{
+			SocketPath:  "/tmp/fleet-test-AAA.sock",
+			SessionName: "fleet-orphan",
+			OwnerPID:    0, // no live go test parent
+		}}, nil
+	}
+	deps.KillTmuxServer = func(string) error { killed = true; return nil }
+
+	got, err := Reconcile(Options{Kinds: []Kind{KindOrphanTmux}}, deps)
+	if err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	a, ok := findAction(got, KindOrphanTmux, "fleet-orphan")
+	if !ok {
+		t.Fatalf("expected orphan-tmux action for fleet-orphan, got %+v", got.Actions)
+	}
+	if a.Verb != VerbSurface {
+		t.Errorf("verb = %q, want %q (dry-run surfaces, never kills)", a.Verb, VerbSurface)
+	}
+	if !strings.Contains(a.Reason, "/tmp/fleet-test-AAA.sock") {
+		t.Errorf("reason missing socket path: %q", a.Reason)
+	}
+	if !strings.Contains(a.Reason, "--aggressive") {
+		t.Errorf("reason should point at --aggressive escape hatch: %q", a.Reason)
+	}
+	if killed {
+		t.Error("KillTmuxServer ran during dry-run; must not mutate")
+	}
+}
+
+// T2 — --apply --aggressive kills the orphan test-sock tmux server.
+func TestReconcile_LiveTestSock_ApplyAggressiveKills(t *testing.T) {
+	now := time.Date(2026, 5, 29, 12, 0, 0, 0, time.UTC)
+	deps := withLiveTestSocketStubs(stubDeps(now))
+	var killedPath string
+	deps.ListLiveTestSockets = func() ([]LiveTestSocket, error) {
+		return []LiveTestSocket{{
+			SocketPath:  "/tmp/fleet-test-AAA.sock",
+			SessionName: "fleet-orphan",
+			OwnerPID:    0,
+		}}, nil
+	}
+	deps.KillTmuxServer = func(p string) error { killedPath = p; return nil }
+
+	got, err := Reconcile(Options{Apply: true, Aggressive: true, Kinds: []Kind{KindOrphanTmux}}, deps)
+	if err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	a, ok := findAction(got, KindOrphanTmux, "fleet-orphan")
+	if !ok || a.Verb != VerbKilled {
+		t.Fatalf("verb = %q (ok=%v), want %q", a.Verb, ok, VerbKilled)
+	}
+	if killedPath != "/tmp/fleet-test-AAA.sock" {
+		t.Errorf("KillTmuxServer called with %q, want /tmp/fleet-test-AAA.sock", killedPath)
+	}
+}
+
+// T3 — --apply WITHOUT --aggressive spares the orphan (surface only).
+func TestReconcile_LiveTestSock_ApplyWithoutAggressiveSpares(t *testing.T) {
+	now := time.Date(2026, 5, 29, 12, 0, 0, 0, time.UTC)
+	deps := withLiveTestSocketStubs(stubDeps(now))
+	killed := false
+	deps.ListLiveTestSockets = func() ([]LiveTestSocket, error) {
+		return []LiveTestSocket{{
+			SocketPath:  "/tmp/fleet-test-AAA.sock",
+			SessionName: "fleet-orphan",
+			OwnerPID:    0,
+		}}, nil
+	}
+	deps.KillTmuxServer = func(string) error { killed = true; return nil }
+
+	got, err := Reconcile(Options{Apply: true, Aggressive: false, Kinds: []Kind{KindOrphanTmux}}, deps)
+	if err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	a, ok := findAction(got, KindOrphanTmux, "fleet-orphan")
+	if !ok || a.Verb != VerbSurface {
+		t.Fatalf("verb = %q (ok=%v), want %q (surface only without --aggressive)", a.Verb, ok, VerbSurface)
+	}
+	if killed {
+		t.Error("KillTmuxServer ran without --aggressive; surface-don't-silo violated")
+	}
+}
+
+// T4 — a server still owned by a LIVE go test process is NEVER reaped,
+// even under --apply --aggressive.
+func TestReconcile_LiveTestSock_LiveOwnerNotReaped(t *testing.T) {
+	now := time.Date(2026, 5, 29, 12, 0, 0, 0, time.UTC)
+	deps := withLiveTestSocketStubs(stubDeps(now))
+	killed := false
+	deps.ListLiveTestSockets = func() ([]LiveTestSocket, error) {
+		return []LiveTestSocket{{
+			SocketPath:  "/tmp/fleet-test-LIVE.sock",
+			SessionName: "fleet-live1234",
+			OwnerPID:    4242, // live go test parent
+		}}, nil
+	}
+	deps.KillTmuxServer = func(string) error { killed = true; return nil }
+
+	got, err := Reconcile(Options{Apply: true, Aggressive: true, Kinds: []Kind{KindOrphanTmux}}, deps)
+	if err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	if _, ok := findAction(got, KindOrphanTmux, "fleet-live1234"); ok {
+		t.Error("live-owned test-sock server was surfaced/reaped; must be left alone")
+	}
+	if killed {
+		t.Error("KillTmuxServer ran against a live-owned server; in-flight test would break")
+	}
+}
+
+// Owner-probe-failure (sentinel ownerProbeFailedPID) must SPARE the
+// server — an ambiguous probe never drives a kill (fail-safe).
+func TestReconcile_LiveTestSock_ProbeFailureSpares(t *testing.T) {
+	now := time.Date(2026, 5, 29, 12, 0, 0, 0, time.UTC)
+	deps := withLiveTestSocketStubs(stubDeps(now))
+	killed := false
+	deps.ListLiveTestSockets = func() ([]LiveTestSocket, error) {
+		return []LiveTestSocket{{
+			SocketPath:  "/tmp/fleet-test-AAA.sock",
+			SessionName: "fleet-orphan",
+			OwnerPID:    ownerProbeFailedPID, // owner unknown
+		}}, nil
+	}
+	deps.KillTmuxServer = func(string) error { killed = true; return nil }
+
+	got, err := Reconcile(Options{Apply: true, Aggressive: true, Kinds: []Kind{KindOrphanTmux}}, deps)
+	if err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	if _, ok := findAction(got, KindOrphanTmux, "fleet-orphan"); ok {
+		t.Error("server with unknown owner was reaped; ambiguous probe must spare it")
+	}
+	if killed {
+		t.Error("KillTmuxServer ran despite unknown owner")
+	}
+}
+
+// T6 — the detector only runs under the orphan-tmux kind, not under
+// sockets / other kinds. An orphan test-sock server is invisible when
+// orphan-tmux is not requested.
+func TestReconcile_LiveTestSock_OnlyUnderOrphanTmuxKind(t *testing.T) {
+	now := time.Date(2026, 5, 29, 12, 0, 0, 0, time.UTC)
+	deps := withLiveTestSocketStubs(stubDeps(now))
+	called := false
+	deps.ListLiveTestSockets = func() ([]LiveTestSocket, error) {
+		called = true
+		return []LiveTestSocket{{
+			SocketPath:  "/tmp/fleet-test-AAA.sock",
+			SessionName: "fleet-orphan",
+			OwnerPID:    0,
+		}}, nil
+	}
+
+	got, err := Reconcile(Options{Kinds: []Kind{KindSockets}}, deps)
+	if err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	if called {
+		t.Error("ListLiveTestSockets ran under sockets kind; should be gated on orphan-tmux")
+	}
+	if _, ok := findAction(got, KindOrphanTmux, "fleet-orphan"); ok {
+		t.Error("orphan-tmux action emitted when only sockets kind requested")
+	}
+}
+
+// Lister/listing-error surfaces (don't silently swallow a read failure).
+func TestReconcile_LiveTestSock_ListErrorSurfaced(t *testing.T) {
+	now := time.Date(2026, 5, 29, 12, 0, 0, 0, time.UTC)
+	deps := withLiveTestSocketStubs(stubDeps(now))
+	deps.ListLiveTestSockets = func() ([]LiveTestSocket, error) {
+		return nil, errors.New("boom")
+	}
+	_, err := Reconcile(Options{Kinds: []Kind{KindOrphanTmux}}, deps)
+	if err == nil || !strings.Contains(err.Error(), "boom") {
+		t.Fatalf("expected list error surfaced via Reconcile, got %v", err)
+	}
+}
+
+// Kill-failure is reported on the action (verb stays surface, reason
+// carries the error) — no false "killed" report.
+func TestReconcile_LiveTestSock_KillFailureReported(t *testing.T) {
+	now := time.Date(2026, 5, 29, 12, 0, 0, 0, time.UTC)
+	deps := withLiveTestSocketStubs(stubDeps(now))
+	deps.ListLiveTestSockets = func() ([]LiveTestSocket, error) {
+		return []LiveTestSocket{{
+			SocketPath:  "/tmp/fleet-test-AAA.sock",
+			SessionName: "fleet-orphan",
+			OwnerPID:    0,
+		}}, nil
+	}
+	deps.KillTmuxServer = func(string) error { return errors.New("kill exploded") }
+
+	got, err := Reconcile(Options{Apply: true, Aggressive: true, Kinds: []Kind{KindOrphanTmux}}, deps)
+	if err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	a, ok := findAction(got, KindOrphanTmux, "fleet-orphan")
+	if !ok {
+		t.Fatalf("expected action for fleet-orphan")
+	}
+	if a.Verb == VerbKilled {
+		t.Error("verb=killed reported despite kill failure")
+	}
+	if !strings.Contains(a.Reason, "kill exploded") {
+		t.Errorf("kill error not surfaced in reason: %q", a.Reason)
+	}
+}
+
+// firstFleetSession must reject a path that is NOT a real Unix socket —
+// a regular file or a symlink in world-writable /tmp could otherwise be
+// followed into the operator's default tmux server and killed under
+// --apply --aggressive (codex iter-2 [P2] symlink guard).
+func TestFirstFleetSession_RejectsNonSocket(t *testing.T) {
+	dir := t.TempDir()
+
+	// Regular file named like a test sock — not a socket → reject.
+	regular := filepath.Join(dir, "fleet-test-regular.sock")
+	if err := os.WriteFile(regular, []byte("not a socket"), 0o600); err != nil {
+		t.Fatalf("write regular file: %v", err)
+	}
+	if _, ok := firstFleetSession(regular); ok {
+		t.Error("firstFleetSession accepted a regular file; symlink/non-socket guard bypassed")
+	}
+
+	// Symlink named like a test sock, pointing anywhere → reject without
+	// dereferencing (the target could be the operator's default server).
+	link := filepath.Join(dir, "fleet-test-link.sock")
+	if err := os.Symlink("/tmp/some-other-tmux.sock", link); err != nil {
+		t.Fatalf("symlink: %v", err)
+	}
+	if _, ok := firstFleetSession(link); ok {
+		t.Error("firstFleetSession followed a symlink; could kill the operator's default server")
+	}
+
+	// Missing path → reject (no panic).
+	if _, ok := firstFleetSession(filepath.Join(dir, "absent.sock")); ok {
+		t.Error("firstFleetSession accepted a missing path")
+	}
+}
+
+// killTmuxServerOnDisk must be a no-op (and never remove the path) when
+// handed a non-socket — defense-in-depth for the symlink guard so a path
+// that became a symlink between enumeration and apply is not kill-server'd
+// or unlinked (codex iter-2 [P2]).
+func TestKillTmuxServerOnDisk_NonSocketNoOp(t *testing.T) {
+	dir := t.TempDir()
+	link := filepath.Join(dir, "fleet-test-link.sock")
+	if err := os.Symlink("/tmp/some-other-tmux.sock", link); err != nil {
+		t.Fatalf("symlink: %v", err)
+	}
+	if err := killTmuxServerOnDisk(link); err != nil {
+		t.Errorf("killTmuxServerOnDisk on a symlink returned err %v; want nil no-op", err)
+	}
+	// The symlink itself must NOT be removed (we never touch non-sockets).
+	if _, err := os.Lstat(link); err != nil {
+		t.Errorf("killTmuxServerOnDisk removed the symlink; want it left intact: %v", err)
+	}
+}
+
+// pgrepCanSeeSelf reports whether pgrep can enumerate the CURRENT test
+// process by its `.test` argv. Some sandboxes (this CI/agent harness
+// included) ship a working pgrep binary that nonetheless cannot inspect
+// other processes' argv and returns "no match" for everything — there
+// the host-wide go-test gate is unobservable, so the assertions below
+// skip rather than report a false failure. On a real operator host pgrep
+// sees the live test binary and the assertions run for real.
+func pgrepCanSeeSelf(t *testing.T) bool {
+	t.Helper()
+	if _, err := exec.LookPath("pgrep"); err != nil {
+		return false
+	}
+	// Match the same `.test` argv shape anyGoTestRunning uses.
+	out, err := exec.Command("pgrep", "-f", `\.test[ /]`).Output()
+	if err != nil {
+		return false
+	}
+	return strings.TrimSpace(string(out)) != ""
+}
+
+// The `.test` pgrep needle must match a real `pkg.test -test.*` argv but
+// NOT unrelated processes like `pytest` / `latest` / `contest` (codex
+// iter-2 [P2] — an unescaped/over-broad `.test` regex would pin the gate
+// true forever on any host running pytest, silently defeating the
+// reaper). pgrep's cross-process visibility is unreliable in sandboxes,
+// so this validates the pattern's INTENT directly with Go's regexp over
+// representative argv strings. The needle is a BRE/ERE common-subset
+// pattern that Go's RE2 also accepts unchanged (`\.` escaped dot +
+// `[ /]` class), so this is a faithful proxy for what pgrep -f evaluates.
+func TestGoTestPgrepNeedles_TestBinarySpecificity(t *testing.T) {
+	// Find the `.test`-shaped needle from the production list.
+	var dotTest string
+	for _, n := range goTestPgrepNeedles {
+		if strings.Contains(n, `\.test`) {
+			dotTest = n
+		}
+	}
+	if dotTest == "" {
+		t.Fatal("no `\\.test` needle in goTestPgrepNeedles")
+	}
+	re, err := regexp.Compile(dotTest)
+	if err != nil {
+		t.Fatalf("compile needle %q: %v", dotTest, err)
+	}
+
+	mustMatch := []string{
+		"/var/folders/xx/T/go-build123/b001/gc.test -test.paniconexit0 -test.v",
+		"/tmp/go-build/pkg.test -test.run=Foo",
+		"/some/dir/internal.test ", // bare binary + trailing space
+		"/a/b/c.test/d",            // path component .test followed by slash
+	}
+	for _, argv := range mustMatch {
+		if !re.MatchString(argv) {
+			t.Errorf("needle %q failed to match a real go-test argv %q — the gate would never see a live test (reaper kills in-flight servers)", dotTest, argv)
+		}
+	}
+
+	mustNotMatch := []string{
+		"pytest -q tests/",
+		"/usr/bin/latest --foo",
+		"contest --run",
+		"some.testament file", // ".test" followed by 'a', not a boundary
+		"/opt/mytestrunner",
+	}
+	for _, argv := range mustNotMatch {
+		if re.MatchString(argv) {
+			t.Errorf("needle %q over-matched argv %q — would pin anyGoTestRunning()==true on unrelated processes and silently defeat the reaper", dotTest, argv)
+		}
+	}
+}
+
+// goTestOwnerVerdict must report SPARE (the unknown sentinel) whenever a
+// `go test` is alive on the host — and this test IS running under
+// `go test`, so the verdict is deterministically the spare sentinel.
+// This is the production-side proof of the codex iter-1 [P1] fix: the
+// host-wide quiescence gate, not lsof-on-socket, decides reapability.
+func TestGoTestOwnerVerdict_SparesWhileTestRunning(t *testing.T) {
+	if !pgrepCanSeeSelf(t) {
+		t.Skip("pgrep cannot enumerate this process's argv (sandbox); host-wide gate unobservable here")
+	}
+	if !anyGoTestRunning() {
+		t.Fatal("anyGoTestRunning() = false while running under `go test` — pgrep needle missed the test binary")
+	}
+	if v := goTestOwnerVerdict(); v != ownerProbeFailedPID {
+		t.Errorf("goTestOwnerVerdict() = %d while a go test runs; want spare sentinel %d (a 0 verdict would reap live test servers)", v, ownerProbeFailedPID)
+	}
+}
+
+// Integration: the production lister enumerates a REAL tmux server on a
+// /tmp/fleet-test-*.sock. Because the test itself runs under `go test`,
+// the host is NOT quiescent, so the lister MUST mark the server spared
+// (OwnerPID == ownerProbeFailedPID) — this is the live-in-flight-spare
+// guarantee that closes codex iter-1 [P1] at the production-helper level
+// (the unit T4 only covers the stubbed-classifier branch). The killer is
+// then exercised directly to confirm it removes the server.
+func TestLiveTestSockets_Integration_ListAndKill(t *testing.T) {
+	// codex iter-3 [P2]: use the unique /tmp/fleet-test-<hex>.sock that
+	// RequireTmux allocates (and auto-cleans), NOT a fixed global path —
+	// a hardcoded socket can collide with another concurrent run's server
+	// and get kill-server'd, the exact cross-run leak this PR exists to
+	// prevent. RequireTmux registers its own kill-server+remove cleanup.
+	sock := tmuxtest.RequireTmux(t)
+	// Spawn a real detached server on the unique socket with a fleet-<id>
+	// session name.
+	if out, err := exec.Command("tmux", "-S", sock, "new-session", "-d",
+		"-s", "fleet-deadbeef", "sleep", "300").CombinedOutput(); err != nil {
+		t.Fatalf("spawn tmux: %v (%s)", err, out)
+	}
+	// codex iter-1 [P2]: `tmux new-session` can print "error creating ..."
+	// yet exit 0 on some hosts, so a clean exit is NOT proof the server
+	// exists. Verify the session is actually live before asserting the
+	// lister sees it — otherwise the failure surfaces downstream as a
+	// confusing "lister did not see live server" instead of a spawn skip.
+	if err := exec.Command("tmux", "-S", sock, "has-session", "-t", "fleet-deadbeef").Run(); err != nil {
+		t.Skipf("tmux exited 0 but no live session on %s (host tmux quirk): %v", sock, err)
+	}
+
+	socks, err := listLiveTestSocketsOnDisk()
+	if err != nil {
+		t.Fatalf("listLiveTestSocketsOnDisk: %v", err)
+	}
+	var found *LiveTestSocket
+	for i := range socks {
+		if socks[i].SocketPath == sock {
+			found = &socks[i]
+			break
+		}
+	}
+	if found == nil {
+		t.Fatalf("lister did not see live server on %s; got %+v", sock, socks)
+	}
+	if found.SessionName != "fleet-deadbeef" {
+		t.Errorf("session name = %q, want fleet-deadbeef", found.SessionName)
+	}
+	// codex iter-1 [P1] regression: the running test IS a `go test`, so
+	// the host is non-quiescent and the production lister must SPARE the
+	// server (never report OwnerPID==0 mid-run). A regression to the old
+	// lsof-on-socket logic would report OwnerPID==0 here and the kill path
+	// would reap a live test server. Only assertable where pgrep can see
+	// this process (skipped in sandboxes that neuter pgrep).
+	if pgrepCanSeeSelf(t) && found.OwnerPID == 0 {
+		t.Errorf("OwnerPID=0 while a go test is running — live-in-flight server would be reaped (lsof-on-socket regression); want spare sentinel %d", ownerProbeFailedPID)
+	}
+
+	// Kill via the production killer and confirm the server is gone.
+	if err := killTmuxServerOnDisk(sock); err != nil {
+		t.Fatalf("killTmuxServerOnDisk: %v", err)
+	}
+	if err := exec.Command("tmux", "-S", sock, "list-sessions").Run(); err == nil {
+		t.Error("server still alive after killTmuxServerOnDisk")
+	}
+}
