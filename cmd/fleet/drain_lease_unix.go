@@ -114,8 +114,11 @@ type drainLeaseDeps struct {
 	// (req.NewAgentID) so journal/doc/remote-control setup keyed to it still
 	// correlates to the live replacement (codex PR3 iter-10 [P2]); empty means
 	// generate a fresh id. nil OldRec means "could not cache OLD" -> the seam
-	// surfaces a recovery instruction instead of spawning blind.
-	RecoverSpawn func(oldRec *agent.Record, docPath, preAllocatedID string, stdout, stderr io.Writer) error
+	// surfaces a recovery instruction instead of spawning blind. disableAutoResume
+	// is the EFFECTIVE per-handoff policy (the queue's DisableAutoResume override
+	// resolved against OLD's baseline — codex PR3 iter-14 [P2]); it gates both the
+	// spawn record's policy and whether recoverHandoffTail types the resume prompt.
+	RecoverSpawn func(oldRec *agent.Record, docPath, preAllocatedID string, disableAutoResume bool, stdout, stderr io.Writer) error
 	// BarrierPoll is the interval between barrier-existence checks while
 	// waiting (bounded) for a graceful handoff to complete. 0 = default.
 	BarrierPoll time.Duration
@@ -182,7 +185,7 @@ func defaultDrainLeaseDeps() drainLeaseDeps {
 // coord's stale stored Cwd. Surface-don't-silo on any gap: a missing record /
 // unresolvable repo prints a concrete recovery command rather than spawning
 // blind.
-func productionRecoverSpawn(oldRec *agent.Record, docPath, preAllocatedID string, stdout, stderr io.Writer) error {
+func productionRecoverSpawn(oldRec *agent.Record, docPath, preAllocatedID string, disableAutoResume bool, stdout, stderr io.Writer) error {
 	if oldRec == nil {
 		_, _ = fmt.Fprintf(stderr,
 			"fleet drain: takeover reaped the hung coord but its record could not be cached; "+
@@ -206,7 +209,7 @@ func productionRecoverSpawn(oldRec *agent.Record, docPath, preAllocatedID string
 				_, _ = fmt.Fprintf(stdout,
 					"fleet drain: adopting already-spawned successor %s for %s (no re-spawn)\n",
 					existing.ID, oldRec.Project)
-				return deliverRecoverResumePrompt(existing, docPath, oldRec.DisableAutoResume, stdout, stderr)
+				return recoverHandoffTail(oldRec, existing, docPath, disableAutoResume, stdout, stderr)
 			}
 		}
 	}
@@ -220,11 +223,15 @@ func productionRecoverSpawn(oldRec *agent.Record, docPath, preAllocatedID string
 		spawnCwd = resolved
 	}
 	rec, err := spawn.Spawn(spawn.Options{
-		OldRecord:         oldRec,
-		NewDocPath:        docPath,
-		Cwd:               spawnCwd,
-		Command:           oldRec.Command,
-		DisableAutoResume: oldRec.DisableAutoResume,
+		OldRecord:  oldRec,
+		NewDocPath: docPath,
+		Cwd:        spawnCwd,
+		Command:    oldRec.Command,
+		// EFFECTIVE per-handoff policy (queue override resolved against OLD's
+		// baseline by the caller), NOT oldRec's baseline — honors
+		// `fleet handoff --no-auto-resume` / `--auto-resume` on the escalated
+		// recovery path the same way handoffop.Resume does (codex PR3 iter-14 [P2]).
+		DisableAutoResume: disableAutoResume,
 		// Reuse the queue's pre-allocated successor id so any handoff
 		// journal/doc/remote-control setup keyed to it correlates to the live
 		// replacement (codex PR3 iter-10 [P2]). Empty -> spawn.Spawn allocates.
@@ -240,7 +247,58 @@ func productionRecoverSpawn(oldRec *agent.Record, docPath, preAllocatedID string
 	}
 	_, _ = fmt.Fprintf(stdout,
 		"fleet drain: cold-spawned lease-wrapped successor %s for %s after takeover\n", rec.ID, oldRec.Project)
-	return deliverRecoverResumePrompt(rec, docPath, oldRec.DisableAutoResume, stdout, stderr)
+	return recoverHandoffTail(oldRec, rec, docPath, disableAutoResume, stdout, stderr)
+}
+
+// Seams for recoverHandoffTail / deliverRecoverResumePrompt, kept injectable so
+// the recover-tail tests stay deterministic (no real tmux send / marker FS).
+var (
+	recoverWriteMarkerFn        = state.WriteCoordSpawnMarker
+	recoverWaitForReadyFn       = spawn.WaitForReadyToPrompt
+	recoverSessionAliveFn       = tmux.SessionAlive
+	recoverSendPromptVerifiedFn = spawn.SendPromptKeysVerified
+)
+
+// effectiveDisableAutoResume resolves the EFFECTIVE per-handoff auto-resume
+// policy the same way handoffop.Resume does (codex PR3 iter-14 [P2]): the
+// queue's DisableAutoResume *bool override wins when set; otherwise fall back to
+// OLD's baseline DisableAutoResume. A nil cachedOld (record could not be cached)
+// falls back to the override or false. Honors `fleet handoff --no-auto-resume` /
+// `--auto-resume` on the escalated takeover-recovery path.
+func effectiveDisableAutoResume(req queue.SpawnFresh, cachedOld *agent.Record) bool {
+	if req.DisableAutoResume != nil {
+		return *req.DisableAutoResume
+	}
+	if cachedOld != nil {
+		return cachedOld.DisableAutoResume
+	}
+	return false
+}
+
+// recoverHandoffTail runs the same post-spawn handoff TAIL the normal recovery
+// path runs, plus PR4's verified prompt-delivery semantics. Without it the
+// takeover-recovered successor is INVISIBLE + INERT:
+//   - the dead OLD's coord.Cleanup cleared the coord-spawn marker, so the TUI /
+//     `fleet attach` discovery (which reads the marker for the live coord's id)
+//     cannot find the replacement -> point the marker at the NEW agent;
+//   - a freshly-spawned coord does nothing until it is told to resume from the
+//     handoff doc -> deliver handoff.ResumePrompt(docPath) once its pane is
+//     ready, with at-most-once retry handling.
+//
+// Marker repair is best-effort with surfaced warnings (surface-don't-silo). The
+// prompt delivery returns errors so the queue is preserved when the replacement
+// would otherwise be left idle.
+func recoverHandoffTail(oldRec *agent.Record, rec *agent.Record, docPath string, disableAutoResume bool,
+	stdout, stderr io.Writer) error {
+	if spawn.IsCoordSpawn(oldRec.TaskID, oldRec.Project) {
+		if werr := recoverWriteMarkerFn(oldRec.Project, rec.ID); werr != nil {
+			_, _ = fmt.Fprintf(stderr,
+				"warning: coord-spawn marker for project %s -> %s failed after takeover recovery: %v "+
+					"(TUI may not discover the replacement; run `fleet rc up %s` to recover)\n",
+				oldRec.Project, rec.ID, werr, oldRec.Project)
+		}
+	}
+	return deliverRecoverResumePrompt(rec, docPath, disableAutoResume, stdout, stderr)
 }
 
 // deliverRecoverResumePrompt delivers the resume prompt to a recovered
@@ -276,11 +334,11 @@ func deliverRecoverResumePrompt(rec *agent.Record, docPath string, disableAutoRe
 			return nil
 		}
 	}
-	if werr := spawn.WaitForReadyToPrompt(rec.TmuxSession); werr != nil {
+	if werr := recoverWaitForReadyFn(rec.TmuxSession); werr != nil {
 		// Readiness poll didn't converge. If the session is DEAD, fail so the
 		// queue is preserved. If it is ALIVE (slow startup / onboarding
 		// screen / custom wrapper), warn and send anyway — the keys buffer.
-		alive, probeErr := tmux.SessionAlive(rec.TmuxSession)
+		alive, probeErr := recoverSessionAliveFn(rec.TmuxSession)
 		if !alive && probeErr == nil {
 			return fmt.Errorf(
 				"fleet drain: recovered successor %s session %s is dead; cannot deliver resume prompt "+
@@ -294,7 +352,7 @@ func deliverRecoverResumePrompt(rec *agent.Record, docPath string, disableAutoRe
 	// when the prompt is left sitting UNSUBMITTED in the input box (its
 	// contract is "attach anyway"). For an unattended recovery there is no
 	// operator to press Enter, so an unsubmitted prompt == not delivered.
-	submitted, serr := spawn.SendPromptKeysVerified(rec.TmuxSession, handoff.ResumePrompt(docPath))
+	submitted, serr := recoverSendPromptVerifiedFn(rec.TmuxSession, handoff.ResumePrompt(docPath))
 	if serr != nil {
 		return fmt.Errorf(
 			"fleet drain: resume prompt to recovered successor %s failed: %w "+
@@ -459,25 +517,62 @@ func drainGraceful(req queue.SpawnFresh, path string, epoch int64, deadline time
 	oldRec, err := d.LoadAgent(req.OldAgentID)
 	switch {
 	case errors.Is(err, state.ErrNotFound):
-		// OLD already archived — handoff fully complete. Clean the queue.
-		_, _ = fmt.Fprintf(stdout, "fleet drain: %s already retired (barrier present); cleaning queue\n", req.OldAgentID)
-		return queue.Delete(path)
+		// OLD already archived — but that is NOT proof a standby acquired the
+		// lease (codex PR3 iter-14 [P1]): coord-run RELEASES the lease and THEN
+		// archives OLD, so between the archive and the standby's next poll there
+		// is a window where the lease is free and unowned. Deleting the queue
+		// here would strand the project coordless if the standby crashed / is
+		// still mid-acquire. Wait (bounded) for a CONFIRMED active owner before
+		// declaring the handoff done. We cannot RecoverSpawn here (OLD's record
+		// is archived, so there is nothing to recover FROM), so on a no-successor
+		// timeout we PRESERVE the queue and surface — a later drain pass (or the
+		// standby finally acquiring) completes it; `fleet doctor` (PR6) handles a
+		// truly-stuck case. Surface-don't-silo: never a silent coordless delete.
+		// OLD is archived/gone so there is no pid to exclude; require a HEALTHY
+		// owner (a present-but-crashed active-epoch owner is not a live successor
+		// — codex PR3 iter-14 [P1]).
+		if d.waitForHealthySuccessor(req.Project, 0, deadline) {
+			_, _ = fmt.Fprintf(stdout,
+				"fleet drain: %s retired and a healthy successor holds the lease; cleaning queue\n", req.OldAgentID)
+			return queue.Delete(path)
+		}
+		_, _ = fmt.Fprintf(stderr,
+			"fleet drain: %s archived (barrier present) but NO successor acquired the lease within the budget; "+
+				"preserving queue %s for retry (a standby may still be mid-acquire; run `fleet doctor` if it persists)\n",
+			req.OldAgentID, path)
+		return fmt.Errorf("fleet drain: %s retired but no successor leads %s yet; queue preserved for retry",
+			req.OldAgentID, req.Project)
 	case err != nil:
 		return fmt.Errorf("fleet drain: load old agent %s: %w", req.OldAgentID, err)
 	}
 
-	// If OLD is still the recorded ACTIVE lease owner, do NOT force-kill it
-	// (the epoch gate refuses, correctly). Wait bounded for its self-release;
-	// escalate to takeover on timeout.
-	if ownerPid, ok := d.ActiveOwnerPID(req.Project); ok && ownerPid == oldRec.SupervisorPID {
+	// Branch on who currently OWNS the lease (codex PR3 iter-14 [P1]). The
+	// invariant across ALL branches: never declare the handoff done / delete the
+	// queue without either reaping a still-present OLD or confirming a HEALTHY
+	// SUCCESSOR. A successor that crashed after writing its `active` epoch but
+	// before releasing still shows up as ActiveOwnerPID, so "successor" means a
+	// HEALTHY owner (LeaderPresent's TTL + pid_start liveness) whose pid != OLD —
+	// raw active-epoch ownership alone is NOT proof of a live successor.
+	ownerPid, ownerOK := d.ActiveOwnerPID(req.Project)
+	switch {
+	case ownerOK && ownerPid == oldRec.SupervisorPID:
+		// OLD is still the recorded ACTIVE lease owner — finishing its own exit.
+		// Do NOT force-kill it (the epoch gate refuses the active leader,
+		// correctly). Wait bounded for a HEALTHY successor; escalate on timeout.
 		_, _ = fmt.Fprintf(stdout,
 			"fleet drain: %s wrote the barrier and is still the active leader; waiting for its self-release\n",
 			oldRec.ID)
 		for {
-			if op, ok := d.ActiveOwnerPID(req.Project); !ok || op != oldRec.SupervisorPID {
-				// OLD released (or a takeover advanced past it). The standby
-				// acquires the freed flock; the handoff is complete. Clean up.
-				_, _ = fmt.Fprintf(stdout, "fleet drain: %s released the lease; handoff complete\n", oldRec.ID)
+			// Completion requires a HEALTHY successor (pid != OLD AND
+			// LeaderPresent), not merely OLD's absence or a stale active epoch:
+			// !healthy means OLD released but no LIVE standby owns the lease yet
+			// (mid-poll, or a successor that crashed after writing its epoch) —
+			// keep waiting. On the deadline fall through to takeover+recover,
+			// which brings up a successor so the project is never left coordless.
+			if op, ok := d.healthySuccessorPresent(req.Project, oldRec.SupervisorPID); ok {
+				_, _ = fmt.Fprintf(stdout,
+					"fleet drain: %s released the lease and healthy successor pid %d acquired it; handoff complete\n",
+					oldRec.ID, op)
 				return queue.Delete(path)
 			}
 			if !time.Now().Before(deadline) {
@@ -491,19 +586,86 @@ func drainGraceful(req queue.SpawnFresh, path string, epoch int64, deadline time
 				time.Sleep(wait)
 			}
 		}
-		// OLD held the lease past the budget despite writing the barrier —
-		// treat as hung; escalate to the safety-net takeover + lease-wrapped
-		// recovery (checks the takeover actually fenced+killed OLD before
-		// spawning a successor — codex PR3 iter-9 [P1]). Never block.
+		// OLD wedged past the budget (or released with no HEALTHY successor ever
+		// acquiring) — escalate to the safety-net takeover + lease-wrapped
+		// recovery (fence+kill OLD, then spawn a successor). Never block.
 		_, _ = fmt.Fprintf(stderr,
-			"fleet drain: %s did not release the lease after writing the barrier within the budget; escalating to takeover\n",
+			"fleet drain: %s did not yield to a healthy successor within the budget; escalating to takeover\n",
+			oldRec.ID)
+		return takeoverAndRecover(req, path, oldRec, stdout, stderr, d)
+
+	case ownerOK && ownerPid != oldRec.SupervisorPID && d.LeaderPresent(req.Project):
+		// A HEALTHY SUCCESSOR already leads (a standby acquired and is
+		// heartbeating). OLD's record is still present but it released the lease —
+		// reap its lingering supervisor through the authenticated primitive, then
+		// the queue is cleaned. The handoff is confirmed complete.
+		return drainReapOld(oldRec, req, path, epoch, stdout, stderr, d)
+
+	default:
+		// Either no owner (!ownerOK) OR the active owner is a non-OLD pid that is
+		// NOT healthy (a successor that crashed after writing its epoch). Either
+		// way there is no LIVE successor yet: reaping OLD + deleting the queue
+		// here would strand the project coordless (codex PR3 iter-14 [P1]). Wait
+		// bounded for a HEALTHY successor; if one acquires, reap OLD's lingering
+		// supervisor and finish. If none by the deadline, escalate to
+		// takeover+recover so a successor is brought up — never a coordless
+		// queue-delete.
+		_, _ = fmt.Fprintf(stdout,
+			"fleet drain: %s released the lease but no healthy successor owns it yet; waiting for a confirmed successor\n",
+			oldRec.ID)
+		if d.waitForHealthySuccessor(req.Project, oldRec.SupervisorPID, deadline) {
+			_, _ = fmt.Fprintf(stdout,
+				"fleet drain: a healthy successor acquired the lease for %s; reaping the old supervisor and finishing\n",
+				req.Project)
+			return drainReapOld(oldRec, req, path, epoch, stdout, stderr, d)
+		}
+		_, _ = fmt.Fprintf(stderr,
+			"fleet drain: %s released the lease but NO healthy successor acquired within the budget; escalating to takeover\n",
 			oldRec.ID)
 		return takeoverAndRecover(req, path, oldRec, stdout, stderr, d)
 	}
+}
 
-	// OLD is not the active owner (already releasing / stale record) — reap it
-	// directly through the authenticated primitive.
-	return drainReapOld(oldRec, req, path, epoch, stdout, stderr, d)
+// healthySuccessorPresent reports whether a HEALTHY successor (not OLD) holds
+// the lease for project: the active owner pid is present, differs from
+// excludePid (OLD's supervisor), AND a healthy leader is heartbeating
+// (LeaderPresent's TTL + pid_start liveness). A successor that crashed after
+// writing its `active` epoch but before releasing still shows in ActiveOwnerPID,
+// so the LeaderPresent gate is what proves the successor is LIVE (codex PR3
+// iter-14 [P1]). Returns (ownerPid, true) only when all hold.
+func (d drainLeaseDeps) healthySuccessorPresent(project string, excludePid int) (int, bool) {
+	op, ok := d.ActiveOwnerPID(project)
+	if !ok || op == excludePid {
+		return 0, false
+	}
+	if !d.LeaderPresent(project) {
+		return 0, false
+	}
+	return op, true
+}
+
+// waitForHealthySuccessor polls (bounded by deadline) for a HEALTHY successor
+// (not excludePid) to hold the lease for project. Used after OLD is confirmed
+// gone (archived / released) to verify a LIVE standby acquired the freed lease
+// before declaring the handoff complete — a present-but-dead active owner is not
+// a successor (codex PR3 iter-14 [P1]). Returns true the instant a healthy
+// successor is observed; false if the deadline passes with none. Holds no lock.
+func (d drainLeaseDeps) waitForHealthySuccessor(project string, excludePid int, deadline time.Time) bool {
+	for {
+		if _, ok := d.healthySuccessorPresent(project, excludePid); ok {
+			return true
+		}
+		if !time.Now().Before(deadline) {
+			return false
+		}
+		wait := d.BarrierPoll
+		if rem := time.Until(deadline); rem < wait {
+			wait = rem
+		}
+		if wait > 0 {
+			time.Sleep(wait)
+		}
+	}
 }
 
 // drainReapOld reaps OLD's coord-run supervisor through the ONE
@@ -598,36 +760,57 @@ func drainWaitBarrierOrEscalate(req queue.SpawnFresh, path string, deadline time
 
 // takeoverAndRecover runs the safety-net takeover (fence -> kill the hung OLD)
 // and then brings up a FRESH lease-wrapped successor from the CACHED old record
-// (dead-coord recovery), deleting the queue on success. It NEVER blocks across
-// the kill, but it DOES hold a SHORT per-agent lock across the
-// takeover->recover sequence (codex PR3 iter-11 [P1]): the production TakeOver
-// releases the lease as soon as OLD is proven gone, opening a window where a
-// SECOND concurrent drain could acquire the freed lease and ALSO RecoverSpawn —
-// a duplicate successor. The per-agent LockAgent serializes the whole sequence
-// (it is BOUNDED — state.acquireBoundedAt — so a contending drain times out
-// instead of hanging, then re-reads state and stands down). Shared by the
+// (dead-coord recovery), deleting the queue on success.
+//
+// LOCK DISCIPLINE (codex PR3 iter-14 [P1] — the deadlock this whole stack
+// exists to kill, reintroduced in PR3's takeover path):
+//
+//	WRONG (self-deadlock):                   RIGHT (narrow critical section):
+//	┌──────────────────────────────┐        ┌──────────────────────────────┐
+//	│ LockAgent(OLD)                │        │ TakeOver(OLD)   ◄── lock-free │
+//	│   TakeOver(OLD)               │        │   fence -> SIGTERM OLD        │
+//	│     SIGTERM OLD               │        │   OLD's coord.Cleanup runs:   │
+//	│     OLD's coord.Cleanup runs: │        │     LockAgent(OLD)  ◄─ FREE   │
+//	│       LockAgent(OLD) ◄ BLOCKS │        │     archive record + reap     │
+//	│       (drain holds it!)       │        │   OLD exits -> flock freed    │
+//	│     OLD never archives ──────►│ stale  │   TakeOver acquires + releases│
+//	│   SIGKILL OLD (record stale,  │ rec +  │ LockAgent(OLD)  ◄ short scope │
+//	│   tmux/engine orphaned)       │ orphan │   re-check queue + RecoverSpawn│
+//	│ release()                     │        │ release()                     │
+//	└──────────────────────────────┘        └──────────────────────────────┘
+//
+// The per-agent lock must NOT span TakeOver: TakeOver SIGTERMs the hung OLD,
+// whose coord.Cleanup archives OLD's record under the SAME state.LockAgent(OLD).
+// Holding it across the kill self-blocks OLD's cleanup -> OLD is SIGKILLed with
+// a STALE live record and an orphaned tmux/engine. So TakeOver runs LOCK-FREE
+// (OLD's dying cleanup can grab the lock and archive cleanly); the lock is taken
+// only for the SHORT RecoverSpawn critical section AFTER OLD is gone.
+//
+// The lock still serializes duplicate recovery (codex PR3 iter-11 [P1]): the
+// production TakeOver releases the lease the instant OLD is proven gone, so two
+// concurrent drains could both observe acquired=true. The post-takeover lock +
+// queue re-check makes only ONE of them RecoverSpawn; the loser sees the queue
+// gone and stands down. The lock is BOUNDED (state.acquireBoundedAt — never a
+// bare LOCK_EX), so a contender times out instead of hanging. Shared by the
 // hung-leader, graceful-past-budget, and Resume-timeout escalations. Returns
 // ErrEscalatedToTakeOver on success (a non-fatal processed outcome).
 func takeoverAndRecover(req queue.SpawnFresh, path string, cachedOld *agent.Record,
 	stdout, stderr io.Writer, d drainLeaseDeps) error {
 
 	project := req.Project
-	// Serialize the takeover->recover sequence against a concurrent drain so
-	// only ONE successor is recovered (codex PR3 iter-11 [P1]).
-	release, lerr := d.LockAgent(req.OldAgentID)
-	if lerr != nil {
-		return fmt.Errorf("fleet drain: lock agent %s for takeover recovery: %w", req.OldAgentID, lerr)
-	}
-	defer release()
 
-	// Re-check under the lock: a drain that won the race may have already
-	// recovered (queue gone / a successor now leads). If the queue file is gone
-	// the work is done — stand down (another drain handled it).
+	// Pre-takeover stand-down check (lock-free): if a peer drain already
+	// recovered (queue gone), there is nothing to take over. Cheap early exit;
+	// the authoritative duplicate guard is the post-takeover locked re-check.
 	if _, statErr := os.Stat(path); errors.Is(statErr, os.ErrNotExist) {
 		_, _ = fmt.Fprintf(stdout, "fleet drain: %s already recovered by a concurrent drain; nothing to do\n", project)
 		return nil
 	}
 
+	// TakeOver runs LOCK-FREE so the hung OLD's coord.Cleanup can take
+	// state.LockAgent(OLD) to archive its record + reap tmux/engine while we
+	// fence->kill it. Holding the per-agent lock here would self-deadlock that
+	// cleanup (see the LOCK DISCIPLINE diagram above).
 	acquired, err := d.TakeOver(project, req.OldAgentID)
 	if err != nil {
 		return fmt.Errorf("fleet drain: safety-net takeover for %s: %w", project, err)
@@ -647,6 +830,51 @@ func takeoverAndRecover(req queue.SpawnFresh, path string, cachedOld *agent.Reco
 				"NOT spawning a successor (would duplicate); leaving queue for retry\n", project)
 		return fmt.Errorf("fleet drain: takeover for %s did not confirm the old coord is gone", project)
 	}
+	// OLD is provably gone now (the takeover fenced+killed it AND its
+	// coord.Cleanup ran lock-free, archiving the record + reaping tmux/engine).
+	// Only NOW take the SHORT per-agent lock — it serializes the RecoverSpawn
+	// against a concurrent drain so only ONE successor is recovered (codex PR3
+	// iter-11 [P1]). Crucially the lock does NOT span TakeOver above (codex PR3
+	// iter-14 [P1]): OLD's cleanup needed this same lock, so holding it across
+	// the kill self-deadlocked the archive (see LOCK DISCIPLINE above).
+	release, lerr := d.LockAgent(req.OldAgentID)
+	if lerr != nil {
+		return fmt.Errorf("fleet drain: lock agent %s for takeover recovery: %w", req.OldAgentID, lerr)
+	}
+	defer release()
+
+	// Re-check the queue UNDER the lock: a peer drain that also won an acquire
+	// (the production TakeOver releases the lease the instant OLD is gone, so two
+	// drains can both observe acquired=true) may have already RecoverSpawned and
+	// deleted the queue. If it is gone, stand down — recovering again would
+	// duplicate the successor (codex PR3 iter-11 [P1]).
+	if _, statErr := os.Stat(path); errors.Is(statErr, os.ErrNotExist) {
+		_, _ = fmt.Fprintf(stdout, "fleet drain: %s already recovered by a concurrent drain; nothing to do\n", project)
+		return nil
+	}
+
+	// Re-check the lease OWNER under the lock before spawning (codex PR3
+	// iter-14 [P1]): a graceful WARM STANDBY may have been polling all along and
+	// acquired the freed lease in the gap between TakeOver killing OLD and
+	// TakeOver releasing the lease. If a HEALTHY successor already leads,
+	// RecoverSpawn would either duplicate the coord or fail on the pre-allocated
+	// standby session/id. Require a HEALTHY owner (LeaderPresent — a successor
+	// that crashed after writing its `active` epoch is not a live leader); OLD is
+	// already dead post-takeover so there is no pid to exclude. A confirmed
+	// healthy successor means the handoff is complete — clean the queue and stand
+	// down instead of cold-spawning a redundant replacement.
+	if op, ok := d.healthySuccessorPresent(project, 0); ok {
+		_, _ = fmt.Fprintf(stdout,
+			"fleet drain: a healthy successor (pid %d) acquired the lease for %s after takeover; standing down (no recovery spawn)\n",
+			op, project)
+		if derr := queue.Delete(path); derr != nil {
+			return fmt.Errorf(
+				"fleet drain: successor leads %s after takeover but queue delete failed (%w); rerun fleet drain to clean it",
+				project, derr)
+		}
+		return ErrEscalatedToTakeOver
+	}
+
 	// The hung OLD is fenced + killed (drain acquired the freed flock, proving
 	// OLD released, then released it for the successor). Bring up a
 	// FRESH lease-wrapped successor from the CACHED old record (dead-coord
@@ -656,7 +884,7 @@ func takeoverAndRecover(req queue.SpawnFresh, path string, cachedOld *agent.Reco
 	// handoff successor that never acquires the lease.
 	_, _ = fmt.Fprintf(stderr,
 		"fleet drain: takeover fenced/killed the hung coord for %s; recovering a lease-wrapped successor\n", project)
-	if err := d.RecoverSpawn(cachedOld, req.HandoffDoc, req.NewAgentID, stdout, stderr); err != nil {
+	if err := d.RecoverSpawn(cachedOld, req.HandoffDoc, req.NewAgentID, effectiveDisableAutoResume(req, cachedOld), stdout, stderr); err != nil {
 		// Surface the recovery-spawn failure but keep the escalation semantics:
 		// the takeover succeeded (OLD reaped). Leave the queue in place so the
 		// dead-coord recovery path (next dispatch / TUI [a]) retries against
@@ -719,17 +947,20 @@ func drainLiveLeaderFallback(req queue.SpawnFresh, path string, deadline time.Ti
 			time.Sleep(wait)
 		}
 	}
-	// A SUCCESSOR already leads (codex PR3 iter-6 [P2]): if the current active
-	// lease owner is NOT OLD's supervisor, a graceful standby has already
-	// acquired the lease (the barrier was written at OLD's now-superseded
-	// epoch, so the current-epoch barrier check above missed it). OLD's record
-	// just hasn't been archived yet. The handoff IS complete — clean the
-	// stale queue, do NOT run legacy Resume (which would spawn a SECOND
-	// replacement for an already-done handoff).
+	// A HEALTHY SUCCESSOR already leads (codex PR3 iter-6 [P2]; iter-14 [P1]): if
+	// a non-OLD pid owns the lease AND is heartbeating (LeaderPresent), a graceful
+	// standby has already acquired (the barrier was written at OLD's now-
+	// superseded epoch, so the current-epoch barrier check above missed it).
+	// OLD's record just hasn't been archived yet. The handoff IS complete — clean
+	// the stale queue, do NOT run legacy Resume (which would spawn a SECOND
+	// replacement). Gate on healthySuccessorPresent, NOT raw ActiveOwnerPID: a
+	// standby that wrote its `active` epoch then crashed still shows as owner but
+	// is not a live leader — deleting the queue for it strands the project
+	// coordless (same class as the graceful path).
 	if err == nil && oldRec != nil && oldRec.SupervisorPID > 0 {
-		if ownerPid, ok := d.ActiveOwnerPID(req.Project); ok && ownerPid != oldRec.SupervisorPID {
+		if ownerPid, ok := d.healthySuccessorPresent(req.Project, oldRec.SupervisorPID); ok {
 			_, _ = fmt.Fprintf(stdout,
-				"fleet drain: a successor already leads %s (active owner pid %d != old %d); handoff complete, cleaning queue\n",
+				"fleet drain: a healthy successor already leads %s (active owner pid %d != old %d); handoff complete, cleaning queue\n",
 				req.Project, ownerPid, oldRec.SupervisorPID)
 			return queue.Delete(path)
 		}
@@ -773,30 +1004,59 @@ func drainLiveLeaderFallback(req queue.SpawnFresh, path string, deadline time.Ti
 // SHORT per-agent LockAgent (Resume's contract; two concurrent drains must not
 // both spawn).
 //
-// It runs SYNCHRONOUSLY (codex PR3 iter-3/9 [P1/P2]): `fleet drain` is a
-// short-lived CLI, so an abandoned Resume goroutine would either be killed
-// mid-spawn on process exit OR race a safety-net recovery to a duplicate /
-// inconsistent handoff. Bounding is NOT needed here to prevent the drain-storm:
-//   - the per-agent LockAgent is BOUNDED (state.acquireBoundedAt never uses a
-//     bare LOCK_EX), so a contending drain times out instead of forever-blocking
-//     — the 81-leak's forever-block class is already gone at the lock layer;
-//   - the genuinely-HUNG-leader case never reaches coldResume: it is detected
-//     up front (LeaderPresent==false / no healthy holder) and handled by
-//     drainWaitBarrierOrEscalate's fence->kill->recover, which holds no lock.
+// It HONORS resumeTimeoutMillis (codex PR3 iter-14 [P1]): even with a healthy
+// leader present, handoffop.Resume can hang inside tmux probes / spawn /
+// readiness waits, which would block `fleet drain` past `--resume-timeout-ms`
+// and reintroduce the drain-storm class this PR exists to bound. So Resume runs
+// in a goroutine bounded by the timeout; on timeout coldResume RETURNS (surface-
+// don't-silo) rather than blocking.
 //
-// So coldResume is exactly the proven legacy completion (LockAgent + Resume),
-// reached only when a HEALTHY leader is present (a real, responsive handoff) or
-// a stealable cold lease — neither of which is the forever-hang incident.
+// Abandoned-goroutine safety (the reason it was synchronous before): on timeout
+// the goroutine keeps running but holds the BOUNDED per-agent LockAgent until
+// Resume returns. A concurrent/later drain that contends for that lock times out
+// (state.acquireBoundedAt never bare-LOCK_EXes) and stands down — so no two
+// drains ever both spawn. `fleet drain` is a short-lived CLI: the goroutine dies
+// with the process. The release runs whenever Resume finally returns (or never,
+// if the process exits first — harmless, the kernel frees the flock).
+//
+// resumeTimeoutMillis <= 0 means "no timeout" (run synchronously) — preserves
+// the legacy contract for callers that pass 0.
 func coldResume(req queue.SpawnFresh, path string, graceMillis, resumeTimeoutMillis int,
 	stdout, stderr io.Writer, d drainLeaseDeps) error {
 
-	_ = resumeTimeoutMillis // synchronous: see doc comment (no abandonable goroutine)
 	release, err := d.LockAgent(req.OldAgentID)
 	if err != nil {
 		return fmt.Errorf("fleet drain: lock agent %s for cold resume: %w", req.OldAgentID, err)
 	}
-	defer release()
-	return d.Resume(req, path, graceMillis, stdout, stderr)
+
+	if resumeTimeoutMillis <= 0 {
+		defer release()
+		return d.Resume(req, path, graceMillis, stdout, stderr)
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		// release runs when Resume returns (whether before or after the timeout),
+		// so the lock is held for exactly the duration Resume needs it.
+		defer release()
+		done <- d.Resume(req, path, graceMillis, stdout, stderr)
+	}()
+
+	timer := time.NewTimer(time.Duration(resumeTimeoutMillis) * time.Millisecond)
+	defer timer.Stop()
+	select {
+	case rerr := <-done:
+		return rerr
+	case <-timer.C:
+		// Resume hung past the budget. Return without blocking; the goroutine
+		// keeps the bounded lock until Resume unwinds (a contending drain times
+		// out + stands down, never a duplicate spawn). Surface so the operator
+		// sees the stuck handoff (fleet doctor / a later drain can retry).
+		_, _ = fmt.Fprintf(stderr,
+			"fleet drain: resume for %s exceeded the %dms budget; returning (the handoff completes in the background or a later drain retries)\n",
+			req.Project, resumeTimeoutMillis)
+		return fmt.Errorf("fleet drain: resume for %s exceeded the %dms resume-timeout budget", req.Project, resumeTimeoutMillis)
+	}
 }
 
 func fillDrainLeaseDeps(d drainLeaseDeps) drainLeaseDeps {

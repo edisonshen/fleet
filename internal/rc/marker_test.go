@@ -9,6 +9,18 @@ import (
 // withFleetHome points FLEET_HOME at t.TempDir() so each test gets
 // an isolated ~/.fleet/. Mirrors the pattern used across the
 // internal/state and internal/workers test packages.
+//
+// Also installs neutral stubs for the self-healing probes
+// (claudeVersionFn, ownerAliveFn) so the production shell-outs don't
+// fire on a dev box where `claude --version` returns a real value
+// that disagrees with any recorded ClaudeVersion the test seeds. Tests
+// that exercise the self-healing branch override these stubs via
+// withStubVersionAndOwner.
+//
+// leak-rc-daemon-lifecycle PR-B: without this neutral default, tests
+// that pre-date the schema bump and seed RecordedState with
+// ClaudeVersion="" would trigger Up's self-heal kill+respawn on every
+// run, signalling os.Getpid() and crashing the test binary.
 func withFleetHome(t *testing.T) string {
 	t.Helper()
 	dir := t.TempDir()
@@ -17,6 +29,17 @@ func withFleetHome(t *testing.T) string {
 	// FLEET_RC_BOOTSTRAP_DISABLED-aware code paths see a known state.
 	// (Individual tests override when they need the gate set.)
 	t.Setenv("FLEET_RC_BOOTSTRAP_DISABLED", "")
+	// Neutral self-heal stubs: empty version + alive owner skip both
+	// heal branches by default (computeHealReason returns "" on empty
+	// curVer; ownerAliveFn always returns true).
+	prevV := claudeVersionFn
+	claudeVersionFn = func() (string, error) { return "", nil }
+	prevO := ownerAliveFn
+	ownerAliveFn = func(coordID string) bool { return true }
+	t.Cleanup(func() {
+		claudeVersionFn = prevV
+		ownerAliveFn = prevO
+	})
 	return dir
 }
 

@@ -61,6 +61,7 @@ import (
 	"github.com/spf13/cobra"
 
 	fleet "github.com/edisonshen/fleet"
+	"github.com/edisonshen/fleet/internal/agent"
 	"github.com/edisonshen/fleet/internal/coord"
 	"github.com/edisonshen/fleet/internal/install"
 	"github.com/edisonshen/fleet/internal/tmux"
@@ -416,6 +417,25 @@ func runCoordRun(ctx context.Context, opts coordRunOpts, stdout, stderr io.Write
 
 	if err := child.Start(); err != nil {
 		return fmt.Errorf("coord-run: start child: %w", err)
+	}
+
+	// WARM STANDBY engine-pid stamp (codex PR3 iter-14 [P1]): a standby spawn
+	// SKIPPED engine-pid resolution at spawn time (the engine wasn't launched
+	// until we acquired the lease just now), so the on-disk record still carries
+	// the short-lived spawning CLI's pid as Record.PID. Stamp the REAL engine
+	// child pid now so TUI / status liveness checks (which read Record.PID) see a
+	// live process instead of misclassifying this live successor as dead. Only
+	// the standby path needs this — a normal coord spawn resolved the engine pid
+	// in spawn.Spawn before the record went live. Best-effort: a stamp failure is
+	// surfaced but does not abort the now-running coord (fleet-guard's heartbeat
+	// re-stamps on the first turn).
+	if opts.standby && child.Process != nil {
+		if serr := agent.StampEnginePID(opts.agentID, child.Process.Pid); serr != nil {
+			_, _ = fmt.Fprintf(stderr,
+				"coord-run: warning: stamp engine pid %d for standby %s failed: %v "+
+					"(status/TUI may briefly show it dead until the next fleet-guard heartbeat)\n",
+				child.Process.Pid, opts.agentID, serr)
+		}
 	}
 
 	// Test-only panic hook. Production leaves panicAfterStart false; the

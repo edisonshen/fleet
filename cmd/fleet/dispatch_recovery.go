@@ -224,6 +224,51 @@ func coordStateFresh(project string) bool {
 	return time.Since(fi.ModTime()) <= coordFreshnessWindow
 }
 
+// coordStateTickedAfter reports whether coord-state.json proves that the
+// SPECIFIC coord spawned at `recordSpawnedAt` has itself ticked — i.e.
+// the file exists, its mtime is within the freshness window, AND that
+// mtime POST-DATES the record's spawn time. This is the candidate-
+// specific freshness gate the idempotent-attach fast path requires
+// (codex iter-7 P2).
+//
+// Why project-level coordStateFresh is insufficient for the fast path:
+// coordStateFresh only asks "did SOME coord tick recently for this
+// project". The fast path then PROMOTES a specific live record (exit 0,
+// `agent <id> spawned`) — so it needs proof that THAT record ticked, not
+// just any coord. Two ways project-level freshness lies about a record:
+//   - Stale-from-predecessor: coord-state.json is fresh from a now-dead
+//     predecessor whose record was archived; the live record the fast
+//     path selected is a NEW session that hasn't ticked. mtime predates
+//     the new record's spawn → this returns false → no false promotion.
+//   - Fail-closed stat error: coordStateFresh returns true on a transient
+//     stat error (safe for the VETO, but the fast path must not PROMOTE
+//     on an unverified signal). Here a stat error returns false → the
+//     fast path is skipped and the dispatch falls to the (safe) veto.
+//
+// Fail-CLOSED for the fast path means returning FALSE (skip the promote,
+// fall through to the veto/recovery) — the opposite polarity from
+// coordStateFresh, whose fail-closed returns true to make the VETO fire.
+func coordStateTickedAfter(project string, recordSpawnedAt time.Time) bool {
+	pdir, err := state.ProjectDir(project)
+	if err != nil {
+		return false
+	}
+	fi, err := os.Stat(filepath.Join(pdir, "coord-state.json"))
+	if err != nil {
+		// Absent OR transient error: cannot PROVE this record ticked,
+		// so do not promote it. The veto below still guards correctness.
+		return false
+	}
+	mtime := fi.ModTime()
+	if time.Since(mtime) > coordFreshnessWindow {
+		return false // stale: nobody ticked recently
+	}
+	// The tick must have happened AFTER this record spawned. A coord
+	// writes coord-state.json on its first tick, strictly after spawn.
+	// !Before is >= (tolerates same-instant clocks).
+	return !mtime.Before(recordSpawnedAt)
+}
+
 // coordRecordExistsInList reports whether the given pre-fetched
 // records slice contains an unarchived agent record for this task_id
 // + project. The dispatch-side live-coord veto pairs this with
@@ -246,6 +291,246 @@ func coordRecordExistsInList(taskID, project string, records []*agent.Record) bo
 		}
 	}
 	return false
+}
+
+// coordSpawnPendingFile is the durable claim a coord-spawn dispatch
+// writes (under the coord-spawn flock) immediately before invoking
+// spawn.Spawn. It bridges the COLD-START WINDOW: from the moment the
+// spawn fires until the new coord's first /coordinator tick writes
+// coord-state.json (3-5 min while a Claude session boots), neither the
+// NB-flock (released the instant the first dispatch returns) nor the
+// coord-state-mtime veto can detect the in-flight coord. A second
+// dispatch in that window would double-spawn. The claim file is the
+// missing signal: the veto refuses while the claim is fresh; the
+// coord's first tick clears it (skills/coordinator/loop.py
+// clear_coord_spawn_pending), after which the live-record / coord-state
+// path takes over.
+//
+//	T+0   dispatch #1: flock → write claim → spawn → release flock
+//	T+18s dispatch #2: flock free; coord-state.json absent;
+//	                   claim FRESH → veto refuses (exit 75 retry)
+//	T+3m  coord first tick: writes coord-state.json + clears claim
+const coordSpawnPendingFile = "coord-spawn-pending"
+
+// coordPendingClaim is the on-disk body of the pending-spawn claim.
+// AgentID is the pre-allocated successor ID (surfaced in the refusal
+// message); SpawnedAt is the claim's UTC mint time (the freshness
+// anchor); PID is the dispatching process for debugging.
+type coordPendingClaim struct {
+	AgentID   string    `json:"agent_id"`
+	SpawnedAt time.Time `json:"spawned_at"`
+	PID       int       `json:"pid"`
+}
+
+// coordPendingClaimPath resolves the per-project claim file path.
+func coordPendingClaimPath(project string) (string, error) {
+	pdir, err := state.ProjectDir(project)
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(pdir, coordSpawnPendingFile), nil
+}
+
+// writeCoordPendingClaim atomically writes a fresh pending-spawn claim
+// for the project. MUST be called under the coord-spawn flock so two
+// concurrent dispatchers can't both write a claim and both proceed.
+// Atomic .tmp+rename via state.WriteAtomic — a torn read by a contending
+// veto is impossible.
+func writeCoordPendingClaim(project, agentID string) error {
+	path, err := coordPendingClaimPath(project)
+	if err != nil {
+		return err
+	}
+	if mkErr := os.MkdirAll(filepath.Dir(path), 0o755); mkErr != nil {
+		return mkErr
+	}
+	data, err := json.Marshal(coordPendingClaim{
+		AgentID:   agentID,
+		SpawnedAt: time.Now().UTC(),
+		PID:       os.Getpid(),
+	})
+	if err != nil {
+		return err
+	}
+	return state.WriteAtomic(path, data)
+}
+
+// coordPendingClaimFresh reports whether a pending-spawn claim exists
+// and is younger than budget. Returns (false, zero-claim) when the file
+// is absent, unreadable, corrupt, or stale — all of which mean "do not
+// block the dispatch" so a crashed-mid-cold-start coord can never wedge
+// the project forever. A stale claim is overwritten by the next
+// successful dispatch's writeCoordPendingClaim.
+func coordPendingClaimFresh(project string, budget time.Duration) (bool, coordPendingClaim) {
+	path, err := coordPendingClaimPath(project)
+	if err != nil {
+		return false, coordPendingClaim{}
+	}
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return false, coordPendingClaim{}
+	}
+	var c coordPendingClaim
+	if jerr := json.Unmarshal(b, &c); jerr != nil {
+		// Corrupt claim must not block forever (fail toward allowing
+		// the spawn). The next dispatch overwrites it atomically.
+		return false, coordPendingClaim{}
+	}
+	if c.SpawnedAt.IsZero() {
+		return false, coordPendingClaim{}
+	}
+	age := time.Since(c.SpawnedAt)
+	// A future-dated claim (age < 0) means the wall clock moved backward
+	// after the claim was written, or the file carries a bogus future
+	// spawned_at (codex iter-9 P2). Without this guard time.Since stays
+	// negative — and thus < budget — until that future instant plus the
+	// budget elapses, so the claim reads "fresh" and vetoes EVERY
+	// --coord-spawn for that whole interval even though no coord is in
+	// flight, wedging recovery. The claim's contract is fail-OPEN (never
+	// block recovery on a bad claim), so treat any non-positive age as
+	// stale: the next dispatch overwrites it with a sane timestamp.
+	if age < 0 || age > budget {
+		return false, coordPendingClaim{}
+	}
+	return true, c
+}
+
+// clearCoordPendingClaim removes the pending-spawn claim. Idempotent:
+// removing an absent claim is a no-op. Production callers: the
+// failed-spawn error path and the prompt-delivery-failure paths in
+// runDispatch (clearClaimOnPromptFailure), plus the coord's first tick
+// (skills/coordinator/loop.py) for the happy path. Defined here so the Go
+// invariant — claim removal is best-effort and never errors on absence —
+// is unit-tested against the same path constant the writer uses.
+func clearCoordPendingClaim(project string) error {
+	path, err := coordPendingClaimPath(project)
+	if err != nil {
+		return err
+	}
+	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	return nil
+}
+
+// clearClaimOnPromptFailure removes the cold-start pending-spawn claim
+// when spawn.Spawn SUCCEEDED but the initial prompt failed to deliver
+// (send-keys errored, or typed-but-not-submitted). In that state the tmux
+// session is alive but /coordinator never started — so the coord's first
+// tick (which is what normally clears the claim) will NEVER run, and the
+// claim would otherwise veto every retry via coordPendingClaimFresh for
+// the full freshness window, blocking the operator's prompt-failure
+// recovery (re-`[a]` / re-dispatch). Clearing it here lets an immediate
+// retry respawn the coord (codex iter-4 P2). Guarded identically to the
+// claim WRITE so we only clear what we wrote; best-effort (the claim is
+// fail-open and ages out regardless, so a clear failure only costs the
+// window we're trying to avoid).
+func clearClaimOnPromptFailure(opts *dispatchOpts, preAllocatedID string) {
+	if !opts.coordSpawn || opts.project == "" || preAllocatedID == "" {
+		return
+	}
+	if clrErr := clearCoordPendingClaim(opts.project); clrErr != nil {
+		_, _ = fmt.Fprintf(os.Stderr,
+			"warning: coord-spawn pending-claim cleanup after prompt-delivery failure failed (%v) — claim ages out in %s\n",
+			clrErr, coordFreshnessWindow)
+	}
+}
+
+// coordSpawnVeto returns a non-empty refusal reason when ANY signal
+// indicates a coord is (or is about to be) supervising the project,
+// or "" when ALL signals are clear. This is the OR-based veto that
+// closes the cold-start double-spawn window:
+//
+//	veto if (coordStateFresh && recordExists)   // original AND-gate
+//	     OR liveCoordRecord                      // record + live tmux now
+//	     OR pendingClaimFresh                     // cold-start in flight
+//
+// The original (coordStateFresh && recordExists) pair is preserved as
+// the first disjunct: it remains the steady-state signal once the coord
+// has ticked at least once. The two new disjuncts cover the windows the
+// AND-gate misses — a live coord whose coord-state.json hasn't refreshed
+// within the window (liveCoordRecord), and the cold-start gap before the
+// first tick (pendingClaimFresh).
+func coordSpawnVeto(coordStateFresh, recordExists, liveCoordRecord, pendingClaimFresh bool) string {
+	switch {
+	case coordStateFresh && recordExists:
+		return "coord-state.json mtime is recent AND a record exists"
+	case liveCoordRecord:
+		return "a live coord record (tmux session alive) exists for this project"
+	case pendingClaimFresh:
+		return "a coord-spawn is in flight (fresh pending claim) during the cold-start window"
+	default:
+		return ""
+	}
+}
+
+// liveCoordForAttach returns the live coord record (an agent record for
+// this task_id+project whose tmux session is alive on the local socket)
+// or nil. The dispatch path uses this to make coord-spawn IDEMPOTENT:
+// when a coord is already alive for the project, print an attach hint
+// and skip the spawn instead of minting a duplicate.
+//
+// Only a LOCAL-socket tmux liveness check counts here — a record whose
+// session lives on a different tmux server is invisible to this probe
+// (the cross-socket case is still covered by the coordSpawnVeto's
+// coord-state / pending-claim disjuncts and the skill's NB-flock).
+// Returns the newest match by SpawnedAt so a stale-record + live-record
+// pair resolves to the live successor.
+func liveCoordForAttach(taskID, project string, records []*agent.Record, sessionAlive sessionAliveProbe) *agent.Record {
+	var best *agent.Record
+	for _, r := range records {
+		if r == nil {
+			continue
+		}
+		if r.TaskID != taskID || r.Project != project {
+			continue
+		}
+		if r.TmuxSession == "" || !sessionAlive(r.TmuxSession) {
+			continue
+		}
+		if best == nil || r.SpawnedAt.After(best.SpawnedAt) {
+			best = r
+		}
+	}
+	return best
+}
+
+// uniqueLiveCoordForAttach returns the live coord record ONLY when there
+// is EXACTLY ONE live candidate for the task_id+project; it returns nil
+// when there are zero OR two-or-more live candidates (codex iter-8 P2).
+//
+// The fast path PROMOTES the returned record (exit 0 `agent <id>
+// spawned`). With MULTIPLE live coord records the project-wide
+// coord-state.json cannot identify WHICH coord wrote it: an older real
+// coord's tick could vouch for a newer prompt-failed session that
+// liveCoordForAttach (newest-wins) would select, promoting a
+// non-coordinator. Requiring uniqueness removes that ambiguity — when the
+// project is already in a duplicate-live-coord state, the fast path
+// promotes nobody and the dispatch falls through to the veto/recovery
+// path, which is the correct handling for an already-forked project.
+func uniqueLiveCoordForAttach(taskID, project string, records []*agent.Record, sessionAlive sessionAliveProbe) *agent.Record {
+	var found *agent.Record
+	n := 0
+	for _, r := range records {
+		if r == nil {
+			continue
+		}
+		if r.TaskID != taskID || r.Project != project {
+			continue
+		}
+		if r.TmuxSession == "" || !sessionAlive(r.TmuxSession) {
+			continue
+		}
+		found = r
+		n++
+		if n > 1 {
+			return nil // ambiguous: refuse to promote any
+		}
+	}
+	if n == 1 {
+		return found
+	}
+	return nil
 }
 
 // pidAlive is the production pidAliveFn. Mirrors workers.IsAlive (the

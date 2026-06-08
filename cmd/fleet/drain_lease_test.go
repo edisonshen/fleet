@@ -151,10 +151,12 @@ func TestDrainLease_LiveLeaderBarrierAppearsMidPoll_NoDuplicateResume(t *testing
 			// Barrier appears on the 2nd poll (the producer just wrote it).
 			return atomic.AddInt32(&barrierReads, 1) >= 2
 		},
-		// After the barrier, OLD releases (active owner flips away) so the
-		// graceful self-release wait completes.
-		ActiveOwnerPID: func(string) (int, bool) { return 0, false },
+		// After the barrier, a SUCCESSOR (different pid) acquires the lease so the
+		// graceful path completes via the confirmed-successor branch (codex PR3
+		// iter-14 [P1]: completion needs a confirmed successor, not !ok).
+		ActiveOwnerPID: func(string) (int, bool) { return 555555, true },
 		LoadAgent:      func(string) (*agent.Record, error) { return oldCoordRec(), nil },
+		KillCoord:      func(coord.KillTarget) error { return nil }, // OLD released; reap its lingering supervisor
 		Resume: func(queue.SpawnFresh, string, int, io.Writer, io.Writer) error {
 			atomic.AddInt32(&resumed, 1)
 			return nil
@@ -202,6 +204,41 @@ func TestDrainLease_SuccessorAlreadyLeads_NoDuplicateSpawn(t *testing.T) {
 	}
 }
 
+// codex PR3 iter-14 [P1]: the live-leader fallback must gate "successor already
+// leads" on a HEALTHY leader, not a raw active-epoch owner. A standby that wrote
+// its `active` epoch (pid != OLD) then crashed (LeaderPresent=false) must NOT be
+// treated as a completed handoff — deleting the queue would strand the project.
+// The drain must instead complete via the legacy Resume fallback.
+func TestDrainLease_LiveLeaderFallback_CrashedSuccessorNotCompletion(t *testing.T) {
+	var resumed int32
+	out := &bytes.Buffer{}
+	// LeaderPresent gates the top-level switch (call #1 -> true, routes to the
+	// live-leader fallback) and then the fallback's inner healthySuccessorPresent
+	// check (call #2 -> false, the "successor" wrote its epoch then crashed). The
+	// poll loop in between calls ActiveOwnerPID, not LeaderPresent, so exactly two
+	// LeaderPresent reads occur.
+	var leaderReads int32
+	d := drainLeaseDeps{
+		LeaderPresent:  func(string) bool { return atomic.AddInt32(&leaderReads, 1) == 1 },
+		CurrentEpoch:   func(string) (int64, bool) { return 6, true },
+		BarrierExists:  func(string, int64) bool { return false },
+		ActiveOwnerPID: func(string) (int, bool) { return 777777, true }, // non-OLD pid, but dead
+		LoadAgent:      func(string) (*agent.Record, error) { return oldCoordRec(), nil },
+		LockAgent:      func(string) (func(), error) { return func() {}, nil },
+		Resume: func(queue.SpawnFresh, string, int, io.Writer, io.Writer) error {
+			atomic.AddInt32(&resumed, 1)
+			return nil
+		},
+		BarrierPoll: time.Millisecond,
+	}
+	if err := drainOneLeaseAwareWith(leaseDrainReq(), existingQueuePath(t), 0, 5, out, out, d); err != nil {
+		t.Fatalf("crashed-successor fallback returned %v, want nil (legacy resume completes it)", err)
+	}
+	if atomic.LoadInt32(&resumed) != 1 {
+		t.Errorf("legacy Resume ran %d times, want 1 — a crashed active-epoch owner is NOT a completed handoff", resumed)
+	}
+}
+
 // T25: no barrier present and the leader is unresponsive (deadline passes) —
 // drain does NOT graceful-kill OLD before the barrier; it escalates instead.
 // Combined with T41 here: the escalation calls TakeOver.
@@ -220,7 +257,7 @@ func TestDrainLease_NoBarrierNoGracefulKill_Escalates(t *testing.T) {
 			atomic.AddInt32(&tookOver, 1)
 			return true, nil
 		},
-		RecoverSpawn: func(oldRec *agent.Record, _, preAllocatedID string, _, _ io.Writer) error {
+		RecoverSpawn: func(oldRec *agent.Record, _, preAllocatedID string, _ bool, _, _ io.Writer) error {
 			atomic.AddInt32(&recovered, 1)
 			recoveredFromOld = oldRec
 			recoveredID = preAllocatedID
@@ -274,7 +311,7 @@ func TestDrainLease_ConcurrentRecovery_NoDuplicate(t *testing.T) {
 		BarrierExists: func(string, int64) bool { return false },
 		LoadAgent:     func(string) (*agent.Record, error) { return oldCoordRec(), nil },
 		TakeOver:      func(string, string) (bool, error) { atomic.AddInt32(&tookOver, 1); return true, nil },
-		RecoverSpawn: func(*agent.Record, string, string, io.Writer, io.Writer) error {
+		RecoverSpawn: func(*agent.Record, string, string, bool, io.Writer, io.Writer) error {
 			atomic.AddInt32(&recovered, 1)
 			return nil
 		},
@@ -308,7 +345,7 @@ func TestDrainLease_HungOldEscalatesToTakeOver(t *testing.T) {
 			tookOverProject = project
 			return true, nil // takeover acquired -> OLD confirmed gone
 		},
-		RecoverSpawn: func(*agent.Record, string, string, io.Writer, io.Writer) error {
+		RecoverSpawn: func(*agent.Record, string, string, bool, io.Writer, io.Writer) error {
 			atomic.AddInt32(&recovered, 1)
 			return nil
 		},
@@ -332,6 +369,45 @@ func TestDrainLease_HungOldEscalatesToTakeOver(t *testing.T) {
 	}
 	if atomic.LoadInt32(&recovered) != 1 {
 		t.Errorf("RecoverSpawn ran %d times after takeover, want 1 (no coordless project)", recovered)
+	}
+}
+
+// codex PR3 iter-14 [P2]: the queue's DisableAutoResume override must reach
+// RecoverSpawn on the takeover-recovery path (so `fleet handoff --no-auto-resume`
+// is honored on an escalated drain, not silently overridden by OLD's baseline).
+func TestDrainLease_TakeoverRecovery_HonorsQueueAutoResumeOverride(t *testing.T) {
+	out := &bytes.Buffer{}
+	var gotDisable bool
+	var recovered int32
+	disable := true // queue override: --no-auto-resume
+	req := leaseDrainReq()
+	req.DisableAutoResume = &disable
+	d := drainLeaseDeps{
+		LeaderPresent: func(string) bool { return false },
+		CurrentEpoch:  func(string) (int64, bool) { return 9, true },
+		BarrierExists: func(string, int64) bool { return false },
+		LoadAgent: func(string) (*agent.Record, error) {
+			r := oldCoordRec()
+			r.DisableAutoResume = false // baseline DIFFERS from the override
+			return r, nil
+		},
+		TakeOver: func(string, string) (bool, error) { return true, nil },
+		RecoverSpawn: func(_ *agent.Record, _, _ string, disableAutoResume bool, _, _ io.Writer) error {
+			gotDisable = disableAutoResume
+			atomic.AddInt32(&recovered, 1)
+			return nil
+		},
+		LockAgent:   func(string) (func(), error) { return func() {}, nil },
+		BarrierPoll: time.Millisecond,
+	}
+	if err := drainOneLeaseAwareWith(req, existingQueuePath(t), 0, 5, out, out, d); !errors.Is(err, ErrEscalatedToTakeOver) {
+		t.Fatalf("expected escalation, got %v", err)
+	}
+	if atomic.LoadInt32(&recovered) != 1 {
+		t.Fatalf("RecoverSpawn ran %d times, want 1", recovered)
+	}
+	if !gotDisable {
+		t.Error("RecoverSpawn received disableAutoResume=false, want true (queue --no-auto-resume override ignored)")
 	}
 }
 
@@ -361,7 +437,7 @@ func TestDrainLease_BareCoordRoutesToLegacyResume_NoDuplicate(t *testing.T) {
 			atomic.AddInt32(&tookOver, 1)
 			return true, nil
 		},
-		RecoverSpawn: func(*agent.Record, string, string, io.Writer, io.Writer) error {
+		RecoverSpawn: func(*agent.Record, string, string, bool, io.Writer, io.Writer) error {
 			atomic.AddInt32(&recovered, 1)
 			return nil
 		},
@@ -392,9 +468,9 @@ func TestDrainLease_GracefulKillRefusalSurfaced(t *testing.T) {
 		LeaderPresent: func(string) bool { return true },
 		CurrentEpoch:  func(string) (int64, bool) { return 5, true },
 		BarrierExists: func(string, int64) bool { return true }, // graceful path
-		// OLD is NOT the active owner (already releasing/stale) -> direct reap
-		// path (not the self-release wait).
-		ActiveOwnerPID: func(string) (int, bool) { return 0, false },
+		// A SUCCESSOR (different pid) already owns the lease -> OLD released;
+		// reap its lingering supervisor directly (not the self-release wait).
+		ActiveOwnerPID: func(string) (int, bool) { return 555555, true },
 		LoadAgent: func(string) (*agent.Record, error) {
 			return oldCoordRec(), nil
 		},
@@ -402,6 +478,7 @@ func TestDrainLease_GracefulKillRefusalSurfaced(t *testing.T) {
 			target = kt
 			return refusal
 		},
+		BarrierPoll: time.Millisecond,
 	}
 	err := drainOneLeaseAwareWith(leaseDrainReq(), "/tmp/q.json", 0, 1000, out, out, d)
 	if err == nil || !errors.Is(err, refusal) {
@@ -422,20 +499,58 @@ func TestDrainLease_GracefulKillRefusalSurfaced(t *testing.T) {
 func TestDrainLease_GracefulOldAlreadyArchived(t *testing.T) {
 	out := &bytes.Buffer{}
 	var killed int32
+	// OLD archived AND a successor holds the lease -> genuinely complete: clean
+	// the queue, no kill. (codex PR3 iter-14 [P1]: a confirmed successor, not
+	// merely OLD's archive, is what proves completion.)
 	d := drainLeaseDeps{
 		LeaderPresent:  func(string) bool { return true },
 		CurrentEpoch:   func(string) (int64, bool) { return 5, true },
 		BarrierExists:  func(string, int64) bool { return true },
-		ActiveOwnerPID: func(string) (int, bool) { return 0, false },
+		ActiveOwnerPID: func(string) (int, bool) { return 555555, true }, // successor leads
 		LoadAgent:      func(string) (*agent.Record, error) { return nil, state.ErrNotFound },
 		KillCoord:      func(coord.KillTarget) error { atomic.AddInt32(&killed, 1); return nil },
+		BarrierPoll:    time.Millisecond,
 	}
-	// queue.Delete on a non-existent path is tolerated by handoffop's
-	// cleanUpStaleQueue elsewhere; here Delete returns its own error which we
-	// accept either way — assert no kill + no crash.
-	_ = drainOneLeaseAwareWith(leaseDrainReq(), "/tmp/does-not-exist-q.json", 0, 1000, out, out, d)
+	qp := existingQueuePath(t)
+	if err := drainOneLeaseAwareWith(leaseDrainReq(), qp, 0, 1000, out, out, d); err != nil {
+		t.Fatalf("archived OLD + successor present should complete cleanly, got %v", err)
+	}
 	if atomic.LoadInt32(&killed) != 0 {
 		t.Errorf("kill ran %d times though OLD was already archived", killed)
+	}
+	if _, statErr := os.Stat(qp); !errors.Is(statErr, os.ErrNotExist) {
+		t.Errorf("queue must be deleted when archived OLD has a confirmed successor")
+	}
+}
+
+// codex PR3 iter-14 [P1]: OLD is archived (coord-run released the lease then
+// archived OLD) but NO successor has acquired the freed lease yet (standby
+// crashed / still mid-poll). Deleting the queue here would strand the project
+// coordless with the only recovery request gone. The drain must NOT delete it —
+// it preserves the queue + surfaces an error so a later pass (or the standby
+// finally acquiring) completes the handoff.
+func TestDrainLease_GracefulOldArchivedNoSuccessor_PreservesQueue(t *testing.T) {
+	out := &bytes.Buffer{}
+	var killed int32
+	d := drainLeaseDeps{
+		LeaderPresent:  func(string) bool { return true },
+		CurrentEpoch:   func(string) (int64, bool) { return 5, true },
+		BarrierExists:  func(string, int64) bool { return true },
+		ActiveOwnerPID: func(string) (int, bool) { return 0, false }, // no successor
+		LoadAgent:      func(string) (*agent.Record, error) { return nil, state.ErrNotFound },
+		KillCoord:      func(coord.KillTarget) error { atomic.AddInt32(&killed, 1); return nil },
+		BarrierPoll:    time.Millisecond,
+	}
+	qp := existingQueuePath(t)
+	err := drainOneLeaseAwareWith(leaseDrainReq(), qp, 0, 5, out, out, d)
+	if err == nil {
+		t.Fatal("no-successor archived case must surface an error, not declare done")
+	}
+	if atomic.LoadInt32(&killed) != 0 {
+		t.Errorf("kill ran %d times though OLD was already archived", killed)
+	}
+	if _, statErr := os.Stat(qp); errors.Is(statErr, os.ErrNotExist) {
+		t.Error("queue must be PRESERVED when archived OLD has no successor (deleting it strands the project coordless)")
 	}
 }
 
@@ -446,16 +561,20 @@ func TestDrainLease_GracefulOldAlreadyArchived(t *testing.T) {
 func TestDrainLease_GracefulWaitsForSelfRelease(t *testing.T) {
 	out := &bytes.Buffer{}
 	var killed, tookOver int32
-	// OLD is the active owner for the first two reads, then releases.
+	// OLD is the active owner for the first two reads, then a SUCCESSOR (a
+	// DIFFERENT pid) acquires the freed flock. Completion requires a confirmed
+	// successor owner, not merely OLD's absence (codex PR3 iter-14 [P1]).
+	const successorPid = 555555
 	var reads int32
 	d := drainLeaseDeps{
 		CurrentEpoch:  func(string) (int64, bool) { return 5, true },
 		BarrierExists: func(string, int64) bool { return true },
+		LeaderPresent: func(string) bool { return true }, // successor heartbeats (healthy)
 		ActiveOwnerPID: func(string) (int, bool) {
 			if atomic.AddInt32(&reads, 1) <= 2 {
 				return 424242, true // OLD still leader
 			}
-			return 0, false // OLD released
+			return successorPid, true // standby acquired the freed lease
 		},
 		LoadAgent:   func(string) (*agent.Record, error) { return oldCoordRec(), nil },
 		KillCoord:   func(coord.KillTarget) error { atomic.AddInt32(&killed, 1); return nil },
@@ -470,10 +589,94 @@ func TestDrainLease_GracefulWaitsForSelfRelease(t *testing.T) {
 		t.Errorf("force-killed the active leader %d times — must wait for self-release", killed)
 	}
 	if atomic.LoadInt32(&tookOver) != 0 {
-		t.Errorf("escalated to takeover %d times — OLD released cleanly, no escalation needed", tookOver)
+		t.Errorf("escalated to takeover %d times — successor acquired cleanly, no escalation needed", tookOver)
 	}
-	if !strings.Contains(out.String(), "released the lease") {
-		t.Errorf("expected self-release completion message, got: %q", out.String())
+	if !strings.Contains(out.String(), "successor pid 555555 acquired") {
+		t.Errorf("expected confirmed-successor completion message, got: %q", out.String())
+	}
+}
+
+// codex PR3 iter-14 [P1]: OLD releases the lease but NO successor ever acquires
+// (the standby crashed / never came up) — ActiveOwnerPID returns !ok. The drain
+// must NOT treat that as completion (deleting the queue would strand the project
+// coordless); it waits to the budget then ESCALATES to takeover+recover so a
+// successor is brought up.
+func TestDrainLease_GracefulOldReleasedNoSuccessor_Escalates(t *testing.T) {
+	out := &bytes.Buffer{}
+	var killed, tookOver, recovered int32
+	var reads int32
+	d := drainLeaseDeps{
+		CurrentEpoch:  func(string) (int64, bool) { return 5, true },
+		BarrierExists: func(string, int64) bool { return true },
+		ActiveOwnerPID: func(string) (int, bool) {
+			if atomic.AddInt32(&reads, 1) == 1 {
+				return 424242, true // OLD still leader -> enters the self-release wait
+			}
+			return 0, false // OLD released but NO successor acquired
+		},
+		LoadAgent: func(string) (*agent.Record, error) { return oldCoordRec(), nil },
+		KillCoord: func(coord.KillTarget) error { atomic.AddInt32(&killed, 1); return nil },
+		TakeOver:  func(string, string) (bool, error) { atomic.AddInt32(&tookOver, 1); return true, nil },
+		RecoverSpawn: func(*agent.Record, string, string, bool, io.Writer, io.Writer) error {
+			atomic.AddInt32(&recovered, 1)
+			return nil
+		},
+		LockAgent:   func(string) (func(), error) { return func() {}, nil },
+		BarrierPoll: time.Millisecond,
+	}
+	qp := existingQueuePath(t)
+	err := drainOneLeaseAwareWith(leaseDrainReq(), qp, 0, 5, out, out, d)
+	if !errors.Is(err, ErrEscalatedToTakeOver) {
+		t.Fatalf("no-successor self-release must escalate; got %v", err)
+	}
+	if atomic.LoadInt32(&tookOver) != 1 {
+		t.Errorf("TakeOver ran %d times, want 1 (no successor -> must escalate, not declare done)", tookOver)
+	}
+	if atomic.LoadInt32(&recovered) != 1 {
+		t.Errorf("RecoverSpawn ran %d times, want 1 (project must not be left coordless)", recovered)
+	}
+}
+
+// codex PR3 iter-14 [P1]: a successor that CRASHED after writing its `active`
+// epoch but before releasing still shows in ActiveOwnerPID (pid != OLD) — but it
+// is NOT a live leader (LeaderPresent=false). The drain must NOT treat that
+// stale active owner as a confirmed successor and delete the queue; it must wait
+// then escalate to takeover+recover so a LIVE successor is brought up.
+func TestDrainLease_GracefulSuccessorCrashedAfterEpoch_Escalates(t *testing.T) {
+	out := &bytes.Buffer{}
+	var tookOver, recovered int32
+	var reads int32
+	d := drainLeaseDeps{
+		CurrentEpoch:  func(string) (int64, bool) { return 5, true },
+		BarrierExists: func(string, int64) bool { return true },
+		// OLD active on first read (enters self-release wait); then a DIFFERENT
+		// pid owns the active epoch — but it crashed, so LeaderPresent=false.
+		ActiveOwnerPID: func(string) (int, bool) {
+			if atomic.AddInt32(&reads, 1) == 1 {
+				return 424242, true // OLD still leader
+			}
+			return 777777, true // a successor wrote its epoch then crashed
+		},
+		LeaderPresent: func(string) bool { return false }, // no HEALTHY leader heartbeating
+		LoadAgent:     func(string) (*agent.Record, error) { return oldCoordRec(), nil },
+		TakeOver:      func(string, string) (bool, error) { atomic.AddInt32(&tookOver, 1); return true, nil },
+		RecoverSpawn: func(*agent.Record, string, string, bool, io.Writer, io.Writer) error {
+			atomic.AddInt32(&recovered, 1)
+			return nil
+		},
+		LockAgent:   func(string) (func(), error) { return func() {}, nil },
+		BarrierPoll: time.Millisecond,
+	}
+	qp := existingQueuePath(t)
+	err := drainOneLeaseAwareWith(leaseDrainReq(), qp, 0, 5, out, out, d)
+	if !errors.Is(err, ErrEscalatedToTakeOver) {
+		t.Fatalf("crashed-successor must escalate (not declare done off a stale active epoch); got %v", err)
+	}
+	if atomic.LoadInt32(&tookOver) != 1 {
+		t.Errorf("TakeOver ran %d times, want 1", tookOver)
+	}
+	if atomic.LoadInt32(&recovered) != 1 {
+		t.Errorf("RecoverSpawn ran %d times, want 1 (a dead active-epoch owner is not a successor)", recovered)
 	}
 }
 
@@ -484,12 +687,20 @@ func TestDrainLease_GracefulOldHoldsLeasePastBudget_Escalates(t *testing.T) {
 	var tookOver int32
 	var recovered int32
 	d := drainLeaseDeps{
-		CurrentEpoch:   func(string) (int64, bool) { return 5, true },
-		BarrierExists:  func(string, int64) bool { return true },
-		ActiveOwnerPID: func(string) (int, bool) { return 424242, true }, // never releases
-		LoadAgent:      func(string) (*agent.Record, error) { return oldCoordRec(), nil },
-		TakeOver:       func(string, string) (bool, error) { atomic.AddInt32(&tookOver, 1); return true, nil },
-		RecoverSpawn: func(*agent.Record, string, string, io.Writer, io.Writer) error {
+		CurrentEpoch:  func(string) (int64, bool) { return 5, true },
+		BarrierExists: func(string, int64) bool { return true },
+		// OLD holds the lease past the budget; after TakeOver fences+kills it the
+		// lease is free with no successor (the post-takeover re-check sees !ok),
+		// so RecoverSpawn brings up a replacement.
+		ActiveOwnerPID: func(string) (int, bool) {
+			if atomic.LoadInt32(&tookOver) == 0 {
+				return 424242, true // OLD still leads until takeover reaps it
+			}
+			return 0, false // OLD killed; no successor yet -> RecoverSpawn
+		},
+		LoadAgent: func(string) (*agent.Record, error) { return oldCoordRec(), nil },
+		TakeOver:  func(string, string) (bool, error) { atomic.AddInt32(&tookOver, 1); return true, nil },
+		RecoverSpawn: func(*agent.Record, string, string, bool, io.Writer, io.Writer) error {
 			atomic.AddInt32(&recovered, 1)
 			return nil
 		},
@@ -521,7 +732,7 @@ func TestDrainLease_TakeoverNotAcquired_NoRecoverSpawn(t *testing.T) {
 		BarrierExists: func(string, int64) bool { return false },
 		LoadAgent:     func(string) (*agent.Record, error) { return oldCoordRec(), nil },
 		TakeOver:      func(string, string) (bool, error) { return false, nil }, // did NOT acquire
-		RecoverSpawn: func(*agent.Record, string, string, io.Writer, io.Writer) error {
+		RecoverSpawn: func(*agent.Record, string, string, bool, io.Writer, io.Writer) error {
 			atomic.AddInt32(&recovered, 1)
 			return nil
 		},
@@ -594,7 +805,9 @@ func TestDrainLease_ColdResume_HoldsPerAgentLock(t *testing.T) {
 			return nil
 		},
 	}
-	if err := drainOneLeaseAwareWith(leaseDrainReq(), "/tmp/q.json", 0, 1000, out, out, d); err != nil {
+	// resumeTimeoutMillis=0 -> coldResume runs synchronously (no timeout), so the
+	// lock-held-then-released ordering is deterministic for this contract test.
+	if err := drainOneLeaseAwareWith(leaseDrainReq(), "/tmp/q.json", 0, 0, out, out, d); err != nil {
 		t.Fatalf("cold resume returned %v, want nil", err)
 	}
 	if !lockedDuringResume {
@@ -602,6 +815,40 @@ func TestDrainLease_ColdResume_HoldsPerAgentLock(t *testing.T) {
 	}
 	if atomic.LoadInt32(&released) != 1 {
 		t.Errorf("per-agent lock released %d times, want 1 (must always release)", released)
+	}
+}
+
+// codex PR3 iter-14 [P1]: coldResume HONORS resumeTimeoutMillis — a Resume that
+// hangs past the budget must RETURN (surface), not block fleet drain forever
+// (the drain-storm class). Deterministic: a Resume that blocks on a channel the
+// test never closes, asserted to RETURN at ~budget, not a wall-clock value.
+func TestDrainLease_ColdResume_HonorsResumeTimeout(t *testing.T) {
+	out := &bytes.Buffer{}
+	block := make(chan struct{})
+	t.Cleanup(func() { close(block) }) // unblock the abandoned goroutine at test end
+	d := drainLeaseDeps{
+		CurrentEpoch: func(string) (int64, bool) { return 0, false }, // stealable -> coldResume
+		LockAgent:    func(string) (func(), error) { return func() {}, nil },
+		Resume: func(queue.SpawnFresh, string, int, io.Writer, io.Writer) error {
+			<-block // hang past the budget
+			return nil
+		},
+	}
+	done := make(chan error, 1)
+	go func() {
+		// 20ms budget; Resume never returns until t.Cleanup -> must time out.
+		done <- drainOneLeaseAwareWith(leaseDrainReq(), "/tmp/q.json", 0, 20, out, out, d)
+	}()
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("coldResume returned nil though Resume hung past the budget; want a timeout error")
+		}
+		if !strings.Contains(err.Error(), "resume-timeout") {
+			t.Errorf("expected a resume-timeout error, got %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("coldResume BLOCKED past the budget — resume-timeout not honored (drain-storm regression)")
 	}
 }
 
@@ -620,14 +867,17 @@ func TestDrainLease_GracefulPath_HoldsNoPerAgentLock(t *testing.T) {
 	d := drainLeaseDeps{
 		CurrentEpoch:  func(string) (int64, bool) { return 5, true },
 		BarrierExists: func(string, int64) bool { return true },
+		LeaderPresent: func(string) bool { return true }, // successor heartbeats (healthy)
 		ActiveOwnerPID: func(string) (int, bool) {
 			// First read: OLD still leader (enters the self-release wait, during
-			// which we probe the sibling lock). Then OLD releases.
+			// which we probe the sibling lock). Then a SUCCESSOR (different pid)
+			// acquires the freed lease -> graceful completion, lock-free (codex
+			// PR3 iter-14 [P1]: completion needs a confirmed healthy successor).
 			if atomic.AddInt32(&reads, 1) == 1 {
 				close(probed)
 				return 424242, true
 			}
-			return 0, false
+			return 555555, true
 		},
 		LoadAgent:   func(string) (*agent.Record, error) { return oldCoordRec(), nil },
 		BarrierPoll: 50 * time.Millisecond,
@@ -660,5 +910,165 @@ func TestDrainLease_GracefulPath_HoldsNoPerAgentLock(t *testing.T) {
 	case <-done:
 	case <-time.After(5 * time.Second):
 		t.Fatal("graceful path did not converge")
+	}
+}
+
+// codex PR3 iter-14 [P1] REGRESSION: takeoverAndRecover must NOT hold the
+// per-agent lock across TakeOver. The production TakeOver SIGTERMs the hung OLD,
+// whose coord.Cleanup archives OLD's record under state.LockAgent(OLD). If the
+// drain held that SAME lock across TakeOver, OLD's cleanup would block -> OLD is
+// SIGKILLed with a STALE live record + orphaned tmux/engine (the deadlock class
+// this whole stack exists to kill, reintroduced in PR3's takeover path).
+//
+// This test wires the REAL state.LockAgent as the seam and, INSIDE the TakeOver
+// callback (i.e. while the kill is "in flight"), simulates OLD's coord.Cleanup
+// archive grabbing state.LockAgent(OLD). With the lock held across TakeOver that
+// sibling acquire deadlocks; with the narrowed critical section it acquires
+// immediately. Deterministic: a channel proves the sibling lock was granted
+// during TakeOver, no wall-clock timing assertion.
+func TestDrainLease_TakeoverDoesNotHoldLockAcrossKill(t *testing.T) {
+	setupFleetHome(t)
+
+	out := &bytes.Buffer{}
+	siblingGotLock := make(chan struct{})
+	var recovered int32
+
+	d := drainLeaseDeps{
+		LeaderPresent: func(string) bool { return false },
+		CurrentEpoch:  func(string) (int64, bool) { return 9, true },
+		BarrierExists: func(string, int64) bool { return false },
+		LoadAgent:     func(string) (*agent.Record, error) { return oldCoordRec(), nil },
+		// REAL per-agent lock — the same primitive coord.Cleanup's archive uses.
+		LockAgent: state.LockAgent,
+		TakeOver: func(string, string) (bool, error) {
+			// Simulate OLD's coord.Cleanup archive (archiveAgentRecord ->
+			// state.LockAgent(OLD)) running while the kill is in flight. If the
+			// drain holds the lock across TakeOver this blocks forever.
+			rel, err := state.LockAgent("oldcoord1")
+			if err != nil {
+				return false, err
+			}
+			rel()
+			close(siblingGotLock)
+			return true, nil // takeover acquired -> OLD confirmed gone
+		},
+		RecoverSpawn: func(*agent.Record, string, string, bool, io.Writer, io.Writer) error {
+			atomic.AddInt32(&recovered, 1)
+			return nil
+		},
+		BarrierPoll: time.Millisecond,
+	}
+
+	qp := existingQueuePath(t)
+	done := make(chan error, 1)
+	go func() { done <- drainOneLeaseAwareWith(leaseDrainReq(), qp, 0, 5, out, out, d) }()
+
+	select {
+	case <-siblingGotLock:
+		// OLD's cleanup-equivalent acquired the lock DURING TakeOver — the drain
+		// is not holding it across the kill. No deadlock.
+	case <-time.After(5 * time.Second):
+		t.Fatal("sibling LockAgent(OLD) BLOCKED during TakeOver — drain holds the per-agent lock across the kill (iter-14 deadlock regression)")
+	}
+
+	select {
+	case err := <-done:
+		if !errors.Is(err, ErrEscalatedToTakeOver) {
+			t.Fatalf("expected escalation signal, got %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("takeover recovery did not converge")
+	}
+	if atomic.LoadInt32(&recovered) != 1 {
+		t.Errorf("RecoverSpawn ran %d times, want 1 (successor recovered under the SHORT post-takeover lock)", recovered)
+	}
+}
+
+// codex PR3 iter-14 [P1] REGRESSION: a takeover-recovered successor must run the
+// post-spawn handoff TAIL — write the coord-spawn marker for the NEW agent (so
+// the TUI/attach can discover it; the dead OLD's cleanup cleared the old one)
+// AND send handoff.ResumePrompt(docPath) (so the fresh coord actually resumes
+// from the handoff doc instead of sitting idle). Without it the replacement is
+// invisible + inert.
+func TestRecoverHandoffTail_WritesMarkerAndSendsPrompt(t *testing.T) {
+	oldRec := oldCoordRec()
+	oldRec.TaskID = "coord-projects-fleet" // IsCoordSpawn requires "coord-<project>"
+
+	var gotMarkerProj, gotMarkerID, gotSession, gotPrompt string
+	origMarker := recoverWriteMarkerFn
+	origReady := recoverWaitForReadyFn
+	origAlive := recoverSessionAliveFn
+	origPrompt := recoverSendPromptVerifiedFn
+	t.Cleanup(func() {
+		recoverWriteMarkerFn = origMarker
+		recoverWaitForReadyFn = origReady
+		recoverSessionAliveFn = origAlive
+		recoverSendPromptVerifiedFn = origPrompt
+	})
+	recoverWriteMarkerFn = func(project, id string) error { gotMarkerProj, gotMarkerID = project, id; return nil }
+	recoverWaitForReadyFn = func(string) error { return nil }
+	recoverSessionAliveFn = func(string) (bool, error) { return true, nil }
+	recoverSendPromptVerifiedFn = func(session, prompt string) (bool, error) {
+		gotSession, gotPrompt = session, prompt
+		return true, nil
+	}
+
+	rec := agent.New("newcoord9")
+	rec.Project = "projects-fleet"
+	rec.TmuxSession = "fleet-newcoord9"
+	if err := recoverHandoffTail(oldRec, rec, "/tmp/handoff.md", false, &bytes.Buffer{}, &bytes.Buffer{}); err != nil {
+		t.Fatalf("recoverHandoffTail returned %v", err)
+	}
+
+	if gotMarkerProj != "projects-fleet" || gotMarkerID != "newcoord9" {
+		t.Errorf("coord-spawn marker = (%q,%q), want (projects-fleet,newcoord9) — TUI cannot discover the replacement without it",
+			gotMarkerProj, gotMarkerID)
+	}
+	if gotSession != "fleet-newcoord9" {
+		t.Errorf("resume prompt sent to session %q, want fleet-newcoord9", gotSession)
+	}
+	if !strings.Contains(gotPrompt, "/tmp/handoff.md") {
+		t.Errorf("resume prompt %q must reference the handoff doc /tmp/handoff.md (the coord stays idle otherwise)", gotPrompt)
+	}
+}
+
+// The tail honors DisableAutoResume: no resume prompt is typed (the operator
+// drives the first turn), but the marker is STILL written so discovery works.
+func TestRecoverHandoffTail_DisableAutoResume_NoPromptStillMarks(t *testing.T) {
+	oldRec := oldCoordRec()
+	oldRec.TaskID = "coord-projects-fleet"
+
+	var markerWritten, promptSent bool
+	origMarker := recoverWriteMarkerFn
+	origReady := recoverWaitForReadyFn
+	origAlive := recoverSessionAliveFn
+	origPrompt := recoverSendPromptVerifiedFn
+	t.Cleanup(func() {
+		recoverWriteMarkerFn = origMarker
+		recoverWaitForReadyFn = origReady
+		recoverSessionAliveFn = origAlive
+		recoverSendPromptVerifiedFn = origPrompt
+	})
+	recoverWriteMarkerFn = func(string, string) error { markerWritten = true; return nil }
+	recoverWaitForReadyFn = func(string) error { return nil }
+	recoverSessionAliveFn = func(string) (bool, error) { return true, nil }
+	recoverSendPromptVerifiedFn = func(string, string) (bool, error) {
+		promptSent = true
+		return true, nil
+	}
+
+	// disableAutoResume=true (the EFFECTIVE policy, e.g. from a queue override).
+	rec := agent.New("newcoord9")
+	rec.Project = "projects-fleet"
+	rec.TmuxSession = "fleet-newcoord9"
+	if err := recoverHandoffTail(oldRec, rec, "/tmp/handoff.md", true, &bytes.Buffer{}, &bytes.Buffer{}); err != nil {
+		t.Fatalf("recoverHandoffTail returned %v", err)
+	}
+
+	if !markerWritten {
+		t.Error("marker must be written even when auto-resume is disabled (discovery is independent of resume)")
+	}
+	if promptSent {
+		t.Error("resume prompt must NOT be sent when DisableAutoResume is set")
 	}
 }

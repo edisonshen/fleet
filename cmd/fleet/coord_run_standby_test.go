@@ -17,10 +17,21 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/edisonshen/fleet/internal/agent"
 )
+
+// childPidSleepArgv returns an argv that records the child's own PID to pidFile
+// then sleeps, so a test can read the child's real pid and keep the record live
+// while it asserts the engine-pid stamp.
+func childPidSleepArgv(pidFile string) []string {
+	return []string{"sh", "-c", "echo $$ > " + pidFile + "; sleep 30"}
+}
 
 // T33: a standby coord polls a busy lease and starts the engine ONLY after
 // it acquires the lease (the leader exited / was taken over). The first
@@ -188,5 +199,82 @@ func TestCoordRun_Standby_AcquireFaultDuringPoll_Surfaces(t *testing.T) {
 	}
 	if _, serr := os.Stat(sentinel); !errors.Is(serr, os.ErrNotExist) {
 		t.Errorf("child sentinel %s exists — child MUST NOT start on a standby acquire fault", sentinel)
+	}
+}
+
+// codex PR3 iter-14 [P1]: a standby spawn skipped engine-pid resolution, so the
+// live record carries the dead spawning-CLI pid. After the standby ACQUIRES and
+// starts the engine child, coord-run must stamp the REAL child pid into the
+// record (else TUI/status misclassify the live successor as dead).
+func TestCoordRun_Standby_StampsEnginePIDAfterAcquire(t *testing.T) {
+	const (
+		agentID = "sb4stamp"
+		project = "sb-stamp"
+		session = "fleet-sb4stamp"
+	)
+	_ = coordRunTestHome(t, agentID, project, session)
+	// Provisional dead pid, as a real standby spawn would persist.
+	provisional := os.Getpid()
+	if rec, err := agent.Load(agentID); err == nil {
+		rec.PID = provisional
+		_ = rec.Write()
+	}
+
+	pidFile := filepath.Join(t.TempDir(), "child.pid")
+	lease := &fakeLease{}
+	acquire := func() (coordLease, bool, error) { return lease, true, nil } // acquire immediately
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	opts := coordRunOpts{
+		agentID:      agentID,
+		project:      project,
+		session:      session,
+		argv:         childPidSleepArgv(pidFile),
+		killTmux:     func(string) error { return nil },
+		standby:      true,
+		standbyPoll:  time.Millisecond,
+		acquireLease: acquire,
+	}
+	done := make(chan error, 1)
+	go func() { done <- runCoordRun(ctx, opts, os.Stdout, os.Stderr) }()
+
+	// Poll the live record until the stamp lands (PID changes off the
+	// provisional dead pid). Deterministic: a condition poll, not a sleep-assert.
+	var stamped int
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		if rec, err := agent.Load(agentID); err == nil && rec.PID != provisional && rec.PID > 0 {
+			stamped = rec.PID
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if stamped == 0 {
+		cancel()
+		<-done
+		t.Fatal("engine pid never stamped into the standby record after acquire (stale dead pid would remain)")
+	}
+
+	// The stamped pid must be the REAL engine child pid (from the pidfile).
+	var childPid int
+	for time.Now().Before(deadline) {
+		if b, err := os.ReadFile(pidFile); err == nil {
+			if p, perr := strconv.Atoi(strings.TrimSpace(string(b))); perr == nil {
+				childPid = p
+				break
+			}
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if childPid != 0 && stamped != childPid {
+		t.Errorf("stamped engine pid = %d, want the child pid %d", stamped, childPid)
+	}
+
+	cancel() // end the sleeping child -> runCoordRun returns + cleanup
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("runCoordRun did not return after cancel")
 	}
 }

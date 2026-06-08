@@ -100,6 +100,12 @@ type KillDeps struct {
 	// Sleep is the poll sleep between liveness checks (injectable so tests
 	// don't wall-clock wait). Production: time.Sleep.
 	Sleep func(time.Duration)
+	// ReapOrphan performs the cleanup a SIGKILLed supervisor's `defer
+	// Cleanup(...)` could not run: kill the tmux/engine session + archive the
+	// agent record (idempotent). Called ONLY on the SIGKILL-escalation branch
+	// (a clean SIGTERM exit ran the supervisor's own deferred cleanup).
+	// Production: a closure over coord.Cleanup with Default() deps.
+	ReapOrphan func(agentID, project string) error
 	// Stderr receives the reaped-coord log + refusal diagnostics
 	// (surface-don't-silo). nil = os.Stderr.
 	Stderr io.Writer
@@ -129,6 +135,12 @@ func DefaultKillDeps() KillDeps {
 		Grace:            killGraceDelay,
 		KillTimeout:      killEscalateTimeout,
 		Sleep:            time.Sleep,
+		ReapOrphan: func(agentID, project string) error {
+			// Reuse the canonical coord-exit cleanup (tmux kill + archive
+			// record + marker clear) the dead supervisor's defer could not run.
+			// Idempotent: Cleanup no-ops a record that is already archived.
+			return Cleanup(agentID, project, Default())
+		},
 	}
 }
 
@@ -330,6 +342,23 @@ func killCoord(target KillTarget, d KillDeps) error {
 		if err := d.Signal(target.Pid, syscall.SIGKILL); err != nil && !errors.Is(err, syscall.ESRCH) {
 			return fmt.Errorf("coord.KillCoordIfIdentityMatches: SIGKILL pid %d: %w", target.Pid, err)
 		}
+		// SIGKILL bypasses the supervisor's `defer Cleanup(...)`: a coord-run
+		// wedged enough to ignore SIGTERM never archives its record or kills its
+		// tmux/engine child. Without an explicit reap here the old engine session
+		// stays alive while takeover spawns a replacement -> duplicate/orphaned
+		// coord + stale live record (codex PR3 iter-14 [P1], the same
+		// orphan-after-takeover class the deadlock fix addresses). So the killer
+		// itself performs the cleanup the dead supervisor could not. ReapOrphan
+		// (production: coord.Cleanup) is idempotent — a no-op if the record was
+		// already archived — so reaping here is safe even on a borderline exit.
+		if rerr := d.ReapOrphan(match.ID, match.Project); rerr != nil {
+			// Surface-don't-silo: the SIGKILL succeeded but the orphan reap had a
+			// problem; the takeover still proceeds (the supervisor is dead, the
+			// flock is freed) but the operator sees the residue.
+			_, _ = fmt.Fprintf(stderr,
+				"coord.KillCoordIfIdentityMatches: SIGKILLed pid=%d (agent %s) but orphan reap failed: %v\n",
+				target.Pid, match.ID, rerr)
+		}
 	}
 
 	_, _ = fmt.Fprintf(stderr, "reaped coord pid=%d agent=%s epoch=%d\n",
@@ -365,6 +394,9 @@ func fillKillDeps(d KillDeps) KillDeps {
 	}
 	if d.Sleep == nil {
 		d.Sleep = def.Sleep
+	}
+	if d.ReapOrphan == nil {
+		d.ReapOrphan = def.ReapOrphan
 	}
 	if d.Grace == 0 {
 		d.Grace = def.Grace

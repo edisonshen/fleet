@@ -81,6 +81,28 @@ jobs:
       - name: Python tests
         run: python3 -m pytest skills/ scripts/ -q
 
+      - name: Reap /tmp/fleet-test-* sockets
+        # Linux hosted runners can retain tmux socket inodes after the
+        # race-enabled test binaries exit cleanly. This cleanup keeps the
+        # job's final state leak-free; the following assertion remains the
+        # gate for any socket that cannot be reaped.
+        if: always()
+        run: |
+          leaked=$(find /tmp -maxdepth 1 -name 'fleet-test-*.sock' \
+            -newer /tmp/fleet-test-ci-sentinel 2>/dev/null || true)
+          if [ -z "$leaked" ]; then
+            echo "no /tmp/fleet-test-*.sock cleanup needed"
+            exit 0
+          fi
+          echo "reaping /tmp/fleet-test-*.sock files from this CI run:"
+          echo "$leaked"
+          for sock in $leaked; do
+            if command -v tmux >/dev/null 2>&1; then
+              tmux -S "$sock" kill-server >/dev/null 2>&1 || true
+            fi
+            rm -f "$sock" || true
+          done
+
       - name: Assert no /tmp/fleet-test-* leak
         # fleet#165 PR-B gate. The test-suite Sweep (internal/testutil)
         # reaps stale fleet-test-*.sock files at every package's TestMain
