@@ -504,27 +504,31 @@ var ErrNotLeaseOwner = errors.New(
 
 // LeaseCheckByAncestor decides whether the calling process (startPid,
 // normally os.Getpid()) may mutate, given the project's lease state. It is
-// the executable form of the design's skill-side ownership proof, and is
-// careful to FENCE only the actual split-brain case — not every coord that
-// happens to lack a lease parent:
+// the executable form of the design's skill-side ownership proof.
+//
+// The discriminant is the caller's OWN lease, identified by walking its
+// getppid chain to find the recorded owner pid — NOT merely "is there a
+// healthy owner somewhere." This closes two holes (codex PR4 [P1]): a
+// fence-before-kill window (state=fencing) and a self-expired-but-still-
+// active record (a paused leader past TTL) must both FENCE the zombie's
+// tick, even though neither is a "healthy" record.
 //
 //	read coordinator.epoch
-//	  ├─ NO healthy active owner (no record / released / expired / hung)
-//	  │     -> NO lease is in play -> PROCEED (nil). A legacy non-wrapped
-//	  │        coord, or a live `fleet handoff` successor running before any
-//	  │        coord-run supervisor re-acquires, is NOT a zombie — there is
-//	  │        no successor holding the lease to protect. (codex PR4 [P1].)
-//	  └─ a HEALTHY active owner exists
-//	        ├─ an ancestor of startPid IS that owner (pid+pid_start match)
-//	        │     -> PROVEN -> PROCEED (nil).
-//	        └─ no ancestor is that owner
-//	              -> someone ELSE provably holds the active lease and this
-//	                 caller does not descend from it -> FENCE (ErrNotLeaseOwner).
+//	  ├─ NO record -> no lease in play -> PROCEED (legacy / non-wrapped coord).
+//	  └─ a record exists; walk startPid's ancestors:
+//	        ├─ an ancestor IS the recorded owner (pid+pid_start match)
+//	        │     ├─ record active AND NOT self-expired -> PROCEED (live leader)
+//	        │     └─ else (fencing / released / expired) -> FENCE: our own
+//	        │        lease was taken / lapsed -> self-demote.
+//	        └─ NO ancestor is the recorded owner
+//	              ├─ a DIFFERENT owner is healthy+active -> FENCE (a live
+//	              │  successor holds the lease; we are the zombie).
+//	              └─ else (owner dead/released/expired, not our ancestor)
+//	                 -> PROCEED: no live lease is in play for us (a legacy
+//	                    non-wrapped coord, or a live `fleet handoff` successor
+//	                    spawned after the old coord retired).
 //
-// This is exactly the split-brain guard: the fence fires iff a DIFFERENT
-// live leader holds the lease (a successor stole it from this coord's
-// retired parent). The walk is bounded so an unexpected ppid cycle / deep
-// tree can't spin.
+// The walk is bounded so an unexpected ppid cycle / deep tree can't spin.
 func LeaseCheckByAncestor(project string, startPid int) error {
 	return leaseCheckByAncestorWithCfg(project, startPid, defaultLeaseConfig())
 }
@@ -546,36 +550,25 @@ func leaseCheckByAncestorWithCfg(project string, startPid int, cfg leaseConfig) 
 		}
 		return fmt.Errorf("coordlock.LeaseCheck: read epoch: %w", err)
 	}
-	// Only a HEALTHY active leader can fence anyone. A released / expired /
-	// hung / fencing record means NO live successor currently holds the
-	// lease, so there is no split-brain to guard against -> proceed. (This
-	// is the codex PR4 [P1] fix: a live `fleet handoff` successor running
-	// after the old coord retired but before a coord-run re-acquires must
-	// NOT self-demote — nobody else owns the lease.)
 	l := &Lease{cfg: cfg, paths: paths, boot: cfg.boot()}
-	if !l.holderHealthy(rec) {
-		return nil
-	}
-	// A healthy active owner exists. Walk the ancestor chain from startPid;
-	// if one ancestor IS that owner (pid + pid_start match, PID-reuse-safe)
-	// the caller is legitimately under the live leader -> proceed. Otherwise
-	// a DIFFERENT live leader holds the lease and this caller is the zombie
-	// -> FENCE.
+
+	// Walk the caller's ancestor chain looking for the RECORDED owner pid.
 	ppidFn := cfg.ppid
 	if ppidFn == nil {
 		ppidFn = ppidOf
 	}
+	ancestorIsOwner := false
 	pid := startPid
 	const maxDepth = 64
 	for depth := 0; depth < maxDepth && pid > 1; depth++ {
 		if pid == rec.Owner.Pid {
-			st, ok := cfg.pidStart(pid)
-			if ok && st == rec.Owner.PidStart {
-				return nil // proven: an ancestor is the live owner
+			// pid matches the recorded owner pid; confirm it is the SAME
+			// process (PID-reuse-safe start-time match). A start-time
+			// mismatch means a recycled pid — NOT actually the owner.
+			if st, ok := cfg.pidStart(pid); ok && st == rec.Owner.PidStart {
+				ancestorIsOwner = true
 			}
-			// pid matches but start-time differs -> PID reuse; not the owner.
-			return fmt.Errorf("%w: ancestor pid=%d start-time mismatch (PID reuse)",
-				ErrNotLeaseOwner, pid)
+			break
 		}
 		ppid, ok := ppidFn(pid)
 		if !ok || ppid == pid {
@@ -583,8 +576,32 @@ func leaseCheckByAncestorWithCfg(project string, startPid int, cfg leaseConfig) 
 		}
 		pid = ppid
 	}
-	return fmt.Errorf("%w: active lease owner pid=%d is not an ancestor of pid=%d",
-		ErrNotLeaseOwner, rec.Owner.Pid, startPid)
+
+	if ancestorIsOwner {
+		// The caller descends from the recorded owner — this is OUR lease.
+		// Proceed ONLY if it is still validly ours: state==active AND not
+		// self-expired (same boot, within TTL). A fencing / released record,
+		// or an active-but-self-expired one (paused leader past TTL), means
+		// our lease was taken or lapsed -> FENCE so we self-demote BEFORE a
+		// takeover races us (Patroni "only act if I still own the lease").
+		if rec.State == stateActive && rec.BootID == l.boot &&
+			cfg.nowMono()-rec.RenewedAtMono <= int64(cfg.ttl) {
+			return nil
+		}
+		return fmt.Errorf("%w: our lease is no longer active (state=%s, possibly self-expired)",
+			ErrNotLeaseOwner, rec.State)
+	}
+
+	// No ancestor is the recorded owner. FENCE iff a DIFFERENT owner is a
+	// HEALTHY active leader (a live successor genuinely holds the lease, and
+	// we are the zombie). Otherwise no live lease is in play for us (legacy
+	// coord, or a live `fleet handoff` bare successor after the old retired)
+	// -> proceed.
+	if l.holderHealthy(rec) {
+		return fmt.Errorf("%w: active lease owner pid=%d is not an ancestor of pid=%d",
+			ErrNotLeaseOwner, rec.Owner.Pid, startPid)
+	}
+	return nil
 }
 
 // --- atomic write helpers (shared) ---

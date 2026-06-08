@@ -42,6 +42,7 @@ import (
 	"github.com/edisonshen/fleet/internal/coord"
 	"github.com/edisonshen/fleet/internal/coordlock"
 	"github.com/edisonshen/fleet/internal/coordrepo"
+	"github.com/edisonshen/fleet/internal/handoff"
 	"github.com/edisonshen/fleet/internal/handoffop"
 	"github.com/edisonshen/fleet/internal/queue"
 	"github.com/edisonshen/fleet/internal/spawn"
@@ -218,6 +219,32 @@ func productionRecoverSpawn(oldRec *agent.Record, docPath, preAllocatedID string
 	}
 	_, _ = fmt.Fprintf(stdout,
 		"fleet drain: cold-spawned lease-wrapped successor %s for %s after takeover\n", rec.ID, oldRec.Project)
+
+	// Deliver the resume prompt so the recovered successor READS the handoff
+	// doc and continues the in-flight work (codex PR4 [P1]). The safety-net
+	// takeover path bypasses handoffop.Resume/retireOldAgent and then deletes
+	// the queue as processed, so without an explicit prompt here the new coord
+	// would start blank and the in-flight work captured in docPath is
+	// stranded. Mirrors retireOldAgent's gated delivery: skip when the doc is
+	// empty or auto-resume is disabled (a non-claude wrapper must not receive
+	// "Read your handoff doc..." as garbage). Best-effort: a readiness/send
+	// failure is surfaced but does NOT fail the recovery — the successor is
+	// live + lease-held; the doc is also chain-linked on its record, and the
+	// operator can re-prompt on attach.
+	if docPath != "" && !oldRec.DisableAutoResume {
+		if werr := spawn.WaitForReadyToPrompt(rec.TmuxSession); werr != nil {
+			_, _ = fmt.Fprintf(stderr,
+				"fleet drain: recovered successor %s not ready for resume prompt (%v); "+
+					"it will resume from its chain-linked doc on `/coordinator`, or re-prompt on attach\n",
+				rec.ID, werr)
+			return nil
+		}
+		if serr := spawn.SendPromptKeys(rec.TmuxSession, handoff.ResumePrompt(docPath)); serr != nil {
+			_, _ = fmt.Fprintf(stderr,
+				"fleet drain: resume prompt to recovered successor %s failed (%v); "+
+					"re-prompt on attach (doc: %s)\n", rec.ID, serr, docPath)
+		}
+	}
 	return nil
 }
 

@@ -115,6 +115,25 @@ def test_worker_handoff_not_fenced_by_coord_lease(
     assert fenced_calls == [], "the coord fence must not even be consulted for a worker"
 
 
+# codex PR4 [P2]: a worker whose slug merely STARTS WITH "coord-" but is not
+# the exact "coord-<project>" must NOT be treated as the coord (a prefix
+# match would wrongly fence it).
+def test_coord_prefix_worker_not_treated_as_coord(
+    fleet_home_tmp: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _stub_collectors(monkeypatch)
+    fenced_calls = []
+    monkeypatch.setattr(handoff, "_producer_fenced",
+                        lambda p: fenced_calls.append(p) or True)
+    monkeypatch.setattr(handoff, "write_doc", lambda **k: "/w")
+    monkeypatch.setattr(handoff, "write_queue", lambda **k: True)
+    # task_id "coord-helper" with project "myproj" -> NOT "coord-myproj".
+    worker = _record(agent_id="w0000002", task_id="coord-helper", project="myproj")
+    ok = handoff._do_handoff(worker, "fleet-w0000002", handoff.TYPE_AUTO_YELLOW, 55.0)
+    assert ok is True
+    assert fenced_calls == [], "a 'coord-'-prefixed worker must not hit the coord fence"
+
+
 # ---------- (b) back-off ----------
 
 

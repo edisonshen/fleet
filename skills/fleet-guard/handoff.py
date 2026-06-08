@@ -513,15 +513,16 @@ def _do_handoff(record: dict[str, Any], session: str,
     # backed off. Returning False here makes the caller clear the pending
     # mark and the (dead) coord stops trying.
     #
-    # The fence applies to COORD producers ONLY (codex PR4 [P1]). A worker
-    # pane is NOT a descendant of the project's `coord-run` supervisor, so
-    # `fleet lease-check --project <p>` would return exit 3 (the coord lease
-    # owner is not the worker's ancestor) while a perfectly healthy coord
-    # lease exists — refusing a legitimate WORKER handoff and dropping its
-    # context. Workers don't hold the coord lease and can't be fenced by it.
-    # Coord identity convention: task_id == "coord-<project>" (mirrors
-    # internal/tui.coordTaskID and _COORD_TASK_ID_PREFIX below).
-    is_coord = task_id.startswith(_COORD_TASK_ID_PREFIX)
+    # The fence applies to COORD producers ONLY (codex PR4 [P1]/[P2]). A
+    # worker pane is NOT a descendant of the project's `coord-run` supervisor,
+    # so `fleet lease-check --project <p>` would return exit 3 (the coord lease
+    # owner is not the worker's ancestor) while a perfectly healthy coord lease
+    # exists — refusing a legitimate WORKER handoff and dropping its context.
+    # Workers don't hold the coord lease and can't be fenced by it. The coord
+    # identity is the EXACT task_id "coord-<project>" (mirrors
+    # internal/tui.coordTaskID); a prefix match would misclassify a worker
+    # whose slug merely starts with "coord-" (codex PR4 [P2]).
+    is_coord = bool(project) and task_id == _COORD_TASK_ID_PREFIX + project
     if is_coord and _producer_fenced(project):
         print(
             f"fleet-guard: handoff producer for coord agent {agent_id} "

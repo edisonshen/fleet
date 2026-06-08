@@ -561,11 +561,12 @@ func TestLeaseCheckByAncestor_GenuineSuccessorFences(t *testing.T) {
 	}
 }
 
-// codex PR4 [P1]: no HEALTHY active owner -> no split-brain -> PROCEED.
-// A non-active (fencing / released / expired) record means no live
-// successor holds the lease, so a legacy / live-handoff successor tick must
-// NOT be fenced — it would self-demote with nobody to take over.
-func TestLeaseCheckByAncestor_NonActiveProceeds(t *testing.T) {
+// codex PR4 [P1] (fence-window hole): when the caller's OWN ancestor is the
+// recorded owner but the record is no longer active (fencing / released /
+// fenced_not_acquired), the caller's lease was taken -> it must FENCE
+// (self-demote), NOT proceed. This is the fence-before-kill window: a
+// candidate fenced our parent; our tick must stop before mutating.
+func TestLeaseCheckByAncestor_OwnLeaseFencedSelfDemotes(t *testing.T) {
 	setupHome(t)
 	const project = "rainier"
 	clk := &fakeClock{}
@@ -579,9 +580,30 @@ func TestLeaseCheckByAncestor_NonActiveProceeds(t *testing.T) {
 			Epoch: 4, State: st, Owner: owner,
 			BootID: "test-boot-1", RenewedAtMono: clk.now(),
 		})
-		if err := leaseCheckByAncestorWithCfg(project, 510, cfg); err != nil {
-			t.Fatalf("state=%s: no healthy owner must PROCEED, got %v", st, err)
+		if err := leaseCheckByAncestorWithCfg(project, 510, cfg); !errors.Is(err, ErrNotLeaseOwner) {
+			t.Fatalf("state=%s: our own fenced lease must self-demote, got %v", st, err)
 		}
+	}
+}
+
+// codex PR4 [P1] (self-expiry hole): the caller's ancestor IS the recorded
+// owner and state==active, but the record's renewed_at is past TTL (a
+// paused leader that woke). It must FENCE before a takeover races it.
+func TestLeaseCheckByAncestor_OwnLeaseSelfExpiredFences(t *testing.T) {
+	setupHome(t)
+	const project = "rainier"
+	clk := &fakeClock{}
+	live := newFakeLiveness()
+	owner := identity{Pid: 500, PidStart: 9001, AgentID: "coord", Project: project}
+	live.set(owner.Pid, owner.PidStart)
+	cfg := leaseCheckCfg(clk, live, map[int]int{510: 500, 500: 1})
+	writeEpochRaw(t, project, epochRecord{
+		Epoch: 4, State: stateActive, Owner: owner,
+		BootID: "test-boot-1", RenewedAtMono: clk.now(),
+	})
+	clk.advance(cfg.ttl + 1) // our own renewal window lapsed
+	if err := leaseCheckByAncestorWithCfg(project, 510, cfg); !errors.Is(err, ErrNotLeaseOwner) {
+		t.Fatalf("our own self-expired active lease must self-demote, got %v", err)
 	}
 }
 
