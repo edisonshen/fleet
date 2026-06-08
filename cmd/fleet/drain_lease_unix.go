@@ -36,6 +36,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"time"
 
 	"github.com/edisonshen/fleet/internal/agent"
@@ -247,13 +248,19 @@ func productionRecoverSpawn(oldRec *agent.Record, docPath, preAllocatedID string
 // (codex PR4 [P1]). The safety-net takeover path bypasses handoffop.Resume/
 // retireOldAgent, so without this the new coord would start blank.
 //
-// On a readiness/send FAILURE it returns an error so takeoverAndRecover
-// PRESERVES the queue (the durable retry signal) instead of deleting it —
-// mirroring the other handoff paths. A retry is safe because
-// productionRecoverSpawn ADOPTS an already-spawned successor (above) rather
-// than re-spawning, so re-driving just re-attempts prompt delivery. The
-// chain-linked doc on the successor's record (spawn.Spawn sets
-// LastHandoffPath = NewDocPath) is the secondary durable resume path.
+// At-most-once + no-strand semantics (codex PR4 [P2]):
+//
+//   - AT-MOST-ONCE: a per-successor sentinel file
+//     (.locks/resume-prompt-sent-<newID>) is written BEFORE the send. On an
+//     adopt-retry (queue.Delete failed after a prior successful send) the
+//     sentinel short-circuits, so the same doc prompt is never re-submitted.
+//     This is the at-most-once marker the other handoff paths get from
+//     queue.Delete ordering; the recovery path can't reorder around
+//     queue.Delete (it runs in the caller), so it carries its own marker.
+//   - NO-STRAND on readiness timeout: WaitForReadyToPrompt failing does NOT
+//     hard-fail. If the tmux session is still alive, we WARN and send anyway
+//     (keys buffer in the pty until Claude is ready) — matching
+//     retireOldAgent. Only a DEAD session returns an error (queue preserved).
 //
 // Skips silently when the doc is empty or auto-resume is disabled (a
 // non-claude wrapper must not receive "Read your handoff doc..." as garbage).
@@ -262,11 +269,32 @@ func deliverRecoverResumePrompt(rec *agent.Record, docPath string, disableAutoRe
 	if docPath == "" || disableAutoResume {
 		return nil
 	}
+	sentinel, serr := resumePromptSentinelPath(rec.Project, rec.ID)
+	if serr == nil {
+		if _, statErr := os.Stat(sentinel); statErr == nil {
+			// Already delivered on a prior pass; do not re-send (at-most-once).
+			return nil
+		}
+	}
 	if werr := spawn.WaitForReadyToPrompt(rec.TmuxSession); werr != nil {
-		return fmt.Errorf(
-			"fleet drain: recovered successor %s not ready for resume prompt: %w "+
-				"(queue preserved for retry; successor is live + chain-linked to %s)",
-			rec.ID, werr, docPath)
+		// Readiness poll didn't converge. If the session is DEAD, fail so the
+		// queue is preserved. If it is ALIVE (slow startup / onboarding
+		// screen / custom wrapper), warn and send anyway — the keys buffer.
+		alive, probeErr := tmux.SessionAlive(rec.TmuxSession)
+		if !alive && probeErr == nil {
+			return fmt.Errorf(
+				"fleet drain: recovered successor %s session %s is dead; cannot deliver resume prompt "+
+					"(queue preserved for retry; doc: %s)", rec.ID, rec.TmuxSession, docPath)
+		}
+		_, _ = fmt.Fprintf(stderr,
+			"fleet drain: recovered successor %s not visibly ready (%v) but session alive; sending resume prompt anyway\n",
+			rec.ID, werr)
+	}
+	// Mark BEFORE the send so a crash between send and queue.Delete can't
+	// cause a re-send on retry (at-most-once; a never-sent sentinel just
+	// means one missed prompt, recoverable via the chain-linked doc).
+	if sentinel != "" {
+		_ = os.WriteFile(sentinel, []byte(docPath+"\n"), 0o644)
 	}
 	if serr := spawn.SendPromptKeys(rec.TmuxSession, handoff.ResumePrompt(docPath)); serr != nil {
 		return fmt.Errorf(
@@ -275,6 +303,16 @@ func deliverRecoverResumePrompt(rec *agent.Record, docPath string, disableAutoRe
 	}
 	_, _ = fmt.Fprintf(stdout, "fleet drain: delivered resume prompt to recovered successor %s\n", rec.ID)
 	return nil
+}
+
+// resumePromptSentinelPath returns the at-most-once marker path for a
+// recovered successor's resume prompt, under the project's .locks/ dir.
+func resumePromptSentinelPath(project, newID string) (string, error) {
+	pdir, err := state.ProjectDir(project)
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(pdir, ".locks", "resume-prompt-sent-"+newID), nil
 }
 
 // drainOneLeaseAware is the production entry point for the bounded drain.
