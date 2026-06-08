@@ -6,6 +6,61 @@ follows [SemVer](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.13.0] - 2026-06-08
+
+Handoff durability gets a real lease. A three-file coordinator lease
+primitive with bounded acquire replaces the old best-effort lock, and
+`fleet coord-run` now holds that lease with a heartbeat and STONITH
+fence so exactly one coordinator owns a project at a time. The whole
+handoff path moves behind a `*WithLease` boundary with a recovery-point
+objective and producer back-off, warm-standby graceful handoff
+collapses the old drain army into a single successor, and
+`FLEET_LEASE_FAILOVER` flips ON by default. Coordinator repo binding is
+rebuilt around one shared resolver (Design 3): a `fleet project
+resolve-repo` CLI with an explicit `--project` flag and fingerprint
+stamp, every call site routed through the resolver with the cwd
+fallbacks deleted, and the Python repo-binding ladder retired in favor
+of shelling out to the Go binder. Leak hardening continues: a
+`KindDrainProcs` reaper plus `--legacy-drains` sweep and drain
+run-record, a `gc` pass that reaps live leaked test-socket tmux
+servers, and an RC-daemon lifecycle rebuild (schema v2 + self-heal + gc
+orphan-rc-daemons). The cold-start double-spawn window is closed with a
+pending claim, OR-veto, and idempotent attach, and the durable PR-watch
+gains continuous ~1-minute auto-remediation.
+
+### Added
+
+- Three-file coordinator lease primitive with bounded acquire, wired
+  into `fleet coord-run` with lease hold, heartbeat, and STONITH fence
+  (#218, #219). The handoff path moves behind a `*WithLease` boundary
+  with an RPO and producer back-off, and `FLEET_LEASE_FAILOVER` flips
+  ON by default (#222).
+- Warm-standby graceful handoff that collapses the multi-process drain
+  army into a single live successor (#221).
+- `fleet project resolve-repo` CLI with an explicit `--project` flag
+  and fingerprint stamp, backed by a shared coord repo-binding resolver
+  (#210, #211).
+- `KindDrainProcs` reaper with a `--legacy-drains` sweep and drain
+  run-record (#217).
+
+### Changed
+
+- Every coordinator repo-binding call site resolves through the shared
+  resolver; the cwd fallbacks are deleted and the Python repo-binding
+  ladder is retired in favor of shelling out to the Go binder
+  (#213, #212).
+- The durable PR-watch runs continuous ~1-minute auto-remediation
+  instead of event-only polling (#214).
+- The coordinator opens the rendered `.html` at plan-doc gates (#209).
+
+### Fixed
+
+- Cold-start double-spawn window closed with a pending claim, OR-veto,
+  and idempotent attach (#216).
+- RC-daemon lifecycle rebuilt: schema v2, self-heal, and a `gc`
+  orphan-rc-daemons reaper (#215).
+- `gc` reaps live leaked test-socket tmux servers (#220).
+
 ## [0.12.0] - 2026-06-05
 
 Coord-owned PR shepherding lands as a durable, tick-owned loop:
@@ -1035,7 +1090,8 @@ Initial public release.
 - Filesystem packages: `internal/state`, `internal/handoff`,
   `internal/queue`, `internal/spawn`, `internal/tmux`.
 
-[Unreleased]: https://github.com/edisonshen/fleet/compare/v0.12.0...HEAD
+[Unreleased]: https://github.com/edisonshen/fleet/compare/v0.13.0...HEAD
+[0.13.0]: https://github.com/edisonshen/fleet/compare/v0.12.0...v0.13.0
 [0.12.0]: https://github.com/edisonshen/fleet/compare/v0.11.0...v0.12.0
 [0.11.0]: https://github.com/edisonshen/fleet/compare/v0.10.0...v0.11.0
 [0.10.0]: https://github.com/edisonshen/fleet/compare/v0.9.0...v0.10.0
