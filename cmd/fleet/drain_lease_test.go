@@ -204,6 +204,41 @@ func TestDrainLease_SuccessorAlreadyLeads_NoDuplicateSpawn(t *testing.T) {
 	}
 }
 
+// codex PR3 iter-14 [P1]: the live-leader fallback must gate "successor already
+// leads" on a HEALTHY leader, not a raw active-epoch owner. A standby that wrote
+// its `active` epoch (pid != OLD) then crashed (LeaderPresent=false) must NOT be
+// treated as a completed handoff — deleting the queue would strand the project.
+// The drain must instead complete via the legacy Resume fallback.
+func TestDrainLease_LiveLeaderFallback_CrashedSuccessorNotCompletion(t *testing.T) {
+	var resumed int32
+	out := &bytes.Buffer{}
+	// LeaderPresent gates the top-level switch (call #1 -> true, routes to the
+	// live-leader fallback) and then the fallback's inner healthySuccessorPresent
+	// check (call #2 -> false, the "successor" wrote its epoch then crashed). The
+	// poll loop in between calls ActiveOwnerPID, not LeaderPresent, so exactly two
+	// LeaderPresent reads occur.
+	var leaderReads int32
+	d := drainLeaseDeps{
+		LeaderPresent:  func(string) bool { return atomic.AddInt32(&leaderReads, 1) == 1 },
+		CurrentEpoch:   func(string) (int64, bool) { return 6, true },
+		BarrierExists:  func(string, int64) bool { return false },
+		ActiveOwnerPID: func(string) (int, bool) { return 777777, true }, // non-OLD pid, but dead
+		LoadAgent:      func(string) (*agent.Record, error) { return oldCoordRec(), nil },
+		LockAgent:      func(string) (func(), error) { return func() {}, nil },
+		Resume: func(queue.SpawnFresh, string, int, io.Writer, io.Writer) error {
+			atomic.AddInt32(&resumed, 1)
+			return nil
+		},
+		BarrierPoll: time.Millisecond,
+	}
+	if err := drainOneLeaseAwareWith(leaseDrainReq(), existingQueuePath(t), 0, 5, out, out, d); err != nil {
+		t.Fatalf("crashed-successor fallback returned %v, want nil (legacy resume completes it)", err)
+	}
+	if atomic.LoadInt32(&resumed) != 1 {
+		t.Errorf("legacy Resume ran %d times, want 1 — a crashed active-epoch owner is NOT a completed handoff", resumed)
+	}
+}
+
 // T25: no barrier present and the leader is unresponsive (deadline passes) —
 // drain does NOT graceful-kill OLD before the barrier; it escalates instead.
 // Combined with T41 here: the escalation calls TakeOver.

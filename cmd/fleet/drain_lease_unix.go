@@ -790,17 +790,20 @@ func drainLiveLeaderFallback(req queue.SpawnFresh, path string, deadline time.Ti
 			time.Sleep(wait)
 		}
 	}
-	// A SUCCESSOR already leads (codex PR3 iter-6 [P2]): if the current active
-	// lease owner is NOT OLD's supervisor, a graceful standby has already
-	// acquired the lease (the barrier was written at OLD's now-superseded
-	// epoch, so the current-epoch barrier check above missed it). OLD's record
-	// just hasn't been archived yet. The handoff IS complete — clean the
-	// stale queue, do NOT run legacy Resume (which would spawn a SECOND
-	// replacement for an already-done handoff).
+	// A HEALTHY SUCCESSOR already leads (codex PR3 iter-6 [P2]; iter-14 [P1]): if
+	// a non-OLD pid owns the lease AND is heartbeating (LeaderPresent), a graceful
+	// standby has already acquired (the barrier was written at OLD's now-
+	// superseded epoch, so the current-epoch barrier check above missed it).
+	// OLD's record just hasn't been archived yet. The handoff IS complete — clean
+	// the stale queue, do NOT run legacy Resume (which would spawn a SECOND
+	// replacement). Gate on healthySuccessorPresent, NOT raw ActiveOwnerPID: a
+	// standby that wrote its `active` epoch then crashed still shows as owner but
+	// is not a live leader — deleting the queue for it strands the project
+	// coordless (same class as the graceful path).
 	if err == nil && oldRec != nil && oldRec.SupervisorPID > 0 {
-		if ownerPid, ok := d.ActiveOwnerPID(req.Project); ok && ownerPid != oldRec.SupervisorPID {
+		if ownerPid, ok := d.healthySuccessorPresent(req.Project, oldRec.SupervisorPID); ok {
 			_, _ = fmt.Fprintf(stdout,
-				"fleet drain: a successor already leads %s (active owner pid %d != old %d); handoff complete, cleaning queue\n",
+				"fleet drain: a healthy successor already leads %s (active owner pid %d != old %d); handoff complete, cleaning queue\n",
 				req.Project, ownerPid, oldRec.SupervisorPID)
 			return queue.Delete(path)
 		}
