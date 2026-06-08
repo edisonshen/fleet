@@ -16,7 +16,14 @@ const StateFilename = "rc-state.json"
 
 // SchemaVersion is the value RecordedState.Schema receives on Write.
 // Bump when adding non-backwards-compatible fields.
-const SchemaVersion = "v1"
+//
+// v2 — leak-rc-daemon-lifecycle PR-B: adds ClaudeVersion + OwningCoordID
+// so superseded daemons (across `claude` version upgrades) and orphaned
+// daemons (owning coord died) can be recognized as orphans and self-
+// healed by Up's idempotent tick. Older v1 state files load with empty
+// values; the resolver treats an empty version as "always stale" to
+// force one heal cycle which backfills the new fields.
+const SchemaVersion = "v2"
 
 // SessionPrefix is the legacy daemon prefix the Claude CLI's
 // --remote-control-session-name-prefix accepts. Per the design doc
@@ -52,6 +59,24 @@ type RecordedState struct {
 	SessionPrefix string    `json:"session_prefix"`
 	LastSpawnAt   time.Time `json:"last_spawn_at"`
 	LastError     string    `json:"last_error,omitempty"`
+
+	// ClaudeVersion is the `claude --version` output captured at spawn
+	// time (e.g. "2.1.156"). Used by Up's self-healing idempotent path
+	// to detect a daemon left over from an older claude install — if
+	// the recorded version disagrees with the current binary, the old
+	// PID is killed and a fresh daemon is spawned. Empty on legacy v1
+	// records → treated as "always stale" (one heal cycle backfills it).
+	// leak-rc-daemon-lifecycle PR-B (v2 schema bump).
+	ClaudeVersion string `json:"claude_version"`
+
+	// OwningCoordID is the agent ID of the coord that called Up. When
+	// that agent record disappears (coord crashed, replaced via handoff
+	// without proper Down), the daemon becomes an orphan — no live coord
+	// drives it. Self-healing Up detects the dead-owner case via a
+	// liveness probe and respawns under the new caller. Empty on legacy
+	// v1 records or fresh acquires without a CoordID hint.
+	// leak-rc-daemon-lifecycle PR-B.
+	OwningCoordID string `json:"owning_coord_id"`
 }
 
 // ErrStateMissing is returned by ReadState when no rc-state.json

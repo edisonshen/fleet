@@ -154,6 +154,55 @@ class TestSpawnDaemonIfNeeded:
             "fleet", "rc", "up", "demo", "--respawn-only", "--idempotent",
         ]
 
+    def test_passes_coord_id_when_valid(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """leak-rc-daemon-lifecycle: a valid 8-hex coord_id is threaded to
+        `fleet rc up --coord-id <id>` so the spawned daemon records its
+        owning coord. Without this the Go-side dead-owner self-heal can't
+        detect a crashed coord's orphaned daemon."""
+        calls: list[list[str]] = []
+
+        class _FakeResult:
+            def __init__(self, returncode: int = 0) -> None:
+                self.returncode = returncode
+
+        def _fake_run(args, **kwargs):
+            calls.append(list(args))
+            return _FakeResult(0)
+
+        monkeypatch.setattr(remote_control.subprocess, "run", _fake_run)
+        ok = remote_control.spawn_daemon_if_needed("demo", "abcd1234")
+        assert ok is True
+        assert calls[0] == [
+            "fleet", "rc", "up", "demo", "--respawn-only", "--idempotent",
+            "--coord-id", "abcd1234",
+        ]
+
+    def test_drops_invalid_coord_id(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A coord_id failing the canonical 8-lowercase-hex shape is NOT
+        passed as an argument (defense in depth — never inject an
+        unvalidated value into the fleet argv). The daemon still spawns."""
+        calls: list[list[str]] = []
+
+        class _FakeResult:
+            def __init__(self, returncode: int = 0) -> None:
+                self.returncode = returncode
+
+        def _fake_run(args, **kwargs):
+            calls.append(list(args))
+            return _FakeResult(0)
+
+        monkeypatch.setattr(remote_control.subprocess, "run", _fake_run)
+        ok = remote_control.spawn_daemon_if_needed("demo", "NOT-HEX!!")
+        assert ok is True
+        assert "--coord-id" not in calls[0]
+        assert calls[0] == [
+            "fleet", "rc", "up", "demo", "--respawn-only", "--idempotent",
+        ]
+
     def test_returns_false_on_nonzero_exit(
         self, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
@@ -461,6 +510,58 @@ class TestBootstrap:
         assert not inbox_target.exists()
         # Quiet steady-state: no bootstrap log entry written.
         assert not isolated_bootstrap_log.exists()
+
+    def test_marker_present_still_fires_respawn_tick(
+        self, fleet_home: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """leak-rc-daemon-lifecycle (codex P2): once a coord is bootstrapped
+        (marker present) the tick still re-runs `fleet rc up --respawn-only
+        --coord-id` so a daemon reaped by SweepAllProjects (marker preserved)
+        gets respawned. Without this the project sits marker-present/no-state
+        until the operator runs `fleet rc up` by hand. Returns SKIPPED_MARKER
+        (inbox not re-seeded) but the respawn shell-out MUST fire."""
+        _enable_rc_bootstrap_for_test(monkeypatch)
+        rc_calls = _stub_fleet_rc_up_success(monkeypatch)
+        proj_dir = fleet_home / "projects" / "myproj"
+        proj_dir.mkdir(parents=True)
+        (proj_dir / ".remote-control-bootstrap-abcd1234").touch()
+
+        status = remote_control.bootstrap_remote_control(
+            "myproj", "abcd1234", fleet_home=fleet_home,
+        )
+        assert status == remote_control.STATUS_SKIPPED_MARKER
+        # The respawn-only spawn MUST have fired with the coord-id threaded.
+        up_calls = [c for c in rc_calls if c[:3] == ["fleet", "rc", "up"]]
+        assert len(up_calls) == 1, f"expected one respawn shell-out; got {rc_calls}"
+        assert "--respawn-only" in up_calls[0]
+        assert up_calls[0][-2:] == ["--coord-id", "abcd1234"]
+
+    def test_marker_present_respawn_transient_error_surfaces(
+        self, fleet_home: Path, monkeypatch: pytest.MonkeyPatch,
+        isolated_bootstrap_log: Path,
+    ) -> None:
+        """codex P2: when the post-bootstrap respawn tick fails transiently
+        (fleet binary missing / timeout / contested replacement after a
+        sweep), bootstrap must NOT silently return SKIPPED_MARKER — it must
+        log + return the retry-next-tick status so `fleet status` surfaces a
+        breadcrumb instead of leaving the project marker-present/no-state."""
+        _enable_rc_bootstrap_for_test(monkeypatch)
+
+        # Stub `fleet rc up` to a transient failure (exit 1, not 10).
+        def _fake_run(args, **kwargs):
+            return type("R", (), {"returncode": 1})()
+
+        monkeypatch.setattr(remote_control.subprocess, "run", _fake_run)
+        proj_dir = fleet_home / "projects" / "myproj"
+        proj_dir.mkdir(parents=True)
+        (proj_dir / ".remote-control-bootstrap-abcd1234").touch()
+
+        status = remote_control.bootstrap_remote_control(
+            "myproj", "abcd1234", fleet_home=fleet_home,
+        )
+        assert status == remote_control.STATUS_FAILED_SEED
+        # Breadcrumb written for the operator.
+        assert isolated_bootstrap_log.exists()
 
     def test_per_coord_marker_isolation(
         self, fleet_home: Path, fake_popen: _FakePopen,

@@ -785,12 +785,26 @@ def _tick_locked(
         # finishes — exactly the orphan-tmux shape invariant 5 exists
         # to prevent. Best-effort save; swallow errors (the next tick
         # re-derives state from disk).
+        coord_state_saved = False
         try:
             _save_coord_state(state_path, state)
+            coord_state_saved = True
         except Exception as save_exc:  # noqa: BLE001
             result.errors.append(
                 f"coord-state save on parse-error path failed: {save_exc}"
             )
+        # Clear the cold-start pending-spawn claim on THIS bail path too —
+        # but ONLY if the save above actually wrote coord-state.json
+        # (codex iter-2 P2). The claim is the SOLE double-spawn veto until
+        # coord-state.json is fresh; if the best-effort save failed, no
+        # coord-state veto exists yet, so clearing the claim would let a
+        # second cold-start dispatch spawn a duplicate. Leaving the claim
+        # in place on a failed save keeps the veto active — it ages out in
+        # the freshness window if this coord never recovers. When the save
+        # DID succeed, the coord-state veto has taken over and dropping the
+        # claim avoids blocking a legitimate respawn. Idempotent + fail-soft.
+        if coord_state_saved:
+            clear_coord_spawn_pending(project_dir)
         return result
 
     # 5.0. dispatch-durability (#184) — tick-entry REPLAY reconcile.
@@ -1005,6 +1019,24 @@ def _tick_locked(
     # the unconditional refresh is correct. The tick_count bumped just
     # above (rolling checkpoint) is persisted here in the same write.
     _save_coord_state(state_path, state)
+
+    # Clear the cold-start pending-spawn claim (leak-coord-spawn-idempot)
+    # — ONLY AFTER the heartbeat above writes coord-state.json. The Go
+    # dispatch path wrote the claim under the coord-spawn flock before
+    # spawning US, to veto a SECOND cold-start dispatch during the 3-5
+    # min window before coord-state.json exists. The claim is the ONLY
+    # active veto signal until that file lands, so clearing it earlier
+    # (codex iter-1 P1) opened a gap: a cross-socket dispatch #2 between
+    # an early clear and the coord-state write would pass BOTH the
+    # pending-claim veto AND the coordStateFresh veto → duplicate coord,
+    # re-opening the exact window this fix closes. By draining the claim
+    # here — past the heartbeat — the live-record / coord-state veto has
+    # already taken over, so the handoff is seamless. Every early return
+    # before this point (parse error, kill-cycle bail, etc.) leaves the
+    # claim in place; the parse-error path clears it separately AFTER its
+    # own coord-state save (above). Idempotent + fail-soft: gone after
+    # the first full tick, a no-op thereafter.
+    clear_coord_spawn_pending(project_dir)
 
     # Auto-archive when tasks.md grows past the threshold. Runs at end
     # of every tick, after dispatch + heartbeat, before lock release
@@ -1502,25 +1534,27 @@ def _run_supervisor(
         # Durable PR-watch on the SUPERVISOR's cadence (codex iter-16 [P1]):
         # the supervisor holds the coord lock for the whole session (up to
         # 4h), so external ticks return lock-busy and _tick_locked's one-shot
-        # PR-watch never re-runs. Without this, a PR that merges / goes stale
-        # / gets changes-requested while the supervisor parks on in-review
-        # work goes untracked + un-auto-fixed until the supervisor exits. We
-        # re-read tasks.md AFTER the legacy reconcile above (it may have just
-        # cleared a red PR's pr_url) and run the SAME reconcile the primary
-        # tick runs. Fail-soft.
+        # PR-watch never re-runs. Enroll from the PRE-clear `f3.tasks` (the
+        # legacy reconcile above may have just cleared a red PR's pr_url) so a
+        # mid-session PR still gets a durable watch (codex iter-23 [P1]).
+        return _pr_watch_supervisor_pass(enroll_tasks=f3.tasks)
+
+    def _pr_watch_supervisor_pass(*, enroll_tasks=None) -> bool:
+        """Run ONLY the durable PR-watch reconcile (NOT the legacy
+        _reconcile_slugs sweep). Shared by periodic_full_reconcile and the
+        ~60 s poll floor (DESIGN-pr-watch-autoremediate §1) so the floor does
+        NOT drag the expensive legacy in-flight/CI sweep down to ~1 min
+        cadence (codex P2) — the floor is a PR-watch-only heartbeat. Returns
+        True iff it STAGED a DISPATCH block or RAISED an actionable event, so
+        the supervisor exits + flushes promptly. Fail-soft."""
         n_blocks_before = len(result.dispatch_instructions)
         n_raised_before = result.raised
         try:
             f_pw = parse.read(str(tasks_path))
-            # ADVANCE tick_count for this PR-watch pass (codex iter-27 [P2]).
-            # PR-watch's budgets (probe backoff, launch grace, unverified
-            # stale reclaim) all age by tick_count. During a long supervisor
-            # session external ticks are lock-busy, so a snapshot read of
-            # coord-state would keep passing the SAME tick_count and those
-            # timers would never reach threshold until the supervisor exits.
-            # Bump + persist the counter each periodic pass so the timers
-            # advance monotonically (the supervisor runs this on the
-            # stuck-check cadence — a real elapsed-time proxy).
+            # ADVANCE tick_count for this PR-watch pass (codex iter-27 [P2]) so
+            # PR-watch's tick-budget timers (probe backoff, launch grace,
+            # unverified stale reclaim) advance monotonically during a long
+            # supervisor session where external ticks are lock-busy.
             cs_pw = _load_coord_state(state_path)
             _bump_tick_counter(cs_pw)
             _save_coord_state(state_path, cs_pw)
@@ -1528,29 +1562,22 @@ def _run_supervisor(
                 f_pw.tasks, project=project, project_dir=project_dir,
                 cwd=cwd, fleet_bin=fleet_bin,
                 state=cs_pw, result=result, home=home,
-                # PRE-reconcile snapshot for ENROLLMENT (codex iter-23 [P1]):
-                # the legacy _reconcile_slugs above may have just cleared a
-                # newly-opened PR's pr_url (CI-red/not-mergeable). Mirroring
-                # the primary tick, enroll from the pre-clear `f3.tasks` so a
-                # PR opened mid-supervisor-session still gets a durable watch
-                # created (refresh/probe/auto-fix use the post-clear f_pw).
-                enroll_tasks=f3.tasks,
+                enroll_tasks=enroll_tasks if enroll_tasks is not None else f_pw.tasks,
             )
         except Exception as exc:  # noqa: BLE001 — PR-watch must never wedge the supervisor
             result.errors.append(f"supervisor pr-watch reconcile: {exc}")
-        # Signal the supervisor to exit + flush if PR-watch staged a DISPATCH
-        # block (codex iter-17 [P1]) OR raised an operator-actionable event
-        # (codex iter-28 [P2]: closed-unmerged / orphan / blocked / ambiguous
-        # rebase). Both must reach the coord promptly — a staged block's lease
-        # is running with no Agent launched, and a raise is the alert PR-watch
-        # exists to surface; holding either until the session ends defeats the
-        # feature. main() prints result.dispatch_instructions + result.errors
-        # the moment tick() returns.
-        pr_watch_dispatched = (
+        return (
             len(result.dispatch_instructions) > n_blocks_before
             or result.raised > n_raised_before
         )
-        return pr_watch_dispatched
+
+    def pr_watch_floor_pass() -> bool:
+        # The ~60 s poll-floor pass (DESIGN-pr-watch-autoremediate §1): a
+        # PR-watch-ONLY reconcile, NOT periodic_full_reconcile's legacy sweep,
+        # so the tight floor cadence doesn't multiply the legacy in-flight/CI
+        # reconcile work (codex P2). Returns True to make the supervisor exit +
+        # flush when it staged a dispatch / raised.
+        return _pr_watch_supervisor_pass()
 
     def write_state_hook():
         # Heartbeat publish. Re-load → no-op-write so any concurrent
@@ -1977,6 +2004,9 @@ def _run_supervisor(
             cs["last_archive_scan_ts"] = last_seen
         _save_coord_state(state_path, cs)
 
+    def pr_watch_floor_due_hook() -> bool:
+        return _pr_watch_floor_due(project_dir, tasks_path)
+
     sup_result = supervisor_mod.run_supervisor(
         cfg=cfg,
         project=project,
@@ -1989,6 +2019,8 @@ def _run_supervisor(
         force_tick_check=force_tick_check_hook,
         force_tick_dispatch=force_tick_dispatch_hook,
         reaper_hook=reaper_hook_supervisor,
+        pr_watch_floor_due=pr_watch_floor_due_hook,
+        pr_watch_floor_pass=pr_watch_floor_pass,
         coord_id=coord_id,
         # Codex iter-21 [P3]: share the single mtime baseline that
         # force_tick_check_hook closed over (force_tick_baseline["mtime"])
@@ -2418,6 +2450,38 @@ def _read_coord_spawn_marker(project_dir: Path) -> str:
     except OSError:
         return ""
     return first.strip()
+
+
+# Filename of the durable pending-spawn claim the Go dispatch path
+# writes under the coord-spawn flock before spawning. Must match
+# coordSpawnPendingFile in cmd/fleet/dispatch_recovery.go.
+COORD_SPAWN_PENDING_FILE = "coord-spawn-pending"
+
+
+def clear_coord_spawn_pending(project_dir: Path) -> None:
+    """Remove the cold-start pending-spawn claim for this project.
+
+    The Go dispatch path writes ``<project_dir>/coord-spawn-pending``
+    under the coord-spawn flock immediately before spawning a coord, so
+    a SECOND cold-start dispatch is vetoed during the 3-5 min window
+    before this coord writes coord-state.json. Once WE are ticking, the
+    claim has served its purpose: the live-record / coord-state veto
+    paths take over, so we clear the claim to avoid blocking a
+    legitimately-needed respawn after this coord later dies.
+
+    Idempotent + fail-soft: removing an absent claim is a no-op, and any
+    OS error is swallowed (never block the tick on cleanup). Called on
+    every tick — the claim is gone after the first tick and the call is
+    a cheap no-op thereafter.
+    """
+    claim = project_dir / COORD_SPAWN_PENDING_FILE
+    try:
+        claim.unlink()
+    except FileNotFoundError:
+        pass
+    except OSError:
+        # Best-effort cleanup must never crash the tick.
+        pass
 
 
 def _agent_is_project_coord(home: Path, agent_id: str, project: str) -> bool:
@@ -5381,6 +5445,44 @@ def _worktree_cleanup_context(
 _pr_watch_prober = None  # lazily defaults to pr_watch_mod.GhGitProber()
 
 
+def _has_open_watched_pr(project_dir: Path) -> bool:
+    """True iff the durable pr-watches.json has at least one OPEN watch
+    (DESIGN-pr-watch-autoremediate §1 floor gate). Cheap fs read, never
+    raises. A missing/empty file -> False (idle coord; the floor stays
+    inert so it won't poll GitHub every ~60 s)."""
+    try:
+        doc = pr_watch_mod.load_watches(project_dir)
+    except Exception:  # noqa: BLE001 — gate must never wedge the supervisor
+        return False
+    for w in (doc.get("watches") or {}).values():
+        if isinstance(w, dict) and w.get("state") == pr_watch_mod.STATE_OPEN:
+            return True
+    return False
+
+
+def _pr_watch_floor_due(project_dir: Path, tasks_path: Path) -> bool:
+    """The ~60 s PR-watch poll-floor gate (DESIGN-pr-watch-autoremediate §1):
+    True iff this coord has ANY OPEN watched PR, OR any current task carrying
+    a live (non-terminal) pr_url that has NOT been enrolled yet.
+
+    The task-side check is load-bearing (codex P2): a PR opened mid-session
+    lives in tasks.md BEFORE the next periodic_full_reconcile enrolls it into
+    pr-watches.json — without it the floor would never fire to enroll/probe
+    that fresh PR and it would wait for the slow cadence. Cheap fs reads, no
+    shell-out; never raises (the gate must not wedge the supervisor)."""
+    if _has_open_watched_pr(project_dir):
+        return True
+    try:
+        f = parse.read(str(tasks_path))
+    except Exception:  # noqa: BLE001
+        return False
+    for t in f.tasks:
+        if getattr(t, "pr_url", "") and getattr(t, "status", "") \
+                not in pr_watch_mod.TERMINAL_TASK_STATUSES:
+            return True
+    return False
+
+
 def _reconcile_pr_watches(
     tasks: list[parse.Task],
     *,
@@ -5525,20 +5627,40 @@ def _reconcile_pr_watches(
             return "gone"
         rec = _read_agent_record(agent_id, home=home)
         if isinstance(rec, dict):
-            if rec.get("blocked"):
-                return "blocked"
             try:
                 pid = int(rec.get("pid", 0) or 0)
             except (TypeError, ValueError):
                 pid = 0
+            # A recorded, STILL-ALIVE pid means the agent is genuinely in
+            # flight — suppress regardless of any outcome field it has already
+            # written (codex P2): a rebase subagent can write
+            # remediation_outcome BEFORE it exits, and consuming that while it
+            # still owns the branch checkout would clear the lease and race a
+            # re-derive agent onto the same branch. Liveness wins; only a
+            # provably-DEAD/absent-pid agent's recorded outcome is consumed.
+            if pid > 0 and _pid_alive(pid):
+                return "running"
+            # NONTERMINAL rebase-conflict (DESIGN-pr-watch-autoremediate §2.2):
+            # a rebase subagent that hit a conflict writes this outcome (NOT
+            # blocked) so the ladder advances to re-derive. Consumed only now
+            # that the agent is NOT provably-alive (dead pid / no pid).
+            # Checked BEFORE the blocked flag so a subagent that set both
+            # prefers the nonterminal advance (a conflict is never a dead end
+            # when re-derive is eligible). The conflicted paths ride alongside
+            # via _agent_conflicts.
+            if str(rec.get("remediation_outcome", "") or "") == \
+                    pr_watch_mod.OUTCOME_REBASE_CONFLICTED:
+                return pr_watch_mod.OUTCOME_REBASE_CONFLICTED
+            if rec.get("blocked"):
+                return "blocked"
             if pid > 0:
-                # The agent WROTE a record with a real pid — a DEFINITIVE
-                # liveness signal. Alive -> running; dead -> "gone" (codex
+                # The agent WROTE a record with a real pid that is NOT alive
+                # (the alive case returned "running" above) -> "gone" (codex
                 # iter-25 [P2]): a recorded-then-crashed fixer must reclaim
                 # after the normal launch grace, NOT be held for the long
                 # unverified stale bound. Do NOT fall through to the journal
                 # (which would mask the dead pid as running-unverified).
-                return "running" if _pid_alive(pid) else "gone"
+                return "gone"
         # No agent record with a usable pid -> fall back to the journal (the
         # coord's own
         # durable launch signal). A launched/in-flight journal means the
@@ -5567,6 +5689,23 @@ def _reconcile_pr_watches(
         # the launch grace) and the action re-dispatches.
         return "gone"
 
+    def _agent_conflicts(agent_id: str) -> list:
+        # The conflicted-path set a rebase subagent reported alongside the
+        # rebase_conflicted_needs_rederive outcome (DESIGN-pr-watch-
+        # autoremediate §2.1/§2.2). Read from its agent record's
+        # `conflicted_paths`; the watch persists them onto the snapshot so the
+        # next pass's DIRTY signature/frontier reflect the real paths. Never
+        # raises.
+        if not agent_id:
+            return []
+        rec = _read_agent_record(agent_id, home=home)
+        if not isinstance(rec, dict):
+            return []
+        cp = rec.get("conflicted_paths")
+        if isinstance(cp, (list, tuple)):
+            return [str(p) for p in cp if p]
+        return []
+
     def _dispatch_action(action) -> str:
         # Mint an agent_id, render the rebase/fix prompt, acquire the
         # coord_prompt_inbox CLAIM (which creates the dispatch JOURNAL the
@@ -5592,10 +5731,20 @@ def _reconcile_pr_watches(
         try:
             agent_id = dispatch_mod.mint_agent_id()
             label = f"pr-{action.kind}-{action.pr_number}"
+            # Pass the minted agent_id into the prompt so the subagent knows
+            # WHICH agent record to write its remediation outcome /
+            # conflicted_paths into — the coord reads ~/.fleet/agents/<id>.json
+            # by exactly this id, and register:false PR-watch dispatches have
+            # no other channel to learn it (codex P1).
             if action.kind == pr_watch_mod.ACTION_REBASE:
-                prompt = dispatch_mod.build_rebase_prompt(action, standards_md=_standards())
+                prompt = dispatch_mod.build_rebase_prompt(
+                    action, standards_md=_standards(), agent_id=agent_id)
+            elif action.kind == pr_watch_mod.ACTION_REDERIVE:
+                prompt = dispatch_mod.build_rederive_prompt(
+                    action, standards_md=_standards(), agent_id=agent_id)
             else:
-                prompt = dispatch_mod.build_fix_prompt(action, standards_md=_standards())
+                prompt = dispatch_mod.build_fix_prompt(
+                    action, standards_md=_standards(), agent_id=agent_id)
             # acquire-prompt mints the journal at ExecPending gen 0 and
             # writes the inbox atomically; the DISPATCH block carries gen 0
             # so `mark-launch-attempted <id> 0` returns ok.
@@ -5643,6 +5792,17 @@ def _reconcile_pr_watches(
             )
 
     staged_blocks: list[str] = []
+    # PR-watch ~60 s poll floor (DESIGN-pr-watch-autoremediate §1): when the
+    # floor is ON, IT is the cadence — so every open watched PR (including a
+    # quiescent READY one) must be probe-due on every floored pass, else the
+    # slow per-watch cadence (_probe_due skips READY unless tick%N==0) would
+    # suppress 4/5 floored probes and a READY->BEHIND/merged transition would
+    # still wait ~5 min, defeating the floor (codex P2). slow_cadence_ticks=1
+    # makes READY watches probe every pass; the per-repo cost is unchanged
+    # (one batched GraphQL covers all the repo's watched PRs). When the floor
+    # is OFF (0), keep the module default slow cadence (legacy behavior).
+    floor_on = supervisor_mod.env_pr_watch_poll_floor_s() > 0
+    slow_cadence = 1 if floor_on else pr_watch_mod._SLOW_CADENCE_TICKS_DEFAULT
     outcome = pr_watch_mod.reconcile_watches(
         tasks,
         project=project,
@@ -5652,12 +5812,14 @@ def _reconcile_pr_watches(
         flip_task_done=_flip_done,
         now_iso=pr_watch_mod.utc_now_iso(),
         tick_count=tick_count,
+        slow_cadence_ticks=slow_cadence,
         repo_path=repo_path,
         enroll_tasks=enroll_tasks,
         dispatch_action=_dispatch_action,
         agent_outcome=_agent_outcome,
         deps_done=_deps_done,
         release_action=_release_action,
+        agent_conflicts=_agent_conflicts,
     )
 
     # reconcile_watches returned WITHOUT raising -> the watch doc (incl. the

@@ -32,11 +32,12 @@ import (
 const gcDefaultMaxAge = 24 * time.Hour
 
 type gcFlags struct {
-	apply      bool
-	aggressive bool
-	maxAge     time.Duration
-	kindsCSV   string
-	project    string
+	apply        bool
+	aggressive   bool
+	maxAge       time.Duration
+	kindsCSV     string
+	project      string
+	legacyDrains bool
 }
 
 func newGCCmd() *cobra.Command {
@@ -44,7 +45,7 @@ func newGCCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "gc",
 		Short: "Reap orphan fleet-owned resources (sockets, agent records, tmux, worktrees)",
-		Long: `gc one-shot reaper for fleet-created leftovers (fleet#165, #172, #177). Six kinds:
+		Long: `gc one-shot reaper for fleet-created leftovers (fleet#165, #172, #177, leak-rc-daemon-lifecycle). Eight kinds:
 
   sockets        — /tmp/fleet-test-*.sock files older than --max-age
   orphan-agents  — ~/.fleet/agents/*.json records whose tmux session is gone
@@ -73,6 +74,23 @@ func newGCCmd() *cobra.Command {
                    default; --apply rm -rf's the dir. A malformed name
                    WITH a tasks.md is surfaced but never auto-removed
                    (invalid-project-dir-guar-d636)
+  orphan-rc-daemons — live claude remote-control daemons (matched by
+                   --remote-control-session-name-prefix fleet-coord) whose
+                   PID is in no project's rc-state.json, OR whose claude
+                   version is superseded (the 2026-05-29 OOM root cause —
+                   5 stale daemons across 4 versions ate ~471 MB).
+                   SURFACE only by default; --apply sends SIGTERM with
+                   SIGKILL escalation. PR-B of leak-rc-daemon-lifecycle
+                   (DESIGN-lifecycle-leak-recurrence.md)
+  drain-procs    — leaked/wedged fleet-drain processes (the 81-proc
+                   leak). Keys off ~/.fleet/drain-runs/<pid>.json: a
+                   drain whose heartbeat is stale past the TTL AND whose
+                   pid+pid_start is still live is WEDGED. SURFACE only by
+                   default; --apply reaps via a guarded kill (pid_start +
+                   exe re-validated before signal) then deletes the stale
+                   record. Add --legacy-drains for the one-time coarse
+                   ps sweep of the existing 81 that predate the
+                   run-record (sleeping + age>=5m) (handoff-drain-storm-leak)
 
 Default behavior is DRY-RUN — prints a planned action list and exits
 0 WITHOUT mutating. Pass --apply to actually remove / archive / kill.
@@ -90,7 +108,7 @@ Per-action output format:
   <kind>  <target>  verb=<v>  reason=<r>
 
 Trailing summary line:
-  summary: N sockets, M agents, K tmux (surface only), L worktrees, P coord-locks, Q worker-records
+  summary: N sockets, M agents, K tmux (surface only), L worktrees, P coord-locks, Q worker-records, R invalid-projects, S orphan-rc-daemons, T drain-procs
 
 Exit codes:
   0  — sweep ran (always; per-action failures surface in stderr lines)
@@ -106,9 +124,11 @@ Exit codes:
 	cmd.Flags().DurationVar(&f.maxAge, "max-age", gcDefaultMaxAge,
 		"age floor for socket sweep (Go duration; default 24h)")
 	cmd.Flags().StringVar(&f.kindsCSV, "kinds", "",
-		"comma-separated kinds to consider (sockets,orphan-agents,orphan-tmux,worktrees,coord-locks,worker-records,invalid-projects); empty = all")
+		"comma-separated kinds to consider (sockets,orphan-agents,orphan-tmux,worktrees,coord-locks,worker-records,invalid-projects,orphan-rc-daemons,drain-procs); empty = all")
 	cmd.Flags().StringVar(&f.project, "project", "",
 		"scope worktree + agent enumeration to one project (default: all projects)")
+	cmd.Flags().BoolVar(&f.legacyDrains, "legacy-drains", false,
+		"one-time coarse `ps` sweep for leaked `fleet drain` procs predating the run-record (sleeping + age>=5m); implies the drain-procs kind")
 	return cmd
 }
 
@@ -134,6 +154,13 @@ func runGC(stdout, stderr io.Writer, f *gcFlags) error {
 	if err != nil {
 		return err
 	}
+	// --legacy-drains implies the drain-procs kind: if the operator
+	// passed an explicit --kinds list that omitted it, fold it in so the
+	// one-time sweep actually runs (a no-op kind that silently does
+	// nothing would violate surface-don't-silo).
+	if f.legacyDrains && !hasKind(kinds, gc.KindDrainProcs) {
+		kinds = append(kinds, gc.KindDrainProcs)
+	}
 	if f.apply && hasKind(kinds, gc.KindOrphanAgents) {
 		if sock := strings.TrimSpace(os.Getenv("FLEET_TMUX_SOCKET")); sock != "" {
 			_, _ = fmt.Fprintf(stderr,
@@ -157,11 +184,12 @@ func runGC(stdout, stderr io.Writer, f *gcFlags) error {
 		}
 	}
 	opts := gc.Options{
-		Apply:      f.apply,
-		Aggressive: f.aggressive,
-		MaxAge:     f.maxAge,
-		Kinds:      kinds,
-		Project:    f.project,
+		Apply:        f.apply,
+		Aggressive:   f.aggressive,
+		MaxAge:       f.maxAge,
+		Kinds:        kinds,
+		Project:      f.project,
+		LegacyDrains: f.legacyDrains,
 	}
 	// DESIGN-coord-worktree-lifecycle § Concurrency: hold the project-
 	// scoped worktree-GC flock across the whole scan → re-check → remove
@@ -258,14 +286,14 @@ func parseKindsCSV(csv string) ([]gc.Kind, error) {
 		}
 		k := gc.Kind(p)
 		switch k {
-		case gc.KindSockets, gc.KindOrphanAgents, gc.KindOrphanTmux, gc.KindWorktrees, gc.KindCoordLocks, gc.KindWorkerRecords, gc.KindInvalidProjects:
+		case gc.KindSockets, gc.KindOrphanAgents, gc.KindOrphanTmux, gc.KindWorktrees, gc.KindCoordLocks, gc.KindWorkerRecords, gc.KindInvalidProjects, gc.KindOrphanRCDaemons, gc.KindDrainProcs:
 			out = append(out, k)
 		default:
-			return nil, fmt.Errorf("unknown --kinds value %q (allowed: sockets, orphan-agents, orphan-tmux, worktrees, coord-locks, worker-records, invalid-projects)", p)
+			return nil, fmt.Errorf("unknown --kinds value %q (allowed: sockets, orphan-agents, orphan-tmux, worktrees, coord-locks, worker-records, invalid-projects, orphan-rc-daemons, drain-procs)", p)
 		}
 	}
 	if len(out) == 0 {
-		return nil, fmt.Errorf("--kinds parsed empty list (allowed: sockets, orphan-agents, orphan-tmux, worktrees, coord-locks, worker-records, invalid-projects)")
+		return nil, fmt.Errorf("--kinds parsed empty list (allowed: sockets, orphan-agents, orphan-tmux, worktrees, coord-locks, worker-records, invalid-projects, orphan-rc-daemons, drain-procs)")
 	}
 	return out, nil
 }
@@ -286,7 +314,7 @@ func renderReport(stdout io.Writer, opts gc.Options, r gc.Report) {
 	_, _ = fmt.Fprintf(stdout, "fleet gc — mode=%s aggressive=%t max-age=%s\n",
 		mode, opts.Aggressive, opts.MaxAge)
 
-	var nSockets, nAgents, nTmux, nWorktrees, nCoordLocks, nWorkerRecords, nInvalidProjects int
+	var nSockets, nAgents, nTmux, nWorktrees, nCoordLocks, nWorkerRecords, nInvalidProjects, nRCDaemons, nDrainProcs int
 	for _, a := range r.Actions {
 		_, _ = fmt.Fprintf(stdout, "%s  %s  verb=%s  reason=%s\n",
 			a.Kind, a.Target, a.Verb, a.Reason)
@@ -305,9 +333,13 @@ func renderReport(stdout io.Writer, opts gc.Options, r gc.Report) {
 			nWorkerRecords++
 		case gc.KindInvalidProjects:
 			nInvalidProjects++
+		case gc.KindOrphanRCDaemons:
+			nRCDaemons++
+		case gc.KindDrainProcs:
+			nDrainProcs++
 		}
 	}
 	_, _ = fmt.Fprintf(stdout,
-		"summary: %d sockets, %d agents, %d tmux (surface only by default), %d worktrees, %d coord-locks, %d worker-records, %d invalid-projects\n",
-		nSockets, nAgents, nTmux, nWorktrees, nCoordLocks, nWorkerRecords, nInvalidProjects)
+		"summary: %d sockets, %d agents, %d tmux (surface only by default), %d worktrees, %d coord-locks, %d worker-records, %d invalid-projects, %d orphan-rc-daemons, %d drain-procs\n",
+		nSockets, nAgents, nTmux, nWorktrees, nCoordLocks, nWorkerRecords, nInvalidProjects, nRCDaemons, nDrainProcs)
 }

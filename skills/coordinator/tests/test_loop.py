@@ -2597,7 +2597,15 @@ def test_parse_sentinel_ignores_narrative() -> None:
 # ---------- entry point ----------
 
 
-def test_main_with_no_project_returns_zero(capsys) -> None:
+def test_main_with_no_project_returns_zero(tmp_path, monkeypatch, capsys) -> None:
+    # Sandbox FLEET_HOME so this never touches the operator's real ~/.fleet
+    # (test-isolation: an unsandboxed loop.main() reconciled live state and
+    # could write a real dispatch journal that polluted later tests). Run
+    # from a project-less cwd so "no project set" is the genuine outcome.
+    monkeypatch.setenv("FLEET_HOME", str(tmp_path / "fleet-home"))
+    monkeypatch.delenv("FLEET_PROJECT", raising=False)
+    monkeypatch.delenv("FLEET_AGENT_ID", raising=False)
+    monkeypatch.chdir(tmp_path)
     rc = loop.main([])
     assert rc == 0
     captured = capsys.readouterr()
@@ -4591,3 +4599,110 @@ def test_tick_retries_missed_checkpoint_via_latch(
     # And the latch is cleared after the successful publish.
     final = json.loads(sp.read_text())
     assert final.get("checkpoint_due") is False
+
+
+# ---- leak-coord-spawn-idempot: claim cleared ONLY after coord-state save ----
+
+
+def test_tick_clears_pending_claim_after_coord_state_save(
+    fleet_home: Path, project_dir: Path,
+    fleet_run_recorder, dispatch_subprocess, monkeypatch,
+) -> None:
+    """Ordering invariant (codex iter-1 P1): the cold-start pending-spawn
+    claim must be cleared ONLY AFTER the heartbeat writes coord-state.json,
+    never before.
+
+    The claim is the sole active double-spawn veto until coord-state.json
+    lands. If the tick cleared it earlier, a cross-socket dispatch #2
+    between the early clear and the coord-state write would pass BOTH the
+    pending-claim veto AND the coordStateFresh veto, re-opening the
+    duplicate-coord window. This test drives a real tick on a cold-start
+    project (no coord-state.json yet) with a pre-seeded claim, spies on
+    _save_coord_state to capture claim-existence at save time, and asserts
+    the claim still existed when state was saved and is gone afterward.
+    """
+    _write_tasks(project_dir, [])  # no ready tasks → trivial tick
+    claim = project_dir / "coord-spawn-pending"
+    claim.write_text('{"agent_id": "abc", "spawned_at": "2026-06-06T00:00:00Z"}')
+    # Cold start: coord-state.json deliberately absent before the tick.
+    state_path = project_dir / "coord-state.json"
+    assert not state_path.exists()
+
+    saw = {"claim_present_at_first_save": None}
+    real_save = loop._save_coord_state
+
+    def spy_save(path, state):
+        if saw["claim_present_at_first_save"] is None:
+            # Record claim-existence at the moment of the FIRST save.
+            saw["claim_present_at_first_save"] = claim.exists()
+        return real_save(path, state)
+
+    monkeypatch.setattr(loop, "_save_coord_state", spy_save)
+
+    loop.tick(
+        "fleet", coord_id="cccccc01", cwd="/repo",
+        fleet_home=str(fleet_home),
+    )
+
+    # The claim must NOT have been cleared before the first coord-state
+    # save (that's the whole P1 fix — clear runs strictly after the save).
+    assert saw["claim_present_at_first_save"] is True, (
+        "claim was cleared BEFORE coord-state.json was saved — re-opens "
+        "the cold-start double-spawn window"
+    )
+    # And the heartbeat wrote coord-state.json (handoff signal now live)...
+    assert state_path.exists(), "tick must write coord-state.json"
+    # ...so the claim is now safely cleared.
+    assert not claim.exists(), "claim must be cleared after the heartbeat save"
+
+
+def test_tick_keeps_claim_when_parse_error_save_fails(
+    fleet_home: Path, project_dir: Path,
+    fleet_run_recorder, dispatch_subprocess, monkeypatch,
+) -> None:
+    """codex iter-2 P2: on the tasks.md parse-error bail path, the pending
+    claim must be cleared ONLY if the best-effort coord-state save there
+    succeeded. If that save ALSO fails, no fresh coord-state.json exists,
+    so the claim is the sole double-spawn veto — clearing it would let a
+    second cold-start dispatch spawn a duplicate. The claim must survive.
+    """
+    _write_tasks(project_dir, [])
+    claim = project_dir / "coord-spawn-pending"
+    claim.write_text('{"agent_id": "abc", "spawned_at": "2026-06-06T00:00:00Z"}')
+    state_path = project_dir / "coord-state.json"
+
+    # Force the tasks.md re-read to fail → enter the parse-error bail path.
+    # The re-read happens AFTER the initial parse, so we let the first
+    # parse.read succeed (loaded at tick entry) and fail the second.
+    real_read = loop.parse.read
+    calls = {"n": 0}
+
+    def flaky_read(path):
+        calls["n"] += 1
+        if calls["n"] >= 2:
+            raise RuntimeError("simulated tasks.md re-read failure")
+        return real_read(path)
+
+    monkeypatch.setattr(loop.parse, "read", flaky_read)
+    # And make the parse-error-path coord-state save fail too.
+    monkeypatch.setattr(
+        loop, "_save_coord_state",
+        lambda *a, **k: (_ for _ in ()).throw(OSError("simulated save failure")),
+    )
+
+    result = loop.tick(
+        "fleet", coord_id="cccccc01", cwd="/repo",
+        fleet_home=str(fleet_home),
+    )
+
+    # We must have actually hit the parse-error bail path.
+    assert any("re-read failed" in e for e in result.errors), (
+        f"test did not exercise the parse-error path; errors={result.errors}"
+    )
+    # No fresh coord-state.json (the save failed), so the claim is the only
+    # veto and MUST be preserved.
+    assert not state_path.exists(), "coord-state.json must not exist (save failed)"
+    assert claim.exists(), (
+        "pending claim must survive a failed parse-error-path save — "
+        "clearing it removes the sole cold-start double-spawn veto"
+    )
