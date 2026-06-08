@@ -386,25 +386,26 @@ func drainGraceful(req queue.SpawnFresh, path string, epoch int64, deadline time
 		return fmt.Errorf("fleet drain: load old agent %s: %w", req.OldAgentID, err)
 	}
 
-	// If OLD is still the recorded ACTIVE lease owner, do NOT force-kill it
-	// (the epoch gate refuses, correctly). Wait bounded for its self-release;
-	// escalate to takeover on timeout.
-	if ownerPid, ok := d.ActiveOwnerPID(req.Project); ok && ownerPid == oldRec.SupervisorPID {
+	// Branch on who currently OWNS the lease (codex PR3 iter-14 [P1]). The
+	// invariant across ALL branches: never declare the handoff done / delete the
+	// queue without either reaping a still-present OLD or confirming a SUCCESSOR
+	// acquired — OLD's absence alone is NOT proof a standby came up.
+	ownerPid, ownerOK := d.ActiveOwnerPID(req.Project)
+	switch {
+	case ownerOK && ownerPid == oldRec.SupervisorPID:
+		// OLD is still the recorded ACTIVE lease owner — finishing its own exit.
+		// Do NOT force-kill it (the epoch gate refuses the active leader,
+		// correctly). Wait bounded for a CONFIRMED SUCCESSOR; escalate on
+		// timeout.
 		_, _ = fmt.Fprintf(stdout,
 			"fleet drain: %s wrote the barrier and is still the active leader; waiting for its self-release\n",
 			oldRec.ID)
 		for {
-			// Completion requires a CONFIRMED SUCCESSOR owner, not merely OLD's
-			// absence (codex PR3 iter-14 [P1]): if the standby crashed / never
-			// acquired, ActiveOwnerPID returns !ok — deleting the queue there
-			// strands the project coordless with the only recovery request gone.
-			//   - ok && op != OLD  -> a successor acquired the freed flock; the
-			//     handoff is genuinely complete -> clean the queue.
-			//   - !ok (no owner)   -> OLD released but NO successor took over;
-			//     keep waiting (the standby may still be mid-acquire). On the
-			//     deadline we fall through to the takeover+recover escalation,
-			//     which brings up a successor — never leaving the project
-			//     coordless with the queue deleted.
+			// Completion requires a confirmed successor (ok && op != OLD), not
+			// merely OLD's absence: !ok means OLD released but NO standby has
+			// acquired yet — keep waiting (it may be mid-poll). On the deadline
+			// fall through to the takeover+recover escalation, which brings up a
+			// successor so the project is never left coordless.
 			if op, ok := d.ActiveOwnerPID(req.Project); ok && op != oldRec.SupervisorPID {
 				_, _ = fmt.Fprintf(stdout,
 					"fleet drain: %s released the lease and successor pid %d acquired it; handoff complete\n",
@@ -422,22 +423,44 @@ func drainGraceful(req queue.SpawnFresh, path string, epoch int64, deadline time
 				time.Sleep(wait)
 			}
 		}
-		// Either OLD held the lease past the budget (wedged after writing the
-		// barrier) OR OLD released but no successor ever acquired (the standby
-		// crashed / never came up) — both leave the project without a confirmed
-		// leader. Escalate to the safety-net takeover + lease-wrapped recovery
-		// (checks the takeover actually fenced+killed OLD before spawning a
-		// successor — codex PR3 iter-9 [P1]; brings up a successor so the project
-		// is never coordless — codex PR3 iter-14 [P1]). Never block.
+		// OLD wedged past the budget (or released with no successor ever
+		// acquiring) — escalate to the safety-net takeover + lease-wrapped
+		// recovery (fence+kill OLD, then spawn a successor). Never block.
 		_, _ = fmt.Fprintf(stderr,
-			"fleet drain: %s did not release the lease after writing the barrier within the budget; escalating to takeover\n",
+			"fleet drain: %s did not yield to a confirmed successor within the budget; escalating to takeover\n",
+			oldRec.ID)
+		return takeoverAndRecover(req, path, oldRec, stdout, stderr, d)
+
+	case ownerOK && ownerPid != oldRec.SupervisorPID:
+		// A SUCCESSOR already leads (a standby acquired). OLD's record is still
+		// present but it has released the lease — reap its lingering supervisor
+		// through the authenticated primitive, then the queue is cleaned. The
+		// handoff is confirmed complete (a successor owns the lease).
+		return drainReapOld(oldRec, req, path, epoch, stdout, stderr, d)
+
+	default:
+		// !ownerOK: OLD's record is present but NO process owns the lease right
+		// now — OLD released/demoted, and the standby has not acquired yet (or
+		// crashed). Reaping OLD + deleting the queue here would strand the
+		// project coordless if no successor ever comes up (codex PR3 iter-14
+		// [P1]). Wait bounded for a CONFIRMED successor; if one acquires, reap
+		// OLD's lingering supervisor and finish. If none by the deadline,
+		// escalate to takeover+recover so a successor is brought up — never a
+		// coordless queue-delete.
+		_, _ = fmt.Fprintf(stdout,
+			"fleet drain: %s released the lease but no successor owns it yet; waiting for a confirmed successor\n",
+			oldRec.ID)
+		if d.waitForSuccessorOwner(req.Project, deadline) {
+			_, _ = fmt.Fprintf(stdout,
+				"fleet drain: a successor acquired the lease for %s; reaping the old supervisor and finishing\n",
+				req.Project)
+			return drainReapOld(oldRec, req, path, epoch, stdout, stderr, d)
+		}
+		_, _ = fmt.Fprintf(stderr,
+			"fleet drain: %s released the lease but NO successor acquired within the budget; escalating to takeover\n",
 			oldRec.ID)
 		return takeoverAndRecover(req, path, oldRec, stdout, stderr, d)
 	}
-
-	// OLD is not the active owner (already releasing / stale record) — reap it
-	// directly through the authenticated primitive.
-	return drainReapOld(oldRec, req, path, epoch, stdout, stderr, d)
 }
 
 // waitForSuccessorOwner polls (bounded by deadline) for ANY active lease owner

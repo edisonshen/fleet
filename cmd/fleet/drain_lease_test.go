@@ -151,10 +151,12 @@ func TestDrainLease_LiveLeaderBarrierAppearsMidPoll_NoDuplicateResume(t *testing
 			// Barrier appears on the 2nd poll (the producer just wrote it).
 			return atomic.AddInt32(&barrierReads, 1) >= 2
 		},
-		// After the barrier, OLD releases (active owner flips away) so the
-		// graceful self-release wait completes.
-		ActiveOwnerPID: func(string) (int, bool) { return 0, false },
+		// After the barrier, a SUCCESSOR (different pid) acquires the lease so the
+		// graceful path completes via the confirmed-successor branch (codex PR3
+		// iter-14 [P1]: completion needs a confirmed successor, not !ok).
+		ActiveOwnerPID: func(string) (int, bool) { return 555555, true },
 		LoadAgent:      func(string) (*agent.Record, error) { return oldCoordRec(), nil },
+		KillCoord:      func(coord.KillTarget) error { return nil }, // OLD released; reap its lingering supervisor
 		Resume: func(queue.SpawnFresh, string, int, io.Writer, io.Writer) error {
 			atomic.AddInt32(&resumed, 1)
 			return nil
@@ -346,9 +348,9 @@ func TestDrainLease_GracefulKillRefusalSurfaced(t *testing.T) {
 		LeaderPresent: func(string) bool { return true },
 		CurrentEpoch:  func(string) (int64, bool) { return 5, true },
 		BarrierExists: func(string, int64) bool { return true }, // graceful path
-		// OLD is NOT the active owner (already releasing/stale) -> direct reap
-		// path (not the self-release wait).
-		ActiveOwnerPID: func(string) (int, bool) { return 0, false },
+		// A SUCCESSOR (different pid) already owns the lease -> OLD released;
+		// reap its lingering supervisor directly (not the self-release wait).
+		ActiveOwnerPID: func(string) (int, bool) { return 555555, true },
 		LoadAgent: func(string) (*agent.Record, error) {
 			return oldCoordRec(), nil
 		},
@@ -356,6 +358,7 @@ func TestDrainLease_GracefulKillRefusalSurfaced(t *testing.T) {
 			target = kt
 			return refusal
 		},
+		BarrierPoll: time.Millisecond,
 	}
 	err := drainOneLeaseAwareWith(leaseDrainReq(), "/tmp/q.json", 0, 1000, out, out, d)
 	if err == nil || !errors.Is(err, refusal) {
