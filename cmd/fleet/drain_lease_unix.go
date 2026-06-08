@@ -360,9 +360,28 @@ func drainGraceful(req queue.SpawnFresh, path string, epoch int64, deadline time
 	oldRec, err := d.LoadAgent(req.OldAgentID)
 	switch {
 	case errors.Is(err, state.ErrNotFound):
-		// OLD already archived — handoff fully complete. Clean the queue.
-		_, _ = fmt.Fprintf(stdout, "fleet drain: %s already retired (barrier present); cleaning queue\n", req.OldAgentID)
-		return queue.Delete(path)
+		// OLD already archived — but that is NOT proof a standby acquired the
+		// lease (codex PR3 iter-14 [P1]): coord-run RELEASES the lease and THEN
+		// archives OLD, so between the archive and the standby's next poll there
+		// is a window where the lease is free and unowned. Deleting the queue
+		// here would strand the project coordless if the standby crashed / is
+		// still mid-acquire. Wait (bounded) for a CONFIRMED active owner before
+		// declaring the handoff done. We cannot RecoverSpawn here (OLD's record
+		// is archived, so there is nothing to recover FROM), so on a no-successor
+		// timeout we PRESERVE the queue and surface — a later drain pass (or the
+		// standby finally acquiring) completes it; `fleet doctor` (PR6) handles a
+		// truly-stuck case. Surface-don't-silo: never a silent coordless delete.
+		if d.waitForSuccessorOwner(req.Project, deadline) {
+			_, _ = fmt.Fprintf(stdout,
+				"fleet drain: %s retired and a successor holds the lease; cleaning queue\n", req.OldAgentID)
+			return queue.Delete(path)
+		}
+		_, _ = fmt.Fprintf(stderr,
+			"fleet drain: %s archived (barrier present) but NO successor acquired the lease within the budget; "+
+				"preserving queue %s for retry (a standby may still be mid-acquire; run `fleet doctor` if it persists)\n",
+			req.OldAgentID, path)
+		return fmt.Errorf("fleet drain: %s retired but no successor leads %s yet; queue preserved for retry",
+			req.OldAgentID, req.Project)
 	case err != nil:
 		return fmt.Errorf("fleet drain: load old agent %s: %w", req.OldAgentID, err)
 	}
@@ -419,6 +438,30 @@ func drainGraceful(req queue.SpawnFresh, path string, epoch int64, deadline time
 	// OLD is not the active owner (already releasing / stale record) — reap it
 	// directly through the authenticated primitive.
 	return drainReapOld(oldRec, req, path, epoch, stdout, stderr, d)
+}
+
+// waitForSuccessorOwner polls (bounded by deadline) for ANY active lease owner
+// to appear for project. Used after OLD is confirmed gone (archived) to verify a
+// standby actually acquired the freed lease before declaring the handoff
+// complete — OLD's absence alone is not proof of a successor (codex PR3 iter-14
+// [P1]). Returns true the instant an owner is observed; false if the deadline
+// passes with none. Holds no lock.
+func (d drainLeaseDeps) waitForSuccessorOwner(project string, deadline time.Time) bool {
+	for {
+		if _, ok := d.ActiveOwnerPID(project); ok {
+			return true
+		}
+		if !time.Now().Before(deadline) {
+			return false
+		}
+		wait := d.BarrierPoll
+		if rem := time.Until(deadline); rem < wait {
+			wait = rem
+		}
+		if wait > 0 {
+			time.Sleep(wait)
+		}
+	}
 }
 
 // drainReapOld reaps OLD's coord-run supervisor through the ONE

@@ -376,20 +376,58 @@ func TestDrainLease_GracefulKillRefusalSurfaced(t *testing.T) {
 func TestDrainLease_GracefulOldAlreadyArchived(t *testing.T) {
 	out := &bytes.Buffer{}
 	var killed int32
+	// OLD archived AND a successor holds the lease -> genuinely complete: clean
+	// the queue, no kill. (codex PR3 iter-14 [P1]: a confirmed successor, not
+	// merely OLD's archive, is what proves completion.)
 	d := drainLeaseDeps{
 		LeaderPresent:  func(string) bool { return true },
 		CurrentEpoch:   func(string) (int64, bool) { return 5, true },
 		BarrierExists:  func(string, int64) bool { return true },
-		ActiveOwnerPID: func(string) (int, bool) { return 0, false },
+		ActiveOwnerPID: func(string) (int, bool) { return 555555, true }, // successor leads
 		LoadAgent:      func(string) (*agent.Record, error) { return nil, state.ErrNotFound },
 		KillCoord:      func(coord.KillTarget) error { atomic.AddInt32(&killed, 1); return nil },
+		BarrierPoll:    time.Millisecond,
 	}
-	// queue.Delete on a non-existent path is tolerated by handoffop's
-	// cleanUpStaleQueue elsewhere; here Delete returns its own error which we
-	// accept either way — assert no kill + no crash.
-	_ = drainOneLeaseAwareWith(leaseDrainReq(), "/tmp/does-not-exist-q.json", 0, 1000, out, out, d)
+	qp := existingQueuePath(t)
+	if err := drainOneLeaseAwareWith(leaseDrainReq(), qp, 0, 1000, out, out, d); err != nil {
+		t.Fatalf("archived OLD + successor present should complete cleanly, got %v", err)
+	}
 	if atomic.LoadInt32(&killed) != 0 {
 		t.Errorf("kill ran %d times though OLD was already archived", killed)
+	}
+	if _, statErr := os.Stat(qp); !errors.Is(statErr, os.ErrNotExist) {
+		t.Errorf("queue must be deleted when archived OLD has a confirmed successor")
+	}
+}
+
+// codex PR3 iter-14 [P1]: OLD is archived (coord-run released the lease then
+// archived OLD) but NO successor has acquired the freed lease yet (standby
+// crashed / still mid-poll). Deleting the queue here would strand the project
+// coordless with the only recovery request gone. The drain must NOT delete it —
+// it preserves the queue + surfaces an error so a later pass (or the standby
+// finally acquiring) completes the handoff.
+func TestDrainLease_GracefulOldArchivedNoSuccessor_PreservesQueue(t *testing.T) {
+	out := &bytes.Buffer{}
+	var killed int32
+	d := drainLeaseDeps{
+		LeaderPresent:  func(string) bool { return true },
+		CurrentEpoch:   func(string) (int64, bool) { return 5, true },
+		BarrierExists:  func(string, int64) bool { return true },
+		ActiveOwnerPID: func(string) (int, bool) { return 0, false }, // no successor
+		LoadAgent:      func(string) (*agent.Record, error) { return nil, state.ErrNotFound },
+		KillCoord:      func(coord.KillTarget) error { atomic.AddInt32(&killed, 1); return nil },
+		BarrierPoll:    time.Millisecond,
+	}
+	qp := existingQueuePath(t)
+	err := drainOneLeaseAwareWith(leaseDrainReq(), qp, 0, 5, out, out, d)
+	if err == nil {
+		t.Fatal("no-successor archived case must surface an error, not declare done")
+	}
+	if atomic.LoadInt32(&killed) != 0 {
+		t.Errorf("kill ran %d times though OLD was already archived", killed)
+	}
+	if _, statErr := os.Stat(qp); errors.Is(statErr, os.ErrNotExist) {
+		t.Error("queue must be PRESERVED when archived OLD has no successor (deleting it strands the project coordless)")
 	}
 }
 
