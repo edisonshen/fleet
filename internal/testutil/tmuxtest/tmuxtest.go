@@ -93,7 +93,7 @@ func IsolateSocket(t *testing.T) string {
 	t.Setenv("FLEET_TMUX_SOCKET", sock)
 	t.Cleanup(func() {
 		if err := killServerAndRemove(sock); err != nil {
-			t.Logf("tmuxtest: cleanup %s: %v", sock, err)
+			t.Errorf("tmuxtest: cleanup %s: %v", sock, err)
 		}
 	})
 	return sock
@@ -102,11 +102,12 @@ func IsolateSocket(t *testing.T) string {
 // socketRemoveRetries / socketRemoveDelay bound the verified-remove loop
 // in killServerAndRemove. Vars (not consts) so the unit test can shrink
 // the delay and so the count is tunable if a slower CI kernel needs more
-// settle iterations. 10 * 20ms = 200ms worst case — negligible per test,
-// and the common case removes on the first attempt.
+// settle iterations. 100 * 50ms = 5s worst case only when tmux or the
+// filesystem keeps recreating the socket; the common case removes on the
+// first attempt.
 var (
-	socketRemoveRetries = 10
-	socketRemoveDelay   = 20 * time.Millisecond
+	socketRemoveRetries = 100
+	socketRemoveDelay   = 50 * time.Millisecond
 )
 
 // killServerAndRemove tears the per-test tmux server down and DELETES the
@@ -134,7 +135,9 @@ var (
 func killServerAndRemove(sock string) error {
 	// kill-server is idempotent: tmux exits non-zero when no server is
 	// running on the socket, which is fine — we just want it gone.
-	_ = exec.Command("tmux", "-S", sock, "kill-server").Run()
+	cmd := exec.Command("tmux", "-S", sock, "kill-server")
+	cmd.Env = append(os.Environ(), "TMUX=")
+	_ = cmd.Run()
 
 	var lastErr error
 	for attempt := 0; attempt < socketRemoveRetries; attempt++ {

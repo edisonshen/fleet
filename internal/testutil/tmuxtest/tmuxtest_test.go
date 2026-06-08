@@ -116,6 +116,39 @@ func TestKillServerAndRemove_IdempotentWhenGone(t *testing.T) {
 	}
 }
 
+// TestKillServerAndRemove_StopsLiveServerAndDeletesSocket pins the CI
+// failure mode: a real tmux server bound to a fleet-test socket must leave
+// no /tmp/fleet-test-*.sock file behind after helper cleanup.
+func TestKillServerAndRemove_StopsLiveServerAndDeletesSocket(t *testing.T) {
+	if _, err := exec.LookPath("tmux"); err != nil {
+		t.Skip("tmux not installed")
+	}
+
+	sock := isolatedSocketPath(t)
+	session := "fleet-test-cleanup"
+	cmd := exec.Command("tmux", "-S", sock, "new-session", "-d", "-s", session, "sleep", "60")
+	cmd.Env = append(os.Environ(), "TMUX=")
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("start tmux server: %v\n%s", err, out)
+	}
+	t.Cleanup(func() {
+		cleanup := exec.Command("tmux", "-S", sock, "kill-server")
+		cleanup.Env = append(os.Environ(), "TMUX=")
+		_ = cleanup.Run()
+		_ = os.Remove(sock)
+	})
+	if _, err := os.Stat(sock); err != nil {
+		t.Fatalf("expected live tmux socket at %s: %v", sock, err)
+	}
+
+	if err := killServerAndRemove(sock); err != nil {
+		t.Fatalf("killServerAndRemove live server: %v", err)
+	}
+	if _, err := os.Stat(sock); !os.IsNotExist(err) {
+		t.Errorf("live tmux socket %s not removed (stat err=%v)", sock, err)
+	}
+}
+
 // TestKillServerAndRemove_RetriesUntilGone pins the verified-remove loop:
 // a socket file that only disappears after a few attempts (simulating the
 // Linux server-teardown race where the inode lingers briefly) is still
