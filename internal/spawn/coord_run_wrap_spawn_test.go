@@ -17,6 +17,7 @@ import (
 	"os"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/edisonshen/fleet/internal/agent"
 	"github.com/edisonshen/fleet/internal/state"
@@ -91,5 +92,73 @@ func TestSpawn_StandbySkipsEnginePidResolution(t *testing.T) {
 	if rec.PID != os.Getpid() {
 		t.Errorf("standby rec.PID = %d, want the provisional fleet-binary pid %d (resolver must be skipped)",
 			rec.PID, os.Getpid())
+	}
+}
+
+// codex PR3 iter-14 [P2]: if `coord-run --standby` acquires the lease and stamps
+// the REAL engine pid (agent.StampEnginePID) into the on-disk record BEFORE
+// spawn.Spawn's final locked merge runs, the merge must NOT clobber it back to
+// the provisional spawning-CLI pid. Simulate the concurrent stamp by writing a
+// sentinel engine pid to the pre-launch record while Spawn is mid-flight, then
+// assert the final record preserves it.
+func TestSpawn_StandbyFinalMergePreservesStampedEnginePID(t *testing.T) {
+	requireTmux(t)
+	setupFleetHome(t)
+	t.Setenv("FLEET_LEASE_FAILOVER", "1")
+
+	const id = "sbmerge1"
+	const stampedPid = 4242424 // sentinel "real engine pid" a standby would stamp
+
+	old := agent.New("oldsbmerge")
+	old.Project = "p"
+	old.TaskID = "coord-p" // isCoordSpawn
+	old.Cwd = t.TempDir()
+	old.Command = []string{"sh", "-c", "sleep 60"}
+
+	// Concurrently stamp a sentinel engine pid once the pre-launch record lands,
+	// racing Spawn's final merge — exactly the standby-acquires-mid-spawn window.
+	stamped := make(chan struct{})
+	go func() {
+		deadline := time.Now().Add(10 * time.Second)
+		for time.Now().Before(deadline) {
+			if _, err := agent.Load(id); err == nil {
+				if serr := agent.StampEnginePID(id, stampedPid); serr == nil {
+					close(stamped)
+					return
+				}
+			}
+			time.Sleep(2 * time.Millisecond)
+		}
+	}()
+
+	rec, err := Spawn(Options{
+		OldRecord:      old,
+		TaskID:         "coord-p",
+		Project:        "p",
+		Cwd:            old.Cwd,
+		Command:        old.Command,
+		Standby:        true,
+		PreAllocatedID: id,
+	})
+	if err != nil {
+		t.Fatalf("standby Spawn: %v", err)
+	}
+	t.Cleanup(func() { _ = tmux.Kill(rec.TmuxSession) })
+
+	select {
+	case <-stamped:
+	case <-time.After(2 * time.Second):
+		t.Skip("could not stamp before Spawn finished (timing); merge-preservation not exercised")
+	}
+
+	// The final on-disk record must carry the stamped engine pid, not the
+	// provisional os.Getpid clobbered back over it.
+	got, err := agent.Load(id)
+	if err != nil {
+		t.Fatalf("Load final record: %v", err)
+	}
+	if got.PID != stampedPid {
+		t.Errorf("final standby record PID = %d, want the stamped engine pid %d (merge clobbered the live pid back to provisional)",
+			got.PID, stampedPid)
 	}
 }

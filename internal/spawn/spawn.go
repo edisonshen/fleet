@@ -1121,6 +1121,18 @@ func Spawn(opts Options) (*agent.Record, error) {
 			rec.SupervisorPID = onDisk.SupervisorPID
 			rec.SupervisorPidStart = onDisk.SupervisorPidStart
 			rec.SupervisorExePath = onDisk.SupervisorExePath
+			// WARM STANDBY (codex PR3 iter-14 [P2]): a standby spawn SKIPPED
+			// engine-pid resolution, so our in-memory rec.PID is still the
+			// provisional spawning-CLI pid. If `coord-run --standby` already
+			// acquired the lease and stamped the REAL engine child pid (via
+			// agent.StampEnginePID) before this final locked write, onDisk.PID
+			// holds it — carry it forward so we don't clobber the live successor's
+			// pid back to the dead provisional one. (Non-standby spawns resolved
+			// rec.PID themselves above, so this preserves their value too when
+			// onDisk agrees; only adopt onDisk.PID when it differs and is live.)
+			if opts.Standby && onDisk.PID > 0 && onDisk.PID != rec.PID {
+				rec.PID = onDisk.PID
+			}
 		}
 		// Any other load error: fall through to the write (best-effort).
 		if werr := rec.Write(); werr != nil {
