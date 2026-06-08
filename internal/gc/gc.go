@@ -348,6 +348,18 @@ type Deps struct {
 	// coordRecordExistsOnDisk. nil disables the dead-owner branch.
 	CoordRecordExists func(coordID string) bool
 
+	// Live test-socket tmux servers (sub-pass of KindOrphanTmux,
+	// DESIGN-lifecycle-leak-recurrence.md PR-D).
+	// ListLiveTestSockets enumerates live `fleet-<id>` tmux servers bound
+	// to /tmp/fleet-test-*.sock, each annotated with OwnerPID (a live
+	// `go test` process holding the socket open, or 0 = orphan). nil
+	// disables the sub-pass (older Deps / narrow unit tests). Production
+	// wiring is listLiveTestSocketsOnDisk.
+	ListLiveTestSockets func() ([]LiveTestSocket, error)
+	// KillTmuxServer runs `tmux -S <sock> kill-server` under
+	// --apply --aggressive. Production wiring is killTmuxServerOnDisk.
+	KillTmuxServer func(socketPath string) error
+
 	// Invalid-projects (KindInvalidProjects).
 	// ListProjectDirs enumerates EVERY ~/.fleet/projects/<name>/ entry
 	// (unlike ListProjects, which already filters out invalid names) plus
@@ -515,6 +527,13 @@ func Reconcile(opts Options, deps Deps) (Report, error) {
 	if hasKind(opts.Kinds, KindOrphanTmux) {
 		if err := reconcileOrphanTmux(&r, opts, deps); err != nil {
 			recordErr(fmt.Errorf("orphan-tmux: %w", err))
+		}
+		// Sub-pass: live test-socket tmux servers (PR-D). Distinct from
+		// reconcileOrphanTmux (which probes the default/FLEET_TMUX_SOCKET
+		// server); this one walks /tmp/fleet-test-*.sock servers. Both emit
+		// Kind=KindOrphanTmux actions so they group in the output.
+		if err := reconcileLiveTestSockets(&r, opts, deps); err != nil {
+			recordErr(fmt.Errorf("orphan-tmux (live test-sock): %w", err))
 		}
 	}
 	// dirtyParkedInRun tracks (project/slug) worktrees the worktrees pass
@@ -973,6 +992,8 @@ func DefaultDeps() Deps {
 		RemoveDrainRun:        removeDrainRunFile,
 		ListDrainProcs:        listDrainProcsOnDisk,
 		ReloadDrainRun:        reloadDrainRunOnDisk,
+		ListLiveTestSockets:   listLiveTestSocketsOnDisk,
+		KillTmuxServer:        killTmuxServerOnDisk,
 	}
 }
 
