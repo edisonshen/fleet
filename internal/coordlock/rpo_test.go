@@ -244,6 +244,46 @@ func TestT39_CleanRebuildReplaysNothing(t *testing.T) {
 	}
 }
 
+// codex PR4 [P1]: replay re-fences per action. If a fence lands mid-replay
+// (the handler runs long enough for a takeover), the loop stops driving side
+// effects as a non-owner and the remaining intents are left for the real
+// successor.
+func TestReplayIntents_PerActionFenceStopsMidLoop(t *testing.T) {
+	setupHome(t)
+	const project = "rainier"
+	tok := ownerToken(t, project, 4)
+	store, _ := tok.intentStore()
+	for _, k := range []string{"a-first", "b-second", "c-third"} {
+		if err := store.writeIntent(k, 4); err != nil {
+			t.Fatal(err)
+		}
+	}
+	driven := []string{}
+	err := ReplayIntents(tok, func(key string) error {
+		driven = append(driven, key)
+		// After the FIRST handler runs, simulate a takeover fencing us: bump
+		// the on-disk epoch so the next StillOwned() (before the 2nd handler)
+		// returns false.
+		if len(driven) == 1 {
+			writeEpochRaw(t, project, epochRecord{
+				Epoch: 5, State: stateActive,
+				Owner:  identity{Pid: 9999, PidStart: 8888, AgentID: "successor", Project: project},
+				BootID: "test-boot-1", RenewedAtMono: 0,
+			})
+		}
+		return nil
+	})
+	if !errors.Is(err, ErrLeaseLost) {
+		t.Fatalf("a mid-replay fence must return ErrLeaseLost, got %v", err)
+	}
+	// Only the first intent's handler ran (and its completion may or may not
+	// have been written — the re-fence is before completion too). The 2nd/3rd
+	// were NOT driven.
+	if len(driven) != 1 || driven[0] != "a-first" {
+		t.Fatalf("replay must stop at the fence; drove %v", driven)
+	}
+}
+
 func TestReplayIntents_RejectedWhenLeaseLost(t *testing.T) {
 	setupHome(t)
 	const project = "rainier"

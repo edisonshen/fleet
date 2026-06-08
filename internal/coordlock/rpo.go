@@ -274,12 +274,26 @@ func ReplayIntents(tok LeaseToken, handler func(idempotencyKey string) error) er
 		return fmt.Errorf("coordlock.ReplayIntents: scan intents: %w", perr)
 	}
 	for _, key := range keys {
+		// PER-ACTION FENCE (codex PR4 [P1]). Replay can span a slow handler
+		// and many pending intents; a candidate could fence us (or we could
+		// self-expire) mid-loop. Re-check ownership BEFORE each handler and
+		// BEFORE each completion write so a fenced successor stops driving
+		// side effects as a non-owner — the same boundary GuardWithLease
+		// enforces, applied to replay. A partially-replayed log is safe: the
+		// real successor re-drives the remaining intents idempotently.
+		if !tok.StillOwned() {
+			return ErrLeaseLost
+		}
 		if herr := handler(key); herr != nil {
 			return fmt.Errorf("coordlock.ReplayIntents: replay %q: %w", key, herr)
 		}
 		// Mark complete under the CURRENT lease epoch so a subsequent
-		// rebuild sees it finished. Best-effort fsync; a failure here just
-		// means the (idempotent) action is re-driven once more next time.
+		// rebuild sees it finished. Re-fence first: the handler may have run
+		// long enough for a takeover to fence us; a non-owner must not write
+		// a completion (which would suppress the real successor's replay).
+		if !tok.StillOwned() {
+			return ErrLeaseLost
+		}
 		if cerr := store.writeCompletion(key, tok.Epoch); cerr != nil {
 			return fmt.Errorf("coordlock.ReplayIntents: mark %q complete: %w", key, cerr)
 		}
@@ -357,6 +371,18 @@ func WriteCheckpoint(tok LeaseToken, payload []byte) error {
 		}
 	}
 	blob := encodeCheckpoint(payload, tok.Epoch)
+	// RE-FENCE immediately before the commit (codex PR4 [P1]). The .prev roll
+	// + encode above take wall-clock time; a candidate could fence us in that
+	// window. A zombie's checkpoint is stamped with its STALE epoch, which is
+	// <= the successor's epoch, so ReadCheckpoint would NOT quarantine it
+	// (only future-epoch is quarantined) — the successor would trust the
+	// zombie's rolled-back state. Re-checking ownership right before the
+	// atomic rename closes that hole to the minimum window. (The render-then-
+	// rename of writeBytesAtomicFsync is itself atomic; the only TOCTOU is
+	// here, and it is now as tight as a no-lock-across-IO design allows.)
+	if !tok.StillOwned() {
+		return ErrLeaseLost
+	}
 	if werr := writeBytesAtomicFsync(live, blob); werr != nil {
 		return fmt.Errorf("coordlock.WriteCheckpoint: %w", werr)
 	}
