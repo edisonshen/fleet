@@ -31,6 +31,22 @@ type killRecorder struct {
 		pid int
 		sig syscall.Signal
 	}
+	// reaps records (agentID, project) pairs passed to the ReapOrphan seam so
+	// a test can assert the SIGKILL-escalation orphan reap fired (or did not).
+	reaps []struct{ agentID, project string }
+}
+
+func (k *killRecorder) reap(agentID, project string) error {
+	k.mu.Lock()
+	defer k.mu.Unlock()
+	k.reaps = append(k.reaps, struct{ agentID, project string }{agentID, project})
+	return nil
+}
+
+func (k *killRecorder) reapCount() int {
+	k.mu.Lock()
+	defer k.mu.Unlock()
+	return len(k.reaps)
 }
 
 func (k *killRecorder) signal(pid int, sig syscall.Signal) error {
@@ -96,6 +112,10 @@ func testKillDeps(rec *killRecorder, recs []*agent.Record, liveStart map[int]int
 		Grace:            0, // no grace delay in unit tests
 		KillTimeout:      10 * time.Millisecond,
 		Sleep:            func(time.Duration) {},
+		// Stub the orphan reap so unit tests neither shell out to tmux nor
+		// touch the real ~/.fleet archive; the dedicated reap test asserts it
+		// fires on the SIGKILL branch.
+		ReapOrphan: rec.reap,
 	}
 }
 
@@ -283,6 +303,67 @@ func TestKillCoord_SuccessfulReap_TermThenKill(t *testing.T) {
 	rec.mu.Unlock()
 	if !sawTerm || !sawKill {
 		t.Errorf("expected SIGTERM then SIGKILL escalation; sawTerm=%v sawKill=%v", sawTerm, sawKill)
+	}
+}
+
+// codex PR3 iter-14 [P1] REGRESSION: when escalation reaches SIGKILL (the
+// supervisor ignored SIGTERM), the dead supervisor's `defer Cleanup(...)` never
+// runs — so the killer MUST itself reap the orphan (archive record + kill
+// tmux/engine). Otherwise the old engine session stays alive while takeover
+// spawns a replacement -> duplicate/orphaned coord + stale live record. Asserts
+// ReapOrphan fires once with the matched record's (agentID, project).
+func TestKillCoord_SigkillEscalation_ReapsOrphan(t *testing.T) {
+	const (
+		project = "proj-orphan"
+		selfPid = 1000
+		pid     = 9100
+	)
+	recs := []*agent.Record{coordRec("orph0001", project, pid, 707, "/usr/local/bin/fleet")}
+	live := map[int]int64{selfPid: 111, pid: 707} // pid stays alive -> SIGKILL fires
+	rec := &killRecorder{}
+	d := testKillDeps(rec, recs, live, 0, selfPid)
+	if err := killCoord(KillTarget{Pid: pid, PidStart: 707, AgentID: "orph0001", Project: project, FencerEpoch: 7}, d); err != nil {
+		t.Fatalf("reap: want nil, got %v", err)
+	}
+	if rec.reapCount() != 1 {
+		t.Fatalf("ReapOrphan fired %d times after SIGKILL, want 1 (orphan tmux/engine + record must be reaped)", rec.reapCount())
+	}
+	rec.mu.Lock()
+	got := rec.reaps[0]
+	rec.mu.Unlock()
+	if got.agentID != "orph0001" || got.project != project {
+		t.Errorf("ReapOrphan called with (%q,%q), want (orph0001,%q)", got.agentID, got.project, project)
+	}
+}
+
+// The orphan reap is SCOPED to the SIGKILL branch: a supervisor that exits
+// cleanly under SIGTERM ran its OWN deferred Cleanup, so the killer must NOT
+// double-reap. Here the pid "dies" before SIGKILL (removed from the live map by
+// an Alive stub that reports dead after the first SIGTERM).
+func TestKillCoord_CleanSigtermExit_NoOrphanReap(t *testing.T) {
+	const (
+		project = "proj-clean"
+		selfPid = 1000
+		pid     = 9200
+	)
+	recs := []*agent.Record{coordRec("clean001", project, pid, 808, "/usr/local/bin/fleet")}
+	live := map[int]int64{selfPid: 111, pid: 808}
+	rec := &killRecorder{}
+	d := testKillDeps(rec, recs, live, 0, selfPid)
+	// After the first SIGTERM, the supervisor exits: mark pid dead so the
+	// SIGKILL escalation branch is NOT entered.
+	d.Signal = func(p int, sig syscall.Signal) error {
+		_ = rec.signal(p, sig)
+		if p == pid && sig == syscall.SIGTERM {
+			delete(live, pid) // self-demoted + exited under SIGTERM
+		}
+		return nil
+	}
+	if err := killCoord(KillTarget{Pid: pid, PidStart: 808, AgentID: "clean001", Project: project, FencerEpoch: 8}, d); err != nil {
+		t.Fatalf("clean exit: want nil, got %v", err)
+	}
+	if rec.reapCount() != 0 {
+		t.Errorf("ReapOrphan fired %d times on a clean SIGTERM exit, want 0 (supervisor's own defer ran the cleanup)", rec.reapCount())
 	}
 }
 

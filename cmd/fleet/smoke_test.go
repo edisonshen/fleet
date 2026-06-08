@@ -137,7 +137,7 @@ func TestSmoke_AutoHandoffEndToEnd(t *testing.T) {
 
 	// Step 6: drain the queue.
 	var drainOut, drainErr bytes.Buffer
-	if err := runDrain(&drainOut, &drainErr, 0); err != nil {
+	if err := runDrain(&drainOut, &drainErr, 0, 0); err != nil {
 		t.Fatalf("runDrain: %v\nstdout=%s\nstderr=%s",
 			err, drainOut.String(), drainErr.String())
 	}

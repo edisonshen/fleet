@@ -1259,6 +1259,39 @@ func CurrentActiveOwnerPID(project string) (pid int, ok bool) {
 	return rec.Owner.Pid, true
 }
 
+// CurrentEpoch returns the project's current on-disk fencing epoch (the
+// monotonic token) and ok=false if no epoch record exists / is unreadable.
+// It is the value the graceful handoff stamps into its
+// handoff-complete-<epoch>.json barrier (PR3) so the drain verifier can
+// confirm the barrier belongs to the lease generation it is about to reap.
+// Read-only, takes no lock; a torn read degrades to (0, false).
+func CurrentEpoch(project string) (epoch int64, ok bool) {
+	paths, err := resolvePaths(project)
+	if err != nil {
+		return 0, false
+	}
+	rec, err := readEpoch(paths.epoch)
+	if err != nil {
+		return 0, false
+	}
+	return rec.Epoch, true
+}
+
+// BarrierPath returns the absolute path of the graceful-handoff completion
+// barrier for (project, epoch): <project>/.locks/handoff-complete-<epoch>.json.
+// The OLD coord writes it (atomic .tmp->fsync->rename) ONLY after the
+// handoff doc + checkpoint are fsynced; the drain verifier waits for it
+// before a GRACEFUL kill (the safety-net kill may fire pre-barrier). Both
+// producers resolve the path through this one helper so they never drift.
+func BarrierPath(project string, epoch int64) (string, error) {
+	paths, err := resolvePaths(project)
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(filepath.Dir(paths.flock),
+		fmt.Sprintf("handoff-complete-%d.json", epoch)), nil
+}
+
 // LeaderPresent reports whether a coordinator lease is currently held by
 // a HEALTHY leader OR is mid a FRESH in-progress takeover for project —
 // i.e. whether a duplicate spawn should stand down. It applies the SAME
@@ -1286,16 +1319,40 @@ func leaderPresentWithCfg(project string, cfg leaseConfig) bool {
 	if err != nil {
 		return false
 	}
+	// Throwaway lease carrying the seams so holderHealthy /
+	// transientResumable / flockHolderRecoverable apply the same logic the
+	// acquire path does. self is zero (we only read foreign records);
+	// transientResumable's "is this MY fencing record" short-circuit can
+	// never fire on a zero self vs a real candidate.
+	l := &Lease{cfg: cfg, paths: paths, boot: cfg.boot()}
+
 	rec, err := readEpoch(paths.epoch)
 	if err != nil {
-		return false
+		// MISSING epoch — mirror the acquire path's busy-flock booting check
+		// (codex PR3 iter-3 [P2]). A holder can grab coordinator.flock and not
+		// yet have written coordinator.epoch (it is still booting). Returning
+		// false here would misclassify that fresh booting leader as "no leader"
+		// — making a duplicate spawn report a failure instead of a clean
+		// stand-down. So: if the flock is BUSY and its body vouches for a
+		// FRESH same-boot live holder (flockHolderRecoverable == false), a
+		// leader is present. A free flock, or a stale/dead/hung body, is no
+		// healthy leader.
+		if !errors.Is(err, os.ErrNotExist) {
+			return false // unreadable epoch (not just "absent") -> conservative
+		}
+		f, gotFlock, ferr := tryFlock(paths.flock)
+		if ferr != nil {
+			return false
+		}
+		if gotFlock {
+			// We acquired it -> nobody holds it -> no leader. Release at once.
+			_ = releaseFlock(f)
+			return false
+		}
+		// Busy flock, no epoch yet: present iff the holder is a fresh booting
+		// one (not recoverable/stealable).
+		return !l.flockHolderRecoverable()
 	}
-	// Throwaway lease carrying the seams so holderHealthy /
-	// transientResumable apply the same logic the acquire path does. self
-	// is zero (we only read foreign records); transientResumable's
-	// "is this MY fencing record" short-circuit can never fire on a zero
-	// self vs a real candidate.
-	l := &Lease{cfg: cfg, paths: paths, boot: cfg.boot()}
 	switch rec.State {
 	case stateActive:
 		return l.holderHealthy(rec)

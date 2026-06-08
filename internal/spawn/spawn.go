@@ -208,15 +208,22 @@ func shouldLeaseWrap(failoverOn, isCoord, liveHandoffSuccessor bool) bool {
 }
 
 // coordRunWrap builds the lease-failover exec argv: the engine argv
-// supervised by `fleet coord-run` (DESIGN-handoff-drain-storm-leak PR2).
+// supervised by `fleet coord-run` (DESIGN-handoff-drain-storm-leak PR2/PR3).
 // Pure + does not mutate argv. The persisted rec.Command stays clean;
-// only the EXECUTION argv is wrapped.
+// only the EXECUTION argv is wrapped. When standby is set, `--standby` is
+// added so the supervisor POLLS a busy lease (PR3 warm standby) instead of
+// standing down.
 //
-//	["<fleetBin>","coord-run","--agent",<id>,"--project",<p>,"--",<argv...>]
-func coordRunWrap(fleetBin, agentID, project string, argv []string) []string {
-	wrapped := make([]string, 0, len(argv)+7)
+//	["<fleetBin>","coord-run","--agent",<id>,"--project",<p>,
+//	 ("--standby",)? "--",<argv...>]
+func coordRunWrap(fleetBin, agentID, project string, standby bool, argv []string) []string {
+	wrapped := make([]string, 0, len(argv)+8)
 	wrapped = append(wrapped, fleetBin, "coord-run",
-		"--agent", agentID, "--project", project, "--")
+		"--agent", agentID, "--project", project)
+	if standby {
+		wrapped = append(wrapped, "--standby")
+	}
+	wrapped = append(wrapped, "--")
 	return append(wrapped, argv...)
 }
 
@@ -667,6 +674,19 @@ type Options struct {
 	// recovery path; left false by internal/handoffop's live handoff
 	// (codex PR2 iter-8 [P1]). Ignored when OldRecord is nil.
 	RecoverDeadCoord bool
+
+	// Standby marks this spawn as a WARM-STANDBY coord
+	// (DESIGN-handoff-drain-storm-leak §3(A), PR3). A standby is lease-
+	// wrapped with `fleet coord-run --standby` so that — unlike a normal
+	// live handoff successor (which is spawned UNWRAPPED, see
+	// liveHandoffSuccessor) — it POLLS the busy lease until the outgoing
+	// leader exits rather than standing down. The OLD coord spawns exactly
+	// one standby at the start of a graceful handoff (internal/handoffop's
+	// GracefulHandoff), then retires; the standby's next poll acquires the
+	// kernel-released flock and becomes leader. Forces the coord-run wrap
+	// even though OldRecord is set (it is the receiving half of the
+	// lease-transfer handoff PR2 deferred). Ignored when failover is off.
+	Standby bool
 }
 
 // Spawn creates a fresh agent (or a handoff replacement, if
@@ -938,7 +958,11 @@ func Spawn(opts Options) (*agent.Record, error) {
 	// A LIVE handoff successor = OldRecord present AND not a dead-coord
 	// recovery. A dead-coord recovery (RecoverDeadCoord) is a fresh leader
 	// and IS wrapped.
-	liveHandoffSuccessor := opts.OldRecord != nil && !opts.RecoverDeadCoord
+	// A WARM STANDBY (PR3) is the one OldRecord-carrying spawn that IS
+	// wrapped: it must run `coord-run --standby` so it polls the busy lease
+	// instead of standing down. So a standby is NOT a "live handoff
+	// successor" for the wrap decision even though OldRecord is set.
+	liveHandoffSuccessor := opts.OldRecord != nil && !opts.RecoverDeadCoord && !opts.Standby
 	leaseWrapped := false
 	if shouldLeaseWrap(leaseFailoverEnabled(), isCoordSpawn(rec.TaskID, rec.Project), liveHandoffSuccessor) {
 		switch {
@@ -946,7 +970,7 @@ func Spawn(opts Options) (*agent.Record, error) {
 			leaseWrapped = true // a supervisor will run; apply lifecycle handling
 		default:
 			if fleetBin, exeErr := os.Executable(); exeErr == nil && fleetBin != "" {
-				execArgv = coordRunWrap(fleetBin, id, rec.Project, execArgv)
+				execArgv = coordRunWrap(fleetBin, id, rec.Project, opts.Standby, execArgv)
 				leaseWrapped = true
 			} else {
 				_, _ = fmt.Fprintf(os.Stderr,
@@ -1001,25 +1025,37 @@ func Spawn(opts Options) (*agent.Record, error) {
 	// resolveEnginePid blocks up to pidResolveTimeout; on timeout it
 	// returns the pane pid as a best-effort fallback (wrong-but-live
 	// beats os.Getpid which is dead by construction).
-	disambiguator := pidResolveDisambiguator(id, execArgv)
-	engineHint := pidResolveEngineHint(rec.Engine, opts.OldRecord, opts.Command)
-	resolvedPid, _, resolveErr := resolveEnginePid(
-		session, disambiguator, engineHint,
-		pidResolveTimeout(),
-		productionResolveDeps(),
-	)
-	if resolveErr != nil {
-		// Pane pid unreachable — log a warning to stderr but DO NOT
-		// fail the spawn. The agent record will still go to disk with
-		// PID=os.Getpid (the pre-fix shape); operators can re-resolve
-		// via fleet-guard heartbeat once the agent boots and the
-		// Stop hook fires. Aborting here would orphan a live tmux
-		// session for a transient tmux probe blip.
-		_, _ = fmt.Fprintf(os.Stderr,
-			"warning: resolve engine pid for %s failed: %v (recording fleet binary pid as fallback)\n",
-			session, resolveErr)
-	} else if resolvedPid > 0 {
-		rec.PID = resolvedPid
+	// WARM STANDBY (PR3): the wrapped `coord-run --standby` supervisor does
+	// NOT launch the engine child until it acquires the lease (after the old
+	// leader exits). So the pane's process tree contains ONLY the supervisor
+	// right now — running the engine-pid resolver would block the full timeout
+	// and then fall back to the pane/supervisor pid, corrupting the
+	// PID==engine vs SupervisorPID==lease-holder split (codex PR3 iter-12
+	// [P2]). Skip it: leave rec.PID provisional; the supervisor stamps the
+	// real engine pid after it acquires + starts the engine (via the
+	// fleet-guard heartbeat / supervisor identity stamp). Non-standby spawns
+	// resolve immediately as before.
+	if !opts.Standby {
+		disambiguator := pidResolveDisambiguator(id, execArgv)
+		engineHint := pidResolveEngineHint(rec.Engine, opts.OldRecord, opts.Command)
+		resolvedPid, _, resolveErr := resolveEnginePid(
+			session, disambiguator, engineHint,
+			pidResolveTimeout(),
+			productionResolveDeps(),
+		)
+		if resolveErr != nil {
+			// Pane pid unreachable — log a warning to stderr but DO NOT
+			// fail the spawn. The agent record will still go to disk with
+			// PID=os.Getpid (the pre-fix shape); operators can re-resolve
+			// via fleet-guard heartbeat once the agent boots and the
+			// Stop hook fires. Aborting here would orphan a live tmux
+			// session for a transient tmux probe blip.
+			_, _ = fmt.Fprintf(os.Stderr,
+				"warning: resolve engine pid for %s failed: %v (recording fleet binary pid as fallback)\n",
+				session, resolveErr)
+		} else if resolvedPid > 0 {
+			rec.PID = resolvedPid
+		}
 	}
 
 	// Merge back supervisor identity the coord-run process may have
@@ -1085,6 +1121,18 @@ func Spawn(opts Options) (*agent.Record, error) {
 			rec.SupervisorPID = onDisk.SupervisorPID
 			rec.SupervisorPidStart = onDisk.SupervisorPidStart
 			rec.SupervisorExePath = onDisk.SupervisorExePath
+			// WARM STANDBY (codex PR3 iter-14 [P2]): a standby spawn SKIPPED
+			// engine-pid resolution, so our in-memory rec.PID is still the
+			// provisional spawning-CLI pid. If `coord-run --standby` already
+			// acquired the lease and stamped the REAL engine child pid (via
+			// agent.StampEnginePID) before this final locked write, onDisk.PID
+			// holds it — carry it forward so we don't clobber the live successor's
+			// pid back to the dead provisional one. (Non-standby spawns resolved
+			// rec.PID themselves above, so this preserves their value too when
+			// onDisk agrees; only adopt onDisk.PID when it differs and is live.)
+			if opts.Standby && onDisk.PID > 0 && onDisk.PID != rec.PID {
+				rec.PID = onDisk.PID
+			}
 		}
 		// Any other load error: fall through to the write (best-effort).
 		if werr := rec.Write(); werr != nil {

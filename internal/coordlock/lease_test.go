@@ -230,6 +230,68 @@ func TestLeaderPresent(t *testing.T) {
 	}
 }
 
+// TestLeaderPresent_BusyFlockNoEpoch_Booting (codex PR3 iter-3 [P2]): a
+// holder grabbed coordinator.flock but has not written coordinator.epoch yet
+// (still booting). LeaderPresent must mirror the acquire path's flock-body
+// freshness check: a FRESH same-boot live holder reads as present (so a
+// duplicate spawn stands down cleanly), a stale/dead/missing body does not.
+func TestLeaderPresent_BusyFlockNoEpoch_Booting(t *testing.T) {
+	setupHome(t)
+	const project = "lp-busy-no-epoch"
+	clk := &fakeClock{}
+	live := newFakeLiveness()
+	cfg := testCfg(clk, live)
+	const holderPid, holderStart = 9100, int64(910910)
+	live.set(holderPid, holderStart)
+
+	paths, err := resolvePaths(project)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Dir(paths.flock), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// Hold the flock for the whole test (simulates the booting holder).
+	f, gotFlock, err := tryFlock(paths.flock)
+	if err != nil || !gotFlock {
+		t.Fatalf("tryFlock: ok=%v err=%v", gotFlock, err)
+	}
+	defer func() { _ = releaseFlock(f) }()
+
+	writeBody := func(b flockBody) {
+		raw, _ := json.Marshal(b)
+		if e := f.Truncate(0); e != nil {
+			t.Fatal(e)
+		}
+		if _, e := f.Seek(0, 0); e != nil {
+			t.Fatal(e)
+		}
+		if _, e := f.Write(raw); e != nil {
+			t.Fatal(e)
+		}
+		_ = f.Sync()
+	}
+
+	// Fresh same-boot live holder, in-budget -> present.
+	writeBody(flockBody{Pid: holderPid, PidStart: holderStart, BootID: "test-boot-1", Mono: clk.now()})
+	if !leaderPresentWithCfg(project, cfg) {
+		t.Error("busy flock + fresh booting holder: want LeaderPresent true")
+	}
+
+	// Hung holder (body mono past TTL) -> not present (stealable).
+	staleClk := &fakeClock{}
+	staleClk.advance(2 * cfg.ttl)
+	if leaderPresentWithCfg(project, testCfg(staleClk, live)) {
+		t.Error("busy flock + hung holder past TTL: want LeaderPresent false")
+	}
+
+	// Dead holder pid -> not present.
+	deadLive := newFakeLiveness() // holder not set -> dead
+	if leaderPresentWithCfg(project, testCfg(clk, deadLive)) {
+		t.Error("busy flock + dead holder: want LeaderPresent false")
+	}
+}
+
 // TestReleasedHolderBusyFlock_RetriesNotFenced (codex PR2 iter-12 [P2]):
 // a `released` epoch with the flock STILL briefly held (the old supervisor
 // is mid-Release/cleanup) must be RETRIED — the candidate acquires when

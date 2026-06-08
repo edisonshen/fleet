@@ -9,12 +9,32 @@ import (
 
 	"github.com/edisonshen/fleet/internal/handoffop"
 	"github.com/edisonshen/fleet/internal/queue"
+	"github.com/edisonshen/fleet/internal/spawn"
 	"github.com/edisonshen/fleet/internal/state"
 	"github.com/edisonshen/fleet/internal/tmux"
 )
 
+// ErrEscalatedToTakeOver is the typed signal the lease-aware drain returns
+// when it could not complete a graceful drain within the budget and escalated
+// to the safety-net takeover (fence -> kill -> acquire). It is NOT a failure:
+// the drain did not block and held no lock; the takeover handles recovery.
+// runDrain counts it as processed (codex PR3 iter-2 [P2]). Declared here (the
+// all-platform file) so the loop can reference it on every GOOS; the
+// lease-aware path that returns it is linux/darwin only.
+var ErrEscalatedToTakeOver = errors.New("fleet drain: escalated to safety-net takeover")
+
+// defaultResumeTimeoutMillis bounds a single per-queue-file Resume on the
+// lease-failover drain path (FLEET_LEASE_FAILOVER on). It is the wall-clock
+// budget after which the drain STOPS waiting on a slow handoff and escalates
+// to the safety-net takeover instead of blocking forever — the structural
+// fix for the 81-drain leak. Legacy (flag-off) drains ignore it.
+const defaultResumeTimeoutMillis = 30000
+
 func newDrainCmd() *cobra.Command {
-	var graceMillis int
+	var (
+		graceMillis        int
+		resumeTimeoutMilli int
+	)
 	cmd := &cobra.Command{
 		Use:   "drain",
 		Short: "Process pending fleet-guard auto-handoff queue files",
@@ -29,13 +49,20 @@ TUI open can run ` + "`fleet drain`" + ` from cron or after a crash to
 catch up.
 
 Per-agent flocking keeps two concurrent drains (e.g. cron + TUI) from
-double-spawning the same replacement.`,
+double-spawning the same replacement.
+
+Under FLEET_LEASE_FAILOVER the drain is BOUNDED + lease-aware: it stands
+down when a healthy leader holds the lease, verifies the handoff-complete
+barrier before a graceful kill, and escalates a slow/hung handoff to the
+safety-net takeover after --resume-timeout-ms instead of blocking.`,
 		RunE: func(c *cobra.Command, _ []string) error {
-			return runDrain(c.OutOrStdout(), c.ErrOrStderr(), graceMillis)
+			return runDrain(c.OutOrStdout(), c.ErrOrStderr(), graceMillis, resumeTimeoutMilli)
 		},
 	}
 	cmd.Flags().IntVar(&graceMillis, "grace-ms", handoffop.DefaultGraceMillis,
 		"milliseconds between /exit and Kill on each retired session")
+	cmd.Flags().IntVar(&resumeTimeoutMilli, "resume-timeout-ms", defaultResumeTimeoutMillis,
+		"FLEET_LEASE_FAILOVER only: wall-clock budget for one handoff before escalating to the safety-net takeover")
 	return cmd
 }
 
@@ -49,7 +76,7 @@ double-spawning the same replacement.`,
 // least one file processed successfully OR there were zero files; only
 // returns an error for setup failures (Bootstrap, ListPending) where no
 // progress was possible.
-func runDrain(stdout, stderr io.Writer, graceMillis int) error {
+func runDrain(stdout, stderr io.Writer, graceMillis, resumeTimeoutMillis int) error {
 	if _, err := state.Bootstrap(); err != nil {
 		return fmt.Errorf("bootstrap ~/.fleet: %w", err)
 	}
@@ -103,12 +130,23 @@ func runDrain(stdout, stderr io.Writer, graceMillis int) error {
 			failed++
 			continue
 		}
-		if err := drainOne(req, path, graceMillis, stdout, stderr); err != nil {
+		err := drainOne(req, path, graceMillis, resumeTimeoutMillis, stdout, stderr)
+		switch {
+		case errors.Is(err, ErrEscalatedToTakeOver):
+			// Not a failure (codex PR3 iter-2 [P2]): the bounded drain did its
+			// job — it stopped waiting on a slow/hung handoff and handed
+			// recovery to the safety-net takeover without blocking or holding a
+			// lock. Count it as processed so a queue of successful escalations
+			// does not make `fleet drain` report "every pending handoff failed".
+			_, _ = fmt.Fprintf(stdout,
+				"fleet drain: %s escalated to safety-net takeover (handoff was slow/hung)\n", req.OldAgentID)
+			processed++
+		case err != nil:
 			_, _ = fmt.Fprintf(stderr, "fleet drain: %s: %v\n", req.OldAgentID, err)
 			failed++
-			continue
+		default:
+			processed++
 		}
-		processed++
 	}
 
 	_, _ = fmt.Fprintf(stdout, "fleet drain: %d processed, %d failed\n",
@@ -119,8 +157,44 @@ func runDrain(stdout, stderr io.Writer, graceMillis int) error {
 	return nil
 }
 
-// drainOne handles a single queue file under its per-agent flock.
-func drainOne(req queue.SpawnFresh, path string, graceMillis int,
+// drainOne handles a single queue file.
+//
+// FLEET_LEASE_FAILOVER + the COORD-vs-WORKER classification route the
+// behavior (DESIGN-handoff-drain-storm-leak §3(D), PR3):
+//
+//   - flag OFF (default): the LEGACY path — take the per-agent flock and run
+//     handoffop.Resume under it. Byte-identical to pre-PR3 behavior.
+//   - flag ON + a COORD handoff: the BOUNDED, lease-aware path
+//     (drainOneLeaseAware) — the lease is the single-flight guarantee, so the
+//     graceful/hung path holds NO lock across kill/escalate (the structural
+//     fix for the forever-held lock + 81-drain leak).
+//   - flag ON + a WORKER (non-coord) handoff: the LEGACY path. A worker
+//     handoff carries a Project but is NOT the project coord, so the coord
+//     lease says nothing about it; routing it through the coord lease
+//     stand-down would strand it forever (codex PR3 iter-4 [P1]). Workers
+//     keep the per-agent-flock serialization their Resume contract requires.
+//
+// The discriminator is spawn.IsCoordSpawn(req.TaskID, req.Project) — the SAME
+// coord-vs-worker convention the spawn path uses, so the two never drift.
+func drainOne(req queue.SpawnFresh, path string, graceMillis, resumeTimeoutMillis int,
+	stdout, stderr io.Writer) error {
+
+	if leaseDrainEnabled() && spawn.IsCoordSpawn(req.TaskID, req.Project) {
+		return drainOneLeaseAware(req, path, graceMillis, resumeTimeoutMillis, stdout, stderr)
+	}
+	return drainOneLegacy(req, path, graceMillis, stdout, stderr)
+}
+
+// drainOneLegacy is the pre-PR3 drain: take the per-agent flock and run
+// Resume under it. Retained verbatim for the FLEET_LEASE_FAILOVER-off path
+// so production behavior is unchanged this PR.
+//
+// KNOWN ROOT CAUSE (the reason the lease-aware path exists): this holds the
+// per-agent flock across the ENTIRE Resume — tmux probes, AtomicCoordSwap's
+// nested flock, spawn — any of which can hang, and acquireFlock has no
+// timeout, so a single stuck holder wedges every later drain forever
+// (drain.go:101-106, the 81-process leak). The lease-aware path drops this.
+func drainOneLegacy(req queue.SpawnFresh, path string, graceMillis int,
 	stdout, stderr io.Writer) error {
 
 	release, err := state.LockAgent(req.OldAgentID)

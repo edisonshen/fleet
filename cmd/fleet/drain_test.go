@@ -78,7 +78,7 @@ func TestDrain_NoQueueFilesIsNotAnError(t *testing.T) {
 	setupFleetHome(t)
 
 	out := &bytes.Buffer{}
-	if err := runDrain(out, out, 0); err != nil {
+	if err := runDrain(out, out, 0, 0); err != nil {
 		t.Fatalf("runDrain: %v\n%s", err, out.String())
 	}
 	if !strings.Contains(out.String(), "no pending handoffs") {
@@ -93,7 +93,7 @@ func TestDrain_ProcessesSkillWrittenQueue(t *testing.T) {
 	qp, req := writeSkillQueueFile(t, oldRec)
 
 	out := &bytes.Buffer{}
-	if err := runDrain(out, out, 0); err != nil {
+	if err := runDrain(out, out, 0, 0); err != nil {
 		t.Fatalf("runDrain: %v\n%s", err, out.String())
 	}
 
@@ -118,6 +118,37 @@ func TestDrain_ProcessesSkillWrittenQueue(t *testing.T) {
 	}
 }
 
+// codex PR3 iter-4 [P1]: with FLEET_LEASE_FAILOVER on, a WORKER (non-coord)
+// handoff must NOT be routed through the coord lease stand-down — it carries a
+// Project but is not the project coord, so the coord lease says nothing about
+// it. It must drain via the LEGACY path (spawn + retire), not get stranded.
+func TestDrain_FailoverOn_WorkerHandoffUsesLegacyPath(t *testing.T) {
+	requireTmux(t)
+	setupFleetHome(t)
+	t.Setenv("FLEET_LEASE_FAILOVER", "1")
+	// seedAgent's TaskID is a worker task (not "coord-<project>").
+	oldRec := seedAgent(t)
+	qp, req := writeSkillQueueFile(t, oldRec)
+
+	out := &bytes.Buffer{}
+	if err := runDrain(out, out, 0, 0); err != nil {
+		t.Fatalf("runDrain: %v\n%s", err, out.String())
+	}
+	// The worker handoff drained normally (legacy): old gone, new alive, queue
+	// deleted — NOT a "coord live; nothing to drain" stand-down.
+	if strings.Contains(out.String(), "coord live") {
+		t.Errorf("worker handoff was wrongly routed through coord lease stand-down:\n%s", out.String())
+	}
+	if _, err := os.Stat(qp); !os.IsNotExist(err) {
+		t.Errorf("queue file %s not deleted (worker handoff stranded): %v", qp, err)
+	}
+	newRec, err := agent.Load(req.NewAgentID)
+	if err != nil {
+		t.Fatalf("load new: %v", err)
+	}
+	t.Cleanup(func() { _ = tmux.Kill(newRec.TmuxSession) })
+}
+
 func TestDrain_ProcessesMultipleQueueFilesIndependently(t *testing.T) {
 	requireTmux(t)
 	setupFleetHome(t)
@@ -130,7 +161,7 @@ func TestDrain_ProcessesMultipleQueueFilesIndependently(t *testing.T) {
 	_, reqB := writeSkillQueueFile(t, oldB)
 
 	out := &bytes.Buffer{}
-	if err := runDrain(out, out, 0); err != nil {
+	if err := runDrain(out, out, 0, 0); err != nil {
 		t.Fatalf("runDrain: %v\n%s", err, out.String())
 	}
 	for _, id := range []string{reqA.NewAgentID, reqB.NewAgentID} {
@@ -174,7 +205,7 @@ func TestDrain_FailureIsolatedToOneFile(t *testing.T) {
 
 	out := &bytes.Buffer{}
 	stderr := &bytes.Buffer{}
-	if err := runDrain(out, stderr, 0); err != nil {
+	if err := runDrain(out, stderr, 0, 0); err != nil {
 		t.Fatalf("runDrain: %v\nstdout=%s\nstderr=%s", err, out.String(), stderr.String())
 	}
 
@@ -216,7 +247,7 @@ func TestDrain_AllFailuresReturnsError(t *testing.T) {
 	}
 
 	out := &bytes.Buffer{}
-	if err := runDrain(out, out, 0); err == nil {
+	if err := runDrain(out, out, 0, 0); err == nil {
 		t.Errorf("expected error when every file failed; got nil")
 	}
 }
