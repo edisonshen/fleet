@@ -592,19 +592,51 @@ func leaseCheckByAncestorWithCfg(project string, startPid int, cfg leaseConfig) 
 			ErrNotLeaseOwner, rec.State)
 	}
 
-	// No ancestor is the recorded owner. FENCE iff a DIFFERENT owner is a
-	// HEALTHY active leader (a live successor genuinely holds the lease, and
-	// we are the zombie). Otherwise no live lease is in play for us (legacy
-	// coord, or a live `fleet handoff` bare successor after the old retired)
-	// -> proceed.
+	// No ancestor is the recorded owner. FENCE iff a live leader OR a FRESH
+	// in-progress takeover holds the lease (we are the zombie). Two cases:
+	//
+	//   - a DIFFERENT owner is a HEALTHY ACTIVE leader (a successor genuinely
+	//     leads); OR
+	//   - the record is FRESH `fencing` — a candidate is mid-takeover and may
+	//     have already killed/reparented the old supervisor, so the ancestor
+	//     walk no longer finds rec.Owner. Treating this as "no live lease"
+	//     (holderHealthy is always false for non-active records) would let the
+	//     old skill-side tick keep writing DURING the takeover — exactly the
+	//     zombie-write window this check must close (codex PR4 [P1]). Mirror
+	//     LeaderPresent's predicate: a fresh fencing record == a live takeover.
+	//
+	// Otherwise no live lease is in play for us (legacy coord, or a live
+	// `fleet handoff` bare successor after the old retired) -> proceed.
 	if l.holderHealthy(rec) {
 		return fmt.Errorf("%w: active lease owner pid=%d is not an ancestor of pid=%d",
 			ErrNotLeaseOwner, rec.Owner.Pid, startPid)
+	}
+	if rec.State == stateFencing && !l.transientResumable(rec) {
+		// A fresh, live, in-budget takeover is acquiring -> a new leader is
+		// coming; the non-descendant caller must self-demote.
+		return fmt.Errorf("%w: a takeover is in progress (state=fencing) for project %q; pid=%d must self-demote",
+			ErrNotLeaseOwner, rec.Owner.Project, startPid)
 	}
 	return nil
 }
 
 // --- atomic write helpers (shared) ---
+
+// fsyncDir fsyncs a directory so a rename into it is durable across a
+// crash/power loss (the renamed entry, not just the file contents). Mirrors
+// internal/state.fsyncParent.
+func fsyncDir(dir string) error {
+	d, err := os.Open(dir)
+	if err != nil {
+		return err
+	}
+	syncErr := d.Sync()
+	closeErr := d.Close()
+	if syncErr != nil {
+		return syncErr
+	}
+	return closeErr
+}
 
 // writeJSONAtomicFsync marshals v and writes it atomically (.tmp -> fsync
 // -> rename), fsyncing the tmp file before the rename so a crash never
@@ -643,6 +675,16 @@ func writeBytesAtomicFsync(path string, b []byte) error {
 	if rerr := os.Rename(tmp, path); rerr != nil {
 		_ = os.Remove(tmp)
 		return fmt.Errorf("rename: %w", rerr)
+	}
+	// Fsync the PARENT DIRECTORY so the renamed entry survives a crash/power
+	// loss (codex PR4 [P2]). Without this the file contents are durable but
+	// the directory entry pointing at them can be lost on recovery — an
+	// intent/completion/checkpoint would vanish from replay, breaking the
+	// bounded-RPO guarantee. Mirrors internal/state.WriteAtomic's parent
+	// fsync. The fsync FAILING is surfaced (we promise durability here); a
+	// torn replay is worse than a loud error.
+	if derr := fsyncDir(filepath.Dir(path)); derr != nil {
+		return fmt.Errorf("fsync dir: %w", derr)
 	}
 	return nil
 }

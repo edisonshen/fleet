@@ -161,6 +161,24 @@ def test_prove_helper_failover_off_is_noop(
     assert called == [], "failover off must NOT shell out to lease-check"
 
 
+def test_prove_helper_prefers_fleet_bin_env(
+    fleet_home: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # codex PR4 [P2]: when fleet_bin is the default sentinel, the FLEET_BIN
+    # the spawn stamped must be used (not a bare `fleet` on PATH).
+    monkeypatch.setenv("FLEET_LEASE_FAILOVER", "1")
+    monkeypatch.setenv("FLEET_BIN", "/stamped/fleet")
+    seen = {}
+
+    def _capture(cmd, **k):
+        seen["bin"] = cmd[0]
+        return _fake_completed(0)
+
+    monkeypatch.setattr(loop.subprocess, "run", _capture)
+    loop._prove_parent_lease_ownership("fleet", home=fleet_home)  # default fleet_bin
+    assert seen["bin"] == "/stamped/fleet", "must invoke the FLEET_BIN-stamped binary"
+
+
 def test_prove_helper_binary_missing_is_unknown(
     fleet_home: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:

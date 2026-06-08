@@ -2621,11 +2621,22 @@ def _prove_parent_lease_ownership(
     """
     if not _lease_failover_enabled():
         return "owner"
+    # Resolve the binary the SAME way the producer/kick paths do: prefer the
+    # FLEET_BIN the spawn stamped into the coord's env over a bare `fleet` on
+    # PATH (codex PR4 [P2]). main() calls tick() without fleet_bin, so without
+    # this a PATH pointing at an OLD install lacking `lease-check` would make
+    # the proof "unknown" (fail-open) and let a fenced coord keep mutating —
+    # defeating the fence. The stamped FLEET_BIN is the binary that actually
+    # supports lease-check. Only override the default sentinel "fleet"; an
+    # explicit test/caller fleet_bin still wins.
+    bin_path = fleet_bin
+    if bin_path == "fleet":
+        bin_path = os.environ.get("FLEET_BIN", "") or "fleet"
     env = dict(os.environ)
     env["FLEET_HOME"] = str(home)
     try:
         proc = subprocess.run(
-            [fleet_bin, "lease-check", "--project", project],
+            [bin_path, "lease-check", "--project", project],
             capture_output=True, text=True,
             timeout=_LEASE_CHECK_TIMEOUT_S, check=False, env=env,
         )

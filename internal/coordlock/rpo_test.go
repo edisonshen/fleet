@@ -539,6 +539,40 @@ func TestLeaseCheckByAncestor_ProvenAndRefused(t *testing.T) {
 	}
 }
 
+// codex PR4 [P1] (fresh-takeover window): a FRESH `fencing` record (a
+// candidate mid-takeover that may have killed/reparented the old supervisor)
+// must FENCE a caller that doesn't descend from the recorded owner — else
+// the old skill-side tick keeps writing DURING the takeover.
+func TestLeaseCheckByAncestor_FreshTakeoverFences(t *testing.T) {
+	setupHome(t)
+	const project = "rainier"
+	clk := &fakeClock{}
+	live := newFakeLiveness()
+	// A candidate (pid 800, live) is mid-takeover; owner=old (pid 500, now
+	// dead — killed by the takeover). The stale tick (pid 510) descends from
+	// the dead old supervisor, but the ancestor walk won't match a dead owner
+	// pid (it can still be in the tree, but the record is fencing not active).
+	live.set(800, 6000)                                  // candidate alive
+	cfg := leaseCheckCfg(clk, live, map[int]int{700: 1}) // caller 700 under nothing relevant
+	writeEpochRaw(t, project, epochRecord{
+		Epoch: 5, State: stateFencing,
+		Owner:     identity{Pid: 500, PidStart: 9001, AgentID: "old", Project: project},
+		Candidate: identity{Pid: 800, PidStart: 6000, AgentID: "cand", Project: project},
+		BootID:    "test-boot-1", RenewedAtMono: clk.now(),
+	})
+	if err := leaseCheckByAncestorWithCfg(project, 700, cfg); !errors.Is(err, ErrNotLeaseOwner) {
+		t.Fatalf("a fresh in-progress takeover must FENCE a non-owner tick, got %v", err)
+	}
+
+	// But an ABANDONED fencing record (candidate dead, past resume) is NOT a
+	// live takeover -> proceed (a successor will resume or a legacy tick runs).
+	live.kill(800)
+	clk.advance(cfg.ttl + 1)
+	if err := leaseCheckByAncestorWithCfg(project, 700, cfg); err != nil {
+		t.Fatalf("an abandoned (stale) fencing record must PROCEED, got %v", err)
+	}
+}
+
 // FENCE: a genuinely live successor (healthy active owner) that the caller
 // does NOT descend from — the real split-brain case the fence exists for.
 func TestLeaseCheckByAncestor_GenuineSuccessorFences(t *testing.T) {
