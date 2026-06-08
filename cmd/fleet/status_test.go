@@ -826,6 +826,40 @@ func TestStatus_SurfacesInvalidProject_HintActionable(t *testing.T) {
 	}
 }
 
+// TestStatus_SurfacesWedgedDrain_HintActionable pins codex iter-3 [P2]:
+// adding KindDrainProcs to gc.AllKinds makes `fleet status` surface
+// drain-procs actions, so orphanCleanupHint must offer the actionable
+// `fleet gc --apply --kinds=drain-procs` command rather than the
+// unknown-Kind fallback.
+func TestStatus_SurfacesWedgedDrain_HintActionable(t *testing.T) {
+	stubEnsureFresh(t)
+	dir := t.TempDir()
+	t.Setenv("FLEET_HOME", dir)
+
+	report := gc.Report{Actions: []gc.Action{{
+		Kind:   gc.KindDrainProcs,
+		Target: "drain pid=4242",
+		Verb:   gc.VerbSurface,
+		Reason: "WEDGED fleet drain (pid=4242, heartbeat 10m ago > TTL 2m)",
+	}}}
+	stubStatusReconcile(t, report, nil)
+
+	var stdout, stderr bytes.Buffer
+	if err := runStatus(&statusOpts{}, &stdout, &stderr, "dev"); err != nil {
+		t.Fatalf("runStatus: %v", err)
+	}
+	out := stdout.String()
+	if !strings.Contains(out, "drain pid=4242") {
+		t.Errorf("stdout should name the wedged drain; got:\n%s", out)
+	}
+	if !strings.Contains(out, "fleet gc --apply --kinds=drain-procs") {
+		t.Errorf("wedged drain row must suggest the actionable gc command; got:\n%s", out)
+	}
+	if strings.Contains(out, "unknown — run `fleet gc` for details") {
+		t.Errorf("wedged drain row hit the unknown-Kind fallback; got:\n%s", out)
+	}
+}
+
 // TestStatus_ReconcileError_LoggedNotReturned pins the
 // surface-don't-silo contract: a reconcile error must reach stderr
 // AND status must still exit 0 (informational view). Returning err

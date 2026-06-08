@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
@@ -59,6 +60,17 @@ func TestParseKindsCSV_AcceptsWorkerRecords(t *testing.T) {
 	}
 	if len(got) != 1 || got[0] != gc.KindWorkerRecords {
 		t.Fatalf("got %v, want [worker-records]", got)
+	}
+}
+
+func TestParseKindsCSV_AcceptsDrainProcs(t *testing.T) {
+	// handoff-drain-storm-leak PR5: --kinds=drain-procs must parse cleanly.
+	got, err := parseKindsCSV("drain-procs")
+	if err != nil {
+		t.Fatalf("parseKindsCSV: %v", err)
+	}
+	if len(got) != 1 || got[0] != gc.KindDrainProcs {
+		t.Fatalf("got %v, want [drain-procs]", got)
 	}
 }
 
@@ -264,5 +276,103 @@ func TestRunGC_Worktrees_SkipsOnLockTimeout(t *testing.T) {
 	// It must NOT have fallen back to the unlocked path.
 	if strings.Contains(se, "proceeding unlocked") {
 		t.Fatalf("runGC must NOT proceed unlocked on a lock timeout; got:\n%s", se)
+	}
+}
+
+// TestRenderReport_IncludesDrainProcs pins the drain-procs column in the
+// per-action + summary output (handoff-drain-storm-leak PR5).
+func TestRenderReport_IncludesDrainProcs(t *testing.T) {
+	var buf bytes.Buffer
+	renderReport(&buf, gc.Options{Apply: false, Kinds: gc.AllKinds},
+		gc.Report{Actions: []gc.Action{
+			{Kind: gc.KindDrainProcs, Target: "drain pid=4242", Verb: gc.VerbSurface,
+				Reason: "WEDGED fleet drain (pid=4242, heartbeat 10m ago > TTL 2m)"},
+		}})
+	out := buf.String()
+	if !strings.Contains(out, "drain-procs  drain pid=4242  verb=surface") {
+		t.Errorf("drain-procs action line missing:\n%s", out)
+	}
+	if !strings.Contains(out, "1 drain-procs") {
+		t.Errorf("summary should count drain-procs; got:\n%s", out)
+	}
+}
+
+// writeDrainRun seeds a ~/.fleet/drain-runs/<pid>.json run-record under
+// the test's FLEET_HOME for the end-to-end runGC surface tests. The pid
+// is set to a definitely-dead value so the production DrainProcLive
+// probe returns false (no real process is touched).
+func writeDrainRun(t *testing.T, root string, pid int, heartbeatAt time.Time) {
+	t.Helper()
+	dir := filepath.Join(root, "drain-runs")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatalf("mkdir drain-runs: %v", err)
+	}
+	rec := map[string]any{
+		"pid":          pid,
+		"pid_start":    "Mon Jun  2 00:00:00 2026",
+		"started_at":   heartbeatAt.Add(-time.Hour),
+		"heartbeat_at": heartbeatAt,
+	}
+	data, _ := json.Marshal(rec)
+	if err := os.WriteFile(filepath.Join(dir, "999999999.json"), data, 0o644); err != nil {
+		t.Fatalf("write run-record: %v", err)
+	}
+}
+
+// TestRunGC_DrainProcs_DryRun_StaleRecordDeadPid surfaces a stale
+// run-record whose pid is dead (no live process). Dry-run → the
+// classifier reports a "would-clean record" action and never kills.
+// Uses an impossible pid (999999999) so the production DrainProcLive
+// returns false deterministically without any real process.
+func TestRunGC_DrainProcs_DryRun_StaleRecordDeadPid(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("FLEET_HOME", root)
+	t.Setenv("FLEET_TMUX_SOCKET", "")
+	// Heartbeat far in the past → stale beyond TTL.
+	writeDrainRun(t, root, 999999999, time.Now().Add(-time.Hour))
+
+	var stdout, stderr bytes.Buffer
+	if err := runGC(&stdout, &stderr, &gcFlags{
+		apply:    false,
+		maxAge:   gcDefaultMaxAge,
+		kindsCSV: "drain-procs",
+	}); err != nil {
+		t.Fatalf("runGC: %v", err)
+	}
+	out := stdout.String()
+	if !strings.Contains(out, "drain pid=999999999") {
+		t.Fatalf("expected the stale dead-pid run-record surfaced; got:\n%s", out)
+	}
+	// Dead pid in dry-run → would-remove the stale record (no kill verb).
+	if !strings.Contains(out, "verb=would-remove") {
+		t.Fatalf("dead-pid stale record should be a would-remove in dry-run; got:\n%s", out)
+	}
+	if strings.Contains(out, "verb=killed") {
+		t.Fatalf("dry-run must never kill; got:\n%s", out)
+	}
+}
+
+// TestRunGC_LegacyDrains_ImpliesKind asserts --legacy-drains folds the
+// drain-procs kind in even when --kinds names a different family, and
+// runs end-to-end without error against an isolated FLEET_HOME (no real
+// fleet drain processes → the legacy ps sweep finds none, zero actions).
+func TestRunGC_LegacyDrains_ImpliesKind(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("FLEET_HOME", root)
+	t.Setenv("FLEET_TMUX_SOCKET", "")
+
+	var stdout, stderr bytes.Buffer
+	if err := runGC(&stdout, &stderr, &gcFlags{
+		apply:        false,
+		maxAge:       gcDefaultMaxAge,
+		kindsCSV:     "sockets", // deliberately omit drain-procs
+		legacyDrains: true,
+	}); err != nil {
+		t.Fatalf("runGC: %v", err)
+	}
+	// The summary always prints the drain-procs column; with the kind
+	// folded in, the sweep ran (0 found on a clean host).
+	if !strings.Contains(stdout.String(), "drain-procs") {
+		t.Fatalf("--legacy-drains should imply the drain-procs kind; summary:\n%s", stdout.String())
 	}
 }

@@ -9,6 +9,10 @@
 go.work
 go.work.sum
 
+# Sandbox-redirected Go caches (never commit build artifacts)
+/.gocache/
+/.gomodcache/
+
 # Editor / OS
 .DS_Store
 .idea/
