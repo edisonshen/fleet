@@ -404,10 +404,30 @@ func drainOneLeaseAwareWith(req queue.SpawnFresh, path string, graceMillis, resu
 
 	default:
 		// An epoch exists but the leader is NOT healthy (hung past TTL /
-		// stale) and NO barrier. Either OLD is mid-handoff (will write the
-		// barrier soon) OR HUNG before the barrier (the incident). Wait
-		// BOUNDED for the barrier; if it appears -> graceful finish; if the
-		// deadline passes -> ESCALATE to the safety-net takeover (never block).
+		// stale / released) and NO barrier.
+		//
+		// BARE-COORD GUARD (codex PR4 [P1]): the OLD coord being drained may
+		// be a BARE (non-lease-wrapped) successor from an earlier legacy
+		// handoff — its record has no SupervisorPID, and the stale epoch
+		// belongs to an OLDER, already-released coord generation (a different
+		// agent), NOT to OLD. The safety-net takeover would fence + acquire
+		// that orphaned free flock and RecoverSpawn a successor WITHOUT
+		// killing the still-live BARE OLD coord — producing TWO coordinators.
+		// So when OLD is bare, route through the legacy coldResume, which
+		// loads OLD by id and retires/kills it via Resume (no duplicate).
+		// Only a LEASE-WRAPPED OLD (SupervisorPID set) — the genuine
+		// hung-before-barrier incident — takes the takeover path.
+		if oldRec, lerr := d.LoadAgent(req.OldAgentID); lerr == nil &&
+			oldRec != nil && oldRec.SupervisorPID == 0 {
+			_, _ = fmt.Fprintf(stderr,
+				"fleet drain: %s is a bare (non-lease-wrapped) coord; completing via legacy resume "+
+					"(no takeover — its stale epoch belongs to an older generation)\n", req.OldAgentID)
+			return coldResume(req, path, graceMillis, resumeTimeoutMillis, stdout, stderr, d)
+		}
+		// Either OLD is mid-handoff (will write the barrier soon) OR HUNG
+		// before the barrier (the incident). Wait BOUNDED for the barrier; if
+		// it appears -> graceful finish; if the deadline passes -> ESCALATE to
+		// the safety-net takeover (never block).
 		return drainWaitBarrierOrEscalate(req, path, deadline, graceMillis, resumeTimeoutMillis, stdout, stderr, d)
 	}
 }
