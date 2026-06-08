@@ -290,13 +290,19 @@ func deliverRecoverResumePrompt(rec *agent.Record, docPath string, disableAutoRe
 			"fleet drain: recovered successor %s not visibly ready (%v) but session alive; sending resume prompt anyway\n",
 			rec.ID, werr)
 	}
-	// Mark BEFORE the send so a crash between send and queue.Delete can't
-	// cause a re-send on retry (at-most-once; a never-sent sentinel just
-	// means one missed prompt, recoverable via the chain-linked doc).
+	// Mark BEFORE the send so a crash AFTER a successful send but before
+	// queue.Delete can't cause a re-send on retry (at-most-once). On a send
+	// FAILURE we REMOVE the sentinel (codex PR4 [P2]): otherwise the retry
+	// would see the marker, skip delivery, report success, let the queue be
+	// deleted, and strand the successor after a transient tmux/send-keys
+	// blip. So the marker only persists when delivery actually succeeded.
 	if sentinel != "" {
 		_ = os.WriteFile(sentinel, []byte(docPath+"\n"), 0o644)
 	}
 	if serr := spawn.SendPromptKeys(rec.TmuxSession, handoff.ResumePrompt(docPath)); serr != nil {
+		if sentinel != "" {
+			_ = os.Remove(sentinel) // send failed -> allow a clean retry
+		}
 		return fmt.Errorf(
 			"fleet drain: resume prompt to recovered successor %s failed: %w "+
 				"(queue preserved for retry; doc: %s)", rec.ID, serr, docPath)
