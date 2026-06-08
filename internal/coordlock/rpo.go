@@ -116,6 +116,17 @@ func GuardWithLease(tok LeaseToken, idempotencyKey string, fn func() error) erro
 	if ferr := fn(); ferr != nil {
 		return ferr
 	}
+	// Step 3.5: RE-FENCE before the completion (codex PR4 [P1]). fn() can run
+	// long enough for a candidate to fence us. A fenced owner must NOT write
+	// the completion marker: a stale .done.json would make the new leader's
+	// ReplayIntents SKIP this intent (treating it finished) even though it was
+	// produced by a non-owner. We return ErrLeaseLost instead — the action
+	// already ran, but it carries an idempotency key, so the successor's
+	// replay re-drives it as a no-op (never a duplicate). Matches the
+	// per-action fence ReplayIntents already applies before its completion.
+	if !tok.StillOwned() {
+		return ErrLeaseLost
+	}
 	// Step 4: COMPLETION after the act. A write fault here is surfaced but
 	// is benign for correctness — replay re-drives idempotently.
 	if cerr := store.writeCompletion(idempotencyKey, tok.Epoch); cerr != nil {
@@ -194,6 +205,33 @@ func (s intentStore) writeCompletion(key string, epoch int64) error {
 	})
 }
 
+// readCompletion reports whether a VALID completion record exists for key.
+//
+//	done=true,  err=nil  -> a parseable completion with the matching key
+//	done=false, err=nil  -> no completion file (os.ErrNotExist)
+//	done=false, err!=nil -> a present-but-corrupt/unreadable completion
+//
+// Callers (pendingIntents) suppress replay ONLY on (true,nil); a corrupt
+// completion is NOT trusted (codex PR4 [P2]) so the intent is replayed
+// idempotently rather than silently skipped.
+func (s intentStore) readCompletion(key string) (done bool, err error) {
+	b, rerr := os.ReadFile(s.completionPath(key))
+	if rerr != nil {
+		if errors.Is(rerr, os.ErrNotExist) {
+			return false, nil // no completion -> pending
+		}
+		return false, rerr // unreadable -> don't trust
+	}
+	var rec intentRecord
+	if uerr := json.Unmarshal(b, &rec); uerr != nil {
+		return false, fmt.Errorf("corrupt completion: %w", uerr)
+	}
+	if rec.Key != key {
+		return false, fmt.Errorf("completion key mismatch: got %q want %q", rec.Key, key)
+	}
+	return true, nil
+}
+
 // pendingIntents returns the keys of intents that have NO completion — the
 // in-flight actions a crash left mid-flight. Sorted for deterministic
 // replay order. A torn (unparseable) intent file is reported via the second
@@ -228,9 +266,22 @@ func (s intentStore) pendingIntents() (keys []string, torn []string, err error) 
 			torn = append(torn, full)
 			continue
 		}
-		// Completion present? then it finished cleanly — skip.
-		if _, serr := os.Stat(s.completionPath(rec.Key)); serr == nil {
-			continue
+		// Completion present AND VALID? then it finished cleanly — skip.
+		// Validate, don't just os.Stat (codex PR4 [P2]): a torn completion
+		// (corrupt bytes, or a writeCompletion that renamed but lost the
+		// dir-fsync on a crash) must NOT suppress replay — the action's
+		// done-ness is unproven. A present-but-unparseable completion -> treat
+		// the intent as PENDING (re-drive idempotently) rather than silently
+		// skip, preserving the RPO contract. A completion whose key doesn't
+		// match is also not trustworthy.
+		switch done, derr := s.readCompletion(rec.Key); {
+		case derr == nil && done:
+			continue // clean, validated completion -> finished
+		case derr != nil:
+			// Unreadable/corrupt completion -> don't trust it; replay.
+			fmt.Fprintf(os.Stderr,
+				"coordlock: completion for intent %q unreadable (%v); will replay idempotently\n",
+				rec.Key, derr)
 		}
 		pendList = append(pendList, pend{key: rec.Key, stamp: rec.StampWall})
 	}

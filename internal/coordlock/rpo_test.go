@@ -284,6 +284,29 @@ func TestReplayIntents_PerActionFenceStopsMidLoop(t *testing.T) {
 	}
 }
 
+// codex PR4 [P2]: a CORRUPT completion file must NOT suppress replay. The
+// intent is re-driven idempotently rather than silently treated as finished.
+func TestReplayIntents_CorruptCompletionReplays(t *testing.T) {
+	setupHome(t)
+	const project = "rainier"
+	tok := ownerToken(t, project, 4)
+	store, _ := tok.intentStore()
+	if err := store.writeIntent("act-x", 4); err != nil {
+		t.Fatal(err)
+	}
+	// A present-but-CORRUPT completion (e.g. torn / lost dir-fsync on crash).
+	if err := os.WriteFile(store.completionPath("act-x"), []byte("{garbage"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	driven := 0
+	if err := ReplayIntents(tok, func(string) error { driven++; return nil }); err != nil {
+		t.Fatalf("ReplayIntents: %v", err)
+	}
+	if driven != 1 {
+		t.Fatalf("a corrupt completion must NOT suppress replay; drove %d, want 1", driven)
+	}
+}
+
 func TestReplayIntents_RejectedWhenLeaseLost(t *testing.T) {
 	setupHome(t)
 	const project = "rainier"
