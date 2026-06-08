@@ -31,6 +31,7 @@ var subdirs = []string{
 	"progress",
 	"queue",
 	"logs",
+	"drain-runs",
 }
 
 // Root returns the absolute path to ~/.fleet/.
@@ -90,6 +91,23 @@ func AgentArchivePath(id string) (string, error) {
 		return "", err
 	}
 	return filepath.Join(root, "agents", "archive", id+".json"), nil
+}
+
+// DrainRunsDir returns ~/.fleet/drain-runs/.
+//
+// Each live `fleet drain` writes a tiny run-record <pid>.json here on
+// start, heartbeats it while running, and deletes it on clean exit. A
+// drain that stops heartbeating past a TTL is provably wedged — the
+// signal the gc KindDrainProcs classifier keys off (vs. inferring
+// wedged-ness from raw `ps` "sleeping" state, which can kill a
+// legitimate long recovery). One writer per record (the drain itself),
+// one reader (fleet gc).
+func DrainRunsDir() (string, error) {
+	root, err := Root()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(root, "drain-runs"), nil
 }
 
 // HandoffDir returns ~/.fleet/handoffs/.
