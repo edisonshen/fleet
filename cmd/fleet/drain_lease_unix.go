@@ -47,6 +47,7 @@ import (
 	"github.com/edisonshen/fleet/internal/queue"
 	"github.com/edisonshen/fleet/internal/spawn"
 	"github.com/edisonshen/fleet/internal/state"
+	"github.com/edisonshen/fleet/internal/tmux"
 )
 
 // leaseDrainEnabled reports whether the lease-aware drain path is selected.
@@ -190,6 +191,25 @@ func productionRecoverSpawn(oldRec *agent.Record, docPath, preAllocatedID string
 	if len(oldRec.Command) == 0 {
 		return fmt.Errorf("fleet drain: recover-spawn: old coord %s has no stored command", oldRec.ID)
 	}
+
+	// ADOPT an already-spawned successor instead of re-spawning (codex PR4
+	// [P1]/[P2]). A prior recovery pass may have spawned the replacement with
+	// THIS preAllocatedID and then failed only at prompt delivery, preserving
+	// the queue for retry. Re-running spawn with the same id would collide
+	// with the live session. So: if the pre-allocated successor record exists
+	// AND its tmux session is alive, skip the spawn and go straight to (idempotent)
+	// prompt delivery. This makes a preserved-queue retry safe.
+	if preAllocatedID != "" {
+		if existing, lerr := agent.Load(preAllocatedID); lerr == nil && existing != nil {
+			if alive, _ := tmux.SessionAlive(existing.TmuxSession); alive {
+				_, _ = fmt.Fprintf(stdout,
+					"fleet drain: adopting already-spawned successor %s for %s (no re-spawn)\n",
+					existing.ID, oldRec.Project)
+				return deliverRecoverResumePrompt(existing, docPath, oldRec.DisableAutoResume, stdout, stderr)
+			}
+		}
+	}
+
 	spawnCwd := oldRec.Cwd
 	if spawn.IsCoordSpawn(oldRec.TaskID, oldRec.Project) {
 		resolved, rerr := coordrepo.ResolveProjectRepo(oldRec.Project, true)
@@ -219,32 +239,41 @@ func productionRecoverSpawn(oldRec *agent.Record, docPath, preAllocatedID string
 	}
 	_, _ = fmt.Fprintf(stdout,
 		"fleet drain: cold-spawned lease-wrapped successor %s for %s after takeover\n", rec.ID, oldRec.Project)
+	return deliverRecoverResumePrompt(rec, docPath, oldRec.DisableAutoResume, stdout, stderr)
+}
 
-	// Deliver the resume prompt so the recovered successor READS the handoff
-	// doc and continues the in-flight work (codex PR4 [P1]). The safety-net
-	// takeover path bypasses handoffop.Resume/retireOldAgent and then deletes
-	// the queue as processed, so without an explicit prompt here the new coord
-	// would start blank and the in-flight work captured in docPath is
-	// stranded. Mirrors retireOldAgent's gated delivery: skip when the doc is
-	// empty or auto-resume is disabled (a non-claude wrapper must not receive
-	// "Read your handoff doc..." as garbage). Best-effort: a readiness/send
-	// failure is surfaced but does NOT fail the recovery — the successor is
-	// live + lease-held; the doc is also chain-linked on its record, and the
-	// operator can re-prompt on attach.
-	if docPath != "" && !oldRec.DisableAutoResume {
-		if werr := spawn.WaitForReadyToPrompt(rec.TmuxSession); werr != nil {
-			_, _ = fmt.Fprintf(stderr,
-				"fleet drain: recovered successor %s not ready for resume prompt (%v); "+
-					"it will resume from its chain-linked doc on `/coordinator`, or re-prompt on attach\n",
-				rec.ID, werr)
-			return nil
-		}
-		if serr := spawn.SendPromptKeys(rec.TmuxSession, handoff.ResumePrompt(docPath)); serr != nil {
-			_, _ = fmt.Fprintf(stderr,
-				"fleet drain: resume prompt to recovered successor %s failed (%v); "+
-					"re-prompt on attach (doc: %s)\n", rec.ID, serr, docPath)
-		}
+// deliverRecoverResumePrompt delivers the resume prompt to a recovered
+// successor so it READS the handoff doc and continues the in-flight work
+// (codex PR4 [P1]). The safety-net takeover path bypasses handoffop.Resume/
+// retireOldAgent, so without this the new coord would start blank.
+//
+// On a readiness/send FAILURE it returns an error so takeoverAndRecover
+// PRESERVES the queue (the durable retry signal) instead of deleting it —
+// mirroring the other handoff paths. A retry is safe because
+// productionRecoverSpawn ADOPTS an already-spawned successor (above) rather
+// than re-spawning, so re-driving just re-attempts prompt delivery. The
+// chain-linked doc on the successor's record (spawn.Spawn sets
+// LastHandoffPath = NewDocPath) is the secondary durable resume path.
+//
+// Skips silently when the doc is empty or auto-resume is disabled (a
+// non-claude wrapper must not receive "Read your handoff doc..." as garbage).
+func deliverRecoverResumePrompt(rec *agent.Record, docPath string, disableAutoResume bool,
+	stdout, stderr io.Writer) error {
+	if docPath == "" || disableAutoResume {
+		return nil
 	}
+	if werr := spawn.WaitForReadyToPrompt(rec.TmuxSession); werr != nil {
+		return fmt.Errorf(
+			"fleet drain: recovered successor %s not ready for resume prompt: %w "+
+				"(queue preserved for retry; successor is live + chain-linked to %s)",
+			rec.ID, werr, docPath)
+	}
+	if serr := spawn.SendPromptKeys(rec.TmuxSession, handoff.ResumePrompt(docPath)); serr != nil {
+		return fmt.Errorf(
+			"fleet drain: resume prompt to recovered successor %s failed: %w "+
+				"(queue preserved for retry; doc: %s)", rec.ID, serr, docPath)
+	}
+	_, _ = fmt.Fprintf(stdout, "fleet drain: delivered resume prompt to recovered successor %s\n", rec.ID)
 	return nil
 }
 

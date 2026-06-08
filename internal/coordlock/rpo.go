@@ -98,6 +98,19 @@ func GuardWithLease(tok LeaseToken, idempotencyKey string, fn func() error) erro
 	if werr := store.writeIntent(idempotencyKey, tok.Epoch); werr != nil {
 		return fmt.Errorf("coordlock.GuardWithLease: write intent %q: %w", idempotencyKey, werr)
 	}
+	// Step 2.5: RE-FENCE immediately before the side effect (codex PR4 [P1]).
+	// The intent write + its fsync take real wall-clock time; a candidate
+	// could fence this leader DURING that window. Re-reading the live epoch
+	// here narrows the check-to-act gap to the minimum — we cannot hold a
+	// lock across fn() (the design forbids any lock across a side effect /
+	// tmux / network), so a double-check (before intent + immediately before
+	// the act) is the tightest fence possible. The orphaned intent we just
+	// wrote is harmless: it has no completion, so a real successor's replay
+	// would re-drive it idempotently (and an idempotency key makes that a
+	// no-op if the action never ran).
+	if !tok.StillOwned() {
+		return ErrLeaseLost
+	}
 	// Step 3: the actual mutation. A failed action writes NO completion, so
 	// it is replayed on rebuild (idempotently).
 	if ferr := fn(); ferr != nil {
