@@ -85,26 +85,26 @@ func TestCoordRun_Lease_Integration_RealFlockHeldThenReleased(t *testing.T) {
 	}
 	t.Cleanup(killSupervisor)
 
-	epochPath := filepath.Join(fleetHome, "projects", project, ".locks", "coordinator.epoch")
+	lockDir := filepath.Join(fleetHome, "projects", project, ".locks")
+	epochPath := filepath.Join(lockDir, "coordinator.epoch")
+	flockPath := filepath.Join(lockDir, "coordinator.flock")
 
 	// Step 3: poll until the supervisor holds the lease (a from-test
-	// AcquireLease returns acquired=false) AND the epoch names it active.
+	// nonblocking flock probe reports busy) AND the epoch names it active.
+	// Do not call coordlock.AcquireLease as the probe here: on Linux that
+	// participates in takeover/epoch logic and can perturb the exact state
+	// this test is trying to observe.
 	heldDeadline := time.Now().Add(15 * time.Second)
 	held := false
 	for time.Now().Before(heldDeadline) {
-		lease, acquired, err := coordlock.AcquireLease(project, "probe-tester")
-		if err == nil && !acquired {
-			// Busy: a live holder owns the flock. Confirm it is OUR
-			// supervisor via the epoch's active owner pid.
+		busy, err := flockBusy(flockPath)
+		if err == nil && busy {
+			// Busy: a live holder owns the flock. Confirm it is OUR supervisor
+			// via the epoch's active owner pid.
 			if ownerPid, ok := coordlock.CurrentActiveOwnerPID(project); ok && ownerPid == supPid {
 				held = true
 				break
 			}
-		}
-		if acquired && lease != nil {
-			// We unexpectedly won — the supervisor hasn't acquired yet.
-			// Release immediately so we don't steal its lease, then retry.
-			lease.Release()
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
@@ -172,6 +172,24 @@ func TestCoordRun_Lease_Integration_RealFlockHeldThenReleased(t *testing.T) {
 	if !released {
 		t.Fatalf("flock was not released within 15s after killing supervisor pid %d", supPid)
 	}
+}
+
+func flockBusy(path string) (bool, error) {
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		return false, err
+	}
+	defer func() { _ = f.Close() }()
+
+	err = syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
+	if err == nil {
+		_ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
+		return false, nil
+	}
+	if errors.Is(err, syscall.EWOULDBLOCK) || errors.Is(err, syscall.EAGAIN) {
+		return true, nil
+	}
+	return false, err
 }
 
 // T9 end-to-end + do-not-resurrect precondition (codex PR2 iter-3 [P2]):
