@@ -449,6 +449,7 @@ func TestDrainLease_GracefulWaitsForSelfRelease(t *testing.T) {
 	d := drainLeaseDeps{
 		CurrentEpoch:  func(string) (int64, bool) { return 5, true },
 		BarrierExists: func(string, int64) bool { return true },
+		LeaderPresent: func(string) bool { return true }, // successor heartbeats (healthy)
 		ActiveOwnerPID: func(string) (int, bool) {
 			if atomic.AddInt32(&reads, 1) <= 2 {
 				return 424242, true // OLD still leader
@@ -513,6 +514,49 @@ func TestDrainLease_GracefulOldReleasedNoSuccessor_Escalates(t *testing.T) {
 	}
 	if atomic.LoadInt32(&recovered) != 1 {
 		t.Errorf("RecoverSpawn ran %d times, want 1 (project must not be left coordless)", recovered)
+	}
+}
+
+// codex PR3 iter-14 [P1]: a successor that CRASHED after writing its `active`
+// epoch but before releasing still shows in ActiveOwnerPID (pid != OLD) — but it
+// is NOT a live leader (LeaderPresent=false). The drain must NOT treat that
+// stale active owner as a confirmed successor and delete the queue; it must wait
+// then escalate to takeover+recover so a LIVE successor is brought up.
+func TestDrainLease_GracefulSuccessorCrashedAfterEpoch_Escalates(t *testing.T) {
+	out := &bytes.Buffer{}
+	var tookOver, recovered int32
+	var reads int32
+	d := drainLeaseDeps{
+		CurrentEpoch:  func(string) (int64, bool) { return 5, true },
+		BarrierExists: func(string, int64) bool { return true },
+		// OLD active on first read (enters self-release wait); then a DIFFERENT
+		// pid owns the active epoch — but it crashed, so LeaderPresent=false.
+		ActiveOwnerPID: func(string) (int, bool) {
+			if atomic.AddInt32(&reads, 1) == 1 {
+				return 424242, true // OLD still leader
+			}
+			return 777777, true // a successor wrote its epoch then crashed
+		},
+		LeaderPresent: func(string) bool { return false }, // no HEALTHY leader heartbeating
+		LoadAgent:     func(string) (*agent.Record, error) { return oldCoordRec(), nil },
+		TakeOver:      func(string, string) (bool, error) { atomic.AddInt32(&tookOver, 1); return true, nil },
+		RecoverSpawn: func(*agent.Record, string, string, io.Writer, io.Writer) error {
+			atomic.AddInt32(&recovered, 1)
+			return nil
+		},
+		LockAgent:   func(string) (func(), error) { return func() {}, nil },
+		BarrierPoll: time.Millisecond,
+	}
+	qp := existingQueuePath(t)
+	err := drainOneLeaseAwareWith(leaseDrainReq(), qp, 0, 5, out, out, d)
+	if !errors.Is(err, ErrEscalatedToTakeOver) {
+		t.Fatalf("crashed-successor must escalate (not declare done off a stale active epoch); got %v", err)
+	}
+	if atomic.LoadInt32(&tookOver) != 1 {
+		t.Errorf("TakeOver ran %d times, want 1", tookOver)
+	}
+	if atomic.LoadInt32(&recovered) != 1 {
+		t.Errorf("RecoverSpawn ran %d times, want 1 (a dead active-epoch owner is not a successor)", recovered)
 	}
 }
 
@@ -667,11 +711,12 @@ func TestDrainLease_GracefulPath_HoldsNoPerAgentLock(t *testing.T) {
 	d := drainLeaseDeps{
 		CurrentEpoch:  func(string) (int64, bool) { return 5, true },
 		BarrierExists: func(string, int64) bool { return true },
+		LeaderPresent: func(string) bool { return true }, // successor heartbeats (healthy)
 		ActiveOwnerPID: func(string) (int, bool) {
 			// First read: OLD still leader (enters the self-release wait, during
 			// which we probe the sibling lock). Then a SUCCESSOR (different pid)
 			// acquires the freed lease -> graceful completion, lock-free (codex
-			// PR3 iter-14 [P1]: completion needs a confirmed successor, not !ok).
+			// PR3 iter-14 [P1]: completion needs a confirmed healthy successor).
 			if atomic.AddInt32(&reads, 1) == 1 {
 				close(probed)
 				return 424242, true

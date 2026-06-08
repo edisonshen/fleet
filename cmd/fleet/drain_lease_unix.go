@@ -371,9 +371,12 @@ func drainGraceful(req queue.SpawnFresh, path string, epoch int64, deadline time
 		// timeout we PRESERVE the queue and surface — a later drain pass (or the
 		// standby finally acquiring) completes it; `fleet doctor` (PR6) handles a
 		// truly-stuck case. Surface-don't-silo: never a silent coordless delete.
-		if d.waitForSuccessorOwner(req.Project, deadline) {
+		// OLD is archived/gone so there is no pid to exclude; require a HEALTHY
+		// owner (a present-but-crashed active-epoch owner is not a live successor
+		// — codex PR3 iter-14 [P1]).
+		if d.waitForHealthySuccessor(req.Project, 0, deadline) {
 			_, _ = fmt.Fprintf(stdout,
-				"fleet drain: %s retired and a successor holds the lease; cleaning queue\n", req.OldAgentID)
+				"fleet drain: %s retired and a healthy successor holds the lease; cleaning queue\n", req.OldAgentID)
 			return queue.Delete(path)
 		}
 		_, _ = fmt.Fprintf(stderr,
@@ -388,27 +391,30 @@ func drainGraceful(req queue.SpawnFresh, path string, epoch int64, deadline time
 
 	// Branch on who currently OWNS the lease (codex PR3 iter-14 [P1]). The
 	// invariant across ALL branches: never declare the handoff done / delete the
-	// queue without either reaping a still-present OLD or confirming a SUCCESSOR
-	// acquired — OLD's absence alone is NOT proof a standby came up.
+	// queue without either reaping a still-present OLD or confirming a HEALTHY
+	// SUCCESSOR. A successor that crashed after writing its `active` epoch but
+	// before releasing still shows up as ActiveOwnerPID, so "successor" means a
+	// HEALTHY owner (LeaderPresent's TTL + pid_start liveness) whose pid != OLD —
+	// raw active-epoch ownership alone is NOT proof of a live successor.
 	ownerPid, ownerOK := d.ActiveOwnerPID(req.Project)
 	switch {
 	case ownerOK && ownerPid == oldRec.SupervisorPID:
 		// OLD is still the recorded ACTIVE lease owner — finishing its own exit.
 		// Do NOT force-kill it (the epoch gate refuses the active leader,
-		// correctly). Wait bounded for a CONFIRMED SUCCESSOR; escalate on
-		// timeout.
+		// correctly). Wait bounded for a HEALTHY successor; escalate on timeout.
 		_, _ = fmt.Fprintf(stdout,
 			"fleet drain: %s wrote the barrier and is still the active leader; waiting for its self-release\n",
 			oldRec.ID)
 		for {
-			// Completion requires a confirmed successor (ok && op != OLD), not
-			// merely OLD's absence: !ok means OLD released but NO standby has
-			// acquired yet — keep waiting (it may be mid-poll). On the deadline
-			// fall through to the takeover+recover escalation, which brings up a
-			// successor so the project is never left coordless.
-			if op, ok := d.ActiveOwnerPID(req.Project); ok && op != oldRec.SupervisorPID {
+			// Completion requires a HEALTHY successor (pid != OLD AND
+			// LeaderPresent), not merely OLD's absence or a stale active epoch:
+			// !healthy means OLD released but no LIVE standby owns the lease yet
+			// (mid-poll, or a successor that crashed after writing its epoch) —
+			// keep waiting. On the deadline fall through to takeover+recover,
+			// which brings up a successor so the project is never left coordless.
+			if op, ok := d.healthySuccessorPresent(req.Project, oldRec.SupervisorPID); ok {
 				_, _ = fmt.Fprintf(stdout,
-					"fleet drain: %s released the lease and successor pid %d acquired it; handoff complete\n",
+					"fleet drain: %s released the lease and healthy successor pid %d acquired it; handoff complete\n",
 					oldRec.ID, op)
 				return queue.Delete(path)
 			}
@@ -423,55 +429,73 @@ func drainGraceful(req queue.SpawnFresh, path string, epoch int64, deadline time
 				time.Sleep(wait)
 			}
 		}
-		// OLD wedged past the budget (or released with no successor ever
+		// OLD wedged past the budget (or released with no HEALTHY successor ever
 		// acquiring) — escalate to the safety-net takeover + lease-wrapped
 		// recovery (fence+kill OLD, then spawn a successor). Never block.
 		_, _ = fmt.Fprintf(stderr,
-			"fleet drain: %s did not yield to a confirmed successor within the budget; escalating to takeover\n",
+			"fleet drain: %s did not yield to a healthy successor within the budget; escalating to takeover\n",
 			oldRec.ID)
 		return takeoverAndRecover(req, path, oldRec, stdout, stderr, d)
 
-	case ownerOK && ownerPid != oldRec.SupervisorPID:
-		// A SUCCESSOR already leads (a standby acquired). OLD's record is still
-		// present but it has released the lease — reap its lingering supervisor
-		// through the authenticated primitive, then the queue is cleaned. The
-		// handoff is confirmed complete (a successor owns the lease).
+	case ownerOK && ownerPid != oldRec.SupervisorPID && d.LeaderPresent(req.Project):
+		// A HEALTHY SUCCESSOR already leads (a standby acquired and is
+		// heartbeating). OLD's record is still present but it released the lease —
+		// reap its lingering supervisor through the authenticated primitive, then
+		// the queue is cleaned. The handoff is confirmed complete.
 		return drainReapOld(oldRec, req, path, epoch, stdout, stderr, d)
 
 	default:
-		// !ownerOK: OLD's record is present but NO process owns the lease right
-		// now — OLD released/demoted, and the standby has not acquired yet (or
-		// crashed). Reaping OLD + deleting the queue here would strand the
-		// project coordless if no successor ever comes up (codex PR3 iter-14
-		// [P1]). Wait bounded for a CONFIRMED successor; if one acquires, reap
-		// OLD's lingering supervisor and finish. If none by the deadline,
-		// escalate to takeover+recover so a successor is brought up — never a
-		// coordless queue-delete.
+		// Either no owner (!ownerOK) OR the active owner is a non-OLD pid that is
+		// NOT healthy (a successor that crashed after writing its epoch). Either
+		// way there is no LIVE successor yet: reaping OLD + deleting the queue
+		// here would strand the project coordless (codex PR3 iter-14 [P1]). Wait
+		// bounded for a HEALTHY successor; if one acquires, reap OLD's lingering
+		// supervisor and finish. If none by the deadline, escalate to
+		// takeover+recover so a successor is brought up — never a coordless
+		// queue-delete.
 		_, _ = fmt.Fprintf(stdout,
-			"fleet drain: %s released the lease but no successor owns it yet; waiting for a confirmed successor\n",
+			"fleet drain: %s released the lease but no healthy successor owns it yet; waiting for a confirmed successor\n",
 			oldRec.ID)
-		if d.waitForSuccessorOwner(req.Project, deadline) {
+		if d.waitForHealthySuccessor(req.Project, oldRec.SupervisorPID, deadline) {
 			_, _ = fmt.Fprintf(stdout,
-				"fleet drain: a successor acquired the lease for %s; reaping the old supervisor and finishing\n",
+				"fleet drain: a healthy successor acquired the lease for %s; reaping the old supervisor and finishing\n",
 				req.Project)
 			return drainReapOld(oldRec, req, path, epoch, stdout, stderr, d)
 		}
 		_, _ = fmt.Fprintf(stderr,
-			"fleet drain: %s released the lease but NO successor acquired within the budget; escalating to takeover\n",
+			"fleet drain: %s released the lease but NO healthy successor acquired within the budget; escalating to takeover\n",
 			oldRec.ID)
 		return takeoverAndRecover(req, path, oldRec, stdout, stderr, d)
 	}
 }
 
-// waitForSuccessorOwner polls (bounded by deadline) for ANY active lease owner
-// to appear for project. Used after OLD is confirmed gone (archived) to verify a
-// standby actually acquired the freed lease before declaring the handoff
-// complete — OLD's absence alone is not proof of a successor (codex PR3 iter-14
-// [P1]). Returns true the instant an owner is observed; false if the deadline
-// passes with none. Holds no lock.
-func (d drainLeaseDeps) waitForSuccessorOwner(project string, deadline time.Time) bool {
+// healthySuccessorPresent reports whether a HEALTHY successor (not OLD) holds
+// the lease for project: the active owner pid is present, differs from
+// excludePid (OLD's supervisor), AND a healthy leader is heartbeating
+// (LeaderPresent's TTL + pid_start liveness). A successor that crashed after
+// writing its `active` epoch but before releasing still shows in ActiveOwnerPID,
+// so the LeaderPresent gate is what proves the successor is LIVE (codex PR3
+// iter-14 [P1]). Returns (ownerPid, true) only when all hold.
+func (d drainLeaseDeps) healthySuccessorPresent(project string, excludePid int) (int, bool) {
+	op, ok := d.ActiveOwnerPID(project)
+	if !ok || op == excludePid {
+		return 0, false
+	}
+	if !d.LeaderPresent(project) {
+		return 0, false
+	}
+	return op, true
+}
+
+// waitForHealthySuccessor polls (bounded by deadline) for a HEALTHY successor
+// (not excludePid) to hold the lease for project. Used after OLD is confirmed
+// gone (archived / released) to verify a LIVE standby acquired the freed lease
+// before declaring the handoff complete — a present-but-dead active owner is not
+// a successor (codex PR3 iter-14 [P1]). Returns true the instant a healthy
+// successor is observed; false if the deadline passes with none. Holds no lock.
+func (d drainLeaseDeps) waitForHealthySuccessor(project string, excludePid int, deadline time.Time) bool {
 	for {
-		if _, ok := d.ActiveOwnerPID(project); ok {
+		if _, ok := d.healthySuccessorPresent(project, excludePid); ok {
 			return true
 		}
 		if !time.Now().Before(deadline) {
@@ -675,13 +699,16 @@ func takeoverAndRecover(req queue.SpawnFresh, path string, cachedOld *agent.Reco
 	// Re-check the lease OWNER under the lock before spawning (codex PR3
 	// iter-14 [P1]): a graceful WARM STANDBY may have been polling all along and
 	// acquired the freed lease in the gap between TakeOver killing OLD and
-	// TakeOver releasing the lease. If a successor already leads, RecoverSpawn
-	// would either duplicate the coord or fail on the pre-allocated standby
-	// session/id. A confirmed successor means the handoff is complete — clean the
-	// queue and stand down instead of cold-spawning a redundant replacement.
-	if op, ok := d.ActiveOwnerPID(project); ok {
+	// TakeOver releasing the lease. If a HEALTHY successor already leads,
+	// RecoverSpawn would either duplicate the coord or fail on the pre-allocated
+	// standby session/id. Require a HEALTHY owner (LeaderPresent — a successor
+	// that crashed after writing its `active` epoch is not a live leader); OLD is
+	// already dead post-takeover so there is no pid to exclude. A confirmed
+	// healthy successor means the handoff is complete — clean the queue and stand
+	// down instead of cold-spawning a redundant replacement.
+	if op, ok := d.healthySuccessorPresent(project, 0); ok {
 		_, _ = fmt.Fprintf(stdout,
-			"fleet drain: a successor (pid %d) acquired the lease for %s after takeover; standing down (no recovery spawn)\n",
+			"fleet drain: a healthy successor (pid %d) acquired the lease for %s after takeover; standing down (no recovery spawn)\n",
 			op, project)
 		if derr := queue.Delete(path); derr != nil {
 			return fmt.Errorf(
