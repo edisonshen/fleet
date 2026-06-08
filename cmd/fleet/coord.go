@@ -9,16 +9,27 @@
 //
 //	fleet coord-run --agent <id> --project <p> -- <child-cmd> [args...]
 //
-// Production wiring: the dispatch path (cmd/fleet/dispatch.go) builds
-// the default --command argv as:
+// Production wiring:
 //
-//	["sh", "-c", "claude --dangerously-skip-permissions; ..."]
+//   - FLEET_LEASE_FAILOVER OFF (default): the dispatch path
+//     (cmd/fleet/dispatch.go) builds the default --command argv as
+//     ["sh","-c","claude --dangerously-skip-permissions; ..."] — a bare
+//     engine, NOT routed through this supervisor (byte-identical to
+//     pre-PR2 behavior).
 //
-// PR-C does NOT change that default — it just introduces this new
-// subcommand so a future PR (or operator-scripted dispatch) can opt
-// the coord onto a supervisor that guarantees cleanup. Wiring the
-// default --command to use coord-run is dispatch-surface scope; this
-// PR is intentionally narrow to keep the stack clean.
+//   - FLEET_LEASE_FAILOVER ON (DESIGN-handoff-drain-storm-leak PR2):
+//     dispatch wraps that engine argv in this supervisor:
+//     ["fleet","coord-run","--agent",<id>,"--project",<p>,"--",
+//     "sh","-c","claude ..."]. The supervisor then ACQUIRES + HEARTBEATS
+//     the coordinator lease for the coord's whole life, stands down
+//     (exit 0) if a healthy leader already holds it, releases the lease
+//     on EVERY exit path (alongside coord.Cleanup), and — on a contested
+//     acquire — reaps the stale holder via the authenticated
+//     internal/coord.KillCoordIfIdentityMatches STONITH.
+//
+// PR-C originally introduced this subcommand without wiring it in; PR2
+// closes that gap behind the failover flag so the lease has a real
+// lifetime holder.
 //
 // Exit-path matrix (per task plan acceptance criteria):
 //
@@ -85,6 +96,39 @@ type coordRunOpts struct {
 	// production callers leave it nil. Used by the real-OS-signal test
 	// to synchronize "send the kill" with "handler is wired up".
 	notifyReady func()
+
+	// --- lease wiring (DESIGN-handoff-drain-storm-leak PR2) ---
+	//
+	// acquireLease is the lease-acquire seam. nil = production
+	// (productionAcquireLease, which calls coordlock.AcquireLeaseWithKill
+	// + stamps the supervisor identity + runs the new-leader sweep, all
+	// gated on FLEET_LEASE_FAILOVER). Tests inject a stub that returns a
+	// fakeLease + an acquired flag without touching a real flock.
+	//
+	// Contract (mirrors coordlock.AcquireLease):
+	//   acquired=true,  lease!=nil  -> we are the leader; runCoordRun
+	//       registers lease.Release() in the cleanup defer stack, starts
+	//       lease.Heartbeat(), then starts the child.
+	//   acquired=false              -> a healthy live leader exists;
+	//       runCoordRun stands down (prints, returns nil, NEVER starts
+	//       the child).
+	//   err!=nil with failover-disabled sentinel -> off-flag: runCoordRun
+	//       skips all lease behavior and runs the legacy bare-child path.
+	acquireLease func() (coordLease, bool, error)
+
+	// onStandDown, when non-nil, is invoked instead of the default
+	// stderr print when acquired==false. Test-only seam so a stand-down
+	// test can assert the path was taken without scraping stderr.
+	onStandDown func()
+}
+
+// coordLease is the minimal lease surface runCoordRun needs. The real
+// *coordlock.Lease satisfies it; tests inject a fake so the lifetime
+// (acquire -> heartbeat -> release on every exit path) is exercised
+// without a real kernel flock.
+type coordLease interface {
+	Heartbeat()
+	Release()
 }
 
 // withReady is a tiny helper for the real-OS-signal test that returns
@@ -233,6 +277,69 @@ func runCoordRun(ctx context.Context, opts coordRunOpts, stdout, stderr io.Write
 
 	if len(opts.argv) == 0 {
 		return errors.New("coord-run: empty child argv")
+	}
+
+	// --- lease acquire / stand-down / heartbeat (PR2) ---
+	//
+	// BEFORE child.Start(): acquire the coordinator lease so the
+	// supervisor is the single lease-holder for the coord's lifetime.
+	//   - acquired=false -> a healthy live leader exists; STAND DOWN
+	//     (print + return nil, NEVER start the child). Stand-down is not
+	//     a failure: a normal coord-spawn that loses the race exits 0.
+	//   - acquired=true  -> register lease.Release() in this defer stack
+	//     (runs on EVERY exit path alongside coord.Cleanup —
+	//     fleet-owns-its-resources), start the heartbeat, then start the
+	//     child.
+	//   - failover OFF/unsupported -> skip all lease behavior; run the
+	//     legacy bare-child path (byte-identical to today).
+	acquire := opts.acquireLease
+	if acquire == nil {
+		acquire = defaultAcquireLease(opts, stderr)
+	}
+	lease, acquired, lerr := acquire()
+	switch {
+	case leaseDisabledOrUnsupported(lerr):
+		// Flag OFF (or platform without the lease primitive) — no lease,
+		// legacy path. Fall through to child start.
+	case lerr != nil:
+		// A real acquire/takeover fault. Surface-don't-silo: refuse to
+		// start a child that would have no lease holder rather than
+		// silently spawning an unsupervised coord.
+		return fmt.Errorf("coord-run: acquire lease for project %q: %w", opts.project, lerr)
+	case !acquired:
+		// Healthy live leader exists -> stand down. Do NOT start the child.
+		if opts.onStandDown != nil {
+			opts.onStandDown()
+		} else {
+			_, _ = fmt.Fprintf(stderr, "a coord is already running for %s\n", opts.project)
+		}
+		return nil
+	default:
+		// acquired==true: we are the leader. Release joins the cleanup
+		// defer stack (LIFO: this defer runs BEFORE coord.Cleanup, so the
+		// flock frees first, then the record is archived). lease.Release
+		// also stops the heartbeat goroutine, so heartbeat-stop is on the
+		// same every-exit-path guarantee.
+		//
+		// SCOPE BOUNDARY (codex PR2 iter-5 [P1] — deferred to PR3/PR4 by
+		// design): this heartbeat reflects SUPERVISOR LIVENESS, not
+		// coordinator PROGRESS. While child.Wait blocks (engine process
+		// alive) the lease keeps renewing — even if the Claude
+		// /coordinator child is wedged-but-alive and no longer updating
+		// coord-state.json. A wedged engine that stays a live process is
+		// therefore NOT yet detected by this layer:
+		//   - a DEAD engine process -> child.Wait returns -> lease releases
+		//     (handled here today),
+		//   - a WEDGED-but-alive engine -> detected by the central
+		//     lease-gated mutation API rejecting its stale token (PR4) and
+		//     by the warm-standby progress poll (PR3), NOT by PR2.
+		// This is why FLEET_LEASE_FAILOVER ships OFF + unsupported until
+		// the PR3/PR4 progress layer lands (see internal/coordlock/
+		// lease.go FailoverEnvVar). Tying the heartbeat to coord-state.json
+		// freshness is PR3's job; doing it here would duplicate the
+		// progress-tracking the warm-standby owns.
+		defer lease.Release()
+		lease.Heartbeat()
 	}
 
 	// Build the child with the cancellable context — when the parent's

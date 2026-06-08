@@ -208,7 +208,28 @@ func Cleanup(agentID, project string, deps Deps) error {
 // ~/.fleet/agents/archive/<id>-<UTCYYYYMMDD-HHMMSS>.json. Idempotent
 // on a missing live record (Cleanup may be invoked twice — once from
 // the signal handler, once from defer in main).
+//
+// CONCURRENCY (codex PR2 iter-10 [P2]): under FLEET_LEASE_FAILOVER a
+// lease-wrapped coord's record is also written by spawn.Spawn's final
+// locked merge (engine PID) and by agent.StampSupervisorIdentity
+// (supervisor identity). If this archive raced spawn's merge — archiving
+// AFTER spawn's locked Load but BEFORE its rec.Write — the final write
+// would RESURRECT a live record for a dead/stood-down coord. So the
+// stat→rename runs under the SAME per-agent lock (state.LockAgent) those
+// writers take: either we archive first (spawn's locked Load then sees
+// ErrNotFound → its do-not-resurrect branch) or spawn finalizes first and
+// we archive the complete record. Lock failure is non-fatal (best-effort
+// cleanup) — fall through and archive unlocked rather than leak the
+// record.
 func archiveAgentRecord(id string) error {
+	if unlock, err := state.LockAgent(id); err == nil {
+		defer unlock()
+	} else {
+		// Surface-don't-silo: the archive proceeds unlocked (better a
+		// rare resurrect-race than a leaked live record), but note it.
+		fmt.Fprintf(os.Stderr,
+			"coord.Cleanup: archive %s proceeding WITHOUT per-agent lock: %v\n", id, err)
+	}
 	livePath, err := state.AgentPath(id)
 	if err != nil {
 		return fmt.Errorf("AgentPath: %w", err)
