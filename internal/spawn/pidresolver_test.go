@@ -61,6 +61,68 @@ func TestResolveEnginePid_PrefersDisambiguatorMatch(t *testing.T) {
 	}
 }
 
+// TestResolveEnginePid_SkipsCoordRunWrapper (codex PR2 iter-4 [P2]):
+// under FLEET_LEASE_FAILOVER the pane's top process is the `fleet
+// coord-run` supervisor, whose argv CONTAINS the disambiguator + engine
+// name in its tail. The resolver must record the ENGINE child pid, NOT
+// the supervisor pid (PID==engine / SupervisorPID==lease-holder split).
+//
+// Synthetic tree:
+//
+//	pane: fleet coord-run --agent A1 -- sh -c "claude ... fleet-coord-A1"
+//	  └── sh -c "claude ... fleet-coord-A1"
+//	      └── claude --remote-control fleet-coord-A1 ...   (target)
+func TestResolveEnginePid_SkipsCoordRunWrapper(t *testing.T) {
+	const disam = "fleet-coord-A1"
+	procs := []procEntry{
+		{PID: 100, PPID: 1, Args: "tmux server"},
+		{PID: 200, PPID: 100, Args: "/usr/local/bin/fleet coord-run --agent A1 --project p -- sh -c claude --remote-control " + disam + " --dangerously-skip-permissions"},
+		{PID: 201, PPID: 200, Args: "sh -c claude --remote-control " + disam + " --dangerously-skip-permissions"},
+		{PID: 202, PPID: 201, Args: "claude --remote-control " + disam + " --dangerously-skip-permissions"},
+	}
+	deps := resolveEnginePidDeps{
+		panePID:   func(string) (int, error) { return 200, nil },
+		listProcs: func() ([]procEntry, error) { return procs, nil },
+		now:       func() time.Time { return time.Unix(0, 0) },
+		sleep:     func(time.Duration) {},
+	}
+	pid, args, err := resolveEnginePid("fleet-A1", disam, "claude", 1*time.Second, deps)
+	if err != nil {
+		t.Fatalf("resolveEnginePid: %v", err)
+	}
+	if pid != 202 {
+		t.Errorf("pid = %d, want 202 (the engine child, NOT coord-run supervisor 200)", pid)
+	}
+	if !strings.Contains(args, "claude") || strings.Contains(args, "coord-run") {
+		t.Errorf("args = %q, want the claude engine argv (not the coord-run supervisor)", args)
+	}
+}
+
+func TestIsCoordRunArgv(t *testing.T) {
+	yes := []string{
+		"/usr/local/bin/fleet coord-run --agent A -- sh -c claude",
+		"fleet coord-run -- true",
+		"/tmp/go-build/exe/fleet.test coord-run --agent x -- sleep 30",
+	}
+	no := []string{
+		"sh -c claude",
+		"claude --remote-control fleet-coord-A1",
+		"/usr/local/bin/fleet dispatch task", // fleet but not coord-run
+		"someproc --flag coord-run",          // coord-run not the subcommand
+		"",
+	}
+	for _, a := range yes {
+		if !isCoordRunArgv(a) {
+			t.Errorf("isCoordRunArgv(%q) = false, want true", a)
+		}
+	}
+	for _, a := range no {
+		if isCoordRunArgv(a) {
+			t.Errorf("isCoordRunArgv(%q) = true, want false", a)
+		}
+	}
+}
+
 // TestResolveEnginePid_FallsBackToEngineMatch: when there is no
 // disambiguator (plain worker dispatch without --remote-control), the
 // resolver picks the deepest claude descendant.
@@ -435,6 +497,63 @@ func TestResolveEnginePid_RawShellLeafFastReturns(t *testing.T) {
 	if pid != 200 {
 		t.Errorf("raw-shell-leaf must fast-return pane pid 200; got %d", pid)
 	}
+}
+
+// TestResolveEnginePid_RawShellUnderCoordRun (codex PR2 iter-14 [P2]):
+// a RAW-SHELL coord command (`--command sh`) wrapped by coord-run under
+// FLEET_LEASE_FAILOVER. The pane is the coord-run SUPERVISOR; its only
+// child is the bare shell engine (no deeper child). The resolver must
+// record the SHELL pid (the engine), NOT the coord-run supervisor pid —
+// else PID == SupervisorPID breaks liveness.
+func TestResolveEnginePid_RawShellUnderCoordRun(t *testing.T) {
+	procs := []procEntry{
+		{PID: 200, PPID: 1, Args: "/usr/local/bin/fleet coord-run --agent A --project p -- sh"},
+		{PID: 201, PPID: 200, Args: "sh"}, // the raw-shell engine, no children
+	}
+	deps := resolveEnginePidDeps{
+		panePID:   func(string) (int, error) { return 200, nil },
+		listProcs: func() ([]procEntry, error) { return procs, nil },
+		now:       func() time.Time { return time.Unix(0, 0) },
+		sleep:     func(time.Duration) {},
+	}
+	pid, _, err := resolveEnginePid("fleet-A", "", "", 10*time.Second, deps)
+	if err != nil {
+		t.Fatalf("resolveEnginePid: %v", err)
+	}
+	if pid != 201 {
+		t.Errorf("raw-shell-under-coord-run must record the shell pid 201, not the supervisor 200; got %d", pid)
+	}
+}
+
+// TestRawShellLeafPid covers the helper for the coord-run cases.
+func TestRawShellLeafPid(t *testing.T) {
+	t.Run("coord-run pane with raw-shell child → child pid", func(t *testing.T) {
+		procs := []procEntry{
+			{PID: 200, PPID: 1, Args: "/usr/local/bin/fleet coord-run --agent A -- sh"},
+			{PID: 201, PPID: 200, Args: "sh"},
+		}
+		pid, ok := rawShellLeafPid(procs, 200)
+		if !ok || pid != 201 {
+			t.Errorf("want (201,true), got (%d,%v)", pid, ok)
+		}
+	})
+	t.Run("coord-run pane whose shell child has a claude grandchild → false", func(t *testing.T) {
+		procs := []procEntry{
+			{PID: 200, PPID: 1, Args: "/usr/local/bin/fleet coord-run --agent A -- sh -c claude"},
+			{PID: 201, PPID: 200, Args: "sh -c claude"},
+			{PID: 202, PPID: 201, Args: "claude"},
+		}
+		if _, ok := rawShellLeafPid(procs, 200); ok {
+			t.Error("want false; the shell has a claude grandchild (real engine)")
+		}
+	})
+	t.Run("bare-shell pane → pane pid", func(t *testing.T) {
+		procs := []procEntry{{PID: 200, PPID: 1, Args: "sh"}}
+		pid, ok := rawShellLeafPid(procs, 200)
+		if !ok || pid != 200 {
+			t.Errorf("want (200,true), got (%d,%v)", pid, ok)
+		}
+	})
 }
 
 // TestPaneIsRawShellLeaf covers the helper in isolation.

@@ -736,6 +736,18 @@ func runDispatch(opts *dispatchOpts, stdout io.Writer) error {
 	// record disjunct fails and — if the claim is stale and coord-state
 	// is stale — the dispatch proceeds.
 	//
+	// DEFENSE-IN-DEPTH (DESIGN-handoff-drain-storm-leak PR2). With
+	// FLEET_LEASE_FAILOVER on, the PRIMARY singleton guarantee is the
+	// coordinator lease: the coord-run supervisor takes a kernel LOCK_NB
+	// on coordinator.flock, so a second supervisor for the same project
+	// physically cannot acquire it and stands down (exit 0). This
+	// freshness veto is no longer the load-bearing gate — it stays as a
+	// cheap belt-and-braces check that can short-circuit a dispatch
+	// before we even spawn the supervisor, and it remains the ONLY gate
+	// when the flag is off. It is deliberately NOT removed: a heuristic
+	// that occasionally over-refuses (retryable exit 75) is strictly
+	// safer than a window with no gate at all.
+	//
 	// Only fires on --coord-spawn (the auto-coord-bootstrap path).
 	if opts.coordSpawn {
 		stateFresh := coordStateFresh(opts.project)
@@ -1066,6 +1078,14 @@ func runDispatch(opts *dispatchOpts, stdout io.Writer) error {
 		}
 	}
 
+	// Lease-failover supervisor wrap (DESIGN-handoff-drain-storm-leak
+	// PR2) is applied inside spawn.Spawn — NOT here — so it covers EVERY
+	// coord spawn (fresh dispatch AND the handoff/drain replacements that
+	// bypass dispatch by inheriting oldRec.Command). See spawn.Spawn's
+	// "Lease-failover supervisor wrap" block. The persisted rec.Command
+	// stays the clean engine argv; only the EXECUTION argv is wrapped, so
+	// each handoff re-wraps from the clean argv without nesting.
+
 	// Durable pending-spawn claim (leak-coord-spawn-idempot). Written
 	// HERE — under the coord-spawn flock (held via `defer release()`
 	// for the whole runDispatch when coordSpawn), after every gate that
@@ -1074,6 +1094,10 @@ func runDispatch(opts *dispatchOpts, stdout io.Writer) error {
 	// coordSpawnVeto (disjunct c) refuse until the new coord's first
 	// tick clears it (skills/coordinator/loop.py). Atomic .tmp+rename
 	// so a contending veto never reads a torn claim.
+	//
+	// Sits after the lease-failover note above on purpose: the lease
+	// wrapping is inside spawn.Spawn and only rewrites the execution argv;
+	// it does not refuse the spawn before this claim lands.
 	//
 	// Failure is non-fatal: if the claim write fails we log and proceed
 	// to spawn anyway — the NB-flock + coord-state veto remain as
@@ -1099,7 +1123,46 @@ func runDispatch(opts *dispatchOpts, stdout io.Writer) error {
 		PreAllocatedID:    preAllocatedID,
 		DisableAutoResume: disableAutoResume,
 		Engine:            engineName,
+		// LeaderCheck lets spawn distinguish a clean lease stand-down from
+		// a supervisor failure on the lease-wrapped coord path (PR2).
+		LeaderCheck: coordLeaderCheck,
+		// RecoverDeadCoord: when oldRecord != nil on the DISPATCH path it
+		// is a DEAD-coord recovery (findRecoveryCandidate found it dead) —
+		// a FRESH leader whose predecessor is gone, so it MUST be
+		// lease-wrapped (codex PR2 iter-8 [P1]). This is distinct from a
+		// LIVE handoff successor (internal/handoffop), where the outgoing
+		// coord still holds the lease and the successor must NOT be wrapped.
+		RecoverDeadCoord: oldRecord != nil,
 	})
+	// Lease stand-down (DESIGN-handoff-drain-storm-leak PR2): the wrapped
+	// coord-run supervisor found a healthy leader already holding the
+	// coordinator lease, stood down, and archived its pre-launch record.
+	// There is NO live agent to prompt or attach.
+	//
+	// Return the SAME *vetoError the freshness veto uses (codex PR2
+	// iter-9 [P2]) so this maps to exit 75 (EX_TEMPFAIL) — the established
+	// "a coord is already running, retry/attach the live one" signal that
+	// the TUI's startCoordSpawn + `fleet attach`'s coord-spawn wrapper
+	// already classify correctly. Returning exit 0 with only an
+	// "already running" line made the TUI (which expects "agent <id>
+	// spawned" on a nil-error dispatch) report a spurious
+	// "missing agent ID line" error instead of attaching to the leader.
+	if errors.Is(err, spawn.ErrCoordStoodDown) {
+		// Clear the pending-spawn claim before returning the veto: this
+		// dispatch did not boot a coord for preAllocatedID; a healthy leader
+		// already held the lease.
+		if opts.coordSpawn && opts.project != "" && preAllocatedID != "" {
+			if clrErr := clearCoordPendingClaim(opts.project); clrErr != nil {
+				_, _ = fmt.Fprintf(os.Stderr,
+					"warning: coord-spawn pending-claim cleanup after lease stand-down failed (%v) — claim ages out in %s\n",
+					clrErr, coordFreshnessWindow)
+			}
+		}
+		return &vetoError{msg: fmt.Sprintf(
+			"a coord is already running for %s (coordinator lease held by the live leader); "+
+				"did not spawn a duplicate — attach to the live coord via TUI [a] or `fleet attach`",
+			opts.project)}
+	}
 	if err != nil {
 		// Spawn failed → NO coord is booting, so the pending-spawn claim
 		// we wrote above is a lie. Leaving it would make every retry hit

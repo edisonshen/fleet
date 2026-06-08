@@ -196,10 +196,10 @@ func resolveEnginePid(
 			// has clearly NOT exec'd a real child, so the pane IS
 			// the correct recorded pid (operator dispatched a
 			// bare shell with no command).
-			if paneIsRawShellLeaf(procs, panePid) {
+			if leafPid, ok := rawShellLeafPid(procs, panePid); ok {
 				rawShellLeafObservations++
 				if rawShellLeafObservations >= rawShellLeafConfirmPolls {
-					return panePid, "", nil
+					return leafPid, "", nil
 				}
 			} else {
 				rawShellLeafObservations = 0
@@ -313,33 +313,43 @@ func findEngineDescendant(
 		f := queue[0]
 		queue = queue[1:]
 		p := f.entry
+		// A WRAPPER process is transport, not the engine: a shell
+		// (`sh -c "claude ..."`) OR — under FLEET_LEASE_FAILOVER — the
+		// `fleet coord-run` supervisor (DESIGN-handoff-drain-storm-leak
+		// PR2), whose argv CONTAINS the engine argv (and therefore the
+		// disambiguator + engine-hint) as its tail. Matching the
+		// supervisor would record SupervisorPID as Record.PID, violating
+		// the PID==engine / SupervisorPID==lease-holder split (codex PR2
+		// iter-4 [P2]). Exclude both from every match priority; the real
+		// engine is the deeper descendant.
+		isWrapper := isShellArgv(p.Args) || isCoordRunArgv(p.Args)
 		// Priority 1: exact disambiguator hit — return immediately
-		// UNLESS the match is on a shell wrapper. A shell argv that
-		// carries the disambiguator (via `sh -c "claude ... <disam>"`)
-		// is just transport — we want the real engine underneath. If
-		// the matched entry is a shell, defer to depth-2+ children;
-		// the production poll loop will re-walk once claude exec's.
+		// UNLESS the match is on a wrapper. A wrapper argv that carries
+		// the disambiguator is just transport — we want the real engine
+		// underneath. If the matched entry is a wrapper, defer to its
+		// deeper children; the production poll loop will re-walk once
+		// claude exec's.
 		if disambiguator != "" && strings.Contains(p.Args, disambiguator) {
-			if !isShellArgv(p.Args) {
+			if !isWrapper {
 				return p.PID, p.Args, true // strong match
 			}
-			// Shell carrying the disambiguator — still keep it as a
-			// fallback signal so a pane-only walk (no claude yet)
-			// doesn't return 0 and burn the timeout for nothing. We
-			// don't slot it into bestFallback because the shell filter
-			// below excludes shells; instead, we just keep walking.
+			// Wrapper carrying the disambiguator — keep walking to the
+			// real engine underneath (the wrapper-filter below excludes
+			// it from bestFallback).
 		}
 		// Priority 2: engine command match. Keep the deepest one in
 		// case multiple processes share the engine name in the tree.
-		if engineHint != "" && argvCommandIs(p.Args, engineHint) {
+		// Skip wrappers: the coord-run supervisor's argv contains the
+		// engine name in its tail but is NOT the engine.
+		if engineHint != "" && !isWrapper && argvCommandIs(p.Args, engineHint) {
 			if f.depth > bestEngineDepth {
 				bestEngine = p
 				bestEngineDepth = f.depth
 			}
 		}
-		// Priority 3: fallback to deepest non-shell descendant. We
+		// Priority 3: fallback to deepest non-wrapper descendant. We
 		// pick this only when the engine-match path also failed.
-		if !isShellArgv(p.Args) {
+		if !isWrapper {
 			if f.depth > bestFallbackDepth {
 				bestFallback = p
 				bestFallbackDepth = f.depth
@@ -371,23 +381,60 @@ func findEngineDescendant(
 // timeout would gratuitously stall the spawn. Codex iter-5
 // hardening (2026-05-14).
 func paneIsRawShellLeaf(procs []procEntry, panePID int) bool {
+	_, ok := rawShellLeafPid(procs, panePID)
+	return ok
+}
+
+// rawShellLeafPid returns the pid to record as the engine when the coord's
+// command is a RAW SHELL/REPL with no real engine child (`--command sh`),
+// and ok=false otherwise. It handles two shapes:
+//
+//   - UNWRAPPED pane: the pane process itself is a shell with no children
+//     → record the pane pid (the original raw-shell-leaf case).
+//   - COORD-RUN WRAPPED pane (FLEET_LEASE_FAILOVER): the pane is `fleet
+//     coord-run`, whose intended engine is a shell child. The supervisor
+//     argv is a WRAPPER (excluded from the normal match), so without this
+//     the resolver would fall back to the pane pid = the SUPERVISOR pid,
+//     giving PID == SupervisorPID and breaking liveness (codex PR2 iter-14
+//     [P2]). Here we descend through coord-run to its shell leaf (a shell
+//     with no further children) and return THAT pid — the real engine.
+//
+// "Leaf" = a shell whose only descendants (if any) are not present, i.e.
+// it has not exec'd a deeper engine. Returns the SHELL itself, not the
+// supervisor.
+func rawShellLeafPid(procs []procEntry, panePID int) (int, bool) {
 	if panePID <= 0 || len(procs) == 0 {
-		return false
+		return 0, false
 	}
-	var paneArgs string
-	hasChildren := false
+	byPID := make(map[int]procEntry, len(procs))
+	children := make(map[int][]procEntry, len(procs))
 	for _, p := range procs {
-		if p.PID == panePID {
-			paneArgs = p.Args
+		byPID[p.PID] = p
+		children[p.PPID] = append(children[p.PPID], p)
+	}
+	pane, ok := byPID[panePID]
+	if !ok {
+		return 0, false
+	}
+	hasChild := func(pid int) bool { return len(children[pid]) > 0 }
+	// Unwrapped: pane is a shell leaf.
+	if isShellArgv(pane.Args) {
+		if !hasChild(panePID) {
+			return panePID, true
 		}
-		if p.PPID == panePID {
-			hasChildren = true
+		return 0, false // a shell WITH children -> normal sh -c wrapper, not a leaf
+	}
+	// Wrapped: pane is the coord-run supervisor. Its intended engine is a
+	// direct shell child; treat it as the leaf only if THAT shell has no
+	// further children (no deeper engine exec'd).
+	if isCoordRunArgv(pane.Args) {
+		for _, c := range children[panePID] {
+			if isShellArgv(c.Args) && !hasChild(c.PID) {
+				return c.PID, true
+			}
 		}
 	}
-	if paneArgs == "" {
-		return false
-	}
-	return isShellArgv(paneArgs) && !hasChildren
+	return 0, false
 }
 
 // argvCommandIs reports whether the first token of argv (the command
@@ -425,6 +472,31 @@ func isShellArgv(argv string) bool {
 		return true
 	}
 	return false
+}
+
+// isCoordRunArgv reports whether argv is the `fleet coord-run`
+// supervisor (DESIGN-handoff-drain-storm-leak PR2). Under
+// FLEET_LEASE_FAILOVER the supervisor wraps the engine, so it is the
+// pane's top process and its argv CONTAINS the engine argv (disambiguator
+// + engine name) as its tail. The pid resolver must treat it as a
+// wrapper, not the engine — argv[0] basename contains "fleet" AND the
+// second token is "coord-run". Conservative: both conditions required so
+// an unrelated process that merely mentions "coord-run" in a deeper arg
+// is not misclassified.
+func isCoordRunArgv(argv string) bool {
+	first := firstToken(argv)
+	if first == "" {
+		return false
+	}
+	base := first
+	if idx := strings.LastIndexByte(base, '/'); idx >= 0 {
+		base = base[idx+1:]
+	}
+	if !strings.Contains(strings.ToLower(base), "fleet") {
+		return false
+	}
+	rest := strings.TrimLeft(argv[len(first):], " \t")
+	return firstToken(rest) == "coord-run"
 }
 
 // firstToken returns the first whitespace-separated token of s. Empty

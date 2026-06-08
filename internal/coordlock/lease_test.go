@@ -86,7 +86,7 @@ func testCfg(clk *fakeClock, live *fakeLiveness) leaseConfig {
 		nowMono:          clk.now,
 		pidStart:         live.get,
 		boot:             func() string { return "test-boot-1" },
-		killStub:         func(identity) error { return nil },
+		killStub:         func(identity, int64) error { return nil },
 	}
 }
 
@@ -160,6 +160,127 @@ func writeEpochRaw(t *testing.T, project string, rec epochRecord) {
 	}
 	if err := os.WriteFile(paths.epoch, b, 0o644); err != nil {
 		t.Fatalf("write epoch: %v", err)
+	}
+}
+
+// TestLeaderPresent (codex PR2 iter-11 [P2]): LeaderPresent uses the same
+// healthy/in-progress predicate AcquireLease uses, not a bare
+// state==active check. Healthy active -> true; stale active past TTL ->
+// false; fresh fencing takeover -> true; released / no record -> false.
+func TestLeaderPresent(t *testing.T) {
+	setupHome(t)
+	const project = "lp-test"
+	clk := &fakeClock{}
+	live := newFakeLiveness()
+	cfg := testCfg(clk, live)
+	const (
+		ownerPid   = 7000
+		ownerStart = int64(700700)
+		candPid    = 8000
+		candStart  = int64(800800)
+	)
+	live.set(ownerPid, ownerStart)
+	live.set(candPid, candStart)
+	owner := identity{Pid: ownerPid, PidStart: ownerStart, AgentID: "owner", Project: project}
+	cand := identity{Pid: candPid, PidStart: candStart, AgentID: "cand", Project: project}
+
+	// No record -> false.
+	if leaderPresentWithCfg(project, cfg) {
+		t.Error("no record: want false")
+	}
+
+	// Healthy active -> true.
+	writeEpochRaw(t, project, epochRecord{
+		Epoch: 5, State: stateActive, Owner: owner,
+		BootID: "test-boot-1", RenewedAtMono: clk.now(),
+	})
+	if !leaderPresentWithCfg(project, cfg) {
+		t.Error("healthy active: want true")
+	}
+
+	// Stale active (owner alive but renewed_at past TTL) -> false.
+	staleClk := &fakeClock{}
+	staleClk.advance(2 * cfg.ttl) // now is well past renewed_at=0
+	if leaderPresentWithCfg(project, testCfg(staleClk, live)) {
+		t.Error("stale active past TTL: want false (stealable)")
+	}
+
+	// Dead owner (pid gone) -> false even within TTL.
+	deadLive := newFakeLiveness() // owner/cand NOT set -> dead
+	if leaderPresentWithCfg(project, testCfg(clk, deadLive)) {
+		t.Error("dead owner: want false")
+	}
+
+	// Fresh fencing takeover (live candidate, in budget) -> true.
+	writeEpochRaw(t, project, epochRecord{
+		Epoch: 6, State: stateFencing, Owner: owner, Candidate: cand,
+		BootID: "test-boot-1", RenewedAtMono: clk.now(),
+	})
+	if !leaderPresentWithCfg(project, cfg) {
+		t.Error("fresh fencing takeover: want true")
+	}
+
+	// Released -> false.
+	writeEpochRaw(t, project, epochRecord{
+		Epoch: 7, State: stateReleased, Owner: owner,
+		BootID: "test-boot-1", RenewedAtMono: clk.now(),
+	})
+	if leaderPresentWithCfg(project, cfg) {
+		t.Error("released: want false")
+	}
+}
+
+// TestReleasedHolderBusyFlock_RetriesNotFenced (codex PR2 iter-12 [P2]):
+// a `released` epoch with the flock STILL briefly held (the old supervisor
+// is mid-Release/cleanup) must be RETRIED — the candidate acquires when
+// the flock frees — and must NOT STONITH the releasing supervisor.
+func TestReleasedHolderBusyFlock_RetriesNotFenced(t *testing.T) {
+	setupHome(t)
+	const project = "rel-busy"
+	clk := &fakeClock{}
+	live := newFakeLiveness()
+	cfg := testCfg(clk, live)
+
+	const oldPid = 4242
+	const oldStart = int64(424242)
+	live.set(oldPid, oldStart)
+
+	// Old holder demoted its record to `released` but still holds the flock.
+	writeEpochRaw(t, project, epochRecord{
+		Epoch: 9, State: stateReleased,
+		Owner:  identity{Pid: oldPid, PidStart: oldStart, AgentID: "old", Project: project},
+		BootID: "test-boot-1", RenewedAtMono: clk.now(),
+	})
+	releaseFlockHeld := holdFlock(t, project)
+
+	// killStub must NEVER fire — STONITH of a cleanly-releasing supervisor
+	// is exactly the bug.
+	var killed atomic.Bool
+	cfg.killStub = func(identity, int64) error { killed.Store(true); return nil }
+
+	// Free the flock shortly after acquire starts (simulates Release()
+	// closing the fd mid-cleanup). retryFlock polls every ~20ms within its
+	// budget, so this is caught well inside the bound.
+	go func() {
+		time.Sleep(40 * time.Millisecond)
+		releaseFlockHeld()
+	}()
+
+	lease, acquired, err := acquireLease(project, "cand", cfg)
+	if err != nil {
+		t.Fatalf("acquireLease: %v", err)
+	}
+	if !acquired || lease == nil {
+		t.Fatalf("expected the candidate to acquire after the releaser drops the flock; acquired=%v", acquired)
+	}
+	defer lease.Release()
+	if killed.Load() {
+		t.Error("killStub fired — must NOT STONITH a cleanly-releasing supervisor")
+	}
+	// The candidate is now the active owner at the released epoch+1.
+	rec := readEpochFor(t, project)
+	if rec.State != stateActive {
+		t.Errorf("state = %q, want active after acquire", rec.State)
 	}
 }
 
@@ -259,7 +380,7 @@ func TestT3_TakeoverOnTTLExpiryHungHolder(t *testing.T) {
 
 	cfg := testCfg(clk, live)
 	var fenceObservedBeforeKill atomic.Bool
-	cfg.killStub = func(owner identity) error {
+	cfg.killStub = func(owner identity, _ int64) error {
 		// At kill time the epoch must already be FENCING (fence-before-kill).
 		rec := readEpochFor(t, project)
 		if rec.State == stateFencing {
@@ -354,7 +475,7 @@ func TestT5_NoTakeoverOnHealthyHeartbeat(t *testing.T) {
 
 	cfg := testCfg(clk, live)
 	var killed atomic.Bool
-	cfg.killStub = func(identity) error { killed.Store(true); return nil }
+	cfg.killStub = func(identity, int64) error { killed.Store(true); return nil }
 
 	// Advance only within TTL.
 	clk.advance(10 * time.Second)
@@ -622,7 +743,7 @@ func TestT34_TwoPhaseCrashBetweenFenceAndAcquire(t *testing.T) {
 	})
 
 	cfg := testCfg(clk, live)
-	cfg.killStub = func(owner identity) error {
+	cfg.killStub = func(owner identity, _ int64) error {
 		if owner.AgentID != "old" {
 			t.Errorf("kill must target OLD owner, got %s", owner.AgentID)
 		}
@@ -1005,7 +1126,7 @@ func TestDoesNotStealFreshInProgressFencing(t *testing.T) {
 
 	cfg := testCfg(clk, live)
 	var killed atomic.Bool
-	cfg.killStub = func(identity) error { killed.Store(true); return nil }
+	cfg.killStub = func(identity, int64) error { killed.Store(true); return nil }
 
 	clk.advance(5 * time.Second) // still within TTL
 
@@ -1208,7 +1329,7 @@ func TestBusyFlockNoEpoch_StaleHolderRecovers(t *testing.T) {
 	cfg := testCfg(clk, live)
 	cfg.flockRetryBudget = 100 * time.Millisecond // PR1 stub can't free the flock
 	var fenced atomic.Bool
-	cfg.killStub = func(owner identity) error {
+	cfg.killStub = func(owner identity, _ int64) error {
 		if owner.Pid == hungPid {
 			fenced.Store(true)
 		}
@@ -1346,7 +1467,7 @@ func TestResumeTakeoverKillsFlockBodyHolder(t *testing.T) {
 
 	cfg := testCfg(clk, live)
 	var killedCand atomic.Bool
-	cfg.killStub = func(target identity) error {
+	cfg.killStub = func(target identity, _ int64) error {
 		if target.Pid == candPid {
 			killedCand.Store(true)
 			// Simulate the kill freeing the flock so the takeover completes.
@@ -1405,7 +1526,7 @@ func TestFencedNotAcquiredDoesNotSilentlyStandDown(t *testing.T) {
 	cfg := testCfg(clk, live)
 	cfg.flockRetryBudget = 100 * time.Millisecond // PR1 stub can't free a real flock
 	var fenced atomic.Bool
-	cfg.killStub = func(identity) error { fenced.Store(true); return nil }
+	cfg.killStub = func(identity, int64) error { fenced.Store(true); return nil }
 
 	clk.advance(5 * time.Second) // still within TTL
 
@@ -1514,7 +1635,7 @@ func TestResumeTakeoverKillsCandidateWithoutFlockBody(t *testing.T) {
 
 	cfg := testCfg(clk, live)
 	var killedCand atomic.Bool
-	cfg.killStub = func(target identity) error {
+	cfg.killStub = func(target identity, _ int64) error {
 		if target.Pid == candPid {
 			killedCand.Store(true)
 			live.kill(candPid)

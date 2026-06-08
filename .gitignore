@@ -31,3 +31,6 @@ __pycache__/
 .env.*
 !.env.example
 !.env.sample
+
+# Local Go build cache (accidental sweep guard)
+.gocache/

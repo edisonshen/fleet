@@ -87,6 +87,63 @@ func TestWriteAndLoad_RoundTrip(t *testing.T) {
 	}
 }
 
+// W10: StampSupervisorIdentity load-modify-writes the supervisor identity
+// fields without clobbering other record fields. This is what `fleet
+// coord-run` calls at startup so the STONITH primitive can target the
+// lease holder.
+func TestStampSupervisorIdentity_PreservesOtherFields(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("FLEET_HOME", tmp)
+	if err := os.MkdirAll(filepath.Join(tmp, "agents"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	r := New("sup00001")
+	r.PID = 4242 // engine pid — must be preserved, distinct from supervisor
+	r.Project = "projects-fleet"
+	r.TaskID = "coord-projects-fleet"
+	if err := r.Write(); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+
+	if err := StampSupervisorIdentity("sup00001", 9999, 1234567, "/usr/local/bin/fleet"); err != nil {
+		t.Fatalf("StampSupervisorIdentity: %v", err)
+	}
+
+	got, err := Load("sup00001")
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if got.SupervisorPID != 9999 {
+		t.Errorf("SupervisorPID = %d, want 9999", got.SupervisorPID)
+	}
+	if got.SupervisorPidStart != 1234567 {
+		t.Errorf("SupervisorPidStart = %d, want 1234567", got.SupervisorPidStart)
+	}
+	if got.SupervisorExePath != "/usr/local/bin/fleet" {
+		t.Errorf("SupervisorExePath = %q, want fleet binary", got.SupervisorExePath)
+	}
+	// Engine pid + project + task untouched.
+	if got.PID != 4242 {
+		t.Errorf("engine PID clobbered: got %d, want 4242", got.PID)
+	}
+	if got.Project != "projects-fleet" || got.TaskID != "coord-projects-fleet" {
+		t.Errorf("project/task clobbered: %q / %q", got.Project, got.TaskID)
+	}
+}
+
+// A missing record surfaces ErrNotFound rather than silently creating one.
+func TestStampSupervisorIdentity_MissingRecord(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("FLEET_HOME", tmp)
+	if err := os.MkdirAll(filepath.Join(tmp, "agents"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := StampSupervisorIdentity("nope0001", 1, 2, "/bin/fleet"); err == nil {
+		t.Fatal("expected error for missing record, got nil")
+	}
+}
+
 func TestList_Filters(t *testing.T) {
 	tmp := t.TempDir()
 	t.Setenv("FLEET_HOME", tmp)
