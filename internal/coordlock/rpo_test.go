@@ -307,6 +307,32 @@ func TestReplayIntents_CorruptCompletionReplays(t *testing.T) {
 	}
 }
 
+// codex PR4 [P2]: a STALE completion from a PRIOR epoch (an idempotency key
+// reused in a later lease generation) must NOT suppress replay of the new
+// pending intent.
+func TestReplayIntents_StaleCompletionEpochReplays(t *testing.T) {
+	setupHome(t)
+	const project = "rainier"
+	tok := ownerToken(t, project, 7) // current lease epoch 7
+	store, _ := tok.intentStore()
+	// A NEW intent for the reused key at the current epoch...
+	if err := store.writeIntent("branch/feat", 7); err != nil {
+		t.Fatal(err)
+	}
+	// ...but only a STALE completion from an earlier epoch 3 exists (the
+	// process crashed before writing the new completion).
+	if err := store.writeCompletion("branch/feat", 3); err != nil {
+		t.Fatal(err)
+	}
+	driven := 0
+	if err := ReplayIntents(tok, func(string) error { driven++; return nil }); err != nil {
+		t.Fatalf("ReplayIntents: %v", err)
+	}
+	if driven != 1 {
+		t.Fatalf("a stale-epoch completion must NOT suppress replay; drove %d, want 1", driven)
+	}
+}
+
 func TestReplayIntents_RejectedWhenLeaseLost(t *testing.T) {
 	setupHome(t)
 	const project = "rainier"
