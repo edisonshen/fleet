@@ -616,3 +616,74 @@ func TestDrainLease_GracefulPath_HoldsNoPerAgentLock(t *testing.T) {
 		t.Fatal("graceful path did not converge")
 	}
 }
+
+// codex PR3 iter-14 [P1] REGRESSION: takeoverAndRecover must NOT hold the
+// per-agent lock across TakeOver. The production TakeOver SIGTERMs the hung OLD,
+// whose coord.Cleanup archives OLD's record under state.LockAgent(OLD). If the
+// drain held that SAME lock across TakeOver, OLD's cleanup would block -> OLD is
+// SIGKILLed with a STALE live record + orphaned tmux/engine (the deadlock class
+// this whole stack exists to kill, reintroduced in PR3's takeover path).
+//
+// This test wires the REAL state.LockAgent as the seam and, INSIDE the TakeOver
+// callback (i.e. while the kill is "in flight"), simulates OLD's coord.Cleanup
+// archive grabbing state.LockAgent(OLD). With the lock held across TakeOver that
+// sibling acquire deadlocks; with the narrowed critical section it acquires
+// immediately. Deterministic: a channel proves the sibling lock was granted
+// during TakeOver, no wall-clock timing assertion.
+func TestDrainLease_TakeoverDoesNotHoldLockAcrossKill(t *testing.T) {
+	setupFleetHome(t)
+
+	out := &bytes.Buffer{}
+	siblingGotLock := make(chan struct{})
+	var recovered int32
+
+	d := drainLeaseDeps{
+		LeaderPresent: func(string) bool { return false },
+		CurrentEpoch:  func(string) (int64, bool) { return 9, true },
+		BarrierExists: func(string, int64) bool { return false },
+		LoadAgent:     func(string) (*agent.Record, error) { return oldCoordRec(), nil },
+		// REAL per-agent lock — the same primitive coord.Cleanup's archive uses.
+		LockAgent: state.LockAgent,
+		TakeOver: func(string, string) (bool, error) {
+			// Simulate OLD's coord.Cleanup archive (archiveAgentRecord ->
+			// state.LockAgent(OLD)) running while the kill is in flight. If the
+			// drain holds the lock across TakeOver this blocks forever.
+			rel, err := state.LockAgent("oldcoord1")
+			if err != nil {
+				return false, err
+			}
+			rel()
+			close(siblingGotLock)
+			return true, nil // takeover acquired -> OLD confirmed gone
+		},
+		RecoverSpawn: func(*agent.Record, string, string, io.Writer, io.Writer) error {
+			atomic.AddInt32(&recovered, 1)
+			return nil
+		},
+		BarrierPoll: time.Millisecond,
+	}
+
+	qp := existingQueuePath(t)
+	done := make(chan error, 1)
+	go func() { done <- drainOneLeaseAwareWith(leaseDrainReq(), qp, 0, 5, out, out, d) }()
+
+	select {
+	case <-siblingGotLock:
+		// OLD's cleanup-equivalent acquired the lock DURING TakeOver — the drain
+		// is not holding it across the kill. No deadlock.
+	case <-time.After(5 * time.Second):
+		t.Fatal("sibling LockAgent(OLD) BLOCKED during TakeOver — drain holds the per-agent lock across the kill (iter-14 deadlock regression)")
+	}
+
+	select {
+	case err := <-done:
+		if !errors.Is(err, ErrEscalatedToTakeOver) {
+			t.Fatalf("expected escalation signal, got %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("takeover recovery did not converge")
+	}
+	if atomic.LoadInt32(&recovered) != 1 {
+		t.Errorf("RecoverSpawn ran %d times, want 1 (successor recovered under the SHORT post-takeover lock)", recovered)
+	}
+}

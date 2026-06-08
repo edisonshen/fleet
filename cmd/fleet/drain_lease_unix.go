@@ -455,36 +455,57 @@ func drainWaitBarrierOrEscalate(req queue.SpawnFresh, path string, deadline time
 
 // takeoverAndRecover runs the safety-net takeover (fence -> kill the hung OLD)
 // and then brings up a FRESH lease-wrapped successor from the CACHED old record
-// (dead-coord recovery), deleting the queue on success. It NEVER blocks across
-// the kill, but it DOES hold a SHORT per-agent lock across the
-// takeover->recover sequence (codex PR3 iter-11 [P1]): the production TakeOver
-// releases the lease as soon as OLD is proven gone, opening a window where a
-// SECOND concurrent drain could acquire the freed lease and ALSO RecoverSpawn —
-// a duplicate successor. The per-agent LockAgent serializes the whole sequence
-// (it is BOUNDED — state.acquireBoundedAt — so a contending drain times out
-// instead of hanging, then re-reads state and stands down). Shared by the
+// (dead-coord recovery), deleting the queue on success.
+//
+// LOCK DISCIPLINE (codex PR3 iter-14 [P1] — the deadlock this whole stack
+// exists to kill, reintroduced in PR3's takeover path):
+//
+//	WRONG (self-deadlock):                   RIGHT (narrow critical section):
+//	┌──────────────────────────────┐        ┌──────────────────────────────┐
+//	│ LockAgent(OLD)                │        │ TakeOver(OLD)   ◄── lock-free │
+//	│   TakeOver(OLD)               │        │   fence -> SIGTERM OLD        │
+//	│     SIGTERM OLD               │        │   OLD's coord.Cleanup runs:   │
+//	│     OLD's coord.Cleanup runs: │        │     LockAgent(OLD)  ◄─ FREE   │
+//	│       LockAgent(OLD) ◄ BLOCKS │        │     archive record + reap     │
+//	│       (drain holds it!)       │        │   OLD exits -> flock freed    │
+//	│     OLD never archives ──────►│ stale  │   TakeOver acquires + releases│
+//	│   SIGKILL OLD (record stale,  │ rec +  │ LockAgent(OLD)  ◄ short scope │
+//	│   tmux/engine orphaned)       │ orphan │   re-check queue + RecoverSpawn│
+//	│ release()                     │        │ release()                     │
+//	└──────────────────────────────┘        └──────────────────────────────┘
+//
+// The per-agent lock must NOT span TakeOver: TakeOver SIGTERMs the hung OLD,
+// whose coord.Cleanup archives OLD's record under the SAME state.LockAgent(OLD).
+// Holding it across the kill self-blocks OLD's cleanup -> OLD is SIGKILLed with
+// a STALE live record and an orphaned tmux/engine. So TakeOver runs LOCK-FREE
+// (OLD's dying cleanup can grab the lock and archive cleanly); the lock is taken
+// only for the SHORT RecoverSpawn critical section AFTER OLD is gone.
+//
+// The lock still serializes duplicate recovery (codex PR3 iter-11 [P1]): the
+// production TakeOver releases the lease the instant OLD is proven gone, so two
+// concurrent drains could both observe acquired=true. The post-takeover lock +
+// queue re-check makes only ONE of them RecoverSpawn; the loser sees the queue
+// gone and stands down. The lock is BOUNDED (state.acquireBoundedAt — never a
+// bare LOCK_EX), so a contender times out instead of hanging. Shared by the
 // hung-leader, graceful-past-budget, and Resume-timeout escalations. Returns
 // ErrEscalatedToTakeOver on success (a non-fatal processed outcome).
 func takeoverAndRecover(req queue.SpawnFresh, path string, cachedOld *agent.Record,
 	stdout, stderr io.Writer, d drainLeaseDeps) error {
 
 	project := req.Project
-	// Serialize the takeover->recover sequence against a concurrent drain so
-	// only ONE successor is recovered (codex PR3 iter-11 [P1]).
-	release, lerr := d.LockAgent(req.OldAgentID)
-	if lerr != nil {
-		return fmt.Errorf("fleet drain: lock agent %s for takeover recovery: %w", req.OldAgentID, lerr)
-	}
-	defer release()
 
-	// Re-check under the lock: a drain that won the race may have already
-	// recovered (queue gone / a successor now leads). If the queue file is gone
-	// the work is done — stand down (another drain handled it).
+	// Pre-takeover stand-down check (lock-free): if a peer drain already
+	// recovered (queue gone), there is nothing to take over. Cheap early exit;
+	// the authoritative duplicate guard is the post-takeover locked re-check.
 	if _, statErr := os.Stat(path); errors.Is(statErr, os.ErrNotExist) {
 		_, _ = fmt.Fprintf(stdout, "fleet drain: %s already recovered by a concurrent drain; nothing to do\n", project)
 		return nil
 	}
 
+	// TakeOver runs LOCK-FREE so the hung OLD's coord.Cleanup can take
+	// state.LockAgent(OLD) to archive its record + reap tmux/engine while we
+	// fence->kill it. Holding the per-agent lock here would self-deadlock that
+	// cleanup (see the LOCK DISCIPLINE diagram above).
 	acquired, err := d.TakeOver(project, req.OldAgentID)
 	if err != nil {
 		return fmt.Errorf("fleet drain: safety-net takeover for %s: %w", project, err)
@@ -504,6 +525,29 @@ func takeoverAndRecover(req queue.SpawnFresh, path string, cachedOld *agent.Reco
 				"NOT spawning a successor (would duplicate); leaving queue for retry\n", project)
 		return fmt.Errorf("fleet drain: takeover for %s did not confirm the old coord is gone", project)
 	}
+	// OLD is provably gone now (the takeover fenced+killed it AND its
+	// coord.Cleanup ran lock-free, archiving the record + reaping tmux/engine).
+	// Only NOW take the SHORT per-agent lock — it serializes the RecoverSpawn
+	// against a concurrent drain so only ONE successor is recovered (codex PR3
+	// iter-11 [P1]). Crucially the lock does NOT span TakeOver above (codex PR3
+	// iter-14 [P1]): OLD's cleanup needed this same lock, so holding it across
+	// the kill self-deadlocked the archive (see LOCK DISCIPLINE above).
+	release, lerr := d.LockAgent(req.OldAgentID)
+	if lerr != nil {
+		return fmt.Errorf("fleet drain: lock agent %s for takeover recovery: %w", req.OldAgentID, lerr)
+	}
+	defer release()
+
+	// Re-check the queue UNDER the lock: a peer drain that also won an acquire
+	// (the production TakeOver releases the lease the instant OLD is gone, so two
+	// drains can both observe acquired=true) may have already RecoverSpawned and
+	// deleted the queue. If it is gone, stand down — recovering again would
+	// duplicate the successor (codex PR3 iter-11 [P1]).
+	if _, statErr := os.Stat(path); errors.Is(statErr, os.ErrNotExist) {
+		_, _ = fmt.Fprintf(stdout, "fleet drain: %s already recovered by a concurrent drain; nothing to do\n", project)
+		return nil
+	}
+
 	// The hung OLD is fenced + killed (drain acquired the freed flock, proving
 	// OLD released, then released it for the successor). Bring up a
 	// FRESH lease-wrapped successor from the CACHED old record (dead-coord
