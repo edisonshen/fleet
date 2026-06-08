@@ -48,11 +48,11 @@ import (
 	"github.com/edisonshen/fleet/internal/state"
 )
 
-// leaseDrainEnabled reports whether the lease-aware drain path is selected
-// (FLEET_LEASE_FAILOVER on). Mirrors coordlock's internal gate.
+// leaseDrainEnabled reports whether the lease-aware drain path is selected.
+// Delegates to coordlock's single source of truth (PR4 default ON;
+// =0/false/off/no disables).
 func leaseDrainEnabled() bool {
-	v := os.Getenv(coordlock.FailoverEnvVar)
-	return v != "" && v != "0" && v != "false"
+	return coordlock.FailoverEnabled()
 }
 
 // drainLeaseDeps are the injectable seams that keep drainOneLeaseAware

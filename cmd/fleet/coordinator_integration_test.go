@@ -313,6 +313,14 @@ print(json.dumps({
 		// loop and the test wedges until FLEET_COORD_POLL_MAX_S
 		// (default 4 h) elapses.
 		"FLEET_COORD_POLL_INTERVAL_S=0",
+		// DESIGN-handoff-drain-storm-leak PR4 flipped FLEET_LEASE_FAILOVER
+		// default ON, which makes loop.tick prove parent-lease ownership
+		// via `fleet lease-check`. These tests drive a BARE tick (no
+		// `fleet coord-run` lease supervisor parent), so the proof would
+		// (correctly) fence them. Pin the legacy path here — this suite
+		// exercises tick parse/reconcile/drain/dispatch, not the lease
+		// fence (the fence has its own coverage in skills + coordlock).
+		"FLEET_LEASE_FAILOVER=0",
 	)
 	// Postmortem 2026-05-14 (orphan tmux leak): the python3 driver's
 	// `loop.tick` shells out to `fleet dispatch`, which calls

@@ -156,12 +156,11 @@ func stampSupervisorWithRetry(agentID string, pid int, pidStart int64, exe strin
 	return lastErr
 }
 
-// leaseFailoverEnabled mirrors coordlock's internal failover gate for the
-// supervisor-side identity stamp (coordlock keeps its predicate
-// unexported). Any non-empty, non-"0"/"false" value enables it.
+// leaseFailoverEnabled delegates to coordlock's single source of truth for
+// the failover flag (PR4 flipped the default to ON; =0/false/off/no still
+// disables). Kept as a thin wrapper so call sites read naturally.
 func leaseFailoverEnabled() bool {
-	v := os.Getenv(coordlock.FailoverEnvVar)
-	return v != "" && v != "0" && v != "false"
+	return coordlock.FailoverEnabled()
 }
 
 // sweepStaleCompetitors reaps any OTHER same-project coord supervisor

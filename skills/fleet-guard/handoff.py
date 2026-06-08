@@ -504,6 +504,32 @@ def _do_handoff(record: dict[str, Any], session: str,
     prev_raw = record.get("last_handoff_path")
     prev_path: str | None = prev_raw if isinstance(prev_raw, str) and prev_raw else None
 
+    # (a) FENCE (correctness — DESIGN-handoff-drain-storm-leak PR4 item 10a).
+    # Under FLEET_LEASE_FAILOVER, a coord that was FENCED (a successor took
+    # over its lease) must NOT write a handoff doc / enqueue — that would be
+    # a zombie producer write the new leader's state would have to reconcile.
+    # Prove parent-lease ownership exactly as the supervisor tick does
+    # (via `fleet lease-check`); a fenced producer is REFUSED, not merely
+    # backed off. Returning False here makes the caller clear the pending
+    # mark and the (dead) coord stops trying.
+    if _producer_fenced(project):
+        print(
+            f"fleet-guard: handoff producer for agent {agent_id} "
+            f"(project {project!r}) is FENCED — a successor coord holds the "
+            f"lease; refusing to write a zombie handoff doc/queue",
+            file=sys.stderr,
+        )
+        return False
+
+    # (b) BACK-OFF (storm suppression — PR5-deferred half, the lease-coupled
+    # producer back-off). Even when validly the leader, do NOT re-fire a
+    # handoff while one is already in flight: a queue file already enqueued
+    # for THIS agent means a successor is live / being spawned. Writing doc
+    # #2..#16 on top of it is exactly the storm the incident showed (16 docs,
+    # zero successors). Back off silently — the in-flight handoff owns it.
+    if _handoff_already_in_flight(agent_id):
+        return True  # treat as success: the handoff is already happening
+
     recent = capture_recent(session)
     # Issue #93 Phase B2: when the outgoing agent is a coord, harvest
     # its in-flight worker subagents so the successor can re-dispatch
@@ -1210,6 +1236,62 @@ def write_queue(*, old_id: str, new_id: str, doc_path: str,
         path,
         (json.dumps(payload, indent=2) + "\n").encode("utf-8"),
     )
+
+
+# -- lease fence + storm back-off (PR4) --------------------------------------
+
+# `fleet lease-check`'s dedicated "not the lease owner" exit code (mirrors
+# cmd/fleet/lease_check.go::leaseCheckNotOwnerExit + loop.py).
+_LEASE_CHECK_NOT_OWNER_EXIT = 3
+_LEASE_CHECK_TIMEOUT_S = 5.0
+
+
+def _lease_failover_enabled() -> bool:
+    """Mirror coordlock.FailoverEnabled's tri-state gate (PR4 default ON):
+    enabled unless FLEET_LEASE_FAILOVER is EXPLICITLY 0/false/off/no
+    (case-insensitive)."""
+    return (os.environ.get("FLEET_LEASE_FAILOVER", "") or "").strip().lower() \
+        not in ("0", "false", "off", "no")
+
+
+def _producer_fenced(project: str) -> bool:
+    """True iff this producer is a FENCED old coord that must NOT write.
+
+    Routes through `fleet lease-check --project <p>` (the Go epoch re-read +
+    ancestor proof). Returns True ONLY on the definitive exit-3 "not owner"
+    verdict. Failover off, the binary missing, an error, or a timeout all
+    return False (fail-open): a legacy install or transient fault must not
+    silently disable a healthy coord's handoff — the storm back-off below
+    still suppresses duplicates, and the consumer-side fence (Go *WithLease)
+    remains the hard guarantee for the queue read."""
+    if not _lease_failover_enabled() or not project:
+        return False
+    env = dict(os.environ)
+    env["FLEET_HOME"] = str(health.fleet_home())
+    fleet_bin = os.environ.get("FLEET_BIN", "fleet")
+    try:
+        proc = subprocess.run(
+            [fleet_bin, "lease-check", "--project", project],
+            capture_output=True, text=True,
+            timeout=_LEASE_CHECK_TIMEOUT_S, check=False, env=env,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return False  # fail-open: don't wedge a legacy/slow environment
+    return proc.returncode == _LEASE_CHECK_NOT_OWNER_EXIT
+
+
+def _handoff_already_in_flight(agent_id: str) -> bool:
+    """True iff a handoff for agent_id is already enqueued (a successor is
+    live / being spawned). The durable signal is the consumer queue file
+    ~/.fleet/queue/spawn-fresh-<id>.json, which `write_queue` drops and the
+    consumer deletes when the handoff completes. Its presence means do NOT
+    write doc #2..#16 — that is the storm. Best-effort: any stat error
+    returns False (write the doc rather than silently skip a real handoff)."""
+    try:
+        qpath = health.fleet_home() / "queue" / f"spawn-fresh-{agent_id}.json"
+        return qpath.exists()
+    except OSError:
+        return False
 
 
 # -- atomic file write -------------------------------------------------------

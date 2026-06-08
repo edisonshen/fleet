@@ -183,13 +183,20 @@ var propagatedRuntimeEnv = []string{
 	"FLEET_LEASE_FAILOVER",
 }
 
-// leaseFailoverEnabled mirrors coordlock's failover gate (kept here to
-// avoid importing coordlock just for the predicate; coordlock keeps its
-// own copy unexported). Any non-empty, non-"0"/"false" value enables it.
-// DESIGN-handoff-drain-storm-leak PR2.
+// leaseFailoverEnabled mirrors coordlock.FailoverEnabled's tri-state gate
+// (kept here as a local copy rather than importing coordlock: spawn.go
+// compiles on every GOOS, while coordlock is build-tagged linux||darwin,
+// so a hard import would break non-unix builds). PR4 flipped the default
+// to ON: enabled unless EXPLICITLY one of 0/false/off/no
+// (case-insensitive). This MUST stay byte-for-byte consistent with
+// coordlock.parseFailover — they are the same tri-state contract.
 func leaseFailoverEnabled() bool {
-	v := os.Getenv("FLEET_LEASE_FAILOVER")
-	return v != "" && v != "0" && v != "false"
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("FLEET_LEASE_FAILOVER"))) {
+	case "0", "false", "off", "no":
+		return false
+	default:
+		return true
+	}
 }
 
 // shouldLeaseWrap decides whether this spawn wraps the coord in the

@@ -64,9 +64,14 @@ func TestCoordRunWrap_StandbyInsertsFlag(t *testing.T) {
 	}
 }
 
-// W2: the gate is OFF unless FLEET_LEASE_FAILOVER selects it.
+// W2: PR4 flipped the default to ON. The gate is now ON unless
+// FLEET_LEASE_FAILOVER is EXPLICITLY a disable token (0/false/off/no);
+// unset/empty/anything-else -> ON. Mirrors coordlock.parseFailover.
 func TestLeaseFailoverEnabled_Gate(t *testing.T) {
-	cases := map[string]bool{"": false, "0": false, "false": false, "1": true, "yes": true, "on": true}
+	cases := map[string]bool{
+		"": true, "1": true, "yes": true, "on": true, "anything": true, " 1 ": true,
+		"0": false, "false": false, "off": false, "no": false, "FALSE": false, " 0 ": false,
+	}
 	for v, want := range cases {
 		t.Setenv("FLEET_LEASE_FAILOVER", v)
 		if got := leaseFailoverEnabled(); got != want {

@@ -117,6 +117,7 @@ Engine selection:
 	root.AddCommand(newGCCmd())
 	root.AddCommand(newCoordRunCmd())
 	root.AddCommand(newSkillsCmd())
+	root.AddCommand(newLeaseCheckCmd())
 	return root
 }
 

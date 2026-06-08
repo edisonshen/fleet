@@ -43,6 +43,24 @@ def _disable_rc_bootstrap_session_fleet_guard() -> None:
 
 
 @pytest.fixture(autouse=True)
+def _producer_not_fenced_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Default: the handoff producer is NOT fenced.
+
+    DESIGN-handoff-drain-storm-leak PR4 made `_do_handoff` prove parent-lease
+    ownership via `fleet lease-check` (FLEET_LEASE_FAILOVER defaults ON). In
+    dev / CI / homebrew the real `fleet` binary IS on PATH, so a test that
+    seeds no lease record would get exit-3 "fenced" and the producer would
+    refuse to write — breaking every unrelated handoff-write test. This
+    autouse fixture stubs the fence to "not fenced" so those tests exercise
+    the WRITE path; test_producer_fence.py overrides it per-test to assert
+    the fence + back-off behavior (per-test monkeypatch wins over autouse).
+    Mirrors the coordinator-side conftest._stub_lease_check."""
+    import handoff  # noqa: WPS433 — sibling skill module on sys.path
+
+    monkeypatch.setattr(handoff, "_producer_fenced", lambda _project: False)
+
+
+@pytest.fixture(autouse=True)
 def _silence_kick_drain(monkeypatch: pytest.MonkeyPatch) -> None:
     """Producer-triggers-drain (`main._on_stop` / `_on_precompact` call
     `kick_drain_if_pending` after their tail writes) launches a real

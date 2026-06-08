@@ -979,18 +979,61 @@ func TestHeartbeatRenewsRenewedAt(t *testing.T) {
 
 // ---- Failover gate ----
 
-// TestAcquireLeaseRefusesWhenFailoverDisabled: the public entry point
-// refuses with ErrFailoverDisabled while FLEET_LEASE_FAILOVER is off
-// (default), so production behavior is unchanged by this merge.
+// TestAcquireLeaseRefusesWhenFailoverDisabled: T41 — with the PR4 flip the
+// flag is ON by default, so the ONLY way to get the legacy bare-child path
+// is to EXPLICITLY disable it (=0). The entry point then refuses with
+// ErrFailoverDisabled so the caller runs as pre-lease. Proves the flip is
+// reversible.
 func TestAcquireLeaseRefusesWhenFailoverDisabled(t *testing.T) {
 	setupHome(t)
-	t.Setenv(FailoverEnvVar, "") // explicitly off
-	_, _, err := AcquireLease("rainier", "cand")
-	if err == nil {
-		t.Fatal("AcquireLease must refuse when FLEET_LEASE_FAILOVER is off")
+	for _, off := range []string{"0", "false", "off", "no", "FALSE", "Off"} {
+		t.Run(off, func(t *testing.T) {
+			t.Setenv(FailoverEnvVar, off)
+			_, _, err := AcquireLease("rainier", "cand")
+			if err == nil {
+				t.Fatalf("AcquireLease must refuse when FLEET_LEASE_FAILOVER=%q", off)
+			}
+			if err.Error() != ErrFailoverDisabled.Error() {
+				t.Fatalf("expected ErrFailoverDisabled, got %v", err)
+			}
+		})
 	}
-	if err.Error() != ErrFailoverDisabled.Error() {
-		t.Fatalf("expected ErrFailoverDisabled, got %v", err)
+}
+
+// TestAcquireLeaseDefaultsOnWhenUnset: T40 — with no FLEET_LEASE_FAILOVER
+// set (the PR4 default), the lease path is LIVE: the first-ever leader
+// acquires epoch 1 rather than getting ErrFailoverDisabled. The "not yet
+// supported" refusal is gone for the default case.
+func TestAcquireLeaseDefaultsOnWhenUnset(t *testing.T) {
+	setupHome(t)
+	os.Unsetenv(FailoverEnvVar) //nolint:errcheck // ensure truly unset
+	lease, acquired, err := AcquireLease("rainier", "cand")
+	if err != nil {
+		t.Fatalf("AcquireLease with flag UNSET must run the live path (default ON), got err=%v", err)
+	}
+	if !acquired || lease == nil {
+		t.Fatalf("first-ever leader should acquire; acquired=%v lease=%v", acquired, lease)
+	}
+	t.Cleanup(lease.Release)
+	if lease.epoch != 1 {
+		t.Fatalf("first-ever epoch want 1, got %d", lease.epoch)
+	}
+}
+
+// TestParseFailoverTriState exercises the single source-of-truth parser
+// directly: explicit disable tokens -> OFF; everything else -> ON.
+func TestParseFailoverTriState(t *testing.T) {
+	off := []string{"0", "false", "off", "no", " 0 ", "FALSE", "Off", "NO"}
+	on := []string{"", "1", "true", "yes", "on", "anything", " 1 ", "enabled"}
+	for _, v := range off {
+		if parseFailover(v) {
+			t.Errorf("parseFailover(%q) = true, want false", v)
+		}
+	}
+	for _, v := range on {
+		if !parseFailover(v) {
+			t.Errorf("parseFailover(%q) = false, want true", v)
+		}
 	}
 }
 

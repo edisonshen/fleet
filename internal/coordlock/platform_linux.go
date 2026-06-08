@@ -75,6 +75,36 @@ func pidStartNanos(pid int) (int64, error) {
 	return ticks * 1_000_000_000 / userHZ, nil
 }
 
+// ppidOf returns the parent pid of pid from /proc/<pid>/stat field 4
+// (ppid). Used by the skill-side ownership proof to walk the getppid chain
+// and confirm the lease owner is an ancestor of the calling tick. Returns
+// (0,false) if the pid is gone / unreadable.
+func ppidOf(pid int) (int, bool) {
+	if pid <= 0 {
+		return 0, false
+	}
+	b, err := os.ReadFile(fmt.Sprintf("/proc/%d/stat", pid))
+	if err != nil {
+		return 0, false
+	}
+	s := string(b)
+	close := strings.LastIndexByte(s, ')')
+	if close < 0 || close+2 > len(s) {
+		return 0, false
+	}
+	rest := strings.Fields(s[close+2:])
+	// post-comm fields: state(3) ppid(4) ...; rest[0]==field3 -> ppid=rest[1].
+	const ppidIdx = 1
+	if len(rest) <= ppidIdx {
+		return 0, false
+	}
+	ppid, err := strconv.Atoi(rest[ppidIdx])
+	if err != nil {
+		return 0, false
+	}
+	return ppid, true
+}
+
 // monotonicNanos returns raw CLOCK_MONOTONIC nanoseconds (elapsed-only;
 // jump-immune — T24).
 func monotonicNanos() int64 {

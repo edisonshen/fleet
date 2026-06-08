@@ -88,6 +88,30 @@ def _stub_repo_binder_to_cwd(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _stub_lease_check(monkeypatch):
+    """Default: the parent-lease ownership proof returns "owner".
+
+    DESIGN-handoff-drain-storm-leak PR4 made `loop.tick` prove parent-lease
+    ownership by shelling out to `fleet lease-check` (FLEET_LEASE_FAILOVER
+    defaults ON). The vast majority of coordinator tests exercise UNRELATED
+    tick behavior and don't model a coord-run lease supervisor parent — they
+    must not shell out for the proof, nor pay for a real epoch read. This
+    autouse fixture substitutes the seam with a stub that returns "owner"
+    (proven), restoring the pre-PR4 "tick proceeds" behavior.
+
+    The dedicated lease-fence test (test_lease_fence.py) overrides
+    `loop._lease_check_fn` itself to return "fenced"; a later monkeypatch in
+    the test body wins over this autouse default.
+    """
+    import loop
+
+    def _proven(project, *, home, fleet_bin="fleet"):
+        return "owner"
+
+    monkeypatch.setattr(loop, "_lease_check_fn", _proven)
+
+
+@pytest.fixture(autouse=True)
 def _disable_supervisor_by_default(monkeypatch):
     """Default: supervisor disabled. Tests that need it set their own
     FLEET_COORD_POLL_INTERVAL_S inside the test body via monkeypatch.
