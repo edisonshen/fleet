@@ -271,6 +271,34 @@ func StampSupervisorIdentity(id string, pid int, pidStart int64, exePath string)
 	return rec.Write()
 }
 
+// StampEnginePID updates the record's engine-child PID after the supervisor
+// starts the engine. Needed for the WARM STANDBY path (codex PR3 iter-14 [P1]):
+// a `coord-run --standby` spawn SKIPS engine-pid resolution at spawn time (the
+// engine isn't launched until the standby acquires the lease), so spawn.Spawn
+// leaves rec.PID as the short-lived spawning CLI's pid. Once the standby
+// acquires + starts the engine child, this stamps the REAL child pid so TUI /
+// status liveness checks (which read Record.PID) no longer see a dead pid and
+// misclassify the live successor as dead.
+//
+// CONCURRENCY: same locked load-modify-write contract as
+// StampSupervisorIdentity — re-read under the per-agent lock and overlay ONLY
+// the PID field, preserving the supervisor identity the coord-run process
+// stamped. A missing record returns state.ErrNotFound (caller surfaces).
+func StampEnginePID(id string, pid int) error {
+	unlock, err := state.LockAgent(id)
+	if err != nil {
+		return fmt.Errorf("lock agent %s for engine-pid stamp: %w", id, err)
+	}
+	defer unlock()
+
+	rec, err := Load(id)
+	if err != nil {
+		return err
+	}
+	rec.PID = pid
+	return rec.Write()
+}
+
 // Write atomically publishes the record to ~/.fleet/agents/<id>.json.
 func (r *Record) Write() error {
 	path, err := state.AgentPath(r.ID)

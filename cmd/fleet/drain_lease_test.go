@@ -685,7 +685,9 @@ func TestDrainLease_ColdResume_HoldsPerAgentLock(t *testing.T) {
 			return nil
 		},
 	}
-	if err := drainOneLeaseAwareWith(leaseDrainReq(), "/tmp/q.json", 0, 1000, out, out, d); err != nil {
+	// resumeTimeoutMillis=0 -> coldResume runs synchronously (no timeout), so the
+	// lock-held-then-released ordering is deterministic for this contract test.
+	if err := drainOneLeaseAwareWith(leaseDrainReq(), "/tmp/q.json", 0, 0, out, out, d); err != nil {
 		t.Fatalf("cold resume returned %v, want nil", err)
 	}
 	if !lockedDuringResume {
@@ -693,6 +695,40 @@ func TestDrainLease_ColdResume_HoldsPerAgentLock(t *testing.T) {
 	}
 	if atomic.LoadInt32(&released) != 1 {
 		t.Errorf("per-agent lock released %d times, want 1 (must always release)", released)
+	}
+}
+
+// codex PR3 iter-14 [P1]: coldResume HONORS resumeTimeoutMillis — a Resume that
+// hangs past the budget must RETURN (surface), not block fleet drain forever
+// (the drain-storm class). Deterministic: a Resume that blocks on a channel the
+// test never closes, asserted to RETURN at ~budget, not a wall-clock value.
+func TestDrainLease_ColdResume_HonorsResumeTimeout(t *testing.T) {
+	out := &bytes.Buffer{}
+	block := make(chan struct{})
+	t.Cleanup(func() { close(block) }) // unblock the abandoned goroutine at test end
+	d := drainLeaseDeps{
+		CurrentEpoch: func(string) (int64, bool) { return 0, false }, // stealable -> coldResume
+		LockAgent:    func(string) (func(), error) { return func() {}, nil },
+		Resume: func(queue.SpawnFresh, string, int, io.Writer, io.Writer) error {
+			<-block // hang past the budget
+			return nil
+		},
+	}
+	done := make(chan error, 1)
+	go func() {
+		// 20ms budget; Resume never returns until t.Cleanup -> must time out.
+		done <- drainOneLeaseAwareWith(leaseDrainReq(), "/tmp/q.json", 0, 20, out, out, d)
+	}()
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("coldResume returned nil though Resume hung past the budget; want a timeout error")
+		}
+		if !strings.Contains(err.Error(), "resume-timeout") {
+			t.Errorf("expected a resume-timeout error, got %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("coldResume BLOCKED past the budget — resume-timeout not honored (drain-storm regression)")
 	}
 }
 

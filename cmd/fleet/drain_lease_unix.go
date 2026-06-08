@@ -829,30 +829,59 @@ func drainLiveLeaderFallback(req queue.SpawnFresh, path string, deadline time.Ti
 // SHORT per-agent LockAgent (Resume's contract; two concurrent drains must not
 // both spawn).
 //
-// It runs SYNCHRONOUSLY (codex PR3 iter-3/9 [P1/P2]): `fleet drain` is a
-// short-lived CLI, so an abandoned Resume goroutine would either be killed
-// mid-spawn on process exit OR race a safety-net recovery to a duplicate /
-// inconsistent handoff. Bounding is NOT needed here to prevent the drain-storm:
-//   - the per-agent LockAgent is BOUNDED (state.acquireBoundedAt never uses a
-//     bare LOCK_EX), so a contending drain times out instead of forever-blocking
-//     — the 81-leak's forever-block class is already gone at the lock layer;
-//   - the genuinely-HUNG-leader case never reaches coldResume: it is detected
-//     up front (LeaderPresent==false / no healthy holder) and handled by
-//     drainWaitBarrierOrEscalate's fence->kill->recover, which holds no lock.
+// It HONORS resumeTimeoutMillis (codex PR3 iter-14 [P1]): even with a healthy
+// leader present, handoffop.Resume can hang inside tmux probes / spawn /
+// readiness waits, which would block `fleet drain` past `--resume-timeout-ms`
+// and reintroduce the drain-storm class this PR exists to bound. So Resume runs
+// in a goroutine bounded by the timeout; on timeout coldResume RETURNS (surface-
+// don't-silo) rather than blocking.
 //
-// So coldResume is exactly the proven legacy completion (LockAgent + Resume),
-// reached only when a HEALTHY leader is present (a real, responsive handoff) or
-// a stealable cold lease — neither of which is the forever-hang incident.
+// Abandoned-goroutine safety (the reason it was synchronous before): on timeout
+// the goroutine keeps running but holds the BOUNDED per-agent LockAgent until
+// Resume returns. A concurrent/later drain that contends for that lock times out
+// (state.acquireBoundedAt never bare-LOCK_EXes) and stands down — so no two
+// drains ever both spawn. `fleet drain` is a short-lived CLI: the goroutine dies
+// with the process. The release runs whenever Resume finally returns (or never,
+// if the process exits first — harmless, the kernel frees the flock).
+//
+// resumeTimeoutMillis <= 0 means "no timeout" (run synchronously) — preserves
+// the legacy contract for callers that pass 0.
 func coldResume(req queue.SpawnFresh, path string, graceMillis, resumeTimeoutMillis int,
 	stdout, stderr io.Writer, d drainLeaseDeps) error {
 
-	_ = resumeTimeoutMillis // synchronous: see doc comment (no abandonable goroutine)
 	release, err := d.LockAgent(req.OldAgentID)
 	if err != nil {
 		return fmt.Errorf("fleet drain: lock agent %s for cold resume: %w", req.OldAgentID, err)
 	}
-	defer release()
-	return d.Resume(req, path, graceMillis, stdout, stderr)
+
+	if resumeTimeoutMillis <= 0 {
+		defer release()
+		return d.Resume(req, path, graceMillis, stdout, stderr)
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		// release runs when Resume returns (whether before or after the timeout),
+		// so the lock is held for exactly the duration Resume needs it.
+		defer release()
+		done <- d.Resume(req, path, graceMillis, stdout, stderr)
+	}()
+
+	timer := time.NewTimer(time.Duration(resumeTimeoutMillis) * time.Millisecond)
+	defer timer.Stop()
+	select {
+	case rerr := <-done:
+		return rerr
+	case <-timer.C:
+		// Resume hung past the budget. Return without blocking; the goroutine
+		// keeps the bounded lock until Resume unwinds (a contending drain times
+		// out + stands down, never a duplicate spawn). Surface so the operator
+		// sees the stuck handoff (fleet doctor / a later drain can retry).
+		_, _ = fmt.Fprintf(stderr,
+			"fleet drain: resume for %s exceeded the %dms budget; returning (the handoff completes in the background or a later drain retries)\n",
+			req.Project, resumeTimeoutMillis)
+		return fmt.Errorf("fleet drain: resume for %s exceeded the %dms resume-timeout budget", req.Project, resumeTimeoutMillis)
+	}
 }
 
 func fillDrainLeaseDeps(d drainLeaseDeps) drainLeaseDeps {

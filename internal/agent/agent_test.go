@@ -132,6 +132,57 @@ func TestStampSupervisorIdentity_PreservesOtherFields(t *testing.T) {
 	}
 }
 
+// StampEnginePID updates ONLY the engine PID, preserving the supervisor
+// identity fields the coord-run process stamped (codex PR3 iter-14 [P1] — the
+// warm-standby engine-pid stamp must not clobber the STONITH identity).
+func TestStampEnginePID_PreservesSupervisorFields(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("FLEET_HOME", tmp)
+	if err := os.MkdirAll(filepath.Join(tmp, "agents"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	r := New("eng00001")
+	r.PID = 111 // provisional spawning-CLI pid (dead) — to be replaced
+	r.Project = "projects-fleet"
+	r.TaskID = "coord-projects-fleet"
+	r.SupervisorPID = 9999
+	r.SupervisorPidStart = 1234567
+	r.SupervisorExePath = "/usr/local/bin/fleet"
+	if err := r.Write(); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+
+	if err := StampEnginePID("eng00001", 5555); err != nil {
+		t.Fatalf("StampEnginePID: %v", err)
+	}
+
+	got, err := Load("eng00001")
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if got.PID != 5555 {
+		t.Errorf("engine PID = %d, want 5555 (the real engine child)", got.PID)
+	}
+	// Supervisor identity (STONITH auth) must be untouched.
+	if got.SupervisorPID != 9999 || got.SupervisorPidStart != 1234567 || got.SupervisorExePath != "/usr/local/bin/fleet" {
+		t.Errorf("supervisor identity clobbered: pid=%d start=%d exe=%q",
+			got.SupervisorPID, got.SupervisorPidStart, got.SupervisorExePath)
+	}
+}
+
+// A missing record surfaces ErrNotFound rather than silently creating one.
+func TestStampEnginePID_MissingRecord(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("FLEET_HOME", tmp)
+	if err := os.MkdirAll(filepath.Join(tmp, "agents"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := StampEnginePID("nope0002", 1); err == nil {
+		t.Fatal("expected error for missing record, got nil")
+	}
+}
+
 // A missing record surfaces ErrNotFound rather than silently creating one.
 func TestStampSupervisorIdentity_MissingRecord(t *testing.T) {
 	tmp := t.TempDir()
