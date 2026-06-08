@@ -640,6 +640,67 @@ func runDispatch(opts *dispatchOpts, stdout io.Writer) error {
 		coordRecords = recs
 	}
 
+	// Idempotent coord-spawn (leak-coord-spawn-idempot): if a coord is
+	// ALREADY alive for this project (a record + a live tmux session on
+	// THIS socket), don't mint a duplicate — point the caller at the
+	// existing coord and return cleanly. This is the operator-friendly
+	// fast path for a double-press / re-dispatch of an already-running
+	// coord. It runs BEFORE the veto because "attach me to the live one"
+	// is a success, not a retry-later refusal. Cross-socket live coords
+	// aren't caught here (the local probe can't see them) — those fall to
+	// the coordSpawnVeto below, which returns exit 75 retry.
+	//
+	// Output-contract preservation (codex iter-2 P2): the wrapper callers
+	// (attach.go:doCoordSpawn parseSpawnedAgentID, TUI startCoordSpawn)
+	// parse the canonical `agent <id> spawned` line from a 0-exit dispatch
+	// to learn which session to probe+attach. We MUST emit that line with
+	// the LIVE coord's ID — otherwise an "already alive" race exits 0 with
+	// no parseable line and the wrapper reports a parse failure instead of
+	// attaching. We additionally print a human attach hint to stderr (not
+	// stdout, so it can't pollute the parse target).
+	//
+	// Prompt-failure + candidate-freshness gate (codex iter-3 + iter-7
+	// P2): the fast path may PROMOTE a specific live record to the caller
+	// (exit 0, `agent <id> spawned` → TUI/attach attach to it), so it must
+	// prove THAT record has actually ticked /coordinator — not merely that
+	// SOME coord ticked for the project. coordStateTickedAfter checks the
+	// SELECTED record: coord-state.json exists, is fresh, AND its mtime
+	// post-dates the record's spawn (the coord writes coord-state on its
+	// first tick, strictly after spawn). This rejects two ways a
+	// project-level freshness check would lie:
+	//   - a prompt-failed session that never ticked (iter-3): its mtime
+	//     is absent or predates its spawn → not promoted; the TUI's
+	//     respawn recovery runs instead of promoting a non-coordinator.
+	//   - coord-state fresh from a now-archived PREDECESSOR while the
+	//     selected live record is a brand-new not-yet-ticked session
+	//     (iter-7): predecessor's mtime predates the new record's spawn
+	//     → not promoted.
+	// coordStateTickedAfter fails CLOSED toward NOT promoting (returns
+	// false on absent/stat-error/stale/older-than-spawn), so anything
+	// unproven falls through to the veto/recovery path below — a genuinely
+	// booting coord is held by the cold-start pending-claim veto (retry),
+	// a prompt-failed session respawns. The fast path fires ONLY for a
+	// coord that has PROVEN it is supervising the project since it spawned.
+	//
+	// Uniqueness gate (codex iter-8 P2): only promote when there is
+	// EXACTLY ONE live candidate. With multiple live coord records the
+	// project-wide coord-state.json can't identify which one ticked, so
+	// an older real coord's mtime could vouch for a newer prompt-failed
+	// session — promoting a non-coordinator. uniqueLiveCoordForAttach
+	// returns nil for the ambiguous (>=2 live) case → fall through to the
+	// veto/recovery path, the correct handling for an already-forked
+	// project.
+	if opts.coordSpawn {
+		if live := uniqueLiveCoordForAttach(opts.taskID, opts.project, coordRecords, tmuxHasSession); live != nil &&
+			coordStateTickedAfter(opts.project, live.SpawnedAt) {
+			_, _ = fmt.Fprintf(os.Stderr,
+				"coord %s already alive for project %s; attaching to the existing session\n",
+				live.ID, opts.project)
+			_, _ = fmt.Fprintf(stdout, "agent %s spawned\n", live.ID)
+			return nil
+		}
+	}
+
 	// Live-coord veto (codex review iter-12 P1 — reinstated after
 	// iter-11 briefly removed it). The Python /coordinator skill only
 	// holds coordinator.lock for a single tick before releasing it in
@@ -647,41 +708,104 @@ func runDispatch(opts *dispatchOpts, stdout io.Writer) error {
 	// net at the dispatch boundary (two coords would alternate ticks,
 	// both mutating tasks/worker state — split-brain coordination).
 	//
-	// Veto when BOTH:
-	//   (a) coord-state.json mtime is fresh (something is ticking), AND
-	//   (b) an agent record exists for this project+task_id (the
-	//       record claiming to BE that something).
+	// OR-based veto (leak-coord-spawn-idempot) — refuse when ANY of:
+	//   (a) coord-state.json mtime fresh AND a record exists (the
+	//       original AND-gate; steady-state signal once the coord has
+	//       ticked at least once).
+	//   (b) a live coord record (tmux session alive on THIS socket) —
+	//       handled ABOVE by the coordStateFresh-gated idempotent-attach
+	//       fast path, which returns success for a coord that has PROVEN
+	//       it ticked. We pass false for this disjunct HERE on purpose: a
+	//       bare-live-but-not-ticking session is ambiguous (booting vs
+	//       prompt-failed) and raw liveness can't tell them apart — the
+	//       pending CLAIM (disjunct c) is the precise cold-start signal
+	//       instead (see the detailed note at the const liveCoord below).
+	//       The disjunct lives in coordSpawnVeto's contract (T7 tests it)
+	//       for a complete OR-gate, but in this call path it stays false.
+	//   (c) a FRESH pending-spawn claim exists — the cold-start window:
+	//       dispatch #1 wrote the claim + spawned, but coord-state.json
+	//       isn't written until the first tick (3-5 min). Without (c),
+	//       a dispatch #2 in that gap sees neither (a) nor (b) and
+	//       double-spawns. This is root cause #3 from
+	//       DESIGN-lifecycle-leak-recurrence.md (projects-spark, two
+	//       coords 18.8s apart on 2026-05-29).
 	//
-	// Both signals required to keep the dispatch-after-clean-archive
-	// case unblocked (codex iter-8 P2): after an operator hits [x] to
-	// archive the dead record, (b) fails → dispatch proceeds.
-	//
-	// Limitations we accept:
-	//   - Recently-crashed coords whose record hasn't been archived
-	//     will be vetoed for the freshness window. Operator workaround:
-	//     `fleet rm <coord-id>` first.
-	//   - Live coord on a different tmux socket: (a) and (b) both hold
-	//     correctly, veto fires, split-brain avoided. This is the
-	//     load-bearing case the veto exists for.
+	// The (a) AND-gate stays paired (not just coordStateFresh alone) so
+	// the dispatch-after-clean-archive case is unblocked (codex iter-8
+	// P2): after an operator hits [x] to archive the dead record, the
+	// record disjunct fails and — if the claim is stale and coord-state
+	// is stale — the dispatch proceeds.
 	//
 	// Only fires on --coord-spawn (the auto-coord-bootstrap path).
-	if opts.coordSpawn && coordStateFresh(opts.project) {
-		if coordRecordExistsInList(opts.taskID, opts.project, coordRecords) {
+	if opts.coordSpawn {
+		stateFresh := coordStateFresh(opts.project)
+		recordExists := coordRecordExistsInList(opts.taskID, opts.project, coordRecords)
+		// liveCoordRecord disjunct stays FALSE here, and the cold-start
+		// signal is the pending CLAIM, not raw tmux liveness (codex iter-6
+		// P2 — reverting the iter-5 over-correction). A bare-live tmux
+		// session for the coord task_id is AMBIGUOUS: it is EITHER a coord
+		// genuinely booting (refuse+retry is right) OR a prompt-failed
+		// session where /coordinator never started and the TUI expects the
+		// next [a] to RESPAWN (refusing would strand recovery until a
+		// manual `fleet rm`). Raw liveness cannot tell these apart; the
+		// claim CAN:
+		//   - genuinely booting coord → fresh claim present → claimFresh
+		//     disjunct (c) below vetoes the duplicate.
+		//   - prompt-failed session → its claim was cleared on the
+		//     prompt-delivery-failure path (clearClaimOnPromptFailure,
+		//     iter-4) → no claimFresh → dispatch falls through and respawns.
+		// Feeding raw liveness into the veto (iter-5) conflated the two and
+		// re-stranded prompt-failure retries. The coordStateFresh-gated
+		// fast path ABOVE handles the proven-live-coord attach; everything
+		// else is decided by the claim. Residual: a cold start that runs
+		// PAST the 5-min claim budget without ticking can still admit a
+		// second spawn — that is the documented freshness-budget tradeoff
+		// (TASK-PLAN non-goal: "Changing the cold-start duration"), not a
+		// new regression. T7 still exercises the (b) disjunct for contract
+		// completeness.
+		//
+		// DELIBERATE FORK (codex iter-5 demanded live-veto → iter-6
+		// demanded NO live-veto → iter-8 re-demanded live-veto): these are
+		// mutually exclusive with local-only signals. "Veto on raw live"
+		// closes a narrow duplicate window but strands prompt-failure
+		// retries (a recurring real bug). "Don't veto on raw live" keeps
+		// retries working at the cost of a residual cold-start duplicate
+		// window when the claim is unusable (write failed, corrupt, or an
+		// older binary wrote no claim) AND the coord is live-not-ticking
+		// AND a contending dispatch is on a DIFFERENT tmux socket (same-
+		// socket concurrency is already serialized by the NB-flock). We
+		// keep the claim-based design (this branch): the residual is a
+		// narrow degraded-state intersection and is strictly better than
+		// the pre-task baseline (which had NO cold-start veto at all),
+		// whereas re-stranding prompt-failure retries breaks an everyday
+		// operator path. Filed as a deferred [P2] for an operator design
+		// call (a durable per-record liveness/heartbeat signal would let
+		// the veto distinguish booting from prompt-failed and resolve the
+		// fork properly — out of this task's scope).
+		const liveCoord = false
+		claimFresh, claim := coordPendingClaimFresh(opts.project, coordFreshnessWindow)
+		if reason := coordSpawnVeto(stateFresh, recordExists, liveCoord, claimFresh); reason != "" {
 			// Typed vetoError → main() maps to exit 75 (EX_TEMPFAIL).
 			// This is a RETRY signal, not a hard failure: a live coord
-			// exists on another tmux socket OR one crashed within the
-			// freshness window and may be restarting. `fleet attach`'s
-			// shared coord-spawn wrapper classifies exit 75 (via
-			// exec.ExitError.ExitCode()) as wait+retry, NOT a never-exit-
-			// violating hard exit 70 (BUG #2, attach-failover plan
-			// INVARIANT 3). Spawning over a live/restarting coord here
-			// would split-brain the project.
+			// exists on another tmux socket, one crashed within the
+			// freshness window and may be restarting, or a cold-start
+			// spawn is still booting. `fleet attach`'s shared
+			// coord-spawn wrapper classifies exit 75 (via
+			// exec.ExitError.ExitCode()) as wait+retry, NOT a
+			// never-exit-violating hard exit 70 (BUG #2, attach-failover
+			// plan INVARIANT 3). Spawning over an in-flight/live coord
+			// here would split-brain the project.
+			claimClause := ""
+			if claimFresh {
+				claimClause = fmt.Sprintf(" (pending-spawn claim age %s, agent %s)",
+					time.Since(claim.SpawnedAt).Round(time.Second), claim.AgentID)
+			}
 			return &vetoError{msg: fmt.Sprintf(
-				"refusing to spawn coord for project %q: coord-state.json mtime is recent AND a record exists. "+
-					"likely causes: (1) a live coord is on a different tmux socket, or (2) a coord just crashed within the freshness window. "+
-					"in case (2), wait %s for the freshness signal to age out, then retry — recovery will pick up in-flight worker state. "+
+				"refusing to spawn coord for project %q: %s%s. "+
+					"likely causes: (1) a live coord is on a different tmux socket, (2) a coord just crashed within the freshness window, or (3) a coord-spawn is still booting (cold start). "+
+					"wait %s for the signal to age out, then retry — recovery will pick up in-flight worker state. "+
 					"do NOT `fleet rm` the dead record first; that disables the recovery path",
-				opts.project, coordFreshnessWindow)}
+				opts.project, reason, claimClause, coordFreshnessWindow)}
 		}
 	}
 
@@ -942,6 +1066,28 @@ func runDispatch(opts *dispatchOpts, stdout io.Writer) error {
 		}
 	}
 
+	// Durable pending-spawn claim (leak-coord-spawn-idempot). Written
+	// HERE — under the coord-spawn flock (held via `defer release()`
+	// for the whole runDispatch when coordSpawn), after every gate that
+	// could refuse the spawn, immediately before spawn.Spawn. The claim
+	// bridges the cold-start window: it makes a second dispatch's
+	// coordSpawnVeto (disjunct c) refuse until the new coord's first
+	// tick clears it (skills/coordinator/loop.py). Atomic .tmp+rename
+	// so a contending veto never reads a torn claim.
+	//
+	// Failure is non-fatal: if the claim write fails we log and proceed
+	// to spawn anyway — the NB-flock + coord-state veto remain as
+	// defense in depth, and refusing the spawn over a claim-write error
+	// would leave the project coord-less (worse than the narrow
+	// double-spawn race the claim closes).
+	if opts.coordSpawn && opts.project != "" && preAllocatedID != "" {
+		if cerr := writeCoordPendingClaim(opts.project, preAllocatedID); cerr != nil {
+			_, _ = fmt.Fprintf(os.Stderr,
+				"warning: coord-spawn pending-claim write failed (%v) — proceeding (flock + coord-state veto still guard against double-spawn)\n",
+				cerr)
+		}
+	}
+
 	rec, err := spawn.Spawn(spawn.Options{
 		OldRecord:         oldRecord,
 		NewDocPath:        newDocPath,
@@ -955,6 +1101,22 @@ func runDispatch(opts *dispatchOpts, stdout io.Writer) error {
 		Engine:            engineName,
 	})
 	if err != nil {
+		// Spawn failed → NO coord is booting, so the pending-spawn claim
+		// we wrote above is a lie. Leaving it would make every retry hit
+		// coordPendingClaimFresh and get vetoed (exit 75) for the full
+		// freshness window, blocking immediate recovery from a transient
+		// tmux/agent-write failure (codex iter-1 P2). Clear it best-
+		// effort: the claim is fail-open (a stale claim ages out in
+		// coordFreshnessWindow regardless), so a clear failure only costs
+		// the window we're trying to avoid — never correctness. Guarded
+		// identically to the write so we only clear what we wrote.
+		if opts.coordSpawn && opts.project != "" && preAllocatedID != "" {
+			if clrErr := clearCoordPendingClaim(opts.project); clrErr != nil {
+				_, _ = fmt.Fprintf(os.Stderr,
+					"warning: coord-spawn pending-claim cleanup after failed spawn failed (%v) — claim ages out in %s\n",
+					clrErr, coordFreshnessWindow)
+			}
+		}
 		return err
 	}
 
@@ -1043,6 +1205,7 @@ func runDispatch(opts *dispatchOpts, stdout io.Writer) error {
 			_, _ = fmt.Fprintf(stdout,
 				"warning: initial prompt not delivered (%v) — attach to type it manually\n",
 				perr)
+			clearClaimOnPromptFailure(opts, preAllocatedID)
 		case !submitted:
 			// Codex review iter-6 P2: include the same sigil
 			// ("initial prompt not delivered") the TUI's
@@ -1055,6 +1218,7 @@ func runDispatch(opts *dispatchOpts, stdout io.Writer) error {
 			// substring is the wire contract.
 			_, _ = fmt.Fprintf(stdout,
 				"warning: initial prompt not delivered (typed but Enter did not submit; still in Claude's input box after retry) — attach and press Enter manually\n")
+			clearClaimOnPromptFailure(opts, preAllocatedID)
 		default:
 			_, _ = fmt.Fprintf(stdout, "  prompt:  delivered\n")
 		}
