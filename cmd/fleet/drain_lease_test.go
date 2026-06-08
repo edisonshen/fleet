@@ -523,11 +523,19 @@ func TestDrainLease_GracefulOldHoldsLeasePastBudget_Escalates(t *testing.T) {
 	var tookOver int32
 	var recovered int32
 	d := drainLeaseDeps{
-		CurrentEpoch:   func(string) (int64, bool) { return 5, true },
-		BarrierExists:  func(string, int64) bool { return true },
-		ActiveOwnerPID: func(string) (int, bool) { return 424242, true }, // never releases
-		LoadAgent:      func(string) (*agent.Record, error) { return oldCoordRec(), nil },
-		TakeOver:       func(string, string) (bool, error) { atomic.AddInt32(&tookOver, 1); return true, nil },
+		CurrentEpoch:  func(string) (int64, bool) { return 5, true },
+		BarrierExists: func(string, int64) bool { return true },
+		// OLD holds the lease past the budget; after TakeOver fences+kills it the
+		// lease is free with no successor (the post-takeover re-check sees !ok),
+		// so RecoverSpawn brings up a replacement.
+		ActiveOwnerPID: func(string) (int, bool) {
+			if atomic.LoadInt32(&tookOver) == 0 {
+				return 424242, true // OLD still leads until takeover reaps it
+			}
+			return 0, false // OLD killed; no successor yet -> RecoverSpawn
+		},
+		LoadAgent: func(string) (*agent.Record, error) { return oldCoordRec(), nil },
+		TakeOver:  func(string, string) (bool, error) { atomic.AddInt32(&tookOver, 1); return true, nil },
 		RecoverSpawn: func(*agent.Record, string, string, io.Writer, io.Writer) error {
 			atomic.AddInt32(&recovered, 1)
 			return nil

@@ -672,6 +672,25 @@ func takeoverAndRecover(req queue.SpawnFresh, path string, cachedOld *agent.Reco
 		return nil
 	}
 
+	// Re-check the lease OWNER under the lock before spawning (codex PR3
+	// iter-14 [P1]): a graceful WARM STANDBY may have been polling all along and
+	// acquired the freed lease in the gap between TakeOver killing OLD and
+	// TakeOver releasing the lease. If a successor already leads, RecoverSpawn
+	// would either duplicate the coord or fail on the pre-allocated standby
+	// session/id. A confirmed successor means the handoff is complete — clean the
+	// queue and stand down instead of cold-spawning a redundant replacement.
+	if op, ok := d.ActiveOwnerPID(project); ok {
+		_, _ = fmt.Fprintf(stdout,
+			"fleet drain: a successor (pid %d) acquired the lease for %s after takeover; standing down (no recovery spawn)\n",
+			op, project)
+		if derr := queue.Delete(path); derr != nil {
+			return fmt.Errorf(
+				"fleet drain: successor leads %s after takeover but queue delete failed (%w); rerun fleet drain to clean it",
+				project, derr)
+		}
+		return ErrEscalatedToTakeOver
+	}
+
 	// The hung OLD is fenced + killed (drain acquired the freed flock, proving
 	// OLD released, then released it for the successor). Bring up a
 	// FRESH lease-wrapped successor from the CACHED old record (dead-coord
