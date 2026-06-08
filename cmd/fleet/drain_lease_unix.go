@@ -36,6 +36,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"time"
 
 	"github.com/edisonshen/fleet/internal/agent"
@@ -47,13 +48,14 @@ import (
 	"github.com/edisonshen/fleet/internal/queue"
 	"github.com/edisonshen/fleet/internal/spawn"
 	"github.com/edisonshen/fleet/internal/state"
+	"github.com/edisonshen/fleet/internal/tmux"
 )
 
-// leaseDrainEnabled reports whether the lease-aware drain path is selected
-// (FLEET_LEASE_FAILOVER on). Mirrors coordlock's internal gate.
+// leaseDrainEnabled reports whether the lease-aware drain path is selected.
+// Delegates to coordlock's single source of truth (PR4 default ON;
+// =0/false/off/no disables).
 func leaseDrainEnabled() bool {
-	v := os.Getenv(coordlock.FailoverEnvVar)
-	return v != "" && v != "0" && v != "false"
+	return coordlock.FailoverEnabled()
 }
 
 // drainLeaseDeps are the injectable seams that keep drainOneLeaseAware
@@ -193,6 +195,25 @@ func productionRecoverSpawn(oldRec *agent.Record, docPath, preAllocatedID string
 	if len(oldRec.Command) == 0 {
 		return fmt.Errorf("fleet drain: recover-spawn: old coord %s has no stored command", oldRec.ID)
 	}
+
+	// ADOPT an already-spawned successor instead of re-spawning (codex PR4
+	// [P1]/[P2]). A prior recovery pass may have spawned the replacement with
+	// THIS preAllocatedID and then failed only at prompt delivery, preserving
+	// the queue for retry. Re-running spawn with the same id would collide
+	// with the live session. So: if the pre-allocated successor record exists
+	// AND its tmux session is alive, skip the spawn and go straight to (idempotent)
+	// prompt delivery. This makes a preserved-queue retry safe.
+	if preAllocatedID != "" {
+		if existing, lerr := agent.Load(preAllocatedID); lerr == nil && existing != nil {
+			if alive, _ := tmux.SessionAlive(existing.TmuxSession); alive {
+				_, _ = fmt.Fprintf(stdout,
+					"fleet drain: adopting already-spawned successor %s for %s (no re-spawn)\n",
+					existing.ID, oldRec.Project)
+				return recoverHandoffTail(oldRec, existing, docPath, disableAutoResume, stdout, stderr)
+			}
+		}
+	}
+
 	spawnCwd := oldRec.Cwd
 	if spawn.IsCoordSpawn(oldRec.TaskID, oldRec.Project) {
 		resolved, rerr := coordrepo.ResolveProjectRepo(oldRec.Project, true)
@@ -226,17 +247,16 @@ func productionRecoverSpawn(oldRec *agent.Record, docPath, preAllocatedID string
 	}
 	_, _ = fmt.Fprintf(stdout,
 		"fleet drain: cold-spawned lease-wrapped successor %s for %s after takeover\n", rec.ID, oldRec.Project)
-	recoverHandoffTail(oldRec, rec.ID, rec.TmuxSession, docPath, disableAutoResume, stderr)
-	return nil
+	return recoverHandoffTail(oldRec, rec, docPath, disableAutoResume, stdout, stderr)
 }
 
-// Seams for recoverHandoffTail (codex PR3 iter-14 [P1]), kept injectable so the
-// recover-tail test stays deterministic (no real tmux send / marker FS).
-// Production: state.WriteCoordSpawnMarker + spawn.SendInitialPrompt (wait-for-
-// ready then type the prompt).
+// Seams for recoverHandoffTail / deliverRecoverResumePrompt, kept injectable so
+// the recover-tail tests stay deterministic (no real tmux send / marker FS).
 var (
-	recoverWriteMarkerFn = state.WriteCoordSpawnMarker
-	recoverSendPromptFn  = spawn.SendInitialPrompt
+	recoverWriteMarkerFn        = state.WriteCoordSpawnMarker
+	recoverWaitForReadyFn       = spawn.WaitForReadyToPrompt
+	recoverSessionAliveFn       = tmux.SessionAlive
+	recoverSendPromptVerifiedFn = spawn.SendPromptKeysVerified
 )
 
 // effectiveDisableAutoResume resolves the EFFECTIVE per-handoff auto-resume
@@ -256,36 +276,116 @@ func effectiveDisableAutoResume(req queue.SpawnFresh, cachedOld *agent.Record) b
 }
 
 // recoverHandoffTail runs the same post-spawn handoff TAIL the normal recovery
-// path runs (codex PR3 iter-14 [P1]). Without it the takeover-recovered
-// successor is INVISIBLE + INERT:
+// path runs, plus PR4's verified prompt-delivery semantics. Without it the
+// takeover-recovered successor is INVISIBLE + INERT:
 //   - the dead OLD's coord.Cleanup cleared the coord-spawn marker, so the TUI /
 //     `fleet attach` discovery (which reads the marker for the live coord's id)
 //     cannot find the replacement -> point the marker at the NEW agent;
 //   - a freshly-spawned coord does nothing until it is told to resume from the
-//     handoff doc -> type handoff.ResumePrompt(docPath) once its pane is ready
-//     (unless auto-resume is disabled for this record).
+//     handoff doc -> deliver handoff.ResumePrompt(docPath) once its pane is
+//     ready, with at-most-once retry handling.
 //
-// Both are best-effort with surfaced warnings (surface-don't-silo): the
-// successor is already live + leasing, so a marker/prompt hiccup degrades
-// discoverability, not correctness, and the operator gets a concrete recovery
-// command.
-func recoverHandoffTail(oldRec *agent.Record, newID, newSession, docPath string, disableAutoResume bool, stderr io.Writer) {
+// Marker repair is best-effort with surfaced warnings (surface-don't-silo). The
+// prompt delivery returns errors so the queue is preserved when the replacement
+// would otherwise be left idle.
+func recoverHandoffTail(oldRec *agent.Record, rec *agent.Record, docPath string, disableAutoResume bool,
+	stdout, stderr io.Writer) error {
 	if spawn.IsCoordSpawn(oldRec.TaskID, oldRec.Project) {
-		if werr := recoverWriteMarkerFn(oldRec.Project, newID); werr != nil {
+		if werr := recoverWriteMarkerFn(oldRec.Project, rec.ID); werr != nil {
 			_, _ = fmt.Fprintf(stderr,
 				"warning: coord-spawn marker for project %s -> %s failed after takeover recovery: %v "+
 					"(TUI may not discover the replacement; run `fleet rc up %s` to recover)\n",
-				oldRec.Project, newID, werr, oldRec.Project)
+				oldRec.Project, rec.ID, werr, oldRec.Project)
 		}
 	}
-	if !disableAutoResume && docPath != "" {
-		if perr := recoverSendPromptFn(newSession, handoff.ResumePrompt(docPath)); perr != nil {
-			_, _ = fmt.Fprintf(stderr,
-				"warning: send resume prompt to %s after takeover recovery: %v "+
-					"(the replacement is live but idle; attach and paste the handoff doc, or it self-resumes on next turn)\n",
-				newSession, perr)
+	return deliverRecoverResumePrompt(rec, docPath, disableAutoResume, stdout, stderr)
+}
+
+// deliverRecoverResumePrompt delivers the resume prompt to a recovered
+// successor so it READS the handoff doc and continues the in-flight work
+// (codex PR4 [P1]). The safety-net takeover path bypasses handoffop.Resume/
+// retireOldAgent, so without this the new coord would start blank.
+//
+// At-most-once + no-strand semantics (codex PR4 [P2]):
+//
+//   - AT-MOST-ONCE: a per-successor sentinel file
+//     (.locks/resume-prompt-sent-<newID>) is written BEFORE the send. On an
+//     adopt-retry (queue.Delete failed after a prior successful send) the
+//     sentinel short-circuits, so the same doc prompt is never re-submitted.
+//     This is the at-most-once marker the other handoff paths get from
+//     queue.Delete ordering; the recovery path can't reorder around
+//     queue.Delete (it runs in the caller), so it carries its own marker.
+//   - NO-STRAND on readiness timeout: WaitForReadyToPrompt failing does NOT
+//     hard-fail. If the tmux session is still alive, we WARN and send anyway
+//     (keys buffer in the pty until Claude is ready) — matching
+//     retireOldAgent. Only a DEAD session returns an error (queue preserved).
+//
+// Skips silently when the doc is empty or auto-resume is disabled (a
+// non-claude wrapper must not receive "Read your handoff doc..." as garbage).
+func deliverRecoverResumePrompt(rec *agent.Record, docPath string, disableAutoResume bool,
+	stdout, stderr io.Writer) error {
+	if docPath == "" || disableAutoResume {
+		return nil
+	}
+	sentinel, serr := resumePromptSentinelPath(rec.Project, rec.ID)
+	if serr == nil {
+		if _, statErr := os.Stat(sentinel); statErr == nil {
+			// Already delivered on a prior pass; do not re-send (at-most-once).
+			return nil
 		}
 	}
+	if werr := recoverWaitForReadyFn(rec.TmuxSession); werr != nil {
+		// Readiness poll didn't converge. If the session is DEAD, fail so the
+		// queue is preserved. If it is ALIVE (slow startup / onboarding
+		// screen / custom wrapper), warn and send anyway — the keys buffer.
+		alive, probeErr := recoverSessionAliveFn(rec.TmuxSession)
+		if !alive && probeErr == nil {
+			return fmt.Errorf(
+				"fleet drain: recovered successor %s session %s is dead; cannot deliver resume prompt "+
+					"(queue preserved for retry; doc: %s)", rec.ID, rec.TmuxSession, docPath)
+		}
+		_, _ = fmt.Fprintf(stderr,
+			"fleet drain: recovered successor %s not visibly ready (%v) but session alive; sending resume prompt anyway\n",
+			rec.ID, werr)
+	}
+	// Use the VERIFIED send (codex PR4 [P2]): SendPromptKeys returns nil even
+	// when the prompt is left sitting UNSUBMITTED in the input box (its
+	// contract is "attach anyway"). For an unattended recovery there is no
+	// operator to press Enter, so an unsubmitted prompt == not delivered.
+	submitted, serr := recoverSendPromptVerifiedFn(rec.TmuxSession, handoff.ResumePrompt(docPath))
+	if serr != nil {
+		return fmt.Errorf(
+			"fleet drain: resume prompt to recovered successor %s failed: %w "+
+				"(queue preserved for retry; doc: %s)", rec.ID, serr, docPath)
+	}
+	if !submitted {
+		// Reached tmux but the prompt didn't submit. Do NOT mark the sentinel
+		// and DO return an error so the queue is preserved — a later drain
+		// adopts the live successor and re-attempts delivery rather than
+		// leaving it idle.
+		return fmt.Errorf(
+			"fleet drain: resume prompt to recovered successor %s reached tmux but was not submitted "+
+				"(queue preserved for retry; doc: %s)", rec.ID, docPath)
+	}
+	// Mark AFTER a VERIFIED-SUBMITTED send (codex PR4 [P2]). The sentinel
+	// means "definitely delivered". A crash between this mark and
+	// queue.Delete would re-send on retry — a benign, idempotent duplicate
+	// ("read your doc and continue") — which is preferable to a silent strand.
+	if sentinel != "" {
+		_ = os.WriteFile(sentinel, []byte(docPath+"\n"), 0o644)
+	}
+	_, _ = fmt.Fprintf(stdout, "fleet drain: delivered resume prompt to recovered successor %s\n", rec.ID)
+	return nil
+}
+
+// resumePromptSentinelPath returns the at-most-once marker path for a
+// recovered successor's resume prompt, under the project's .locks/ dir.
+func resumePromptSentinelPath(project, newID string) (string, error) {
+	pdir, err := state.ProjectDir(project)
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(pdir, ".locks", "resume-prompt-sent-"+newID), nil
 }
 
 // drainOneLeaseAware is the production entry point for the bounded drain.
@@ -317,6 +417,38 @@ func drainOneLeaseAwareWith(req queue.SpawnFresh, path string, graceMillis, resu
 	epoch, hasEpoch := d.CurrentEpoch(project)
 	barrierUp := hasEpoch && d.BarrierExists(project, epoch)
 	leaderHealthy := d.LeaderPresent(project)
+
+	// BARE-COORD GUARD (codex PR4 [P1]) — runs BEFORE the barrier/leader
+	// branch decision. The OLD coord being drained may be a BARE
+	// (non-lease-wrapped, SupervisorPID==0) successor from an earlier legacy
+	// handoff; the project's stale epoch (and any leftover
+	// handoff-complete-<epoch>.json barrier) belongs to an OLDER, already-
+	// released coord generation, NOT to OLD. Routing such a handoff through
+	// the lease branches is wrong twice over:
+	//   - barrierUp -> drainGraceful -> drainReapOld REFUSES (OLD has no
+	//     supervisor identity to authenticate a kill) -> queue stranded forever;
+	//   - default  -> safety-net takeover acquires the orphan flock + spawns a
+	//     successor WITHOUT killing the live bare OLD -> TWO coordinators.
+	// A bare coord (SupervisorPID==0) holds NO lease and is NEVER the recorded
+	// lease owner (the owner is always a coord-run with a SupervisorPID). So a
+	// bare OLD's handoff must ALWAYS complete via the legacy coldResume (loads
+	// OLD by id, retires/kills it via Resume) — regardless of whether some
+	// OTHER coord-run currently holds the project lease (codex PR4 [P1]/[P2]).
+	// Routing it through the lease branches is wrong in every case:
+	//   - leaderHealthy (a different coord-run leads) -> drainLiveLeaderFallback
+	//     polls a barrier OLD will never write, then legacy-Resumes anyway
+	//     (best case) or spawns a duplicate;
+	//   - barrierUp on a stale epoch -> drainGraceful -> drainReapOld REFUSES
+	//     (no supervisor identity) -> queue stranded;
+	//   - default -> safety-net takeover acquires the orphan flock + RecoverSpawn
+	//     without killing the live bare OLD -> TWO coordinators.
+	if oldRec, lerr := d.LoadAgent(req.OldAgentID); lerr == nil &&
+		oldRec != nil && oldRec.SupervisorPID == 0 {
+		_, _ = fmt.Fprintf(stderr,
+			"fleet drain: %s is a bare (non-lease-wrapped) coord; completing via legacy resume "+
+				"(holds no lease — no takeover/graceful-reap/standby-wait)\n", req.OldAgentID)
+		return coldResume(req, path, graceMillis, resumeTimeoutMillis, stdout, stderr, d)
+	}
 
 	switch {
 	case barrierUp:
@@ -361,11 +493,13 @@ func drainOneLeaseAwareWith(req queue.SpawnFresh, path string, graceMillis, resu
 		return coldResume(req, path, graceMillis, resumeTimeoutMillis, stdout, stderr, d)
 
 	default:
-		// An epoch exists but the leader is NOT healthy (hung past TTL /
-		// stale) and NO barrier. Either OLD is mid-handoff (will write the
-		// barrier soon) OR HUNG before the barrier (the incident). Wait
-		// BOUNDED for the barrier; if it appears -> graceful finish; if the
-		// deadline passes -> ESCALATE to the safety-net takeover (never block).
+		// An epoch exists, the leader is NOT healthy (hung past TTL / stale)
+		// and NO barrier. The bare-coord case was already routed to legacy
+		// resume by the pre-switch guard, so OLD here is a LEASE-WRAPPED coord:
+		// either mid-handoff (will write the barrier soon) OR HUNG before the
+		// barrier (the incident). Wait BOUNDED for the barrier; if it appears
+		// -> graceful finish; if the deadline passes -> ESCALATE to the
+		// safety-net takeover (never block).
 		return drainWaitBarrierOrEscalate(req, path, deadline, graceMillis, resumeTimeoutMillis, stdout, stderr, d)
 	}
 }
@@ -834,14 +968,29 @@ func drainLiveLeaderFallback(req queue.SpawnFresh, path string, deadline time.Ti
 	// OLD still present and still the leader -> complete the handoff the proven
 	// way. Delegate to the LEGACY drain (LockAgent + handoffop.Resume), which
 	// is byte-identical to the flag-off path: it spawns + retires the
-	// successor exactly as production does today. The successor is therefore
-	// NOT lease-wrapped here — that is the same PR2-documented gap that exists
-	// flag-off, NOT a regression this PR introduces. The lease-correct
-	// successor transfer is the warm-standby flow (GracefulHandoff spawns a
-	// `coord-run --standby` successor that polls + acquires after OLD exits);
-	// its TRIGGER wiring + the flag flip are PR4. So under failover a live
-	// coord handoff completes via the proven legacy flow until PR4 routes it
-	// through the standby producer (codex PR3 iter-5 [P1]).
+	// successor exactly as production does today.
+	//
+	// SCOPE NOTE (codex PR4 [P1], accepted limitation): the successor spawned
+	// here is NOT lease-wrapped — it is the legacy `claude` shape. Under the
+	// PR4 flag flip (failover default ON) that means a live `fleet handoff`
+	// completed via THIS fallback yields a successor that coordinates but does
+	// not hold/heartbeat the coordinator lease. This is SAFE, not a
+	// correctness break: the successor's `/coordinator` tick reads "no healthy
+	// active owner" (OLD released the lease on retire) and PROCEEDS (the
+	// lease-check's no-lease-in-play branch) — identical to flag-off behavior.
+	// What is lost is lease HA (heartbeat + STONITH) on that one successor
+	// until it itself hands off through the warm-standby path. The
+	// lease-PRESERVING transfer is GracefulHandoff (the OLD coord spawns its
+	// own `coord-run --standby` successor that polls + acquires + receives the
+	// resume prompt post-acquire after OLD exits). Wiring GracefulHandoff's
+	// TRIGGER into the producer — and the standby's post-acquire prompt
+	// delivery — is the remaining PR3-completion follow-up, deliberately NOT
+	// bolted onto spawnAndRetire here (a standby successor cannot receive the
+	// resume prompt through the spawn-then-retire send path, so doing so would
+	// strand the successor idle — a worse failure than the bare-but-functional
+	// successor). Tracked as a follow-up; this fallback stays the proven
+	// legacy completion so no live handoff regresses on activation.
+	//
 	// coldResume runs d.Resume (production: handoffop.Resume) under d.LockAgent
 	// (production: state.LockAgent) — byte-equivalent to drainOneLegacy.
 	_, _ = fmt.Fprintf(stderr,

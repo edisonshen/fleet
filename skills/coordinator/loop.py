@@ -273,6 +273,40 @@ def tick(
                 f"{rec_error}; allowing tick (legacy/upgrade path)\n"
             )
 
+    # 0.5. Parent-lease ownership proof (DESIGN-handoff-drain-storm-leak
+    # PR4). Under FLEET_LEASE_FAILOVER the Go `fleet coord-run` supervisor
+    # that PARENTS this tick holds coordinator.flock + heartbeats the
+    # coordinator.epoch fencing record. If a candidate fenced our parent
+    # (bumped the epoch), every disk-mutating thing this tick does would be
+    # a ZOMBIE write that corrupts the new leader's state — so we must be
+    # FENCED the same way the Go *WithLease APIs are, not merely backed off.
+    #
+    # We route the proof through `fleet lease-check --project <p>`, which
+    # re-reads coordinator.epoch in Go and confirms the active lease owner
+    # is an ANCESTOR of this process (epoch + pid + pid_start, PID-reuse
+    # safe). Exit 3 = definitively fenced/not-owner → abort the tick WITHOUT
+    # writing and self-demote. Exit 0 = proven owner (or failover off — a
+    # no-op success) → proceed. An inconclusive result (binary missing /
+    # internal error / timeout) is surfaced but does NOT abort: a legacy
+    # install without the new subcommand, or a transient fault, must not
+    # wedge a healthy coord — the coordinator.lock + project-ownership guard
+    # remain the defense for those. (A coordinator.lock acquire FAILURE is
+    # still never read as "my parent holds it" — that is step 1's job.)
+    proof = _lease_check_fn(project, home=home, fleet_bin=fleet_bin)
+    if proof == "fenced":
+        msg = (
+            f"[coord] lease fenced: agent {coord_id or '?'} for project "
+            f"{project!r} is no longer under the active coordinator lease "
+            f"owner — a successor took over. Self-demoting (this tick wrote "
+            f"nothing). Run `fleet doctor` if no successor is serving."
+        )
+        sys.stderr.write(msg + "\n")
+        result.errors.append(msg)
+        result.skipped = True
+        result.self_exit = True
+        result.reason = "lease-fenced-self-exit"
+        return result
+
     # 1. NB-flock coordinator.lock (PLAN §6 lock acquisition).
     project_dir = home / "projects" / project
     locks_dir = project_dir / ".locks"
@@ -404,6 +438,30 @@ def tick(
         configured = _load_parallelism(project_dir)
         if configured > 0:
             cap = configured
+    # RE-FENCE before the mutation phase (codex PR4 [P1]). The step-0.5 proof
+    # ran before _try_lock + the repo-resolve shellout, which take real
+    # wall-clock time; a successor could fence this coord in that window. The
+    # Python mutations inside _tick_locked do NOT individually go through the
+    # Go GuardWithLease boundary, so re-proving ownership here — after the lock
+    # is held, immediately before _tick_locked — narrows the zombie-write
+    # window from the whole tick to just the lock/resolve steps. A fence now
+    # aborts WITHOUT entering the mutation phase; the coord self-demotes.
+    if _lease_check_fn(project, home=home, fleet_bin=fleet_bin) == "fenced":
+        msg = (
+            f"[coord] lease fenced after lock acquire: agent {coord_id or '?'} "
+            f"for {project!r} lost the lease before mutating; self-demoting "
+            f"(tick wrote nothing). Run `fleet doctor` if no successor serves."
+        )
+        sys.stderr.write(msg + "\n")
+        result.errors.append(msg)
+        result.skipped = True
+        result.self_exit = True
+        result.reason = "lease-fenced-self-exit"
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        finally:
+            os.close(lock_fd)
+        return result
     try:
         return _tick_locked(
             result, project, project_dir, coord_id, cwd, cap,
@@ -2610,6 +2668,125 @@ def _resolve_home(fleet_home: str | None) -> Path:
     if env:
         return Path(env)
     return Path(os.path.expanduser("~/.fleet"))
+
+
+# `fleet lease-check`'s dedicated "not the lease owner" exit code (mirrors
+# cmd/fleet/lease_check.go::leaseCheckNotOwnerExit). Distinct from 1
+# (usage/internal) so the tick can tell a definitive fence from an
+# inconclusive error.
+_LEASE_CHECK_NOT_OWNER_EXIT = 3
+_LEASE_CHECK_TIMEOUT_S = 5.0
+
+
+def _lease_failover_enabled() -> bool:
+    """Mirror coordlock.FailoverEnabled's tri-state gate (PR4 default ON):
+    enabled unless FLEET_LEASE_FAILOVER is EXPLICITLY one of 0/false/off/no
+    (case-insensitive). Unset/empty/anything-else → ON. Kept consistent
+    with internal/coordlock.parseFailover + the Go mirrors."""
+    return (os.environ.get("FLEET_LEASE_FAILOVER", "") or "").strip().lower() \
+        not in ("0", "false", "off", "no")
+
+
+def _lease_check_unknown_command(stderr_text: str) -> bool:
+    """True if a `fleet lease-check` exit-1 was an UNKNOWN-COMMAND error (the
+    installed binary is too old to have the subcommand) rather than a genuine
+    internal error. cobra emits 'unknown command "lease-check"' on an
+    unrecognized subcommand. Distinguishing the two lets an internal error
+    fail CLOSED (fence) while a too-old binary fails OPEN (don't wedge a
+    pre-lease coord). Matches loop.py + handoff.py identically."""
+    low = stderr_text.lower()
+    return "unknown command" in low or "unknown subcommand" in low
+
+
+def _prove_parent_lease_ownership(
+    project: str, *, home: Path, fleet_bin: str = "fleet",
+) -> str:
+    """Prove this tick descends from the active coordinator lease owner.
+
+    Routes through `fleet lease-check --project <p>` so the epoch re-read +
+    ancestor proof happen in Go (one source of truth). Returns one of:
+
+      "owner"   — proven owner, OR failover disabled (no lease in play).
+                  The tick may mutate.
+      "fenced"  — the Go check returned exit 3: definitively NOT the owner
+                  (a successor took over). The tick MUST abort + self-demote.
+      "unknown" — the binary is missing / errored / timed out. Surfaced to
+                  stderr but treated as non-fatal: a legacy install or a
+                  transient fault must not wedge a healthy coord (the
+                  coordinator.lock + #171 guard remain the defense).
+
+    When failover is OFF this returns "owner" without shelling out — the
+    legacy bare-child path has no lease, so there is nothing to fence.
+    """
+    if not _lease_failover_enabled():
+        return "owner"
+    # Resolve the binary the SAME way the producer/kick paths do: prefer the
+    # FLEET_BIN the spawn stamped into the coord's env over a bare `fleet` on
+    # PATH (codex PR4 [P2]). main() calls tick() without fleet_bin, so without
+    # this a PATH pointing at an OLD install lacking `lease-check` would make
+    # the proof "unknown" (fail-open) and let a fenced coord keep mutating —
+    # defeating the fence. The stamped FLEET_BIN is the binary that actually
+    # supports lease-check. Only override the default sentinel "fleet"; an
+    # explicit test/caller fleet_bin still wins.
+    bin_path = fleet_bin
+    if bin_path == "fleet":
+        bin_path = os.environ.get("FLEET_BIN", "") or "fleet"
+    env = dict(os.environ)
+    env["FLEET_HOME"] = str(home)
+    try:
+        proc = subprocess.run(
+            [bin_path, "lease-check", "--project", project],
+            capture_output=True, text=True,
+            timeout=_LEASE_CHECK_TIMEOUT_S, check=False, env=env,
+        )
+    except subprocess.TimeoutExpired:
+        sys.stderr.write(
+            f"[coord] lease-check for {project!r} timed out "
+            f"(>{_LEASE_CHECK_TIMEOUT_S}s); proceeding without the proof\n"
+        )
+        return "unknown"
+    except OSError:
+        # OSError covers FileNotFoundError (no `fleet` on PATH) AND a
+        # non-executable / permission-denied FLEET_BIN (codex PR4 [P2]).
+        # Lease-check unavailable -> inconclusive; don't wedge the tick (the
+        # coordinator.lock + #171 guard remain the defense).
+        return "unknown"
+    if proc.returncode == 0:
+        return "owner"
+    if proc.returncode == _LEASE_CHECK_NOT_OWNER_EXIT:
+        return "fenced"
+    # Any OTHER non-zero is exit 1. Two sub-cases (codex PR4 [P1]):
+    #
+    #   - The binary is too OLD to have the `lease-check` subcommand (a skill
+    #     loaded from a newer repo than the installed `fleet`). cobra prints
+    #     "unknown command" and exits 1. There is no lease machinery in that
+    #     binary either, so fail-OPEN (don't wedge a pre-lease coord).
+    #   - The subcommand RAN and hit an internal error (e.g. a corrupt/
+    #     unreadable coordinator.epoch). Per the CLI contract this means
+    #     "cannot prove ownership" -> fail-CLOSED (FENCE). Failing open here
+    #     would let a coord that cannot prove ownership keep mutating —
+    #     reopening the zombie-write path the fence exists to close.
+    detail = (proc.stderr or proc.stdout or "").strip()
+    if _lease_check_unknown_command(detail):
+        sys.stderr.write(
+            f"[coord] lease-check unsupported by this fleet binary for {project!r} "
+            f"(too old?); proceeding without the proof\n"
+        )
+        return "unknown"
+    sys.stderr.write(
+        f"[coord] lease-check for {project!r} could not prove ownership "
+        f"(exit {proc.returncode}): {detail}; FENCING (cannot prove ownership)\n"
+    )
+    return "fenced"
+
+
+# _lease_check_fn is the injectable seam tick() calls for the parent-lease
+# ownership proof. Production = _prove_parent_lease_ownership (shells out to
+# `fleet lease-check`). Tests substitute a deterministic stub (see
+# conftest._stub_lease_check) so the suite never shells out for the proof;
+# a test exercising the fence overrides it to return "fenced". Mirrors the
+# _resolve_repo_fn seam pattern.
+_lease_check_fn = _prove_parent_lease_ownership
 
 
 # ---------- coord state ----------

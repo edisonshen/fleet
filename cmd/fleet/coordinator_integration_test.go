@@ -313,6 +313,14 @@ print(json.dumps({
 		// loop and the test wedges until FLEET_COORD_POLL_MAX_S
 		// (default 4 h) elapses.
 		"FLEET_COORD_POLL_INTERVAL_S=0",
+		// DESIGN-handoff-drain-storm-leak PR4 flipped FLEET_LEASE_FAILOVER
+		// default ON, so loop.tick proves parent-lease ownership via
+		// `fleet lease-check`. These tests drive a BARE tick (no
+		// `fleet coord-run` lease supervisor parent) against a sandbox with
+		// NO lease record — the proof correctly reads "no lease in play" and
+		// PROCEEDS (codex PR4 [P1]: a no-lease / legacy tick must not
+		// self-fence). We intentionally leave the flag at its new default so
+		// this suite exercises the activated path, not a pinned legacy one.
 	)
 	// Postmortem 2026-05-14 (orphan tmux leak): the python3 driver's
 	// `loop.tick` shells out to `fleet dispatch`, which calls

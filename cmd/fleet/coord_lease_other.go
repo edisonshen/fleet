@@ -40,3 +40,11 @@ func leaseDisabledOrUnsupported(err error) bool {
 // lease primitive — the lease never runs here, so spawn never wraps a
 // coord-run and never consults this.
 func coordLeaderCheck(string) bool { return false }
+
+// leaseFailoverEnabled is the non-linux/darwin stub. The lease primitive is
+// unsupported here (coordlock is build-tagged linux||darwin), so failover is
+// always OFF regardless of FLEET_LEASE_FAILOVER — `fleet lease-check` is a
+// no-op success and the legacy bare-child path always runs. The
+// linux||darwin definition lives in coord_lease_unix.go (delegates to
+// coordlock.FailoverEnabled).
+func leaseFailoverEnabled() bool { return false }

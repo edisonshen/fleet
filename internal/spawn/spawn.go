@@ -183,14 +183,20 @@ var propagatedRuntimeEnv = []string{
 	"FLEET_LEASE_FAILOVER",
 }
 
-// leaseFailoverEnabled mirrors coordlock's failover gate (kept here to
-// avoid importing coordlock just for the predicate; coordlock keeps its
-// own copy unexported). Any non-empty, non-"0"/"false" value enables it.
-// DESIGN-handoff-drain-storm-leak PR2.
-func leaseFailoverEnabled() bool {
-	v := os.Getenv("FLEET_LEASE_FAILOVER")
-	return v != "" && v != "0" && v != "false"
-}
+// leaseFailoverEnabled gates whether Spawn wraps a coord in the
+// `fleet coord-run` lease supervisor. It is build-tagged:
+//
+//   - linux||darwin (spawn_lease_unix.go): mirror coordlock.FailoverEnabled's
+//     tri-state (PR4 default ON; 0/false/off/no disables).
+//   - other GOOS (spawn_lease_other.go): ALWAYS false — the lease primitive
+//     (coordlock) is unsupported there, and the cmd-side coord-run stub
+//     promises the legacy bare-child path, so Spawn must NOT lease-wrap
+//     (codex PR4 [P2]).
+//
+// Splitting by build tag keeps the all-platform spawn.go free of a hard
+// coordlock import (which would break non-unix builds) while preventing the
+// default-ON flag from wrapping coords on a platform where the supervisor
+// can't actually hold a lease.
 
 // shouldLeaseWrap decides whether this spawn wraps the coord in the
 // `fleet coord-run` lease supervisor (DESIGN-handoff-drain-storm-leak

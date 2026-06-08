@@ -411,6 +411,52 @@ func TestDrainLease_TakeoverRecovery_HonorsQueueAutoResumeOverride(t *testing.T)
 	}
 }
 
+// codex PR4 [P1]: draining a BARE (non-lease-wrapped, SupervisorPID==0)
+// coord whose stale epoch belongs to an OLDER released generation must route
+// through the legacy Resume (kills OLD by id), NOT the safety-net takeover +
+// RecoverSpawn (which would acquire the orphan flock and spawn a SECOND
+// coordinator while the live bare OLD keeps running).
+func TestDrainLease_BareCoordRoutesToLegacyResume_NoDuplicate(t *testing.T) {
+	var resumed, recovered, tookOver int32
+	out := &bytes.Buffer{}
+	bareRec := agent.New("barecoord")
+	bareRec.Project = "projects-fleet"
+	bareRec.TaskID = "coord"
+	// SupervisorPID intentionally 0 -> bare coord (never coord-run-wrapped).
+	d := drainLeaseDeps{
+		LeaderPresent: func(string) bool { return false }, // released epoch, no healthy leader
+		CurrentEpoch:  func(string) (int64, bool) { return 9, true },
+		BarrierExists: func(string, int64) bool { return false },
+		LoadAgent:     func(string) (*agent.Record, error) { return bareRec, nil },
+		LockAgent:     func(string) (func(), error) { return func() {}, nil },
+		Resume: func(queue.SpawnFresh, string, int, io.Writer, io.Writer) error {
+			atomic.AddInt32(&resumed, 1)
+			return nil
+		},
+		TakeOver: func(string, string) (bool, error) {
+			atomic.AddInt32(&tookOver, 1)
+			return true, nil
+		},
+		RecoverSpawn: func(*agent.Record, string, string, bool, io.Writer, io.Writer) error {
+			atomic.AddInt32(&recovered, 1)
+			return nil
+		},
+		BarrierPoll: time.Millisecond,
+	}
+	if err := drainOneLeaseAwareWith(leaseDrainReq(), existingQueuePath(t), 0, 10, out, out, d); err != nil {
+		t.Fatalf("bare-coord drain returned %v, want nil (legacy resume)", err)
+	}
+	if atomic.LoadInt32(&resumed) != 1 {
+		t.Errorf("legacy Resume ran %d times, want 1 (bare coord must drain via Resume)", resumed)
+	}
+	if atomic.LoadInt32(&tookOver) != 0 {
+		t.Errorf("TakeOver ran %d times, want 0 (no takeover for a bare coord)", tookOver)
+	}
+	if atomic.LoadInt32(&recovered) != 0 {
+		t.Errorf("RecoverSpawn ran %d times, want 0 (no duplicate successor)", recovered)
+	}
+}
+
 // T42: the graceful kill routes through KillCoordIfIdentityMatches. A refusal
 // (e.g. PID reuse / start-time mismatch) is surfaced; the drain does not
 // claim success and does not delete the queue.
@@ -949,12 +995,30 @@ func TestRecoverHandoffTail_WritesMarkerAndSendsPrompt(t *testing.T) {
 	oldRec.TaskID = "coord-projects-fleet" // IsCoordSpawn requires "coord-<project>"
 
 	var gotMarkerProj, gotMarkerID, gotSession, gotPrompt string
-	origMarker, origPrompt := recoverWriteMarkerFn, recoverSendPromptFn
-	t.Cleanup(func() { recoverWriteMarkerFn, recoverSendPromptFn = origMarker, origPrompt })
+	origMarker := recoverWriteMarkerFn
+	origReady := recoverWaitForReadyFn
+	origAlive := recoverSessionAliveFn
+	origPrompt := recoverSendPromptVerifiedFn
+	t.Cleanup(func() {
+		recoverWriteMarkerFn = origMarker
+		recoverWaitForReadyFn = origReady
+		recoverSessionAliveFn = origAlive
+		recoverSendPromptVerifiedFn = origPrompt
+	})
 	recoverWriteMarkerFn = func(project, id string) error { gotMarkerProj, gotMarkerID = project, id; return nil }
-	recoverSendPromptFn = func(session, prompt string) error { gotSession, gotPrompt = session, prompt; return nil }
+	recoverWaitForReadyFn = func(string) error { return nil }
+	recoverSessionAliveFn = func(string) (bool, error) { return true, nil }
+	recoverSendPromptVerifiedFn = func(session, prompt string) (bool, error) {
+		gotSession, gotPrompt = session, prompt
+		return true, nil
+	}
 
-	recoverHandoffTail(oldRec, "newcoord9", "fleet-newcoord9", "/tmp/handoff.md", false, &bytes.Buffer{})
+	rec := agent.New("newcoord9")
+	rec.Project = "projects-fleet"
+	rec.TmuxSession = "fleet-newcoord9"
+	if err := recoverHandoffTail(oldRec, rec, "/tmp/handoff.md", false, &bytes.Buffer{}, &bytes.Buffer{}); err != nil {
+		t.Fatalf("recoverHandoffTail returned %v", err)
+	}
 
 	if gotMarkerProj != "projects-fleet" || gotMarkerID != "newcoord9" {
 		t.Errorf("coord-spawn marker = (%q,%q), want (projects-fleet,newcoord9) — TUI cannot discover the replacement without it",
@@ -975,13 +1039,31 @@ func TestRecoverHandoffTail_DisableAutoResume_NoPromptStillMarks(t *testing.T) {
 	oldRec.TaskID = "coord-projects-fleet"
 
 	var markerWritten, promptSent bool
-	origMarker, origPrompt := recoverWriteMarkerFn, recoverSendPromptFn
-	t.Cleanup(func() { recoverWriteMarkerFn, recoverSendPromptFn = origMarker, origPrompt })
+	origMarker := recoverWriteMarkerFn
+	origReady := recoverWaitForReadyFn
+	origAlive := recoverSessionAliveFn
+	origPrompt := recoverSendPromptVerifiedFn
+	t.Cleanup(func() {
+		recoverWriteMarkerFn = origMarker
+		recoverWaitForReadyFn = origReady
+		recoverSessionAliveFn = origAlive
+		recoverSendPromptVerifiedFn = origPrompt
+	})
 	recoverWriteMarkerFn = func(string, string) error { markerWritten = true; return nil }
-	recoverSendPromptFn = func(string, string) error { promptSent = true; return nil }
+	recoverWaitForReadyFn = func(string) error { return nil }
+	recoverSessionAliveFn = func(string) (bool, error) { return true, nil }
+	recoverSendPromptVerifiedFn = func(string, string) (bool, error) {
+		promptSent = true
+		return true, nil
+	}
 
 	// disableAutoResume=true (the EFFECTIVE policy, e.g. from a queue override).
-	recoverHandoffTail(oldRec, "newcoord9", "fleet-newcoord9", "/tmp/handoff.md", true, &bytes.Buffer{})
+	rec := agent.New("newcoord9")
+	rec.Project = "projects-fleet"
+	rec.TmuxSession = "fleet-newcoord9"
+	if err := recoverHandoffTail(oldRec, rec, "/tmp/handoff.md", true, &bytes.Buffer{}, &bytes.Buffer{}); err != nil {
+		t.Fatalf("recoverHandoffTail returned %v", err)
+	}
 
 	if !markerWritten {
 		t.Error("marker must be written even when auto-resume is disabled (discovery is independent of resume)")

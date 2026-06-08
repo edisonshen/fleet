@@ -40,6 +40,21 @@ func pidStartNanos(pid int) (int64, error) {
 	return tv.Nano(), nil
 }
 
+// ppidOf returns the parent pid of pid via KERN_PROC_PID's
+// kp_eproc.e_ppid. Used by the skill-side ownership proof to walk the
+// getppid chain and confirm the lease owner is an ancestor of the calling
+// tick. Returns (0,false) if the pid is gone / unreadable.
+func ppidOf(pid int) (int, bool) {
+	if pid <= 0 {
+		return 0, false
+	}
+	kp, err := unix.SysctlKinfoProc("kern.proc.pid", pid)
+	if err != nil {
+		return 0, false
+	}
+	return int(kp.Eproc.Ppid), true
+}
+
 // monotonicNanos returns raw CLOCK_MONOTONIC nanoseconds. The value is
 // meaningful only as a difference (elapsed), never as an absolute time.
 // It does not move when the wall clock is stepped by NTP/admin, so the
