@@ -594,14 +594,29 @@ func drainLiveLeaderFallback(req queue.SpawnFresh, path string, deadline time.Ti
 	// OLD still present and still the leader -> complete the handoff the proven
 	// way. Delegate to the LEGACY drain (LockAgent + handoffop.Resume), which
 	// is byte-identical to the flag-off path: it spawns + retires the
-	// successor exactly as production does today. The successor is therefore
-	// NOT lease-wrapped here — that is the same PR2-documented gap that exists
-	// flag-off, NOT a regression this PR introduces. The lease-correct
-	// successor transfer is the warm-standby flow (GracefulHandoff spawns a
-	// `coord-run --standby` successor that polls + acquires after OLD exits);
-	// its TRIGGER wiring + the flag flip are PR4. So under failover a live
-	// coord handoff completes via the proven legacy flow until PR4 routes it
-	// through the standby producer (codex PR3 iter-5 [P1]).
+	// successor exactly as production does today.
+	//
+	// SCOPE NOTE (codex PR4 [P1], accepted limitation): the successor spawned
+	// here is NOT lease-wrapped — it is the legacy `claude` shape. Under the
+	// PR4 flag flip (failover default ON) that means a live `fleet handoff`
+	// completed via THIS fallback yields a successor that coordinates but does
+	// not hold/heartbeat the coordinator lease. This is SAFE, not a
+	// correctness break: the successor's `/coordinator` tick reads "no healthy
+	// active owner" (OLD released the lease on retire) and PROCEEDS (the
+	// lease-check's no-lease-in-play branch) — identical to flag-off behavior.
+	// What is lost is lease HA (heartbeat + STONITH) on that one successor
+	// until it itself hands off through the warm-standby path. The
+	// lease-PRESERVING transfer is GracefulHandoff (the OLD coord spawns its
+	// own `coord-run --standby` successor that polls + acquires + receives the
+	// resume prompt post-acquire after OLD exits). Wiring GracefulHandoff's
+	// TRIGGER into the producer — and the standby's post-acquire prompt
+	// delivery — is the remaining PR3-completion follow-up, deliberately NOT
+	// bolted onto spawnAndRetire here (a standby successor cannot receive the
+	// resume prompt through the spawn-then-retire send path, so doing so would
+	// strand the successor idle — a worse failure than the bare-but-functional
+	// successor). Tracked as a follow-up; this fallback stays the proven
+	// legacy completion so no live handoff regresses on activation.
+	//
 	// coldResume runs d.Resume (production: handoffop.Resume) under d.LockAgent
 	// (production: state.LockAgent) — byte-equivalent to drainOneLegacy.
 	_, _ = fmt.Fprintf(stderr,

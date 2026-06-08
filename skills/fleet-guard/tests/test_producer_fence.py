@@ -41,9 +41,10 @@ def fleet_home_tmp(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     return home
 
 
-def _record(agent_id: str = "abc12345", project: str = "myproj") -> dict[str, Any]:
+def _record(agent_id: str = "abc12345", project: str = "myproj",
+            task_id: str = "coord-myproj") -> dict[str, Any]:
     return {
-        "id": agent_id, "task_id": "demo-task", "project": project,
+        "id": agent_id, "task_id": task_id, "project": project,
         "handoff_number": 1, "last_handoff_path": None,
     }
 
@@ -87,6 +88,31 @@ def test_unfenced_producer_proceeds(
     ok = handoff._do_handoff(_record(), "fleet-abc12345", handoff.TYPE_AUTO_YELLOW, 55.0)
     assert ok is True
     assert wrote.get("doc") == "/tmp/doc.md", "an un-fenced producer must write the doc"
+
+
+# codex PR4 [P1]: the fence applies to COORD producers ONLY. A worker pane
+# is not a descendant of the coord-run supervisor, so lease-check would
+# return exit 3 against the coord lease — but a worker doesn't hold that
+# lease and must NOT be fenced by it (that would drop the worker's handoff).
+def test_worker_handoff_not_fenced_by_coord_lease(
+    fleet_home_tmp: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _stub_collectors(monkeypatch)
+    # _producer_fenced would say True (a worker fails the coord ancestry
+    # proof) — but a WORKER record (task_id != coord-*) must skip the fence.
+    fenced_calls = []
+    monkeypatch.setattr(handoff, "_producer_fenced",
+                        lambda p: fenced_calls.append(p) or True)
+    wrote = {}
+    monkeypatch.setattr(handoff, "write_doc",
+                        lambda **k: wrote.setdefault("doc", "/w") or "/w")
+    monkeypatch.setattr(handoff, "write_queue", lambda **k: True)
+
+    worker = _record(agent_id="w0000001", task_id="some-worker-task")
+    ok = handoff._do_handoff(worker, "fleet-w0000001", handoff.TYPE_AUTO_YELLOW, 55.0)
+    assert ok is True, "a worker handoff must NOT be refused by the coord lease fence"
+    assert wrote.get("doc") == "/w", "worker handoff must write its doc"
+    assert fenced_calls == [], "the coord fence must not even be consulted for a worker"
 
 
 # ---------- (b) back-off ----------

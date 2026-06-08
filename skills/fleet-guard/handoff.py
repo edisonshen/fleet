@@ -505,16 +505,26 @@ def _do_handoff(record: dict[str, Any], session: str,
     prev_path: str | None = prev_raw if isinstance(prev_raw, str) and prev_raw else None
 
     # (a) FENCE (correctness — DESIGN-handoff-drain-storm-leak PR4 item 10a).
-    # Under FLEET_LEASE_FAILOVER, a coord that was FENCED (a successor took
+    # Under FLEET_LEASE_FAILOVER, a COORD that was FENCED (a successor took
     # over its lease) must NOT write a handoff doc / enqueue — that would be
     # a zombie producer write the new leader's state would have to reconcile.
     # Prove parent-lease ownership exactly as the supervisor tick does
     # (via `fleet lease-check`); a fenced producer is REFUSED, not merely
     # backed off. Returning False here makes the caller clear the pending
     # mark and the (dead) coord stops trying.
-    if _producer_fenced(project):
+    #
+    # The fence applies to COORD producers ONLY (codex PR4 [P1]). A worker
+    # pane is NOT a descendant of the project's `coord-run` supervisor, so
+    # `fleet lease-check --project <p>` would return exit 3 (the coord lease
+    # owner is not the worker's ancestor) while a perfectly healthy coord
+    # lease exists — refusing a legitimate WORKER handoff and dropping its
+    # context. Workers don't hold the coord lease and can't be fenced by it.
+    # Coord identity convention: task_id == "coord-<project>" (mirrors
+    # internal/tui.coordTaskID and _COORD_TASK_ID_PREFIX below).
+    is_coord = task_id.startswith(_COORD_TASK_ID_PREFIX)
+    if is_coord and _producer_fenced(project):
         print(
-            f"fleet-guard: handoff producer for agent {agent_id} "
+            f"fleet-guard: handoff producer for coord agent {agent_id} "
             f"(project {project!r}) is FENCED — a successor coord holds the "
             f"lease; refusing to write a zombie handoff doc/queue",
             file=sys.stderr,
