@@ -225,3 +225,67 @@ func TestLockProjectWorktreeGC_DifferentProjectsDoNotBlock(t *testing.T) {
 		t.Error("different projects should not contend on worktree-gc lock")
 	}
 }
+
+// codex iter-11 [P2]: LockAgent must SERIALIZE (block-then-acquire) a
+// contended same-agent op for the full handoff window, not fast-fail —
+// the handoff Resume holds it across a slow spawn-and-wait. We hold the
+// lock from a separate fd, confirm a LockAgent waiter is blocked, then
+// release and confirm it acquires (within the generous agentLockTimeout).
+func TestLockAgent_SerializesNotFastFail(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("FLEET_HOME", tmp)
+	if _, err := Bootstrap(); err != nil {
+		t.Fatal(err)
+	}
+
+	path, err := AgentLockPath("deadbeef")
+	if err != nil {
+		t.Fatalf("AgentLockPath: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	holder, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o644)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = holder.Close() }()
+	if err := syscall.Flock(int(holder.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		t.Fatalf("flock holder: %v", err)
+	}
+
+	var acquired atomic.Bool
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		release, lerr := LockAgent("deadbeef")
+		if lerr != nil {
+			t.Errorf("LockAgent should serialize (block) then acquire, not fail: %v", lerr)
+			return
+		}
+		acquired.Store(true)
+		release()
+	}()
+
+	// Confirm the waiter is blocked (NOT fast-failing).
+	time.Sleep(150 * time.Millisecond)
+	if acquired.Load() {
+		t.Fatal("LockAgent should block while the holder owns the lock")
+	}
+
+	// Release the holder; the waiter must acquire shortly after.
+	if err := syscall.Flock(int(holder.Fd()), syscall.LOCK_UN); err != nil {
+		t.Fatalf("unlock holder: %v", err)
+	}
+	done := make(chan struct{})
+	go func() { wg.Wait(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Error("LockAgent should have acquired after the holder released")
+	}
+	if !acquired.Load() {
+		t.Error("LockAgent did not record acquisition after release")
+	}
+}
