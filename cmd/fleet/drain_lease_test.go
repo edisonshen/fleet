@@ -257,7 +257,7 @@ func TestDrainLease_NoBarrierNoGracefulKill_Escalates(t *testing.T) {
 			atomic.AddInt32(&tookOver, 1)
 			return true, nil
 		},
-		RecoverSpawn: func(oldRec *agent.Record, _, preAllocatedID string, _, _ io.Writer) error {
+		RecoverSpawn: func(oldRec *agent.Record, _, preAllocatedID string, _ bool, _, _ io.Writer) error {
 			atomic.AddInt32(&recovered, 1)
 			recoveredFromOld = oldRec
 			recoveredID = preAllocatedID
@@ -311,7 +311,7 @@ func TestDrainLease_ConcurrentRecovery_NoDuplicate(t *testing.T) {
 		BarrierExists: func(string, int64) bool { return false },
 		LoadAgent:     func(string) (*agent.Record, error) { return oldCoordRec(), nil },
 		TakeOver:      func(string, string) (bool, error) { atomic.AddInt32(&tookOver, 1); return true, nil },
-		RecoverSpawn: func(*agent.Record, string, string, io.Writer, io.Writer) error {
+		RecoverSpawn: func(*agent.Record, string, string, bool, io.Writer, io.Writer) error {
 			atomic.AddInt32(&recovered, 1)
 			return nil
 		},
@@ -345,7 +345,7 @@ func TestDrainLease_HungOldEscalatesToTakeOver(t *testing.T) {
 			tookOverProject = project
 			return true, nil // takeover acquired -> OLD confirmed gone
 		},
-		RecoverSpawn: func(*agent.Record, string, string, io.Writer, io.Writer) error {
+		RecoverSpawn: func(*agent.Record, string, string, bool, io.Writer, io.Writer) error {
 			atomic.AddInt32(&recovered, 1)
 			return nil
 		},
@@ -369,6 +369,45 @@ func TestDrainLease_HungOldEscalatesToTakeOver(t *testing.T) {
 	}
 	if atomic.LoadInt32(&recovered) != 1 {
 		t.Errorf("RecoverSpawn ran %d times after takeover, want 1 (no coordless project)", recovered)
+	}
+}
+
+// codex PR3 iter-14 [P2]: the queue's DisableAutoResume override must reach
+// RecoverSpawn on the takeover-recovery path (so `fleet handoff --no-auto-resume`
+// is honored on an escalated drain, not silently overridden by OLD's baseline).
+func TestDrainLease_TakeoverRecovery_HonorsQueueAutoResumeOverride(t *testing.T) {
+	out := &bytes.Buffer{}
+	var gotDisable bool
+	var recovered int32
+	disable := true // queue override: --no-auto-resume
+	req := leaseDrainReq()
+	req.DisableAutoResume = &disable
+	d := drainLeaseDeps{
+		LeaderPresent: func(string) bool { return false },
+		CurrentEpoch:  func(string) (int64, bool) { return 9, true },
+		BarrierExists: func(string, int64) bool { return false },
+		LoadAgent: func(string) (*agent.Record, error) {
+			r := oldCoordRec()
+			r.DisableAutoResume = false // baseline DIFFERS from the override
+			return r, nil
+		},
+		TakeOver: func(string, string) (bool, error) { return true, nil },
+		RecoverSpawn: func(_ *agent.Record, _, _ string, disableAutoResume bool, _, _ io.Writer) error {
+			gotDisable = disableAutoResume
+			atomic.AddInt32(&recovered, 1)
+			return nil
+		},
+		LockAgent:   func(string) (func(), error) { return func() {}, nil },
+		BarrierPoll: time.Millisecond,
+	}
+	if err := drainOneLeaseAwareWith(req, existingQueuePath(t), 0, 5, out, out, d); !errors.Is(err, ErrEscalatedToTakeOver) {
+		t.Fatalf("expected escalation, got %v", err)
+	}
+	if atomic.LoadInt32(&recovered) != 1 {
+		t.Fatalf("RecoverSpawn ran %d times, want 1", recovered)
+	}
+	if !gotDisable {
+		t.Error("RecoverSpawn received disableAutoResume=false, want true (queue --no-auto-resume override ignored)")
 	}
 }
 
@@ -532,7 +571,7 @@ func TestDrainLease_GracefulOldReleasedNoSuccessor_Escalates(t *testing.T) {
 		LoadAgent: func(string) (*agent.Record, error) { return oldCoordRec(), nil },
 		KillCoord: func(coord.KillTarget) error { atomic.AddInt32(&killed, 1); return nil },
 		TakeOver:  func(string, string) (bool, error) { atomic.AddInt32(&tookOver, 1); return true, nil },
-		RecoverSpawn: func(*agent.Record, string, string, io.Writer, io.Writer) error {
+		RecoverSpawn: func(*agent.Record, string, string, bool, io.Writer, io.Writer) error {
 			atomic.AddInt32(&recovered, 1)
 			return nil
 		},
@@ -575,7 +614,7 @@ func TestDrainLease_GracefulSuccessorCrashedAfterEpoch_Escalates(t *testing.T) {
 		LeaderPresent: func(string) bool { return false }, // no HEALTHY leader heartbeating
 		LoadAgent:     func(string) (*agent.Record, error) { return oldCoordRec(), nil },
 		TakeOver:      func(string, string) (bool, error) { atomic.AddInt32(&tookOver, 1); return true, nil },
-		RecoverSpawn: func(*agent.Record, string, string, io.Writer, io.Writer) error {
+		RecoverSpawn: func(*agent.Record, string, string, bool, io.Writer, io.Writer) error {
 			atomic.AddInt32(&recovered, 1)
 			return nil
 		},
@@ -615,7 +654,7 @@ func TestDrainLease_GracefulOldHoldsLeasePastBudget_Escalates(t *testing.T) {
 		},
 		LoadAgent: func(string) (*agent.Record, error) { return oldCoordRec(), nil },
 		TakeOver:  func(string, string) (bool, error) { atomic.AddInt32(&tookOver, 1); return true, nil },
-		RecoverSpawn: func(*agent.Record, string, string, io.Writer, io.Writer) error {
+		RecoverSpawn: func(*agent.Record, string, string, bool, io.Writer, io.Writer) error {
 			atomic.AddInt32(&recovered, 1)
 			return nil
 		},
@@ -647,7 +686,7 @@ func TestDrainLease_TakeoverNotAcquired_NoRecoverSpawn(t *testing.T) {
 		BarrierExists: func(string, int64) bool { return false },
 		LoadAgent:     func(string) (*agent.Record, error) { return oldCoordRec(), nil },
 		TakeOver:      func(string, string) (bool, error) { return false, nil }, // did NOT acquire
-		RecoverSpawn: func(*agent.Record, string, string, io.Writer, io.Writer) error {
+		RecoverSpawn: func(*agent.Record, string, string, bool, io.Writer, io.Writer) error {
 			atomic.AddInt32(&recovered, 1)
 			return nil
 		},
@@ -867,7 +906,7 @@ func TestDrainLease_TakeoverDoesNotHoldLockAcrossKill(t *testing.T) {
 			close(siblingGotLock)
 			return true, nil // takeover acquired -> OLD confirmed gone
 		},
-		RecoverSpawn: func(*agent.Record, string, string, io.Writer, io.Writer) error {
+		RecoverSpawn: func(*agent.Record, string, string, bool, io.Writer, io.Writer) error {
 			atomic.AddInt32(&recovered, 1)
 			return nil
 		},
@@ -915,7 +954,7 @@ func TestRecoverHandoffTail_WritesMarkerAndSendsPrompt(t *testing.T) {
 	recoverWriteMarkerFn = func(project, id string) error { gotMarkerProj, gotMarkerID = project, id; return nil }
 	recoverSendPromptFn = func(session, prompt string) error { gotSession, gotPrompt = session, prompt; return nil }
 
-	recoverHandoffTail(oldRec, "newcoord9", "fleet-newcoord9", "/tmp/handoff.md", &bytes.Buffer{})
+	recoverHandoffTail(oldRec, "newcoord9", "fleet-newcoord9", "/tmp/handoff.md", false, &bytes.Buffer{})
 
 	if gotMarkerProj != "projects-fleet" || gotMarkerID != "newcoord9" {
 		t.Errorf("coord-spawn marker = (%q,%q), want (projects-fleet,newcoord9) — TUI cannot discover the replacement without it",
@@ -934,7 +973,6 @@ func TestRecoverHandoffTail_WritesMarkerAndSendsPrompt(t *testing.T) {
 func TestRecoverHandoffTail_DisableAutoResume_NoPromptStillMarks(t *testing.T) {
 	oldRec := oldCoordRec()
 	oldRec.TaskID = "coord-projects-fleet"
-	oldRec.DisableAutoResume = true
 
 	var markerWritten, promptSent bool
 	origMarker, origPrompt := recoverWriteMarkerFn, recoverSendPromptFn
@@ -942,7 +980,8 @@ func TestRecoverHandoffTail_DisableAutoResume_NoPromptStillMarks(t *testing.T) {
 	recoverWriteMarkerFn = func(string, string) error { markerWritten = true; return nil }
 	recoverSendPromptFn = func(string, string) error { promptSent = true; return nil }
 
-	recoverHandoffTail(oldRec, "newcoord9", "fleet-newcoord9", "/tmp/handoff.md", &bytes.Buffer{})
+	// disableAutoResume=true (the EFFECTIVE policy, e.g. from a queue override).
+	recoverHandoffTail(oldRec, "newcoord9", "fleet-newcoord9", "/tmp/handoff.md", true, &bytes.Buffer{})
 
 	if !markerWritten {
 		t.Error("marker must be written even when auto-resume is disabled (discovery is independent of resume)")

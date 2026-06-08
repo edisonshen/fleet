@@ -112,8 +112,11 @@ type drainLeaseDeps struct {
 	// (req.NewAgentID) so journal/doc/remote-control setup keyed to it still
 	// correlates to the live replacement (codex PR3 iter-10 [P2]); empty means
 	// generate a fresh id. nil OldRec means "could not cache OLD" -> the seam
-	// surfaces a recovery instruction instead of spawning blind.
-	RecoverSpawn func(oldRec *agent.Record, docPath, preAllocatedID string, stdout, stderr io.Writer) error
+	// surfaces a recovery instruction instead of spawning blind. disableAutoResume
+	// is the EFFECTIVE per-handoff policy (the queue's DisableAutoResume override
+	// resolved against OLD's baseline — codex PR3 iter-14 [P2]); it gates both the
+	// spawn record's policy and whether recoverHandoffTail types the resume prompt.
+	RecoverSpawn func(oldRec *agent.Record, docPath, preAllocatedID string, disableAutoResume bool, stdout, stderr io.Writer) error
 	// BarrierPoll is the interval between barrier-existence checks while
 	// waiting (bounded) for a graceful handoff to complete. 0 = default.
 	BarrierPoll time.Duration
@@ -180,7 +183,7 @@ func defaultDrainLeaseDeps() drainLeaseDeps {
 // coord's stale stored Cwd. Surface-don't-silo on any gap: a missing record /
 // unresolvable repo prints a concrete recovery command rather than spawning
 // blind.
-func productionRecoverSpawn(oldRec *agent.Record, docPath, preAllocatedID string, stdout, stderr io.Writer) error {
+func productionRecoverSpawn(oldRec *agent.Record, docPath, preAllocatedID string, disableAutoResume bool, stdout, stderr io.Writer) error {
 	if oldRec == nil {
 		_, _ = fmt.Fprintf(stderr,
 			"fleet drain: takeover reaped the hung coord but its record could not be cached; "+
@@ -199,11 +202,15 @@ func productionRecoverSpawn(oldRec *agent.Record, docPath, preAllocatedID string
 		spawnCwd = resolved
 	}
 	rec, err := spawn.Spawn(spawn.Options{
-		OldRecord:         oldRec,
-		NewDocPath:        docPath,
-		Cwd:               spawnCwd,
-		Command:           oldRec.Command,
-		DisableAutoResume: oldRec.DisableAutoResume,
+		OldRecord:  oldRec,
+		NewDocPath: docPath,
+		Cwd:        spawnCwd,
+		Command:    oldRec.Command,
+		// EFFECTIVE per-handoff policy (queue override resolved against OLD's
+		// baseline by the caller), NOT oldRec's baseline — honors
+		// `fleet handoff --no-auto-resume` / `--auto-resume` on the escalated
+		// recovery path the same way handoffop.Resume does (codex PR3 iter-14 [P2]).
+		DisableAutoResume: disableAutoResume,
 		// Reuse the queue's pre-allocated successor id so any handoff
 		// journal/doc/remote-control setup keyed to it correlates to the live
 		// replacement (codex PR3 iter-10 [P2]). Empty -> spawn.Spawn allocates.
@@ -219,7 +226,7 @@ func productionRecoverSpawn(oldRec *agent.Record, docPath, preAllocatedID string
 	}
 	_, _ = fmt.Fprintf(stdout,
 		"fleet drain: cold-spawned lease-wrapped successor %s for %s after takeover\n", rec.ID, oldRec.Project)
-	recoverHandoffTail(oldRec, rec.ID, rec.TmuxSession, docPath, stderr)
+	recoverHandoffTail(oldRec, rec.ID, rec.TmuxSession, docPath, disableAutoResume, stderr)
 	return nil
 }
 
@@ -231,6 +238,22 @@ var (
 	recoverWriteMarkerFn = state.WriteCoordSpawnMarker
 	recoverSendPromptFn  = spawn.SendInitialPrompt
 )
+
+// effectiveDisableAutoResume resolves the EFFECTIVE per-handoff auto-resume
+// policy the same way handoffop.Resume does (codex PR3 iter-14 [P2]): the
+// queue's DisableAutoResume *bool override wins when set; otherwise fall back to
+// OLD's baseline DisableAutoResume. A nil cachedOld (record could not be cached)
+// falls back to the override or false. Honors `fleet handoff --no-auto-resume` /
+// `--auto-resume` on the escalated takeover-recovery path.
+func effectiveDisableAutoResume(req queue.SpawnFresh, cachedOld *agent.Record) bool {
+	if req.DisableAutoResume != nil {
+		return *req.DisableAutoResume
+	}
+	if cachedOld != nil {
+		return cachedOld.DisableAutoResume
+	}
+	return false
+}
 
 // recoverHandoffTail runs the same post-spawn handoff TAIL the normal recovery
 // path runs (codex PR3 iter-14 [P1]). Without it the takeover-recovered
@@ -246,7 +269,7 @@ var (
 // successor is already live + leasing, so a marker/prompt hiccup degrades
 // discoverability, not correctness, and the operator gets a concrete recovery
 // command.
-func recoverHandoffTail(oldRec *agent.Record, newID, newSession, docPath string, stderr io.Writer) {
+func recoverHandoffTail(oldRec *agent.Record, newID, newSession, docPath string, disableAutoResume bool, stderr io.Writer) {
 	if spawn.IsCoordSpawn(oldRec.TaskID, oldRec.Project) {
 		if werr := recoverWriteMarkerFn(oldRec.Project, newID); werr != nil {
 			_, _ = fmt.Fprintf(stderr,
@@ -255,7 +278,7 @@ func recoverHandoffTail(oldRec *agent.Record, newID, newSession, docPath string,
 				oldRec.Project, newID, werr, oldRec.Project)
 		}
 	}
-	if !oldRec.DisableAutoResume && docPath != "" {
+	if !disableAutoResume && docPath != "" {
 		if perr := recoverSendPromptFn(newSession, handoff.ResumePrompt(docPath)); perr != nil {
 			_, _ = fmt.Fprintf(stderr,
 				"warning: send resume prompt to %s after takeover recovery: %v "+
@@ -727,7 +750,7 @@ func takeoverAndRecover(req queue.SpawnFresh, path string, cachedOld *agent.Reco
 	// handoff successor that never acquires the lease.
 	_, _ = fmt.Fprintf(stderr,
 		"fleet drain: takeover fenced/killed the hung coord for %s; recovering a lease-wrapped successor\n", project)
-	if err := d.RecoverSpawn(cachedOld, req.HandoffDoc, req.NewAgentID, stdout, stderr); err != nil {
+	if err := d.RecoverSpawn(cachedOld, req.HandoffDoc, req.NewAgentID, effectiveDisableAutoResume(req, cachedOld), stdout, stderr); err != nil {
 		// Surface the recovery-spawn failure but keep the escalation semantics:
 		// the takeover succeeded (OLD reaped). Leave the queue in place so the
 		// dead-coord recovery path (next dispatch / TUI [a]) retries against
