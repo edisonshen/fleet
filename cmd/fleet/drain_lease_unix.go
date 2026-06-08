@@ -360,6 +360,32 @@ func drainOneLeaseAwareWith(req queue.SpawnFresh, path string, graceMillis, resu
 	barrierUp := hasEpoch && d.BarrierExists(project, epoch)
 	leaderHealthy := d.LeaderPresent(project)
 
+	// BARE-COORD GUARD (codex PR4 [P1]) — runs BEFORE the barrier/leader
+	// branch decision. The OLD coord being drained may be a BARE
+	// (non-lease-wrapped, SupervisorPID==0) successor from an earlier legacy
+	// handoff; the project's stale epoch (and any leftover
+	// handoff-complete-<epoch>.json barrier) belongs to an OLDER, already-
+	// released coord generation, NOT to OLD. Routing such a handoff through
+	// the lease branches is wrong twice over:
+	//   - barrierUp -> drainGraceful -> drainReapOld REFUSES (OLD has no
+	//     supervisor identity to authenticate a kill) -> queue stranded forever;
+	//   - default  -> safety-net takeover acquires the orphan flock + spawns a
+	//     successor WITHOUT killing the live bare OLD -> TWO coordinators.
+	// A bare coord holds no lease, so its handoff always completes via the
+	// legacy coldResume (loads OLD by id, retires/kills it via Resume). Only
+	// when OLD is the CURRENT healthy lease owner do we skip this (it is a
+	// genuine lease-wrapped coord mid-self-handoff, e.g. a standby already
+	// acquired and re-stamped — let the lease branches handle it).
+	if !leaderHealthy {
+		if oldRec, lerr := d.LoadAgent(req.OldAgentID); lerr == nil &&
+			oldRec != nil && oldRec.SupervisorPID == 0 {
+			_, _ = fmt.Fprintf(stderr,
+				"fleet drain: %s is a bare (non-lease-wrapped) coord; completing via legacy resume "+
+					"(no takeover/graceful-reap — its epoch belongs to an older generation)\n", req.OldAgentID)
+			return coldResume(req, path, graceMillis, resumeTimeoutMillis, stdout, stderr, d)
+		}
+	}
+
 	switch {
 	case barrierUp:
 		// Graceful path: the OLD coord wrote the completion barrier — doc +
@@ -403,31 +429,13 @@ func drainOneLeaseAwareWith(req queue.SpawnFresh, path string, graceMillis, resu
 		return coldResume(req, path, graceMillis, resumeTimeoutMillis, stdout, stderr, d)
 
 	default:
-		// An epoch exists but the leader is NOT healthy (hung past TTL /
-		// stale / released) and NO barrier.
-		//
-		// BARE-COORD GUARD (codex PR4 [P1]): the OLD coord being drained may
-		// be a BARE (non-lease-wrapped) successor from an earlier legacy
-		// handoff — its record has no SupervisorPID, and the stale epoch
-		// belongs to an OLDER, already-released coord generation (a different
-		// agent), NOT to OLD. The safety-net takeover would fence + acquire
-		// that orphaned free flock and RecoverSpawn a successor WITHOUT
-		// killing the still-live BARE OLD coord — producing TWO coordinators.
-		// So when OLD is bare, route through the legacy coldResume, which
-		// loads OLD by id and retires/kills it via Resume (no duplicate).
-		// Only a LEASE-WRAPPED OLD (SupervisorPID set) — the genuine
-		// hung-before-barrier incident — takes the takeover path.
-		if oldRec, lerr := d.LoadAgent(req.OldAgentID); lerr == nil &&
-			oldRec != nil && oldRec.SupervisorPID == 0 {
-			_, _ = fmt.Fprintf(stderr,
-				"fleet drain: %s is a bare (non-lease-wrapped) coord; completing via legacy resume "+
-					"(no takeover — its stale epoch belongs to an older generation)\n", req.OldAgentID)
-			return coldResume(req, path, graceMillis, resumeTimeoutMillis, stdout, stderr, d)
-		}
-		// Either OLD is mid-handoff (will write the barrier soon) OR HUNG
-		// before the barrier (the incident). Wait BOUNDED for the barrier; if
-		// it appears -> graceful finish; if the deadline passes -> ESCALATE to
-		// the safety-net takeover (never block).
+		// An epoch exists, the leader is NOT healthy (hung past TTL / stale)
+		// and NO barrier. The bare-coord case was already routed to legacy
+		// resume by the pre-switch guard, so OLD here is a LEASE-WRAPPED coord:
+		// either mid-handoff (will write the barrier soon) OR HUNG before the
+		// barrier (the incident). Wait BOUNDED for the barrier; if it appears
+		// -> graceful finish; if the deadline passes -> ESCALATE to the
+		// safety-net takeover (never block).
 		return drainWaitBarrierOrEscalate(req, path, deadline, graceMillis, resumeTimeoutMillis, stdout, stderr, d)
 	}
 }

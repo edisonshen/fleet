@@ -417,6 +417,33 @@ func TestT27_FutureEpochCheckpointQuarantined(t *testing.T) {
 	}
 }
 
+// codex PR4 [P2]: a STALE reader (token epoch < live lease) must NOT
+// quarantine a future-epoch checkpoint — that would delete the real
+// successor's good state. It refuses with ErrLeaseLost and leaves the file.
+func TestReadCheckpoint_StaleReaderDoesNotQuarantineFutureEpoch(t *testing.T) {
+	setupHome(t)
+	const project = "rainier"
+	// staleToken: token@5, on-disk lease@6 (StillOwned false).
+	tok := staleToken(t, project, 5, 6)
+	live, _, _ := checkpointPaths(tok)
+	// The real successor (epoch 6) wrote a valid checkpoint.
+	good := encodeCheckpoint([]byte("SUCCESSOR-STATE"), 6)
+	if err := os.WriteFile(live, good, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	_, q, err := ReadCheckpoint(tok) // tok.Epoch=5 -> sees epoch 6 as "future"
+	if !errors.Is(err, ErrLeaseLost) {
+		t.Fatalf("a stale reader must refuse with ErrLeaseLost, got %v", err)
+	}
+	if len(q) != 0 {
+		t.Fatalf("a stale reader must NOT quarantine, got %v", q)
+	}
+	// The successor's checkpoint is untouched on disk.
+	if _, serr := os.Stat(live); serr != nil {
+		t.Fatalf("the successor's checkpoint must remain: %v", serr)
+	}
+}
+
 func TestReadCheckpoint_NoCheckpointYet(t *testing.T) {
 	setupHome(t)
 	tok := ownerToken(t, "rainier", 1)

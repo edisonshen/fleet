@@ -416,10 +416,26 @@ func ReadCheckpoint(tok LeaseToken) (payload []byte, quarantined []string, err e
 		return pl, nil, nil
 	case errors.Is(derr, os.ErrNotExist):
 		// No live file — fall through to .prev.
-	case errors.Is(derr, ErrCheckpointTorn), errors.Is(derr, ErrCheckpointFutureEpoch),
-		errors.Is(derr, errCheckpointNoTrailerYet):
-		// Quarantine the poisoned live file so it can never be read again,
-		// then fall back to .prev (the pg_rewind clean-stop lesson).
+	case errors.Is(derr, ErrCheckpointFutureEpoch):
+		// A checkpoint stamped NEWER than our token's epoch. Two readings:
+		//   - WE are the valid owner and a zombie wrote it -> quarantine it.
+		//   - WE are a fenced/stale reader and a real SUCCESSOR wrote a valid
+		//     newer checkpoint -> quarantining it would DELETE the new
+		//     leader's good state (codex PR4 [P2]). Re-check ownership: if we
+		//     no longer own the lease, REFUSE (we are the zombie reader, not
+		//     the checkpoint) — never touch the successor's file.
+		if !tok.StillOwned() {
+			return nil, nil, ErrLeaseLost
+		}
+		q, qerr := quarantineFile(dir, live, derr)
+		if qerr != nil {
+			return nil, nil, fmt.Errorf("coordlock.ReadCheckpoint: quarantine future-epoch live: %w", qerr)
+		}
+		quarantined = append(quarantined, q)
+	case errors.Is(derr, ErrCheckpointTorn), errors.Is(derr, errCheckpointNoTrailerYet):
+		// A torn (bad len/CRC/trailer) file is garbage regardless of who
+		// reads it — safe to quarantine + fall back to .prev (pg_rewind
+		// clean-stop lesson).
 		q, qerr := quarantineFile(dir, live, derr)
 		if qerr != nil {
 			return nil, nil, fmt.Errorf("coordlock.ReadCheckpoint: quarantine torn live: %w", qerr)
@@ -436,8 +452,18 @@ func ReadCheckpoint(tok LeaseToken) (payload []byte, quarantined []string, err e
 		return pl2, quarantined, nil
 	case errors.Is(derr2, os.ErrNotExist):
 		return nil, quarantined, ErrNoCleanCheckpoint
-	case errors.Is(derr2, ErrCheckpointTorn), errors.Is(derr2, ErrCheckpointFutureEpoch),
-		errors.Is(derr2, errCheckpointNoTrailerYet):
+	case errors.Is(derr2, ErrCheckpointFutureEpoch):
+		// Same stale-reader guard as the live branch (codex PR4 [P2]).
+		if !tok.StillOwned() {
+			return nil, quarantined, ErrLeaseLost
+		}
+		q, qerr := quarantineFile(dir, prev, derr2)
+		if qerr != nil {
+			return nil, quarantined, fmt.Errorf("coordlock.ReadCheckpoint: quarantine future-epoch prev: %w", qerr)
+		}
+		quarantined = append(quarantined, q)
+		return nil, quarantined, ErrNoCleanCheckpoint
+	case errors.Is(derr2, ErrCheckpointTorn), errors.Is(derr2, errCheckpointNoTrailerYet):
 		q, qerr := quarantineFile(dir, prev, derr2)
 		if qerr != nil {
 			return nil, quarantined, fmt.Errorf("coordlock.ReadCheckpoint: quarantine torn prev: %w", qerr)
@@ -711,7 +737,14 @@ func writeBytesAtomicFsyncGated(path string, b []byte, beforeCommit func() error
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return fmt.Errorf("mkdir: %w", err)
 	}
-	tmp := path + ".tmp"
+	// UNIQUE temp per writer (codex PR4 [P2]). This helper holds NO lock
+	// across the I/O, so a stale and a current writer can race the same
+	// target. A FIXED ".tmp" name would let a stale writer's cleanup (os.Remove
+	// on a lost-lease beforeCommit) delete the bytes the new leader is mid-
+	// writing, or two writers clobber one tmp. A pid+nanos suffix isolates
+	// each writer's tmp; only the winning Rename publishes. Mirrors
+	// state.WriteAtomic's ".tmp.<pid>" pattern.
+	tmp := fmt.Sprintf("%s.tmp.%d.%d", path, os.Getpid(), time.Now().UnixNano())
 	f, err := os.OpenFile(tmp, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o644)
 	if err != nil {
 		return fmt.Errorf("open tmp: %w", err)
