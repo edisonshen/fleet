@@ -375,10 +375,21 @@ func drainGraceful(req queue.SpawnFresh, path string, epoch int64, deadline time
 			"fleet drain: %s wrote the barrier and is still the active leader; waiting for its self-release\n",
 			oldRec.ID)
 		for {
-			if op, ok := d.ActiveOwnerPID(req.Project); !ok || op != oldRec.SupervisorPID {
-				// OLD released (or a takeover advanced past it). The standby
-				// acquires the freed flock; the handoff is complete. Clean up.
-				_, _ = fmt.Fprintf(stdout, "fleet drain: %s released the lease; handoff complete\n", oldRec.ID)
+			// Completion requires a CONFIRMED SUCCESSOR owner, not merely OLD's
+			// absence (codex PR3 iter-14 [P1]): if the standby crashed / never
+			// acquired, ActiveOwnerPID returns !ok — deleting the queue there
+			// strands the project coordless with the only recovery request gone.
+			//   - ok && op != OLD  -> a successor acquired the freed flock; the
+			//     handoff is genuinely complete -> clean the queue.
+			//   - !ok (no owner)   -> OLD released but NO successor took over;
+			//     keep waiting (the standby may still be mid-acquire). On the
+			//     deadline we fall through to the takeover+recover escalation,
+			//     which brings up a successor — never leaving the project
+			//     coordless with the queue deleted.
+			if op, ok := d.ActiveOwnerPID(req.Project); ok && op != oldRec.SupervisorPID {
+				_, _ = fmt.Fprintf(stdout,
+					"fleet drain: %s released the lease and successor pid %d acquired it; handoff complete\n",
+					oldRec.ID, op)
 				return queue.Delete(path)
 			}
 			if !time.Now().Before(deadline) {
@@ -392,10 +403,13 @@ func drainGraceful(req queue.SpawnFresh, path string, epoch int64, deadline time
 				time.Sleep(wait)
 			}
 		}
-		// OLD held the lease past the budget despite writing the barrier —
-		// treat as hung; escalate to the safety-net takeover + lease-wrapped
-		// recovery (checks the takeover actually fenced+killed OLD before
-		// spawning a successor — codex PR3 iter-9 [P1]). Never block.
+		// Either OLD held the lease past the budget (wedged after writing the
+		// barrier) OR OLD released but no successor ever acquired (the standby
+		// crashed / never came up) — both leave the project without a confirmed
+		// leader. Escalate to the safety-net takeover + lease-wrapped recovery
+		// (checks the takeover actually fenced+killed OLD before spawning a
+		// successor — codex PR3 iter-9 [P1]; brings up a successor so the project
+		// is never coordless — codex PR3 iter-14 [P1]). Never block.
 		_, _ = fmt.Fprintf(stderr,
 			"fleet drain: %s did not release the lease after writing the barrier within the budget; escalating to takeover\n",
 			oldRec.ID)

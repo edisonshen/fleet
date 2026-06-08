@@ -400,7 +400,10 @@ func TestDrainLease_GracefulOldAlreadyArchived(t *testing.T) {
 func TestDrainLease_GracefulWaitsForSelfRelease(t *testing.T) {
 	out := &bytes.Buffer{}
 	var killed, tookOver int32
-	// OLD is the active owner for the first two reads, then releases.
+	// OLD is the active owner for the first two reads, then a SUCCESSOR (a
+	// DIFFERENT pid) acquires the freed flock. Completion requires a confirmed
+	// successor owner, not merely OLD's absence (codex PR3 iter-14 [P1]).
+	const successorPid = 555555
 	var reads int32
 	d := drainLeaseDeps{
 		CurrentEpoch:  func(string) (int64, bool) { return 5, true },
@@ -409,7 +412,7 @@ func TestDrainLease_GracefulWaitsForSelfRelease(t *testing.T) {
 			if atomic.AddInt32(&reads, 1) <= 2 {
 				return 424242, true // OLD still leader
 			}
-			return 0, false // OLD released
+			return successorPid, true // standby acquired the freed lease
 		},
 		LoadAgent:   func(string) (*agent.Record, error) { return oldCoordRec(), nil },
 		KillCoord:   func(coord.KillTarget) error { atomic.AddInt32(&killed, 1); return nil },
@@ -424,10 +427,51 @@ func TestDrainLease_GracefulWaitsForSelfRelease(t *testing.T) {
 		t.Errorf("force-killed the active leader %d times — must wait for self-release", killed)
 	}
 	if atomic.LoadInt32(&tookOver) != 0 {
-		t.Errorf("escalated to takeover %d times — OLD released cleanly, no escalation needed", tookOver)
+		t.Errorf("escalated to takeover %d times — successor acquired cleanly, no escalation needed", tookOver)
 	}
-	if !strings.Contains(out.String(), "released the lease") {
-		t.Errorf("expected self-release completion message, got: %q", out.String())
+	if !strings.Contains(out.String(), "successor pid 555555 acquired") {
+		t.Errorf("expected confirmed-successor completion message, got: %q", out.String())
+	}
+}
+
+// codex PR3 iter-14 [P1]: OLD releases the lease but NO successor ever acquires
+// (the standby crashed / never came up) — ActiveOwnerPID returns !ok. The drain
+// must NOT treat that as completion (deleting the queue would strand the project
+// coordless); it waits to the budget then ESCALATES to takeover+recover so a
+// successor is brought up.
+func TestDrainLease_GracefulOldReleasedNoSuccessor_Escalates(t *testing.T) {
+	out := &bytes.Buffer{}
+	var killed, tookOver, recovered int32
+	var reads int32
+	d := drainLeaseDeps{
+		CurrentEpoch:  func(string) (int64, bool) { return 5, true },
+		BarrierExists: func(string, int64) bool { return true },
+		ActiveOwnerPID: func(string) (int, bool) {
+			if atomic.AddInt32(&reads, 1) == 1 {
+				return 424242, true // OLD still leader -> enters the self-release wait
+			}
+			return 0, false // OLD released but NO successor acquired
+		},
+		LoadAgent: func(string) (*agent.Record, error) { return oldCoordRec(), nil },
+		KillCoord: func(coord.KillTarget) error { atomic.AddInt32(&killed, 1); return nil },
+		TakeOver:  func(string, string) (bool, error) { atomic.AddInt32(&tookOver, 1); return true, nil },
+		RecoverSpawn: func(*agent.Record, string, string, io.Writer, io.Writer) error {
+			atomic.AddInt32(&recovered, 1)
+			return nil
+		},
+		LockAgent:   func(string) (func(), error) { return func() {}, nil },
+		BarrierPoll: time.Millisecond,
+	}
+	qp := existingQueuePath(t)
+	err := drainOneLeaseAwareWith(leaseDrainReq(), qp, 0, 5, out, out, d)
+	if !errors.Is(err, ErrEscalatedToTakeOver) {
+		t.Fatalf("no-successor self-release must escalate; got %v", err)
+	}
+	if atomic.LoadInt32(&tookOver) != 1 {
+		t.Errorf("TakeOver ran %d times, want 1 (no successor -> must escalate, not declare done)", tookOver)
+	}
+	if atomic.LoadInt32(&recovered) != 1 {
+		t.Errorf("RecoverSpawn ran %d times, want 1 (project must not be left coordless)", recovered)
 	}
 }
 
@@ -576,12 +620,14 @@ func TestDrainLease_GracefulPath_HoldsNoPerAgentLock(t *testing.T) {
 		BarrierExists: func(string, int64) bool { return true },
 		ActiveOwnerPID: func(string) (int, bool) {
 			// First read: OLD still leader (enters the self-release wait, during
-			// which we probe the sibling lock). Then OLD releases.
+			// which we probe the sibling lock). Then a SUCCESSOR (different pid)
+			// acquires the freed lease -> graceful completion, lock-free (codex
+			// PR3 iter-14 [P1]: completion needs a confirmed successor, not !ok).
 			if atomic.AddInt32(&reads, 1) == 1 {
 				close(probed)
 				return 424242, true
 			}
-			return 0, false
+			return 555555, true
 		},
 		LoadAgent:   func(string) (*agent.Record, error) { return oldCoordRec(), nil },
 		BarrierPoll: 50 * time.Millisecond,
