@@ -371,19 +371,24 @@ func WriteCheckpoint(tok LeaseToken, payload []byte) error {
 		}
 	}
 	blob := encodeCheckpoint(payload, tok.Epoch)
-	// RE-FENCE immediately before the commit (codex PR4 [P1]). The .prev roll
-	// + encode above take wall-clock time; a candidate could fence us in that
-	// window. A zombie's checkpoint is stamped with its STALE epoch, which is
-	// <= the successor's epoch, so ReadCheckpoint would NOT quarantine it
-	// (only future-epoch is quarantined) — the successor would trust the
-	// zombie's rolled-back state. Re-checking ownership right before the
-	// atomic rename closes that hole to the minimum window. (The render-then-
-	// rename of writeBytesAtomicFsync is itself atomic; the only TOCTOU is
-	// here, and it is now as tight as a no-lock-across-IO design allows.)
-	if !tok.StillOwned() {
+	// RE-FENCE at the COMMIT POINT, not before the I/O (codex PR4 [P1]). The
+	// gated write runs StillOwned() AFTER the tmp file is written+fsynced and
+	// IMMEDIATELY before the rename — the only instant the new bytes become
+	// visible. A zombie's checkpoint carries its STALE epoch (<= successor's),
+	// which ReadCheckpoint would NOT quarantine (only future-epoch is), so a
+	// late publish would roll the successor's state back. Gating the rename
+	// itself closes that window to the minimum a no-lock-across-IO design
+	// allows. On a lost lease the tmp is discarded and nothing is published.
+	werr := writeBytesAtomicFsyncGated(live, blob, func() error {
+		if !tok.StillOwned() {
+			return ErrLeaseLost
+		}
+		return nil
+	})
+	if errors.Is(werr, ErrLeaseLost) {
 		return ErrLeaseLost
 	}
-	if werr := writeBytesAtomicFsync(live, blob); werr != nil {
+	if werr != nil {
 		return fmt.Errorf("coordlock.WriteCheckpoint: %w", werr)
 	}
 	return nil
@@ -689,6 +694,20 @@ func writeJSONAtomicFsync(path string, v any) error {
 }
 
 func writeBytesAtomicFsync(path string, b []byte) error {
+	return writeBytesAtomicFsyncGated(path, b, nil)
+}
+
+// writeBytesAtomicFsyncGated is writeBytesAtomicFsync with an optional
+// beforeCommit hook that runs AFTER the tmp file is written+fsynced but
+// IMMEDIATELY BEFORE the rename (the commit point). If beforeCommit returns
+// an error, the tmp is removed and the live file is left untouched — nothing
+// is published. This is the tightest possible just-in-time fence for a
+// lease-gated atomic write (codex PR4 [P1]): the rename is the only moment
+// the new bytes become visible, so re-validating ownership right before it
+// closes the check-to-commit window that a check-before-all-the-IO leaves
+// open. No lock is held across the I/O (design constraint); the hook is a
+// fast epoch re-read.
+func writeBytesAtomicFsyncGated(path string, b []byte, beforeCommit func() error) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return fmt.Errorf("mkdir: %w", err)
 	}
@@ -710,6 +729,13 @@ func writeBytesAtomicFsync(path string, b []byte) error {
 	if cerr := f.Close(); cerr != nil {
 		_ = os.Remove(tmp)
 		return fmt.Errorf("close tmp: %w", cerr)
+	}
+	// Just-in-time gate: the LAST thing before the bytes become visible.
+	if beforeCommit != nil {
+		if gerr := beforeCommit(); gerr != nil {
+			_ = os.Remove(tmp)
+			return gerr
+		}
 	}
 	if rerr := os.Rename(tmp, path); rerr != nil {
 		_ = os.Remove(tmp)

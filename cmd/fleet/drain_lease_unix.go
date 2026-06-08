@@ -290,22 +290,20 @@ func deliverRecoverResumePrompt(rec *agent.Record, docPath string, disableAutoRe
 			"fleet drain: recovered successor %s not visibly ready (%v) but session alive; sending resume prompt anyway\n",
 			rec.ID, werr)
 	}
-	// Mark BEFORE the send so a crash AFTER a successful send but before
-	// queue.Delete can't cause a re-send on retry (at-most-once). On a send
-	// FAILURE we REMOVE the sentinel (codex PR4 [P2]): otherwise the retry
-	// would see the marker, skip delivery, report success, let the queue be
-	// deleted, and strand the successor after a transient tmux/send-keys
-	// blip. So the marker only persists when delivery actually succeeded.
-	if sentinel != "" {
-		_ = os.WriteFile(sentinel, []byte(docPath+"\n"), 0o644)
-	}
 	if serr := spawn.SendPromptKeys(rec.TmuxSession, handoff.ResumePrompt(docPath)); serr != nil {
-		if sentinel != "" {
-			_ = os.Remove(sentinel) // send failed -> allow a clean retry
-		}
 		return fmt.Errorf(
 			"fleet drain: resume prompt to recovered successor %s failed: %w "+
 				"(queue preserved for retry; doc: %s)", rec.ID, serr, docPath)
+	}
+	// Mark AFTER a SUCCESSFUL send (codex PR4 [P2]). The sentinel must mean
+	// "definitely delivered" — writing it before the send would, on a crash
+	// between the marker and the send, make the retry skip delivery and
+	// strand the successor (a hard failure). The opposite risk — a crash
+	// between send and queue.Delete re-sending on retry — is a benign,
+	// effectively-idempotent duplicate ("read your doc and continue"). Prefer
+	// at-least-once delivery over a silent strand.
+	if sentinel != "" {
+		_ = os.WriteFile(sentinel, []byte(docPath+"\n"), 0o644)
 	}
 	_, _ = fmt.Fprintf(stdout, "fleet drain: delivered resume prompt to recovered successor %s\n", rec.ID)
 	return nil
