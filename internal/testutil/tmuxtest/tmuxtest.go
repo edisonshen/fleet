@@ -27,6 +27,7 @@ import (
 	"os"
 	"os/exec"
 	"testing"
+	"time"
 )
 
 // RequireTmux installs per-test tmux server isolation AND skips the
@@ -44,9 +45,12 @@ import (
 //   - t.Setenv("FLEET_TMUX_SOCKET", <sock>) so every tmuxArgs call in
 //     this test routes to the per-test server.
 //   - Register t.Cleanup that runs `tmux -S <sock> kill-server` AND
-//     removes the socket file, regardless of pass/fail/panic. Without
-//     the explicit os.Remove some tmux builds leave the .sock file
-//     behind even after kill-server.
+//     removes the socket file (verified gone via a bounded stat+retry,
+//     see killServerAndRemove), regardless of pass/fail/panic. Some
+//     tmux builds — and the Linux CI runner specifically — leave the
+//     .sock file behind even after kill-server; a single os.Remove can
+//     race the server's async unlink, so the verified loop is what makes
+//     /tmp leak-free deterministically.
 //
 // For tests that should ALSO run on tmux-less CI (e.g., rejection /
 // validation tests where runDispatch is expected to fail before
@@ -88,18 +92,73 @@ func IsolateSocket(t *testing.T) string {
 	sock := isolatedSocketPath(t)
 	t.Setenv("FLEET_TMUX_SOCKET", sock)
 	t.Cleanup(func() {
-		// kill-server is idempotent: tmux exits non-zero when no server
-		// is running on the socket, which is fine — we just want it gone.
-		_ = exec.Command("tmux", "-S", sock, "kill-server").Run()
-		// Some tmux builds leave the .sock file behind even after
-		// kill-server; remove it explicitly so /tmp doesn't accumulate
-		// thousands of stale sockets across a long-running operator's
-		// test runs.
-		if err := os.Remove(sock); err != nil && !os.IsNotExist(err) {
-			t.Logf("tmuxtest: remove %s: %v", sock, err)
+		if err := killServerAndRemove(sock); err != nil {
+			t.Logf("tmuxtest: cleanup %s: %v", sock, err)
 		}
 	})
 	return sock
+}
+
+// socketRemoveRetries / socketRemoveDelay bound the verified-remove loop
+// in killServerAndRemove. Vars (not consts) so the unit test can shrink
+// the delay and so the count is tunable if a slower CI kernel needs more
+// settle iterations. 10 * 20ms = 200ms worst case — negligible per test,
+// and the common case removes on the first attempt.
+var (
+	socketRemoveRetries = 10
+	socketRemoveDelay   = 20 * time.Millisecond
+)
+
+// killServerAndRemove tears the per-test tmux server down and DELETES the
+// socket file, verifying the file is actually gone before returning.
+//
+// Why the verify-with-retry (the leak this closes — Linux CI, 2026-06-07,
+// 79 dead `srw-------` sockets / run): on Linux the tmux server unlinks
+// its own socket asynchronously as it exits. A single os.Remove right
+// after `kill-server` returns can race that teardown: the server has not
+// finished unlinking, our Remove sees the file, removes it — fine — OR
+// the server re-touches/leaves the inode such that one Remove is not
+// enough and a dead 0-byte socket lingers. macOS tmux 3.6a never showed
+// this; the Linux runner did, deterministically. The fix is to keep
+// removing until a stat confirms the file is gone (ENOENT), bounded by a
+// short retry budget so a genuinely stuck remove still returns instead of
+// hanging the cleanup.
+//
+//	kill-server (idempotent) ─▶ remove ─▶ stat
+//	                               ▲          │ still present?
+//	                               └──────────┘ retry (bounded)
+//
+// Returns the last non-ENOENT error if the socket could not be removed
+// within the budget (the caller logs it; the suite-level leak guard then
+// surfaces it loudly rather than letting it pass silently).
+func killServerAndRemove(sock string) error {
+	// kill-server is idempotent: tmux exits non-zero when no server is
+	// running on the socket, which is fine — we just want it gone.
+	_ = exec.Command("tmux", "-S", sock, "kill-server").Run()
+
+	var lastErr error
+	for attempt := 0; attempt < socketRemoveRetries; attempt++ {
+		removeErr := os.Remove(sock)
+		if removeErr != nil && !os.IsNotExist(removeErr) {
+			lastErr = removeErr
+		}
+		// Verify it is actually gone — os.Remove returning nil is not
+		// enough on the Linux race where the server re-creates/leaves the
+		// inode after our unlink. stat is the source of truth.
+		if _, statErr := os.Stat(sock); os.IsNotExist(statErr) {
+			return nil
+		}
+		time.Sleep(socketRemoveDelay)
+	}
+	if lastErr != nil {
+		return lastErr
+	}
+	// File still present after the budget but every Remove reported
+	// success/ENOENT — surface a generic "still present" so the caller logs it.
+	if _, statErr := os.Stat(sock); statErr == nil {
+		return os.ErrExist
+	}
+	return nil
 }
 
 // isolatedSocketPath returns a unique /tmp/fleet-test-<hex>.sock path.

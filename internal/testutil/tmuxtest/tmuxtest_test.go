@@ -3,8 +3,10 @@ package tmuxtest
 import (
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 // TestRequireTmux_SetsAndCleansSocket verifies the two invariants the
@@ -78,6 +80,79 @@ func TestIsolateSocket_DoesNotSkipWhenTmuxMissing(t *testing.T) {
 	}
 	if !strings.HasPrefix(sock, "/tmp/fleet-test-") {
 		t.Errorf("IsolateSocket sock = %q; want /tmp/fleet-test-* prefix", sock)
+	}
+}
+
+// TestKillServerAndRemove_DeletesDeadSocketFile is the regression for the
+// Linux-CI socket leak (2026-06-07, 79 dead srw------- sockets / run). A
+// dead socket file (no tmux server bound — the server already exited and
+// left the inode behind) MUST be removed by the per-test cleanup. Before
+// the verified-remove loop a single os.Remove could race the server's
+// async unlink; this pins that the file is gone after killServerAndRemove
+// returns. We forge a plain file at a fleet-test path to stand in for the
+// dead socket (the kill-server call is a no-op against it) and assert it
+// is unlinked deterministically.
+func TestKillServerAndRemove_DeletesDeadSocketFile(t *testing.T) {
+	// Use t.TempDir so we never touch the operator's real /tmp namespace.
+	sock := filepath.Join(t.TempDir(), "fleet-test-dead.sock")
+	if err := os.WriteFile(sock, []byte("dead"), 0o600); err != nil {
+		t.Fatalf("forge dead socket: %v", err)
+	}
+	if err := killServerAndRemove(sock); err != nil {
+		t.Fatalf("killServerAndRemove returned error for a dead socket: %v", err)
+	}
+	if _, err := os.Stat(sock); !os.IsNotExist(err) {
+		t.Errorf("dead socket %s not removed (stat err=%v)", sock, err)
+	}
+}
+
+// TestKillServerAndRemove_IdempotentWhenGone pins that calling cleanup on
+// an already-absent socket is a clean no-op (ENOENT collapses to success)
+// — the common case where tmux already unlinked the socket on server exit.
+func TestKillServerAndRemove_IdempotentWhenGone(t *testing.T) {
+	sock := filepath.Join(t.TempDir(), "fleet-test-absent.sock")
+	if err := killServerAndRemove(sock); err != nil {
+		t.Errorf("killServerAndRemove on an absent socket should be nil, got %v", err)
+	}
+}
+
+// TestKillServerAndRemove_RetriesUntilGone pins the verified-remove loop:
+// a socket file that only disappears after a few attempts (simulating the
+// Linux server-teardown race where the inode lingers briefly) is still
+// reaped within the retry budget. We shrink the delay and spawn a
+// background unlinker that removes the file after a short beat — the loop
+// must succeed without erroring.
+func TestKillServerAndRemove_RetriesUntilGone(t *testing.T) {
+	sock := filepath.Join(t.TempDir(), "fleet-test-laggy.sock")
+	if err := os.WriteFile(sock, []byte("laggy"), 0o600); err != nil {
+		t.Fatalf("forge laggy socket: %v", err)
+	}
+	// Make os.Remove fail by removing write/exec perms on the parent dir
+	// for a beat, then restoring so a later attempt in the loop succeeds.
+	// This exercises the retry path deterministically without depending on
+	// real tmux timing.
+	dir := filepath.Dir(sock)
+	if err := os.Chmod(dir, 0o500); err != nil { // r-x: cannot unlink children
+		t.Fatalf("chmod dir: %v", err)
+	}
+	restored := make(chan struct{})
+	go func() {
+		time.Sleep(15 * time.Millisecond)
+		_ = os.Chmod(dir, 0o700) // restore so a retry can unlink
+		close(restored)
+	}()
+	t.Cleanup(func() { <-restored; _ = os.Chmod(dir, 0o700) })
+
+	// Give the loop enough iterations to outlast the 15ms perms window.
+	oldDelay := socketRemoveDelay
+	socketRemoveDelay = 5 * time.Millisecond
+	t.Cleanup(func() { socketRemoveDelay = oldDelay })
+
+	if err := killServerAndRemove(sock); err != nil {
+		t.Fatalf("killServerAndRemove did not recover within the retry budget: %v", err)
+	}
+	if _, err := os.Stat(sock); !os.IsNotExist(err) {
+		t.Errorf("laggy socket %s not removed after retries (stat err=%v)", sock, err)
 	}
 }
 
