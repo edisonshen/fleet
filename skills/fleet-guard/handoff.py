@@ -1297,8 +1297,14 @@ def _producer_fenced(project: str) -> bool:
             capture_output=True, text=True,
             timeout=_LEASE_CHECK_TIMEOUT_S, check=False, env=env,
         )
-    except (FileNotFoundError, subprocess.TimeoutExpired):
-        return False  # fail-open: don't wedge a legacy/slow environment
+    except (OSError, subprocess.SubprocessError):
+        # OSError covers FileNotFoundError (no binary) AND a non-executable /
+        # permission-denied FLEET_BIN; SubprocessError covers TimeoutExpired.
+        # All are "lease-check unavailable" -> fail-open (codex PR4 [P2]). An
+        # uncaught OSError would escape to maybe_trigger's handler and, on the
+        # already-committed red/precompact path, strand the agent with no
+        # doc/queue while future fires skip it as committed.
+        return False
     if proc.returncode == 0:
         return False
     if proc.returncode == _LEASE_CHECK_NOT_OWNER_EXIT:

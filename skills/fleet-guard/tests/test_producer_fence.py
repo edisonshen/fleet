@@ -223,3 +223,17 @@ def test_producer_fenced_binary_missing_fail_open(
 
     monkeypatch.setattr(handoff.subprocess, "run", _boom)
     assert _REAL_PRODUCER_FENCED("myproj") is False, "missing binary is fail-open"
+
+
+def test_producer_fenced_oserror_fail_open(
+    fleet_home_tmp: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A non-executable FLEET_BIN raises OSError (PermissionError) -> fail open
+    # (codex PR4 [P2]); must NOT escape _producer_fenced.
+    monkeypatch.setenv("FLEET_LEASE_FAILOVER", "1")
+
+    def _perm(*a, **k):
+        raise PermissionError("not executable")
+
+    monkeypatch.setattr(handoff.subprocess, "run", _perm)
+    assert _REAL_PRODUCER_FENCED("myproj") is False, "OSError must fail open"

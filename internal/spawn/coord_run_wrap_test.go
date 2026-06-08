@@ -13,6 +13,7 @@ package spawn
 
 import (
 	"reflect"
+	"runtime"
 	"testing"
 )
 
@@ -67,15 +68,24 @@ func TestCoordRunWrap_StandbyInsertsFlag(t *testing.T) {
 // W2: PR4 flipped the default to ON. The gate is now ON unless
 // FLEET_LEASE_FAILOVER is EXPLICITLY a disable token (0/false/off/no);
 // unset/empty/anything-else -> ON. Mirrors coordlock.parseFailover.
+//
+// On non-linux/darwin (spawn_lease_other.go) the lease primitive is
+// unsupported, so leaseFailoverEnabled is ALWAYS false regardless of the
+// env (codex PR4 [P2]) — guard the expectations by GOOS so the test passes
+// on every build target.
 func TestLeaseFailoverEnabled_Gate(t *testing.T) {
+	leaseCapable := runtime.GOOS == "linux" || runtime.GOOS == "darwin"
 	cases := map[string]bool{
 		"": true, "1": true, "yes": true, "on": true, "anything": true, " 1 ": true,
 		"0": false, "false": false, "off": false, "no": false, "FALSE": false, " 0 ": false,
 	}
 	for v, want := range cases {
+		if !leaseCapable {
+			want = false // unsupported platform: always off
+		}
 		t.Setenv("FLEET_LEASE_FAILOVER", v)
 		if got := leaseFailoverEnabled(); got != want {
-			t.Errorf("FLEET_LEASE_FAILOVER=%q -> %v, want %v", v, got, want)
+			t.Errorf("FLEET_LEASE_FAILOVER=%q -> %v, want %v (GOOS=%s)", v, got, want, runtime.GOOS)
 		}
 	}
 }

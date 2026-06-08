@@ -2651,15 +2651,17 @@ def _prove_parent_lease_ownership(
             capture_output=True, text=True,
             timeout=_LEASE_CHECK_TIMEOUT_S, check=False, env=env,
         )
-    except FileNotFoundError:
-        # `fleet` not on PATH / not the expected binary — legacy or test
-        # environment. Don't wedge the tick.
-        return "unknown"
     except subprocess.TimeoutExpired:
         sys.stderr.write(
             f"[coord] lease-check for {project!r} timed out "
             f"(>{_LEASE_CHECK_TIMEOUT_S}s); proceeding without the proof\n"
         )
+        return "unknown"
+    except OSError:
+        # OSError covers FileNotFoundError (no `fleet` on PATH) AND a
+        # non-executable / permission-denied FLEET_BIN (codex PR4 [P2]).
+        # Lease-check unavailable -> inconclusive; don't wedge the tick (the
+        # coordinator.lock + #171 guard remain the defense).
         return "unknown"
     if proc.returncode == 0:
         return "owner"
