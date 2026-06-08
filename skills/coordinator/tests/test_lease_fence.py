@@ -133,16 +133,32 @@ def test_prove_helper_exit_code_mapping(
     fleet_home: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("FLEET_LEASE_FAILOVER", "1")
-    cases = {0: "owner", 3: "fenced", 1: "unknown", 2: "unknown"}
+    # exit 0 -> owner; exit 3 -> fenced; exit 1/2 with a genuine internal
+    # error -> FENCED (cannot prove ownership, codex PR4 [P1]).
+    cases = {0: "owner", 3: "fenced", 1: "fenced", 2: "fenced"}
     for rc, want in cases.items():
         monkeypatch.setattr(
             loop.subprocess, "run",
-            lambda *a, _rc=rc, **k: _fake_completed(_rc, "boom"),
+            lambda *a, _rc=rc, **k: _fake_completed(_rc, "internal boom"),
         )
         got = loop._prove_parent_lease_ownership(
             "fleet", home=fleet_home, fleet_bin="fleet",
         )
         assert got == want, f"exit {rc} should map to {want!r}, got {got!r}"
+
+
+def test_prove_helper_too_old_binary_fails_open(
+    fleet_home: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A binary too old to have `lease-check` -> cobra "unknown command" +
+    # exit 1 -> fail OPEN ("unknown"), don't wedge a pre-lease coord.
+    monkeypatch.setenv("FLEET_LEASE_FAILOVER", "1")
+    monkeypatch.setattr(
+        loop.subprocess, "run",
+        lambda *a, **k: _fake_completed(1, 'unknown command "lease-check" for "fleet"'),
+    )
+    got = loop._prove_parent_lease_ownership("fleet", home=fleet_home, fleet_bin="fleet")
+    assert got == "unknown", "a too-old binary (unknown command) must fail open"
 
 
 def test_prove_helper_failover_off_is_noop(

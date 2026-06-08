@@ -1265,16 +1265,27 @@ def _lease_failover_enabled() -> bool:
         not in ("0", "false", "off", "no")
 
 
+def _lease_check_unknown_command(stderr_text: str) -> bool:
+    """True if a `fleet lease-check` exit-1 was an UNKNOWN-COMMAND error (the
+    installed binary is too old to have the subcommand) vs a genuine internal
+    error. Mirrors loop.py._lease_check_unknown_command byte-for-byte."""
+    low = stderr_text.lower()
+    return "unknown command" in low or "unknown subcommand" in low
+
+
 def _producer_fenced(project: str) -> bool:
-    """True iff this producer is a FENCED old coord that must NOT write.
+    """True iff this COORD producer is FENCED / cannot prove ownership and so
+    must NOT write a handoff doc/queue.
 
     Routes through `fleet lease-check --project <p>` (the Go epoch re-read +
-    ancestor proof). Returns True ONLY on the definitive exit-3 "not owner"
-    verdict. Failover off, the binary missing, an error, or a timeout all
-    return False (fail-open): a legacy install or transient fault must not
-    silently disable a healthy coord's handoff — the storm back-off below
-    still suppresses duplicates, and the consumer-side fence (Go *WithLease)
-    remains the hard guarantee for the queue read."""
+    ancestor proof). Fences on:
+      - exit 3 (definitive "not owner"); AND
+      - exit 1 that is a genuine INTERNAL error (e.g. corrupt coordinator.epoch)
+        — "cannot prove ownership" -> fail CLOSED (codex PR4 [P1]).
+    Fails OPEN (returns False) only when there is no lease machinery to fence
+    against: failover off, the binary absent (FileNotFoundError), a too-old
+    binary lacking the subcommand (exit-1 unknown-command), or a timeout. A
+    transient/legacy environment must not wedge a healthy coord."""
     if not _lease_failover_enabled() or not project:
         return False
     env = dict(os.environ)
@@ -1288,7 +1299,21 @@ def _producer_fenced(project: str) -> bool:
         )
     except (FileNotFoundError, subprocess.TimeoutExpired):
         return False  # fail-open: don't wedge a legacy/slow environment
-    return proc.returncode == _LEASE_CHECK_NOT_OWNER_EXIT
+    if proc.returncode == 0:
+        return False
+    if proc.returncode == _LEASE_CHECK_NOT_OWNER_EXIT:
+        return True
+    # exit 1: too-old binary (unknown command) -> fail open; else internal
+    # error -> cannot prove ownership -> FENCE.
+    detail = (proc.stderr or proc.stdout or "").strip()
+    if _lease_check_unknown_command(detail):
+        return False
+    print(
+        f"fleet-guard: lease-check for {project!r} could not prove ownership "
+        f"(exit {proc.returncode}): {detail}; treating as FENCED",
+        file=sys.stderr,
+    )
+    return True
 
 
 def _handoff_already_in_flight(agent_id: str) -> bool:

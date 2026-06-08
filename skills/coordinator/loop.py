@@ -2599,6 +2599,17 @@ def _lease_failover_enabled() -> bool:
         not in ("0", "false", "off", "no")
 
 
+def _lease_check_unknown_command(stderr_text: str) -> bool:
+    """True if a `fleet lease-check` exit-1 was an UNKNOWN-COMMAND error (the
+    installed binary is too old to have the subcommand) rather than a genuine
+    internal error. cobra emits 'unknown command "lease-check"' on an
+    unrecognized subcommand. Distinguishing the two lets an internal error
+    fail CLOSED (fence) while a too-old binary fails OPEN (don't wedge a
+    pre-lease coord). Matches loop.py + handoff.py identically."""
+    low = stderr_text.lower()
+    return "unknown command" in low or "unknown subcommand" in low
+
+
 def _prove_parent_lease_ownership(
     project: str, *, home: Path, fleet_bin: str = "fleet",
 ) -> str:
@@ -2654,13 +2665,29 @@ def _prove_parent_lease_ownership(
         return "owner"
     if proc.returncode == _LEASE_CHECK_NOT_OWNER_EXIT:
         return "fenced"
-    # Any other non-zero (usage / internal error) is inconclusive.
+    # Any OTHER non-zero is exit 1. Two sub-cases (codex PR4 [P1]):
+    #
+    #   - The binary is too OLD to have the `lease-check` subcommand (a skill
+    #     loaded from a newer repo than the installed `fleet`). cobra prints
+    #     "unknown command" and exits 1. There is no lease machinery in that
+    #     binary either, so fail-OPEN (don't wedge a pre-lease coord).
+    #   - The subcommand RAN and hit an internal error (e.g. a corrupt/
+    #     unreadable coordinator.epoch). Per the CLI contract this means
+    #     "cannot prove ownership" -> fail-CLOSED (FENCE). Failing open here
+    #     would let a coord that cannot prove ownership keep mutating —
+    #     reopening the zombie-write path the fence exists to close.
     detail = (proc.stderr or proc.stdout or "").strip()
+    if _lease_check_unknown_command(detail):
+        sys.stderr.write(
+            f"[coord] lease-check unsupported by this fleet binary for {project!r} "
+            f"(too old?); proceeding without the proof\n"
+        )
+        return "unknown"
     sys.stderr.write(
-        f"[coord] lease-check for {project!r} inconclusive "
-        f"(exit {proc.returncode}): {detail}; proceeding\n"
+        f"[coord] lease-check for {project!r} could not prove ownership "
+        f"(exit {proc.returncode}): {detail}; FENCING (cannot prove ownership)\n"
     )
-    return "unknown"
+    return "fenced"
 
 
 # _lease_check_fn is the injectable seam tick() calls for the parent-lease

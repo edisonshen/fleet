@@ -176,15 +176,30 @@ def _completed(rc: int):
     return subprocess.CompletedProcess(["fleet"], rc, stdout="", stderr="")
 
 
-def test_producer_fenced_maps_exit_3_only(
+def _completed_err(rc: int, stderr: str):
+    return subprocess.CompletedProcess(["fleet"], rc, stdout="", stderr=stderr)
+
+
+def test_producer_fenced_exit_code_mapping(
     fleet_home_tmp: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("FLEET_LEASE_FAILOVER", "1")
-    # exit 3 => fenced; everything else => not fenced (fail-open).
-    for rc, want in {0: False, 3: True, 1: False, 2: False}.items():
+    # exit 0 -> not fenced; exit 3 -> fenced; exit 1/2 INTERNAL error ->
+    # FENCED (cannot prove ownership, codex PR4 [P1]).
+    for rc, want in {0: False, 3: True, 1: True, 2: True}.items():
         monkeypatch.setattr(handoff.subprocess, "run",
-                            lambda *a, _rc=rc, **k: _completed(_rc))
+                            lambda *a, _rc=rc, **k: _completed_err(_rc, "internal boom"))
         assert _REAL_PRODUCER_FENCED("myproj") is want, f"exit {rc}"
+
+
+def test_producer_fenced_too_old_binary_fails_open(
+    fleet_home_tmp: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # too-old binary -> "unknown command" + exit 1 -> fail OPEN (not fenced).
+    monkeypatch.setenv("FLEET_LEASE_FAILOVER", "1")
+    monkeypatch.setattr(handoff.subprocess, "run",
+                        lambda *a, **k: _completed_err(1, 'unknown command "lease-check"'))
+    assert _REAL_PRODUCER_FENCED("myproj") is False, "too-old binary must fail open"
 
 
 def test_producer_fenced_failover_off_is_noop(
