@@ -42,6 +42,7 @@ import (
 	"github.com/edisonshen/fleet/internal/coord"
 	"github.com/edisonshen/fleet/internal/coordlock"
 	"github.com/edisonshen/fleet/internal/coordrepo"
+	"github.com/edisonshen/fleet/internal/handoff"
 	"github.com/edisonshen/fleet/internal/handoffop"
 	"github.com/edisonshen/fleet/internal/queue"
 	"github.com/edisonshen/fleet/internal/spawn"
@@ -218,7 +219,50 @@ func productionRecoverSpawn(oldRec *agent.Record, docPath, preAllocatedID string
 	}
 	_, _ = fmt.Fprintf(stdout,
 		"fleet drain: cold-spawned lease-wrapped successor %s for %s after takeover\n", rec.ID, oldRec.Project)
+	recoverHandoffTail(oldRec, rec.ID, rec.TmuxSession, docPath, stderr)
 	return nil
+}
+
+// Seams for recoverHandoffTail (codex PR3 iter-14 [P1]), kept injectable so the
+// recover-tail test stays deterministic (no real tmux send / marker FS).
+// Production: state.WriteCoordSpawnMarker + spawn.SendInitialPrompt (wait-for-
+// ready then type the prompt).
+var (
+	recoverWriteMarkerFn = state.WriteCoordSpawnMarker
+	recoverSendPromptFn  = spawn.SendInitialPrompt
+)
+
+// recoverHandoffTail runs the same post-spawn handoff TAIL the normal recovery
+// path runs (codex PR3 iter-14 [P1]). Without it the takeover-recovered
+// successor is INVISIBLE + INERT:
+//   - the dead OLD's coord.Cleanup cleared the coord-spawn marker, so the TUI /
+//     `fleet attach` discovery (which reads the marker for the live coord's id)
+//     cannot find the replacement -> point the marker at the NEW agent;
+//   - a freshly-spawned coord does nothing until it is told to resume from the
+//     handoff doc -> type handoff.ResumePrompt(docPath) once its pane is ready
+//     (unless auto-resume is disabled for this record).
+//
+// Both are best-effort with surfaced warnings (surface-don't-silo): the
+// successor is already live + leasing, so a marker/prompt hiccup degrades
+// discoverability, not correctness, and the operator gets a concrete recovery
+// command.
+func recoverHandoffTail(oldRec *agent.Record, newID, newSession, docPath string, stderr io.Writer) {
+	if spawn.IsCoordSpawn(oldRec.TaskID, oldRec.Project) {
+		if werr := recoverWriteMarkerFn(oldRec.Project, newID); werr != nil {
+			_, _ = fmt.Fprintf(stderr,
+				"warning: coord-spawn marker for project %s -> %s failed after takeover recovery: %v "+
+					"(TUI may not discover the replacement; run `fleet rc up %s` to recover)\n",
+				oldRec.Project, newID, werr, oldRec.Project)
+		}
+	}
+	if !oldRec.DisableAutoResume && docPath != "" {
+		if perr := recoverSendPromptFn(newSession, handoff.ResumePrompt(docPath)); perr != nil {
+			_, _ = fmt.Fprintf(stderr,
+				"warning: send resume prompt to %s after takeover recovery: %v "+
+					"(the replacement is live but idle; attach and paste the handoff doc, or it self-resumes on next turn)\n",
+				newSession, perr)
+		}
+	}
 }
 
 // drainOneLeaseAware is the production entry point for the bounded drain.

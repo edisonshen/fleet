@@ -687,3 +687,56 @@ func TestDrainLease_TakeoverDoesNotHoldLockAcrossKill(t *testing.T) {
 		t.Errorf("RecoverSpawn ran %d times, want 1 (successor recovered under the SHORT post-takeover lock)", recovered)
 	}
 }
+
+// codex PR3 iter-14 [P1] REGRESSION: a takeover-recovered successor must run the
+// post-spawn handoff TAIL — write the coord-spawn marker for the NEW agent (so
+// the TUI/attach can discover it; the dead OLD's cleanup cleared the old one)
+// AND send handoff.ResumePrompt(docPath) (so the fresh coord actually resumes
+// from the handoff doc instead of sitting idle). Without it the replacement is
+// invisible + inert.
+func TestRecoverHandoffTail_WritesMarkerAndSendsPrompt(t *testing.T) {
+	oldRec := oldCoordRec()
+	oldRec.TaskID = "coord-projects-fleet" // IsCoordSpawn requires "coord-<project>"
+
+	var gotMarkerProj, gotMarkerID, gotSession, gotPrompt string
+	origMarker, origPrompt := recoverWriteMarkerFn, recoverSendPromptFn
+	t.Cleanup(func() { recoverWriteMarkerFn, recoverSendPromptFn = origMarker, origPrompt })
+	recoverWriteMarkerFn = func(project, id string) error { gotMarkerProj, gotMarkerID = project, id; return nil }
+	recoverSendPromptFn = func(session, prompt string) error { gotSession, gotPrompt = session, prompt; return nil }
+
+	recoverHandoffTail(oldRec, "newcoord9", "fleet-newcoord9", "/tmp/handoff.md", &bytes.Buffer{})
+
+	if gotMarkerProj != "projects-fleet" || gotMarkerID != "newcoord9" {
+		t.Errorf("coord-spawn marker = (%q,%q), want (projects-fleet,newcoord9) — TUI cannot discover the replacement without it",
+			gotMarkerProj, gotMarkerID)
+	}
+	if gotSession != "fleet-newcoord9" {
+		t.Errorf("resume prompt sent to session %q, want fleet-newcoord9", gotSession)
+	}
+	if !strings.Contains(gotPrompt, "/tmp/handoff.md") {
+		t.Errorf("resume prompt %q must reference the handoff doc /tmp/handoff.md (the coord stays idle otherwise)", gotPrompt)
+	}
+}
+
+// The tail honors DisableAutoResume: no resume prompt is typed (the operator
+// drives the first turn), but the marker is STILL written so discovery works.
+func TestRecoverHandoffTail_DisableAutoResume_NoPromptStillMarks(t *testing.T) {
+	oldRec := oldCoordRec()
+	oldRec.TaskID = "coord-projects-fleet"
+	oldRec.DisableAutoResume = true
+
+	var markerWritten, promptSent bool
+	origMarker, origPrompt := recoverWriteMarkerFn, recoverSendPromptFn
+	t.Cleanup(func() { recoverWriteMarkerFn, recoverSendPromptFn = origMarker, origPrompt })
+	recoverWriteMarkerFn = func(string, string) error { markerWritten = true; return nil }
+	recoverSendPromptFn = func(string, string) error { promptSent = true; return nil }
+
+	recoverHandoffTail(oldRec, "newcoord9", "fleet-newcoord9", "/tmp/handoff.md", &bytes.Buffer{})
+
+	if !markerWritten {
+		t.Error("marker must be written even when auto-resume is disabled (discovery is independent of resume)")
+	}
+	if promptSent {
+		t.Error("resume prompt must NOT be sent when DisableAutoResume is set")
+	}
+}
