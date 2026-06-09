@@ -823,7 +823,7 @@ func TestDoctor_StaleMarker_NotUsedForRespawn(t *testing.T) {
 	}
 	d.ListAgents = func() ([]*agent.Record, error) { return []*agent.Record{worker, realCoord}, nil }
 
-	got := cacheCoordRecord(project, queue.SpawnFresh{}, d)
+	got := cacheCoordRecord(project, queue.SpawnFresh{}, "", d)
 	if got == nil {
 		t.Fatalf("cacheCoordRecord returned nil; want the real coord %s", realID)
 	}
@@ -832,5 +832,64 @@ func TestDoctor_StaleMarker_NotUsedForRespawn(t *testing.T) {
 	}
 	if got.ID != realID {
 		t.Errorf("cacheCoordRecord = %s, want the real coord %s", got.ID, realID)
+	}
+}
+
+// --- codex PR6 iter-12 regression ---
+
+// [P2] the LEASE-ONLY stuck case: only a lingering coordinator.epoch remains
+// (no marker, no live record, no queue). --fix must restart from the lease
+// epoch's OwnerAgentID archived record, not dead-end at cachedOld==nil.
+func TestDoctor_LeaseOnly_RecoversFromOwnerArchive(t *testing.T) {
+	const (
+		project = "loproj"
+		ownerID = "loowner"
+	)
+	archived := agent.New(ownerID)
+	archived.Project = project
+	archived.TaskID = CoordTaskIDPrefix + project
+	archived.SupervisorPID = 555
+	archived.Command = []string{"claude"}
+
+	d := doctorTestDeps()
+	// Only trace: a hung lease whose epoch names the OLD owner. No marker, no
+	// live record, no queue.
+	d.Diagnose = func(string) coordlock.LeaseDiagnosis {
+		return coordlock.LeaseDiagnosis{
+			Health: coordlock.LeaseHealthHung, HasRecord: true,
+			OwnerPID: 555, OwnerAlive: true, OwnerAgentID: ownerID,
+		}
+	}
+	d.LeaseProjects = func() ([]string, error) { return []string{project}, nil }
+	d.CoordMarker = func(string) string { return "" }
+	d.ListAgents = func() ([]*agent.Record, error) { return nil, nil }
+	d.LoadAgent = func(string) (*agent.Record, error) { return nil, errors.New("no live record") }
+	d.LoadArchive = func(id string) (*agent.Record, error) {
+		if id == ownerID {
+			return archived, nil
+		}
+		return nil, errors.New("no archive")
+	}
+	d.TakeOver = func(string, string) (bool, error) { return true, nil }
+	var respawnedFrom string
+	d.RecoverSpawn = func(rec *agent.Record, _ string, _ string, _ bool, _, _ io.Writer) error {
+		if rec != nil {
+			respawnedFrom = rec.ID
+		}
+		return nil
+	}
+
+	report, err := gatherDoctorReportWith(doctorOpts{project: project, fix: true}, d)
+	if err != nil {
+		t.Fatalf("gather: %v", err)
+	}
+	var out, errOut bytes.Buffer
+	doctorRunFixWith(doctorOpts{project: project, fix: true}, &report, &out, &errOut, d)
+
+	if respawnedFrom != ownerID {
+		t.Fatalf("lease-only recovery respawned from %q, want the lease owner's archived record %q", respawnedFrom, ownerID)
+	}
+	if pr := report.projects[0]; pr.fixErr != nil {
+		t.Fatalf("lease-only recovery errored: %v", pr.fixErr)
 	}
 }

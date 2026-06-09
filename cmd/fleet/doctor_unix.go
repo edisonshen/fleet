@@ -584,11 +584,15 @@ func fixOneProject(pr *doctorProjectReport, stdout, stderr io.Writer, d doctorDe
 
 	// Find the coord record to respawn from. Cache it BEFORE the takeover —
 	// the takeover's kill archives the record, so a post-kill load would race
-	// the archive (same reason drainWaitBarrierOrEscalate caches it). The
-	// queueReq lets it fall back to the queue's OldAgentID (live then ARCHIVE)
-	// for the queue-only stuck case where the coord record is already archived
-	// (codex PR6 iter-7 [P1]).
-	cachedOld := cacheCoordRecord(project, queueReq, d)
+	// the archive (same reason drainWaitBarrierOrEscalate caches it). Two
+	// fallbacks for the record-gone cases:
+	//   - queueReq.OldAgentID for the queue-only stuck case (codex PR6 iter-7);
+	//   - the lease epoch's OwnerAgentID for the LEASE-ONLY case (only a
+	//     lingering coordinator.epoch — no marker, no record, no queue), read
+	//     fresh here so --fix can restart from the OLD owner's archived record
+	//     instead of dead-ending at cachedOld==nil (codex PR6 iter-12 [P2]).
+	leaseOwnerID := d.Diagnose(project).OwnerAgentID
+	cachedOld := cacheCoordRecord(project, queueReq, leaseOwnerID, d)
 
 	pr.fixPlanned = true
 	_, _ = fmt.Fprintf(stdout,
@@ -705,11 +709,16 @@ func pendingQueueForProject(project string, d doctorDeps) (string, queue.SpawnFr
 //     file) has NO live marker/record, so without the archive fallback --fix
 //     would take over but then error with "record gone" — unable to fix the
 //     very case `fleet doctor` advertises.
+//  4. the lease epoch's OwnerAgentID — LIVE then ARCHIVE (codex PR6 iter-12
+//     [P2]). The LEASE-ONLY stuck case (only a lingering coordinator.epoch —
+//     no marker, no record, no queue) still names the OLD owner in the epoch;
+//     load its archived record so --fix can restart instead of dead-ending.
 //
 // queueReq is the pending handoff request for this project (zero value if
+// none); leaseOwnerID is the lease epoch's recorded owner agent id (empty if
 // none). Returns nil only when no record can be found anywhere (the fixer
 // then surfaces a manual recovery step rather than spawning blind).
-func cacheCoordRecord(project string, queueReq queue.SpawnFresh, d doctorDeps) *agent.Record {
+func cacheCoordRecord(project string, queueReq queue.SpawnFresh, leaseOwnerID string, d doctorDeps) *agent.Record {
 	if marker := d.CoordMarker(project); marker != "" {
 		// VALIDATE the marker record before trusting it (codex PR6 iter-10
 		// [P2]): a STALE marker can point at a non-coordinator (or another
@@ -730,12 +739,29 @@ func cacheCoordRecord(project string, queueReq queue.SpawnFresh, d doctorDeps) *
 	}
 	// Queue-only fallback: load the OLD coord named by the pending handoff —
 	// live first, then the archive (it was retired when the handoff was
-	// requested).
-	if queueReq.OldAgentID != "" {
-		if rec, err := d.LoadAgent(queueReq.OldAgentID); err == nil && rec != nil {
+	// requested). Lease-only fallback: the epoch's recorded owner id (codex PR6
+	// iter-12 [P2]). Each candidate is validated to be THIS project's coord (a
+	// stale id must not respawn a worker/other-project record).
+	for _, id := range []string{queueReq.OldAgentID, leaseOwnerID} {
+		if id == "" {
+			continue
+		}
+		if rec := loadCoordRecordByID(id, project, d); rec != nil {
 			return rec
 		}
-		if rec, err := d.LoadArchive(queueReq.OldAgentID); err == nil && rec != nil {
+	}
+	return nil
+}
+
+// loadCoordRecordByID loads agent id (LIVE then ARCHIVE) and returns it ONLY
+// if it is THIS project's coordinator (rec.Project==project &&
+// isCoordAgentRecord) — a stale queue/lease owner id must never respawn a
+// worker or another project's record (same validation the marker path does,
+// codex PR6 iter-10/iter-12 [P2]). Returns nil otherwise.
+func loadCoordRecordByID(id, project string, d doctorDeps) *agent.Record {
+	for _, load := range []func(string) (*agent.Record, error){d.LoadAgent, d.LoadArchive} {
+		if rec, err := load(id); err == nil && rec != nil &&
+			rec.Project == project && isCoordAgentRecord(rec) {
 			return rec
 		}
 	}
