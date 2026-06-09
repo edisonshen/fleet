@@ -50,6 +50,7 @@ func doctorTestDeps() doctorDeps {
 		SessionAlive:     func(string) (bool, error) { return true, nil },
 		ListPendingQueue: func() ([]string, error) { return nil, nil },
 		ReadQueue:        func(string) (queue.SpawnFresh, error) { return queue.SpawnFresh{}, nil },
+		DeleteQueue:      func(string) error { return nil },
 		HandoffDocs:      func() ([]string, error) { return nil, nil },
 		WedgedDrains:     func() (int, error) { return 0, nil },
 		TakeOver:         func(string, string) (bool, error) { return false, nil },
@@ -137,12 +138,28 @@ func TestDoctor_T20_FixRecoversStaleLease(t *testing.T) {
 		}
 		return nil, errors.New("no record")
 	}
-	d.ListPendingQueue = func() ([]string, error) { return []string{"/q/spawn-fresh-" + coordID + ".json"}, nil }
+	const (
+		queuePath = "/q/spawn-fresh-" + coordID + ".json"
+		handoffMd = "/tmp/handoff-t20.md"
+		newID     = "t20successor"
+	)
+	d.ListPendingQueue = func() ([]string, error) { return []string{queuePath}, nil }
 	d.ReadQueue = func(string) (queue.SpawnFresh, error) {
-		return queue.SpawnFresh{OldAgentID: coordID, Project: project}, nil
+		// A real pending handoff: it names the doc to resume from + the
+		// pre-allocated successor id the recovery must carry (codex PR6 [P1]).
+		return queue.SpawnFresh{OldAgentID: coordID, Project: project, HandoffDoc: handoffMd, NewAgentID: newID}, nil
+	}
+	var deleted int32
+	d.DeleteQueue = func(p string) error {
+		atomic.AddInt32(&deleted, 1)
+		if p != queuePath {
+			t.Errorf("DeleteQueue path = %q, want %q", p, queuePath)
+		}
+		return nil
 	}
 	// LeaderPresent is false throughout (dead lease). Track the takeover +
-	// respawn so we assert the fence->kill->respawn order ran.
+	// respawn so we assert the fence->kill->respawn order ran, AND that the
+	// queued handoff metadata (doc + pre-allocated id) reached RecoverSpawn.
 	var tookOver, respawned int32
 	d.TakeOver = func(p, a string) (bool, error) {
 		atomic.AddInt32(&tookOver, 1)
@@ -151,10 +168,16 @@ func TestDoctor_T20_FixRecoversStaleLease(t *testing.T) {
 		}
 		return true, nil // acquired: old holder was gone, takeover fenced+killed it
 	}
-	d.RecoverSpawn = func(rec *agent.Record, _ string, _ string, _ bool, _, _ io.Writer) error {
+	d.RecoverSpawn = func(rec *agent.Record, doc string, preID string, _ bool, _, _ io.Writer) error {
 		atomic.AddInt32(&respawned, 1)
 		if rec == nil || rec.ID != coordID {
 			t.Errorf("RecoverSpawn got rec %v, want cached old %s", rec, coordID)
+		}
+		if doc != handoffMd {
+			t.Errorf("RecoverSpawn doc = %q, want the queued handoff doc %q (else successor is idle)", doc, handoffMd)
+		}
+		if preID != newID {
+			t.Errorf("RecoverSpawn preAllocatedID = %q, want the queued successor id %q (else it can't adopt)", preID, newID)
 		}
 		return nil
 	}
@@ -172,6 +195,9 @@ func TestDoctor_T20_FixRecoversStaleLease(t *testing.T) {
 	if atomic.LoadInt32(&respawned) != 1 {
 		t.Errorf("RecoverSpawn ran %d times, want 1", respawned)
 	}
+	if atomic.LoadInt32(&deleted) != 1 {
+		t.Errorf("DeleteQueue ran %d times, want 1 (the fulfilled handoff must be cleared)", deleted)
+	}
 	pr := report.projects[0]
 	if !pr.fixPlanned || pr.fixErr != nil || pr.fixRefused != "" {
 		t.Fatalf("fix outcome: planned=%v err=%v refused=%q", pr.fixPlanned, pr.fixErr, pr.fixRefused)
@@ -183,6 +209,43 @@ func TestDoctor_T20_FixRecoversStaleLease(t *testing.T) {
 	}
 	if !strings.Contains(s, "Starting a fresh coordinator") {
 		t.Errorf("missing start action in surfaced output:\n%s", s)
+	}
+}
+
+// --- regression (codex PR6 [P2]): doctor (no --project) discovers a
+//     queue-ONLY stuck project whose coord record was already archived ---
+
+func TestDoctor_DiscoversQueueOnlyStuckProject(t *testing.T) {
+	const project = "queueonly"
+	d := doctorTestDeps()
+	// No live agent records at all (OLD coord archived) ...
+	d.ListAgents = func() ([]*agent.Record, error) { return nil, nil }
+	// ... but a pending spawn-fresh queue file names the project, and no
+	// healthy leader holds the lease -> a stuck handoff.
+	d.ListPendingQueue = func() ([]string, error) { return []string{"/q/spawn-fresh-old.json"}, nil }
+	d.ReadQueue = func(string) (queue.SpawnFresh, error) {
+		return queue.SpawnFresh{OldAgentID: "old", Project: project}, nil
+	}
+	d.LeaderPresent = func(string) bool { return false }
+
+	// doctor with NO --project must still surface this project (else `fleet
+	// status` says "Run fleet doctor" but the command finds nothing).
+	report, err := gatherDoctorReportWith(doctorOpts{}, d)
+	if err != nil {
+		t.Fatalf("gather: %v", err)
+	}
+	found := false
+	for _, pr := range report.projects {
+		if pr.project == project {
+			found = true
+			if pr.status != doctorStatusHandoffStuck {
+				t.Errorf("queue-only project status = %v, want HandoffStuck", pr.status)
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("doctor (no --project) did not discover queue-only stuck project %q; projects=%v",
+			project, report.projects)
 	}
 }
 

@@ -72,6 +72,10 @@ type doctorDeps struct {
 	ListPendingQueue func() ([]string, error)
 	// ReadQueue parses a spawn-fresh queue file. Production: queue.ReadSpawnFresh.
 	ReadQueue func(path string) (queue.SpawnFresh, error)
+	// DeleteQueue removes a spawn-fresh queue file after the recovery spawn
+	// fulfilled its handoff (so a later drain doesn't re-process it).
+	// Production: queue.Delete.
+	DeleteQueue func(path string) error
 	// HandoffDocs lists handoff doc filenames in ~/.fleet/handoffs/.
 	// Production: a ReadDir over state.HandoffDir.
 	HandoffDocs func() ([]string, error)
@@ -101,6 +105,7 @@ func defaultDoctorDeps() doctorDeps {
 		SessionAlive:     tmux.SessionAlive,
 		ListPendingQueue: queue.ListPending,
 		ReadQueue:        queue.ReadSpawnFresh,
+		DeleteQueue:      queue.Delete,
 		HandoffDocs:      defaultDoctorHandoffDocs,
 		WedgedDrains:     defaultDoctorWedgedDrains,
 		TakeOver: func(project, agentID string) (bool, error) {
@@ -204,11 +209,19 @@ func doctorProjects(opts doctorOpts, d doctorDeps) ([]string, error) {
 			add(r.Project)
 		}
 	}
-	// Also include any project whose coord-spawn marker / lease lingers even
-	// though its agent record is gone: we can only discover those from the
-	// agent records above (the marker is per-project, keyed by name we don't
-	// have a global index for), so the agent-record scan is the source of
-	// truth. A --project flag covers the "record fully gone" case explicitly.
+	// ALSO include any project named by a pending spawn-fresh queue file
+	// (codex PR6 [P2]): a stuck handoff whose OLD coord record was already
+	// archived leaves ONLY the queue file behind. Without this, `fleet status`
+	// would print "Run fleet doctor" but `fleet doctor` (no --project) would
+	// find nothing to check — the recovery command couldn't reach the very
+	// case it advertises. A --project flag still covers a fully-vanished one.
+	if paths, qerr := d.ListPendingQueue(); qerr == nil {
+		for _, p := range paths {
+			if req, rerr := d.ReadQueue(p); rerr == nil {
+				add(req.Project)
+			}
+		}
+	}
 	return out, nil
 }
 
@@ -418,6 +431,16 @@ func fixOneProject(pr *doctorProjectReport, stdout, stderr io.Writer, d doctorDe
 	// the archive (same reason drainWaitBarrierOrEscalate caches it).
 	cachedOld := cacheCoordRecord(project, d)
 
+	// Cache the pending handoff request (codex PR6 [P1]): a stuck handoff left
+	// a spawn-fresh queue file naming the handoff doc + the pre-allocated
+	// successor id. The recovery MUST carry those into RecoverSpawn — without
+	// the doc the successor comes up IDLE, and without the pre-allocated id it
+	// can't ADOPT an already-spawned successor (it would re-spawn / collide).
+	// Read it before the takeover so we have the metadata even though OLD's
+	// record gets archived. queuePath is the file to delete once the recovery
+	// fulfills the request (so a later drain doesn't re-process it).
+	queuePath, queueReq := pendingQueueForProject(project, d)
+
 	pr.fixPlanned = true
 	_, _ = fmt.Fprintf(stdout,
 		"Project %s: %s. Plan: stop the stuck coordinator, then start a fresh one.\n",
@@ -463,8 +486,15 @@ func fixOneProject(pr *doctorProjectReport, stdout, stderr io.Writer, d doctorDe
 		return
 	}
 	_, _ = fmt.Fprintf(stdout, "  - Starting a fresh coordinator.\n")
-	docPath := ""
-	if rerr := d.RecoverSpawn(cachedOld, docPath, "", cachedOld.DisableAutoResume, stdout, stderr); rerr != nil {
+	// Carry the queued handoff metadata (codex PR6 [P1]): the doc so the
+	// successor resumes the in-flight work (not idle), and the pre-allocated
+	// successor id so RecoverSpawn ADOPTS an already-spawned replacement
+	// instead of colliding. effectiveDisableAutoResume resolves the queue's
+	// per-handoff override against OLD's baseline, exactly as the drain path.
+	docPath := queueReq.HandoffDoc
+	preAllocatedID := queueReq.NewAgentID
+	disableAutoResume := effectiveDisableAutoResume(queueReq, cachedOld)
+	if rerr := d.RecoverSpawn(cachedOld, docPath, preAllocatedID, disableAutoResume, stdout, stderr); rerr != nil {
 		pr.fixErr = rerr
 		pr.verboseFix = append(pr.verboseFix, "recover-spawn error: "+rerr.Error())
 		_, _ = fmt.Fprintf(stderr,
@@ -472,11 +502,42 @@ func fixOneProject(pr *doctorProjectReport, stdout, stderr io.Writer, d doctorDe
 				"Run `fleet dispatch --coord-spawn` to retry.\n", project, rerr)
 		return
 	}
+	// The recovery fulfilled the handoff — delete the pending queue file so a
+	// later drain doesn't re-process it (a delete failure is surfaced, not
+	// silent: a lingering queue file would re-spawn). Skip when there was no
+	// pending request (a hung coord with no queued handoff).
+	if queuePath != "" {
+		if derr := d.DeleteQueue(queuePath); derr != nil {
+			pr.verboseFix = append(pr.verboseFix, "queue delete failed: "+derr.Error())
+			_, _ = fmt.Fprintf(stderr,
+				"Project %s: recovered the coordinator but couldn't clear the pending handoff file (%v); "+
+					"rerun `fleet drain` to clean it.\n", project, derr)
+		}
+	}
 	pr.fixActions = []string{
 		"Stopped the stuck coordinator.",
 		"Started a fresh coordinator.",
 	}
 	_, _ = fmt.Fprintf(stdout, "Project %s: recovery complete.\n", project)
+}
+
+// pendingQueueForProject returns the first pending spawn-fresh queue file
+// (path + parsed request) for project, or ("", zero) if none. The recovery
+// uses it to carry the queued handoff doc + pre-allocated successor id into
+// the respawn so the successor resumes the in-flight work instead of coming
+// up idle (codex PR6 [P1]). Best-effort + read-only.
+func pendingQueueForProject(project string, d doctorDeps) (string, queue.SpawnFresh) {
+	paths, err := d.ListPendingQueue()
+	if err != nil {
+		return "", queue.SpawnFresh{}
+	}
+	for _, p := range paths {
+		req, rerr := d.ReadQueue(p)
+		if rerr == nil && req.Project == project {
+			return p, req
+		}
+	}
+	return "", queue.SpawnFresh{}
 }
 
 // cacheCoordRecord loads the project's coord agent record (via the coord-spawn
@@ -590,6 +651,9 @@ func fillDoctorDeps(d doctorDeps) doctorDeps {
 	}
 	if d.ReadQueue == nil {
 		d.ReadQueue = def.ReadQueue
+	}
+	if d.DeleteQueue == nil {
+		d.DeleteQueue = def.DeleteQueue
 	}
 	if d.HandoffDocs == nil {
 		d.HandoffDocs = def.HandoffDocs
