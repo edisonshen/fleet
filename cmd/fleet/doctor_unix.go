@@ -343,7 +343,9 @@ func diagnoseProject(project string, wedgedDrains int, wedgedErr error, d doctor
 
 	// Headline status from the lease classification.
 	switch diag.Health {
-	case coordlock.LeaseHealthOK:
+	case coordlock.LeaseHealthOK, coordlock.LeaseHealthBooting:
+		// OK = a heartbeating leader; Booting = a fresh holder mid-startup (a
+		// leader is coming). Neither is stuck (codex PR6 iter-16 [P2]).
 		pr.status = doctorStatusHealthy
 	case coordlock.LeaseHealthHung:
 		pr.status = doctorStatusUnresponsive
@@ -514,7 +516,15 @@ func pendingStuckHandoff(project string, d doctorDeps) bool {
 // status/diagnosis path. Used by the stuck-handoff scan; the --fix guards
 // keep using LeaderPresent (they run on a mutating path anyway).
 func leaderHealthyReadOnly(project string, d doctorDeps) bool {
-	return d.Diagnose(project).Health == coordlock.LeaseHealthOK
+	switch d.Diagnose(project).Health {
+	case coordlock.LeaseHealthOK, coordlock.LeaseHealthBooting:
+		// OK = a heartbeating leader; Booting = a fresh holder mid-startup
+		// (a leader is coming). Both mean "not a stuck handoff" (codex PR6
+		// iter-16 [P2]) — mirrors LeaderPresent's busy-flock booting check.
+		return true
+	default:
+		return false
+	}
 }
 
 // isCoordHandoffQueue reports whether a pending spawn-fresh request is a

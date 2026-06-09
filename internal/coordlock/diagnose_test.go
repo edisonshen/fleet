@@ -13,6 +13,7 @@ package coordlock
 import (
 	"os"
 	"path/filepath"
+	"strconv"
 	"syscall"
 	"testing"
 )
@@ -215,5 +216,49 @@ func TestDiagnose_ReadOnly_DoesNotCreateFlock(t *testing.T) {
 		t.Fatalf("Diagnose created coordinator.flock during a read-only inspection")
 	} else if !os.IsNotExist(statErr) {
 		t.Fatalf("unexpected stat error: %v", statErr)
+	}
+}
+
+// TestDiagnose_BusyFlockNoEpoch_FreshHolder_Booting: a holder grabbed the
+// flock and is mid-startup (fresh same-boot live body, no epoch yet) — the
+// normal startup window. Diagnose must return Booting (a leader is coming),
+// NOT Hung and NOT None, so read-only scans don't false-alarm (codex PR6
+// iter-16 [P2]).
+func TestDiagnose_BusyFlockNoEpoch_FreshHolder_Booting(t *testing.T) {
+	setupHome(t)
+	const project = "diag-booting"
+	clk := &fakeClock{}
+	live := newFakeLiveness()
+	cfg := testCfg(clk, live)
+
+	paths, err := resolvePaths(project)
+	if err != nil {
+		t.Fatalf("resolvePaths: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Dir(paths.flock), 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	f, err := os.OpenFile(paths.flock, os.O_CREATE|os.O_RDWR, 0o644)
+	if err != nil {
+		t.Fatalf("open flock: %v", err)
+	}
+	t.Cleanup(func() { _ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN); _ = f.Close() })
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		t.Fatalf("flock: %v", err)
+	}
+	// FRESH body: a LIVE pid, same boot, mono = now -> flockHolderRecoverable
+	// is false -> legitimately booting.
+	const bootPid = 30303
+	const bootStart = int64(303030)
+	live.set(bootPid, bootStart)
+	freshBody := `{"pid":30303,"pid_start":303030,"boot_id":"test-boot-1","mono":` +
+		strconv.FormatInt(clk.now(), 10) + `}`
+	if _, werr := f.WriteAt([]byte(freshBody), 0); werr != nil {
+		t.Fatalf("write body: %v", werr)
+	}
+	_ = f.Sync()
+
+	if got := diagnoseWithCfg(project, cfg); got.Health != LeaseHealthBooting {
+		t.Fatalf("busy flock + no epoch + fresh live body: Health=%v, want Booting", got.Health)
 	}
 }

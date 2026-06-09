@@ -51,6 +51,12 @@ const (
 	LeaseHealthFencedNotAcquired
 	// LeaseHealthReleased — the holder cleanly released; no live leader.
 	LeaseHealthReleased
+	// LeaseHealthBooting — a holder took coordinator.flock but has not written
+	// coordinator.epoch yet: the NORMAL startup window for a fresh same-boot
+	// live leader. A leader IS coming (LeaderPresent treats this as present),
+	// so read-only scans must NOT false-alarm a stuck handoff here; --fix
+	// leaves it alone (it is not stuck).
+	LeaseHealthBooting
 )
 
 // LeaseDiagnosis is the read-only snapshot of a project's coordinator lease.
@@ -129,13 +135,15 @@ func diagnoseWithCfg(project string, cfg leaseConfig) LeaseDiagnosis {
 			// No flock file, an unreadable probe, or a FREE flock -> no holder.
 			return LeaseDiagnosis{Health: LeaseHealthNone}
 		}
-		// Busy flock, no epoch: a fresh same-boot live holder is legitimately
-		// booting (None); a stale/dead/cross-boot/past-TTL body is a holder
-		// hung in the acquire window -> Hung (recoverable).
+		// Busy flock, no epoch: a stale/dead/cross-boot/past-TTL body is a
+		// holder hung in the acquire window -> Hung (recoverable). A fresh
+		// same-boot live holder is legitimately BOOTING (codex PR6 iter-16
+		// [P2]): a leader is coming, so it is NOT None — read-only scans must
+		// not false-alarm a stuck handoff during normal startup.
 		if l.flockHolderRecoverable() {
 			return LeaseDiagnosis{Health: LeaseHealthHung}
 		}
-		return LeaseDiagnosis{Health: LeaseHealthNone}
+		return LeaseDiagnosis{Health: LeaseHealthBooting}
 	}
 
 	d := LeaseDiagnosis{

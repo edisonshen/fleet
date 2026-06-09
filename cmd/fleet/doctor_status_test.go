@@ -165,3 +165,27 @@ func TestStatus_StuckHandoff_DoesNotCallLeaderPresent(t *testing.T) {
 		t.Errorf("scan should still surface the stuck handoff via Diagnose:\n%s", out.String())
 	}
 }
+
+// codex PR6 iter-16 [P2]: a coordinator mid-startup (LeaseHealthBooting: flock
+// taken, epoch not written yet) is a leader-is-coming state — a pending coord
+// handoff during that window must NOT be surfaced as stuck.
+func TestStatus_BootingHolder_NotStuck(t *testing.T) {
+	t.Setenv("FLEET_LEASE_FAILOVER", "1")
+	d := doctorTestDeps()
+	d.ListPendingQueue = func() ([]string, error) { return []string{"/q/spawn-fresh-a.json"}, nil }
+	d.ReadQueue = func(string) (queue.SpawnFresh, error) {
+		return queue.SpawnFresh{OldAgentID: "a", Project: "bootproj", TaskID: CoordTaskIDPrefix + "bootproj"}, nil
+	}
+	d.Diagnose = func(string) coordlock.LeaseDiagnosis {
+		return coordlock.LeaseDiagnosis{Health: coordlock.LeaseHealthBooting}
+	}
+	orig := stuckHandoffStatusFn
+	stuckHandoffStatusFn = func() doctorDeps { return d }
+	t.Cleanup(func() { stuckHandoffStatusFn = orig })
+
+	var out, errOut bytes.Buffer
+	emitStuckHandoffSection(&out, &errOut)
+	if out.Len() != 0 {
+		t.Errorf("a booting coordinator must not be surfaced as a stuck handoff, got:\n%s", out.String())
+	}
+}
