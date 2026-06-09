@@ -41,6 +41,7 @@ import (
 	"github.com/edisonshen/fleet/internal/coordlock"
 	"github.com/edisonshen/fleet/internal/gc"
 	"github.com/edisonshen/fleet/internal/queue"
+	"github.com/edisonshen/fleet/internal/spawn"
 	"github.com/edisonshen/fleet/internal/state"
 	"github.com/edisonshen/fleet/internal/tmux"
 )
@@ -260,7 +261,7 @@ func doctorProjects(opts doctorOpts, d doctorDeps) ([]string, error) {
 	// case it advertises. A --project flag still covers a fully-vanished one.
 	if paths, qerr := d.ListPendingQueue(); qerr == nil {
 		for _, p := range paths {
-			if req, rerr := d.ReadQueue(p); rerr == nil {
+			if req, rerr := d.ReadQueue(p); rerr == nil && isCoordHandoffQueue(req) {
 				add(req.Project)
 			}
 		}
@@ -326,8 +327,16 @@ func diagnoseProject(project string, wedgedDrains int, wedgedErr error, d doctor
 		pr.status = doctorStatusHealthy
 	case coordlock.LeaseHealthHung:
 		pr.status = doctorStatusUnresponsive
-	case coordlock.LeaseHealthDead, coordlock.LeaseHealthReleased:
+	case coordlock.LeaseHealthDead:
 		pr.status = doctorStatusDead
+	case coordlock.LeaseHealthReleased:
+		// A `released` lease is a coord that exited CLEANLY (Release writes
+		// `released` before coord.Cleanup archives the record). This is NOT a
+		// stuck coord to recover (codex PR6 iter-3 [P2]): respawning during the
+		// clean-shutdown window would resurrect a coord that meant to stop.
+		// Treat it as "no active coordinator"; only a separate stuck signal (a
+		// pending coord handoff, below) escalates it to a recoverable status.
+		pr.status = doctorStatusNone
 	case coordlock.LeaseHealthFencedNotAcquired:
 		pr.status = doctorStatusNeedsConfirm
 	default: // LeaseHealthNone
@@ -419,7 +428,7 @@ func pendingStuckHandoff(project string, d doctorDeps) bool {
 		if rerr != nil {
 			continue
 		}
-		if req.Project == project {
+		if req.Project == project && isCoordHandoffQueue(req) {
 			hasForProject = true
 			break
 		}
@@ -429,6 +438,17 @@ func pendingStuckHandoff(project string, d doctorDeps) bool {
 	}
 	// A healthy leader means the handoff is in-flight, not stuck.
 	return !d.LeaderPresent(project)
+}
+
+// isCoordHandoffQueue reports whether a pending spawn-fresh request is a
+// COORDINATOR handoff (not a generic worker handoff). queue.SpawnFresh is
+// shared by worker + coord handoffs, so the doctor MUST filter to coord
+// queues (codex PR6 iter-3 [P1]): selecting a worker queue would feed the
+// worker's doc/successor-id into the COORD recovery spawn and then delete the
+// worker queue — wrong resume context + a dropped worker handoff. The
+// discriminator is the SAME spawn.IsCoordSpawn the drain router uses.
+func isCoordHandoffQueue(req queue.SpawnFresh) bool {
+	return spawn.IsCoordSpawn(req.TaskID, req.Project)
 }
 
 // handoffStormCount counts handoff docs whose filename is prefixed with the
@@ -597,7 +617,7 @@ func pendingQueueForProject(project string, d doctorDeps) (string, queue.SpawnFr
 	}
 	for _, p := range paths {
 		req, rerr := d.ReadQueue(p)
-		if rerr == nil && req.Project == project {
+		if rerr == nil && req.Project == project && isCoordHandoffQueue(req) {
 			return p, req
 		}
 	}
@@ -678,7 +698,7 @@ func stuckHandoffProjects(d doctorDeps) ([]string, error) {
 	var out []string
 	for _, p := range paths {
 		req, rerr := d.ReadQueue(p)
-		if rerr != nil || req.Project == "" || seen[req.Project] {
+		if rerr != nil || req.Project == "" || seen[req.Project] || !isCoordHandoffQueue(req) {
 			continue
 		}
 		if d.LeaderPresent(req.Project) {

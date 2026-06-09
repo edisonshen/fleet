@@ -146,9 +146,14 @@ func TestDoctor_T20_FixRecoversStaleLease(t *testing.T) {
 	)
 	d.ListPendingQueue = func() ([]string, error) { return []string{queuePath}, nil }
 	d.ReadQueue = func(string) (queue.SpawnFresh, error) {
-		// A real pending handoff: it names the doc to resume from + the
+		// A real pending COORD handoff: it names the doc to resume from + the
 		// pre-allocated successor id the recovery must carry (codex PR6 [P1]).
-		return queue.SpawnFresh{OldAgentID: coordID, Project: project, HandoffDoc: handoffMd, NewAgentID: newID}, nil
+		// TaskID = coord- + project so isCoordHandoffQueue accepts it (codex
+		// PR6 iter-3 [P1] — a worker queue must NOT be picked).
+		return queue.SpawnFresh{
+			OldAgentID: coordID, Project: project, TaskID: CoordTaskIDPrefix + project,
+			HandoffDoc: handoffMd, NewAgentID: newID,
+		}, nil
 	}
 	var deleted int32
 	d.DeleteQueue = func(p string) error {
@@ -225,7 +230,7 @@ func TestDoctor_DiscoversQueueOnlyStuckProject(t *testing.T) {
 	// healthy leader holds the lease -> a stuck handoff.
 	d.ListPendingQueue = func() ([]string, error) { return []string{"/q/spawn-fresh-old.json"}, nil }
 	d.ReadQueue = func(string) (queue.SpawnFresh, error) {
-		return queue.SpawnFresh{OldAgentID: "old", Project: project}, nil
+		return queue.SpawnFresh{OldAgentID: "old", Project: project, TaskID: CoordTaskIDPrefix + project}, nil
 	}
 	d.LeaderPresent = func(string) bool { return false }
 
@@ -441,5 +446,93 @@ func TestDoctor_AmbiguousSessionProbe_NotTreatedDead(t *testing.T) {
 		if strings.Contains(f.plain, "terminal session is gone") {
 			t.Errorf("ambiguous tmux probe wrongly reported the session gone: %q", f.plain)
 		}
+	}
+}
+
+// --- codex PR6 iter-3 regressions ---
+
+// [P1] a WORKER handoff queue for the same project must NOT be consumed by
+// coord recovery: its doc/id must not feed the coord respawn and its queue
+// must not be deleted.
+func TestDoctor_IgnoresWorkerHandoffQueue(t *testing.T) {
+	const (
+		project = "wqproj"
+		coordID = "wqcoord"
+	)
+	old := agent.New(coordID)
+	old.Project = project
+	old.TaskID = CoordTaskIDPrefix + project
+	old.SupervisorPID = 222
+	old.Command = []string{"claude"}
+
+	d := doctorTestDeps()
+	d.Diagnose = func(string) coordlock.LeaseDiagnosis {
+		return coordlock.LeaseDiagnosis{Health: coordlock.LeaseHealthDead, HasRecord: true, OwnerPID: 222, OwnerAlive: false}
+	}
+	d.CoordMarker = func(string) string { return coordID }
+	d.LoadAgent = func(id string) (*agent.Record, error) {
+		if id == coordID {
+			return old, nil
+		}
+		return nil, errors.New("no record")
+	}
+	// The ONLY pending queue is a WORKER handoff for this project (TaskID is a
+	// plain worker task, NOT coord-<project>).
+	d.ListPendingQueue = func() ([]string, error) { return []string{"/q/spawn-fresh-worker.json"}, nil }
+	d.ReadQueue = func(string) (queue.SpawnFresh, error) {
+		return queue.SpawnFresh{OldAgentID: "worker7", Project: project, TaskID: "task-42",
+			HandoffDoc: "/tmp/worker-handoff.md", NewAgentID: "worker8"}, nil
+	}
+	var deleted int32
+	d.DeleteQueue = func(string) error { atomic.AddInt32(&deleted, 1); return nil }
+	d.TakeOver = func(string, string) (bool, error) { return true, nil }
+	var gotDoc, gotID string
+	d.RecoverSpawn = func(_ *agent.Record, doc string, preID string, _ bool, _, _ io.Writer) error {
+		gotDoc, gotID = doc, preID
+		return nil
+	}
+
+	report, err := gatherDoctorReportWith(doctorOpts{project: project, fix: true}, d)
+	if err != nil {
+		t.Fatalf("gather: %v", err)
+	}
+	var out, errOut bytes.Buffer
+	doctorRunFixWith(doctorOpts{project: project, fix: true}, &report, &out, &errOut, d)
+
+	if gotDoc == "/tmp/worker-handoff.md" || gotID == "worker8" {
+		t.Errorf("coord recovery consumed the WORKER handoff metadata (doc=%q id=%q)", gotDoc, gotID)
+	}
+	if atomic.LoadInt32(&deleted) != 0 {
+		t.Errorf("coord recovery deleted the worker handoff queue (%d) — that drops the worker handoff", deleted)
+	}
+}
+
+// [P2] a cleanly-RELEASED lease is NOT a stuck coord: read-only diagnosis
+// reports nothing-to-recover, and --fix does not respawn.
+func TestDoctor_ReleasedLease_NotRecovered(t *testing.T) {
+	const project = "relproj"
+	d := doctorTestDeps()
+	d.Diagnose = func(string) coordlock.LeaseDiagnosis {
+		return coordlock.LeaseDiagnosis{Health: coordlock.LeaseHealthReleased, HasRecord: true, State: "released"}
+	}
+	var killed, respawned int32
+	d.TakeOver = func(string, string) (bool, error) { atomic.AddInt32(&killed, 1); return false, nil }
+	d.RecoverSpawn = func(*agent.Record, string, string, bool, io.Writer, io.Writer) error {
+		atomic.AddInt32(&respawned, 1)
+		return nil
+	}
+
+	report, err := gatherDoctorReportWith(doctorOpts{project: project, fix: true}, d)
+	if err != nil {
+		t.Fatalf("gather: %v", err)
+	}
+	pr := report.projects[0]
+	if pr.status.needsRecovery() {
+		t.Errorf("released lease classified as needing recovery (status=%v)", pr.status)
+	}
+	var out, errOut bytes.Buffer
+	doctorRunFixWith(doctorOpts{project: project, fix: true}, &report, &out, &errOut, d)
+	if atomic.LoadInt32(&killed) != 0 || atomic.LoadInt32(&respawned) != 0 {
+		t.Errorf("released lease triggered recovery (killed=%d respawned=%d) — resurrects a cleanly-stopped coord", killed, respawned)
 	}
 }

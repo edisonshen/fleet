@@ -26,9 +26,9 @@ func TestStatus_StuckHandoff_Surfaced(t *testing.T) {
 	}
 	d.ReadQueue = func(p string) (queue.SpawnFresh, error) {
 		if strings.Contains(p, "-a.json") {
-			return queue.SpawnFresh{OldAgentID: "a", Project: "stuckproj"}, nil
+			return queue.SpawnFresh{OldAgentID: "a", Project: "stuckproj", TaskID: CoordTaskIDPrefix + "stuckproj"}, nil
 		}
-		return queue.SpawnFresh{OldAgentID: "b", Project: "liveproj"}, nil
+		return queue.SpawnFresh{OldAgentID: "b", Project: "liveproj", TaskID: CoordTaskIDPrefix + "liveproj"}, nil
 	}
 	d.LeaderPresent = func(project string) bool { return project == "liveproj" }
 
