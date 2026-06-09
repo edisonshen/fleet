@@ -429,6 +429,12 @@ func diagnoseProject(project string, wedgedDrains int, wedgedErr error, d doctor
 // was requested but never completed. A pending queue file WITH a healthy
 // leader is a benign in-flight handoff, not a stuck one.
 func pendingStuckHandoff(project string, d doctorDeps) bool {
+	// With failover off there is no lease, so LeaderPresent is always false and
+	// a benign legacy handoff would look stuck (codex PR6 iter-5 [P2]). The
+	// lease-aware stuck signal doesn't apply in legacy mode.
+	if !coordlock.FailoverEnabled() {
+		return false
+	}
 	paths, err := d.ListPendingQueue()
 	if err != nil || len(paths) == 0 {
 		return false
@@ -707,6 +713,14 @@ const doctorStuckHandoffLine = "Fleet isn't responding — the handoff to a fres
 // handoff (a spawn-fresh queue file) AND no live leader — the wedged-handoff
 // set. Read-only.
 func stuckHandoffProjects(d doctorDeps) ([]string, error) {
+	// Only meaningful with the lease failover ON (codex PR6 iter-5 [P2]): with
+	// FLEET_LEASE_FAILOVER=0 legacy coords hold NO lease, so LeaderPresent is
+	// always false and EVERY pending handoff would look "stuck" — pointing the
+	// operator at `fleet doctor`, which can't recover with failover off. The
+	// lease-aware stuck-handoff signal simply doesn't apply in legacy mode.
+	if !coordlock.FailoverEnabled() {
+		return nil, nil
+	}
 	paths, err := d.ListPendingQueue()
 	if err != nil {
 		return nil, err

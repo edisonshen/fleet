@@ -159,3 +159,35 @@ func TestDiagnose_NoEpoch_FreeFlock_None(t *testing.T) {
 		t.Fatalf("no epoch + free flock: Health=%v, want None", got.Health)
 	}
 }
+
+// TestDiagnose_ReleasedButFlockHeld_Hung: a `released` record whose flock is
+// STILL HELD is a releaser that hung mid-cleanup. The acquire path takes it
+// over after the retry budget, so Diagnose must classify it Hung, not
+// Released (codex PR6 iter-5 [P2]).
+func TestDiagnose_ReleasedButFlockHeld_Hung(t *testing.T) {
+	setupHome(t)
+	const project = "diag-relheld"
+	clk := &fakeClock{}
+	live := newFakeLiveness()
+	cfg := testCfg(clk, live)
+
+	owner := identity{Pid: 4242, PidStart: 424242, AgentID: "rel", Project: project}
+	live.set(owner.Pid, owner.PidStart)
+	writeEpochRaw(t, project, epochRecord{
+		Epoch: 8, State: stateReleased, Owner: owner,
+		BootID: "test-boot-1", RenewedAtMono: clk.now(),
+	})
+	// Flock STILL held by a separate fd -> the releaser hung before dropping it.
+	rel := holdFlock(t, project)
+	defer rel()
+
+	if got := diagnoseWithCfg(project, cfg); got.Health != LeaseHealthHung {
+		t.Fatalf("released + flock held: Health=%v, want Hung (hung releaser)", got.Health)
+	}
+
+	// Drop the flock -> a clean Released (nothing to recover).
+	rel()
+	if got := diagnoseWithCfg(project, cfg); got.Health != LeaseHealthReleased {
+		t.Fatalf("released + flock free: Health=%v, want Released (clean)", got.Health)
+	}
+}

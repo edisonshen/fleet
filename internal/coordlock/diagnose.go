@@ -147,24 +147,38 @@ func diagnoseWithCfg(project string, cfg leaseConfig) LeaseDiagnosis {
 		OwnerAlive:    l.pidAlive(rec.Owner),
 	}
 
+	d.Health = classifyDiagnosis(rec, paths, l)
+	return d
+}
+
+// classifyDiagnosis maps an on-disk epoch record to a LeaseHealth using the
+// SAME predicates the acquire path applies.
+func classifyDiagnosis(rec epochRecord, paths leasePaths, l *Lease) LeaseHealth {
 	switch rec.State {
 	case stateActive:
 		if l.holderHealthy(rec) {
-			d.Health = LeaseHealthOK
-			return d
+			return LeaseHealthOK
 		}
 		// Active record but NOT healthy: either the owner pid is gone
 		// (Dead) or it is alive with a frozen heartbeat / cross-boot stamp
 		// (Hung). pidAlive is the discriminator the acquire path uses.
-		if d.OwnerAlive {
-			d.Health = LeaseHealthHung
-		} else {
-			d.Health = LeaseHealthDead
+		if l.pidAlive(rec.Owner) {
+			return LeaseHealthHung
 		}
+		return LeaseHealthDead
 	case stateFencedNotAcquired:
-		d.Health = LeaseHealthFencedNotAcquired
+		return LeaseHealthFencedNotAcquired
 	case stateReleased:
-		d.Health = LeaseHealthReleased
+		// A `released` record normally means a coord exited cleanly. But if the
+		// flock is STILL HELD, the releaser demoted the record then HUNG before
+		// dropping the flock — the acquire path bounded-retries the flock and,
+		// on budget exhaustion, takes the releaser over as a hung holder (codex
+		// PR6 iter-5 [P2]). Diagnose mirrors that: flock still busy -> Hung
+		// (recoverable); flock free -> a clean Released (nothing to recover).
+		if flockBusy(paths.flock) {
+			return LeaseHealthHung
+		}
+		return LeaseHealthReleased
 	case stateFencing:
 		// A fencing record is mid-takeover. If a fresh, live, in-budget
 		// candidate is driving it, a successor is coming (treat as OK so the
@@ -172,12 +186,27 @@ func diagnoseWithCfg(project string, cfg leaseConfig) LeaseDiagnosis {
 		// abandoned/stalled takeover the doctor should surface as recoverable
 		// (same class as fenced_not_acquired for the operator's purposes).
 		if l.transientResumable(rec) {
-			d.Health = LeaseHealthFencedNotAcquired
-		} else {
-			d.Health = LeaseHealthOK
+			return LeaseHealthFencedNotAcquired
 		}
+		return LeaseHealthOK
 	default:
-		d.Health = LeaseHealthNone
+		return LeaseHealthNone
 	}
-	return d
+}
+
+// flockBusy reports whether coordinator.flock is currently held by some
+// process (a non-NB acquire would block). It tries a NB acquire: success
+// means FREE (released immediately), EWOULDBLOCK means BUSY. Any open/flock
+// error degrades to "not busy" (conservative: the caller then treats a
+// released record as clean rather than inventing a hung holder). Read-only.
+func flockBusy(path string) bool {
+	f, gotFlock, err := tryFlock(path)
+	if err != nil {
+		return false
+	}
+	if gotFlock {
+		_ = releaseFlock(f)
+		return false
+	}
+	return true
 }

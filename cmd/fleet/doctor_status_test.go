@@ -72,3 +72,26 @@ func TestStatus_NoStuckHandoff_Silent(t *testing.T) {
 		t.Errorf("healthy state should be silent, got:\n%s", out.String())
 	}
 }
+
+// codex PR6 iter-5 [P2]: with FLEET_LEASE_FAILOVER=0 (legacy mode) the
+// lease-aware stuck-handoff signal doesn't apply — LeaderPresent is always
+// false, so a benign pending legacy handoff must NOT be advertised as stuck.
+func TestStatus_FailoverDisabled_NoStuckHandoff(t *testing.T) {
+	t.Setenv("FLEET_LEASE_FAILOVER", "0")
+	d := doctorTestDeps()
+	d.ListPendingQueue = func() ([]string, error) { return []string{"/q/spawn-fresh-a.json"}, nil }
+	d.ReadQueue = func(string) (queue.SpawnFresh, error) {
+		return queue.SpawnFresh{OldAgentID: "a", Project: "legacyproj", TaskID: CoordTaskIDPrefix + "legacyproj"}, nil
+	}
+	d.LeaderPresent = func(string) bool { return false } // legacy: no lease
+
+	orig := stuckHandoffStatusFn
+	stuckHandoffStatusFn = func() doctorDeps { return d }
+	t.Cleanup(func() { stuckHandoffStatusFn = orig })
+
+	var out, errOut bytes.Buffer
+	emitStuckHandoffSection(&out, &errOut)
+	if out.Len() != 0 {
+		t.Errorf("legacy mode (failover off) must not surface stuck handoffs, got:\n%s", out.String())
+	}
+}
