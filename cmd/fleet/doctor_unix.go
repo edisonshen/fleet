@@ -804,37 +804,42 @@ func pendingQueueForProject(project string, d doctorDeps) (string, queue.SpawnFr
 	return "", queue.SpawnFresh{}
 }
 
-// cacheCoordRecord loads the project's coord agent record BEFORE a takeover
-// archives it, trying in order:
-//  1. the coord-spawn marker's LIVE record;
-//  2. a LIVE-records TaskID scan;
-//  3. the pending queue's OldAgentID — LIVE then ARCHIVE (codex PR6 iter-7
-//     [P1]). The queue-only stuck case (the OLD coord record was already
-//     archived when its handoff retired it, leaving only the spawn-fresh
-//     file) has NO live marker/record, so without the archive fallback --fix
-//     would take over but then error with "record gone" — unable to fix the
-//     very case `fleet doctor` advertises.
+// cacheCoordRecord loads the project's coord agent record to respawn from
+// BEFORE a takeover archives it, trying in order:
+//  1. the pending queue's OldAgentID — LIVE then ARCHIVE, FIRST when a coord
+//     handoff is pending (codex PR6 iter-19 [P1]). A pending handoff may have
+//     already moved the coord-spawn marker to NewAgentID, so the OUTGOING coord
+//     the queue names — not the marker's preallocated successor — is the
+//     correct recovery source; trusting the marker first would respawn from the
+//     stale replacement (corrupting lineage / colliding on preAllocatedID).
+//  2. the coord-spawn marker's LIVE record (validated as this project's coord);
+//  3. a LIVE-records TaskID scan;
 //  4. the lease epoch's OwnerAgentID — LIVE then ARCHIVE (codex PR6 iter-12
 //     [P2]). The LEASE-ONLY stuck case (only a lingering coordinator.epoch —
-//     no marker, no record, no queue) still names the OLD owner in the epoch;
-//     load its archived record so --fix can restart instead of dead-ending.
+//     no marker, no record, no queue) still names the OLD owner in the epoch.
 //
-// queueReq is the pending handoff request for this project (zero value if
-// none); leaseOwnerID is the lease epoch's recorded owner agent id (empty if
-// none). Returns nil only when no record can be found anywhere (the fixer
+// Every candidate is validated to be THIS project's coordinator (a stale id /
+// worker record must never respawn). queueReq is the pending handoff request
+// (zero value if none); leaseOwnerID is the lease epoch's owner agent id (empty
+// if none). Returns nil only when no record can be found anywhere (the fixer
 // then surfaces a manual recovery step rather than spawning blind).
 func cacheCoordRecord(project string, queueReq queue.SpawnFresh, leaseOwnerID string, d doctorDeps) *agent.Record {
+	// 1. The QUEUE's outgoing coord FIRST (the recovery source for a pending
+	// handoff) — live then archive, validated.
+	if queueReq.OldAgentID != "" {
+		if rec := loadCoordRecordByID(queueReq.OldAgentID, project, d); rec != nil {
+			return rec
+		}
+	}
+	// 2. The coord-spawn marker's record (validated — a STALE marker can point
+	// at a non-coordinator / other-project record; codex PR6 iter-10 [P2]).
 	if marker := d.CoordMarker(project); marker != "" {
-		// VALIDATE the marker record before trusting it (codex PR6 iter-10
-		// [P2]): a STALE marker can point at a non-coordinator (or another
-		// project's) record. Respawning from a worker record would spawn the
-		// wrong, unwrapped command — leaving the project coordless after the
-		// takeover. Require it to be THIS project's coordinator.
 		if rec, err := d.LoadAgent(marker); err == nil && rec != nil &&
 			rec.Project == project && isCoordAgentRecord(rec) {
 			return rec
 		}
 	}
+	// 3. A live-records TaskID scan.
 	if recs, err := d.ListAgents(); err == nil {
 		for _, r := range recs {
 			if r != nil && isCoordAgentRecord(r) && r.Project == project {
@@ -842,16 +847,10 @@ func cacheCoordRecord(project string, queueReq queue.SpawnFresh, leaseOwnerID st
 			}
 		}
 	}
-	// Queue-only fallback: load the OLD coord named by the pending handoff —
-	// live first, then the archive (it was retired when the handoff was
-	// requested). Lease-only fallback: the epoch's recorded owner id (codex PR6
-	// iter-12 [P2]). Each candidate is validated to be THIS project's coord (a
-	// stale id must not respawn a worker/other-project record).
-	for _, id := range []string{queueReq.OldAgentID, leaseOwnerID} {
-		if id == "" {
-			continue
-		}
-		if rec := loadCoordRecordByID(id, project, d); rec != nil {
+	// 4. The lease epoch's recorded owner id — the lease-only fallback (codex
+	// PR6 iter-12 [P2]).
+	if leaseOwnerID != "" {
+		if rec := loadCoordRecordByID(leaseOwnerID, project, d); rec != nil {
 			return rec
 		}
 	}
@@ -879,11 +878,16 @@ func loadCoordRecordByID(id, project string, d doctorDeps) *agent.Record {
 // so the two serialize on the SAME key: prefer the cached coord record id, then
 // the pending queue's OldAgentID, then a project-scoped fallback.
 func postTakeoverLockID(cachedOld *agent.Record, queueReq queue.SpawnFresh, project string) string {
-	if cachedOld != nil && cachedOld.ID != "" {
-		return cachedOld.ID
-	}
+	// Prefer the QUEUE's OldAgentID whenever a coord handoff is pending (codex
+	// PR6 iter-19 [P1]): the drain path locks on req.OldAgentID, so doctor MUST
+	// use the SAME key for queued handoffs — else a concurrent doctor + drain
+	// take DIFFERENT locks (the marker/cache may point at the preallocated
+	// successor) and both pass the under-lock queue re-check, double-spawning.
 	if queueReq.OldAgentID != "" {
 		return queueReq.OldAgentID
+	}
+	if cachedOld != nil && cachedOld.ID != "" {
+		return cachedOld.ID
 	}
 	return "doctor-fix-" + project
 }

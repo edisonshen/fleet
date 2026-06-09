@@ -1141,3 +1141,57 @@ func TestDoctor_ConcurrentRecovery_StandsDownUnderLock(t *testing.T) {
 		t.Errorf("standing down on a peer recovery should not be an error: %v", pr.fixErr)
 	}
 }
+
+// --- codex PR6 iter-19 regression ---
+
+// [P1] when a coord handoff is pending, the QUEUE's OldAgentID is the recovery
+// source + the lock key — even if the marker already moved to the preallocated
+// successor. cacheCoordRecord must respawn from the OUTGOING coord, and
+// postTakeoverLockID must lock on the queue's OldAgentID (matching the drain
+// path) so doctor + drain contend on the same key.
+func TestDoctor_QueuedHandoff_PrefersOutgoingCoord(t *testing.T) {
+	const (
+		project     = "qhproj"
+		outgoingID  = "qhout"
+		successorID = "qhsucc"
+	)
+	outgoing := agent.New(outgoingID)
+	outgoing.Project = project
+	outgoing.TaskID = CoordTaskIDPrefix + project
+	outgoing.SupervisorPID = 909
+	outgoing.Command = []string{"claude"}
+
+	// The marker already points at the preallocated SUCCESSOR (a handoff in
+	// progress moved it). It is also a coord record for the project.
+	successor := agent.New(successorID)
+	successor.Project = project
+	successor.TaskID = CoordTaskIDPrefix + project
+
+	queueReq := queue.SpawnFresh{
+		OldAgentID: outgoingID, Project: project, TaskID: CoordTaskIDPrefix + project,
+		HandoffDoc: "/tmp/qh.md", NewAgentID: successorID,
+	}
+
+	d := doctorTestDeps()
+	d.CoordMarker = func(string) string { return successorID } // marker moved to successor
+	d.LoadAgent = func(id string) (*agent.Record, error) {
+		switch id {
+		case outgoingID:
+			return outgoing, nil
+		case successorID:
+			return successor, nil
+		}
+		return nil, errors.New("no record")
+	}
+
+	// cacheCoordRecord must prefer the QUEUE's outgoing coord, not the marker.
+	got := cacheCoordRecord(project, queueReq, "", d)
+	if got == nil || got.ID != outgoingID {
+		t.Fatalf("cacheCoordRecord = %v, want the queue's outgoing coord %s (not the marker's successor)", got, outgoingID)
+	}
+
+	// And the lock key must be the queue's OldAgentID (drain locks the same).
+	if id := postTakeoverLockID(successor, queueReq, project); id != outgoingID {
+		t.Fatalf("postTakeoverLockID = %q, want the queue OldAgentID %q (must match drain's lock key)", id, outgoingID)
+	}
+}
