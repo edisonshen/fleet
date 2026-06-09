@@ -741,6 +741,9 @@ func spawnAndRetire(req queue.SpawnFresh, queuePath string,
 	isCoordSwap := false
 	if oldRec.Project != "" && state.ReadCoordSpawnMarker(oldRec.Project) == oldRec.ID {
 		isCoordSwap = true
+		if leaseFailoverEnabled() {
+			return refuseLeaseWrappedCoordHandoffRetire(oldRec, newRec, stderr)
+		}
 		// Eager marker write — closes the duplicate-coord window
 		// during NEW's readiness wait. Best-effort; marker errors
 		// print a warning but don't fail the drain. retireOldAgent's
@@ -811,6 +814,9 @@ func retireOldAgent(oldRec, newRec *agent.Record, docPath, queuePath string,
 	// this respects the iter-2 P2 invariant. If the new agent dies
 	// during the wait, OLD is still alive; roll back the new and
 	// return so operator/recovery can retry cleanly.
+	if isCoordSwap && leaseFailoverEnabled() {
+		return refuseLeaseWrappedCoordHandoffRetire(oldRec, newRec, stderr)
+	}
 	//
 	// Always runs, even when auto-resume is disabled (codex iter-9
 	// P1): the wait doubles as a post-spawn liveness check, catching
@@ -866,9 +872,6 @@ func retireOldAgent(oldRec, newRec *agent.Record, docPath, queuePath string,
 	// AlreadySpawnedNewRec entrypoint skips its own spawn + probe
 	// steps and proceeds straight to the marker commit.
 	if isCoordSwap {
-		if leaseFailoverEnabled() {
-			return refuseLeaseWrappedCoordHandoffRetire(oldRec, newRec, stderr)
-		}
 		_, swapErr := AtomicCoordSwap(AtomicCoordSwapInputs{
 			Project:              oldRec.Project,
 			OldRec:               oldRec,
