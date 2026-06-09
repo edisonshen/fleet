@@ -171,3 +171,28 @@ func TestAugmentCoordRunWrap_ReplacesWrongTimeout(t *testing.T) {
 		t.Errorf("augmented argv = %v, want %v", got, want)
 	}
 }
+
+func TestShouldStandDownLeaseWrappedSpawn(t *testing.T) {
+	leader := func(string) bool { return true }
+
+	if shouldStandDownLeaseWrappedSpawn("rainier", 0, leader,
+		func(string) (int, bool) { return 1234, true }) {
+		t.Fatal("missing supervisor pid must not stand down")
+	}
+	if shouldStandDownLeaseWrappedSpawn("rainier", 1234, nil,
+		func(string) (int, bool) { return 5678, true }) {
+		t.Fatal("missing leader check must not stand down")
+	}
+	if shouldStandDownLeaseWrappedSpawn("rainier", 1234, func(string) bool { return false },
+		func(string) (int, bool) { return 5678, true }) {
+		t.Fatal("no healthy leader must not stand down")
+	}
+	if shouldStandDownLeaseWrappedSpawn("rainier", 1234, leader,
+		func(string) (int, bool) { return 1234, true }) {
+		t.Fatal("this supervisor is the owner; must not stand down")
+	}
+	if !shouldStandDownLeaseWrappedSpawn("rainier", 1234, leader,
+		func(string) (int, bool) { return 5678, true }) {
+		t.Fatal("healthy different owner must stand down instead of exposing idle standby")
+	}
+}

@@ -1126,6 +1126,7 @@ func runDispatch(opts *dispatchOpts, stdout io.Writer) error {
 		// LeaderCheck lets spawn distinguish a clean lease stand-down from
 		// a supervisor failure on the lease-wrapped coord path (PR2).
 		LeaderCheck:    coordLeaderCheck,
+		ActiveOwnerPID: leaseActiveOwnerPID,
 		StandbyTimeout: spawn.DefaultStandbyTimeout,
 	})
 	// Lease stand-down (DESIGN-handoff-drain-storm-leak PR2): the wrapped

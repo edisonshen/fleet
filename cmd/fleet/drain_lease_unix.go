@@ -234,6 +234,7 @@ func productionRecoverSpawn(oldRec *agent.Record, docPath, preAllocatedID string
 		// replacement (codex PR3 iter-10 [P2]). Empty -> spawn.Spawn allocates.
 		PreAllocatedID: preAllocatedID,
 		LeaderCheck:    coordLeaderCheck,
+		ActiveOwnerPID: leaseActiveOwnerPID,
 		StandbyTimeout: spawn.DefaultStandbyTimeout,
 	})
 	if err != nil {

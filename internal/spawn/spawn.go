@@ -709,13 +709,26 @@ type Options struct {
 	// coordlock.CurrentActiveOwnerPID via cmd/fleet (spawn cannot import
 	// coordlock — it is build-tagged to linux/darwin while spawn is
 	// all-platforms).
-	LeaderCheck func(project string) bool
+	LeaderCheck    func(project string) bool
+	ActiveOwnerPID func(project string) (int, bool)
 
 	// StandbyTimeout bounds how long a lease-wrapped coord-run --standby
 	// polls behind a healthy leader before self-exiting cleanly. 0 uses
 	// DefaultStandbyTimeout. Ignored when failover is off or this is not a
 	// coord spawn.
 	StandbyTimeout time.Duration
+}
+
+func shouldStandDownLeaseWrappedSpawn(project string, supervisorPID int,
+	leaderCheck func(string) bool, activeOwnerPID func(string) (int, bool)) bool {
+	if leaderCheck == nil || activeOwnerPID == nil || supervisorPID <= 0 {
+		return false
+	}
+	if !leaderCheck(project) {
+		return false
+	}
+	ownerPID, ok := activeOwnerPID(project)
+	return ok && ownerPID > 0 && ownerPID != supervisorPID
 }
 
 // Spawn creates a fresh agent (or a handoff replacement, if
@@ -1122,6 +1135,18 @@ func Spawn(opts Options) (*agent.Record, error) {
 			rec.SupervisorPID = onDisk.SupervisorPID
 			rec.SupervisorPidStart = onDisk.SupervisorPidStart
 			rec.SupervisorExePath = onDisk.SupervisorExePath
+			if shouldStandDownLeaseWrappedSpawn(rec.Project, rec.SupervisorPID,
+				opts.LeaderCheck, opts.ActiveOwnerPID) {
+				unlock()
+				_ = tmux.Kill(session)
+				if livePath, perr := state.AgentPath(id); perr == nil {
+					_ = os.Remove(livePath)
+				}
+				_, _ = fmt.Fprintf(os.Stderr,
+					"spawn: coord %s stood down — a healthy leader already holds the lease "+
+						"for %q; not leaving an idle standby record\n", id, rec.Project)
+				return rec, ErrCoordStoodDown
+			}
 			// A lease-wrapped standby spawn skipped engine-pid resolution, so
 			// our in-memory rec.PID may still be the provisional spawning-CLI
 			// pid. If coord-run already acquired the lease and stamped the real
