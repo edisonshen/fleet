@@ -1411,6 +1411,37 @@ func TestDrain_LeaseFailoverCoordHandoffRefusesBeforeRetiringOld(t *testing.T) {
 	}
 }
 
+func TestShouldRefuseLeaseWrappedCoordHandoffRetire_RequiresLiveOld(t *testing.T) {
+	t.Setenv("FLEET_LEASE_FAILOVER", "1")
+	oldRec := &agent.Record{ID: "oldcoord", TmuxSession: "fleet-oldcoord"}
+
+	origAlive := tmuxSessionAliveFn
+	tmuxSessionAliveFn = func(session string) (bool, error) {
+		if session != oldRec.TmuxSession {
+			t.Fatalf("probed session %q, want %q", session, oldRec.TmuxSession)
+		}
+		return false, nil
+	}
+	t.Cleanup(func() { tmuxSessionAliveFn = origAlive })
+
+	refuse, err := shouldRefuseLeaseWrappedCoordHandoffRetire(oldRec)
+	if err != nil {
+		t.Fatalf("shouldRefuseLeaseWrappedCoordHandoffRetire: %v", err)
+	}
+	if refuse {
+		t.Fatal("old coord is dead; retry path must not drop a standby that may already be leader")
+	}
+
+	tmuxSessionAliveFn = func(string) (bool, error) { return true, nil }
+	refuse, err = shouldRefuseLeaseWrappedCoordHandoffRetire(oldRec)
+	if err != nil {
+		t.Fatalf("shouldRefuseLeaseWrappedCoordHandoffRetire live-old: %v", err)
+	}
+	if !refuse {
+		t.Fatal("old coord is alive; PR1 must refuse before retiring it behind a standby supervisor")
+	}
+}
+
 // TestDrain_WorkerHandoff_NoMarkerWrite pins
 // T-drain-worker-no-marker-write. A worker handoff (marker absent or
 // pointing elsewhere) MUST NOT touch the rc-enabled marker via the

@@ -98,6 +98,19 @@ func refuseLeaseWrappedCoordHandoffRetire(oldRec, newRec *agent.Record, stderr i
 		oldRec.Project, newRec.ID, oldRec.ID)
 }
 
+func shouldRefuseLeaseWrappedCoordHandoffRetire(oldRec *agent.Record) (bool, error) {
+	if !leaseFailoverEnabled() {
+		return false, nil
+	}
+	alive, err := tmuxSessionAliveFn(oldRec.TmuxSession)
+	if err != nil {
+		return false, fmt.Errorf(
+			"probe old coord %s session %s before standby-retire refusal: %w",
+			oldRec.ID, oldRec.TmuxSession, err)
+	}
+	return alive, nil
+}
+
 // Resume completes a handoff for which the queue file already exists.
 // Two producers create such queue files:
 //
@@ -741,7 +754,11 @@ func spawnAndRetire(req queue.SpawnFresh, queuePath string,
 	isCoordSwap := false
 	if oldRec.Project != "" && state.ReadCoordSpawnMarker(oldRec.Project) == oldRec.ID {
 		isCoordSwap = true
-		if leaseFailoverEnabled() {
+		refuse, rerr := shouldRefuseLeaseWrappedCoordHandoffRetire(oldRec)
+		if rerr != nil {
+			return fmt.Errorf("resume: %w (old agent untouched, queue file preserved for retry)", rerr)
+		}
+		if refuse {
 			return refuseLeaseWrappedCoordHandoffRetire(oldRec, newRec, stderr)
 		}
 		// Eager marker write — closes the duplicate-coord window
@@ -814,8 +831,14 @@ func retireOldAgent(oldRec, newRec *agent.Record, docPath, queuePath string,
 	// this respects the iter-2 P2 invariant. If the new agent dies
 	// during the wait, OLD is still alive; roll back the new and
 	// return so operator/recovery can retry cleanly.
-	if isCoordSwap && leaseFailoverEnabled() {
-		return refuseLeaseWrappedCoordHandoffRetire(oldRec, newRec, stderr)
+	if isCoordSwap {
+		refuse, rerr := shouldRefuseLeaseWrappedCoordHandoffRetire(oldRec)
+		if rerr != nil {
+			return fmt.Errorf("resume: %w (old agent untouched, queue file preserved for retry)", rerr)
+		}
+		if refuse {
+			return refuseLeaseWrappedCoordHandoffRetire(oldRec, newRec, stderr)
+		}
 	}
 	//
 	// Always runs, even when auto-resume is disabled (codex iter-9
