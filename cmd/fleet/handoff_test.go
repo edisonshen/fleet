@@ -617,6 +617,37 @@ func TestHandoff_LeaseFailoverCoordHandoffRefusesBeforeRetiringOld(t *testing.T)
 	}
 }
 
+func TestHandoff_ShouldRefuseLeaseWrappedCoordHandoffRetire_RequiresLiveOld(t *testing.T) {
+	t.Setenv("FLEET_LEASE_FAILOVER", "1")
+	oldRec := &agent.Record{ID: "oldcoord", TmuxSession: "fleet-oldcoord"}
+
+	origAlive := handoffSessionAliveFn
+	handoffSessionAliveFn = func(session string) (bool, error) {
+		if session != oldRec.TmuxSession {
+			t.Fatalf("probed session %q, want %q", session, oldRec.TmuxSession)
+		}
+		return false, nil
+	}
+	t.Cleanup(func() { handoffSessionAliveFn = origAlive })
+
+	refuse, err := shouldRefuseLeaseWrappedCoordHandoffRetire(oldRec)
+	if err != nil {
+		t.Fatalf("shouldRefuseLeaseWrappedCoordHandoffRetire: %v", err)
+	}
+	if refuse {
+		t.Fatal("old coord is dead; retry path must not drop a standby that may already be leader")
+	}
+
+	handoffSessionAliveFn = func(string) (bool, error) { return true, nil }
+	refuse, err = shouldRefuseLeaseWrappedCoordHandoffRetire(oldRec)
+	if err != nil {
+		t.Fatalf("shouldRefuseLeaseWrappedCoordHandoffRetire live-old: %v", err)
+	}
+	if !refuse {
+		t.Fatal("old coord is alive; PR1 must refuse before retiring it behind a standby supervisor")
+	}
+}
+
 // E8 (manual handoff) — a WORKER handoff (task_id is a real slug, NOT
 // coord-<project>) keeps inheriting the outgoing record's Cwd. The
 // resolver is COORD-only; workers legitimately follow their dispatch

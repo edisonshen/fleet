@@ -164,6 +164,8 @@ func isCoordHandoffForProject(project, agentID string) bool {
 	return state.ReadCoordSpawnMarker(project) == agentID
 }
 
+var handoffSessionAliveFn = tmux.SessionAlive
+
 func refuseLeaseWrappedCoordHandoffRetire(oldRec, newRec *agent.Record, stderr io.Writer) error {
 	handoffop.RollbackCoordMarkerIfPointingAt(oldRec.Project, oldRec.ID, newRec.ID, stderr)
 	if dropErr := handoffop.DropReplacementRecord(newRec.TmuxSession, newRec.ID, stderr); dropErr != nil {
@@ -174,6 +176,19 @@ func refuseLeaseWrappedCoordHandoffRetire(oldRec, newRec *agent.Record, stderr i
 	return fmt.Errorf(
 		"coord handoff for project %q spawned standby successor %s but PR1 cannot verify its child before retiring old coord %s; old agent untouched, replacement dropped, queue file preserved for retry after PR2 lock-coupled delivery",
 		oldRec.Project, newRec.ID, oldRec.ID)
+}
+
+func shouldRefuseLeaseWrappedCoordHandoffRetire(oldRec *agent.Record) (bool, error) {
+	if !leaseFailoverEnabled() {
+		return false, nil
+	}
+	alive, err := handoffSessionAliveFn(oldRec.TmuxSession)
+	if err != nil {
+		return false, fmt.Errorf(
+			"probe old coord %s session %s before standby-retire refusal: %w",
+			oldRec.ID, oldRec.TmuxSession, err)
+	}
+	return alive, nil
 }
 
 // Crash safety: the queue file (step 5) is the journal entry. If we
@@ -894,7 +909,11 @@ func runHandoff(opts *handoffOpts, stdout, stderr io.Writer) error {
 	isCoordSwap := false
 	if oldRec.Project != "" && state.ReadCoordSpawnMarker(oldRec.Project) == oldRec.ID {
 		isCoordSwap = true
-		if leaseFailoverEnabled() {
+		refuse, rerr := shouldRefuseLeaseWrappedCoordHandoffRetire(oldRec)
+		if rerr != nil {
+			return fmt.Errorf("%w (old agent untouched, queue file preserved for retry)", rerr)
+		}
+		if refuse {
 			return refuseLeaseWrappedCoordHandoffRetire(oldRec, newRec, stderr)
 		}
 		// Eager marker write — best-effort. AtomicCoordSwap will
@@ -1256,7 +1275,13 @@ func resumeHandoff(opts *handoffOpts, stdout, stderr io.Writer,
 		}
 	}
 	if isCoordSwap && leaseFailoverEnabled() {
-		return refuseLeaseWrappedCoordHandoffRetire(oldRec, newRec, stderr)
+		refuse, rerr := shouldRefuseLeaseWrappedCoordHandoffRetire(oldRec)
+		if rerr != nil {
+			return fmt.Errorf("resume handoff: %w (old agent untouched, queue file preserved for retry)", rerr)
+		}
+		if refuse {
+			return refuseLeaseWrappedCoordHandoffRetire(oldRec, newRec, stderr)
+		}
 	}
 
 	// Wait BEFORE killing old (codex iter-8 P1). Always runs — the
