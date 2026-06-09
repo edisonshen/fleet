@@ -57,6 +57,8 @@ func doctorTestDeps() doctorDeps {
 		WedgedDrains:     func() (int, error) { return 0, nil },
 		TakeOver:         func(string, string) (bool, error) { return false, nil },
 		RecoverSpawn:     func(*agent.Record, string, string, bool, io.Writer, io.Writer) error { return nil },
+		LockAgent:        func(string) (func(), error) { return func() {}, nil },
+		QueueExists:      func(string) bool { return true }, // queue still present unless a test says otherwise
 		Self:             func() int { return 4242 },
 	}
 }
@@ -955,5 +957,187 @@ func TestDoctor_HealthySuccessorAfterTakeover_NoRedundantSpawn(t *testing.T) {
 	}
 	if pr := report.projects[0]; pr.fixErr != nil {
 		t.Errorf("stand-down should not be an error: %v", pr.fixErr)
+	}
+}
+
+// --- regression (codex PR6 iter-13 [P2]): every doctor --fix failure path
+//     that tells the operator to bring up a coord must emit a RUNNABLE
+//     command. `fleet dispatch --coord-spawn` alone errors out: the hidden
+//     --coord-spawn path requires a `coord-<project>` task id AND
+//     `--project <project>`. The surfaced text must carry both (else the
+//     operator is left without a usable next step — surface-don't-silo). ---
+
+// wantRunnableCoordSpawn asserts the surfaced retry command is the full,
+// runnable shape for `project`, not the truncated `dispatch --coord-spawn`.
+func wantRunnableCoordSpawn(t *testing.T, surfaced, project string) {
+	t.Helper()
+	want := "fleet dispatch coord-" + project + " --project " + project + " --coord-spawn"
+	if !strings.Contains(surfaced, want) {
+		t.Errorf("retry command not runnable: want it to contain %q\ngot:\n%s", want, surfaced)
+	}
+	// Guard against a regression back to the bare, un-runnable form: the
+	// surfaced text must never carry `dispatch --coord-spawn` with no task id.
+	if strings.Contains(surfaced, "dispatch --coord-spawn") {
+		t.Errorf("surfaced text still carries the un-runnable `dispatch --coord-spawn` (no task id / --project):\n%s", surfaced)
+	}
+}
+
+// Fenced+killed a hung coord, takeover acquired, but the record to respawn
+// from was already gone (cachedOld == nil): the dead-end stderr must offer a
+// runnable coord-spawn, not the bare form.
+func TestDoctor_RecordGone_OffersRunnableCoordSpawn(t *testing.T) {
+	const project = "gone"
+
+	d := doctorTestDeps()
+	// A stuck lease with no loadable coord record (CoordMarker empty, archive
+	// + LoadAgent both miss) so we reach the cachedOld==nil dead end after a
+	// successful takeover.
+	d.Diagnose = func(string) coordlock.LeaseDiagnosis {
+		return coordlock.LeaseDiagnosis{
+			Health: coordlock.LeaseHealthDead, HasRecord: true,
+			Epoch: 2, State: "active", OwnerPID: 999, OwnerAlive: false,
+		}
+	}
+	d.TakeOver = func(string, string) (bool, error) { return true, nil } // acquired
+	var respawned int32
+	d.RecoverSpawn = func(*agent.Record, string, string, bool, io.Writer, io.Writer) error {
+		atomic.AddInt32(&respawned, 1)
+		return nil
+	}
+
+	report, err := gatherDoctorReportWith(doctorOpts{project: project, fix: true}, d)
+	if err != nil {
+		t.Fatalf("gather: %v", err)
+	}
+	var out, errOut bytes.Buffer
+	doctorRunFixWith(doctorOpts{project: project, fix: true}, &report, &out, &errOut, d)
+
+	if atomic.LoadInt32(&respawned) != 0 {
+		t.Errorf("no cached record but RecoverSpawn ran %d times (must not spawn blind)", respawned)
+	}
+	pr := report.projects[0]
+	if pr.fixErr == nil {
+		t.Fatalf("record-gone dead end must be surfaced as a fix error")
+	}
+	wantRunnableCoordSpawn(t, errOut.String(), project)
+}
+
+// Takeover acquired + cached record present, but the respawn itself failed:
+// the "starting a fresh one failed … retry" stderr must offer a runnable
+// coord-spawn too.
+func TestDoctor_RecoverSpawnFails_OffersRunnableCoordSpawn(t *testing.T) {
+	const (
+		project = "respawnfail"
+		coordID = "rfcoord"
+	)
+	old := agent.New(coordID)
+	old.Project = project
+	old.TaskID = CoordTaskIDPrefix + project
+	old.SupervisorPID = 555
+	old.Command = []string{"claude"}
+
+	d := doctorTestDeps()
+	d.Diagnose = func(string) coordlock.LeaseDiagnosis {
+		return coordlock.LeaseDiagnosis{
+			Health: coordlock.LeaseHealthDead, HasRecord: true,
+			Epoch: 4, State: "active", OwnerPID: 555, OwnerAlive: false,
+		}
+	}
+	d.CoordMarker = func(string) string { return coordID }
+	d.LoadAgent = func(id string) (*agent.Record, error) {
+		if id == coordID {
+			return old, nil
+		}
+		return nil, errors.New("no record")
+	}
+	const queuePath = "/q/spawn-fresh-" + coordID + ".json"
+	d.ListPendingQueue = func() ([]string, error) { return []string{queuePath}, nil }
+	d.ReadQueue = func(string) (queue.SpawnFresh, error) {
+		return queue.SpawnFresh{OldAgentID: coordID, Project: project, TaskID: CoordTaskIDPrefix + project, HandoffDoc: "/tmp/rf.md"}, nil
+	}
+	d.TakeOver = func(string, string) (bool, error) { return true, nil }
+	d.RecoverSpawn = func(*agent.Record, string, string, bool, io.Writer, io.Writer) error {
+		return errors.New("boom: spawn failed")
+	}
+
+	report, err := gatherDoctorReportWith(doctorOpts{project: project, fix: true}, d)
+	if err != nil {
+		t.Fatalf("gather: %v", err)
+	}
+	var out, errOut bytes.Buffer
+	doctorRunFixWith(doctorOpts{project: project, fix: true}, &report, &out, &errOut, d)
+
+	pr := report.projects[0]
+	if pr.fixErr == nil {
+		t.Fatalf("a failed respawn must be surfaced as a fix error")
+	}
+	wantRunnableCoordSpawn(t, errOut.String(), project)
+}
+
+// --- codex PR6 iter-17 regression ---
+
+// [P1] when a concurrent doctor/drain already recovered (deleted the queue)
+// between this takeover and the post-takeover re-check, --fix must take the
+// per-agent lock, observe the queue gone, and STAND DOWN — never spawn a
+// duplicate successor.
+func TestDoctor_ConcurrentRecovery_StandsDownUnderLock(t *testing.T) {
+	const (
+		project = "crproj"
+		coordID = "crcoord"
+	)
+	old := agent.New(coordID)
+	old.Project = project
+	old.TaskID = CoordTaskIDPrefix + project
+	old.SupervisorPID = 888
+	old.Command = []string{"claude"}
+
+	d := doctorTestDeps()
+	d.Diagnose = func(string) coordlock.LeaseDiagnosis {
+		return coordlock.LeaseDiagnosis{Health: coordlock.LeaseHealthDead, HasRecord: true, OwnerPID: 888, OwnerAlive: false}
+	}
+	d.CoordMarker = func(string) string { return coordID }
+	d.LoadAgent = func(id string) (*agent.Record, error) {
+		if id == coordID {
+			return old, nil
+		}
+		return nil, errors.New("no record")
+	}
+	const queuePath = "/q/spawn-fresh-" + coordID + ".json"
+	d.ListPendingQueue = func() ([]string, error) { return []string{queuePath}, nil }
+	d.ReadQueue = func(string) (queue.SpawnFresh, error) {
+		return queue.SpawnFresh{OldAgentID: coordID, Project: project, TaskID: CoordTaskIDPrefix + project, HandoffDoc: "/tmp/cr.md"}, nil
+	}
+	// Lock is taken; a peer recovery DELETED the queue before we got the lock.
+	var lockedID string
+	d.LockAgent = func(id string) (func(), error) { lockedID = id; return func() {}, nil }
+	d.QueueExists = func(string) bool { return false } // peer already cleared it
+	d.TakeOver = func(string, string) (bool, error) { return true, nil }
+	var respawned, deleted int32
+	d.RecoverSpawn = func(*agent.Record, string, string, bool, io.Writer, io.Writer) error {
+		atomic.AddInt32(&respawned, 1)
+		return nil
+	}
+	d.DeleteQueue = func(string) error { atomic.AddInt32(&deleted, 1); return nil }
+	// LeaderPresent false at entry so --fix proceeds to the takeover.
+	d.LeaderPresent = func(string) bool { return false }
+
+	report, err := gatherDoctorReportWith(doctorOpts{project: project, fix: true}, d)
+	if err != nil {
+		t.Fatalf("gather: %v", err)
+	}
+	var out, errOut bytes.Buffer
+	doctorRunFixWith(doctorOpts{project: project, fix: true}, &report, &out, &errOut, d)
+
+	if lockedID != coordID {
+		t.Errorf("post-takeover lock id = %q, want the OLD coord id %q (must match the drain path's key)", lockedID, coordID)
+	}
+	if atomic.LoadInt32(&respawned) != 0 {
+		t.Errorf("a concurrent recovery cleared the queue but --fix still spawned a duplicate (%d)", respawned)
+	}
+	if atomic.LoadInt32(&deleted) != 0 {
+		t.Errorf("--fix deleted an already-cleared queue (%d)", deleted)
+	}
+	if pr := report.projects[0]; pr.fixErr != nil {
+		t.Errorf("standing down on a peer recovery should not be an error: %v", pr.fixErr)
 	}
 }

@@ -103,6 +103,15 @@ type doctorDeps struct {
 	// RecoverSpawn brings up a fresh lease-wrapped successor from the cached
 	// old record (dead-coord recovery). Production: productionRecoverSpawn.
 	RecoverSpawn func(oldRec *agent.Record, docPath, preAllocatedID string, disableAutoResume bool, stdout, stderr io.Writer) error
+	// LockAgent takes the BOUNDED per-agent lock so a concurrent doctor/drain
+	// recovery can't both spawn a successor after the (lease-releasing)
+	// takeover. Returns a release func. Production: state.LockAgent.
+	LockAgent func(agentID string) (func(), error)
+	// QueueExists reports whether a queue file is still on disk (the
+	// post-takeover re-check: a peer recovery may have already deleted it).
+	// Production: an os.Stat. nil when there is no queue (a hung coord with no
+	// pending handoff) — the caller skips the re-check.
+	QueueExists func(path string) bool
 	// Self is the caller's pid (never reap self). Production: os.Getpid.
 	Self func() int
 }
@@ -143,7 +152,12 @@ func defaultDoctorDeps() doctorDeps {
 			return acquired, err
 		},
 		RecoverSpawn: productionRecoverSpawn,
-		Self:         os.Getpid,
+		LockAgent:    state.LockAgent,
+		QueueExists: func(path string) bool {
+			_, err := os.Stat(path)
+			return err == nil
+		},
+		Self: os.Getpid,
 	}
 }
 
@@ -650,6 +664,41 @@ func fixOneProject(pr *doctorProjectReport, stdout, stderr io.Writer, d doctorDe
 		return
 	}
 
+	// SERIALIZE the post-takeover recovery (codex PR6 iter-17 [P1]): the
+	// production TakeOver RELEASES the lease the instant OLD is proven gone, so
+	// two concurrent doctor/drain recoveries can BOTH observe acquired=true.
+	// Take the SHORT bounded per-agent lock (the SAME lock the drain path uses)
+	// so only ONE proceeds to RecoverSpawn + queue delete; the loser sees the
+	// queue gone (re-check below) and stands down. The lock is taken AFTER the
+	// takeover (never across it — OLD's dying coord.Cleanup needs this same
+	// lock to archive its record). Lock the OLD agent id so doctor + drain
+	// contend on the SAME key.
+	lockID := postTakeoverLockID(cachedOld, queueReq, project)
+	release, lerr := d.LockAgent(lockID)
+	if lerr != nil {
+		pr.fixErr = fmt.Errorf("doctor: stopped the stuck coordinator for %s but could not lock for recovery: %w", project, lerr)
+		pr.verboseDetail = append(pr.verboseDetail, "lock-agent error: "+lerr.Error())
+		_, _ = fmt.Fprintf(stderr,
+			"Project %s: stopped the stuck coordinator but couldn't serialize the restart (%v); rerun `fleet doctor --fix`.\n",
+			project, lerr)
+		return
+	}
+	defer release()
+
+	// Under the lock, re-check the queue: a peer recovery that also won an
+	// acquire may have already RecoverSpawned + deleted it. If it is gone, the
+	// handoff is fulfilled — stand down (recovering again would duplicate).
+	if queuePath != "" && !d.QueueExists(queuePath) {
+		pr.fixActions = []string{
+			"Stopped the stuck coordinator.",
+			"Another recovery already restarted the coordinator; left it in place.",
+		}
+		pr.verboseDetail = append(pr.verboseDetail,
+			"post-takeover: pending handoff already cleared by a concurrent recovery; standing down")
+		_, _ = fmt.Fprintf(stdout, "  - Another recovery already restarted the coordinator; nothing more to do.\n")
+		return
+	}
+
 	// STEP 3: respawn a fresh lease-wrapped successor from the cached record,
 	// via the EXISTING productionRecoverSpawn path (RecoverDeadCoord). It
 	// resumes from the last clean checkpoint + intent replay internally.
@@ -824,6 +873,21 @@ func loadCoordRecordByID(id, project string, d doctorDeps) *agent.Record {
 	return nil
 }
 
+// postTakeoverLockID returns the per-agent lock key the doctor recovery
+// contends on with a concurrent drain/doctor (codex PR6 iter-17 [P1]). It must
+// match the OLD agent id the drain path locks (state.LockAgent(req.OldAgentID))
+// so the two serialize on the SAME key: prefer the cached coord record id, then
+// the pending queue's OldAgentID, then a project-scoped fallback.
+func postTakeoverLockID(cachedOld *agent.Record, queueReq queue.SpawnFresh, project string) string {
+	if cachedOld != nil && cachedOld.ID != "" {
+		return cachedOld.ID
+	}
+	if queueReq.OldAgentID != "" {
+		return queueReq.OldAgentID
+	}
+	return "doctor-fix-" + project
+}
+
 // coordAgentIDForFix returns the agent id the takeover should authenticate
 // against: the cached coord record's id when known, else a synthetic
 // project-scoped id (the takeover's kill re-validates identity regardless, so
@@ -945,6 +1009,12 @@ func fillDoctorDeps(d doctorDeps) doctorDeps {
 	}
 	if d.RecoverSpawn == nil {
 		d.RecoverSpawn = def.RecoverSpawn
+	}
+	if d.LockAgent == nil {
+		d.LockAgent = def.LockAgent
+	}
+	if d.QueueExists == nil {
+		d.QueueExists = def.QueueExists
 	}
 	if d.Self == nil {
 		d.Self = def.Self
