@@ -13,6 +13,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/edisonshen/fleet/internal/coordlock"
 	"github.com/edisonshen/fleet/internal/queue"
 )
 
@@ -30,7 +31,15 @@ func TestStatus_StuckHandoff_Surfaced(t *testing.T) {
 		}
 		return queue.SpawnFresh{OldAgentID: "b", Project: "liveproj", TaskID: CoordTaskIDPrefix + "liveproj"}, nil
 	}
-	d.LeaderPresent = func(project string) bool { return project == "liveproj" }
+	// The scan uses the READ-ONLY Diagnose-based leader probe (codex PR6
+	// iter-15): liveproj has a HEALTHY leader (LeaseHealthOK) -> in-flight,
+	// stuckproj has none -> stuck.
+	d.Diagnose = func(project string) coordlock.LeaseDiagnosis {
+		if project == "liveproj" {
+			return coordlock.LeaseDiagnosis{Health: coordlock.LeaseHealthOK, HasRecord: true}
+		}
+		return coordlock.LeaseDiagnosis{Health: coordlock.LeaseHealthNone}
+	}
 
 	orig := stuckHandoffStatusFn
 	stuckHandoffStatusFn = func() doctorDeps { return d }
@@ -125,5 +134,34 @@ func TestStatus_StuckHandoff_OnJSONPath(t *testing.T) {
 	// stdout must remain valid JSON (the stuck line went to stderr).
 	if !strings.HasPrefix(strings.TrimSpace(stdout.String()), "[") {
 		t.Errorf("--json stdout should be a JSON array, got: %s", stdout.String())
+	}
+}
+
+// codex PR6 iter-15 [P2]: the read-only status stuck-handoff scan must use the
+// Diagnose-based leader probe (which never creates lock files), NOT the
+// flock-creating production LeaderPresent. Assert LeaderPresent is never
+// called from the scan.
+func TestStatus_StuckHandoff_DoesNotCallLeaderPresent(t *testing.T) {
+	t.Setenv("FLEET_LEASE_FAILOVER", "1")
+	d := doctorTestDeps()
+	d.ListPendingQueue = func() ([]string, error) { return []string{"/q/spawn-fresh-a.json"}, nil }
+	d.ReadQueue = func(string) (queue.SpawnFresh, error) {
+		return queue.SpawnFresh{OldAgentID: "a", Project: "p", TaskID: CoordTaskIDPrefix + "p"}, nil
+	}
+	d.Diagnose = func(string) coordlock.LeaseDiagnosis {
+		return coordlock.LeaseDiagnosis{Health: coordlock.LeaseHealthNone}
+	}
+	d.LeaderPresent = func(string) bool {
+		t.Errorf("read-only stuck-handoff scan called the flock-creating LeaderPresent")
+		return false
+	}
+	orig := stuckHandoffStatusFn
+	stuckHandoffStatusFn = func() doctorDeps { return d }
+	t.Cleanup(func() { stuckHandoffStatusFn = orig })
+
+	var out, errOut bytes.Buffer
+	emitStuckHandoffSection(&out, &errOut)
+	if !strings.Contains(out.String(), "the handoff to a fresh coordinator didn't complete") {
+		t.Errorf("scan should still surface the stuck handoff via Diagnose:\n%s", out.String())
 	}
 }

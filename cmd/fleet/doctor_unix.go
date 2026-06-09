@@ -499,8 +499,22 @@ func pendingStuckHandoff(project string, d doctorDeps) bool {
 	if !hasForProject {
 		return false
 	}
-	// A healthy leader means the handoff is in-flight, not stuck.
-	return !d.LeaderPresent(project)
+	// A healthy leader means the handoff is in-flight, not stuck. Use the
+	// READ-ONLY Diagnose-based probe, NOT LeaderPresent (codex PR6 iter-15
+	// [P2]): production LeaderPresent's missing-epoch path creates
+	// coordinator.flock (O_CREATE), which a read-only diagnosis/status scan
+	// must never do.
+	return !leaderHealthyReadOnly(project, d)
+}
+
+// leaderHealthyReadOnly reports whether a HEALTHY leader holds the lease,
+// using the read-only coordlock.Diagnose accessor (LeaseHealthOK) instead of
+// LeaderPresent. Diagnose never creates lock files (its missing-epoch probe is
+// the non-creating flockBusyReadOnly), so it is safe on the read-only
+// status/diagnosis path. Used by the stuck-handoff scan; the --fix guards
+// keep using LeaderPresent (they run on a mutating path anyway).
+func leaderHealthyReadOnly(project string, d doctorDeps) bool {
+	return d.Diagnose(project).Health == coordlock.LeaseHealthOK
 }
 
 // isCoordHandoffQueue reports whether a pending spawn-fresh request is a
@@ -635,7 +649,8 @@ func fixOneProject(pr *doctorProjectReport, stdout, stderr io.Writer, d doctorDe
 		pr.fixErr = fmt.Errorf("doctor: stopped the stuck coordinator for %s but its record was gone; cannot restart it automatically", project)
 		_, _ = fmt.Fprintf(stderr,
 			"Project %s: stopped the stuck coordinator but couldn't find its record to restart it. "+
-				"Run `fleet dispatch --coord-spawn` (or press [a] in the TUI) to bring up a replacement.\n", project)
+				"Run `fleet dispatch coord-%s --project %s --coord-spawn` (or press [a] in the TUI) to bring up a replacement.\n",
+			project, project, project)
 		return
 	}
 	// RE-CHECK for a healthy successor BEFORE spawning (codex PR6 iter-14
@@ -683,7 +698,7 @@ func fixOneProject(pr *doctorProjectReport, stdout, stderr io.Writer, d doctorDe
 		pr.verboseDetail = append(pr.verboseDetail, "recover-spawn error: "+rerr.Error())
 		_, _ = fmt.Fprintf(stderr,
 			"Project %s: stopped the stuck coordinator but starting a fresh one failed: %v. "+
-				"Run `fleet dispatch --coord-spawn` to retry.\n", project, rerr)
+				"Run `fleet dispatch coord-%s --project %s --coord-spawn` to retry.\n", project, rerr, project, project)
 		return
 	}
 	// The recovery fulfilled the handoff — delete the pending queue file so a
@@ -862,7 +877,10 @@ func stuckHandoffProjects(d doctorDeps) ([]string, error) {
 		if rerr != nil || req.Project == "" || seen[req.Project] || !isCoordHandoffQueue(req) {
 			continue
 		}
-		if d.LeaderPresent(req.Project) {
+		// READ-ONLY leader probe (codex PR6 iter-15 [P2]): the status surface
+		// must not create lock files, so use Diagnose-based health, not the
+		// flock-creating LeaderPresent.
+		if leaderHealthyReadOnly(req.Project, d) {
 			continue // in-flight handoff, not stuck
 		}
 		seen[req.Project] = true
