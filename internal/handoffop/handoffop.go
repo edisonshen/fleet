@@ -866,7 +866,7 @@ func retireOldAgent(oldRec, newRec *agent.Record, docPath, queuePath string,
 	// AlreadySpawnedNewRec entrypoint skips its own spawn + probe
 	// steps and proceeds straight to the marker commit.
 	if isCoordSwap {
-		if coordlock.FailoverEnabled() {
+		if leaseFailoverEnabled() {
 			return refuseLeaseWrappedCoordHandoffRetire(oldRec, newRec, stderr)
 		}
 		_, swapErr := AtomicCoordSwap(AtomicCoordSwapInputs{
