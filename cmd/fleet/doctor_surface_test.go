@@ -9,6 +9,8 @@ package main
 
 import (
 	"bytes"
+	"errors"
+	"io"
 	"strings"
 	"testing"
 )
@@ -105,5 +107,42 @@ func TestDoctor_T22_StuckHandoffLine_NoJargon(t *testing.T) {
 	}
 	if !strings.Contains(line, "handoff to a fresh coordinator didn't complete") {
 		t.Errorf("stuck-handoff line lost its canonical phrasing: %q", line)
+	}
+}
+
+// codex PR6 iter-20 [P2]: a recovery error returned to main() (printed
+// verbatim as "error: ...") must be SANITIZED in non-verbose mode — no jargon
+// or internal paths leak. Under --verbose the raw error is allowed.
+func TestDoctor_T20_ReturnedError_SanitizedNonVerbose(t *testing.T) {
+	jargonErr := errors.New("coordlock.WriteCheckpoint: lease epoch /home/u/.fleet/projects/p/.locks/coordinator.flock torn")
+	report := doctorReport{projects: []doctorProjectReport{{
+		project: "p", status: doctorStatusDead, fixPlanned: true, fixErr: jargonErr,
+	}}}
+
+	origGather, origFix := doctorGatherFn, doctorFixFn
+	doctorGatherFn = func(doctorOpts) (doctorReport, error) { return report, nil }
+	doctorFixFn = func(doctorOpts, *doctorReport, io.Writer, io.Writer) {}
+	t.Cleanup(func() { doctorGatherFn, doctorFixFn = origGather, origFix })
+
+	var out bytes.Buffer
+	err := runDoctor(doctorOpts{project: "p", fix: true, verbose: false}, &out, &out)
+	if err == nil {
+		t.Fatal("expected a non-nil exit error for a recovery failure")
+	}
+	low := strings.ToLower(err.Error())
+	for _, w := range jargonWords {
+		if strings.Contains(low, strings.ToLower(w)) {
+			t.Errorf("non-verbose returned error leaked jargon %q: %q", w, err.Error())
+		}
+	}
+	if strings.Contains(err.Error(), "/home/") || strings.Contains(err.Error(), ".fleet") {
+		t.Errorf("non-verbose returned error leaked a path: %q", err.Error())
+	}
+
+	// Verbose: the raw error IS returned (engineer surface).
+	out.Reset()
+	verr := runDoctor(doctorOpts{project: "p", fix: true, verbose: true}, &out, &out)
+	if verr == nil || !strings.Contains(verr.Error(), "coordlock.WriteCheckpoint") {
+		t.Errorf("verbose should return the raw error, got: %v", verr)
 	}
 }

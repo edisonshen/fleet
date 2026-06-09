@@ -29,6 +29,7 @@ package main
 //	    feature is unavailable, mirroring lease_check_{unix,other}.go.
 
 import (
+	"errors"
 	"fmt"
 	"io"
 
@@ -186,9 +187,18 @@ func runDoctor(opts doctorOpts, stdout, stderr io.Writer) error {
 	renderDoctorReport(opts, report, stdout)
 	// A recovery error on any project makes the command exit non-zero so a
 	// scripted caller sees the failure — but the report is still rendered.
+	// SANITIZE the returned error in non-verbose mode (codex PR6 iter-20 [P2]):
+	// main() prints a returned error verbatim as "error: ...", which would leak
+	// the raw internal recovery error (paths / lease / queue jargon) AFTER the
+	// plain-English report. Under --verbose the raw error is allowed (engineer
+	// surface); otherwise return the plain one-liner. The detail is always in
+	// the rendered report / stderr regardless.
 	for i := range report.projects {
-		if report.projects[i].fixErr != nil {
-			return report.projects[i].fixErr
+		if err := report.projects[i].fixErr; err != nil {
+			if opts.verbose {
+				return err
+			}
+			return errors.New(plainErr(err))
 		}
 	}
 	return nil
