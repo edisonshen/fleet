@@ -118,6 +118,7 @@ const (
 	doctorStatusDead                             // the coordinator process is gone
 	doctorStatusHandoffStuck                     // a handoff to a fresh coordinator didn't complete
 	doctorStatusNeedsConfirm                     // an ambiguous state needing operator-confirmed recovery
+	doctorStatusLegacy                           // FLEET_LEASE_FAILOVER off: no lease, lease recovery N/A
 )
 
 // doctorFinding is one secondary observation with a plain message + an
@@ -143,6 +144,8 @@ func (s doctorStatus) plainStatusLine() string {
 		return "Fleet isn't responding — the handoff to a fresh coordinator didn't complete"
 	case doctorStatusNeedsConfirm:
 		return "the coordinator is in a state that needs a confirmed recovery"
+	case doctorStatusLegacy:
+		return "automatic coordinator recovery is turned off for this project"
 	default:
 		return "coordinator status unknown"
 	}

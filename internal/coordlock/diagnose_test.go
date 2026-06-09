@@ -160,13 +160,15 @@ func TestDiagnose_NoEpoch_FreeFlock_None(t *testing.T) {
 	}
 }
 
-// TestDiagnose_ReleasedButFlockHeld_Hung: a `released` record whose flock is
-// STILL HELD is a releaser that hung mid-cleanup. The acquire path takes it
-// over after the retry budget, so Diagnose must classify it Hung, not
-// Released (codex PR6 iter-5 [P2]).
-func TestDiagnose_ReleasedButFlockHeld_Hung(t *testing.T) {
+// TestDiagnose_Released_AlwaysReleased: a `released` record is ALWAYS
+// LeaseHealthReleased (a coord that intended to stop) — even if the flock is
+// still held in the normal Release window. A one-shot read-only probe can't
+// tell the millisecond drop window from a wedged releaser, and respawning an
+// intentionally-stopping coord is wrong; gc reaps a truly-stuck flock (codex
+// PR6 iter-9 [P2]).
+func TestDiagnose_Released_AlwaysReleased(t *testing.T) {
 	setupHome(t)
-	const project = "diag-relheld"
+	const project = "diag-released"
 	clk := &fakeClock{}
 	live := newFakeLiveness()
 	cfg := testCfg(clk, live)
@@ -177,18 +179,16 @@ func TestDiagnose_ReleasedButFlockHeld_Hung(t *testing.T) {
 		Epoch: 8, State: stateReleased, Owner: owner,
 		BootID: "test-boot-1", RenewedAtMono: clk.now(),
 	})
-	// Flock STILL held by a separate fd -> the releaser hung before dropping it.
+
+	// Flock free -> Released.
+	if got := diagnoseWithCfg(project, cfg); got.Health != LeaseHealthReleased {
+		t.Fatalf("released + flock free: Health=%v, want Released", got.Health)
+	}
+	// Flock STILL held (Release window) -> STILL Released, NOT Hung.
 	rel := holdFlock(t, project)
 	defer rel()
-
-	if got := diagnoseWithCfg(project, cfg); got.Health != LeaseHealthHung {
-		t.Fatalf("released + flock held: Health=%v, want Hung (hung releaser)", got.Health)
-	}
-
-	// Drop the flock -> a clean Released (nothing to recover).
-	rel()
 	if got := diagnoseWithCfg(project, cfg); got.Health != LeaseHealthReleased {
-		t.Fatalf("released + flock free: Health=%v, want Released (clean)", got.Health)
+		t.Fatalf("released + flock held (Release window): Health=%v, want Released (never respawn an intentional stop)", got.Health)
 	}
 }
 

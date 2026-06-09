@@ -170,15 +170,15 @@ func classifyDiagnosis(rec epochRecord, paths leasePaths, l *Lease) LeaseHealth 
 	case stateFencedNotAcquired:
 		return LeaseHealthFencedNotAcquired
 	case stateReleased:
-		// A `released` record normally means a coord exited cleanly. But if the
-		// flock is STILL HELD, the releaser demoted the record then HUNG before
-		// dropping the flock — the acquire path bounded-retries the flock and,
-		// on budget exhaustion, takes the releaser over as a hung holder (codex
-		// PR6 iter-5 [P2]). Diagnose mirrors that: flock still busy -> Hung
-		// (recoverable); flock free -> a clean Released (nothing to recover).
-		if busy, ok := flockBusyReadOnly(paths.flock); ok && busy {
-			return LeaseHealthHung
-		}
+		// A `released` record means the coord INTENDED to stop (Release demotes
+		// the record before dropping the flock + running Cleanup). Always
+		// LeaseHealthReleased — never escalate a still-held flock to Hung (codex
+		// PR6 iter-9 [P2]): a one-shot read-only probe cannot tell the normal
+		// millisecond Release window (record demoted, flock about to drop) from
+		// a genuinely wedged releaser, and respawning an intentionally-stopping
+		// coord is the wrong call. The acquire path's bounded flock retry is the
+		// real arbiter of a hung releaser, and a truly stuck flock holder is the
+		// gc reaper's job — not a doctor respawn.
 		return LeaseHealthReleased
 	case stateFencing:
 		// A fencing record is mid-takeover. If a fresh, live, in-budget

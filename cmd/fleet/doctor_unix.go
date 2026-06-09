@@ -329,6 +329,16 @@ func gatherDoctorReportWith(opts doctorOpts, d doctorDeps) (doctorReport, error)
 // diagnoseProject builds one project's read-only report.
 func diagnoseProject(project string, wedgedDrains int, wedgedErr error, d doctorDeps) doctorProjectReport {
 	pr := doctorProjectReport{project: project}
+
+	// LEGACY MODE (codex PR6 iter-9 [P2]): with FLEET_LEASE_FAILOVER=0 there is
+	// no coordinator lease, so coordlock.Diagnose always returns None — which
+	// must NOT be rendered as "no coordinator is running" when a live legacy
+	// coord record exists. The lease-based diagnosis/recovery doesn't apply;
+	// report the legacy mode + the coord's session liveness instead.
+	if !coordlock.FailoverEnabled() {
+		return diagnoseLegacyProject(project, d)
+	}
+
 	diag := d.Diagnose(project)
 
 	// Headline status from the lease classification.
@@ -431,6 +441,32 @@ func diagnoseProject(project string, wedgedDrains int, wedgedErr error, d doctor
 			"drain-scan error (non-fatal): "+wedgedErr.Error())
 	}
 
+	return pr
+}
+
+// diagnoseLegacyProject builds the read-only report for a project when
+// FLEET_LEASE_FAILOVER is OFF (codex PR6 iter-9 [P2]). There is no lease, so
+// the lease-based health/recovery doesn't apply — `--fix` would refuse anyway
+// (coordlock.AcquireLeaseWithKill returns ErrFailoverDisabled). Report the
+// legacy mode + the coord's session liveness rather than the misleading "no
+// coordinator is running" the None classification would otherwise render.
+func diagnoseLegacyProject(project string, d doctorDeps) doctorProjectReport {
+	pr := doctorProjectReport{project: project, status: doctorStatusLegacy}
+	pr.verboseDetail = append(pr.verboseDetail,
+		"FLEET_LEASE_FAILOVER is off: no coordinator lease in play; lease-based recovery does not apply")
+	if marker := d.CoordMarker(project); marker != "" {
+		if rec, lerr := d.LoadAgent(marker); lerr == nil && rec != nil {
+			pr.verboseDetail = append(pr.verboseDetail, "legacy coord record: "+rec.ID)
+			if rec.TmuxSession != "" {
+				if alive, serr := d.SessionAlive(rec.TmuxSession); serr == nil && !alive {
+					pr.findings = append(pr.findings, doctorFinding{
+						plain:   "the coordinator's terminal session is gone",
+						verbose: "tmux session " + rec.TmuxSession + " for coord " + marker + " is not alive",
+					})
+				}
+			}
+		}
+	}
 	return pr
 }
 

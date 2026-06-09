@@ -735,3 +735,56 @@ func TestDoctor_QueueOnly_RecoversFromArchive(t *testing.T) {
 		t.Fatalf("queue-only recovery errored: %v", pr.fixErr)
 	}
 }
+
+// --- codex PR6 iter-9 regression ---
+
+// [P2] with FLEET_LEASE_FAILOVER=0 (legacy mode) a project with a live coord
+// record must NOT render "no coordinator is running" (the lease None verdict);
+// report the legacy status instead, and --fix must not act.
+func TestDoctor_LegacyMode_NotReportedAsNoCoord(t *testing.T) {
+	t.Setenv("FLEET_LEASE_FAILOVER", "0")
+	const (
+		project = "legproj"
+		coordID = "legcoord"
+	)
+	rec := agent.New(coordID)
+	rec.Project = project
+	rec.TaskID = CoordTaskIDPrefix + project
+	rec.TmuxSession = "fleet-leg"
+
+	d := doctorTestDeps()
+	// Diagnose returns None (no lease in legacy mode) — but there IS a live coord.
+	d.Diagnose = func(string) coordlock.LeaseDiagnosis {
+		return coordlock.LeaseDiagnosis{Health: coordlock.LeaseHealthNone}
+	}
+	d.ListAgents = func() ([]*agent.Record, error) { return []*agent.Record{rec}, nil }
+	d.CoordMarker = func(string) string { return coordID }
+	d.LoadAgent = func(id string) (*agent.Record, error) {
+		if id == coordID {
+			return rec, nil
+		}
+		return nil, errors.New("no record")
+	}
+	d.SessionAlive = func(string) (bool, error) { return true, nil }
+
+	report, err := gatherDoctorReportWith(doctorOpts{project: project}, d)
+	if err != nil {
+		t.Fatalf("gather: %v", err)
+	}
+	pr := report.projects[0]
+	if pr.status == doctorStatusNone {
+		t.Fatalf("legacy mode with a live coord rendered 'no coordinator is running' (None)")
+	}
+	if pr.status != doctorStatusLegacy {
+		t.Errorf("legacy mode status = %v, want Legacy", pr.status)
+	}
+	if pr.status.needsRecovery() {
+		t.Errorf("legacy status must not trigger --fix recovery")
+	}
+	// The plain line is jargon-free.
+	for _, w := range jargonWords {
+		if strings.Contains(strings.ToLower(pr.status.plainStatusLine()), strings.ToLower(w)) {
+			t.Errorf("legacy plain line leaked jargon %q: %q", w, pr.status.plainStatusLine())
+		}
+	}
+}
