@@ -98,17 +98,23 @@ func refuseLeaseWrappedCoordHandoffRetire(oldRec, newRec *agent.Record, stderr i
 		oldRec.Project, newRec.ID, oldRec.ID)
 }
 
+var (
+	handoffLeaseActiveOwnerPIDFn = leaseActiveOwnerPID
+	handoffLeaseLeaderPresentFn  = leaseLeaderPresent
+)
+
 func shouldRefuseLeaseWrappedCoordHandoffRetire(oldRec *agent.Record) (bool, error) {
 	if !leaseFailoverEnabled() {
 		return false, nil
 	}
-	alive, err := tmuxSessionAliveFn(oldRec.TmuxSession)
-	if err != nil {
-		return false, fmt.Errorf(
-			"probe old coord %s session %s before standby-retire refusal: %w",
-			oldRec.ID, oldRec.TmuxSession, err)
+	if oldRec.Project == "" || oldRec.SupervisorPID <= 0 {
+		return false, nil
 	}
-	return alive, nil
+	ownerPID, ok := handoffLeaseActiveOwnerPIDFn(oldRec.Project)
+	if !ok || ownerPID != oldRec.SupervisorPID {
+		return false, nil
+	}
+	return handoffLeaseLeaderPresentFn(oldRec.Project), nil
 }
 
 // Resume completes a handoff for which the queue file already exists.

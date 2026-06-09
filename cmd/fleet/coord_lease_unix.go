@@ -163,6 +163,14 @@ func leaseFailoverEnabled() bool {
 	return coordlock.FailoverEnabled()
 }
 
+func leaseActiveOwnerPID(project string) (int, bool) {
+	return coordlock.CurrentActiveOwnerPID(project)
+}
+
+func leaseLeaderPresent(project string) bool {
+	return coordlock.LeaderPresent(project)
+}
+
 // sweepStaleCompetitors reaps any OTHER same-project coord supervisor
 // through the authenticated kill primitive after we win the lease. The
 // flock is the primary singleton; this catches a pre-lease or

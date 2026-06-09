@@ -1381,6 +1381,28 @@ func TestDrain_LeaseFailoverCoordHandoffRefusesBeforeRetiringOld(t *testing.T) {
 	const project = "rainier"
 	cwd := seedCoordRepoMeta(t, project)
 	oldRec := spawnSeedCoord(t, project, cwd)
+	oldRec.SupervisorPID = 4242
+	if err := oldRec.Write(); err != nil {
+		t.Fatalf("rewrite old coord supervisor pid: %v", err)
+	}
+	origOwner := handoffLeaseActiveOwnerPIDFn
+	origLeader := handoffLeaseLeaderPresentFn
+	handoffLeaseActiveOwnerPIDFn = func(p string) (int, bool) {
+		if p != project {
+			t.Fatalf("active owner checked for project %q, want %q", p, project)
+		}
+		return oldRec.SupervisorPID, true
+	}
+	handoffLeaseLeaderPresentFn = func(p string) bool {
+		if p != project {
+			t.Fatalf("leader checked for project %q, want %q", p, project)
+		}
+		return true
+	}
+	t.Cleanup(func() {
+		handoffLeaseActiveOwnerPIDFn = origOwner
+		handoffLeaseLeaderPresentFn = origLeader
+	})
 	if _, err := state.EnsureProjectInitialized(oldRec.Project); err != nil {
 		t.Fatalf("EnsureProjectInitialized: %v", err)
 	}
@@ -1413,32 +1435,37 @@ func TestDrain_LeaseFailoverCoordHandoffRefusesBeforeRetiringOld(t *testing.T) {
 
 func TestShouldRefuseLeaseWrappedCoordHandoffRetire_RequiresLiveOld(t *testing.T) {
 	t.Setenv("FLEET_LEASE_FAILOVER", "1")
-	oldRec := &agent.Record{ID: "oldcoord", TmuxSession: "fleet-oldcoord"}
+	oldRec := &agent.Record{ID: "oldcoord", Project: "rainier", SupervisorPID: 4242}
 
-	origAlive := tmuxSessionAliveFn
-	tmuxSessionAliveFn = func(session string) (bool, error) {
-		if session != oldRec.TmuxSession {
-			t.Fatalf("probed session %q, want %q", session, oldRec.TmuxSession)
+	origOwner := handoffLeaseActiveOwnerPIDFn
+	origLeader := handoffLeaseLeaderPresentFn
+	handoffLeaseActiveOwnerPIDFn = func(project string) (int, bool) {
+		if project != oldRec.Project {
+			t.Fatalf("active owner checked for project %q, want %q", project, oldRec.Project)
 		}
-		return false, nil
+		return 0, false
 	}
-	t.Cleanup(func() { tmuxSessionAliveFn = origAlive })
+	handoffLeaseLeaderPresentFn = func(string) bool { return true }
+	t.Cleanup(func() {
+		handoffLeaseActiveOwnerPIDFn = origOwner
+		handoffLeaseLeaderPresentFn = origLeader
+	})
 
 	refuse, err := shouldRefuseLeaseWrappedCoordHandoffRetire(oldRec)
 	if err != nil {
 		t.Fatalf("shouldRefuseLeaseWrappedCoordHandoffRetire: %v", err)
 	}
 	if refuse {
-		t.Fatal("old coord is dead; retry path must not drop a standby that may already be leader")
+		t.Fatal("old coord is not the active lease owner; handoff must not drop a valid standby")
 	}
 
-	tmuxSessionAliveFn = func(string) (bool, error) { return true, nil }
+	handoffLeaseActiveOwnerPIDFn = func(string) (int, bool) { return oldRec.SupervisorPID, true }
 	refuse, err = shouldRefuseLeaseWrappedCoordHandoffRetire(oldRec)
 	if err != nil {
-		t.Fatalf("shouldRefuseLeaseWrappedCoordHandoffRetire live-old: %v", err)
+		t.Fatalf("shouldRefuseLeaseWrappedCoordHandoffRetire active-old: %v", err)
 	}
 	if !refuse {
-		t.Fatal("old coord is alive; PR1 must refuse before retiring it behind a standby supervisor")
+		t.Fatal("old coord owns the active lease; PR1 must refuse before retiring it behind a standby supervisor")
 	}
 }
 

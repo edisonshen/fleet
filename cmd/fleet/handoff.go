@@ -164,7 +164,10 @@ func isCoordHandoffForProject(project, agentID string) bool {
 	return state.ReadCoordSpawnMarker(project) == agentID
 }
 
-var handoffSessionAliveFn = tmux.SessionAlive
+var (
+	handoffLeaseActiveOwnerPIDFn = leaseActiveOwnerPID
+	handoffLeaseLeaderPresentFn  = leaseLeaderPresent
+)
 
 func refuseLeaseWrappedCoordHandoffRetire(oldRec, newRec *agent.Record, stderr io.Writer) error {
 	handoffop.RollbackCoordMarkerIfPointingAt(oldRec.Project, oldRec.ID, newRec.ID, stderr)
@@ -182,13 +185,14 @@ func shouldRefuseLeaseWrappedCoordHandoffRetire(oldRec *agent.Record) (bool, err
 	if !leaseFailoverEnabled() {
 		return false, nil
 	}
-	alive, err := handoffSessionAliveFn(oldRec.TmuxSession)
-	if err != nil {
-		return false, fmt.Errorf(
-			"probe old coord %s session %s before standby-retire refusal: %w",
-			oldRec.ID, oldRec.TmuxSession, err)
+	if oldRec.Project == "" || oldRec.SupervisorPID <= 0 {
+		return false, nil
 	}
-	return alive, nil
+	ownerPID, ok := handoffLeaseActiveOwnerPIDFn(oldRec.Project)
+	if !ok || ownerPID != oldRec.SupervisorPID {
+		return false, nil
+	}
+	return handoffLeaseLeaderPresentFn(oldRec.Project), nil
 }
 
 // Crash safety: the queue file (step 5) is the journal entry. If we
