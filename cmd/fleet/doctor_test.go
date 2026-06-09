@@ -46,6 +46,7 @@ func doctorTestDeps() doctorDeps {
 		LeaderPresent:    func(string) bool { return false },
 		ListAgents:       func() ([]*agent.Record, error) { return nil, nil },
 		LoadAgent:        func(string) (*agent.Record, error) { return nil, errors.New("no record") },
+		LoadArchive:      func(string) (*agent.Record, error) { return nil, errors.New("no archive") },
 		CoordMarker:      func(string) string { return "" },
 		SessionAlive:     func(string) (bool, error) { return true, nil },
 		ListPendingQueue: func() ([]string, error) { return nil, nil },
@@ -667,5 +668,70 @@ func TestDoctor_WorkerTaskNamedCoordPrefix_NotCoord(t *testing.T) {
 		if pr.project == project {
 			t.Errorf("worker-only project %q surfaced as having a coordinator", project)
 		}
+	}
+}
+
+// --- codex PR6 iter-7 regression ---
+
+// [P1] the queue-ONLY stuck case: the old coord record was archived when its
+// handoff was requested, leaving only the spawn-fresh queue file. --fix must
+// still recover by loading the old record FROM THE ARCHIVE and respawning.
+func TestDoctor_QueueOnly_RecoversFromArchive(t *testing.T) {
+	const (
+		project = "qoa"
+		oldID   = "qoaold"
+	)
+	archived := agent.New(oldID)
+	archived.Project = project
+	archived.TaskID = CoordTaskIDPrefix + project
+	archived.SupervisorPID = 444
+	archived.Command = []string{"claude"}
+
+	d := doctorTestDeps()
+	// Only trace: a pending coord handoff + a lingering (dead) lease. NO live
+	// coord record, NO marker.
+	d.Diagnose = func(string) coordlock.LeaseDiagnosis {
+		return coordlock.LeaseDiagnosis{Health: coordlock.LeaseHealthDead, HasRecord: true, OwnerPID: 444, OwnerAlive: false}
+	}
+	d.ListAgents = func() ([]*agent.Record, error) { return nil, nil }
+	d.CoordMarker = func(string) string { return "" }
+	d.LoadAgent = func(string) (*agent.Record, error) { return nil, errors.New("no live record") }
+	// The OLD coord is only in the ARCHIVE.
+	d.LoadArchive = func(id string) (*agent.Record, error) {
+		if id == oldID {
+			return archived, nil
+		}
+		return nil, errors.New("no archive")
+	}
+	d.ListPendingQueue = func() ([]string, error) { return []string{"/q/spawn-fresh-" + oldID + ".json"}, nil }
+	d.ReadQueue = func(string) (queue.SpawnFresh, error) {
+		return queue.SpawnFresh{OldAgentID: oldID, Project: project, TaskID: CoordTaskIDPrefix + project,
+			HandoffDoc: "/tmp/qoa.md", NewAgentID: "qoanew"}, nil
+	}
+	d.TakeOver = func(string, string) (bool, error) { return true, nil }
+	var respawnedFrom string
+	d.RecoverSpawn = func(rec *agent.Record, doc string, _ string, _ bool, _, _ io.Writer) error {
+		if rec != nil {
+			respawnedFrom = rec.ID
+		}
+		if doc != "/tmp/qoa.md" {
+			t.Errorf("RecoverSpawn doc = %q, want the queued doc", doc)
+		}
+		return nil
+	}
+
+	report, err := gatherDoctorReportWith(doctorOpts{project: project, fix: true}, d)
+	if err != nil {
+		t.Fatalf("gather: %v", err)
+	}
+	var out, errOut bytes.Buffer
+	doctorRunFixWith(doctorOpts{project: project, fix: true}, &report, &out, &errOut, d)
+
+	if respawnedFrom != oldID {
+		t.Fatalf("queue-only recovery respawned from %q, want the archived old coord %q (recovery broken for the advertised case)", respawnedFrom, oldID)
+	}
+	pr := report.projects[0]
+	if pr.fixErr != nil {
+		t.Fatalf("queue-only recovery errored: %v", pr.fixErr)
 	}
 }

@@ -60,8 +60,13 @@ type doctorDeps struct {
 	// ListAgents lists the live agent records (to enumerate coord projects +
 	// find the coord record to respawn from). Production: agent.List.
 	ListAgents func() ([]*agent.Record, error)
-	// LoadAgent loads one agent record. Production: agent.Load.
+	// LoadAgent loads one LIVE agent record. Production: agent.Load.
 	LoadAgent func(id string) (*agent.Record, error)
+	// LoadArchive loads an ARCHIVED agent record (the old coord whose record
+	// was archived when its handoff retired it). Lets the recovery respawn
+	// from the queued OldAgentID even when only the queue file remains.
+	// Production: agent.LoadArchive.
+	LoadArchive func(id string) (*agent.Record, error)
 	// CoordMarker returns the recorded coord-spawn agent id for a project
 	// ("" if none). Production: state.ReadCoordSpawnMarker.
 	CoordMarker func(project string) string
@@ -108,6 +113,7 @@ func defaultDoctorDeps() doctorDeps {
 		LeaderPresent:    coordlock.LeaderPresent,
 		ListAgents:       agent.List,
 		LoadAgent:        agent.Load,
+		LoadArchive:      agent.LoadArchive,
 		CoordMarker:      state.ReadCoordSpawnMarker,
 		SessionAlive:     tmux.SessionAlive,
 		ListPendingQueue: queue.ListPending,
@@ -531,20 +537,22 @@ func fixOneProject(pr *doctorProjectReport, stdout, stderr io.Writer, d doctorDe
 		return
 	}
 
-	// Find the coord record to respawn from. Cache it BEFORE the takeover —
-	// the takeover's kill archives the record, so a post-kill load would race
-	// the archive (same reason drainWaitBarrierOrEscalate caches it).
-	cachedOld := cacheCoordRecord(project, d)
-
-	// Cache the pending handoff request (codex PR6 [P1]): a stuck handoff left
-	// a spawn-fresh queue file naming the handoff doc + the pre-allocated
+	// Cache the pending handoff request FIRST (codex PR6 [P1]): a stuck handoff
+	// left a spawn-fresh queue file naming the handoff doc + the pre-allocated
 	// successor id. The recovery MUST carry those into RecoverSpawn — without
 	// the doc the successor comes up IDLE, and without the pre-allocated id it
 	// can't ADOPT an already-spawned successor (it would re-spawn / collide).
-	// Read it before the takeover so we have the metadata even though OLD's
-	// record gets archived. queuePath is the file to delete once the recovery
-	// fulfills the request (so a later drain doesn't re-process it).
+	// queuePath is the file to delete once the recovery fulfills the request
+	// (so a later drain doesn't re-process it).
 	queuePath, queueReq := pendingQueueForProject(project, d)
+
+	// Find the coord record to respawn from. Cache it BEFORE the takeover —
+	// the takeover's kill archives the record, so a post-kill load would race
+	// the archive (same reason drainWaitBarrierOrEscalate caches it). The
+	// queueReq lets it fall back to the queue's OldAgentID (live then ARCHIVE)
+	// for the queue-only stuck case where the coord record is already archived
+	// (codex PR6 iter-7 [P1]).
+	cachedOld := cacheCoordRecord(project, queueReq, d)
 
 	pr.fixPlanned = true
 	_, _ = fmt.Fprintf(stdout,
@@ -651,23 +659,42 @@ func pendingQueueForProject(project string, d doctorDeps) (string, queue.SpawnFr
 	return "", queue.SpawnFresh{}
 }
 
-// cacheCoordRecord loads the project's coord agent record (via the coord-spawn
-// marker, falling back to a TaskID scan) BEFORE a takeover archives it.
-// Returns nil when no record can be found (the fixer then surfaces a manual
-// recovery step rather than spawning blind).
-func cacheCoordRecord(project string, d doctorDeps) *agent.Record {
+// cacheCoordRecord loads the project's coord agent record BEFORE a takeover
+// archives it, trying in order:
+//  1. the coord-spawn marker's LIVE record;
+//  2. a LIVE-records TaskID scan;
+//  3. the pending queue's OldAgentID — LIVE then ARCHIVE (codex PR6 iter-7
+//     [P1]). The queue-only stuck case (the OLD coord record was already
+//     archived when its handoff retired it, leaving only the spawn-fresh
+//     file) has NO live marker/record, so without the archive fallback --fix
+//     would take over but then error with "record gone" — unable to fix the
+//     very case `fleet doctor` advertises.
+//
+// queueReq is the pending handoff request for this project (zero value if
+// none). Returns nil only when no record can be found anywhere (the fixer
+// then surfaces a manual recovery step rather than spawning blind).
+func cacheCoordRecord(project string, queueReq queue.SpawnFresh, d doctorDeps) *agent.Record {
 	if marker := d.CoordMarker(project); marker != "" {
 		if rec, err := d.LoadAgent(marker); err == nil && rec != nil {
 			return rec
 		}
 	}
-	recs, err := d.ListAgents()
-	if err != nil {
-		return nil
+	if recs, err := d.ListAgents(); err == nil {
+		for _, r := range recs {
+			if r != nil && isCoordAgentRecord(r) && r.Project == project {
+				return r
+			}
+		}
 	}
-	for _, r := range recs {
-		if r != nil && isCoordAgentRecord(r) && r.Project == project {
-			return r
+	// Queue-only fallback: load the OLD coord named by the pending handoff —
+	// live first, then the archive (it was retired when the handoff was
+	// requested).
+	if queueReq.OldAgentID != "" {
+		if rec, err := d.LoadAgent(queueReq.OldAgentID); err == nil && rec != nil {
+			return rec
+		}
+		if rec, err := d.LoadArchive(queueReq.OldAgentID); err == nil && rec != nil {
+			return rec
 		}
 	}
 	return nil
@@ -758,6 +785,9 @@ func fillDoctorDeps(d doctorDeps) doctorDeps {
 	}
 	if d.LoadAgent == nil {
 		d.LoadAgent = def.LoadAgent
+	}
+	if d.LoadArchive == nil {
+		d.LoadArchive = def.LoadArchive
 	}
 	if d.CoordMarker == nil {
 		d.CoordMarker = def.CoordMarker
