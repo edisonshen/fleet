@@ -221,11 +221,11 @@ var propagatedRuntimeEnv = []string{
 const DefaultStandbyTimeout = 10 * time.Minute
 
 // shouldLeaseWrap decides whether this spawn wraps the coord in the
-// `fleet coord-run` lease supervisor. PR1 collapses the old fresh/recovery/
-// live-handoff split: every coord spawn uses coord-run --standby when
-// failover is enabled, while workers and unsupported platforms stay bare.
-func shouldLeaseWrap(failoverOn, isCoord bool) bool {
-	return failoverOn && isCoord
+// `fleet coord-run` lease supervisor. PR1 collapses fresh dispatch and
+// dead-coord recovery onto coord-run --standby when failover is enabled, while
+// workers, unsupported platforms, and explicit legacy fallbacks stay bare.
+func shouldLeaseWrap(failoverOn, isCoord, disable bool) bool {
+	return failoverOn && isCoord && !disable
 }
 
 // coordRunWrap builds the lease-failover exec argv: the engine argv
@@ -735,6 +735,12 @@ type Options struct {
 	// DefaultStandbyTimeout. Ignored when failover is off or this is not a
 	// coord spawn.
 	StandbyTimeout time.Duration
+
+	// DisableLeaseWrap keeps a coord spawn on the legacy bare-engine path even
+	// when lease failover is enabled. It is reserved for handoffop's drain
+	// cold-resume fallback, where the existing contract requires the successor
+	// to start immediately instead of waiting behind the still-live leader.
+	DisableLeaseWrap bool
 }
 
 func shouldStandDownLeaseWrappedSpawn(project string, supervisorPID int,
@@ -994,11 +1000,13 @@ func Spawn(opts Options) (*agent.Record, error) {
 	// PR1 spawn-collapse: every coord spawn runs under
 	// `fleet coord-run --standby --standby-timeout T` when lease failover
 	// is enabled. Applied HERE — not at individual call sites — so fresh
-	// dispatch, dead-coord recovery, and live handoff successors share the
-	// same heartbeat-owning supervisor path. Wrapping the EXECUTION argv
-	// only keeps the persisted rec.Command clean.
+	// dispatch and dead-coord recovery share the same heartbeat-owning
+	// supervisor path. Wrapping the EXECUTION argv only keeps the persisted
+	// rec.Command clean. Handoffop's documented drain cold-resume fallback can
+	// opt out with DisableLeaseWrap because it must start a bare successor
+	// while the old leader is still live.
 	leaseWrapped := false
-	if shouldLeaseWrap(leaseFailoverEnabled(), isCoordSpawn(rec.TaskID, rec.Project)) {
+	if shouldLeaseWrap(leaseFailoverEnabled(), isCoordSpawn(rec.TaskID, rec.Project), opts.DisableLeaseWrap) {
 		standbyTimeout := standbyTimeoutOrDefault(opts.StandbyTimeout)
 		switch {
 		case alreadyCoordRunWrapped(execArgv):

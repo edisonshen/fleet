@@ -1,9 +1,9 @@
 // Tests for the lease-failover coord-run wrap applied inside spawn.Spawn
 // (DESIGN-handoff-drain-storm-leak PR2). The wrap lives in spawn — not at
-// the dispatch call site — so EVERY coord spawn (fresh dispatch + the
-// handoff/drain replacements) gets the lease supervisor (codex PR2 iter-1
-// [P1]). These exercise the pure decision + builder so they stay
-// deterministic without a real tmux server:
+// the dispatch call site — so fresh dispatch and dead-coord recovery get the
+// lease supervisor, while documented legacy fallbacks can opt out explicitly.
+// These exercise the pure decision + builder so they stay deterministic
+// without a real tmux server:
 //
 //	W1  coordRunWrap shape: head = [fleet coord-run --agent <id>
 //	    --project <p> --standby --standby-timeout <T> --], tail = the engine argv.
@@ -97,20 +97,21 @@ func TestLeaseFailoverEnabled_Gate(t *testing.T) {
 
 func TestShouldLeaseWrap(t *testing.T) {
 	cases := []struct {
-		name                string
-		failoverOn, isCoord bool
-		want                bool
+		name                         string
+		failoverOn, isCoord, disable bool
+		want                         bool
 	}{
-		{"coord, flag on", true, true, true},
-		{"flag off", false, true, false},
-		{"worker (not coord)", true, false, false},
-		{"worker and flag off", false, false, false},
+		{"coord, flag on", true, true, false, true},
+		{"coord, explicit legacy fallback", true, true, true, false},
+		{"flag off", false, true, false, false},
+		{"worker (not coord)", true, false, false, false},
+		{"worker and flag off", false, false, false, false},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			if got := shouldLeaseWrap(c.failoverOn, c.isCoord); got != c.want {
-				t.Errorf("shouldLeaseWrap(%v,%v) = %v, want %v",
-					c.failoverOn, c.isCoord, got, c.want)
+			if got := shouldLeaseWrap(c.failoverOn, c.isCoord, c.disable); got != c.want {
+				t.Errorf("shouldLeaseWrap(%v,%v,%v) = %v, want %v",
+					c.failoverOn, c.isCoord, c.disable, got, c.want)
 			}
 		})
 	}
