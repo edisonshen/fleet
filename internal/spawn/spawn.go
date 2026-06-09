@@ -113,6 +113,24 @@ const (
 	unsubmittedTailLines = 12
 )
 
+var (
+	supervisorStampWaitAttempts = 25
+	supervisorStampWaitDelay    = 100 * time.Millisecond
+)
+
+func waitForSupervisorStamp(agentID string) {
+	for i := 0; i < supervisorStampWaitAttempts; i++ {
+		rec, err := agent.Load(agentID)
+		if errors.Is(err, state.ErrNotFound) {
+			return
+		}
+		if err == nil && rec.SupervisorPID > 0 {
+			return
+		}
+		time.Sleep(supervisorStampWaitDelay)
+	}
+}
+
 func initialPromptStableWindow() time.Duration {
 	return envDuration("FLEET_INITIAL_PROMPT_STABLE_MS",
 		defaultInitialPromptStableWindow)
@@ -1099,6 +1117,9 @@ func Spawn(opts Options) (*agent.Record, error) {
 	// stand-down disambiguation (iter-3/6) inside the same critical
 	// section.
 	if leaseWrapped {
+		if opts.LeaderCheck != nil && opts.ActiveOwnerPID != nil {
+			waitForSupervisorStamp(id)
+		}
 		unlock, lkErr := state.LockAgent(id)
 		if lkErr != nil {
 			_ = tmux.Kill(session)
