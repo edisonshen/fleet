@@ -893,3 +893,67 @@ func TestDoctor_LeaseOnly_RecoversFromOwnerArchive(t *testing.T) {
 		t.Fatalf("lease-only recovery errored: %v", pr.fixErr)
 	}
 }
+
+// --- codex PR6 iter-14 regression ---
+
+// [P1] if a WARM STANDBY / concurrent drain acquires the lease AFTER the
+// takeover releases it but BEFORE the respawn, --fix must NOT spawn a
+// redundant coordinator: it stands down (and cleans the queue).
+func TestDoctor_HealthySuccessorAfterTakeover_NoRedundantSpawn(t *testing.T) {
+	const (
+		project = "succ"
+		coordID = "succcoord"
+	)
+	old := agent.New(coordID)
+	old.Project = project
+	old.TaskID = CoordTaskIDPrefix + project
+	old.SupervisorPID = 777
+	old.Command = []string{"claude"}
+
+	d := doctorTestDeps()
+	d.Diagnose = func(string) coordlock.LeaseDiagnosis {
+		return coordlock.LeaseDiagnosis{Health: coordlock.LeaseHealthHung, HasRecord: true, OwnerPID: 777, OwnerAlive: true}
+	}
+	d.CoordMarker = func(string) string { return coordID }
+	d.LoadAgent = func(id string) (*agent.Record, error) {
+		if id == coordID {
+			return old, nil
+		}
+		return nil, errors.New("no record")
+	}
+	const queuePath = "/q/spawn-fresh-" + coordID + ".json"
+	d.ListPendingQueue = func() ([]string, error) { return []string{queuePath}, nil }
+	d.ReadQueue = func(string) (queue.SpawnFresh, error) {
+		return queue.SpawnFresh{OldAgentID: coordID, Project: project, TaskID: CoordTaskIDPrefix + project, HandoffDoc: "/tmp/s.md"}, nil
+	}
+	// A standby acquires the lease only AFTER the takeover releases it: the
+	// TakeOver stub flips standbyUp, and LeaderPresent reflects it. So the
+	// entry guard (pre-takeover) sees no leader and --fix proceeds; the
+	// post-takeover re-check sees the standby and stands down.
+	var standbyUp int32
+	d.LeaderPresent = func(string) bool { return atomic.LoadInt32(&standbyUp) == 1 }
+	d.TakeOver = func(string, string) (bool, error) { atomic.StoreInt32(&standbyUp, 1); return true, nil }
+	var respawned, deleted int32
+	d.RecoverSpawn = func(*agent.Record, string, string, bool, io.Writer, io.Writer) error {
+		atomic.AddInt32(&respawned, 1)
+		return nil
+	}
+	d.DeleteQueue = func(string) error { atomic.AddInt32(&deleted, 1); return nil }
+
+	report, err := gatherDoctorReportWith(doctorOpts{project: project, fix: true}, d)
+	if err != nil {
+		t.Fatalf("gather: %v", err)
+	}
+	var out, errOut bytes.Buffer
+	doctorRunFixWith(doctorOpts{project: project, fix: true}, &report, &out, &errOut, d)
+
+	if atomic.LoadInt32(&respawned) != 0 {
+		t.Errorf("a healthy successor appeared post-takeover but --fix still spawned a redundant coord (%d)", respawned)
+	}
+	if atomic.LoadInt32(&deleted) != 1 {
+		t.Errorf("the fulfilled handoff queue must be cleaned when a successor took over (deleted=%d)", deleted)
+	}
+	if pr := report.projects[0]; pr.fixErr != nil {
+		t.Errorf("stand-down should not be an error: %v", pr.fixErr)
+	}
+}

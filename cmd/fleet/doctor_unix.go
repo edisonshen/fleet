@@ -638,6 +638,37 @@ func fixOneProject(pr *doctorProjectReport, stdout, stderr io.Writer, d doctorDe
 				"Run `fleet dispatch --coord-spawn` (or press [a] in the TUI) to bring up a replacement.\n", project)
 		return
 	}
+	// RE-CHECK for a healthy successor BEFORE spawning (codex PR6 iter-14
+	// [P1]): the production TakeOver RELEASES the lease the instant the OLD
+	// holder is proven gone, so between that release and here a WARM STANDBY or
+	// a concurrent `fleet drain` recovery may have already acquired the lease
+	// and become the new leader. Spawning now would create a REDUNDANT
+	// coordinator (or collide on the pre-allocated id). If a healthy leader is
+	// present, the handoff is already complete — clean the queue and stand
+	// down, mirroring the drain path's post-takeover healthySuccessorPresent
+	// guard. (LeaderPresent is the live TTL + pid-liveness check; a successor
+	// that crashed after writing its epoch is NOT healthy, so we still recover.)
+	if d.LeaderPresent(project) {
+		pr.fixActions = []string{
+			"Stopped the stuck coordinator.",
+			"A fresh coordinator was already taking over; left it in place.",
+		}
+		pr.verboseDetail = append(pr.verboseDetail,
+			"post-takeover: a healthy successor acquired the lease (standby/concurrent drain); not respawning (would duplicate)")
+		_, _ = fmt.Fprintf(stdout, "  - A fresh coordinator is already taking over; not starting another.\n")
+		if queuePath != "" {
+			if derr := d.DeleteQueue(queuePath); derr != nil {
+				pr.fixErr = fmt.Errorf("doctor: a successor took over %s but the pending handoff file %s could not be cleared: %w",
+					project, queuePath, derr)
+				pr.verboseDetail = append(pr.verboseDetail, "queue delete failed: "+derr.Error())
+				_, _ = fmt.Fprintf(stderr,
+					"Project %s: a successor took over but the pending handoff file couldn't be cleared (%v); "+
+						"rerun `fleet drain` to clean it.\n", project, derr)
+			}
+		}
+		return
+	}
+
 	_, _ = fmt.Fprintf(stdout, "  - Starting a fresh coordinator.\n")
 	// Carry the queued handoff metadata (codex PR6 [P1]): the doc so the
 	// successor resumes the in-flight work (not idle), and the pre-allocated
