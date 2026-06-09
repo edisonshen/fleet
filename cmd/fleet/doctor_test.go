@@ -536,3 +536,99 @@ func TestDoctor_ReleasedLease_NotRecovered(t *testing.T) {
 		t.Errorf("released lease triggered recovery (killed=%d respawned=%d) — resurrects a cleanly-stopped coord", killed, respawned)
 	}
 }
+
+// --- codex PR6 iter-4 regressions ---
+
+// [P2] a HEALTHY lease with a (false,nil) dead recorded session must NOT be
+// downgraded to Dead — that would advise --fix, which then refuses the live
+// holder (an unrunnable remedy). Stays Healthy.
+func TestDoctor_HealthyLease_DeadSession_NotDowngraded(t *testing.T) {
+	const (
+		project = "hlds"
+		coordID = "hldscoord"
+	)
+	rec := agent.New(coordID)
+	rec.Project = project
+	rec.TaskID = CoordTaskIDPrefix + project
+	rec.TmuxSession = "fleet-stale"
+
+	d := doctorTestDeps()
+	d.Diagnose = func(string) coordlock.LeaseDiagnosis {
+		return coordlock.LeaseDiagnosis{Health: coordlock.LeaseHealthOK, HasRecord: true, OwnerPID: 5, OwnerAlive: true}
+	}
+	d.CoordMarker = func(string) string { return coordID }
+	d.LoadAgent = func(id string) (*agent.Record, error) {
+		if id == coordID {
+			return rec, nil
+		}
+		return nil, errors.New("no record")
+	}
+	d.SessionAlive = func(string) (bool, error) { return false, nil } // CONFIRMED gone
+
+	report, err := gatherDoctorReportWith(doctorOpts{project: project}, d)
+	if err != nil {
+		t.Fatalf("gather: %v", err)
+	}
+	pr := report.projects[0]
+	if pr.status != doctorStatusHealthy {
+		t.Errorf("healthy lease + dead recorded session downgraded to %v; want Healthy (stale session field)", pr.status)
+	}
+	for _, f := range pr.findings {
+		if strings.Contains(f.plain, "terminal session is gone") {
+			t.Errorf("a healthy lease wrongly surfaced 'session gone' as a plain finding: %q", f.plain)
+		}
+	}
+}
+
+// [P2] a failed queue delete after a successful respawn is a RECOVERY ERROR
+// (not a silent warning) so the caller doesn't think the handoff is safe while
+// a stale queue file remains.
+func TestDoctor_QueueDeleteFailure_IsRecoveryError(t *testing.T) {
+	const (
+		project = "qdf"
+		coordID = "qdfcoord"
+	)
+	old := agent.New(coordID)
+	old.Project = project
+	old.TaskID = CoordTaskIDPrefix + project
+	old.SupervisorPID = 333
+	old.Command = []string{"claude"}
+
+	d := doctorTestDeps()
+	d.Diagnose = func(string) coordlock.LeaseDiagnosis {
+		return coordlock.LeaseDiagnosis{Health: coordlock.LeaseHealthDead, HasRecord: true, OwnerPID: 333, OwnerAlive: false}
+	}
+	d.CoordMarker = func(string) string { return coordID }
+	d.LoadAgent = func(id string) (*agent.Record, error) {
+		if id == coordID {
+			return old, nil
+		}
+		return nil, errors.New("no record")
+	}
+	d.ListPendingQueue = func() ([]string, error) { return []string{"/q/spawn-fresh-" + coordID + ".json"}, nil }
+	d.ReadQueue = func(string) (queue.SpawnFresh, error) {
+		return queue.SpawnFresh{OldAgentID: coordID, Project: project, TaskID: CoordTaskIDPrefix + project,
+			HandoffDoc: "/tmp/h.md", NewAgentID: "succ"}, nil
+	}
+	d.TakeOver = func(string, string) (bool, error) { return true, nil }
+	d.RecoverSpawn = func(*agent.Record, string, string, bool, io.Writer, io.Writer) error { return nil }
+	d.DeleteQueue = func(string) error { return errors.New("disk full") }
+
+	report, err := gatherDoctorReportWith(doctorOpts{project: project, fix: true}, d)
+	if err != nil {
+		t.Fatalf("gather: %v", err)
+	}
+	var out, errOut bytes.Buffer
+	doctorRunFixWith(doctorOpts{project: project, fix: true}, &report, &out, &errOut, d)
+
+	pr := report.projects[0]
+	if pr.fixErr == nil {
+		t.Fatalf("queue delete failure must be a recovery error, got nil (caller would think the handoff is safe)")
+	}
+	// And the final render must NOT claim "Recovery complete".
+	var rendered bytes.Buffer
+	renderDoctorReport(doctorOpts{project: project, fix: true}, report, &rendered)
+	if strings.Contains(rendered.String(), "Recovery complete") {
+		t.Errorf("rendered a false 'Recovery complete' despite the queue-delete failure:\n%s", rendered.String())
+	}
+}

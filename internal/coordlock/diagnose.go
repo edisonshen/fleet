@@ -15,6 +15,11 @@ package coordlock
 // the facts the doctor renders + the SINGLE classification (LeaseHealth)
 // that drives its plain-English message and its --fix decision.
 
+import (
+	"errors"
+	"os"
+)
+
 // LeaseHealth is the doctor's single-verdict classification of a project's
 // coordinator lease. It is derived from the SAME predicate the acquire path
 // applies (holderHealthy), so a doctor that says "healthy" agrees with an
@@ -99,15 +104,39 @@ func diagnoseWithCfg(project string, cfg leaseConfig) LeaseDiagnosis {
 	if err != nil {
 		return LeaseDiagnosis{Health: LeaseHealthNone}
 	}
+	l := &Lease{cfg: cfg, paths: paths, boot: cfg.boot()}
+
 	rec, err := readEpoch(paths.epoch)
 	if err != nil {
-		// Absent or torn -> no usable record. (A torn read is conservatively
-		// "no record" — the doctor surfaces nothing to recover rather than
-		// acting on garbage.)
+		if !errors.Is(err, os.ErrNotExist) {
+			// Torn/unreadable (not merely absent) -> conservatively "no record"
+			// so the doctor surfaces nothing to recover rather than acting on
+			// garbage.
+			return LeaseDiagnosis{Health: LeaseHealthNone}
+		}
+		// NO epoch record. Mirror the acquire path's busy-flock booting check
+		// (codex PR6 iter-4 [P2]): a holder can grab coordinator.flock and HANG
+		// before writing coordinator.epoch (the acquire-to-epoch window). That
+		// state is recoverable via the flock body, so Diagnose must NOT report
+		// LeaseHealthNone and leave the stuck holder in place.
+		f, gotFlock, ferr := tryFlock(paths.flock)
+		if ferr != nil {
+			return LeaseDiagnosis{Health: LeaseHealthNone}
+		}
+		if gotFlock {
+			// We acquired it -> nobody holds it -> truly no leader.
+			_ = releaseFlock(f)
+			return LeaseDiagnosis{Health: LeaseHealthNone}
+		}
+		// Busy flock, no epoch: a fresh same-boot live holder is legitimately
+		// booting (None); a stale/dead/cross-boot/past-TTL body is a holder
+		// hung in the acquire window -> Hung (recoverable).
+		if l.flockHolderRecoverable() {
+			return LeaseDiagnosis{Health: LeaseHealthHung}
+		}
 		return LeaseDiagnosis{Health: LeaseHealthNone}
 	}
 
-	l := &Lease{cfg: cfg, paths: paths, boot: cfg.boot()}
 	d := LeaseDiagnosis{
 		HasRecord:     true,
 		Epoch:         rec.Epoch,

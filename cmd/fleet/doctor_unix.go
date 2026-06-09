@@ -376,16 +376,27 @@ func diagnoseProject(project string, wedgedDrains int, wedgedErr error, d doctor
 			case serr != nil:
 				pr.verboseDetail = append(pr.verboseDetail,
 					"tmux session "+rec.TmuxSession+" liveness probe was ambiguous: "+serr.Error()+" (not treating as dead)")
-			case !alive:
+			case !alive && pr.status != doctorStatusHealthy:
+				// Session confirmed gone AND the lease is NOT healthy -> a real
+				// stopped coord. Surface it; the headline (dead/none/hung) already
+				// drives recovery.
 				pr.findings = append(pr.findings, doctorFinding{
 					plain:   "the coordinator's terminal session is gone",
 					verbose: "tmux session " + rec.TmuxSession + " for coord " + marker + " is not alive",
 				})
-				if pr.status == doctorStatusHealthy {
-					// A healthy lease but a CONFIRMED-dead session is
-					// contradictory — downgrade to "stopped" so --fix can respawn.
-					pr.status = doctorStatusDead
-				}
+			case !alive:
+				// The lease is HEALTHY (live supervisor heartbeating within TTL)
+				// yet THIS record's session is gone — almost always a STALE
+				// TmuxSession on the marker record (the live coord runs on a
+				// different session), NOT a stuck coord (codex PR6 iter-4 [P2]).
+				// Do NOT downgrade to Dead: the read-only path would then advise
+				// --fix, but --fix correctly REFUSES a live holder, so the
+				// "remedy" could never run. Keep the healthy verdict (the lease's
+				// TTL + pid liveness is the stronger signal) and note the stale
+				// session only under --verbose.
+				pr.verboseDetail = append(pr.verboseDetail,
+					"note: recorded tmux session "+rec.TmuxSession+" for coord "+marker+
+						" is not alive, but the lease is healthy (likely a stale session field; not a stuck coord)")
 			}
 		}
 	}
@@ -587,15 +598,21 @@ func fixOneProject(pr *doctorProjectReport, stdout, stderr io.Writer, d doctorDe
 		return
 	}
 	// The recovery fulfilled the handoff — delete the pending queue file so a
-	// later drain doesn't re-process it (a delete failure is surfaced, not
-	// silent: a lingering queue file would re-spawn). Skip when there was no
-	// pending request (a hung coord with no queued handoff).
+	// later drain doesn't re-process the ALREADY-fulfilled handoff. A delete
+	// failure is a RECOVERY ERROR, not just a warning (codex PR6 iter-4 [P2]):
+	// leaving the stale queue file means a later `fleet drain` re-spawns for a
+	// handoff that is already done, so the caller must NOT see "complete" + a
+	// zero exit. Skip the delete only when there was no pending request (a hung
+	// coord with no queued handoff).
 	if queuePath != "" {
 		if derr := d.DeleteQueue(queuePath); derr != nil {
+			pr.fixErr = fmt.Errorf("doctor: recovered %s but could not clear the fulfilled handoff file %s: %w "+
+				"(a later drain may re-spawn for it)", project, queuePath, derr)
 			pr.verboseDetail = append(pr.verboseDetail, "queue delete failed: "+derr.Error())
 			_, _ = fmt.Fprintf(stderr,
 				"Project %s: recovered the coordinator but couldn't clear the pending handoff file (%v); "+
-					"rerun `fleet drain` to clean it.\n", project, derr)
+					"rerun `fleet drain` to clean it before it re-spawns.\n", project, derr)
+			return
 		}
 	}
 	pr.fixActions = []string{

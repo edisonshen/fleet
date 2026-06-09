@@ -10,7 +10,12 @@ package coordlock
 // fenced_not_acquired / released / none. Deterministic via the same
 // fakeClock + fakeLiveness seams the lease tests use — no time.Sleep.
 
-import "testing"
+import (
+	"os"
+	"path/filepath"
+	"syscall"
+	"testing"
+)
 
 func TestDiagnose_ClassifiesEveryHealth(t *testing.T) {
 	setupHome(t)
@@ -98,5 +103,59 @@ func TestDiagnose_FailoverDisabled(t *testing.T) {
 	})
 	if got := Diagnose(project); got.Health != LeaseHealthNone {
 		t.Fatalf("failover off: Health=%v, want None", got.Health)
+	}
+}
+
+// TestDiagnose_BusyFlockNoEpoch_Hung: a holder grabbed coordinator.flock and
+// hung BEFORE writing coordinator.epoch (the acquire-to-epoch window). The
+// acquire path treats that as recoverable via the flock body, so Diagnose
+// must classify it Hung (not None) — else `fleet doctor` says "no coord" and
+// leaves the stuck holder (codex PR6 iter-4 [P2]).
+func TestDiagnose_BusyFlockNoEpoch_Hung(t *testing.T) {
+	setupHome(t)
+	const project = "diag-busyflock"
+	clk := &fakeClock{}
+	live := newFakeLiveness()
+	cfg := testCfg(clk, live)
+
+	paths, err := resolvePaths(project)
+	if err != nil {
+		t.Fatalf("resolvePaths: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Dir(paths.flock), 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	// Hold the flock from a separate fd (a "holder"), write NO epoch, and stamp
+	// a STALE flock body (mono far in the past) so flockHolderRecoverable=true.
+	f, err := os.OpenFile(paths.flock, os.O_CREATE|os.O_RDWR, 0o644)
+	if err != nil {
+		t.Fatalf("open flock: %v", err)
+	}
+	t.Cleanup(func() { _ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN); _ = f.Close() })
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		t.Fatalf("flock: %v", err)
+	}
+	// Stale body: pid not live + mono older than TTL -> recoverable (hung).
+	staleBody := `{"pid":999999,"pid_start":1,"boot_id":"test-boot-1","mono":0}`
+	if _, werr := f.WriteAt([]byte(staleBody), 0); werr != nil {
+		t.Fatalf("write body: %v", werr)
+	}
+	_ = f.Sync()
+	clk.advance(2 * cfg.ttl) // now is well past the body's mono=0
+
+	got := diagnoseWithCfg(project, cfg)
+	if got.Health != LeaseHealthHung {
+		t.Fatalf("busy flock + no epoch + stale body: Health=%v, want Hung", got.Health)
+	}
+}
+
+// TestDiagnose_NoEpoch_FreeFlock_None: no epoch AND a FREE flock -> truly no
+// leader (None).
+func TestDiagnose_NoEpoch_FreeFlock_None(t *testing.T) {
+	setupHome(t)
+	const project = "diag-noflock"
+	cfg := testCfg(&fakeClock{}, newFakeLiveness())
+	if got := diagnoseWithCfg(project, cfg); got.Health != LeaseHealthNone {
+		t.Fatalf("no epoch + free flock: Health=%v, want None", got.Health)
 	}
 }
