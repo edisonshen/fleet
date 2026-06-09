@@ -86,41 +86,6 @@ func isCoordHandoffForAgent(project, agentID string) bool {
 	return state.ReadCoordSpawnMarker(project) == agentID
 }
 
-func refuseLeaseWrappedCoordHandoffRetire(oldRec, newRec *agent.Record, stderr io.Writer) error {
-	RollbackCoordMarkerIfPointingAt(oldRec.Project, oldRec.ID, newRec.ID, stderr)
-	if dropErr := DropReplacementRecord(newRec.TmuxSession, newRec.ID, stderr); dropErr != nil {
-		return fmt.Errorf(
-			"resume: coord handoff for project %q spawned standby successor %s but PR1 cannot verify its child before retiring old coord %s; cleanup failed: %w (old agent untouched, queue file preserved for retry after PR2 lock-coupled delivery)",
-			oldRec.Project, newRec.ID, oldRec.ID, dropErr)
-	}
-	return fmt.Errorf(
-		"resume: coord handoff for project %q spawned standby successor %s but PR1 cannot verify its child before retiring old coord %s; old agent untouched, replacement dropped, queue file preserved for retry after PR2 lock-coupled delivery",
-		oldRec.Project, newRec.ID, oldRec.ID)
-}
-
-var (
-	handoffLeaseActiveOwnerPIDFn = leaseActiveOwnerPID
-	handoffLeaseLeaderPresentFn  = leaseLeaderPresent
-)
-
-func shouldRefuseLeaseWrappedCoordHandoffRetire(oldRec *agent.Record) (bool, error) {
-	if !leaseFailoverEnabled() {
-		return false, nil
-	}
-	if oldRec.Project == "" || oldRec.SupervisorPID <= 0 {
-		return false, nil
-	}
-	ownerPID, ok := handoffLeaseActiveOwnerPIDFn(oldRec.Project)
-	if !ok || ownerPID != oldRec.SupervisorPID {
-		return false, nil
-	}
-	if !handoffLeaseLeaderPresentFn(oldRec.Project) {
-		return false, nil
-	}
-	ownerPID, ok = handoffLeaseActiveOwnerPIDFn(oldRec.Project)
-	return ok && ownerPID == oldRec.SupervisorPID, nil
-}
-
 // Resume completes a handoff for which the queue file already exists.
 // Two producers create such queue files:
 //
@@ -764,13 +729,6 @@ func spawnAndRetire(req queue.SpawnFresh, queuePath string,
 	isCoordSwap := false
 	if oldRec.Project != "" && state.ReadCoordSpawnMarker(oldRec.Project) == oldRec.ID {
 		isCoordSwap = true
-		refuse, rerr := shouldRefuseLeaseWrappedCoordHandoffRetire(oldRec)
-		if rerr != nil {
-			return fmt.Errorf("resume: %w (old agent untouched, queue file preserved for retry)", rerr)
-		}
-		if refuse {
-			return refuseLeaseWrappedCoordHandoffRetire(oldRec, newRec, stderr)
-		}
 		// Eager marker write — closes the duplicate-coord window
 		// during NEW's readiness wait. Best-effort; marker errors
 		// print a warning but don't fail the drain. retireOldAgent's
@@ -841,16 +799,6 @@ func retireOldAgent(oldRec, newRec *agent.Record, docPath, queuePath string,
 	// this respects the iter-2 P2 invariant. If the new agent dies
 	// during the wait, OLD is still alive; roll back the new and
 	// return so operator/recovery can retry cleanly.
-	if isCoordSwap {
-		refuse, rerr := shouldRefuseLeaseWrappedCoordHandoffRetire(oldRec)
-		if rerr != nil {
-			return fmt.Errorf("resume: %w (old agent untouched, queue file preserved for retry)", rerr)
-		}
-		if refuse {
-			return refuseLeaseWrappedCoordHandoffRetire(oldRec, newRec, stderr)
-		}
-	}
-	//
 	// Always runs, even when auto-resume is disabled (codex iter-9
 	// P1): the wait doubles as a post-spawn liveness check, catching
 	// wrappers that survive the immediate HasSession check but crash

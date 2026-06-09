@@ -1373,7 +1373,7 @@ func TestDrain_CoordHandoff_WritesMarkerBeforeInject(t *testing.T) {
 	}
 }
 
-func TestDrain_LeaseFailoverCoordHandoffRefusesBeforeRetiringOld(t *testing.T) {
+func TestDrain_LeaseFailoverCoordHandoff_ResumeFallbackCompletes(t *testing.T) {
 	requireTmux(t)
 	t.Setenv("FLEET_LEASE_FAILOVER", "1")
 	setupFleetHome(t)
@@ -1385,24 +1385,6 @@ func TestDrain_LeaseFailoverCoordHandoffRefusesBeforeRetiringOld(t *testing.T) {
 	if err := oldRec.Write(); err != nil {
 		t.Fatalf("rewrite old coord supervisor pid: %v", err)
 	}
-	origOwner := handoffLeaseActiveOwnerPIDFn
-	origLeader := handoffLeaseLeaderPresentFn
-	handoffLeaseActiveOwnerPIDFn = func(p string) (int, bool) {
-		if p != project {
-			t.Fatalf("active owner checked for project %q, want %q", p, project)
-		}
-		return oldRec.SupervisorPID, true
-	}
-	handoffLeaseLeaderPresentFn = func(p string) bool {
-		if p != project {
-			t.Fatalf("leader checked for project %q, want %q", p, project)
-		}
-		return true
-	}
-	t.Cleanup(func() {
-		handoffLeaseActiveOwnerPIDFn = origOwner
-		handoffLeaseLeaderPresentFn = origLeader
-	})
 	if _, err := state.EnsureProjectInitialized(oldRec.Project); err != nil {
 		t.Fatalf("EnsureProjectInitialized: %v", err)
 	}
@@ -1412,77 +1394,23 @@ func TestDrain_LeaseFailoverCoordHandoffRefusesBeforeRetiringOld(t *testing.T) {
 
 	req, qp := writeCoordSkillQueue(t, oldRec)
 	out := &bytes.Buffer{}
-	err := Resume(req, qp, 0, out, out)
-	if err == nil {
-		t.Fatal("expected failover coord drain handoff to refuse before retiring old")
+	if err := Resume(req, qp, 0, out, out); err != nil {
+		t.Fatalf("Resume must complete the drain cold-resume fallback, got: %v\n%s", err, out.String())
 	}
-	if !strings.Contains(err.Error(), "cannot verify its child before retiring old coord") {
-		t.Fatalf("refusal did not explain child verification gap: %v\n%s", err, out.String())
+	if _, lerr := agent.Load(oldRec.ID); !errors.Is(lerr, state.ErrNotFound) {
+		t.Fatalf("old coord record should be archived after fallback resume, load err=%v", lerr)
 	}
-	if _, lerr := agent.Load(oldRec.ID); lerr != nil {
-		t.Fatalf("old coord record was not preserved: %v", lerr)
+	if got := state.ReadCoordSpawnMarker(oldRec.Project); got != req.NewAgentID {
+		t.Fatalf("coord marker = %q, want new id %q", got, req.NewAgentID)
 	}
-	if got := state.ReadCoordSpawnMarker(oldRec.Project); got != oldRec.ID {
-		t.Fatalf("coord marker = %q, want old id %q", got, oldRec.ID)
+	if _, statErr := os.Stat(qp); !errors.Is(statErr, os.ErrNotExist) {
+		t.Fatalf("queue file should be consumed, stat err=%v", statErr)
 	}
-	if _, statErr := os.Stat(qp); statErr != nil {
-		t.Fatalf("queue file should be preserved for retry: %v", statErr)
+	newRec, lerr := agent.Load(req.NewAgentID)
+	if lerr != nil {
+		t.Fatalf("replacement record should remain live after fallback resume: %v", lerr)
 	}
-	if _, lerr := agent.Load(req.NewAgentID); !errors.Is(lerr, state.ErrNotFound) {
-		t.Fatalf("replacement record should be dropped, load err=%v", lerr)
-	}
-}
-
-func TestShouldRefuseLeaseWrappedCoordHandoffRetire_RequiresLiveOld(t *testing.T) {
-	t.Setenv("FLEET_LEASE_FAILOVER", "1")
-	oldRec := &agent.Record{ID: "oldcoord", Project: "rainier", SupervisorPID: 4242}
-
-	origOwner := handoffLeaseActiveOwnerPIDFn
-	origLeader := handoffLeaseLeaderPresentFn
-	handoffLeaseActiveOwnerPIDFn = func(project string) (int, bool) {
-		if project != oldRec.Project {
-			t.Fatalf("active owner checked for project %q, want %q", project, oldRec.Project)
-		}
-		return 0, false
-	}
-	handoffLeaseLeaderPresentFn = func(string) bool { return true }
-	t.Cleanup(func() {
-		handoffLeaseActiveOwnerPIDFn = origOwner
-		handoffLeaseLeaderPresentFn = origLeader
-	})
-
-	refuse, err := shouldRefuseLeaseWrappedCoordHandoffRetire(oldRec)
-	if err != nil {
-		t.Fatalf("shouldRefuseLeaseWrappedCoordHandoffRetire: %v", err)
-	}
-	if refuse {
-		t.Fatal("old coord is not the active lease owner; handoff must not drop a valid standby")
-	}
-
-	ownerReads := 0
-	handoffLeaseActiveOwnerPIDFn = func(string) (int, bool) {
-		ownerReads++
-		if ownerReads == 1 {
-			return oldRec.SupervisorPID, true
-		}
-		return oldRec.SupervisorPID + 1, true
-	}
-	refuse, err = shouldRefuseLeaseWrappedCoordHandoffRetire(oldRec)
-	if err != nil {
-		t.Fatalf("shouldRefuseLeaseWrappedCoordHandoffRetire owner-race: %v", err)
-	}
-	if refuse {
-		t.Fatal("active owner moved to successor after health check; must not drop standby")
-	}
-
-	handoffLeaseActiveOwnerPIDFn = func(string) (int, bool) { return oldRec.SupervisorPID, true }
-	refuse, err = shouldRefuseLeaseWrappedCoordHandoffRetire(oldRec)
-	if err != nil {
-		t.Fatalf("shouldRefuseLeaseWrappedCoordHandoffRetire active-old: %v", err)
-	}
-	if !refuse {
-		t.Fatal("old coord owns the active lease; PR1 must refuse before retiring it behind a standby supervisor")
-	}
+	t.Cleanup(func() { _ = tmux.Kill(newRec.TmuxSession) })
 }
 
 // TestDrain_WorkerHandoff_NoMarkerWrite pins
