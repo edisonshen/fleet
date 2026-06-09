@@ -191,3 +191,29 @@ func TestDiagnose_ReleasedButFlockHeld_Hung(t *testing.T) {
 		t.Fatalf("released + flock free: Health=%v, want Released (clean)", got.Health)
 	}
 }
+
+// TestDiagnose_ReadOnly_DoesNotCreateFlock: a read-only Diagnose must NOT
+// create coordinator.flock just to inspect a project with no epoch (codex PR6
+// iter-8 [P2]).
+func TestDiagnose_ReadOnly_DoesNotCreateFlock(t *testing.T) {
+	setupHome(t)
+	const project = "diag-nocreate"
+	// Initialize the project's .locks dir but write NO flock and NO epoch.
+	paths, err := resolvePaths(project)
+	if err != nil {
+		t.Fatalf("resolvePaths: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Dir(paths.flock), 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+
+	cfg := testCfg(&fakeClock{}, newFakeLiveness())
+	if got := diagnoseWithCfg(project, cfg); got.Health != LeaseHealthNone {
+		t.Fatalf("no epoch + no flock: Health=%v, want None", got.Health)
+	}
+	if _, statErr := os.Stat(paths.flock); statErr == nil {
+		t.Fatalf("Diagnose created coordinator.flock during a read-only inspection")
+	} else if !os.IsNotExist(statErr) {
+		t.Fatalf("unexpected stat error: %v", statErr)
+	}
+}

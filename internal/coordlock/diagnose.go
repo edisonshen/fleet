@@ -18,6 +18,7 @@ package coordlock
 import (
 	"errors"
 	"os"
+	"syscall"
 )
 
 // LeaseHealth is the doctor's single-verdict classification of a project's
@@ -119,13 +120,13 @@ func diagnoseWithCfg(project string, cfg leaseConfig) LeaseDiagnosis {
 		// before writing coordinator.epoch (the acquire-to-epoch window). That
 		// state is recoverable via the flock body, so Diagnose must NOT report
 		// LeaseHealthNone and leave the stuck holder in place.
-		f, gotFlock, ferr := tryFlock(paths.flock)
-		if ferr != nil {
-			return LeaseDiagnosis{Health: LeaseHealthNone}
-		}
-		if gotFlock {
-			// We acquired it -> nobody holds it -> truly no leader.
-			_ = releaseFlock(f)
+		//
+		// READ-ONLY (codex PR6 iter-8 [P2]): a missing flock file -> no holder
+		// (and we must NOT create it just to inspect). Only probe an EXISTING
+		// flock.
+		busy, ok := flockBusyReadOnly(paths.flock)
+		if !ok || !busy {
+			// No flock file, an unreadable probe, or a FREE flock -> no holder.
 			return LeaseDiagnosis{Health: LeaseHealthNone}
 		}
 		// Busy flock, no epoch: a fresh same-boot live holder is legitimately
@@ -175,7 +176,7 @@ func classifyDiagnosis(rec epochRecord, paths leasePaths, l *Lease) LeaseHealth 
 		// on budget exhaustion, takes the releaser over as a hung holder (codex
 		// PR6 iter-5 [P2]). Diagnose mirrors that: flock still busy -> Hung
 		// (recoverable); flock free -> a clean Released (nothing to recover).
-		if flockBusy(paths.flock) {
+		if busy, ok := flockBusyReadOnly(paths.flock); ok && busy {
 			return LeaseHealthHung
 		}
 		return LeaseHealthReleased
@@ -194,19 +195,34 @@ func classifyDiagnosis(rec epochRecord, paths leasePaths, l *Lease) LeaseHealth 
 	}
 }
 
-// flockBusy reports whether coordinator.flock is currently held by some
-// process (a non-NB acquire would block). It tries a NB acquire: success
-// means FREE (released immediately), EWOULDBLOCK means BUSY. Any open/flock
-// error degrades to "not busy" (conservative: the caller then treats a
-// released record as clean rather than inventing a hung holder). Read-only.
-func flockBusy(path string) bool {
-	f, gotFlock, err := tryFlock(path)
+// flockBusyReadOnly reports whether coordinator.flock is currently held by
+// some process, WITHOUT creating the file (codex PR6 iter-8 [P2]): a
+// read-only `fleet doctor` must not leave a coordinator.flock behind from
+// inspection alone. It opens the EXISTING file O_RDONLY (no O_CREATE) and
+// tries a NB shared-lock probe:
+//
+//	ok=false           -> the file is absent / unopenable -> no holder to judge
+//	ok=true, busy=true  -> a process holds an exclusive lock (live/hung holder)
+//	ok=true, busy=false -> the lock is free (no holder)
+//
+// A shared (LOCK_SH) NB probe is enough to detect an exclusive holder
+// (EWOULDBLOCK) and never blocks. We immediately release any lock we take.
+func flockBusyReadOnly(path string) (busy, ok bool) {
+	if _, statErr := os.Stat(path); statErr != nil {
+		return false, false // absent (or unstattable) -> nothing to probe
+	}
+	f, err := os.OpenFile(path, os.O_RDONLY, 0)
 	if err != nil {
-		return false
+		return false, false
 	}
-	if gotFlock {
-		_ = releaseFlock(f)
-		return false
+	defer func() { _ = f.Close() }()
+	lerr := syscall.Flock(int(f.Fd()), syscall.LOCK_SH|syscall.LOCK_NB)
+	if lerr == nil {
+		_ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
+		return false, true // acquired the shared lock -> no exclusive holder
 	}
-	return true
+	if lerr == syscall.EWOULDBLOCK { //nolint:errorlint // bare errno from syscall.Flock.
+		return true, true // an exclusive holder blocks us -> busy
+	}
+	return false, false // some other flock error -> inconclusive
 }

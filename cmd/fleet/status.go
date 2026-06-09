@@ -130,6 +130,13 @@ func runStatus(opts *statusOpts, stdout, stderr io.Writer, current string) error
 		// JSON stream while still surfacing the cap warning to
 		// monitoring jobs and scripted callers watching stderr.
 		emitSessionCapBanner(stderr)
+		// Stuck-handoff surface on the JSON path too (codex PR6 iter-8
+		// [P2]): a wedged coord handoff with no live agent records is
+		// otherwise invisible — `--json` would emit `[]` with no signal
+		// for dashboards/scripts to run `fleet doctor`. Write BOTH the
+		// line and any warning to STDERR so the stdout JSON stream stays
+		// valid for `| jq`.
+		emitStuckHandoffSection(stderr, stderr)
 		// JSON path stays a single record array — appending the
 		// nudge would break jq pipelines and `fleet status --json |
 		// fleet ...` chains. Operators piping through jq see only

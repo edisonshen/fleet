@@ -95,3 +95,35 @@ func TestStatus_FailoverDisabled_NoStuckHandoff(t *testing.T) {
 		t.Errorf("legacy mode (failover off) must not surface stuck handoffs, got:\n%s", out.String())
 	}
 }
+
+// codex PR6 iter-8 [P2]: `fleet status --json` must still surface a stuck
+// handoff (on stderr, keeping stdout valid JSON) — the JSON branch returns
+// before the human-path scan, so the JSON callers would otherwise get `[]`
+// and no `fleet doctor` signal.
+func TestStatus_StuckHandoff_OnJSONPath(t *testing.T) {
+	stubEnsureFresh(t)
+	t.Setenv("FLEET_HOME", t.TempDir())
+	t.Setenv("FLEET_LEASE_FAILOVER", "1")
+
+	d := doctorTestDeps()
+	d.ListPendingQueue = func() ([]string, error) { return []string{"/q/spawn-fresh-x.json"}, nil }
+	d.ReadQueue = func(string) (queue.SpawnFresh, error) {
+		return queue.SpawnFresh{OldAgentID: "x", Project: "jsonstuck", TaskID: CoordTaskIDPrefix + "jsonstuck"}, nil
+	}
+	d.LeaderPresent = func(string) bool { return false }
+	orig := stuckHandoffStatusFn
+	stuckHandoffStatusFn = func() doctorDeps { return d }
+	t.Cleanup(func() { stuckHandoffStatusFn = orig })
+
+	var stdout, stderr bytes.Buffer
+	if err := runStatus(&statusOpts{jsonOut: true}, &stdout, &stderr, "dev"); err != nil {
+		t.Fatalf("runStatus: %v", err)
+	}
+	if !strings.Contains(stderr.String(), "the handoff to a fresh coordinator didn't complete") {
+		t.Errorf("--json path must surface the stuck handoff on stderr; stderr:\n%s", stderr.String())
+	}
+	// stdout must remain valid JSON (the stuck line went to stderr).
+	if !strings.HasPrefix(strings.TrimSpace(stdout.String()), "[") {
+		t.Errorf("--json stdout should be a JSON array, got: %s", stdout.String())
+	}
+}
