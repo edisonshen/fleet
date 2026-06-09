@@ -100,11 +100,11 @@ type doctorProjectReport struct {
 	findings []doctorFinding
 
 	// --- recovery (populated only when --fix ran) ---
-	fixPlanned bool     // --fix decided to act on this project
-	fixActions []string // the plain-English actions, surfaced as they ran
-	fixRefused string   // non-empty: --fix deliberately did NOT act, with the plain reason
-	fixErr     error    // a recovery error (surfaced, never silently dropped)
-	verboseFix []string // engineer-detail lines for the recovery (--verbose only)
+	fixPlanned    bool     // --fix decided to act on this project
+	fixActions    []string // the plain-English actions, surfaced as they ran
+	fixRefused    string   // non-empty: --fix deliberately did NOT act, with the plain reason
+	fixErr        error    // a recovery error (surfaced, never silently dropped)
+	verboseDetail []string // engineer-detail lines for the recovery (--verbose only)
 }
 
 // doctorStatus is the headline health classification, decoupled from the
@@ -236,10 +236,15 @@ func renderDoctorReport(opts doctorOpts, report doctorReport, w io.Writer) {
 				}
 				_, _ = fmt.Fprintln(w, "  Recovery complete.")
 			}
-			if opts.verbose {
-				for _, v := range p.verboseFix {
-					_, _ = fmt.Fprintf(w, "      (%s)\n", v)
-				}
+		}
+
+		// Engineer detail (--verbose) renders on BOTH the read-only diagnosis
+		// path AND the --fix path (codex PR6 iter-2 [P2]): verboseDetail holds
+		// the lease state/epoch/pid the diagnosis collects PLUS any recovery
+		// detail, so `fleet doctor --verbose` (no --fix) must show it too.
+		if opts.verbose {
+			for _, v := range p.verboseDetail {
+				_, _ = fmt.Fprintf(w, "      (%s)\n", v)
 			}
 		}
 	}
@@ -247,7 +252,7 @@ func renderDoctorReport(opts doctorOpts, report doctorReport, w io.Writer) {
 
 // plainErr renders an error in plain English for the non-verbose surface.
 // It strips the wrapped jargon-laden internal message down to a generic
-// recovery line; --verbose callers see the raw error via verboseFix.
+// recovery line; --verbose callers see the raw error via verboseDetail.
 func plainErr(err error) string {
 	if err == nil {
 		return ""

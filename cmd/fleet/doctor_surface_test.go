@@ -44,7 +44,7 @@ func cannedDoctorReport() doctorReport {
 				"Stopped the stuck coordinator.",
 				"Started a fresh coordinator.",
 			},
-			verboseFix: []string{
+			verboseDetail: []string{
 				"lease: state=active epoch=7 owner-pid=999 owner-alive=true", // jargon in VERBOSE only
 				"refused: STONITH fence skipped",                             // jargon in VERBOSE only
 			},

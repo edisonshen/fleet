@@ -52,6 +52,7 @@ func doctorTestDeps() doctorDeps {
 		ReadQueue:        func(string) (queue.SpawnFresh, error) { return queue.SpawnFresh{}, nil },
 		DeleteQueue:      func(string) error { return nil },
 		HandoffDocs:      func() ([]string, error) { return nil, nil },
+		LeaseProjects:    func() ([]string, error) { return nil, nil },
 		WedgedDrains:     func() (int, error) { return 0, nil },
 		TakeOver:         func(string, string) (bool, error) { return false, nil },
 		RecoverSpawn:     func(*agent.Record, string, string, bool, io.Writer, io.Writer) error { return nil },
@@ -339,5 +340,106 @@ func TestDoctor_T32_FencedNotAcquired_Surfaced(t *testing.T) {
 	es := errOut.String()
 	if !strings.Contains(es, "fleet doctor") && !strings.Contains(es, "fleet status") {
 		t.Errorf("stderr missing an operator next-step hint; got:\n%s", es)
+	}
+}
+
+// --- codex PR6 iter-2 regressions ---
+
+// [P2] doctor (no --project) discovers a LEASE-ONLY stuck project — its coord
+// agent record AND queue file are both gone, only the stale epoch lingers.
+func TestDoctor_DiscoversLeaseOnlyStuckProject(t *testing.T) {
+	const project = "leaseonly"
+	d := doctorTestDeps()
+	d.ListAgents = func() ([]*agent.Record, error) { return nil, nil }
+	d.ListPendingQueue = func() ([]string, error) { return nil, nil }
+	// Only trace: a lingering lease record for a hung coord.
+	d.LeaseProjects = func() ([]string, error) { return []string{project}, nil }
+	d.Diagnose = func(p string) coordlock.LeaseDiagnosis {
+		if p == project {
+			return coordlock.LeaseDiagnosis{Health: coordlock.LeaseHealthHung, HasRecord: true, OwnerPID: 9, OwnerAlive: true}
+		}
+		return coordlock.LeaseDiagnosis{Health: coordlock.LeaseHealthNone}
+	}
+
+	report, err := gatherDoctorReportWith(doctorOpts{}, d)
+	if err != nil {
+		t.Fatalf("gather: %v", err)
+	}
+	found := false
+	for _, pr := range report.projects {
+		if pr.project == project {
+			found = true
+			if pr.status != doctorStatusUnresponsive {
+				t.Errorf("lease-only project status = %v, want Unresponsive", pr.status)
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("doctor (no --project) did not discover lease-only stuck project %q", project)
+	}
+}
+
+// [P2] read-only --verbose renders the lease diagnostic detail (it must NOT be
+// gated behind --fix).
+func TestDoctor_VerboseRendersDiagnosisDetail_NoFix(t *testing.T) {
+	const project = "verbproj"
+	d := doctorTestDeps()
+	d.Diagnose = func(string) coordlock.LeaseDiagnosis {
+		return coordlock.LeaseDiagnosis{
+			Health: coordlock.LeaseHealthHung, HasRecord: true,
+			Epoch: 42, State: "active", OwnerPID: 777, OwnerAlive: true,
+		}
+	}
+	report, err := gatherDoctorReportWith(doctorOpts{project: project, verbose: true}, d)
+	if err != nil {
+		t.Fatalf("gather: %v", err)
+	}
+	var out bytes.Buffer
+	// NOTE: fix=false — the diagnostic detail must still render under --verbose.
+	renderDoctorReport(doctorOpts{project: project, verbose: true}, report, &out)
+	s := out.String()
+	if !strings.Contains(s, "epoch=42") || !strings.Contains(s, "owner-pid=777") {
+		t.Errorf("read-only --verbose hid the lease diagnostic detail; got:\n%s", s)
+	}
+}
+
+// [P2] an AMBIGUOUS tmux probe (false, err) must NOT be reported as a dead
+// session and must NOT downgrade a healthy lease to "stopped".
+func TestDoctor_AmbiguousSessionProbe_NotTreatedDead(t *testing.T) {
+	const (
+		project = "ambigproj"
+		coordID = "ambigcoord"
+	)
+	rec := agent.New(coordID)
+	rec.Project = project
+	rec.TaskID = CoordTaskIDPrefix + project
+	rec.TmuxSession = "fleet-ambig"
+
+	d := doctorTestDeps()
+	d.Diagnose = func(string) coordlock.LeaseDiagnosis {
+		return coordlock.LeaseDiagnosis{Health: coordlock.LeaseHealthOK, HasRecord: true, OwnerPID: 5, OwnerAlive: true}
+	}
+	d.CoordMarker = func(string) string { return coordID }
+	d.LoadAgent = func(id string) (*agent.Record, error) {
+		if id == coordID {
+			return rec, nil
+		}
+		return nil, errors.New("no record")
+	}
+	// Ambiguous probe: (false, err) — a socket/list failure, NOT "dead".
+	d.SessionAlive = func(string) (bool, error) { return false, errors.New("tmux list-sessions: connection refused") }
+
+	report, err := gatherDoctorReportWith(doctorOpts{project: project}, d)
+	if err != nil {
+		t.Fatalf("gather: %v", err)
+	}
+	pr := report.projects[0]
+	if pr.status != doctorStatusHealthy {
+		t.Errorf("ambiguous tmux probe downgraded a healthy lease to %v; want Healthy", pr.status)
+	}
+	for _, f := range pr.findings {
+		if strings.Contains(f.plain, "terminal session is gone") {
+			t.Errorf("ambiguous tmux probe wrongly reported the session gone: %q", f.plain)
+		}
 	}
 }

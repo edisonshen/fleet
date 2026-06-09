@@ -79,6 +79,12 @@ type doctorDeps struct {
 	// HandoffDocs lists handoff doc filenames in ~/.fleet/handoffs/.
 	// Production: a ReadDir over state.HandoffDir.
 	HandoffDocs func() ([]string, error)
+	// LeaseProjects lists every project name that has a coordinator lease
+	// record on disk (~/.fleet/projects/<name>/.locks/coordinator.epoch),
+	// so the default scan reaches a stuck project whose coord record AND
+	// queue file are both gone but whose stale lease lingers. Production:
+	// defaultDoctorLeaseProjects.
+	LeaseProjects func() ([]string, error)
 	// WedgedDrains returns the count of WEDGED fleet drain run-records (gc
 	// KindDrainProcs, dry-run — gc owns the reaping). Production: a
 	// gc.Reconcile dry-run filtered to KindDrainProcs.
@@ -107,6 +113,7 @@ func defaultDoctorDeps() doctorDeps {
 		ReadQueue:        queue.ReadSpawnFresh,
 		DeleteQueue:      queue.Delete,
 		HandoffDocs:      defaultDoctorHandoffDocs,
+		LeaseProjects:    defaultDoctorLeaseProjects,
 		WedgedDrains:     defaultDoctorWedgedDrains,
 		TakeOver: func(project, agentID string) (bool, error) {
 			lease, acquired, err := coordlock.AcquireLeaseWithKill(project, agentID,
@@ -152,6 +159,42 @@ func defaultDoctorHandoffDocs() ([]string, error) {
 			continue
 		}
 		out = append(out, e.Name())
+	}
+	return out, nil
+}
+
+// defaultDoctorLeaseProjects lists every project that has a coordinator lease
+// record on disk: ~/.fleet/projects/<name>/.locks/coordinator.epoch. This is
+// the discovery path for a stuck project whose coord AGENT record AND
+// spawn-fresh QUEUE file are both gone (archived/drained) but whose stale
+// epoch lingers (codex PR6 iter-2 [P2]). Best-effort: a missing projects dir
+// yields nil.
+func defaultDoctorLeaseProjects() ([]string, error) {
+	root, err := state.Root()
+	if err != nil {
+		return nil, err
+	}
+	projectsDir := filepath.Join(root, "projects")
+	entries, err := os.ReadDir(projectsDir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	var out []string
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		name := e.Name()
+		if strings.HasPrefix(name, ".") {
+			continue // .locks/ and other dot-dirs are not projects
+		}
+		epoch := filepath.Join(projectsDir, name, ".locks", "coordinator.epoch")
+		if _, statErr := os.Stat(epoch); statErr == nil {
+			out = append(out, name)
+		}
 	}
 	return out, nil
 }
@@ -222,6 +265,16 @@ func doctorProjects(opts doctorOpts, d doctorDeps) ([]string, error) {
 			}
 		}
 	}
+	// AND include any project whose coordinator lease record lingers on disk
+	// even though its agent record + queue file are both gone (codex PR6
+	// iter-2 [P2]): a stuck coord that was archived/drained still leaves the
+	// stale .locks/coordinator.epoch, which is the only on-disk trace. Without
+	// this the operator would have to already know the name to pass --project.
+	if leaseProjects, lerr := d.LeaseProjects(); lerr == nil {
+		for _, p := range leaseProjects {
+			add(p)
+		}
+	}
 	return out, nil
 }
 
@@ -281,7 +334,7 @@ func diagnoseProject(project string, wedgedDrains int, wedgedErr error, d doctor
 		pr.status = doctorStatusNone
 	}
 	if diag.HasRecord {
-		pr.verboseFix = append(pr.verboseFix, fmt.Sprintf(
+		pr.verboseDetail = append(pr.verboseDetail, fmt.Sprintf(
 			"lease: state=%s epoch=%d owner-pid=%d owner-alive=%v",
 			defaultStr(diag.State, "-"), diag.Epoch, diag.OwnerPID, diag.OwnerAlive))
 	}
@@ -303,14 +356,25 @@ func diagnoseProject(project string, wedgedDrains int, wedgedErr error, d doctor
 	// Coordinator session liveness (only when we have a coord record).
 	if marker := d.CoordMarker(project); marker != "" {
 		if rec, lerr := d.LoadAgent(marker); lerr == nil && rec != nil && rec.TmuxSession != "" {
-			if alive, _ := d.SessionAlive(rec.TmuxSession); !alive {
+			// tmux.SessionAlive reserves a NON-NIL error for an AMBIGUOUS probe
+			// (socket/list-sessions failure) that must NOT be read as
+			// "definitively dead" (codex PR6 iter-2 [P2]). Only treat the session
+			// as gone on a CLEAN (false, nil) result; on an ambiguous error
+			// surface the uncertainty under --verbose but do NOT downgrade a
+			// healthy lease — a false "stopped" would trigger a needless respawn.
+			alive, serr := d.SessionAlive(rec.TmuxSession)
+			switch {
+			case serr != nil:
+				pr.verboseDetail = append(pr.verboseDetail,
+					"tmux session "+rec.TmuxSession+" liveness probe was ambiguous: "+serr.Error()+" (not treating as dead)")
+			case !alive:
 				pr.findings = append(pr.findings, doctorFinding{
 					plain:   "the coordinator's terminal session is gone",
 					verbose: "tmux session " + rec.TmuxSession + " for coord " + marker + " is not alive",
 				})
 				if pr.status == doctorStatusHealthy {
-					// A healthy lease but a dead session is contradictory —
-					// downgrade to "stopped" so --fix can respawn.
+					// A healthy lease but a CONFIRMED-dead session is
+					// contradictory — downgrade to "stopped" so --fix can respawn.
 					pr.status = doctorStatusDead
 				}
 			}
@@ -333,7 +397,7 @@ func diagnoseProject(project string, wedgedDrains int, wedgedErr error, d doctor
 			verbose: fmt.Sprintf("%d WEDGED fleet drain run-record(s) (gc KindDrainProcs); gc owns reaping", wedgedDrains),
 		})
 	} else if wedgedErr != nil {
-		pr.verboseFix = append(pr.verboseFix,
+		pr.verboseDetail = append(pr.verboseDetail,
 			"drain-scan error (non-fatal): "+wedgedErr.Error())
 	}
 
@@ -420,7 +484,7 @@ func fixOneProject(pr *doctorProjectReport, stdout, stderr io.Writer, d doctorDe
 	// is heartbeating now, REFUSE — never steal a live coordinator.
 	if d.LeaderPresent(project) {
 		pr.fixRefused = "the coordinator is live and responding; leaving it alone"
-		pr.verboseFix = append(pr.verboseFix,
+		pr.verboseDetail = append(pr.verboseDetail,
 			"refused: LeaderPresent=true (healthy heartbeating holder) — never clear a live lease")
 		_, _ = fmt.Fprintf(stdout, "Project %s: coordinator is responding; nothing to recover.\n", project)
 		return
@@ -456,7 +520,7 @@ func fixOneProject(pr *doctorProjectReport, stdout, stderr io.Writer, d doctorDe
 		// leave the typed state, surface it, offer operator-confirmed recovery
 		// (T32). NO silent stall, NO second leader.
 		pr.fixErr = err
-		pr.verboseFix = append(pr.verboseFix, "takeover error: "+err.Error())
+		pr.verboseDetail = append(pr.verboseDetail, "takeover error: "+err.Error())
 		_, _ = fmt.Fprintf(stderr,
 			"Project %s: could not safely stop the stuck coordinator. It may be in an ambiguous state. "+
 				"Rerun `fleet doctor --project %s --fix` once it settles, or check `fleet status`.\n",
@@ -467,7 +531,7 @@ func fixOneProject(pr *doctorProjectReport, stdout, stderr io.Writer, d doctorDe
 		// The takeover stood down (a healthy holder appeared, or it could not
 		// confirm the old coord is gone). Do NOT respawn (would duplicate).
 		pr.fixRefused = "the coordinator started responding again; leaving it alone"
-		pr.verboseFix = append(pr.verboseFix,
+		pr.verboseDetail = append(pr.verboseDetail,
 			"takeover acquired=false — healthy holder reappeared or old coord un-killable; not respawning (would duplicate)")
 		_, _ = fmt.Fprintf(stdout, "  - The coordinator started responding again; not restarting.\n")
 		return
@@ -496,7 +560,7 @@ func fixOneProject(pr *doctorProjectReport, stdout, stderr io.Writer, d doctorDe
 	disableAutoResume := effectiveDisableAutoResume(queueReq, cachedOld)
 	if rerr := d.RecoverSpawn(cachedOld, docPath, preAllocatedID, disableAutoResume, stdout, stderr); rerr != nil {
 		pr.fixErr = rerr
-		pr.verboseFix = append(pr.verboseFix, "recover-spawn error: "+rerr.Error())
+		pr.verboseDetail = append(pr.verboseDetail, "recover-spawn error: "+rerr.Error())
 		_, _ = fmt.Fprintf(stderr,
 			"Project %s: stopped the stuck coordinator but starting a fresh one failed: %v. "+
 				"Run `fleet dispatch --coord-spawn` to retry.\n", project, rerr)
@@ -508,7 +572,7 @@ func fixOneProject(pr *doctorProjectReport, stdout, stderr io.Writer, d doctorDe
 	// pending request (a hung coord with no queued handoff).
 	if queuePath != "" {
 		if derr := d.DeleteQueue(queuePath); derr != nil {
-			pr.verboseFix = append(pr.verboseFix, "queue delete failed: "+derr.Error())
+			pr.verboseDetail = append(pr.verboseDetail, "queue delete failed: "+derr.Error())
 			_, _ = fmt.Fprintf(stderr,
 				"Project %s: recovered the coordinator but couldn't clear the pending handoff file (%v); "+
 					"rerun `fleet drain` to clean it.\n", project, derr)
@@ -657,6 +721,9 @@ func fillDoctorDeps(d doctorDeps) doctorDeps {
 	}
 	if d.HandoffDocs == nil {
 		d.HandoffDocs = def.HandoffDocs
+	}
+	if d.LeaseProjects == nil {
+		d.LeaseProjects = def.LeaseProjects
 	}
 	if d.WedgedDrains == nil {
 		d.WedgedDrains = def.WedgedDrains
