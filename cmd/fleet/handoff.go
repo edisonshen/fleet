@@ -192,7 +192,11 @@ func shouldRefuseLeaseWrappedCoordHandoffRetire(oldRec *agent.Record) (bool, err
 	if !ok || ownerPID != oldRec.SupervisorPID {
 		return false, nil
 	}
-	return handoffLeaseLeaderPresentFn(oldRec.Project), nil
+	if !handoffLeaseLeaderPresentFn(oldRec.Project) {
+		return false, nil
+	}
+	ownerPID, ok = handoffLeaseActiveOwnerPIDFn(oldRec.Project)
+	return ok && ownerPID == oldRec.SupervisorPID, nil
 }
 
 // Crash safety: the queue file (step 5) is the journal entry. If we

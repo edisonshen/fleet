@@ -662,6 +662,22 @@ func TestHandoff_ShouldRefuseLeaseWrappedCoordHandoffRetire_RequiresLiveOld(t *t
 		t.Fatal("old coord is not the active lease owner; handoff must not drop a valid standby")
 	}
 
+	ownerReads := 0
+	handoffLeaseActiveOwnerPIDFn = func(string) (int, bool) {
+		ownerReads++
+		if ownerReads == 1 {
+			return oldRec.SupervisorPID, true
+		}
+		return oldRec.SupervisorPID + 1, true
+	}
+	refuse, err = shouldRefuseLeaseWrappedCoordHandoffRetire(oldRec)
+	if err != nil {
+		t.Fatalf("shouldRefuseLeaseWrappedCoordHandoffRetire owner-race: %v", err)
+	}
+	if refuse {
+		t.Fatal("active owner moved to successor after health check; must not drop standby")
+	}
+
 	handoffLeaseActiveOwnerPIDFn = func(string) (int, bool) { return oldRec.SupervisorPID, true }
 	refuse, err = shouldRefuseLeaseWrappedCoordHandoffRetire(oldRec)
 	if err != nil {
