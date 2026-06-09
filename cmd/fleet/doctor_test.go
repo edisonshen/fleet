@@ -632,3 +632,40 @@ func TestDoctor_QueueDeleteFailure_IsRecoveryError(t *testing.T) {
 		t.Errorf("rendered a false 'Recovery complete' despite the queue-delete failure:\n%s", rendered.String())
 	}
 }
+
+// --- codex PR6 iter-6 regression ---
+
+// [P2] a WORKER task whose id prefix-matches "coord-" (e.g. "coord-cache-warm")
+// must NOT be selected as the project coordinator — only the EXACT
+// coord-<project> sentinel is the coord. Otherwise --fix would respawn from a
+// worker record.
+func TestDoctor_WorkerTaskNamedCoordPrefix_NotCoord(t *testing.T) {
+	const project = "ops"
+	worker := agent.New("wcache")
+	worker.Project = project
+	worker.TaskID = "coord-cache-warm" // a worker task, NOT coord-ops
+
+	if isCoordAgentRecord(worker) {
+		t.Fatalf("worker task %q treated as the project coordinator", worker.TaskID)
+	}
+
+	realCoord := agent.New("realcoord")
+	realCoord.Project = project
+	realCoord.TaskID = CoordTaskIDPrefix + project // coord-ops
+	if !isCoordAgentRecord(realCoord) {
+		t.Fatalf("real coord task %q not recognized", realCoord.TaskID)
+	}
+
+	// And the discovery scan must not surface the worker-only project.
+	d := doctorTestDeps()
+	d.ListAgents = func() ([]*agent.Record, error) { return []*agent.Record{worker}, nil }
+	report, err := gatherDoctorReportWith(doctorOpts{}, d)
+	if err != nil {
+		t.Fatalf("gather: %v", err)
+	}
+	for _, pr := range report.projects {
+		if pr.project == project {
+			t.Errorf("worker-only project %q surfaced as having a coordinator", project)
+		}
+	}
+}

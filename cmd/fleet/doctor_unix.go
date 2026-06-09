@@ -279,10 +279,14 @@ func doctorProjects(opts doctorOpts, d doctorDeps) ([]string, error) {
 	return out, nil
 }
 
-// isCoordAgentRecord reports whether a record is a coordinator (its TaskID is
-// the coord- prefixed task for its project).
+// isCoordAgentRecord reports whether a record is THE project coordinator. It
+// uses the EXACT spawn.IsCoordSpawn discriminator (TaskID == "coord-"+Project),
+// not a bare prefix check (codex PR6 iter-6 [P2]): a worker task legitimately
+// named e.g. "coord-cache-warm" in project "ops" prefix-matches "coord-" but
+// is NOT the coordinator — selecting it as the old coord would make --fix
+// respawn from a WORKER record instead of a lease-wrapped coordinator.
 func isCoordAgentRecord(r *agent.Record) bool {
-	return strings.HasPrefix(r.TaskID, CoordTaskIDPrefix) && r.Project != ""
+	return spawn.IsCoordSpawn(r.TaskID, r.Project)
 }
 
 // gatherDoctorReport runs the read-only diagnosis for every in-scope
