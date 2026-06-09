@@ -171,6 +171,14 @@ func runStatus(opts *statusOpts, stdout, stderr io.Writer, current string) error
 	// `fleet status` is a non-fatal stderr line, not a non-zero exit).
 	emitOrphanReconcileSection(stdout, stderr)
 
+	// Stuck-handoff surface (DESIGN-handoff-drain-storm-leak PR6). A
+	// coordinator handoff that was requested but never completed (a pending
+	// spawn-fresh queue file with no live leader) is otherwise invisible in
+	// the agent table — the OLD coord is gone and no NEW one took over. Emit
+	// the canonical plain-English line pointing the operator at `fleet doctor`
+	// so a wedged handoff is never silent (surface-don't-silo). Read-only.
+	emitStuckHandoffSection(stdout, stderr)
+
 	// Upgrade nudge footer. Pure read against ~/.fleet/version_check.json;
 	// silent when no cache, no upgrade, or dev build. Same source of
 	// truth as the TUI banner — single chip, identical format.
