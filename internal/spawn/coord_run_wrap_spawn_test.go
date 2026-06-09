@@ -57,44 +57,6 @@ func TestSpawn_LeaseCoord_RollsBackPrelaunchRecordOnTmuxFailure(t *testing.T) {
 	}
 }
 
-// codex PR3 iter-12 [P2]: a WARM-STANDBY spawn must NOT run the engine-pid
-// resolver — the wrapped `coord-run --standby` supervisor does not launch the
-// engine until it acquires the lease, so the pane tree is supervisor-only and
-// resolving would corrupt the PID==engine vs SupervisorPID==lease-holder split.
-// The standby record keeps a PROVISIONAL pid (os.Getpid, the fleet binary), to
-// be re-stamped by the supervisor once it acquires + starts the engine.
-func TestSpawn_StandbySkipsEnginePidResolution(t *testing.T) {
-	requireTmux(t)
-	setupFleetHome(t)
-	t.Setenv("FLEET_LEASE_FAILOVER", "1")
-
-	old := agent.New("oldstandby")
-	old.Project = "p"
-	old.TaskID = "coord-p" // isCoordSpawn
-	old.Cwd = t.TempDir()
-	old.Command = []string{"sh", "-c", "sleep 60"}
-
-	rec, err := Spawn(Options{
-		OldRecord: old,
-		TaskID:    "coord-p",
-		Project:   "p",
-		Cwd:       old.Cwd,
-		Command:   old.Command,
-		Standby:   true,
-	})
-	if err != nil {
-		t.Fatalf("standby Spawn: %v", err)
-	}
-	t.Cleanup(func() { _ = tmux.Kill(rec.TmuxSession) })
-
-	// Provisional pid (os.Getpid) — the resolver was SKIPPED. A resolved pane
-	// pid would be the supervisor's, breaking the split.
-	if rec.PID != os.Getpid() {
-		t.Errorf("standby rec.PID = %d, want the provisional fleet-binary pid %d (resolver must be skipped)",
-			rec.PID, os.Getpid())
-	}
-}
-
 // codex PR3 iter-14 [P2]: if `coord-run --standby` acquires the lease and stamps
 // the REAL engine pid (agent.StampEnginePID) into the on-disk record BEFORE
 // spawn.Spawn's final locked merge runs, the merge must NOT clobber it back to
@@ -137,7 +99,6 @@ func TestSpawn_StandbyFinalMergePreservesStampedEnginePID(t *testing.T) {
 		Project:        "p",
 		Cwd:            old.Cwd,
 		Command:        old.Command,
-		Standby:        true,
 		PreAllocatedID: id,
 	})
 	if err != nil {

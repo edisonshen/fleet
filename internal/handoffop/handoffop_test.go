@@ -37,6 +37,7 @@ func setupFleetHome(t *testing.T) string {
 func requireTmux(t *testing.T) {
 	t.Helper()
 	tmuxtest.RequireTmux(t)
+	t.Setenv("FLEET_LEASE_FAILOVER", "0")
 	// retireOldAgent calls spawn.SendInitialPrompt, which polls the
 	// pane for stability. Production windows (500 ms stable / 30 s
 	// max) would balloon the suite; tests pin small values that
@@ -1369,6 +1370,44 @@ func TestDrain_CoordHandoff_WritesMarkerBeforeInject(t *testing.T) {
 	// future) are fine.
 	if calls[0] != oldRec.Project {
 		t.Errorf("first writeMarkerFn call: got project=%q want %q", calls[0], oldRec.Project)
+	}
+}
+
+func TestDrain_LeaseFailoverCoordHandoffRefusesBeforeRetiringOld(t *testing.T) {
+	requireTmux(t)
+	t.Setenv("FLEET_LEASE_FAILOVER", "1")
+	setupFleetHome(t)
+
+	const project = "rainier"
+	cwd := seedCoordRepoMeta(t, project)
+	oldRec := spawnSeedCoord(t, project, cwd)
+	if _, err := state.EnsureProjectInitialized(oldRec.Project); err != nil {
+		t.Fatalf("EnsureProjectInitialized: %v", err)
+	}
+	if err := state.WriteCoordSpawnMarker(oldRec.Project, oldRec.ID); err != nil {
+		t.Fatalf("WriteCoordSpawnMarker: %v", err)
+	}
+
+	req, qp := writeCoordSkillQueue(t, oldRec)
+	out := &bytes.Buffer{}
+	err := Resume(req, qp, 0, out, out)
+	if err == nil {
+		t.Fatal("expected failover coord drain handoff to refuse before retiring old")
+	}
+	if !strings.Contains(err.Error(), "cannot verify its child before retiring old coord") {
+		t.Fatalf("refusal did not explain child verification gap: %v\n%s", err, out.String())
+	}
+	if _, lerr := agent.Load(oldRec.ID); lerr != nil {
+		t.Fatalf("old coord record was not preserved: %v", lerr)
+	}
+	if got := state.ReadCoordSpawnMarker(oldRec.Project); got != oldRec.ID {
+		t.Fatalf("coord marker = %q, want old id %q", got, oldRec.ID)
+	}
+	if _, statErr := os.Stat(qp); statErr != nil {
+		t.Fatalf("queue file should be preserved for retry: %v", statErr)
+	}
+	if _, lerr := agent.Load(req.NewAgentID); !errors.Is(lerr, state.ErrNotFound) {
+		t.Fatalf("replacement record should be dropped, load err=%v", lerr)
 	}
 }
 

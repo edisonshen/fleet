@@ -86,6 +86,18 @@ func isCoordHandoffForAgent(project, agentID string) bool {
 	return state.ReadCoordSpawnMarker(project) == agentID
 }
 
+func refuseLeaseWrappedCoordHandoffRetire(oldRec, newRec *agent.Record, stderr io.Writer) error {
+	RollbackCoordMarkerIfPointingAt(oldRec.Project, oldRec.ID, newRec.ID, stderr)
+	if dropErr := DropReplacementRecord(newRec.TmuxSession, newRec.ID, stderr); dropErr != nil {
+		return fmt.Errorf(
+			"resume: coord handoff for project %q spawned standby successor %s but PR1 cannot verify its child before retiring old coord %s; cleanup failed: %w (old agent untouched, queue file preserved for retry after PR2 lock-coupled delivery)",
+			oldRec.Project, newRec.ID, oldRec.ID, dropErr)
+	}
+	return fmt.Errorf(
+		"resume: coord handoff for project %q spawned standby successor %s but PR1 cannot verify its child before retiring old coord %s; old agent untouched, replacement dropped, queue file preserved for retry after PR2 lock-coupled delivery",
+		oldRec.Project, newRec.ID, oldRec.ID)
+}
+
 // Resume completes a handoff for which the queue file already exists.
 // Two producers create such queue files:
 //
@@ -674,6 +686,7 @@ func spawnAndRetire(req queue.SpawnFresh, queuePath string,
 		// legacy case). A v1 drain shouldn't permanently flip the
 		// new record's baseline to opt-out (codex iter-18 P2).
 		DisableAutoResume: disableAutoResume,
+		StandbyTimeout:    spawn.DefaultStandbyTimeout,
 	})
 	if err != nil {
 		return fmt.Errorf("resume: spawn replacement: %w", err)
@@ -853,6 +866,9 @@ func retireOldAgent(oldRec, newRec *agent.Record, docPath, queuePath string,
 	// AlreadySpawnedNewRec entrypoint skips its own spawn + probe
 	// steps and proceeds straight to the marker commit.
 	if isCoordSwap {
+		if coordlock.FailoverEnabled() {
+			return refuseLeaseWrappedCoordHandoffRetire(oldRec, newRec, stderr)
+		}
 		_, swapErr := AtomicCoordSwap(AtomicCoordSwapInputs{
 			Project:              oldRec.Project,
 			OldRec:               oldRec,

@@ -114,6 +114,13 @@ type coordRunOpts struct {
 	// (defaultStandbyPoll). Test-only override so the poll loop is
 	// exercised without a wall-clock wait.
 	standbyPoll time.Duration
+	// standbyTimeout bounds how long a standby polls behind a healthy
+	// leader before self-exiting cleanly. 0 = production default
+	// (defaultStandbyTimeout).
+	standbyTimeout time.Duration
+	// standbyTimeoutC is a test-only timeout channel override so timeout
+	// behavior can be exercised deterministically without sleeping.
+	standbyTimeoutC <-chan time.Time
 	// standbyOnAcquired, when non-nil, is invoked once the standby poll
 	// loop acquires the lease (after a busy period). Test-only seam to
 	// assert the loop converged without scraping stderr.
@@ -168,13 +175,18 @@ func (o coordRunOpts) withReady(f func()) coordRunOpts {
 // tunes the poll cadence).
 var defaultStandbyPoll = 2 * time.Second
 
+var defaultStandbyTimeout = 10 * time.Minute
+
+var errStandbyTimedOut = errors.New("coord-run: standby timed out")
+
 // newCoordRunCmd builds the cobra subcommand for `fleet coord-run`.
 // Registered from cmd/fleet/main.go's newRootCmd.
 func newCoordRunCmd() *cobra.Command {
 	var (
-		agentID string
-		project string
-		standby bool
+		agentID        string
+		project        string
+		standby        bool
+		standbyTimeout time.Duration
 	)
 	cmd := &cobra.Command{
 		Use:   "coord-run -- <cmd> [args...]",
@@ -202,11 +214,12 @@ Required: --agent <id>, --project <name>, and a child argv after --.`,
 				return errors.New("coord-run: child argv required (pass after `--`)")
 			}
 			opts := coordRunOpts{
-				agentID: agentID,
-				project: project,
-				session: tmux.SessionName(agentID),
-				argv:    args,
-				standby: standby,
+				agentID:        agentID,
+				project:        project,
+				session:        tmux.SessionName(agentID),
+				argv:           args,
+				standby:        standby,
+				standbyTimeout: standbyTimeout,
 			}
 			return notifyCoordRun(opts, cmd.OutOrStdout(), cmd.ErrOrStderr())
 		},
@@ -218,6 +231,8 @@ Required: --agent <id>, --project <name>, and a child argv after --.`,
 	cmd.Flags().BoolVar(&standby, "standby", false,
 		"run as a WARM-STANDBY coord: on a busy lease, POLL until the leader exits "+
 			"(graceful handoff) instead of standing down + exiting")
+	cmd.Flags().DurationVar(&standbyTimeout, "standby-timeout", defaultStandbyTimeout,
+		"maximum time a standby coord polls behind a healthy leader before exiting cleanly")
 	return cmd
 }
 
@@ -361,6 +376,8 @@ func runCoordRun(ctx context.Context, opts coordRunOpts, stdout, stderr io.Write
 		}
 		polled, perr := standbyPollUntilAcquired(ctx, acquire, opts, stderr)
 		switch {
+		case errors.Is(perr, errStandbyTimedOut):
+			return nil
 		case perr != nil:
 			return fmt.Errorf("coord-run: standby acquire for project %q: %w", opts.project, perr)
 		case polled == nil:
@@ -466,6 +483,7 @@ func runCoordRun(ctx context.Context, opts coordRunOpts, stdout, stderr io.Write
 //
 //	acquired==true  -> returns (lease, nil): we are now the leader.
 //	ctx canceled    -> returns (nil, nil): clean shutdown, never led.
+//	timeout         -> returns errStandbyTimedOut: clean self-exit, never led.
 //	real fault      -> returns (nil, err): acquire/takeover error, surface.
 //
 // A busy lease (acquired==false, err==nil) is the normal "leader still
@@ -490,15 +508,28 @@ func standbyPollUntilAcquired(ctx context.Context, acquire func() (coordLease, b
 	if poll <= 0 {
 		poll = defaultStandbyPoll
 	}
+	timeout := opts.standbyTimeout
+	if timeout <= 0 {
+		timeout = defaultStandbyTimeout
+	}
 	_, _ = fmt.Fprintf(stderr,
-		"coord-run: standby for %s — a coord is already running; polling for the lease every %s\n",
-		opts.project, poll)
+		"coord-run: standby for %s — a coord is already running; polling for the lease every %s for up to %s\n",
+		opts.project, poll, timeout)
 
 	// First attempt already happened in runCoordRun (acquired==false led us
 	// here); start by waiting one interval before re-trying so we don't
 	// hot-loop on a freshly-observed busy lease.
 	timer := time.NewTimer(poll)
 	defer timer.Stop()
+	timeoutC := opts.standbyTimeoutC
+	var timeoutTimer *time.Timer
+	if timeoutC == nil {
+		timeoutTimer = time.NewTimer(timeout)
+		timeoutC = timeoutTimer.C
+	}
+	if timeoutTimer != nil {
+		defer timeoutTimer.Stop()
+	}
 	for {
 		select {
 		case <-ctx.Done():
@@ -506,6 +537,11 @@ func standbyPollUntilAcquired(ctx context.Context, acquire func() (coordLease, b
 				"coord-run: standby for %s canceled before acquiring the lease (clean shutdown)\n",
 				opts.project)
 			return nil, nil
+		case <-timeoutC:
+			_, _ = fmt.Fprintf(stderr,
+				"coord-run: standby for %s gave up after %s — exiting (not the coord)\n",
+				opts.project, timeout)
+			return nil, errStandbyTimedOut
 		case <-timer.C:
 		}
 		lease, acquired, err := acquire()

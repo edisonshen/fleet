@@ -13,6 +13,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"os"
@@ -157,6 +158,50 @@ func TestCoordRun_Standby_CancelBeforeAcquire_NeverStartsChild(t *testing.T) {
 		t.Errorf("Release runs = %d, want 0 (never acquired)", got)
 	}
 	// coord.Cleanup still ran (our own record archived) on the clean exit.
+	assertCleanupRan(t, agentID, markerPath)
+}
+
+func TestCoordRun_Standby_TimeoutBeforeAcquire_ExitsCleanly(t *testing.T) {
+	const (
+		agentID = "sbtimeout"
+		project = "sb-timeout"
+		session = "fleet-sbtimeout"
+	)
+	markerPath := coordRunTestHome(t, agentID, project, session)
+
+	sentinel := filepath.Join(t.TempDir(), "child-ran")
+	timeoutC := make(chan time.Time)
+	close(timeoutC)
+	var calls int32
+	opts := coordRunOpts{
+		agentID:         agentID,
+		project:         project,
+		session:         session,
+		argv:            childSentinelArgv(sentinel),
+		killTmux:        func(string) error { return nil },
+		standby:         true,
+		standbyPoll:     time.Hour,
+		standbyTimeout:  5 * time.Minute,
+		standbyTimeoutC: timeoutC,
+		acquireLease: func() (coordLease, bool, error) {
+			atomic.AddInt32(&calls, 1)
+			return nil, false, nil
+		},
+	}
+
+	var stderr bytes.Buffer
+	if err := runCoordRun(context.Background(), opts, os.Stdout, &stderr); err != nil {
+		t.Fatalf("timed-out standby must return nil (exit 0), got %v", err)
+	}
+	if got := atomic.LoadInt32(&calls); got != 1 {
+		t.Errorf("acquire calls = %d, want 1 (initial busy acquire only; timeout fired before poll)", got)
+	}
+	if _, err := os.Stat(sentinel); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("child sentinel %s exists — timed-out standby MUST NOT start the child", sentinel)
+	}
+	if !strings.Contains(stderr.String(), "standby for sb-timeout gave up after 5m0s") {
+		t.Errorf("timeout log missing; stderr=%q", stderr.String())
+	}
 	assertCleanupRan(t, agentID, markerPath)
 }
 

@@ -991,6 +991,10 @@ func TestDrainLease_TakeoverDoesNotHoldLockAcrossKill(t *testing.T) {
 // from the handoff doc instead of sitting idle). Without it the replacement is
 // invisible + inert.
 func TestRecoverHandoffTail_WritesMarkerAndSendsPrompt(t *testing.T) {
+	t.Setenv("FLEET_HOME", t.TempDir())
+	if _, err := state.Bootstrap(); err != nil {
+		t.Fatalf("bootstrap: %v", err)
+	}
 	oldRec := oldCoordRec()
 	oldRec.TaskID = "coord-projects-fleet" // IsCoordSpawn requires "coord-<project>"
 
@@ -1035,6 +1039,10 @@ func TestRecoverHandoffTail_WritesMarkerAndSendsPrompt(t *testing.T) {
 // The tail honors DisableAutoResume: no resume prompt is typed (the operator
 // drives the first turn), but the marker is STILL written so discovery works.
 func TestRecoverHandoffTail_DisableAutoResume_NoPromptStillMarks(t *testing.T) {
+	t.Setenv("FLEET_HOME", t.TempDir())
+	if _, err := state.Bootstrap(); err != nil {
+		t.Fatalf("bootstrap: %v", err)
+	}
 	oldRec := oldCoordRec()
 	oldRec.TaskID = "coord-projects-fleet"
 

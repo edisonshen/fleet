@@ -106,11 +106,8 @@ type drainLeaseDeps struct {
 	// RecoverSpawn brings up a FRESH lease-wrapped successor AFTER a safety-net
 	// takeover has fenced+killed a hung OLD (codex PR3 iter-7 [P1]). It must
 	// spawn from the CACHED old record (captured BEFORE the takeover archived
-	// it) as a dead-coord RECOVERY (spawn.Options{RecoverDeadCoord:true}) so
-	// the successor is coord-run-wrapped and ACQUIRES + heartbeats the now-free
-	// lease — NOT routed through handoffop.Resume (which loads OLD by id and
-	// would race the takeover's archive + spawn an UNWRAPPED handoff
-	// successor). preAllocatedID is the queue's pre-allocated successor id
+	// it), using the unified coord-run --standby path so the successor
+	// acquires + heartbeats the now-free lease. preAllocatedID is the queue's pre-allocated successor id
 	// (req.NewAgentID) so journal/doc/remote-control setup keyed to it still
 	// correlates to the live replacement (codex PR3 iter-10 [P2]); empty means
 	// generate a fresh id. nil OldRec means "could not cache OLD" -> the seam
@@ -178,9 +175,9 @@ func defaultDrainLeaseDeps() drainLeaseDeps {
 }
 
 // productionRecoverSpawn brings up a FRESH lease-wrapped successor after a
-// takeover (codex PR3 iter-7 [P1]). It spawns from the CACHED old record as a
-// dead-coord RECOVERY so the successor is coord-run-wrapped and acquires the
-// now-free lease (RecoverDeadCoord=true). Coord cwd resolves through the shared
+// takeover (codex PR3 iter-7 [P1]). It spawns from the CACHED old record via
+// the unified coord-run --standby path so the successor acquires the
+// now-free lease. Coord cwd resolves through the shared
 // project-repo resolver (same as the dispatch recovery path), never the old
 // coord's stale stored Cwd. Surface-don't-silo on any gap: a missing record /
 // unresolvable repo prints a concrete recovery command rather than spawning
@@ -236,11 +233,8 @@ func productionRecoverSpawn(oldRec *agent.Record, docPath, preAllocatedID string
 		// journal/doc/remote-control setup keyed to it correlates to the live
 		// replacement (codex PR3 iter-10 [P2]). Empty -> spawn.Spawn allocates.
 		PreAllocatedID: preAllocatedID,
-		// RecoverDeadCoord: OLD is gone (the takeover reaped it) -> the
-		// successor is a FRESH leader and MUST be lease-wrapped so it acquires
-		// + heartbeats the now-free lease.
-		RecoverDeadCoord: true,
-		LeaderCheck:      coordLeaderCheck,
+		LeaderCheck:    coordLeaderCheck,
+		StandbyTimeout: spawn.DefaultStandbyTimeout,
 	})
 	if err != nil {
 		return fmt.Errorf("fleet drain: recover-spawn replacement for %s: %w", oldRec.ID, err)
@@ -877,11 +871,10 @@ func takeoverAndRecover(req queue.SpawnFresh, path string, cachedOld *agent.Reco
 
 	// The hung OLD is fenced + killed (drain acquired the freed flock, proving
 	// OLD released, then released it for the successor). Bring up a
-	// FRESH lease-wrapped successor from the CACHED old record (dead-coord
-	// recovery — RecoverDeadCoord) so it acquires + heartbeats the now-free
-	// lease (codex PR3 iter-7 [P1]). We do NOT route through handoffop.Resume:
-	// that loads OLD by id (racing the archive) and would spawn an UNWRAPPED
-	// handoff successor that never acquires the lease.
+	// FRESH lease-wrapped successor from the CACHED old record via the
+	// unified standby path so it acquires + heartbeats the now-free lease
+	// (codex PR3 iter-7 [P1]). We do NOT route through handoffop.Resume:
+	// that loads OLD by id (racing the archive).
 	_, _ = fmt.Fprintf(stderr,
 		"fleet drain: takeover fenced/killed the hung coord for %s; recovering a lease-wrapped successor\n", project)
 	if err := d.RecoverSpawn(cachedOld, req.HandoffDoc, req.NewAgentID, effectiveDisableAutoResume(req, cachedOld), stdout, stderr); err != nil {

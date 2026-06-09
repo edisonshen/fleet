@@ -45,6 +45,7 @@ func setupFleetHome(t *testing.T) string {
 func requireTmux(t *testing.T) {
 	t.Helper()
 	tmuxtest.RequireTmux(t)
+	t.Setenv("FLEET_LEASE_FAILOVER", "0")
 	// runHandoff calls spawn.SendInitialPrompt between step 8a and
 	// step 9; the helper polls pane stability before typing. Pin
 	// small windows so tests don't pay the production 30 s cap on
@@ -557,6 +558,62 @@ func TestHandoff_CoordRefusesWhenUnresolvable(t *testing.T) {
 			t.Cleanup(func() { _ = tmux.Kill(l.TmuxSession) })
 			t.Errorf("coord handoff spawned a replacement %q despite refusal", l.ID)
 		}
+	}
+}
+
+func TestHandoff_LeaseFailoverCoordHandoffRefusesBeforeRetiringOld(t *testing.T) {
+	requireTmux(t)
+	t.Setenv("FLEET_LEASE_FAILOVER", "1")
+	root := setupFleetHome(t)
+
+	const project = "rainier"
+	cwd := seedRecoveryRepo(t, root, project)
+	old := agent.New(agent.NewID())
+	old.TaskID = "coord-" + project
+	old.Project = project
+	old.Cwd = cwd
+	old.Command = []string{"sleep", "60"}
+	old.TmuxSession = tmux.SessionName(old.ID)
+	old.SpawnedAt = time.Now().UTC()
+	old.LastActivityTS = old.SpawnedAt
+	if err := tmux.Spawn(old.TmuxSession, old.Cwd, old.Command, []string{"FLEET_AGENT_ID=" + old.ID}); err != nil {
+		t.Fatalf("spawn old coord: %v", err)
+	}
+	t.Cleanup(func() { _ = tmux.Kill(old.TmuxSession) })
+	if err := old.Write(); err != nil {
+		t.Fatalf("write old coord: %v", err)
+	}
+	if _, err := state.EnsureProjectInitialized(project); err != nil {
+		t.Fatalf("EnsureProjectInitialized: %v", err)
+	}
+	if err := state.WriteCoordSpawnMarker(project, old.ID); err != nil {
+		t.Fatalf("seed marker: %v", err)
+	}
+
+	out := &bytes.Buffer{}
+	err := runHandoff(&handoffOpts{
+		oldID:       old.ID,
+		command:     []string{"sleep", "60"},
+		graceMillis: 0,
+	}, out, out)
+	if err == nil {
+		t.Fatal("expected failover coord handoff to refuse before retiring old")
+	}
+	if !strings.Contains(err.Error(), "cannot verify its child before retiring old coord") {
+		t.Fatalf("refusal did not explain child verification gap: %v\n%s", err, out.String())
+	}
+	if _, lerr := agent.Load(old.ID); lerr != nil {
+		t.Fatalf("old coord record was not preserved: %v", lerr)
+	}
+	if got := state.ReadCoordSpawnMarker(project); got != old.ID {
+		t.Fatalf("coord marker = %q, want old id %q", got, old.ID)
+	}
+	qp, qerr := state.QueuePath(queue.SpawnFreshName(old.ID))
+	if qerr != nil {
+		t.Fatalf("QueuePath: %v", qerr)
+	}
+	if _, statErr := os.Stat(qp); statErr != nil {
+		t.Fatalf("queue file should be preserved for retry: %v", statErr)
 	}
 }
 

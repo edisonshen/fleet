@@ -6,7 +6,7 @@
 // deterministic without a real tmux server:
 //
 //	W1  coordRunWrap shape: head = [fleet coord-run --agent <id>
-//	    --project <p> --], tail = the engine argv.
+//	    --project <p> --standby --standby-timeout <T> --], tail = the engine argv.
 //	W2  flag OFF -> leaseFailoverEnabled() false -> no wrap.
 //	W3  alreadyCoordRunWrapped guards against double/nested wrapping.
 package spawn
@@ -15,6 +15,7 @@ import (
 	"reflect"
 	"runtime"
 	"testing"
+	"time"
 )
 
 func TestCoordRunWrap_Shape(t *testing.T) {
@@ -24,9 +25,12 @@ func TestCoordRunWrap_Shape(t *testing.T) {
 		project  = "projects-fleet"
 	)
 	engine := []string{"sh", "-c", "claude --dangerously-skip-permissions"}
-	got := coordRunWrap(fleetBin, agentID, project, false, engine)
+	got := coordRunWrap(fleetBin, agentID, project, 2*time.Minute, engine)
 
-	wantHead := []string{fleetBin, "coord-run", "--agent", agentID, "--project", project, "--"}
+	wantHead := []string{
+		fleetBin, "coord-run", "--agent", agentID, "--project", project,
+		"--standby", "--standby-timeout", "2m0s", "--",
+	}
 	if len(got) < len(wantHead) {
 		t.Fatalf("wrapped argv too short: %v", got)
 	}
@@ -41,24 +45,25 @@ func TestCoordRunWrap_Shape(t *testing.T) {
 func TestCoordRunWrap_DoesNotMutateInput(t *testing.T) {
 	engine := []string{"sh", "-c", "claude"}
 	orig := append([]string(nil), engine...)
-	_ = coordRunWrap("/bin/fleet", "id1", "p1", false, engine)
+	_ = coordRunWrap("/bin/fleet", "id1", "p1", time.Minute, engine)
 	if !reflect.DeepEqual(engine, orig) {
 		t.Errorf("input mutated: got %v want %v", engine, orig)
 	}
 }
 
-// PR3 (warm standby): standby=true inserts `--standby` between the project
-// flag and the `--` separator so the supervisor polls the busy lease.
-func TestCoordRunWrap_StandbyInsertsFlag(t *testing.T) {
+func TestCoordRunWrap_DefaultTimeout(t *testing.T) {
 	const (
 		fleetBin = "/usr/local/bin/fleet"
 		agentID  = "sb-deadbeef"
 		project  = "projects-fleet"
 	)
 	engine := []string{"sh", "-c", "claude"}
-	got := coordRunWrap(fleetBin, agentID, project, true, engine)
+	got := coordRunWrap(fleetBin, agentID, project, 0, engine)
 
-	want := []string{fleetBin, "coord-run", "--agent", agentID, "--project", project, "--standby", "--"}
+	want := []string{
+		fleetBin, "coord-run", "--agent", agentID, "--project", project,
+		"--standby", "--standby-timeout", DefaultStandbyTimeout.String(), "--",
+	}
 	want = append(want, engine...)
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("standby wrap = %v, want %v", got, want)
@@ -90,30 +95,22 @@ func TestLeaseFailoverEnabled_Gate(t *testing.T) {
 	}
 }
 
-// codex PR2 iter-7/8 [P1]: FRESH coord spawns AND dead-coord RECOVERIES
-// are lease-wrapped (both are fresh leaders); only a LIVE handoff/drain
-// successor is NOT (the outgoing coord still holds the lease, so a wrapped
-// successor would stand down and never start). The dead-coord recovery
-// case is exercised here via liveHandoffSuccessor=false (the dispatch
-// call computes OldRecord!=nil && !RecoverDeadCoord).
 func TestShouldLeaseWrap(t *testing.T) {
 	cases := []struct {
-		name                                      string
-		failoverOn, isCoord, liveHandoffSuccessor bool
-		want                                      bool
+		name                string
+		failoverOn, isCoord bool
+		want                bool
 	}{
-		{"fresh coord, flag on", true, true, false, true},
-		{"dead-coord recovery (not a live successor)", true, true, false, true},
-		{"live handoff successor, flag on", true, true, true, false},
-		{"flag off", false, true, false, false},
-		{"worker (not coord)", true, false, false, false},
-		{"live handoff worker", true, false, true, false},
+		{"coord, flag on", true, true, true},
+		{"flag off", false, true, false},
+		{"worker (not coord)", true, false, false},
+		{"worker and flag off", false, false, false},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			if got := shouldLeaseWrap(c.failoverOn, c.isCoord, c.liveHandoffSuccessor); got != c.want {
-				t.Errorf("shouldLeaseWrap(%v,%v,%v) = %v, want %v",
-					c.failoverOn, c.isCoord, c.liveHandoffSuccessor, got, c.want)
+			if got := shouldLeaseWrap(c.failoverOn, c.isCoord); got != c.want {
+				t.Errorf("shouldLeaseWrap(%v,%v) = %v, want %v",
+					c.failoverOn, c.isCoord, got, c.want)
 			}
 		})
 	}
@@ -142,5 +139,35 @@ func TestAlreadyCoordRunWrapped(t *testing.T) {
 		if alreadyCoordRunWrapped(a) {
 			t.Errorf("alreadyCoordRunWrapped(%v) = true, want false", a)
 		}
+	}
+}
+
+func TestAugmentCoordRunWrap_AddsStandbyAndTimeout(t *testing.T) {
+	engine := []string{"sh", "-c", "claude"}
+	got := augmentCoordRunWrap(
+		[]string{"/usr/local/bin/fleet", "coord-run", "--agent", "a1", "--project", "p1", "--", "sh", "-c", "claude"},
+		90*time.Second,
+	)
+	want := []string{
+		"/usr/local/bin/fleet", "coord-run", "--agent", "a1", "--project", "p1",
+		"--standby", "--standby-timeout", "1m30s", "--",
+	}
+	want = append(want, engine...)
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("augmented argv = %v, want %v", got, want)
+	}
+}
+
+func TestAugmentCoordRunWrap_ReplacesWrongTimeout(t *testing.T) {
+	got := augmentCoordRunWrap([]string{
+		"/usr/local/bin/fleet", "coord-run", "--agent", "a1", "--project", "p1",
+		"--standby", "--standby-timeout=5s", "--", "sh", "-c", "claude",
+	}, 2*time.Minute)
+	want := []string{
+		"/usr/local/bin/fleet", "coord-run", "--agent", "a1", "--project", "p1",
+		"--standby", "--standby-timeout", "2m0s", "--", "sh", "-c", "claude",
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("augmented argv = %v, want %v", got, want)
 	}
 }

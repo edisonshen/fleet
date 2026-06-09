@@ -164,6 +164,18 @@ func isCoordHandoffForProject(project, agentID string) bool {
 	return state.ReadCoordSpawnMarker(project) == agentID
 }
 
+func refuseLeaseWrappedCoordHandoffRetire(oldRec, newRec *agent.Record, stderr io.Writer) error {
+	handoffop.RollbackCoordMarkerIfPointingAt(oldRec.Project, oldRec.ID, newRec.ID, stderr)
+	if dropErr := handoffop.DropReplacementRecord(newRec.TmuxSession, newRec.ID, stderr); dropErr != nil {
+		return fmt.Errorf(
+			"coord handoff for project %q spawned standby successor %s but PR1 cannot verify its child before retiring old coord %s; cleanup failed: %w (old agent untouched, queue file preserved for retry after PR2 lock-coupled delivery)",
+			oldRec.Project, newRec.ID, oldRec.ID, dropErr)
+	}
+	return fmt.Errorf(
+		"coord handoff for project %q spawned standby successor %s but PR1 cannot verify its child before retiring old coord %s; old agent untouched, replacement dropped, queue file preserved for retry after PR2 lock-coupled delivery",
+		oldRec.Project, newRec.ID, oldRec.ID)
+}
+
 // Crash safety: the queue file (step 5) is the journal entry. If we
 // crash between step 5 and step 11 (Delete), a future drainer (4b
 // TUI background loop) sees a stale queue file pointing at an
@@ -815,6 +827,7 @@ func runHandoff(opts *handoffOpts, stdout, stderr io.Writer) error {
 		ExecCommand:       rewrittenExecArgv,
 		PreAllocatedID:    newID,
 		DisableAutoResume: thisHandoffDisableAutoResume,
+		StandbyTimeout:    spawn.DefaultStandbyTimeout,
 	})
 	if err != nil {
 		// Spawn failed — leave the queue file in place so the
@@ -881,6 +894,9 @@ func runHandoff(opts *handoffOpts, stdout, stderr io.Writer) error {
 	isCoordSwap := false
 	if oldRec.Project != "" && state.ReadCoordSpawnMarker(oldRec.Project) == oldRec.ID {
 		isCoordSwap = true
+		if leaseFailoverEnabled() {
+			return refuseLeaseWrappedCoordHandoffRetire(oldRec, newRec, stderr)
+		}
 		// Eager marker write — best-effort. AtomicCoordSwap will
 		// re-commit (idempotent) inside its step 4 if this failed,
 		// or skip step 4 if it succeeded.
@@ -1238,6 +1254,9 @@ func resumeHandoff(opts *handoffOpts, stdout, stderr io.Writer,
 		case newRec.ID:
 			isCoordSwap = true
 		}
+	}
+	if isCoordSwap && leaseFailoverEnabled() {
+		return refuseLeaseWrappedCoordHandoffRetire(oldRec, newRec, stderr)
 	}
 
 	// Wait BEFORE killing old (codex iter-8 P1). Always runs — the
