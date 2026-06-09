@@ -711,7 +711,13 @@ func pendingQueueForProject(project string, d doctorDeps) (string, queue.SpawnFr
 // then surfaces a manual recovery step rather than spawning blind).
 func cacheCoordRecord(project string, queueReq queue.SpawnFresh, d doctorDeps) *agent.Record {
 	if marker := d.CoordMarker(project); marker != "" {
-		if rec, err := d.LoadAgent(marker); err == nil && rec != nil {
+		// VALIDATE the marker record before trusting it (codex PR6 iter-10
+		// [P2]): a STALE marker can point at a non-coordinator (or another
+		// project's) record. Respawning from a worker record would spawn the
+		// wrong, unwrapped command — leaving the project coordless after the
+		// takeover. Require it to be THIS project's coordinator.
+		if rec, err := d.LoadAgent(marker); err == nil && rec != nil &&
+			rec.Project == project && isCoordAgentRecord(rec) {
 			return rec
 		}
 	}

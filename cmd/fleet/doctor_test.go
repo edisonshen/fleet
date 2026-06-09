@@ -788,3 +788,49 @@ func TestDoctor_LegacyMode_NotReportedAsNoCoord(t *testing.T) {
 		}
 	}
 }
+
+// --- codex PR6 iter-10 regression ---
+
+// [P2] a STALE coord-spawn marker pointing at a non-coordinator record must
+// NOT be used as the old coord to respawn from; cacheCoordRecord falls through
+// to the real coord (live scan / queue archive).
+func TestDoctor_StaleMarker_NotUsedForRespawn(t *testing.T) {
+	const (
+		project = "smproj"
+		realID  = "smreal"
+		staleID = "smstale"
+	)
+	realCoord := agent.New(realID)
+	realCoord.Project = project
+	realCoord.TaskID = CoordTaskIDPrefix + project
+	realCoord.SupervisorPID = 111
+
+	// The marker points at a WORKER record (stale).
+	worker := agent.New(staleID)
+	worker.Project = project
+	worker.TaskID = "task-99" // not a coord
+
+	d := doctorTestDeps()
+	d.CoordMarker = func(string) string { return staleID }
+	d.LoadAgent = func(id string) (*agent.Record, error) {
+		switch id {
+		case staleID:
+			return worker, nil
+		case realID:
+			return realCoord, nil
+		}
+		return nil, errors.New("no record")
+	}
+	d.ListAgents = func() ([]*agent.Record, error) { return []*agent.Record{worker, realCoord}, nil }
+
+	got := cacheCoordRecord(project, queue.SpawnFresh{}, d)
+	if got == nil {
+		t.Fatalf("cacheCoordRecord returned nil; want the real coord %s", realID)
+	}
+	if got.ID == staleID {
+		t.Fatalf("cacheCoordRecord used the STALE marker's worker record %s for respawn", staleID)
+	}
+	if got.ID != realID {
+		t.Errorf("cacheCoordRecord = %s, want the real coord %s", got.ID, realID)
+	}
+}
