@@ -434,7 +434,28 @@ func cleanUpStaleQueue(req queue.SpawnFresh, queuePath string,
 	case nerr != nil:
 		return fmt.Errorf("resume: load replacement %s failed: %w", req.NewAgentID, nerr)
 	}
-	if !tmux.HasSession(newRec.TmuxSession) {
+	// Resolve auto-resume from queue override + newRec baseline
+	// (codex review iter-12 P2). Gate on schema v2+ (codex
+	// iter-15 P2) — v1 queue files predate this feature.
+	disableAutoResume := newRec.DisableAutoResume
+	if req.DisableAutoResume != nil {
+		disableAutoResume = *req.DisableAutoResume
+	}
+	autoResume := !disableAutoResume && req.SchemaVersion >= 2
+
+	// Coord lock-owner delivery (PR2 §5a): when this is a lease-wrapped coord
+	// swap with failover on, the resume prompt is delivered to the project's
+	// CURRENT LOCK OWNER (discovered via coordlock.CurrentOwner) — NOT into
+	// newRec's session. newRec may be a racing standby that LOST the lock and
+	// has since exited; the live coord is the winner. So the queued-replacement
+	// session-liveness aborts below must NOT fire for this case — they would
+	// strand the queue pending even though CurrentOwner can identify the live
+	// winner and deliver to it (codex iter-31 P1).
+	coordOwnerDelivery := autoResume && coordlock.FailoverEnabled() && newRec.LeaseWrapped &&
+		(spawn.IsCoordSpawn(newRec.TaskID, newRec.Project) ||
+			(newRec.Project != "" && state.ReadCoordSpawnMarker(newRec.Project) == newRec.ID))
+
+	if !tmux.HasSession(newRec.TmuxSession) && !coordOwnerDelivery {
 		return fmt.Errorf(
 			"resume: agent %s already archived BUT replacement %s tmux session %s is gone — task has no live agent; investigate before deleting queue file %s",
 			req.OldAgentID, req.NewAgentID, newRec.TmuxSession, queuePath)
@@ -447,15 +468,6 @@ func cleanUpStaleQueue(req queue.SpawnFresh, queuePath string,
 	// got past queue.Delete in the previous run, queue would be
 	// gone and we wouldn't be on this path — so this delivery is
 	// the FIRST send, not a duplicate.
-	//
-	// Resolve auto-resume from queue override + newRec baseline
-	// (codex review iter-12 P2). Gate on schema v2+ (codex
-	// iter-15 P2) — v1 queue files predate this feature.
-	disableAutoResume := newRec.DisableAutoResume
-	if req.DisableAutoResume != nil {
-		disableAutoResume = *req.DisableAutoResume
-	}
-	autoResume := !disableAutoResume && req.SchemaVersion >= 2
 
 	// Wait + liveness probe ALWAYS run, even when autoResume is off
 	// — the wait doubles as a post-spawn liveness probe (codex
@@ -469,7 +481,10 @@ func cleanUpStaleQueue(req queue.SpawnFresh, queuePath string,
 		_, _ = fmt.Fprintf(stdout,
 			"warning: post-readiness probe for %s failed: %v (proceeding anyway)\n",
 			newRec.TmuxSession, perr)
-	} else if !alive {
+	} else if !alive && !coordOwnerDelivery {
+		// For a coord lock-owner delivery the queued replacement exiting is
+		// EXPECTED when a racing standby won — delivery targets CurrentOwner,
+		// not this dead session, so proceed (codex iter-31 P1).
 		return fmt.Errorf(
 			"resume: agent %s already archived BUT replacement %s tmux session %s exited during readiness wait — task has no live agent",
 			req.OldAgentID, req.NewAgentID, newRec.TmuxSession)

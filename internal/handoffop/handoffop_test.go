@@ -1658,6 +1658,111 @@ func TestDrain_LeaseFailoverCoordStaleQueue_UsesLockOwnerForCapApprovedCoord(t *
 	}
 }
 
+// TestDrain_LeaseFailoverCoord_DeadLoserSession_StillDeliversToLockOwner pins
+// codex iter-31 P1: when the stale queue names a lease-wrapped replacement that
+// was SUPERSEDED by a racing standby and has since EXITED, cleanUpStaleQueue
+// must NOT abort on the dead replacement session. For a coord lock-owner
+// delivery the live coordinator is the lock WINNER (discovered via
+// CurrentOwner), not the dead queued loser — so delivery proceeds to the winner
+// and the queue is consumed, instead of being stranded pending forever.
+func TestDrain_LeaseFailoverCoord_DeadLoserSession_StillDeliversToLockOwner(t *testing.T) {
+	requireTmux(t)
+	t.Setenv("FLEET_LEASE_FAILOVER", "1")
+	setupFleetHome(t)
+
+	const project = "rainier"
+	cwd := seedCoordRepoMeta(t, project)
+	oldRec := spawnSeedCoord(t, project, cwd)
+
+	// The queued replacement (the LOSER): lease-wrapped, but its session is
+	// NEVER spawned — it exited after losing the lock race. tmux.HasSession is
+	// false for it; pre-iter-31 this aborted cleanUpStaleQueue.
+	newRec := agent.New(agent.NewID())
+	newRec.TaskID = oldRec.TaskID
+	newRec.Project = oldRec.Project
+	newRec.Cwd = oldRec.Cwd
+	newRec.Command = oldRec.Command
+	newRec.TmuxSession = tmux.SessionName(newRec.ID) // session deliberately NOT spawned
+	newRec.SpawnedAt = time.Now().UTC()
+	newRec.LastActivityTS = newRec.SpawnedAt
+	newRec.LeaseWrapped = true // lease-wrapped -> coord lock-owner delivery
+	if err := newRec.Write(); err != nil {
+		t.Fatalf("write journaled (dead) replacement: %v", err)
+	}
+
+	// The live winner (a racing standby that won the lock).
+	winner := agent.New(agent.NewID())
+	winner.TaskID = oldRec.TaskID
+	winner.Project = oldRec.Project
+	winner.Cwd = oldRec.Cwd
+	winner.Command = oldRec.Command
+	winner.TmuxSession = tmux.SessionName(winner.ID)
+	winner.SpawnedAt = time.Now().UTC()
+	winner.LastActivityTS = winner.SpawnedAt
+	winner.SupervisorPID = 9002
+	winner.SupervisorPidStart = 77
+	if err := winner.Write(); err != nil {
+		t.Fatalf("write lock-winning standby: %v", err)
+	}
+	if _, err := state.EnsureProjectInitialized(project); err != nil {
+		t.Fatalf("EnsureProjectInitialized: %v", err)
+	}
+	if err := state.WriteCoordSpawnMarker(project, newRec.ID); err != nil {
+		t.Fatalf("WriteCoordSpawnMarker: %v", err)
+	}
+	if err := oldRec.ArchiveWithHandoff(newRec.ID); err != nil {
+		t.Fatalf("archive old coord: %v", err)
+	}
+
+	req, qp := writeCoordSkillQueue(t, oldRec)
+	req.NewAgentID = newRec.ID
+	req.NewSession = newRec.TmuxSession
+	req.CapApproved = true
+	if _, err := queue.WriteSpawnFresh(req); err != nil {
+		t.Fatalf("rewrite stale queue: %v", err)
+	}
+
+	origDeliveryDeps := handoffDeliveryDepsFn
+	origDeliveryTimeout := handoffDeliveryTimeout
+	origDeliveryPoll := handoffDeliveryPoll
+	t.Cleanup(func() {
+		handoffDeliveryDepsFn = origDeliveryDeps
+		handoffDeliveryTimeout = origDeliveryTimeout
+		handoffDeliveryPoll = origDeliveryPoll
+	})
+	handoffDeliveryTimeout = time.Second
+	handoffDeliveryPoll = time.Millisecond
+	var sentSession string
+	handoffDeliveryDepsFn = func() handoffdelivery.Deps {
+		deps := handoffdelivery.DefaultDeps()
+		deps.CurrentOwner = func(string) (coordlock.Owner, bool) {
+			return coordlock.Owner{AgentID: winner.ID, PID: winner.SupervisorPID, PidStart: winner.SupervisorPidStart}, true
+		}
+		deps.WaitReady = func(string) error { return nil }
+		deps.SessionAlive = func(string) (bool, error) { return true, nil }
+		deps.SendVerified = func(session, _ string) (bool, error) {
+			sentSession = session
+			return true, nil
+		}
+		deps.Sleep = func(time.Duration) {}
+		return deps
+	}
+
+	out := &bytes.Buffer{}
+	if err := cleanUpStaleQueue(req, qp, out); err != nil {
+		t.Fatalf("cleanUpStaleQueue must deliver to the lock owner despite the dead loser session: %v\n%s", err, out.String())
+	}
+	if sentSession != winner.TmuxSession {
+		t.Fatalf("resume prompt sent to %q, want lock winner %q (must not require dead loser session)", sentSession, winner.TmuxSession)
+	}
+	if got := state.ReadCoordSpawnMarker(project); got != winner.ID {
+		t.Fatalf("coord marker = %q, want delivered lock owner %q", got, winner.ID)
+	}
+	if _, statErr := os.Stat(qp); !errors.Is(statErr, os.ErrNotExist) {
+		t.Fatalf("queue file must be consumed after delivery to the lock owner, stat err=%v", statErr)
+	}
+}
+
 // TestDrain_WorkerHandoff_NoMarkerWrite pins
 // T-drain-worker-no-marker-write. A worker handoff (marker absent or
 // pointing elsewhere) MUST NOT touch the rc-enabled marker via the
