@@ -1294,11 +1294,21 @@ func CurrentActiveOwnerPID(project string) (pid int, ok bool) {
 }
 
 // CurrentOwner reports the full active lease owner tuple for project, or
-// ok=false if there is no readable ACTIVE owner. It is the delivery-side
+// ok=false if there is no readable HEALTHY active owner. It is the delivery-side
 // companion to CurrentActiveOwnerPID: callers that need to type a handoff
 // resume prompt must address the agent record named by the lease owner, not a
 // preselected standby that may have lost the lock race.
+//
+// It applies the SAME holderHealthy predicate AcquireLease / LeaderPresent use
+// (codex iter-19 [P2]), not a bare state==active check: a stale/expired active
+// record or a dead/cross-boot prior holder is NOT a deliverable owner — its
+// process is gone, so DeliverToCurrentOwner must keep polling for the healthy
+// takeover owner rather than type the resume prompt into a corpse's session.
 func CurrentOwner(project string) (Owner, bool) {
+	return currentOwnerWithCfg(project, defaultLeaseConfig())
+}
+
+func currentOwnerWithCfg(project string, cfg leaseConfig) (Owner, bool) {
 	paths, err := resolvePaths(project)
 	if err != nil {
 		return Owner{}, false
@@ -1307,7 +1317,14 @@ func CurrentOwner(project string) (Owner, bool) {
 	if err != nil {
 		return Owner{}, false
 	}
-	if rec.State != stateActive || rec.Owner.Pid <= 0 || rec.Owner.AgentID == "" {
+	if rec.Owner.Pid <= 0 || rec.Owner.AgentID == "" {
+		return Owner{}, false
+	}
+	// Throwaway lease carrying the seams so holderHealthy applies the same
+	// boot-id + TTL + pid-liveness logic the acquire path does (self is zero;
+	// we only read the foreign record).
+	l := &Lease{cfg: cfg, paths: paths, boot: cfg.boot()}
+	if !l.holderHealthy(rec) {
 		return Owner{}, false
 	}
 	return Owner{
