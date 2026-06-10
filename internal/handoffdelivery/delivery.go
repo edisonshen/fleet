@@ -208,16 +208,28 @@ func finishDelivery(opts Options, deps Deps, owner coordlock.Owner, rec *agent.R
 		current, ok = deps.CurrentOwner(opts.Project)
 		if !ok || current.AgentID != owner.AgentID || current.PID != owner.PID ||
 			current.PidStart != owner.PidStart {
-			// Prompt already physically submitted to owner's tmux. Ownership
-			// flipped in the post-send window; do not loop and re-send to the
-			// new owner.
+			// Ownership flipped AFTER the verified send but BEFORE marker
+			// promotion. The prompt physically landed on the now-SUPERSEDED
+			// owner, and we have NOT promoted the marker — so the NEW owner has
+			// neither the resume prompt nor a marker pointing at it. Reporting
+			// success here would let the caller delete the durable queue + drop
+			// the superseded replacement, stranding the handoff: discovery stays
+			// pointed at a stale/removed agent and the doc is never retried
+			// (codex iter-32 P1).
+			//
+			// Keep it PENDING (return an error, do not promote a marker for an
+			// owner that no longer holds the lock): a retry re-targets the new
+			// stable owner. The cost is a benign duplicate prompt to the
+			// eventual owner — explicitly preferred over a silent strand (§5c).
 			if opts.Stderr != nil {
 				_, _ = fmt.Fprintf(opts.Stderr,
 					"warning: lock owner for project %s changed after verified send to %s; "+
-						"skipping marker promotion (delivery already landed)\n",
+						"keeping handoff pending for the new owner (retry re-delivers)\n",
 					opts.Project, owner.AgentID)
 			}
-			return true, nil
+			return false, fmt.Errorf(
+				"handoff delivery: lock owner for project %s flipped after verified send to %s before marker promotion",
+				opts.Project, owner.AgentID)
 		}
 	}
 	if opts.PromoteMarker && deps.WriteMarker != nil {

@@ -131,7 +131,19 @@ func TestDeliverToCurrentOwnerTargetsLeaseOwnerAndPromotesMarker(t *testing.T) {
 	}
 }
 
-func TestDeliverToCurrentOwner_OwnerFlipAfterSend_NoDoubleSend(t *testing.T) {
+// TestDeliverToCurrentOwner_OwnerFlipAfterSend_StaysPending pins codex iter-32
+// P1: when the lock owner flips AFTER the verified send but BEFORE marker
+// promotion, the prompt landed on the now-superseded owner and the marker was
+// NOT promoted to the new owner. DeliverToCurrentOwner must surface this as
+// PENDING (an error), NOT success — otherwise the caller deletes the durable
+// queue + drops the superseded replacement, stranding the handoff (the new
+// owner never got the prompt, discovery points at a stale agent, no retry).
+//
+// Invariants that REMAIN: no double-send WITHIN this call, no marker write for
+// an owner that no longer holds the lock. The retry (a fresh
+// DeliverToCurrentOwner) re-targets the new stable owner (a benign duplicate
+// prompt, §5c).
+func TestDeliverToCurrentOwner_OwnerFlipAfterSend_StaysPending(t *testing.T) {
 	ownerA := coordlock.Owner{AgentID: "owner-a", PID: 1001, PidStart: 11}
 	ownerB := coordlock.Owner{AgentID: "owner-b", PID: 2002, PidStart: 22}
 	recA := &agent.Record{ID: ownerA.AgentID, Project: "rainier", TmuxSession: "fleet-owner-a"}
@@ -186,23 +198,26 @@ func TestDeliverToCurrentOwner_OwnerFlipAfterSend_NoDoubleSend(t *testing.T) {
 		Now:   time.Now,
 		Sleep: func(time.Duration) {},
 	})
-	if err != nil {
-		t.Fatalf("DeliverToCurrentOwner: %v", err)
+	if err == nil {
+		t.Fatalf("DeliverToCurrentOwner must return an error (pending) on post-send owner flip; got rec=%+v nil err", rec)
 	}
-	if rec != recA {
-		t.Fatalf("delivered rec = %+v, want owner A", rec)
+	if rec != nil {
+		t.Fatalf("delivered rec = %+v, want nil on pending owner-flip", rec)
 	}
 	if sendCalls != 1 {
-		t.Fatalf("SendVerified calls = %d, want 1", sendCalls)
+		t.Fatalf("SendVerified calls = %d, want 1 (no double-send within the call)", sendCalls)
 	}
 	if sentSession != recA.TmuxSession || sentPrompt != "resume now" {
 		t.Fatalf("sent (%q,%q), want (%q,%q)", sentSession, sentPrompt, recA.TmuxSession, "resume now")
 	}
 	if markerWrites != 0 {
-		t.Fatalf("marker writes = %d, want 0 after post-send owner flip", markerWrites)
+		t.Fatalf("marker writes = %d, want 0 — must NOT promote a marker for an owner that lost the lock", markerWrites)
 	}
 	if !strings.Contains(stderr.String(), "changed after verified send") {
 		t.Fatalf("stderr = %q, want owner-flip warning", stderr.String())
+	}
+	if !strings.Contains(err.Error(), "flipped after verified send") {
+		t.Fatalf("err = %q, want owner-flip-pending error", err.Error())
 	}
 }
 
