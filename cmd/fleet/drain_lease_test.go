@@ -848,8 +848,57 @@ func TestDrainLease_ColdResume_HonorsResumeTimeout(t *testing.T) {
 		if !strings.Contains(err.Error(), "resume-timeout") {
 			t.Errorf("expected a resume-timeout error, got %v", err)
 		}
+		// DESIGN-handoff-lifecycle-hardening bug A: the timeout is BACKGROUNDED,
+		// not failed — it must carry the typed sentinel so runDrain counts it
+		// processed instead of reporting "every pending handoff failed".
+		if !errors.Is(err, ErrResumeBackgrounded) {
+			t.Errorf("timeout must wrap ErrResumeBackgrounded, got %v", err)
+		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("coldResume BLOCKED past the budget — resume-timeout not honored (drain-storm regression)")
+	}
+}
+
+// Bug A, test 1: a Resume that completes WITHIN the budget behaves exactly as
+// today — nil error (counted processed), no backgrounding.
+func TestDrainLease_ColdResume_FastResumeWithinBudget(t *testing.T) {
+	out := &bytes.Buffer{}
+	var resumed int32
+	d := drainLeaseDeps{
+		CurrentEpoch: func(string) (int64, bool) { return 0, false }, // stealable -> coldResume
+		LockAgent:    func(string) (func(), error) { return func() {}, nil },
+		Resume: func(queue.SpawnFresh, string, int, io.Writer, io.Writer) error {
+			atomic.AddInt32(&resumed, 1)
+			return nil
+		},
+	}
+	// Generous budget; Resume returns immediately — must come back nil.
+	if err := drainOneLeaseAwareWith(leaseDrainReq(), "/tmp/q.json", 0, 60000, out, out, d); err != nil {
+		t.Fatalf("fast resume within budget must return nil, got %v", err)
+	}
+	if atomic.LoadInt32(&resumed) != 1 {
+		t.Errorf("Resume ran %d times, want 1", resumed)
+	}
+}
+
+// Bug A, test 5 (coldResume seam): a GENUINE Resume error returned before the
+// budget propagates as-is — never the backgrounded sentinel.
+func TestDrainLease_ColdResume_GenuineErrorNotBackgrounded(t *testing.T) {
+	out := &bytes.Buffer{}
+	boom := errors.New("spawn replacement: boom")
+	d := drainLeaseDeps{
+		CurrentEpoch: func(string) (int64, bool) { return 0, false }, // stealable -> coldResume
+		LockAgent:    func(string) (func(), error) { return func() {}, nil },
+		Resume: func(queue.SpawnFresh, string, int, io.Writer, io.Writer) error {
+			return boom
+		},
+	}
+	err := drainOneLeaseAwareWith(leaseDrainReq(), "/tmp/q.json", 0, 60000, out, out, d)
+	if !errors.Is(err, boom) {
+		t.Fatalf("genuine resume error must propagate, got %v", err)
+	}
+	if errors.Is(err, ErrResumeBackgrounded) {
+		t.Error("genuine resume error wrongly classified as backgrounded — masks real failures")
 	}
 }
 

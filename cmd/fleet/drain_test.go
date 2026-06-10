@@ -2,6 +2,9 @@ package main
 
 import (
 	"bytes"
+	"errors"
+	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -249,5 +252,126 @@ func TestDrain_AllFailuresReturnsError(t *testing.T) {
 	out := &bytes.Buffer{}
 	if err := runDrain(out, out, 0, 0); err == nil {
 		t.Errorf("expected error when every file failed; got nil")
+	}
+}
+
+// stubDrainOne swaps the drainOneFn seam for the duration of the test
+// (mirrors the drainProcStartFn/drainRunNow seam pattern).
+func stubDrainOne(t *testing.T, fn func(queue.SpawnFresh, string, int, int, io.Writer, io.Writer) error) {
+	t.Helper()
+	prev := drainOneFn
+	drainOneFn = fn
+	t.Cleanup(func() { drainOneFn = prev })
+}
+
+// bogusQueueFile plants a syntactically valid spawn-fresh queue file; the
+// stubbed drainOneFn never dereferences it beyond the parsed request.
+func bogusQueueFile(t *testing.T) queue.SpawnFresh {
+	t.Helper()
+	req := queue.SpawnFresh{
+		OldAgentID: "slowcord",
+		HandoffDoc: "/nonexistent",
+		Project:    "projects-fleet",
+		TaskID:     "coord",
+		NewAgentID: "newcoord",
+		NewSession: "fleet-newcoord",
+	}
+	if _, err := queue.WriteSpawnFresh(req); err != nil {
+		t.Fatal(err)
+	}
+	return req
+}
+
+// DESIGN-handoff-lifecycle-hardening bug A, test 3: the default resume budget
+// is 120s ("wait at least 2 mins"), and the --resume-timeout-ms flag default
+// follows the constant.
+func TestDrain_DefaultResumeTimeoutIs120Seconds(t *testing.T) {
+	if defaultResumeTimeoutMillis != 120000 {
+		t.Fatalf("defaultResumeTimeoutMillis = %d, want 120000", defaultResumeTimeoutMillis)
+	}
+	f := newDrainCmd().Flags().Lookup("resume-timeout-ms")
+	if f == nil {
+		t.Fatal("--resume-timeout-ms flag missing")
+	}
+	if f.DefValue != "120000" {
+		t.Fatalf("--resume-timeout-ms default = %s, want 120000", f.DefValue)
+	}
+}
+
+// Bug A, test 4 (flag wiring): --resume-timeout-ms still overrides the
+// default. The timeout-honoring behavior itself is covered at the coldResume
+// seam (TestDrainLease_ColdResume_HonorsResumeTimeout).
+func TestDrain_ResumeTimeoutFlagOverride(t *testing.T) {
+	cmd := newDrainCmd()
+	if err := cmd.ParseFlags([]string{"--resume-timeout-ms", "500"}); err != nil {
+		t.Fatalf("ParseFlags: %v", err)
+	}
+	v, err := cmd.Flags().GetInt("resume-timeout-ms")
+	if err != nil {
+		t.Fatalf("GetInt: %v", err)
+	}
+	if v != 500 {
+		t.Fatalf("--resume-timeout-ms parsed = %d, want 500", v)
+	}
+}
+
+// Bug A, test 2 (the false-alarm regression): a resume that merely exceeds the
+// budget is BACKGROUNDED, not failed — runDrain counts it processed, exits 0,
+// and the top-line says the handoff is completing in the background. The
+// string "every pending handoff failed" must not be reachable from a timeout
+// alone. (Observed live 2026-06-10: exit 1 + "0 processed, 1 failed" while the
+// handoff in fact completed.)
+func TestDrain_BackgroundedResumeCountsProcessed(t *testing.T) {
+	requireTmux(t)
+	setupFleetHome(t)
+	req := bogusQueueFile(t)
+	stubDrainOne(t, func(r queue.SpawnFresh, _ string, _, timeoutMillis int, _, stderr io.Writer) error {
+		// Mirror coldResume's timeout branch: stderr diagnostic + wrapped sentinel.
+		_, _ = fmt.Fprintf(stderr,
+			"fleet drain: resume for %s exceeded the %dms budget; returning (the handoff completes in the background or a later drain retries)\n",
+			r.Project, timeoutMillis)
+		return fmt.Errorf("fleet drain: resume for %s exceeded the %dms resume-timeout budget: %w",
+			r.Project, timeoutMillis, ErrResumeBackgrounded)
+	})
+
+	out := &bytes.Buffer{}
+	stderr := &bytes.Buffer{}
+	if err := runDrain(out, stderr, 0, defaultResumeTimeoutMillis); err != nil {
+		t.Fatalf("backgrounded resume must exit 0, got %v\nstdout=%s\nstderr=%s",
+			err, out.String(), stderr.String())
+	}
+	if !strings.Contains(out.String(), "1 processed, 0 failed") {
+		t.Errorf("expected '1 processed, 0 failed' summary, got:\n%s", out.String())
+	}
+	if !strings.Contains(out.String(), "background") {
+		t.Errorf("expected a 'completing in the background' top-line mentioning %s, got:\n%s",
+			req.OldAgentID, out.String())
+	}
+	combined := out.String() + stderr.String()
+	if strings.Contains(combined, "every pending handoff failed") {
+		t.Errorf("timeout alone must never report 'every pending handoff failed':\n%s", combined)
+	}
+}
+
+// Bug A, test 5 (regression guard): a GENUINE Resume error (not a timeout) is
+// still counted failed — the new sentinel must not mask real failures.
+func TestDrain_GenuineResumeErrorStillFails(t *testing.T) {
+	requireTmux(t)
+	setupFleetHome(t)
+	bogusQueueFile(t)
+	stubDrainOne(t, func(queue.SpawnFresh, string, int, int, io.Writer, io.Writer) error {
+		return errors.New("spawn replacement: boom")
+	})
+
+	out := &bytes.Buffer{}
+	err := runDrain(out, out, 0, defaultResumeTimeoutMillis)
+	if err == nil {
+		t.Fatalf("genuine resume error must surface as a drain error; got nil\n%s", out.String())
+	}
+	if !strings.Contains(err.Error(), "every pending handoff failed") {
+		t.Errorf("expected 'every pending handoff failed', got %v", err)
+	}
+	if !strings.Contains(out.String(), "0 processed, 1 failed") {
+		t.Errorf("expected '0 processed, 1 failed' summary, got:\n%s", out.String())
 	}
 }
