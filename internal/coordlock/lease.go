@@ -1353,6 +1353,28 @@ func CurrentEpoch(project string) (epoch int64, ok bool) {
 	return rec.Epoch, true
 }
 
+// LeaseRecordActive reports whether a readable epoch record exists on disk in a
+// NON-terminal state (active or fencing) — i.e. a lease generation is live for
+// project even if its current owner is momentarily unhealthy/stale or a takeover
+// is mid-flight. It is the "is this a real lease, or a legacy/bare coord that
+// never wrote an epoch" discriminator for handoff delivery (codex iter-22 [P1]):
+// CurrentOwner suppresses a stale/dead active owner as ok=false, but that is NOT
+// the same as "no lease exists". Delivery must keep the doc PENDING for a healthy
+// takeover when a lease record is present, and only direct-send (legacy fallback)
+// when there is genuinely no lease record. Read-only; a missing/torn/terminal
+// record degrades to false.
+func LeaseRecordActive(project string) bool {
+	paths, err := resolvePaths(project)
+	if err != nil {
+		return false
+	}
+	rec, err := readEpoch(paths.epoch)
+	if err != nil {
+		return false
+	}
+	return rec.State == stateActive || rec.State == stateFencing
+}
+
 // BarrierPath returns the absolute path of the graceful-handoff completion
 // barrier for (project, epoch): <project>/.locks/handoff-complete-<epoch>.json.
 // The OLD coord writes it (atomic .tmp->fsync->rename) ONLY after the

@@ -26,26 +26,32 @@ var ErrNoOwnerObserved = errors.New("handoff delivery: no active lock owner obse
 // polling; production callers use DefaultDeps.
 type Deps struct {
 	CurrentOwner func(project string) (coordlock.Owner, bool)
-	LoadAgent    func(id string) (*agent.Record, error)
-	WaitReady    func(session string) error
-	SessionAlive func(session string) (bool, error)
-	SendVerified func(session, prompt string) (bool, error)
-	WriteMarker  func(project, id string) error
-	Now          func() time.Time
-	Sleep        func(time.Duration)
+	// LeaseRecordActive reports whether a real lease generation exists on disk
+	// (active/fencing) even if its owner is momentarily unhealthy. It separates
+	// "no lease at all → legacy/bare coord, direct-send fallback" from "lease
+	// exists but owner stale/mid-takeover → keep pending" (codex iter-22 [P1]).
+	LeaseRecordActive func(project string) bool
+	LoadAgent         func(id string) (*agent.Record, error)
+	WaitReady         func(session string) error
+	SessionAlive      func(session string) (bool, error)
+	SendVerified      func(session, prompt string) (bool, error)
+	WriteMarker       func(project, id string) error
+	Now               func() time.Time
+	Sleep             func(time.Duration)
 }
 
 // DefaultDeps returns the production delivery dependencies.
 func DefaultDeps() Deps {
 	return Deps{
-		CurrentOwner: coordlock.CurrentOwner,
-		LoadAgent:    agent.Load,
-		WaitReady:    spawn.WaitForReadyToPrompt,
-		SessionAlive: tmux.SessionAlive,
-		SendVerified: spawn.SendPromptKeysVerified,
-		WriteMarker:  state.WriteCoordSpawnMarker,
-		Now:          time.Now,
-		Sleep:        time.Sleep,
+		CurrentOwner:      coordlock.CurrentOwner,
+		LeaseRecordActive: coordlock.LeaseRecordActive,
+		LoadAgent:         agent.Load,
+		WaitReady:         spawn.WaitForReadyToPrompt,
+		SessionAlive:      tmux.SessionAlive,
+		SendVerified:      spawn.SendPromptKeysVerified,
+		WriteMarker:       state.WriteCoordSpawnMarker,
+		Now:               time.Now,
+		Sleep:             time.Sleep,
 	}
 }
 
@@ -92,7 +98,14 @@ func DeliverToCurrentOwner(opts Options, deps Deps) (*agent.Record, error) {
 	deadline := deps.Now().Add(timeout)
 	var lastErr error
 	ownerObserved := false
+	leaseSeen := false
 	for {
+		// A live lease record (even one whose owner is momentarily unhealthy)
+		// means this is NOT a legacy/bare coord: keep the doc pending for the
+		// healthy takeover owner rather than fall back to a direct send.
+		if deps.LeaseRecordActive != nil && deps.LeaseRecordActive(opts.Project) {
+			leaseSeen = true
+		}
 		owner, ok := deps.CurrentOwner(opts.Project)
 		if ok && owner.AgentID != "" {
 			ownerObserved = true
@@ -153,8 +166,17 @@ func DeliverToCurrentOwner(opts Options, deps Deps) (*agent.Record, error) {
 				return nil, fmt.Errorf("handoff delivery: lock owner for project %s kept changing before a verified send",
 					opts.Project)
 			}
-			// No owner ever observed — a legacy/bare coord that never stamps a
-			// lease record. Signal the caller to fall back to a direct send.
+			if leaseSeen {
+				// No HEALTHY owner converged, but a lease record IS active —
+				// a stale/dead owner mid-reclaim or a fencing takeover. This is
+				// NOT a legacy/bare coord, so do NOT signal the direct-send
+				// fallback; keep the doc pending for the healthy takeover owner
+				// (codex iter-22 [P1]).
+				return nil, fmt.Errorf("handoff delivery: lock owner for project %s is stale/unhealthy; awaiting takeover",
+					opts.Project)
+			}
+			// No owner ever observed AND no live lease record — a legacy/bare
+			// coord that never stamps a lease. Signal the direct-send fallback.
 			return nil, fmt.Errorf("%w for project %s", ErrNoOwnerObserved, opts.Project)
 		}
 		wait := poll

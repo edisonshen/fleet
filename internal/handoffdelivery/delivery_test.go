@@ -270,3 +270,33 @@ func TestDeliverToCurrentOwner_OwnerKeepsFlipping_NotSentinel(t *testing.T) {
 		t.Fatalf("error = %v, must NOT be ErrNoOwnerObserved (owners were observed)", err)
 	}
 }
+
+// codex iter-22 [P1] regression: CurrentOwner returns ok=false for a stale/dead
+// active owner (health-strict), but a lease record IS still on disk. That is NOT
+// a legacy/bare coord — the error must NOT be ErrNoOwnerObserved, so callers keep
+// the doc pending for the healthy takeover owner instead of direct-sending to the
+// queued replacement (which may be a prompt-less standby).
+func TestDeliverToCurrentOwner_StaleOwnerButLeaseActive_NotSentinel(t *testing.T) {
+	now, sleep := fakeClock()
+	_, err := DeliverToCurrentOwner(Options{
+		Project: "rainier",
+		Prompt:  "read the doc",
+		Timeout: time.Second,
+		Poll:    100 * time.Millisecond,
+	}, Deps{
+		CurrentOwner:      func(string) (coordlock.Owner, bool) { return coordlock.Owner{}, false },
+		LeaseRecordActive: func(string) bool { return true }, // lease present, owner unhealthy
+		LoadAgent:         func(string) (*agent.Record, error) { return nil, nil },
+		WaitReady:         func(string) error { return nil },
+		SessionAlive:      func(string) (bool, error) { return true, nil },
+		SendVerified:      func(string, string) (bool, error) { return true, nil },
+		Now:               now,
+		Sleep:             sleep,
+	})
+	if err == nil {
+		t.Fatal("expected timeout error when owner is stale but lease is active")
+	}
+	if errors.Is(err, ErrNoOwnerObserved) {
+		t.Fatalf("error = %v, must NOT be ErrNoOwnerObserved (lease record is active)", err)
+	}
+}
