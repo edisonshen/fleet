@@ -1455,6 +1455,14 @@ func resumeHandoff(opts *handoffOpts, stdout, stderr io.Writer,
 		}
 	}
 	if err := queue.Delete(queuePath); err != nil {
+		if autoResume {
+			// Prompt already delivered but the durable inbox is still on disk;
+			// reporting success would let a retry re-deliver. Mirror runHandoff
+			// and surface a non-zero exit (codex iter-15 P2).
+			return fmt.Errorf(
+				"resumed crashed handoff: %s → %s BUT queue cleanup failed; rerun `fleet handoff %s` to clear the stale inbox (resume prompt already delivered)",
+				oldRec.ID, successorRec.ID, oldRec.ID)
+		}
 		_, _ = fmt.Fprintf(stderr, "warning: delete queue file: %v\n", err)
 	}
 

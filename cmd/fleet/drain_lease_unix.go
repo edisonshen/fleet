@@ -324,6 +324,17 @@ func deliverRecoverResumePrompt(rec *agent.Record, docPath string, disableAutoRe
 		if !disableAutoResume && docPath != "" {
 			prompt = handoff.ResumePrompt(docPath)
 		}
+		// At-most-once for the lock-owner branch too (codex iter-15 P2): if a
+		// prior pass already delivered and only takeoverAndRecover's queue.Delete
+		// failed, the adopt-retry re-enters here. Without the sentinel guard the
+		// owner gets the same prompt again. Key on rec.ID (the queue entry), same
+		// as the direct path below.
+		ownerSentinel, sErr := resumePromptSentinelPath(rec.Project, rec.ID)
+		if prompt != "" && sErr == nil && ownerSentinel != "" {
+			if _, statErr := os.Stat(ownerSentinel); statErr == nil {
+				return nil // already delivered on a prior pass
+			}
+		}
 		deps := handoffdelivery.DefaultDeps()
 		deps.CurrentOwner = recoverCurrentOwnerFn
 		deps.WaitReady = recoverWaitForReadyFn
@@ -342,6 +353,12 @@ func deliverRecoverResumePrompt(rec *agent.Record, docPath string, disableAutoRe
 		}
 		if prompt == "" {
 			return nil
+		}
+		// Mark AFTER the verified send (DeliverToCurrentOwner only returns nil
+		// once SendVerified confirmed submission) so a crash here re-delivers a
+		// benign duplicate rather than stranding.
+		if sErr == nil && ownerSentinel != "" {
+			_ = os.WriteFile(ownerSentinel, []byte(docPath+"\n"), 0o644)
 		}
 		_, _ = fmt.Fprintf(stdout, "fleet drain: delivered resume prompt to recovered lock owner for %s\n", rec.Project)
 		return nil
