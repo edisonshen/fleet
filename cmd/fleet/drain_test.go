@@ -353,6 +353,36 @@ func TestDrain_BackgroundedResumeCountsProcessed(t *testing.T) {
 	}
 }
 
+// Bug A durability (codex iter-1 [P1]): a backgrounded resume must leave the
+// queue file ON DISK — only a completed Resume deletes it (queue.Delete in
+// retireOldAgent/cleanUpStaleQueue). The file is the durable retry signal:
+// `fleet drain` is a short-lived CLI, so process exit can kill the
+// backgrounded goroutine mid-Resume; the surviving queue file makes the NEXT
+// drain re-run Resume, which finishes the handoff or reconciles an
+// already-completed one. Without this retention, exit 0 + "completing in the
+// background" could silently strand a half-done handoff.
+func TestDrain_BackgroundedResumeKeepsQueueFile(t *testing.T) {
+	requireTmux(t)
+	setupFleetHome(t)
+	bogusQueueFile(t)
+	stubDrainOne(t, func(r queue.SpawnFresh, _ string, _, timeoutMillis int, _, _ io.Writer) error {
+		return fmt.Errorf("fleet drain: resume for %s exceeded the %dms resume-timeout budget: %w",
+			r.Project, timeoutMillis, ErrResumeBackgrounded)
+	})
+
+	out := &bytes.Buffer{}
+	if err := runDrain(out, out, 0, defaultResumeTimeoutMillis); err != nil {
+		t.Fatalf("backgrounded resume must exit 0, got %v\n%s", err, out.String())
+	}
+	paths, err := queue.ListPending()
+	if err != nil {
+		t.Fatalf("ListPending: %v", err)
+	}
+	if len(paths) != 1 {
+		t.Fatalf("queue files after backgrounded drain = %d, want 1 — the pending file is the durable retry signal", len(paths))
+	}
+}
+
 // Bug A, test 5 (regression guard): a GENUINE Resume error (not a timeout) is
 // still counted failed — the new sentinel must not mask real failures.
 func TestDrain_GenuineResumeErrorStillFails(t *testing.T) {

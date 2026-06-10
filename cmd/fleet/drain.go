@@ -162,8 +162,18 @@ func runDrain(stdout, stderr io.Writer, graceMillis, resumeTimeoutMillis int) er
 			// drain stands down, so no duplicate spawn. Count it processed so a
 			// slow handoff never produces exit 1 + "every pending handoff
 			// failed" while the handoff in fact completes.
+			//
+			// Durability (codex iter-1 [P1]): this short-lived CLI may exit
+			// and kill the goroutine mid-Resume. That is safe: ONLY a
+			// completed Resume deletes the queue file (queue.Delete in
+			// retireOldAgent/cleanUpStaleQueue), so an interrupted resume
+			// leaves the file pending and the NEXT drain re-runs Resume,
+			// which finishes the handoff or reconciles an already-completed
+			// one. Exit 0 here means "accepted + durably retryable", never
+			// "lost" — pinned by TestDrain_BackgroundedResumeKeepsQueueFile.
 			_, _ = fmt.Fprintf(stdout,
-				"fleet drain: %s resume still running; handoff completing in the background\n", req.OldAgentID)
+				"fleet drain: %s resume still running; handoff completing in the background (queue file kept; a later drain verifies or retries)\n",
+				req.OldAgentID)
 			processed++
 		case errors.Is(err, ErrEscalatedToTakeOver):
 			// Not a failure (codex PR3 iter-2 [P2]): the bounded drain did its
