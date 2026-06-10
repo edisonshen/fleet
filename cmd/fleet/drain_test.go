@@ -356,7 +356,11 @@ func TestDrain_BackgroundedResumeCountsBackgrounded(t *testing.T) {
 		t.Errorf("expected '0 processed, 1 backgrounded (still completing; a later drain retries), 0 failed' summary, got:\n%s",
 			out.String())
 	}
-	if !strings.Contains(out.String(), "background") {
+	// Exact marker substring: the TUI's drainBackgroundedMarker
+	// (internal/tui/model.go) matches this on the drain child's stdout to
+	// schedule its re-drain — this assert pins the producer side of that
+	// cross-package contract.
+	if !strings.Contains(out.String(), "completing in the background") {
 		t.Errorf("expected a 'completing in the background' top-line mentioning %s, got:\n%s",
 			req.OldAgentID, out.String())
 	}
