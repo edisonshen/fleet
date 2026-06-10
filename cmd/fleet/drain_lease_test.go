@@ -30,6 +30,7 @@ import (
 
 	"github.com/edisonshen/fleet/internal/agent"
 	"github.com/edisonshen/fleet/internal/coord"
+	"github.com/edisonshen/fleet/internal/coordlock"
 	"github.com/edisonshen/fleet/internal/queue"
 	"github.com/edisonshen/fleet/internal/state"
 )
@@ -1003,11 +1004,13 @@ func TestRecoverHandoffTail_WritesMarkerAndSendsPrompt(t *testing.T) {
 	origReady := recoverWaitForReadyFn
 	origAlive := recoverSessionAliveFn
 	origPrompt := recoverSendPromptVerifiedFn
+	origCurrentOwner := recoverCurrentOwnerFn
 	t.Cleanup(func() {
 		recoverWriteMarkerFn = origMarker
 		recoverWaitForReadyFn = origReady
 		recoverSessionAliveFn = origAlive
 		recoverSendPromptVerifiedFn = origPrompt
+		recoverCurrentOwnerFn = origCurrentOwner
 	})
 	recoverWriteMarkerFn = func(project, id string) error { gotMarkerProj, gotMarkerID = project, id; return nil }
 	recoverWaitForReadyFn = func(string) error { return nil }
@@ -1020,6 +1023,12 @@ func TestRecoverHandoffTail_WritesMarkerAndSendsPrompt(t *testing.T) {
 	rec := agent.New("newcoord9")
 	rec.Project = "projects-fleet"
 	rec.TmuxSession = "fleet-newcoord9"
+	if err := rec.Write(); err != nil {
+		t.Fatalf("write rec: %v", err)
+	}
+	recoverCurrentOwnerFn = func(project string) (coordlock.Owner, bool) {
+		return coordlock.Owner{AgentID: rec.ID, PID: 4242, PidStart: 99}, true
+	}
 	if err := recoverHandoffTail(oldRec, rec, "/tmp/handoff.md", false, &bytes.Buffer{}, &bytes.Buffer{}); err != nil {
 		t.Fatalf("recoverHandoffTail returned %v", err)
 	}
@@ -1051,11 +1060,13 @@ func TestRecoverHandoffTail_DisableAutoResume_NoPromptStillMarks(t *testing.T) {
 	origReady := recoverWaitForReadyFn
 	origAlive := recoverSessionAliveFn
 	origPrompt := recoverSendPromptVerifiedFn
+	origCurrentOwner := recoverCurrentOwnerFn
 	t.Cleanup(func() {
 		recoverWriteMarkerFn = origMarker
 		recoverWaitForReadyFn = origReady
 		recoverSessionAliveFn = origAlive
 		recoverSendPromptVerifiedFn = origPrompt
+		recoverCurrentOwnerFn = origCurrentOwner
 	})
 	recoverWriteMarkerFn = func(string, string) error { markerWritten = true; return nil }
 	recoverWaitForReadyFn = func(string) error { return nil }
@@ -1069,6 +1080,12 @@ func TestRecoverHandoffTail_DisableAutoResume_NoPromptStillMarks(t *testing.T) {
 	rec := agent.New("newcoord9")
 	rec.Project = "projects-fleet"
 	rec.TmuxSession = "fleet-newcoord9"
+	if err := rec.Write(); err != nil {
+		t.Fatalf("write rec: %v", err)
+	}
+	recoverCurrentOwnerFn = func(project string) (coordlock.Owner, bool) {
+		return coordlock.Owner{AgentID: rec.ID, PID: 4242, PidStart: 99}, true
+	}
 	if err := recoverHandoffTail(oldRec, rec, "/tmp/handoff.md", true, &bytes.Buffer{}, &bytes.Buffer{}); err != nil {
 		t.Fatalf("recoverHandoffTail returned %v", err)
 	}

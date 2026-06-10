@@ -1370,6 +1370,42 @@ func TestStillOwnedRejectsSelfExpiredToken(t *testing.T) {
 	}
 }
 
+func TestCurrentOwnerReturnsActiveOwnerTuple(t *testing.T) {
+	setupHome(t)
+	const project = "rainier"
+	writeEpochRaw(t, project, epochRecord{
+		Epoch: 5,
+		State: stateActive,
+		Owner: identity{
+			Pid:      4242,
+			PidStart: 222222,
+			AgentID:  "owner1",
+			Project:  project,
+		},
+		BootID: "test-boot-1",
+	})
+
+	owner, ok := CurrentOwner(project)
+	if !ok {
+		t.Fatal("CurrentOwner ok=false, want true")
+	}
+	if owner.AgentID != "owner1" || owner.PID != 4242 || owner.PidStart != 222222 {
+		t.Fatalf("CurrentOwner = %+v, want owner1 pid/start tuple", owner)
+	}
+	if !owner.EngineStamped {
+		t.Fatal("CurrentOwner EngineStamped=false, want true for complete owner tuple")
+	}
+
+	writeEpochRaw(t, project, epochRecord{
+		Epoch: 6,
+		State: stateReleased,
+		Owner: identity{Pid: 4242, PidStart: 222222, AgentID: "owner1", Project: project},
+	})
+	if owner, ok := CurrentOwner(project); ok {
+		t.Fatalf("released epoch returned owner %+v, want ok=false", owner)
+	}
+}
+
 // ---- codex iter-5 [P2] #1: free-flock must not steal a fresh fencing ----
 
 // OLD died (flock free) but a live first candidate's FRESH fencing record

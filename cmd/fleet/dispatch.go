@@ -16,6 +16,7 @@ import (
 	"github.com/edisonshen/fleet/internal/enginecfg"
 	"github.com/edisonshen/fleet/internal/gc"
 	"github.com/edisonshen/fleet/internal/handoff"
+	"github.com/edisonshen/fleet/internal/handoffdelivery"
 	"github.com/edisonshen/fleet/internal/rc"
 	"github.com/edisonshen/fleet/internal/spawn"
 	"github.com/edisonshen/fleet/internal/state"
@@ -1257,7 +1258,20 @@ func runDispatch(opts *dispatchOpts, stdout io.Writer) error {
 		//     Enter manually. Logging here lets operator log analysis
 		//     correlate "coord-spawn-marker exists but coord is idle"
 		//     with the unsubmitted-warning that fired during dispatch.
-		submitted, perr := sendInitialPrompt(rec.TmuxSession, opts.prompt)
+		submitted := false
+		var perr error
+		if opts.coordSpawn && newDocPath != "" && leaseFailoverEnabled() {
+			_, perr = handoffdelivery.DeliverToCurrentOwner(handoffdelivery.Options{
+				Project:       rec.Project,
+				Prompt:        opts.prompt,
+				PromoteMarker: true,
+				Stdout:        stdout,
+				Stderr:        stdout,
+			}, handoffdelivery.DefaultDeps())
+			submitted = perr == nil
+		} else {
+			submitted, perr = sendInitialPrompt(rec.TmuxSession, opts.prompt)
+		}
 		switch {
 		case perr != nil:
 			_, _ = fmt.Fprintf(stdout,

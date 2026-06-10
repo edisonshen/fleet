@@ -10,6 +10,8 @@ import (
 	"time"
 
 	"github.com/edisonshen/fleet/internal/agent"
+	"github.com/edisonshen/fleet/internal/coordlock"
+	"github.com/edisonshen/fleet/internal/handoffdelivery"
 	"github.com/edisonshen/fleet/internal/queue"
 	"github.com/edisonshen/fleet/internal/rc"
 	"github.com/edisonshen/fleet/internal/spawn"
@@ -579,6 +581,9 @@ func TestHandoff_LeaseFailoverCoordHandoffRefusesBeforeRetiringOld(t *testing.T)
 	old.SupervisorPID = 4242
 	origOwner := handoffLeaseActiveOwnerPIDFn
 	origLeader := handoffLeaseLeaderPresentFn
+	origDeliveryDeps := handoffDeliveryDepsFn
+	origDeliveryTimeout := handoffDeliveryTimeout
+	origDeliveryPoll := handoffDeliveryPoll
 	handoffLeaseActiveOwnerPIDFn = func(p string) (int, bool) {
 		if p != project {
 			t.Fatalf("active owner checked for project %q, want %q", p, project)
@@ -594,7 +599,40 @@ func TestHandoff_LeaseFailoverCoordHandoffRefusesBeforeRetiringOld(t *testing.T)
 	t.Cleanup(func() {
 		handoffLeaseActiveOwnerPIDFn = origOwner
 		handoffLeaseLeaderPresentFn = origLeader
+		handoffDeliveryDepsFn = origDeliveryDeps
+		handoffDeliveryTimeout = origDeliveryTimeout
+		handoffDeliveryPoll = origDeliveryPoll
 	})
+	handoffDeliveryTimeout = time.Second
+	handoffDeliveryPoll = time.Millisecond
+	handoffDeliveryDepsFn = func() handoffdelivery.Deps {
+		deps := handoffdelivery.DefaultDeps()
+		deps.CurrentOwner = func(p string) (coordlock.Owner, bool) {
+			if p != project {
+				t.Fatalf("current owner checked for project %q, want %q", p, project)
+			}
+			recs, err := agent.List()
+			if err != nil {
+				return coordlock.Owner{}, false
+			}
+			for _, rec := range recs {
+				if rec.Project == project && rec.ID != old.ID {
+					return coordlock.Owner{AgentID: rec.ID, PID: rec.SupervisorPID, PidStart: rec.SupervisorPidStart}, true
+				}
+			}
+			return coordlock.Owner{}, false
+		}
+		deps.WaitReady = func(string) error { return nil }
+		deps.SessionAlive = func(string) (bool, error) { return true, nil }
+		deps.SendVerified = func(session, prompt string) (bool, error) {
+			if !strings.Contains(prompt, "Read your handoff doc at ") {
+				t.Fatalf("resume prompt has wrong shape: %q", prompt)
+			}
+			return true, nil
+		}
+		deps.Sleep = func(time.Duration) {}
+		return deps
+	}
 	if err := tmux.Spawn(old.TmuxSession, old.Cwd, old.Command, []string{"FLEET_AGENT_ID=" + old.ID}); err != nil {
 		t.Fatalf("spawn old coord: %v", err)
 	}
@@ -615,24 +653,163 @@ func TestHandoff_LeaseFailoverCoordHandoffRefusesBeforeRetiringOld(t *testing.T)
 		command:     []string{"sleep", "60"},
 		graceMillis: 0,
 	}, out, out)
-	if err == nil {
-		t.Fatal("expected failover coord handoff to refuse before retiring old")
-	}
-	if !strings.Contains(err.Error(), "cannot verify its child before retiring old coord") {
-		t.Fatalf("refusal did not explain child verification gap: %v\n%s", err, out.String())
-	}
-	if _, lerr := agent.Load(old.ID); lerr != nil {
-		t.Fatalf("old coord record was not preserved: %v", lerr)
-	}
-	if got := state.ReadCoordSpawnMarker(project); got != old.ID {
-		t.Fatalf("coord marker = %q, want old id %q", got, old.ID)
+	if err != nil {
+		t.Fatalf("handoff should deliver via lock owner under PR2: %v\n%s", err, out.String())
 	}
 	qp, qerr := state.QueuePath(queue.SpawnFreshName(old.ID))
 	if qerr != nil {
 		t.Fatalf("QueuePath: %v", qerr)
 	}
-	if _, statErr := os.Stat(qp); statErr != nil {
-		t.Fatalf("queue file should be preserved for retry: %v", statErr)
+	if _, statErr := os.Stat(qp); !os.IsNotExist(statErr) {
+		t.Fatalf("queue file should be consumed after verified delivery, statErr=%v", statErr)
+	}
+}
+
+func TestHandoff_LeaseFailoverCoordHandoffFinalizesDeliveredLockOwner(t *testing.T) {
+	requireTmux(t)
+	t.Setenv("FLEET_LEASE_FAILOVER", "1")
+	root := setupFleetHome(t)
+
+	const project = "rainier"
+	cwd := seedRecoveryRepo(t, root, project)
+	old := agent.New(agent.NewID())
+	old.TaskID = "coord-" + project
+	old.Project = project
+	old.Cwd = cwd
+	old.Command = []string{"sleep", "60"}
+	old.TmuxSession = tmux.SessionName(old.ID)
+	old.SpawnedAt = time.Now().UTC()
+	old.LastActivityTS = old.SpawnedAt
+	old.SupervisorPID = 4242
+
+	winner := agent.New(agent.NewID())
+	winner.TaskID = "coord-" + project
+	winner.Project = project
+	winner.Cwd = cwd
+	winner.Command = []string{"sleep", "60"}
+	winner.TmuxSession = tmux.SessionName(winner.ID)
+	winner.SpawnedAt = time.Now().UTC()
+	winner.LastActivityTS = winner.SpawnedAt
+	winner.SupervisorPID = 9001
+	winner.SupervisorPidStart = 99
+
+	origOwner := handoffLeaseActiveOwnerPIDFn
+	origLeader := handoffLeaseLeaderPresentFn
+	origDeliveryDeps := handoffDeliveryDepsFn
+	origDeliveryTimeout := handoffDeliveryTimeout
+	origDeliveryPoll := handoffDeliveryPoll
+	handoffLeaseActiveOwnerPIDFn = func(p string) (int, bool) {
+		if p != project {
+			t.Fatalf("active owner checked for project %q, want %q", p, project)
+		}
+		return old.SupervisorPID, true
+	}
+	handoffLeaseLeaderPresentFn = func(p string) bool {
+		if p != project {
+			t.Fatalf("leader checked for project %q, want %q", p, project)
+		}
+		return true
+	}
+	t.Cleanup(func() {
+		handoffLeaseActiveOwnerPIDFn = origOwner
+		handoffLeaseLeaderPresentFn = origLeader
+		handoffDeliveryDepsFn = origDeliveryDeps
+		handoffDeliveryTimeout = origDeliveryTimeout
+		handoffDeliveryPoll = origDeliveryPoll
+	})
+	handoffDeliveryTimeout = time.Second
+	handoffDeliveryPoll = time.Millisecond
+	var sentSession string
+	handoffDeliveryDepsFn = func() handoffdelivery.Deps {
+		deps := handoffdelivery.DefaultDeps()
+		deps.CurrentOwner = func(p string) (coordlock.Owner, bool) {
+			if p != project {
+				t.Fatalf("current owner checked for project %q, want %q", p, project)
+			}
+			return coordlock.Owner{AgentID: winner.ID, PID: winner.SupervisorPID, PidStart: winner.SupervisorPidStart}, true
+		}
+		deps.WaitReady = func(session string) error {
+			if session != winner.TmuxSession {
+				t.Fatalf("wait-ready session = %q, want delivered owner session %q", session, winner.TmuxSession)
+			}
+			return nil
+		}
+		deps.SessionAlive = func(session string) (bool, error) {
+			if session != winner.TmuxSession {
+				t.Fatalf("session-alive probe = %q, want delivered owner session %q", session, winner.TmuxSession)
+			}
+			return true, nil
+		}
+		deps.SendVerified = func(session, prompt string) (bool, error) {
+			sentSession = session
+			if session != winner.TmuxSession {
+				t.Fatalf("resume prompt session = %q, want delivered owner session %q", session, winner.TmuxSession)
+			}
+			if !strings.Contains(prompt, "Read your handoff doc at ") {
+				t.Fatalf("resume prompt has wrong shape: %q", prompt)
+			}
+			return true, nil
+		}
+		deps.Sleep = func(time.Duration) {}
+		return deps
+	}
+	if err := tmux.Spawn(old.TmuxSession, old.Cwd, old.Command, []string{"FLEET_AGENT_ID=" + old.ID}); err != nil {
+		t.Fatalf("spawn old coord: %v", err)
+	}
+	t.Cleanup(func() { _ = tmux.Kill(old.TmuxSession) })
+	if err := old.Write(); err != nil {
+		t.Fatalf("write old coord: %v", err)
+	}
+	if err := winner.Write(); err != nil {
+		t.Fatalf("write lock-winning standby: %v", err)
+	}
+	if _, err := state.EnsureProjectInitialized(project); err != nil {
+		t.Fatalf("EnsureProjectInitialized: %v", err)
+	}
+	if err := state.WriteCoordSpawnMarker(project, old.ID); err != nil {
+		t.Fatalf("seed marker: %v", err)
+	}
+
+	out := &bytes.Buffer{}
+	err := runHandoff(&handoffOpts{
+		oldID:       old.ID,
+		command:     []string{"sleep", "60"},
+		graceMillis: 0,
+	}, out, out)
+	if err != nil {
+		t.Fatalf("handoff should finalize delivered lock owner: %v\n%s", err, out.String())
+	}
+	if sentSession != winner.TmuxSession {
+		t.Fatalf("resume prompt sent to %q, want %q", sentSession, winner.TmuxSession)
+	}
+	arc, err := agent.LoadArchive(old.ID)
+	if err != nil {
+		t.Fatalf("LoadArchive(%s): %v", old.ID, err)
+	}
+	if arc.SuccessorID != winner.ID {
+		t.Fatalf("archive successor = %q, want delivered lock owner %q", arc.SuccessorID, winner.ID)
+	}
+	live, err := agent.List()
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	for _, rec := range live {
+		if rec.Project == project && rec.ID != winner.ID {
+			t.Fatalf("superseded replacement %s should have been removed; live project record: %+v", rec.ID, rec)
+		}
+	}
+	if got := state.ReadCoordSpawnMarker(project); got != winner.ID {
+		t.Fatalf("coord marker = %q, want delivered lock owner %q", got, winner.ID)
+	}
+	if !strings.Contains(out.String(), "handed off → "+winner.ID) {
+		t.Fatalf("output did not report delivered lock owner %q:\n%s", winner.ID, out.String())
+	}
+	qp, qerr := state.QueuePath(queue.SpawnFreshName(old.ID))
+	if qerr != nil {
+		t.Fatalf("QueuePath: %v", qerr)
+	}
+	if _, statErr := os.Stat(qp); !os.IsNotExist(statErr) {
+		t.Fatalf("queue file should be consumed after verified delivery, statErr=%v", statErr)
 	}
 }
 

@@ -1293,6 +1293,31 @@ func CurrentActiveOwnerPID(project string) (pid int, ok bool) {
 	return rec.Owner.Pid, true
 }
 
+// CurrentOwner reports the full active lease owner tuple for project, or
+// ok=false if there is no readable ACTIVE owner. It is the delivery-side
+// companion to CurrentActiveOwnerPID: callers that need to type a handoff
+// resume prompt must address the agent record named by the lease owner, not a
+// preselected standby that may have lost the lock race.
+func CurrentOwner(project string) (Owner, bool) {
+	paths, err := resolvePaths(project)
+	if err != nil {
+		return Owner{}, false
+	}
+	rec, err := readEpoch(paths.epoch)
+	if err != nil {
+		return Owner{}, false
+	}
+	if rec.State != stateActive || rec.Owner.Pid <= 0 || rec.Owner.AgentID == "" {
+		return Owner{}, false
+	}
+	return Owner{
+		AgentID:       rec.Owner.AgentID,
+		PID:           rec.Owner.Pid,
+		PidStart:      rec.Owner.PidStart,
+		EngineStamped: rec.Owner.AgentID != "" && rec.Owner.PidStart > 0,
+	}, true
+}
+
 // CurrentEpoch returns the project's current on-disk fencing epoch (the
 // monotonic token) and ok=false if no epoch record exists / is unreadable.
 // It is the value the graceful handoff stamps into its

@@ -44,6 +44,7 @@ import (
 	"github.com/edisonshen/fleet/internal/coordlock"
 	"github.com/edisonshen/fleet/internal/coordrepo"
 	"github.com/edisonshen/fleet/internal/handoff"
+	"github.com/edisonshen/fleet/internal/handoffdelivery"
 	"github.com/edisonshen/fleet/internal/handoffop"
 	"github.com/edisonshen/fleet/internal/queue"
 	"github.com/edisonshen/fleet/internal/spawn"
@@ -252,6 +253,7 @@ var (
 	recoverWaitForReadyFn       = spawn.WaitForReadyToPrompt
 	recoverSessionAliveFn       = tmux.SessionAlive
 	recoverSendPromptVerifiedFn = spawn.SendPromptKeysVerified
+	recoverCurrentOwnerFn       = coordlock.CurrentOwner
 )
 
 // effectiveDisableAutoResume resolves the EFFECTIVE per-handoff auto-resume
@@ -286,14 +288,9 @@ func effectiveDisableAutoResume(req queue.SpawnFresh, cachedOld *agent.Record) b
 func recoverHandoffTail(oldRec *agent.Record, rec *agent.Record, docPath string, disableAutoResume bool,
 	stdout, stderr io.Writer) error {
 	if spawn.IsCoordSpawn(oldRec.TaskID, oldRec.Project) {
-		if werr := recoverWriteMarkerFn(oldRec.Project, rec.ID); werr != nil {
-			_, _ = fmt.Fprintf(stderr,
-				"warning: coord-spawn marker for project %s -> %s failed after takeover recovery: %v "+
-					"(TUI may not discover the replacement; run `fleet rc up %s` to recover)\n",
-				oldRec.Project, rec.ID, werr, oldRec.Project)
-		}
+		return deliverRecoverResumePrompt(rec, docPath, disableAutoResume, true, stdout, stderr)
 	}
-	return deliverRecoverResumePrompt(rec, docPath, disableAutoResume, stdout, stderr)
+	return deliverRecoverResumePrompt(rec, docPath, disableAutoResume, false, stdout, stderr)
 }
 
 // deliverRecoverResumePrompt delivers the resume prompt to a recovered
@@ -317,9 +314,39 @@ func recoverHandoffTail(oldRec *agent.Record, rec *agent.Record, docPath string,
 //
 // Skips silently when the doc is empty or auto-resume is disabled (a
 // non-claude wrapper must not receive "Read your handoff doc..." as garbage).
-func deliverRecoverResumePrompt(rec *agent.Record, docPath string, disableAutoResume bool,
+func deliverRecoverResumePrompt(rec *agent.Record, docPath string, disableAutoResume bool, lockOwnerDelivery bool,
 	stdout, stderr io.Writer) error {
-	if docPath == "" || disableAutoResume {
+	if docPath == "" && !lockOwnerDelivery {
+		return nil
+	}
+	if lockOwnerDelivery {
+		prompt := ""
+		if !disableAutoResume && docPath != "" {
+			prompt = handoff.ResumePrompt(docPath)
+		}
+		deps := handoffdelivery.DefaultDeps()
+		deps.CurrentOwner = recoverCurrentOwnerFn
+		deps.WaitReady = recoverWaitForReadyFn
+		deps.SessionAlive = recoverSessionAliveFn
+		deps.SendVerified = recoverSendPromptVerifiedFn
+		deps.WriteMarker = recoverWriteMarkerFn
+		_, err := handoffdelivery.DeliverToCurrentOwner(handoffdelivery.Options{
+			Project:       rec.Project,
+			Prompt:        prompt,
+			PromoteMarker: true,
+			Stdout:        stdout,
+			Stderr:        stderr,
+		}, deps)
+		if err != nil {
+			return err
+		}
+		if prompt == "" {
+			return nil
+		}
+		_, _ = fmt.Fprintf(stdout, "fleet drain: delivered resume prompt to recovered lock owner for %s\n", rec.Project)
+		return nil
+	}
+	if disableAutoResume {
 		return nil
 	}
 	sentinel, serr := resumePromptSentinelPath(rec.Project, rec.ID)

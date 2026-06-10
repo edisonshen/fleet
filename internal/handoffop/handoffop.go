@@ -16,6 +16,7 @@
 package handoffop
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -26,6 +27,7 @@ import (
 	"github.com/edisonshen/fleet/internal/coordlock"
 	"github.com/edisonshen/fleet/internal/coordrepo"
 	"github.com/edisonshen/fleet/internal/handoff"
+	"github.com/edisonshen/fleet/internal/handoffdelivery"
 	"github.com/edisonshen/fleet/internal/queue"
 	"github.com/edisonshen/fleet/internal/rc"
 	"github.com/edisonshen/fleet/internal/spawn"
@@ -66,6 +68,71 @@ var sessionAliveProbe = tmux.SessionAlive
 // drain-path (auto-handoff + crash recovery) handoffs so pre-v0.12.1
 // coords get RC backfilled on their next handoff.
 var writeMarkerFn = rc.WriteMarker
+
+var (
+	handoffDeliveryDepsFn  = handoffdelivery.DefaultDeps
+	handoffDeliveryTimeout = 30 * time.Second
+	handoffDeliveryPoll    = 100 * time.Millisecond
+	sendPromptKeysVerified = spawn.SendPromptKeysVerified
+)
+
+func deliverResumePrompt(project string, isCoordSwap, leaseWrappedSuccessor bool, rec *agent.Record,
+	docPath string, stdout, stderr io.Writer) (*agent.Record, error) {
+	prompt := handoff.ResumePrompt(docPath)
+	if coordlock.FailoverEnabled() && isCoordSwap && leaseWrappedSuccessor && project != "" {
+		delivered, err := handoffdelivery.DeliverToCurrentOwner(handoffdelivery.Options{
+			Project:       project,
+			Prompt:        prompt,
+			PromoteMarker: true,
+			Timeout:       handoffDeliveryTimeout,
+			Poll:          handoffDeliveryPoll,
+			Stdout:        stdout,
+			Stderr:        stderr,
+		}, handoffDeliveryDepsFn())
+		if err != nil {
+			return nil, err
+		}
+		if delivered != nil {
+			_, _ = fmt.Fprintf(stdout,
+				"  resume: delivered to lock owner %s (%s)\n",
+				delivered.ID, delivered.TmuxSession)
+		}
+		return delivered, nil
+	}
+	submitted, err := sendPromptKeysVerified(rec.TmuxSession, prompt)
+	if err != nil {
+		return nil, err
+	}
+	if !submitted {
+		return nil, fmt.Errorf("resume prompt to %s was typed but not submitted", rec.TmuxSession)
+	}
+	return rec, nil
+}
+
+func retargetArchivedHandoffSuccessor(agentID, successorID string) error {
+	if successorID == "" {
+		return fmt.Errorf("successorID required")
+	}
+	archived, err := agent.LoadArchive(agentID)
+	if err != nil {
+		return err
+	}
+	archived.SuccessorID = successorID
+	archived.ArchivedCause = agent.ArchivedCauseHandoff
+	data, err := json.MarshalIndent(archived, "", "  ")
+	if err != nil {
+		return fmt.Errorf("marshal archive payload: %w", err)
+	}
+	data = append(data, '\n')
+	path, err := state.AgentArchivePath(agentID)
+	if err != nil {
+		return err
+	}
+	if err := state.WriteAtomic(path, data); err != nil {
+		return fmt.Errorf("write archive %s: %w", agentID, err)
+	}
+	return nil
+}
 
 // isCoordHandoffForAgent reports whether (project, agentID) identifies
 // the project's current coord — i.e. the coord-spawn marker resolves
@@ -385,32 +452,40 @@ func cleanUpStaleQueue(req queue.SpawnFresh, queuePath string,
 			"resume: agent %s already archived BUT replacement %s tmux session %s exited during readiness wait — task has no live agent",
 			req.OldAgentID, req.NewAgentID, newRec.TmuxSession)
 	}
+	if autoResume {
+		coordDelivery := spawn.IsCoordSpawn(newRec.TaskID, newRec.Project) ||
+			(newRec.Project != "" && state.ReadCoordSpawnMarker(newRec.Project) == newRec.ID)
+		leaseWrappedSuccessor := req.CapApproved ||
+			!spawn.IsCoordSpawn(newRec.TaskID, newRec.Project)
+		deliveredRec, err := deliverResumePrompt(newRec.Project, coordDelivery, leaseWrappedSuccessor,
+			newRec, req.HandoffDoc, stdout, stdout)
+		if err != nil {
+			return fmt.Errorf(
+				"resume: agent %s already archived BUT resume prompt delivery is still pending: %w (queue preserved at %s)",
+				req.OldAgentID, err, queuePath)
+		}
+		if deliveredRec != nil {
+			if deliveredRec.ID != newRec.ID {
+				if dropErr := DropReplacementRecord(newRec.TmuxSession, newRec.ID, stdout); dropErr != nil {
+					return fmt.Errorf(
+						"resume: agent %s already archived BUT delivered lock owner %s superseded replacement %s and cleanup failed: %w (queue preserved at %s)",
+						req.OldAgentID, deliveredRec.ID, newRec.ID, dropErr, queuePath)
+				}
+			}
+			newRec = deliveredRec
+		}
+		if newRec.ID != req.NewAgentID {
+			if err := retargetArchivedHandoffSuccessor(req.OldAgentID, newRec.ID); err != nil {
+				return fmt.Errorf(
+					"resume: prompt delivered to lock owner %s but handoff archive retarget failed: %w (queue preserved at %s)",
+					newRec.ID, err, queuePath)
+			}
+		}
+	}
 	if err := queue.Delete(queuePath); err != nil {
-		// Return error so fleet drain / TUI watcher retries; under
-		// the new post-delete send order the prompt would never have
-		// been sent if the delete failed, so silently reporting
-		// success would leave the replacement idle (codex review
-		// iter-18 P2).
 		return fmt.Errorf(
 			"resume: agent %s already handed off → %s but queue cleanup failed (%w); will retry",
 			req.OldAgentID, req.NewAgentID, err)
-	}
-	if autoResume {
-		if err := spawn.SendPromptKeys(newRec.TmuxSession,
-			handoff.ResumePrompt(req.HandoffDoc)); err != nil {
-			_, _ = fmt.Fprintf(stdout,
-				"warning: send resume prompt to %s after archive-recovery: %v (re-enqueuing for retry)\n",
-				newRec.TmuxSession, err)
-			// Re-enqueue so a future drain / `fleet handoff` can
-			// retry delivery — without this, send failure on the
-			// non-interactive drain path silently strands the
-			// replacement (codex review iter-14 P1).
-			if _, werr := queue.WriteSpawnFresh(req); werr != nil {
-				_, _ = fmt.Fprintf(stdout,
-					"warning: re-enqueue after archive-recovery send failure: %v\n",
-					werr)
-			}
-		}
 	}
 	_, _ = fmt.Fprintf(stdout,
 		"agent %s already handed off → %s (cleaned stale queue file)\n",
@@ -923,74 +998,41 @@ func retireOldAgent(oldRec, newRec *agent.Record, docPath, queuePath string,
 			}
 		}
 	}
-	queueDeleted := true
-	if err := queue.Delete(queuePath); err != nil {
-		_, _ = fmt.Fprintf(stderr, "warning: delete queue file: %v\n", err)
-		queueDeleted = false
-	}
-
-	// If queue.Delete failed, surface as error so drain reports
-	// the handoff as not-yet-complete (codex review iter-20 P1).
-	// Old is already archived, so a retry will reach
-	// cleanUpStaleQueue, which has its own send + delete pair.
-	// Returning nil here would silently strand the replacement
-	// (queue still on disk, prompt never sent, drain reports
-	// success).
-	if !queueDeleted {
-		return fmt.Errorf(
-			"resume: %s archived but queue file delete failed; rerun fleet drain (or fleet handoff) to deliver the resume prompt",
-			oldRec.ID)
-	}
-
-	// Send the resume prompt now that queue.Delete succeeded (we
-	// returned early on failure above). On SEND failure, re-enqueue
-	// so cleanUpStaleQueue can retry — preserves recovery for non-
-	// interactive drains where no operator can type the prompt
-	// manually (codex iter-13 P2).
+	successorRec := newRec
 	if autoResume {
-		if err := spawn.SendPromptKeys(newRec.TmuxSession,
-			handoff.ResumePrompt(docPath)); err != nil {
-			_, _ = fmt.Fprintf(stderr,
-				"warning: send resume prompt to %s: %v (re-enqueuing for retry)\n",
-				newRec.TmuxSession, err)
-			// Re-enqueue: oldRec is now archived, so a retry
-			// will land in cleanUpStaleQueue, which sends + deletes.
-			var override *bool
-			if disableAutoResume != oldRec.DisableAutoResume {
-				v := disableAutoResume
-				override = &v
+		leaseWrappedSuccessor := !spawn.IsCoordSpawn(newRec.TaskID, newRec.Project)
+		deliveredRec, err := deliverResumePrompt(oldRec.Project, isCoordSwap, leaseWrappedSuccessor,
+			newRec, docPath, stdout, stderr)
+		if err != nil {
+			return fmt.Errorf("resume: prompt delivery pending for %s: %w (queue preserved at %s)",
+				newRec.ID, err, queuePath)
+		}
+		if deliveredRec != nil {
+			successorRec = deliveredRec
+		}
+		if isCoordSwap && successorRec.ID != newRec.ID {
+			if err := retargetArchivedHandoffSuccessor(oldRec.ID, successorRec.ID); err != nil {
+				return fmt.Errorf("resume: prompt delivered to lock owner %s but handoff archive retarget failed: %w (queue preserved at %s)",
+					successorRec.ID, err, queuePath)
 			}
-			if _, werr := queue.WriteSpawnFresh(queue.SpawnFresh{
-				OldAgentID:        oldRec.ID,
-				HandoffDoc:        docPath,
-				Project:           oldRec.Project,
-				TaskID:            oldRec.TaskID,
-				NewAgentID:        newRec.ID,
-				NewSession:        newRec.TmuxSession,
-				DisableAutoResume: override,
-				// Spawn already happened on this drain pass, so the
-				// cap was effectively approved — mark so future
-				// retries don't re-check (codex iter-7 P1).
-				CapApproved: true,
-			}); werr != nil {
-				// Send failed AND re-enqueue failed → replacement
-				// is alive but un-prompted, no journal entry to
-				// recover from. Surface as error so the drainer
-				// reports failure instead of silent success
-				// (codex review iter-19 P2).
-				return fmt.Errorf(
-					"resume: send prompt to %s failed (%w) AND re-enqueue failed (%w); replacement %s alive but idle, retry handoff manually",
-					newRec.TmuxSession, err, werr, newRec.ID)
+			if err := DropReplacementRecord(newRec.TmuxSession, newRec.ID, stderr); err != nil {
+				return fmt.Errorf("resume: prompt delivered to lock owner %s but superseded replacement %s cleanup failed: %w (queue preserved at %s)",
+					successorRec.ID, newRec.ID, err, queuePath)
 			}
 		}
 	}
+	if err := queue.Delete(queuePath); err != nil {
+		return fmt.Errorf(
+			"resume: %s archived but queue file delete failed; rerun fleet drain (or fleet handoff) to deliver the resume prompt: %w",
+			oldRec.ID, err)
+	}
 
-	_, _ = fmt.Fprintf(stdout, "drained %s → %s\n", oldRec.ID, newRec.ID)
-	_, _ = fmt.Fprintf(stdout, "  task:    %s\n", newRec.TaskID)
-	_, _ = fmt.Fprintf(stdout, "  project: %s\n", newRec.Project)
-	_, _ = fmt.Fprintf(stdout, "  tmux:    %s\n", newRec.TmuxSession)
+	_, _ = fmt.Fprintf(stdout, "drained %s → %s\n", oldRec.ID, successorRec.ID)
+	_, _ = fmt.Fprintf(stdout, "  task:    %s\n", successorRec.TaskID)
+	_, _ = fmt.Fprintf(stdout, "  project: %s\n", successorRec.Project)
+	_, _ = fmt.Fprintf(stdout, "  tmux:    %s\n", successorRec.TmuxSession)
 	_, _ = fmt.Fprintf(stdout, "  handoff: %s\n", docPath)
 	_, _ = fmt.Fprintf(stdout, "  number:  %d (was %d)\n",
-		newRec.HandoffNumber, oldRec.HandoffNumber)
+		successorRec.HandoffNumber, oldRec.HandoffNumber)
 	return nil
 }
