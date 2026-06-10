@@ -1935,4 +1935,16 @@ func TestRunDispatch_DeadCoordRecovery_AdvertisesLockWinner(t *testing.T) {
 	if !strings.Contains(got, "won the coord lease") {
 		t.Errorf("expected a note that another standby won the lease; got:\n%s", got)
 	}
+	// The authoritative machine-readable line the TUI parses (LAST
+	// "agent <id> spawned") must name the WINNER, so the TUI promotes the
+	// coord marker + attaches to the live coordinator, not the losing standby
+	// (codex iter-27 P1). Assert the winner's line appears AFTER the note.
+	winnerSpawn := "agent " + winnerID + " spawned"
+	if !strings.Contains(got, winnerSpawn) {
+		t.Errorf("expected authoritative %q line for the TUI to parse; got:\n%s", winnerSpawn, got)
+	}
+	if idx := strings.LastIndex(got, "agent "); !strings.HasPrefix(got[idx:], winnerSpawn) {
+		t.Errorf("the LAST 'agent ... spawned' line must name the winner %s (TUI takes last match); got tail:\n%s",
+			winnerID, got[idx:])
+	}
 }

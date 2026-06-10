@@ -1288,6 +1288,15 @@ func runDispatch(opts *dispatchOpts, stdout io.Writer) error {
 					_, _ = fmt.Fprintf(stdout,
 						"note: another standby (%s) won the coord lease for project %s; resume prompt + coord marker delivered there\n",
 						ownerRec.ID, rec.Project)
+					// Re-emit the canonical "agent <id> spawned" line for the
+					// WINNER. The TUI's coord-spawn path parses the LAST such
+					// line (dispatchAgentID) to decide which session to attach
+					// to + which id to write the coord marker for. Without this
+					// authoritative line the TUI would parse the earlier
+					// rec.ID line and re-stamp the marker onto the losing
+					// standby, overwriting the promotion delivery just did
+					// (codex iter-27 P1).
+					_, _ = fmt.Fprintf(stdout, "agent %s spawned\n", ownerRec.ID)
 				}
 			}
 			if errors.Is(perr, handoffdelivery.ErrNoOwnerObserved) {

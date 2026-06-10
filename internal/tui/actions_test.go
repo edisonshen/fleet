@@ -1885,14 +1885,13 @@ func coordSpawnDoneMsgFromArgs(args []string, out string, dispatchErr error) tea
 			err:         fmt.Errorf("dispatch: %w\n%s", dispatchErr, out),
 		}
 	}
-	match := dispatchAgentIDPattern.FindStringSubmatch(out)
-	if len(match) != 2 {
+	agentID := dispatchAgentID(out)
+	if agentID == "" {
 		return coordSpawnDoneMsg{
 			projectName: argValue(args, "--project"),
 			err:         fmt.Errorf("dispatch output missing agent ID line:\n%s", out),
 		}
 	}
-	agentID := match[1]
 	// Mirror production: promptDelivered=false when stdout warned
 	// about an initial-prompt-delivery failure (dispatch CLI exits
 	// 0 in that case); true otherwise.
@@ -1990,6 +1989,44 @@ func TestKeyA_ProjectRow_DispatchOutputUnparseable(t *testing.T) {
 	}
 	if !strings.Contains(doneMsg.err.Error(), "missing agent ID") {
 		t.Errorf("err should reference missing agent ID; got %q", doneMsg.err.Error())
+	}
+}
+
+// TestDispatchAgentID_TakesLastMatch pins codex iter-27 P1: when dead-coord
+// recovery re-emits an authoritative "agent <winner> spawned" line after a
+// racing standby won the coord lease, the TUI must parse the LAST line (the
+// lock winner), NOT the first (the losing spawned standby). Otherwise it
+// writes the coord marker + attaches the operator to the wrong/dead session.
+func TestDispatchAgentID_TakesLastMatch(t *testing.T) {
+	tests := []struct {
+		name string
+		out  string
+		want string
+	}{
+		{
+			name: "single line — normal dispatch",
+			out:  "agent abcd1234 spawned\n  tmux: fleet-abcd1234\n",
+			want: "abcd1234",
+		},
+		{
+			name: "racing-standby recovery — winner re-emitted last",
+			out: "agent 11111111 spawned\n  task: coord-demo\n  tmux: fleet-11111111\n" +
+				"note: another standby (22222222) won the coord lease for project demo; resume prompt + coord marker delivered there\n" +
+				"agent 22222222 spawned\n  prompt:  delivered\n\nattach with: fleet attach 22222222\n",
+			want: "22222222",
+		},
+		{
+			name: "no agent line",
+			out:  "weird unexpected output\n",
+			want: "",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := dispatchAgentID(tc.out); got != tc.want {
+				t.Errorf("dispatchAgentID = %q, want %q", got, tc.want)
+			}
+		})
 	}
 }
 
