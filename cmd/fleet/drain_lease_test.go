@@ -861,7 +861,9 @@ func TestDrainLease_ColdResume_HonorsResumeTimeout(t *testing.T) {
 		}
 		// DESIGN-handoff-lifecycle-hardening bug A: the timeout is BACKGROUNDED,
 		// not failed — it must carry the typed sentinel so runDrain counts it
-		// processed instead of reporting "every pending handoff failed".
+		// backgrounded (codex iter-1 [P1]: not processed — the handoff may
+		// still be pending) instead of reporting "every pending handoff
+		// failed".
 		if !errors.Is(err, ErrResumeBackgrounded) {
 			t.Errorf("timeout must wrap ErrResumeBackgrounded, got %v", err)
 		}
@@ -871,7 +873,8 @@ func TestDrainLease_ColdResume_HonorsResumeTimeout(t *testing.T) {
 }
 
 // Bug A, test 1: a Resume that completes WITHIN the budget behaves exactly as
-// today — nil error (counted processed), no backgrounding.
+// today — nil error (counted processed, the only completion signal), no
+// backgrounding.
 func TestDrainLease_ColdResume_FastResumeWithinBudget(t *testing.T) {
 	out := &bytes.Buffer{}
 	var resumed int32

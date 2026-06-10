@@ -268,8 +268,16 @@ func stubDrainOne(t *testing.T, fn func(queue.SpawnFresh, string, int, int, io.W
 // stubbed drainOneFn never dereferences it beyond the parsed request.
 func bogusQueueFile(t *testing.T) queue.SpawnFresh {
 	t.Helper()
+	return bogusQueueFileFor(t, "slowcord")
+}
+
+// bogusQueueFileFor is bogusQueueFile with a caller-chosen OldAgentID —
+// queue files are keyed by OldAgentID, so tests that need multiple
+// pending files must use distinct IDs.
+func bogusQueueFileFor(t *testing.T, oldAgentID string) queue.SpawnFresh {
+	t.Helper()
 	req := queue.SpawnFresh{
-		OldAgentID: "slowcord",
+		OldAgentID: oldAgentID,
 		HandoffDoc: "/nonexistent",
 		Project:    "projects-fleet",
 		TaskID:     "coord",
@@ -316,12 +324,15 @@ func TestDrain_ResumeTimeoutFlagOverride(t *testing.T) {
 }
 
 // Bug A, test 2 (the false-alarm regression): a resume that merely exceeds the
-// budget is BACKGROUNDED, not failed — runDrain counts it processed, exits 0,
-// and the top-line says the handoff is completing in the background. The
-// string "every pending handoff failed" must not be reachable from a timeout
-// alone. (Observed live 2026-06-10: exit 1 + "0 processed, 1 failed" while the
-// handoff in fact completed.)
-func TestDrain_BackgroundedResumeCountsProcessed(t *testing.T) {
+// budget is BACKGROUNDED, not failed — runDrain exits 0 and the top-line says
+// the handoff is completing in the background. The string "every pending
+// handoff failed" must not be reachable from a timeout alone. (Observed live
+// 2026-06-10: exit 1 + "0 processed, 1 failed" while the handoff in fact
+// completed.) It is also NOT processed (codex iter-1 [P1]): the CLI exit can
+// kill the resume goroutine, so the summary must report the timed-out resume
+// in its own `backgrounded` bucket — still completing, retried by a later
+// drain — not claim completion.
+func TestDrain_BackgroundedResumeCountsBackgrounded(t *testing.T) {
 	requireTmux(t)
 	setupFleetHome(t)
 	req := bogusQueueFile(t)
@@ -340,8 +351,10 @@ func TestDrain_BackgroundedResumeCountsProcessed(t *testing.T) {
 		t.Fatalf("backgrounded resume must exit 0, got %v\nstdout=%s\nstderr=%s",
 			err, out.String(), stderr.String())
 	}
-	if !strings.Contains(out.String(), "1 processed, 0 failed") {
-		t.Errorf("expected '1 processed, 0 failed' summary, got:\n%s", out.String())
+	if !strings.Contains(out.String(),
+		"0 processed, 1 backgrounded (still completing; a later drain retries), 0 failed") {
+		t.Errorf("expected '0 processed, 1 backgrounded (still completing; a later drain retries), 0 failed' summary, got:\n%s",
+			out.String())
 	}
 	if !strings.Contains(out.String(), "background") {
 		t.Errorf("expected a 'completing in the background' top-line mentioning %s, got:\n%s",
@@ -350,6 +363,39 @@ func TestDrain_BackgroundedResumeCountsProcessed(t *testing.T) {
 	combined := out.String() + stderr.String()
 	if strings.Contains(combined, "every pending handoff failed") {
 		t.Errorf("timeout alone must never report 'every pending handoff failed':\n%s", combined)
+	}
+}
+
+// Bug A, codex iter-1 [P1] (mixed outcomes): one backgrounded resume + one
+// genuine failure. The backgrounded handoff falsifies "every pending handoff
+// failed", so the drain still exits 0 (failure isolation: the failed file is
+// left in place + logged), and the summary reports each bucket truthfully.
+func TestDrain_BackgroundedPlusFailedStillExitsZero(t *testing.T) {
+	requireTmux(t)
+	setupFleetHome(t)
+	slow := bogusQueueFileFor(t, "slowcord")
+	bogusQueueFileFor(t, "deadcord")
+	stubDrainOne(t, func(r queue.SpawnFresh, _ string, _, timeoutMillis int, _, _ io.Writer) error {
+		if r.OldAgentID == slow.OldAgentID {
+			return fmt.Errorf("fleet drain: resume for %s exceeded the %dms resume-timeout budget: %w",
+				r.Project, timeoutMillis, ErrResumeBackgrounded)
+		}
+		return errors.New("spawn replacement: boom")
+	})
+
+	out := &bytes.Buffer{}
+	stderr := &bytes.Buffer{}
+	if err := runDrain(out, stderr, 0, defaultResumeTimeoutMillis); err != nil {
+		t.Fatalf("backgrounded+failed must exit 0 (not every handoff failed), got %v\nstdout=%s\nstderr=%s",
+			err, out.String(), stderr.String())
+	}
+	if !strings.Contains(out.String(),
+		"0 processed, 1 backgrounded (still completing; a later drain retries), 1 failed") {
+		t.Errorf("expected '0 processed, 1 backgrounded (still completing; a later drain retries), 1 failed' summary, got:\n%s",
+			out.String())
+	}
+	if !strings.Contains(stderr.String(), "boom") {
+		t.Errorf("expected the genuine failure on stderr, got:\n%s", stderr.String())
 	}
 }
 

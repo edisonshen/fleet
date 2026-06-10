@@ -26,14 +26,17 @@ var ErrEscalatedToTakeOver = errors.New("fleet drain: escalated to safety-net ta
 // ErrResumeBackgrounded is the typed signal coldResume returns when a
 // handoff Resume exceeds the --resume-timeout-ms budget. It is NOT a
 // failure: the resume goroutine keeps running (holding the bounded
-// per-agent lock until Resume unwinds) and completes the handoff in the
-// background; the drain merely stops waiting. runDrain counts it as
-// processed — modeled on ErrEscalatedToTakeOver — so a merely-slow handoff
-// never reports "every pending handoff failed" with exit 1 while the
-// handoff in fact completes (DESIGN-handoff-lifecycle-hardening bug A,
-// observed live 2026-06-10). Declared here (the all-platform file) so the
-// loop can reference it on every GOOS; the path that returns it is
-// linux/darwin only.
+// per-agent lock until Resume unwinds) and the drain merely stops
+// waiting — so it must never produce "every pending handoff failed" +
+// exit 1 while the handoff in fact completes (DESIGN-handoff-lifecycle-
+// hardening bug A, observed live 2026-06-10). But it is NOT completion
+// either (codex iter-1 [P1]): standalone `fleet drain` exits when
+// runDrain returns, killing the goroutine, so the handoff may still be
+// pending — only a completed Resume deletes the queue file, which is
+// what lets a later drain retry. runDrain therefore counts it in a
+// separate `backgrounded` bucket: never failed, never claimed processed.
+// Declared here (the all-platform file) so the loop can reference it on
+// every GOOS; the path that returns it is linux/darwin only.
 var ErrResumeBackgrounded = errors.New("fleet drain: resume exceeded the budget; handoff completing in the background")
 
 // defaultResumeTimeoutMillis bounds a single per-queue-file Resume on the
@@ -96,9 +99,10 @@ safety-net takeover after --resume-timeout-ms instead of blocking.`,
 // Failure isolation: a Resume error on one queue file logs to stderr and
 // continues with the next file. The failing queue file is left in place
 // so the next drain (or the operator) can pick it up. Returns nil if at
-// least one file processed successfully OR there were zero files; only
-// returns an error for setup failures (Bootstrap, ListPending) where no
-// progress was possible.
+// least one file processed OR was backgrounded (still completing; its
+// queue file survives for a later drain to retry) OR there were zero
+// files; returns an error only when EVERY file genuinely failed, or for
+// setup failures (Bootstrap, ListPending) where no progress was possible.
 func runDrain(stdout, stderr io.Writer, graceMillis, resumeTimeoutMillis int) error {
 	if _, err := state.Bootstrap(); err != nil {
 		return fmt.Errorf("bootstrap ~/.fleet: %w", err)
@@ -136,6 +140,7 @@ func runDrain(stdout, stderr io.Writer, graceMillis, resumeTimeoutMillis int) er
 	}
 
 	processed := 0
+	backgrounded := 0
 	failed := 0
 	for _, path := range paths {
 		// Progress checkpoint: we are about to start work on the next
@@ -159,22 +164,25 @@ func runDrain(stdout, stderr io.Writer, graceMillis, resumeTimeoutMillis int) er
 			// Not a failure (DESIGN-handoff-lifecycle-hardening bug A): the
 			// resume was merely SLOW. The goroutine keeps the bounded per-agent
 			// lock and finishes the handoff in the background; a contending
-			// drain stands down, so no duplicate spawn. Count it processed so a
-			// slow handoff never produces exit 1 + "every pending handoff
-			// failed" while the handoff in fact completes.
+			// drain stands down, so no duplicate spawn. A slow handoff must
+			// never produce exit 1 + "every pending handoff failed".
 			//
-			// Durability (codex iter-1 [P1]): this short-lived CLI may exit
-			// and kill the goroutine mid-Resume. That is safe: ONLY a
-			// completed Resume deletes the queue file (queue.Delete in
-			// retireOldAgent/cleanUpStaleQueue), so an interrupted resume
-			// leaves the file pending and the NEXT drain re-runs Resume,
-			// which finishes the handoff or reconciles an already-completed
-			// one. Exit 0 here means "accepted + durably retryable", never
-			// "lost" — pinned by TestDrain_BackgroundedResumeKeepsQueueFile.
+			// But NOT processed either (codex iter-1 [P1]): standalone
+			// `fleet drain` exits when runDrain returns, killing the
+			// goroutine mid-Resume, so the handoff may still be pending —
+			// "processed" would report success for work that did not happen.
+			// That interruption is safe, not silent: ONLY a completed Resume
+			// deletes the queue file (queue.Delete in retireOldAgent/
+			// cleanUpStaleQueue), so the file survives and the NEXT drain
+			// re-runs Resume, which finishes the handoff or reconciles an
+			// already-completed one (pinned by
+			// TestDrain_BackgroundedResumeKeepsQueueFile). Count it in the
+			// separate `backgrounded` bucket so the summary tells cron/manual
+			// callers the truth: still completing, retried by a later drain.
 			_, _ = fmt.Fprintf(stdout,
 				"fleet drain: %s resume still running; handoff completing in the background (queue file kept; a later drain verifies or retries)\n",
 				req.OldAgentID)
-			processed++
+			backgrounded++
 		case errors.Is(err, ErrEscalatedToTakeOver):
 			// Not a failure (codex PR3 iter-2 [P2]): the bounded drain did its
 			// job — it stopped waiting on a slow/hung handoff and handed
@@ -192,9 +200,24 @@ func runDrain(stdout, stderr io.Writer, graceMillis, resumeTimeoutMillis int) er
 		}
 	}
 
-	_, _ = fmt.Fprintf(stdout, "fleet drain: %d processed, %d failed\n",
-		processed, failed)
-	if processed == 0 && failed > 0 {
+	// Truthful summary (codex iter-1 [P1]): backgrounded resumes get their
+	// own bucket — they are neither completed nor failed, and the queue
+	// file left in place is what makes "a later drain retries" true. The
+	// two-bucket line is kept verbatim when nothing was backgrounded so
+	// existing cron/log scrapers keep matching.
+	if backgrounded > 0 {
+		_, _ = fmt.Fprintf(stdout,
+			"fleet drain: %d processed, %d backgrounded (still completing; a later drain retries), %d failed\n",
+			processed, backgrounded, failed)
+	} else {
+		_, _ = fmt.Fprintf(stdout, "fleet drain: %d processed, %d failed\n",
+			processed, failed)
+	}
+	// Exit code: only "every pending handoff failed" is an error. A
+	// backgrounded resume is not a genuine failure — it must not trip
+	// exit 1 (the false alarm this task exists to fix), and its presence
+	// also falsifies "every ... failed" when mixed with real failures.
+	if processed == 0 && backgrounded == 0 && failed > 0 {
 		return errors.New("fleet drain: every pending handoff failed")
 	}
 	return nil
