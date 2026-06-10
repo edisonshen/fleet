@@ -221,10 +221,18 @@ func finishDelivery(opts Options, deps Deps, owner coordlock.Owner, rec *agent.R
 		}
 	}
 	if opts.PromoteMarker && deps.WriteMarker != nil {
-		if werr := deps.WriteMarker(opts.Project, owner.AgentID); werr != nil && opts.Stderr != nil {
-			_, _ = fmt.Fprintf(opts.Stderr,
-				"warning: coord-spawn marker for project %s -> %s failed after verified lease-owner delivery: %v\n",
-				opts.Project, owner.AgentID, werr)
+		if werr := deps.WriteMarker(opts.Project, owner.AgentID); werr != nil {
+			// The prompt is already verified-submitted, but the coord-spawn
+			// marker still points at the OLD/queued agent. Returning success
+			// here lets callers delete the queue + drop the superseded
+			// replacement, stranding attach/TUI discovery on a removed/losing
+			// agent (codex iter-25 [P2]). Surface the failure so the caller
+			// keeps the doc PENDING: a retry re-promotes the marker (and
+			// re-sends a benign duplicate prompt — preferred over broken
+			// discovery, §5c).
+			return false, fmt.Errorf(
+				"resume prompt delivered to lock owner %s but coord-spawn marker promotion for project %s failed: %w",
+				owner.AgentID, opts.Project, werr)
 		}
 	}
 	return true, nil

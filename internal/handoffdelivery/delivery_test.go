@@ -300,3 +300,39 @@ func TestDeliverToCurrentOwner_StaleOwnerButLeaseActive_NotSentinel(t *testing.T
 		t.Fatalf("error = %v, must NOT be ErrNoOwnerObserved (lease record is active)", err)
 	}
 }
+
+// codex iter-25 [P2] regression: when the resume prompt is delivered to the lock
+// owner but the coord-spawn marker promotion fails, DeliverToCurrentOwner must
+// return an error (not success). Otherwise callers delete the queue + drop the
+// superseded replacement, leaving attach/TUI discovery pointed at a removed agent.
+func TestDeliverToCurrentOwner_MarkerWriteFailure_IsError(t *testing.T) {
+	winner := &agent.Record{ID: "winner1", Project: "rainier", TmuxSession: "fleet-winner1"}
+	sent := false
+	_, err := DeliverToCurrentOwner(Options{
+		Project:       "rainier",
+		Prompt:        "read the doc",
+		PromoteMarker: true,
+		Timeout:       time.Second,
+		Poll:          time.Millisecond,
+	}, Deps{
+		CurrentOwner: func(string) (coordlock.Owner, bool) {
+			return coordlock.Owner{AgentID: winner.ID, PID: 4242, PidStart: 99}, true
+		},
+		LoadAgent:    func(string) (*agent.Record, error) { return winner, nil },
+		WaitReady:    func(string) error { return nil },
+		SessionAlive: func(string) (bool, error) { return true, nil },
+		SendVerified: func(string, string) (bool, error) { sent = true; return true, nil },
+		WriteMarker:  func(string, string) error { return fmt.Errorf("disk full") },
+		Now:          time.Now,
+		Sleep:        func(time.Duration) {},
+	})
+	if !sent {
+		t.Fatal("prompt should have been verified-sent before the marker write")
+	}
+	if err == nil {
+		t.Fatal("marker write failure must surface as an error, not silent success")
+	}
+	if !strings.Contains(err.Error(), "marker promotion") {
+		t.Fatalf("error = %v, want marker promotion failure", err)
+	}
+}
