@@ -470,6 +470,8 @@ func cleanUpStaleQueue(req queue.SpawnFresh, queuePath string,
 			"resume: agent %s already archived BUT replacement %s tmux session %s exited during readiness wait — task has no live agent",
 			req.OldAgentID, req.NewAgentID, newRec.TmuxSession)
 	}
+	supersededSession := ""
+	supersededID := ""
 	if autoResume {
 		coordDelivery := spawn.IsCoordSpawn(newRec.TaskID, newRec.Project) ||
 			(newRec.Project != "" && state.ReadCoordSpawnMarker(newRec.Project) == newRec.ID)
@@ -484,26 +486,32 @@ func cleanUpStaleQueue(req queue.SpawnFresh, queuePath string,
 		}
 		if deliveredRec != nil {
 			if deliveredRec.ID != newRec.ID {
-				if dropErr := DropReplacementRecord(newRec.TmuxSession, newRec.ID, stdout); dropErr != nil {
+				// Retarget the archive to the lock owner, but DEFER dropping the
+				// superseded queued replacement until AFTER queue.Delete: if a
+				// later step fails the queue still names newRec, so a recovery
+				// pass must be able to reload it (codex P2).
+				if err := retargetArchivedHandoffSuccessor(req.OldAgentID, deliveredRec.ID); err != nil {
 					return fmt.Errorf(
-						"resume: agent %s already archived BUT delivered lock owner %s superseded replacement %s and cleanup failed: %w (queue preserved at %s)",
-						req.OldAgentID, deliveredRec.ID, newRec.ID, dropErr, queuePath)
+						"resume: prompt delivered to lock owner %s but handoff archive retarget failed: %w (queue preserved at %s)",
+						deliveredRec.ID, err, queuePath)
 				}
+				supersededSession = newRec.TmuxSession
+				supersededID = newRec.ID
 			}
 			newRec = deliveredRec
-		}
-		if newRec.ID != req.NewAgentID {
-			if err := retargetArchivedHandoffSuccessor(req.OldAgentID, newRec.ID); err != nil {
-				return fmt.Errorf(
-					"resume: prompt delivered to lock owner %s but handoff archive retarget failed: %w (queue preserved at %s)",
-					newRec.ID, err, queuePath)
-			}
 		}
 	}
 	if err := queue.Delete(queuePath); err != nil {
 		return fmt.Errorf(
 			"resume: agent %s already handed off → %s but queue cleanup failed (%w); will retry",
 			req.OldAgentID, req.NewAgentID, err)
+	}
+	if supersededID != "" {
+		if err := DropReplacementRecord(supersededSession, supersededID, stdout); err != nil {
+			return fmt.Errorf(
+				"resume: agent %s already handed off → %s BUT superseded replacement %s cleanup failed: %w",
+				req.OldAgentID, newRec.ID, supersededID, err)
+		}
 	}
 	_, _ = fmt.Fprintf(stdout,
 		"agent %s already handed off → %s (cleaned stale queue file)\n",
@@ -1017,6 +1025,8 @@ func retireOldAgent(oldRec, newRec *agent.Record, docPath, queuePath string,
 		}
 	}
 	successorRec := newRec
+	supersededSession := ""
+	supersededID := ""
 	if autoResume {
 		leaseWrappedSuccessor := !spawn.IsCoordSpawn(newRec.TaskID, newRec.Project)
 		deliveredRec, err := deliverResumePrompt(oldRec.Project, isCoordSwap, leaseWrappedSuccessor,
@@ -1033,16 +1043,23 @@ func retireOldAgent(oldRec, newRec *agent.Record, docPath, queuePath string,
 				return fmt.Errorf("resume: prompt delivered to lock owner %s but handoff archive retarget failed: %w (queue preserved at %s)",
 					successorRec.ID, err, queuePath)
 			}
-			if err := DropReplacementRecord(newRec.TmuxSession, newRec.ID, stderr); err != nil {
-				return fmt.Errorf("resume: prompt delivered to lock owner %s but superseded replacement %s cleanup failed: %w (queue preserved at %s)",
-					successorRec.ID, newRec.ID, err, queuePath)
-			}
+			// Defer the superseded-record drop until AFTER queue.Delete: if the
+			// delete fails the queue still names newRec, so a recovery pass must
+			// be able to reload it (codex P2). Mirrors cmd/fleet/handoff.go.
+			supersededSession = newRec.TmuxSession
+			supersededID = newRec.ID
 		}
 	}
 	if err := queue.Delete(queuePath); err != nil {
 		return fmt.Errorf(
 			"resume: %s archived but queue file delete failed; rerun fleet drain (or fleet handoff) to deliver the resume prompt: %w",
 			oldRec.ID, err)
+	}
+	if supersededID != "" {
+		if err := DropReplacementRecord(supersededSession, supersededID, stderr); err != nil {
+			return fmt.Errorf("resume: prompt delivered to lock owner %s but superseded replacement %s cleanup failed: %w",
+				successorRec.ID, supersededID, err)
+		}
 	}
 
 	_, _ = fmt.Fprintf(stdout, "drained %s → %s\n", oldRec.ID, successorRec.ID)
