@@ -410,8 +410,10 @@ func Resume(req queue.SpawnFresh, queuePath string,
 			isCoordSwap = true
 		}
 	}
-	leaseWrappedSuccessor := req.CapApproved ||
-		!spawn.IsCoordSpawn(newRec.TaskID, newRec.Project)
+	// Read the ACTUAL wrap state from the already-spawned replacement record
+	// (codex iter-24 [P2]) — a bare drain cold-resume coord records false even
+	// on a CapApproved queue, so do NOT infer wrapping from req.CapApproved.
+	leaseWrappedSuccessor := newRec.LeaseWrapped
 	return retireOldAgent(oldRec, newRec, req.HandoffDoc, queuePath,
 		thisHandoffDisable, graceMillis, isCoordSwap, leaseWrappedSuccessor, stdout, stderr)
 }
@@ -477,8 +479,10 @@ func cleanUpStaleQueue(req queue.SpawnFresh, queuePath string,
 	if autoResume {
 		coordDelivery := spawn.IsCoordSpawn(newRec.TaskID, newRec.Project) ||
 			(newRec.Project != "" && state.ReadCoordSpawnMarker(newRec.Project) == newRec.ID)
-		leaseWrappedSuccessor := req.CapApproved ||
-			!spawn.IsCoordSpawn(newRec.TaskID, newRec.Project)
+		// Read the ACTUAL wrap state from the already-spawned replacement
+		// record (codex iter-24 [P2]), not the producer's cap-approval bit: a
+		// bare drain cold-resume coord records false even on a CapApproved queue.
+		leaseWrappedSuccessor := newRec.LeaseWrapped
 		deliveredRec, err := deliverResumePrompt(newRec.Project, coordDelivery, leaseWrappedSuccessor,
 			newRec, req.HandoffDoc, stdout, stdout)
 		if err != nil {
@@ -848,13 +852,12 @@ func spawnAndRetire(req queue.SpawnFresh, queuePath string,
 
 	// This path COLD-SPAWNS the successor above with
 	// DisableLeaseWrap: legacyCoordResume — i.e. a coord successor here is a
-	// BARE/direct successor, NOT lease-wrapped (codex iter-20 P2). So the
-	// lease-wrapped state is exactly !DisableLeaseWrap == !legacyCoordResume,
-	// regardless of req.CapApproved (which only describes the producer's cap
-	// accounting, not how THIS spawn was wrapped). Delivering through the
-	// owner-poll here would mis-route to the old/dead lease owner instead of
-	// the successor we just spawned.
-	leaseWrappedSuccessor := !legacyCoordResume
+	// BARE/direct successor, NOT lease-wrapped (codex iter-20 P2). spawn.Spawn
+	// stamped the ACTUAL wrap state onto the record, so read that authoritative
+	// value (codex iter-24 P2) rather than the producer's cap-approval bit.
+	// Delivering through the owner-poll for a bare successor would mis-route to
+	// the old/dead lease owner instead of the successor we just spawned.
+	leaseWrappedSuccessor := newRec.LeaseWrapped
 	return retireOldAgent(oldRec, newRec, req.HandoffDoc, queuePath,
 		thisHandoffDisableAutoResume, graceMillis, isCoordSwap, leaseWrappedSuccessor, stdout, stderr)
 }

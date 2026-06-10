@@ -1023,6 +1023,11 @@ func Spawn(opts Options) (*agent.Record, error) {
 			}
 		}
 	}
+	// Persist the ACTUAL wrap state (codex iter-24 [P2]) so crash-recovery retry
+	// paths read the truth instead of inferring it from the producer's
+	// cap-approval bit. A bare drain cold-resume coord (DisableLeaseWrap) records
+	// false even on a CapApproved queue.
+	rec.LeaseWrapped = leaseWrapped
 
 	// PRE-LAUNCH record write for lease-wrapped coords (codex PR2 iter-2
 	// [P1]). The wrapped `fleet coord-run` supervisor stamps its identity

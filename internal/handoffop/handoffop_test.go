@@ -1478,73 +1478,53 @@ func TestDrain_LeaseFailoverCoordHandoff_FinalizesDeliveredLockOwner(t *testing.
 	}
 
 	req, qp, _ := writeSkillQueue(t, oldRec)
+	// codex iter-24 [P2]: spawnAndRetire COLD-SPAWNS the successor (bare for
+	// coords via DisableLeaseWrap; a worker is never lease-wrapped). Such a
+	// successor records LeaseWrapped=false, so delivery must go DIRECTLY to it,
+	// never poll the lock owner — polling would target the old/dead owner. So
+	// CurrentOwner must NOT be consulted here.
+	_ = winner
 	origDeliveryDeps := handoffDeliveryDepsFn
-	origDeliveryTimeout := handoffDeliveryTimeout
-	origDeliveryPoll := handoffDeliveryPoll
+	origSend := sendPromptKeysVerified
 	t.Cleanup(func() {
 		handoffDeliveryDepsFn = origDeliveryDeps
-		handoffDeliveryTimeout = origDeliveryTimeout
-		handoffDeliveryPoll = origDeliveryPoll
+		sendPromptKeysVerified = origSend
 	})
-	handoffDeliveryTimeout = time.Second
-	handoffDeliveryPoll = time.Millisecond
-	var sentSession string
 	handoffDeliveryDepsFn = func() handoffdelivery.Deps {
 		deps := handoffdelivery.DefaultDeps()
-		deps.CurrentOwner = func(project string) (coordlock.Owner, bool) {
-			if project != oldRec.Project {
-				t.Fatalf("current owner checked for project %q, want %q", project, oldRec.Project)
-			}
-			return coordlock.Owner{AgentID: winner.ID, PID: winner.SupervisorPID, PidStart: winner.SupervisorPidStart}, true
+		deps.CurrentOwner = func(string) (coordlock.Owner, bool) {
+			t.Fatalf("cold-spawned (bare) successor must NOT poll the lock owner")
+			return coordlock.Owner{}, false
 		}
-		deps.WaitReady = func(session string) error {
-			if session != winner.TmuxSession {
-				t.Fatalf("wait-ready session = %q, want delivered owner session %q", session, winner.TmuxSession)
-			}
-			return nil
-		}
-		deps.SessionAlive = func(session string) (bool, error) {
-			if session != winner.TmuxSession {
-				t.Fatalf("session-alive probe = %q, want delivered owner session %q", session, winner.TmuxSession)
-			}
-			return true, nil
-		}
-		deps.SendVerified = func(session, prompt string) (bool, error) {
-			sentSession = session
-			if session != winner.TmuxSession {
-				t.Fatalf("resume prompt session = %q, want delivered owner session %q", session, winner.TmuxSession)
-			}
-			if !strings.Contains(prompt, "Read your handoff doc at ") {
-				t.Fatalf("resume prompt has wrong shape: %q", prompt)
-			}
-			return true, nil
-		}
-		deps.Sleep = func(time.Duration) {}
 		return deps
+	}
+	var sentSession, sentPrompt string
+	sendPromptKeysVerified = func(session, prompt string) (bool, error) {
+		sentSession, sentPrompt = session, prompt
+		return true, nil
 	}
 
 	out := &bytes.Buffer{}
 	if err := Resume(req, qp, 0, out, out); err != nil {
-		t.Fatalf("Resume should finalize delivered lock owner: %v\n%s", err, out.String())
+		t.Fatalf("Resume should deliver directly to the cold-spawned successor: %v\n%s", err, out.String())
 	}
-	if sentSession != winner.TmuxSession {
-		t.Fatalf("resume prompt sent to %q, want %q", sentSession, winner.TmuxSession)
+	newRec, lerr := agent.Load(req.NewAgentID)
+	if lerr != nil {
+		t.Fatalf("cold-spawned successor record should exist: %v", lerr)
+	}
+	t.Cleanup(func() { _ = tmux.Kill(newRec.TmuxSession) })
+	if sentSession != newRec.TmuxSession {
+		t.Fatalf("resume prompt sent to %q, want cold-spawned successor %q", sentSession, newRec.TmuxSession)
+	}
+	if !strings.Contains(sentPrompt, "Read your handoff doc at ") {
+		t.Fatalf("resume prompt has wrong shape: %q", sentPrompt)
 	}
 	arc, err := agent.LoadArchive(oldRec.ID)
 	if err != nil {
 		t.Fatalf("LoadArchive(%s): %v", oldRec.ID, err)
 	}
-	if arc.SuccessorID != winner.ID {
-		t.Fatalf("archive successor = %q, want delivered lock owner %q", arc.SuccessorID, winner.ID)
-	}
-	if _, lerr := agent.Load(req.NewAgentID); !errors.Is(lerr, state.ErrNotFound) {
-		t.Fatalf("superseded replacement %s should have been removed, load err=%v", req.NewAgentID, lerr)
-	}
-	if got := state.ReadCoordSpawnMarker(oldRec.Project); got != winner.ID {
-		t.Fatalf("coord marker = %q, want delivered lock owner %q", got, winner.ID)
-	}
-	if !strings.Contains(out.String(), "drained "+oldRec.ID+" → "+winner.ID) {
-		t.Fatalf("output did not report delivered lock owner %q:\n%s", winner.ID, out.String())
+	if arc.SuccessorID != req.NewAgentID {
+		t.Fatalf("archive successor = %q, want cold-spawned successor %q", arc.SuccessorID, req.NewAgentID)
 	}
 	if _, statErr := os.Stat(qp); !errors.Is(statErr, os.ErrNotExist) {
 		t.Fatalf("queue file should be consumed after verified delivery, stat err=%v", statErr)
@@ -1567,6 +1547,7 @@ func TestDrain_LeaseFailoverCoordStaleQueue_UsesLockOwnerForCapApprovedCoord(t *
 	newRec.TmuxSession = tmux.SessionName(newRec.ID)
 	newRec.SpawnedAt = time.Now().UTC()
 	newRec.LastActivityTS = newRec.SpawnedAt
+	newRec.LeaseWrapped = true // a lease-wrapped replacement -> lock-owner delivery
 	if err := tmux.Spawn(newRec.TmuxSession, newRec.Cwd, newRec.Command,
 		[]string{"FLEET_AGENT_ID=" + newRec.ID}); err != nil {
 		t.Fatalf("spawn journaled replacement: %v", err)
@@ -2037,6 +2018,7 @@ func TestResume_Case3_CapApprovedCoord_DeliversToLockOwner(t *testing.T) {
 	newRec.TmuxSession = tmux.SessionName(newRec.ID)
 	newRec.SpawnedAt = time.Now().UTC()
 	newRec.LastActivityTS = newRec.SpawnedAt
+	newRec.LeaseWrapped = true // lease-wrapped replacement -> lock-owner delivery
 	if err := tmux.Spawn(newRec.TmuxSession, newRec.Cwd, newRec.Command,
 		[]string{"FLEET_AGENT_ID=" + newRec.ID}); err != nil {
 		t.Fatalf("spawn journaled replacement: %v", err)

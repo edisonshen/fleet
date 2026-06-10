@@ -177,7 +177,12 @@ var (
 func deliverHandoffResumePrompt(project string, isCoordSwap bool, rec *agent.Record,
 	docPath string, stdout, stderr io.Writer) (*agent.Record, error) {
 	prompt := handoff.ResumePrompt(docPath)
-	if leaseFailoverEnabled() && isCoordSwap && project != "" {
+	// Route through the lock owner ONLY when the successor was actually
+	// lease-wrapped (codex iter-24 [P2]). A drain cold-resume queue picked up by
+	// this CLI recovery path may name a BARE coord successor (DisableLeaseWrap)
+	// that never becomes CurrentOwner; polling it would time out / misroute, so
+	// such a successor takes the direct-send path below.
+	if leaseFailoverEnabled() && isCoordSwap && rec.LeaseWrapped && project != "" {
 		delivered, err := handoffdelivery.DeliverToCurrentOwner(handoffdelivery.Options{
 			Project:       project,
 			Prompt:        prompt,

@@ -123,3 +123,52 @@ func TestSpawn_StandbyFinalMergePreservesStampedEnginePID(t *testing.T) {
 			got.PID, stampedPid)
 	}
 }
+
+// codex iter-24 [P2]: Spawn must persist the ACTUAL lease-wrap state on the
+// record so crash-recovery retry paths read the truth (not the producer's
+// cap-approval bit). A lease-wrapped coord records LeaseWrapped=true; a coord
+// spawned with DisableLeaseWrap (the drain cold-resume path) records false.
+func TestSpawn_PersistsLeaseWrappedState(t *testing.T) {
+	requireTmux(t)
+	setupFleetHome(t)
+	t.Setenv("FLEET_LEASE_FAILOVER", "1")
+
+	// Lease-wrapped coord -> LeaseWrapped true.
+	wrapped, err := Spawn(Options{
+		TaskID:         "coord-lwp",
+		Project:        "lwp",
+		Cwd:            t.TempDir(),
+		Command:        []string{"sh", "-c", "sleep 30"},
+		PreAllocatedID: "lwcoord1",
+	})
+	if err != nil {
+		t.Fatalf("spawn lease-wrapped coord: %v", err)
+	}
+	t.Cleanup(func() { _ = tmux.Kill(wrapped.TmuxSession) })
+	if !wrapped.LeaseWrapped {
+		t.Fatal("lease-wrapped coord record LeaseWrapped=false, want true")
+	}
+	if got, lerr := agent.Load(wrapped.ID); lerr != nil || !got.LeaseWrapped {
+		t.Fatalf("persisted LeaseWrapped=%v (err=%v), want true", got.LeaseWrapped, lerr)
+	}
+
+	// DisableLeaseWrap (drain cold-resume) coord -> LeaseWrapped false.
+	bare, err := Spawn(Options{
+		TaskID:           "coord-lwp",
+		Project:          "lwp",
+		Cwd:              t.TempDir(),
+		Command:          []string{"sh", "-c", "sleep 30"},
+		PreAllocatedID:   "barecoord1",
+		DisableLeaseWrap: true,
+	})
+	if err != nil {
+		t.Fatalf("spawn bare coord: %v", err)
+	}
+	t.Cleanup(func() { _ = tmux.Kill(bare.TmuxSession) })
+	if bare.LeaseWrapped {
+		t.Fatal("DisableLeaseWrap coord record LeaseWrapped=true, want false")
+	}
+	if got, lerr := agent.Load(bare.ID); lerr != nil || got.LeaseWrapped {
+		t.Fatalf("persisted bare LeaseWrapped=%v (err=%v), want false", got.LeaseWrapped, lerr)
+	}
+}
