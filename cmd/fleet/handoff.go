@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -12,6 +13,7 @@ import (
 	"github.com/edisonshen/fleet/internal/agent"
 	"github.com/edisonshen/fleet/internal/coordrepo"
 	"github.com/edisonshen/fleet/internal/handoff"
+	"github.com/edisonshen/fleet/internal/handoffdelivery"
 	"github.com/edisonshen/fleet/internal/handoffop"
 	"github.com/edisonshen/fleet/internal/queue"
 	"github.com/edisonshen/fleet/internal/spawn"
@@ -167,18 +169,91 @@ func isCoordHandoffForProject(project, agentID string) bool {
 var (
 	handoffLeaseActiveOwnerPIDFn = leaseActiveOwnerPID
 	handoffLeaseLeaderPresentFn  = leaseLeaderPresent
+	handoffDeliveryDepsFn        = handoffdelivery.DefaultDeps
+	handoffDeliveryTimeout       = 30 * time.Second
+	handoffDeliveryPoll          = 100 * time.Millisecond
 )
 
-func refuseLeaseWrappedCoordHandoffRetire(oldRec, newRec *agent.Record, stderr io.Writer) error {
-	handoffop.RollbackCoordMarkerIfPointingAt(oldRec.Project, oldRec.ID, newRec.ID, stderr)
-	if dropErr := handoffop.DropReplacementRecord(newRec.TmuxSession, newRec.ID, stderr); dropErr != nil {
-		return fmt.Errorf(
-			"coord handoff for project %q spawned standby successor %s but PR1 cannot verify its child before retiring old coord %s; cleanup failed: %w (old agent untouched, queue file preserved for retry after PR2 lock-coupled delivery)",
-			oldRec.Project, newRec.ID, oldRec.ID, dropErr)
+func deliverHandoffResumePrompt(project string, isCoordSwap bool, rec *agent.Record,
+	docPath string, stdout, stderr io.Writer) (*agent.Record, error) {
+	prompt := handoff.ResumePrompt(docPath)
+	// Route through the lock owner ONLY when the successor was actually
+	// lease-wrapped (codex iter-24 [P2]). A drain cold-resume queue picked up by
+	// this CLI recovery path may name a BARE coord successor (DisableLeaseWrap)
+	// that never becomes CurrentOwner; polling it would time out / misroute, so
+	// such a successor takes the direct-send path below.
+	if leaseFailoverEnabled() && isCoordSwap && rec.LeaseWrapped && project != "" {
+		delivered, err := handoffdelivery.DeliverToCurrentOwner(handoffdelivery.Options{
+			Project:       project,
+			Prompt:        prompt,
+			PromoteMarker: true,
+			Timeout:       handoffDeliveryTimeout,
+			Poll:          handoffDeliveryPoll,
+			Stdout:        stdout,
+			Stderr:        stderr,
+		}, handoffDeliveryDepsFn())
+		if err != nil {
+			// Legacy/bare coord: no lease owner was ever stamped, so the
+			// owner-poll cannot converge and would time out on every retry.
+			// The replacement (rec) is already live, so fall back to a direct
+			// send to its session — the pre-PR2 delivery path. A genuine
+			// owner-was-seen-but-undeliverable error is NOT this sentinel, so
+			// it still propagates and stays pending for a real-owner retry.
+			if errors.Is(err, handoffdelivery.ErrNoOwnerObserved) {
+				_, _ = fmt.Fprintf(stderr,
+					"warning: no lease owner for project %s (legacy coord?); delivering resume prompt directly to %s\n",
+					project, rec.TmuxSession)
+				submitted, serr := spawn.SendPromptKeysVerified(rec.TmuxSession, prompt)
+				if serr != nil {
+					return nil, serr
+				}
+				if !submitted {
+					return nil, fmt.Errorf("resume prompt to %s was typed but not submitted", rec.TmuxSession)
+				}
+				return rec, nil
+			}
+			return nil, err
+		}
+		if delivered != nil {
+			_, _ = fmt.Fprintf(stdout,
+				"  resume: delivered to lock owner %s (%s)\n",
+				delivered.ID, delivered.TmuxSession)
+		}
+		return delivered, nil
 	}
-	return fmt.Errorf(
-		"coord handoff for project %q spawned standby successor %s but PR1 cannot verify its child before retiring old coord %s; old agent untouched, replacement dropped, queue file preserved for retry after PR2 lock-coupled delivery",
-		oldRec.Project, newRec.ID, oldRec.ID)
+	submitted, err := spawn.SendPromptKeysVerified(rec.TmuxSession, prompt)
+	if err != nil {
+		return nil, err
+	}
+	if !submitted {
+		return nil, fmt.Errorf("resume prompt to %s was typed but not submitted", rec.TmuxSession)
+	}
+	return rec, nil
+}
+
+func retargetArchivedHandoffSuccessor(agentID, successorID string) error {
+	if successorID == "" {
+		return fmt.Errorf("successorID required")
+	}
+	archived, err := agent.LoadArchive(agentID)
+	if err != nil {
+		return err
+	}
+	archived.SuccessorID = successorID
+	archived.ArchivedCause = agent.ArchivedCauseHandoff
+	data, err := json.MarshalIndent(archived, "", "  ")
+	if err != nil {
+		return fmt.Errorf("marshal archive payload: %w", err)
+	}
+	data = append(data, '\n')
+	path, err := state.AgentArchivePath(agentID)
+	if err != nil {
+		return err
+	}
+	if err := state.WriteAtomic(path, data); err != nil {
+		return fmt.Errorf("write archive %s: %w", agentID, err)
+	}
+	return nil
 }
 
 func shouldRefuseLeaseWrappedCoordHandoffRetire(oldRec *agent.Record) (bool, error) {
@@ -323,38 +398,56 @@ func runHandoff(opts *handoffOpts, stdout, stderr io.Writer) error {
 					"agent %s already archived BUT replacement %s tmux session %s exited during readiness wait — task has no live agent",
 					opts.oldID, pending.NewAgentID, newRec.TmuxSession)
 			}
-			queueDeleted := true
-			if err := queue.Delete(pendingPath); err != nil {
-				_, _ = fmt.Fprintf(stderr, "warning: delete queue file: %v\n", err)
-				queueDeleted = false
-			}
-			if queueDeleted && autoResume {
-				if err := spawn.SendPromptKeys(newRec.TmuxSession,
-					handoff.ResumePrompt(pending.HandoffDoc)); err != nil {
-					_, _ = fmt.Fprintf(stderr,
-						"warning: send resume prompt to %s after archive-recovery: %v (re-enqueuing for retry)\n",
-						newRec.TmuxSession, err)
-					// Re-enqueue so the next retry can attempt
-					// delivery (codex review iter-14 P1).
-					if _, werr := queue.WriteSpawnFresh(pending); werr != nil {
-						_, _ = fmt.Fprintf(stderr,
-							"warning: re-enqueue after archive-recovery send failure: %v\n",
-							werr)
+			// Track a superseded queued replacement (lock owner won the
+			// delivery instead of pending.NewAgentID). The DROP of that record
+			// is deferred until AFTER queue.Delete succeeds — if queue.Delete
+			// fails the queue still names the queued replacement, and the next
+			// recovery pass must be able to reload it (codex P2).
+			supersededSession := ""
+			supersededID := ""
+			if autoResume {
+				coordDelivery := spawn.IsCoordSpawn(newRec.TaskID, newRec.Project) ||
+					(newRec.Project != "" && state.ReadCoordSpawnMarker(newRec.Project) == newRec.ID)
+				deliveredRec, err := deliverHandoffResumePrompt(newRec.Project, coordDelivery,
+					newRec, pending.HandoffDoc, stdout, stderr)
+				if err != nil {
+					return fmt.Errorf(
+						"agent %s already archived BUT resume prompt delivery is still pending: %w (queue preserved at %s)",
+						opts.oldID, err, pendingPath)
+				}
+				if deliveredRec != nil {
+					if deliveredRec.ID != newRec.ID {
+						// Lock owner != queued replacement. Retarget OLD's
+						// archive to the owner that actually got the prompt so
+						// chain-follow (`fleet attach <old>`) resolves correctly.
+						if rtErr := retargetArchivedHandoffSuccessor(opts.oldID, deliveredRec.ID); rtErr != nil {
+							return fmt.Errorf(
+								"agent %s already archived BUT delivered lock owner %s superseded replacement %s and archive retarget failed: %w (queue preserved at %s)",
+								opts.oldID, deliveredRec.ID, newRec.ID, rtErr, pendingPath)
+						}
+						supersededSession = newRec.TmuxSession
+						supersededID = newRec.ID
 					}
+					newRec = deliveredRec
 				}
 			}
-			if !queueDeleted {
-				// queue.Delete failed → SendPromptKeys was skipped,
-				// so the replacement is still un-prompted and the
-				// journal entry persists. Surface as error so the
-				// operator retries (codex review iter-19 P2).
+			if err := queue.Delete(pendingPath); err != nil {
+				// queue.Delete failed → the journal entry persists. Surface as
+				// error so the operator retries (codex review iter-19 P2).
 				return fmt.Errorf(
 					"agent %s already archived BUT queue cleanup failed; rerun `fleet handoff %s` to deliver the resume prompt",
 					opts.oldID, opts.oldID)
 			}
+			if supersededID != "" {
+				if dropErr := handoffop.DropReplacementRecord(supersededSession, supersededID, stderr); dropErr != nil {
+					return fmt.Errorf(
+						"agent %s already handed off → %s BUT superseded replacement %s cleanup failed: %w",
+						opts.oldID, newRec.ID, supersededID, dropErr)
+				}
+			}
 			_, _ = fmt.Fprintf(stdout,
 				"agent %s already handed off → %s (cleaned stale queue file)\n",
-				opts.oldID, pending.NewAgentID)
+				opts.oldID, newRec.ID)
 			if !autoResume {
 				// The original handoff opted out of auto-resume, so
 				// the replacement is alive but still idle. Print the
@@ -917,13 +1010,6 @@ func runHandoff(opts *handoffOpts, stdout, stderr io.Writer) error {
 	isCoordSwap := false
 	if oldRec.Project != "" && state.ReadCoordSpawnMarker(oldRec.Project) == oldRec.ID {
 		isCoordSwap = true
-		refuse, rerr := shouldRefuseLeaseWrappedCoordHandoffRetire(oldRec)
-		if rerr != nil {
-			return fmt.Errorf("%w (old agent untouched, queue file preserved for retry)", rerr)
-		}
-		if refuse {
-			return refuseLeaseWrappedCoordHandoffRetire(oldRec, newRec, stderr)
-		}
 		// Eager marker write — best-effort. AtomicCoordSwap will
 		// re-commit (idempotent) inside its step 4 if this failed,
 		// or skip step 4 if it succeeded.
@@ -1127,59 +1213,63 @@ func runHandoff(opts *handoffOpts, stdout, stderr io.Writer) error {
 		}
 	}
 
-	// 13. Delete the queue file. Work is durable on disk; the journal
-	//     entry is no longer needed. We GATE step 14's send on this
-	//     succeeding — if queue.Delete fails the journal lingers, a
-	//     retry will run cleanUpStaleQueue (or the equivalent
-	//     archive-recovery branch above) which has its own send +
-	//     delete pair; sending here too would double-deliver (codex
-	//     review iter-11 P3).
+	// 13. Deliver the resume prompt BEFORE consuming the queue. The queue
+	//     is the durable doc-inbox; if verified delivery fails, leave it
+	//     pending so a later handoff/drain/attach retry can deliver to the
+	//     eventual lock owner.
+	successorRec := newRec
+	promptDelivered := !autoResume
+	supersededReplacement := false
+	if autoResume {
+		deliveredRec, err := deliverHandoffResumePrompt(oldRec.Project, isCoordSwap,
+			newRec, docPath, stdout, stderr)
+		if err != nil {
+			return fmt.Errorf("resume prompt delivery pending for %s: %w (queue preserved at %s)",
+				newRec.ID, err, queuePath)
+		}
+		if deliveredRec != nil {
+			successorRec = deliveredRec
+		}
+		if isCoordSwap && successorRec.ID != newRec.ID {
+			// Retarget OLD's archive to the owner that got the prompt so
+			// chain-follow resolves correctly even if queue cleanup below
+			// fails. Do NOT drop the superseded newRec record yet — the queue
+			// still names it, and if queue.Delete fails the next recovery pass
+			// must be able to reload it (codex P2). Defer the drop until AFTER
+			// the queue is consumed.
+			if err := retargetArchivedHandoffSuccessor(oldRec.ID, successorRec.ID); err != nil {
+				return fmt.Errorf("resume prompt delivered to lock owner %s but handoff archive retarget failed: %w (queue preserved at %s)",
+					successorRec.ID, err, queuePath)
+			}
+			supersededReplacement = true
+		}
+		promptDelivered = true
+	}
+
+	// 14. Mark the durable inbox consumed only after verified delivery (or
+	//     when auto-resume is explicitly disabled and there is nothing to
+	//     deliver). Delete the queue BEFORE dropping any superseded replacement
+	//     record, so a queue.Delete failure never leaves the queue pointing at
+	//     a record we already removed.
 	queueDeleted := true
 	if err := queue.Delete(queuePath); err != nil {
 		_, _ = fmt.Fprintf(stderr, "warning: delete queue file: %v\n", err)
 		queueDeleted = false
 	}
-
-	// 14. Send the resume prompt — only when queue.Delete succeeded
-	//     so the at-most-once guarantee holds. If the send itself
-	//     fails after the queue was deleted, re-enqueue so a future
-	//     `fleet handoff` / `fleet drain` can retry the delivery
-	//     (codex review iter-13 P2). Without this, send failure
-	//     would silently strand the replacement: queue is gone, no
-	//     journal to recover from. Skipped entirely when
-	//     DisableAutoResume is set.
-	if queueDeleted && autoResume {
-		if err := spawn.SendPromptKeys(newRec.TmuxSession,
-			handoff.ResumePrompt(docPath)); err != nil {
-			_, _ = fmt.Fprintf(stderr,
-				"warning: send resume prompt to %s: %v (re-enqueuing for retry)\n",
-				newRec.TmuxSession, err)
-			if _, werr := queue.WriteSpawnFresh(queue.SpawnFresh{
-				OldAgentID:        oldRec.ID,
-				HandoffDoc:        docPath,
-				Project:           oldRec.Project,
-				TaskID:            oldRec.TaskID,
-				NewAgentID:        newID,
-				NewSession:        newSession,
-				DisableAutoResume: override,
-				// Already passed cap; preserve so retries don't
-				// re-block on a tightened cap (codex iter-7 P1).
-				CapApproved: true,
-			}); werr != nil {
-				_, _ = fmt.Fprintf(stderr,
-					"warning: re-enqueue after send failure: %v (replacement may need manual prompt on attach)\n",
-					werr)
-			}
+	if queueDeleted && supersededReplacement {
+		if err := handoffop.DropReplacementRecord(newRec.TmuxSession, newRec.ID, stderr); err != nil {
+			return fmt.Errorf("resume prompt delivered to lock owner %s but superseded replacement %s cleanup failed: %w",
+				successorRec.ID, newRec.ID, err)
 		}
 	}
 
-	_, _ = fmt.Fprintf(stdout, "agent %s handed off → %s\n", oldRec.ID, newRec.ID)
-	_, _ = fmt.Fprintf(stdout, "  task:    %s\n", newRec.TaskID)
-	_, _ = fmt.Fprintf(stdout, "  project: %s\n", newRec.Project)
-	_, _ = fmt.Fprintf(stdout, "  tmux:    %s\n", newRec.TmuxSession)
+	_, _ = fmt.Fprintf(stdout, "agent %s handed off → %s\n", oldRec.ID, successorRec.ID)
+	_, _ = fmt.Fprintf(stdout, "  task:    %s\n", successorRec.TaskID)
+	_, _ = fmt.Fprintf(stdout, "  project: %s\n", successorRec.Project)
+	_, _ = fmt.Fprintf(stdout, "  tmux:    %s\n", successorRec.TmuxSession)
 	_, _ = fmt.Fprintf(stdout, "  handoff: %s\n", docPath)
-	_, _ = fmt.Fprintf(stdout, "  number:  %d (was %d)\n", newRec.HandoffNumber, oldRec.HandoffNumber)
-	_, _ = fmt.Fprintf(stdout, "\nattach with: fleet attach %s\n", newRec.ID)
+	_, _ = fmt.Fprintf(stdout, "  number:  %d (was %d)\n", successorRec.HandoffNumber, oldRec.HandoffNumber)
+	_, _ = fmt.Fprintf(stdout, "\nattach with: fleet attach %s\n", successorRec.ID)
 	switch {
 	case !autoResume:
 		// Auto-resume disabled — replacement is alive but idle.
@@ -1187,17 +1277,19 @@ func runHandoff(opts *handoffOpts, stdout, stderr io.Writer) error {
 		// review iter-7 P2).
 		_, _ = fmt.Fprintf(stdout,
 			"then say: read the handoff doc at %s and continue\n", docPath)
-	case !queueDeleted:
-		// queue.Delete failed → SendPromptKeys was skipped for the
-		// at-most-once guarantee. The journal is still on disk;
-		// running fleet handoff again triggers cleanUpStaleQueue
-		// which delivers the prompt + cleans up. Telling the
-		// operator to type the prompt manually here would race
-		// with that recovery and produce a double-send (codex
-		// review iter-17 P2).
-		_, _ = fmt.Fprintf(stdout,
-			"queue cleanup failed; rerun `fleet handoff %s` to deliver the resume prompt\n",
-			oldRec.ID)
+	case promptDelivered && !queueDeleted:
+		// The prompt WAS delivered, but queue.Delete failed so the durable
+		// inbox is still on disk. Returning success here would let a
+		// programmatic caller treat the handoff as fully done while a stale
+		// queue lingers; the next handoff/drain retry sees that queue and
+		// re-delivers the same prompt (the at-most-once regression codex
+		// flagged P2). Surface a non-zero exit so the stale queue is not
+		// silently reported as a clean handoff. The duplicate-on-retry is
+		// the deliberately-accepted mark-after-verified-send cost (§5c);
+		// the operator/coord reruns to clear the queue.
+		return fmt.Errorf(
+			"agent %s handed off → %s BUT queue cleanup failed; rerun `fleet handoff %s` to clear the stale inbox (resume prompt already delivered)",
+			oldRec.ID, successorRec.ID, oldRec.ID)
 	}
 	return nil
 }
@@ -1282,16 +1374,6 @@ func resumeHandoff(opts *handoffOpts, stdout, stderr io.Writer,
 			isCoordSwap = true
 		}
 	}
-	if isCoordSwap && leaseFailoverEnabled() {
-		refuse, rerr := shouldRefuseLeaseWrappedCoordHandoffRetire(oldRec)
-		if rerr != nil {
-			return fmt.Errorf("resume handoff: %w (old agent untouched, queue file preserved for retry)", rerr)
-		}
-		if refuse {
-			return refuseLeaseWrappedCoordHandoffRetire(oldRec, newRec, stderr)
-		}
-	}
-
 	// Wait BEFORE killing old (codex iter-8 P1). Always runs — the
 	// wait doubles as a post-spawn liveness check, and a wrapper
 	// that crashes shortly after the previous run's spawn must be
@@ -1374,48 +1456,55 @@ func resumeHandoff(opts *handoffOpts, stdout, stderr io.Writer,
 			}
 		}
 	}
-	queueDeleted := true
-	if err := queue.Delete(queuePath); err != nil {
-		_, _ = fmt.Fprintf(stderr, "warning: delete queue file: %v\n", err)
-		queueDeleted = false
-	}
-
-	// Send the resume prompt only if queue.Delete succeeded — see
-	// runHandoff step 14 / codex iter-11 P3. Re-enqueue on send
-	// failure so the next retry can deliver (codex iter-13 P2).
-	if queueDeleted && autoResume {
-		if err := spawn.SendPromptKeys(newRec.TmuxSession,
-			handoff.ResumePrompt(docPath)); err != nil {
-			_, _ = fmt.Fprintf(stderr,
-				"warning: send resume prompt to %s: %v (re-enqueuing for retry)\n",
-				newRec.TmuxSession, err)
-			if _, werr := queue.WriteSpawnFresh(queue.SpawnFresh{
-				OldAgentID:        oldRec.ID,
-				HandoffDoc:        docPath,
-				Project:           oldRec.Project,
-				TaskID:            oldRec.TaskID,
-				NewAgentID:        newRec.ID,
-				NewSession:        newRec.TmuxSession,
-				DisableAutoResume: pendingDisableAutoResume,
-				// Resume path; the original handoff already passed
-				// the cap. Preserve so further retries don't
-				// re-block on a tightened cap (codex iter-7 P1).
-				CapApproved: true,
-			}); werr != nil {
-				_, _ = fmt.Fprintf(stderr,
-					"warning: re-enqueue after send failure: %v (replacement may need manual prompt on attach)\n",
-					werr)
+	successorRec := newRec
+	supersededSession := ""
+	supersededID := ""
+	if autoResume {
+		deliveredRec, err := deliverHandoffResumePrompt(oldRec.Project, isCoordSwap,
+			newRec, docPath, stdout, stderr)
+		if err != nil {
+			return fmt.Errorf("resume handoff: prompt delivery pending for %s: %w (queue preserved at %s)",
+				newRec.ID, err, queuePath)
+		}
+		if deliveredRec != nil {
+			successorRec = deliveredRec
+		}
+		if isCoordSwap && successorRec.ID != newRec.ID {
+			if err := retargetArchivedHandoffSuccessor(oldRec.ID, successorRec.ID); err != nil {
+				return fmt.Errorf("resume handoff: prompt delivered to lock owner %s but handoff archive retarget failed: %w (queue preserved at %s)",
+					successorRec.ID, err, queuePath)
 			}
+			// Defer the superseded-record drop until AFTER queue.Delete: if the
+			// delete fails the queue still names newRec, so a recovery pass must
+			// be able to reload it (codex P2).
+			supersededSession = newRec.TmuxSession
+			supersededID = newRec.ID
+		}
+	}
+	if err := queue.Delete(queuePath); err != nil {
+		if autoResume {
+			// Prompt already delivered but the durable inbox is still on disk;
+			// reporting success would let a retry re-deliver. Mirror runHandoff
+			// and surface a non-zero exit (codex iter-15 P2).
+			return fmt.Errorf(
+				"resumed crashed handoff: %s → %s BUT queue cleanup failed; rerun `fleet handoff %s` to clear the stale inbox (resume prompt already delivered)",
+				oldRec.ID, successorRec.ID, oldRec.ID)
+		}
+		_, _ = fmt.Fprintf(stderr, "warning: delete queue file: %v\n", err)
+	} else if supersededID != "" {
+		if err := handoffop.DropReplacementRecord(supersededSession, supersededID, stderr); err != nil {
+			return fmt.Errorf("resume handoff: prompt delivered to lock owner %s but superseded replacement %s cleanup failed: %w",
+				successorRec.ID, supersededID, err)
 		}
 	}
 
 	_, _ = fmt.Fprintf(stdout, "resumed crashed handoff: %s → %s (replacement was already spawned)\n",
-		oldRec.ID, newRec.ID)
-	_, _ = fmt.Fprintf(stdout, "  task:    %s\n", newRec.TaskID)
-	_, _ = fmt.Fprintf(stdout, "  project: %s\n", newRec.Project)
-	_, _ = fmt.Fprintf(stdout, "  tmux:    %s\n", newRec.TmuxSession)
+		oldRec.ID, successorRec.ID)
+	_, _ = fmt.Fprintf(stdout, "  task:    %s\n", successorRec.TaskID)
+	_, _ = fmt.Fprintf(stdout, "  project: %s\n", successorRec.Project)
+	_, _ = fmt.Fprintf(stdout, "  tmux:    %s\n", successorRec.TmuxSession)
 	_, _ = fmt.Fprintf(stdout, "  handoff: %s\n", docPath)
-	_, _ = fmt.Fprintf(stdout, "\nattach with: fleet attach %s\n", newRec.ID)
+	_, _ = fmt.Fprintf(stdout, "\nattach with: fleet attach %s\n", successorRec.ID)
 	if !autoResume {
 		_, _ = fmt.Fprintf(stdout,
 			"then say: read the handoff doc at %s and continue\n", docPath)

@@ -16,6 +16,7 @@
 package handoffop
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -26,6 +27,7 @@ import (
 	"github.com/edisonshen/fleet/internal/coordlock"
 	"github.com/edisonshen/fleet/internal/coordrepo"
 	"github.com/edisonshen/fleet/internal/handoff"
+	"github.com/edisonshen/fleet/internal/handoffdelivery"
 	"github.com/edisonshen/fleet/internal/queue"
 	"github.com/edisonshen/fleet/internal/rc"
 	"github.com/edisonshen/fleet/internal/spawn"
@@ -66,6 +68,89 @@ var sessionAliveProbe = tmux.SessionAlive
 // drain-path (auto-handoff + crash recovery) handoffs so pre-v0.12.1
 // coords get RC backfilled on their next handoff.
 var writeMarkerFn = rc.WriteMarker
+
+var (
+	handoffDeliveryDepsFn  = handoffdelivery.DefaultDeps
+	handoffDeliveryTimeout = 30 * time.Second
+	handoffDeliveryPoll    = 100 * time.Millisecond
+	sendPromptKeysVerified = spawn.SendPromptKeysVerified
+)
+
+func deliverResumePrompt(project string, isCoordSwap, leaseWrappedSuccessor bool, rec *agent.Record,
+	docPath string, stdout, stderr io.Writer) (*agent.Record, error) {
+	prompt := handoff.ResumePrompt(docPath)
+	if coordlock.FailoverEnabled() && isCoordSwap && leaseWrappedSuccessor && project != "" {
+		delivered, err := handoffdelivery.DeliverToCurrentOwner(handoffdelivery.Options{
+			Project:       project,
+			Prompt:        prompt,
+			PromoteMarker: true,
+			Timeout:       handoffDeliveryTimeout,
+			Poll:          handoffDeliveryPoll,
+			Stdout:        stdout,
+			Stderr:        stderr,
+		}, handoffDeliveryDepsFn())
+		if err != nil {
+			// Legacy/bare coord with no lease record: the owner-poll can never
+			// converge, so fall back to a direct send into the live replacement
+			// (matches deliverHandoffResumePrompt in cmd/fleet/handoff.go). A
+			// genuine owner-seen-but-undeliverable error is NOT this sentinel and
+			// still propagates so the queue stays pending for a real-owner retry.
+			if errors.Is(err, handoffdelivery.ErrNoOwnerObserved) {
+				_, _ = fmt.Fprintf(stderr,
+					"  resume: no lease owner for project %s (legacy coord?); delivering directly to %s\n",
+					project, rec.TmuxSession)
+				submitted, serr := sendPromptKeysVerified(rec.TmuxSession, prompt)
+				if serr != nil {
+					return nil, serr
+				}
+				if !submitted {
+					return nil, fmt.Errorf("resume prompt to %s was typed but not submitted", rec.TmuxSession)
+				}
+				return rec, nil
+			}
+			return nil, err
+		}
+		if delivered != nil {
+			_, _ = fmt.Fprintf(stdout,
+				"  resume: delivered to lock owner %s (%s)\n",
+				delivered.ID, delivered.TmuxSession)
+		}
+		return delivered, nil
+	}
+	submitted, err := sendPromptKeysVerified(rec.TmuxSession, prompt)
+	if err != nil {
+		return nil, err
+	}
+	if !submitted {
+		return nil, fmt.Errorf("resume prompt to %s was typed but not submitted", rec.TmuxSession)
+	}
+	return rec, nil
+}
+
+func retargetArchivedHandoffSuccessor(agentID, successorID string) error {
+	if successorID == "" {
+		return fmt.Errorf("successorID required")
+	}
+	archived, err := agent.LoadArchive(agentID)
+	if err != nil {
+		return err
+	}
+	archived.SuccessorID = successorID
+	archived.ArchivedCause = agent.ArchivedCauseHandoff
+	data, err := json.MarshalIndent(archived, "", "  ")
+	if err != nil {
+		return fmt.Errorf("marshal archive payload: %w", err)
+	}
+	data = append(data, '\n')
+	path, err := state.AgentArchivePath(agentID)
+	if err != nil {
+		return err
+	}
+	if err := state.WriteAtomic(path, data); err != nil {
+		return fmt.Errorf("write archive %s: %w", agentID, err)
+	}
+	return nil
+}
 
 // isCoordHandoffForAgent reports whether (project, agentID) identifies
 // the project's current coord — i.e. the coord-spawn marker resolves
@@ -325,8 +410,12 @@ func Resume(req queue.SpawnFresh, queuePath string,
 			isCoordSwap = true
 		}
 	}
+	// Read the ACTUAL wrap state from the already-spawned replacement record
+	// (codex iter-24 [P2]) — a bare drain cold-resume coord records false even
+	// on a CapApproved queue, so do NOT infer wrapping from req.CapApproved.
+	leaseWrappedSuccessor := newRec.LeaseWrapped
 	return retireOldAgent(oldRec, newRec, req.HandoffDoc, queuePath,
-		thisHandoffDisable, graceMillis, isCoordSwap, stdout, stderr)
+		thisHandoffDisable, graceMillis, isCoordSwap, leaseWrappedSuccessor, stdout, stderr)
 }
 
 // cleanUpStaleQueue handles the "old record already archived" branch.
@@ -345,7 +434,28 @@ func cleanUpStaleQueue(req queue.SpawnFresh, queuePath string,
 	case nerr != nil:
 		return fmt.Errorf("resume: load replacement %s failed: %w", req.NewAgentID, nerr)
 	}
-	if !tmux.HasSession(newRec.TmuxSession) {
+	// Resolve auto-resume from queue override + newRec baseline
+	// (codex review iter-12 P2). Gate on schema v2+ (codex
+	// iter-15 P2) — v1 queue files predate this feature.
+	disableAutoResume := newRec.DisableAutoResume
+	if req.DisableAutoResume != nil {
+		disableAutoResume = *req.DisableAutoResume
+	}
+	autoResume := !disableAutoResume && req.SchemaVersion >= 2
+
+	// Coord lock-owner delivery (PR2 §5a): when this is a lease-wrapped coord
+	// swap with failover on, the resume prompt is delivered to the project's
+	// CURRENT LOCK OWNER (discovered via coordlock.CurrentOwner) — NOT into
+	// newRec's session. newRec may be a racing standby that LOST the lock and
+	// has since exited; the live coord is the winner. So the queued-replacement
+	// session-liveness aborts below must NOT fire for this case — they would
+	// strand the queue pending even though CurrentOwner can identify the live
+	// winner and deliver to it (codex iter-31 P1).
+	coordOwnerDelivery := autoResume && coordlock.FailoverEnabled() && newRec.LeaseWrapped &&
+		(spawn.IsCoordSpawn(newRec.TaskID, newRec.Project) ||
+			(newRec.Project != "" && state.ReadCoordSpawnMarker(newRec.Project) == newRec.ID))
+
+	if !tmux.HasSession(newRec.TmuxSession) && !coordOwnerDelivery {
 		return fmt.Errorf(
 			"resume: agent %s already archived BUT replacement %s tmux session %s is gone — task has no live agent; investigate before deleting queue file %s",
 			req.OldAgentID, req.NewAgentID, newRec.TmuxSession, queuePath)
@@ -358,15 +468,6 @@ func cleanUpStaleQueue(req queue.SpawnFresh, queuePath string,
 	// got past queue.Delete in the previous run, queue would be
 	// gone and we wouldn't be on this path — so this delivery is
 	// the FIRST send, not a duplicate.
-	//
-	// Resolve auto-resume from queue override + newRec baseline
-	// (codex review iter-12 P2). Gate on schema v2+ (codex
-	// iter-15 P2) — v1 queue files predate this feature.
-	disableAutoResume := newRec.DisableAutoResume
-	if req.DisableAutoResume != nil {
-		disableAutoResume = *req.DisableAutoResume
-	}
-	autoResume := !disableAutoResume && req.SchemaVersion >= 2
 
 	// Wait + liveness probe ALWAYS run, even when autoResume is off
 	// — the wait doubles as a post-spawn liveness probe (codex
@@ -380,36 +481,57 @@ func cleanUpStaleQueue(req queue.SpawnFresh, queuePath string,
 		_, _ = fmt.Fprintf(stdout,
 			"warning: post-readiness probe for %s failed: %v (proceeding anyway)\n",
 			newRec.TmuxSession, perr)
-	} else if !alive {
+	} else if !alive && !coordOwnerDelivery {
+		// For a coord lock-owner delivery the queued replacement exiting is
+		// EXPECTED when a racing standby won — delivery targets CurrentOwner,
+		// not this dead session, so proceed (codex iter-31 P1).
 		return fmt.Errorf(
 			"resume: agent %s already archived BUT replacement %s tmux session %s exited during readiness wait — task has no live agent",
 			req.OldAgentID, req.NewAgentID, newRec.TmuxSession)
 	}
+	supersededSession := ""
+	supersededID := ""
+	if autoResume {
+		coordDelivery := spawn.IsCoordSpawn(newRec.TaskID, newRec.Project) ||
+			(newRec.Project != "" && state.ReadCoordSpawnMarker(newRec.Project) == newRec.ID)
+		// Read the ACTUAL wrap state from the already-spawned replacement
+		// record (codex iter-24 [P2]), not the producer's cap-approval bit: a
+		// bare drain cold-resume coord records false even on a CapApproved queue.
+		leaseWrappedSuccessor := newRec.LeaseWrapped
+		deliveredRec, err := deliverResumePrompt(newRec.Project, coordDelivery, leaseWrappedSuccessor,
+			newRec, req.HandoffDoc, stdout, stdout)
+		if err != nil {
+			return fmt.Errorf(
+				"resume: agent %s already archived BUT resume prompt delivery is still pending: %w (queue preserved at %s)",
+				req.OldAgentID, err, queuePath)
+		}
+		if deliveredRec != nil {
+			if deliveredRec.ID != newRec.ID {
+				// Retarget the archive to the lock owner, but DEFER dropping the
+				// superseded queued replacement until AFTER queue.Delete: if a
+				// later step fails the queue still names newRec, so a recovery
+				// pass must be able to reload it (codex P2).
+				if err := retargetArchivedHandoffSuccessor(req.OldAgentID, deliveredRec.ID); err != nil {
+					return fmt.Errorf(
+						"resume: prompt delivered to lock owner %s but handoff archive retarget failed: %w (queue preserved at %s)",
+						deliveredRec.ID, err, queuePath)
+				}
+				supersededSession = newRec.TmuxSession
+				supersededID = newRec.ID
+			}
+			newRec = deliveredRec
+		}
+	}
 	if err := queue.Delete(queuePath); err != nil {
-		// Return error so fleet drain / TUI watcher retries; under
-		// the new post-delete send order the prompt would never have
-		// been sent if the delete failed, so silently reporting
-		// success would leave the replacement idle (codex review
-		// iter-18 P2).
 		return fmt.Errorf(
 			"resume: agent %s already handed off → %s but queue cleanup failed (%w); will retry",
 			req.OldAgentID, req.NewAgentID, err)
 	}
-	if autoResume {
-		if err := spawn.SendPromptKeys(newRec.TmuxSession,
-			handoff.ResumePrompt(req.HandoffDoc)); err != nil {
-			_, _ = fmt.Fprintf(stdout,
-				"warning: send resume prompt to %s after archive-recovery: %v (re-enqueuing for retry)\n",
-				newRec.TmuxSession, err)
-			// Re-enqueue so a future drain / `fleet handoff` can
-			// retry delivery — without this, send failure on the
-			// non-interactive drain path silently strands the
-			// replacement (codex review iter-14 P1).
-			if _, werr := queue.WriteSpawnFresh(req); werr != nil {
-				_, _ = fmt.Fprintf(stdout,
-					"warning: re-enqueue after archive-recovery send failure: %v\n",
-					werr)
-			}
+	if supersededID != "" {
+		if err := DropReplacementRecord(supersededSession, supersededID, stdout); err != nil {
+			return fmt.Errorf(
+				"resume: agent %s already handed off → %s BUT superseded replacement %s cleanup failed: %w",
+				req.OldAgentID, newRec.ID, supersededID, err)
 		}
 	}
 	_, _ = fmt.Fprintf(stdout,
@@ -743,8 +865,16 @@ func spawnAndRetire(req queue.SpawnFresh, queuePath string,
 		}
 	}
 
+	// This path COLD-SPAWNS the successor above with
+	// DisableLeaseWrap: legacyCoordResume — i.e. a coord successor here is a
+	// BARE/direct successor, NOT lease-wrapped (codex iter-20 P2). spawn.Spawn
+	// stamped the ACTUAL wrap state onto the record, so read that authoritative
+	// value (codex iter-24 P2) rather than the producer's cap-approval bit.
+	// Delivering through the owner-poll for a bare successor would mis-route to
+	// the old/dead lease owner instead of the successor we just spawned.
+	leaseWrappedSuccessor := newRec.LeaseWrapped
 	return retireOldAgent(oldRec, newRec, req.HandoffDoc, queuePath,
-		thisHandoffDisableAutoResume, graceMillis, isCoordSwap, stdout, stderr)
+		thisHandoffDisableAutoResume, graceMillis, isCoordSwap, leaseWrappedSuccessor, stdout, stderr)
 }
 
 // retireOldAgent runs the post-spawn tail in this order: wait for
@@ -786,9 +916,17 @@ func spawnAndRetire(req queue.SpawnFresh, queuePath string,
 // Rollback semantics on Kill failure: kill the new session, delete
 // the new record + queue, surface the live old session for operator
 // triage.
+// leaseWrappedSuccessor reports whether newRec is a lease-wrapped successor
+// (spawned via coord-run --standby), in which case the resume prompt must be
+// delivered to whoever wins the coordinator lease (DeliverToCurrentOwner)
+// rather than the queued session, which may have lost the race. The caller
+// threads it in because the queue's CapApproved flag — the authoritative
+// signal — is not reconstructable from the agent record alone (codex iter-18
+// [P1]: deriving it from TaskID here mis-routed recovered coord prompts to the
+// losing session).
 func retireOldAgent(oldRec, newRec *agent.Record, docPath, queuePath string,
 	disableAutoResume bool,
-	graceMillis int, isCoordSwap bool, stdout, stderr io.Writer) error {
+	graceMillis int, isCoordSwap, leaseWrappedSuccessor bool, stdout, stderr io.Writer) error {
 
 	// disableAutoResume comes from the caller so per-handoff
 	// overrides (queue's *bool) win over newRec's baseline policy
@@ -923,74 +1061,49 @@ func retireOldAgent(oldRec, newRec *agent.Record, docPath, queuePath string,
 			}
 		}
 	}
-	queueDeleted := true
-	if err := queue.Delete(queuePath); err != nil {
-		_, _ = fmt.Fprintf(stderr, "warning: delete queue file: %v\n", err)
-		queueDeleted = false
-	}
-
-	// If queue.Delete failed, surface as error so drain reports
-	// the handoff as not-yet-complete (codex review iter-20 P1).
-	// Old is already archived, so a retry will reach
-	// cleanUpStaleQueue, which has its own send + delete pair.
-	// Returning nil here would silently strand the replacement
-	// (queue still on disk, prompt never sent, drain reports
-	// success).
-	if !queueDeleted {
-		return fmt.Errorf(
-			"resume: %s archived but queue file delete failed; rerun fleet drain (or fleet handoff) to deliver the resume prompt",
-			oldRec.ID)
-	}
-
-	// Send the resume prompt now that queue.Delete succeeded (we
-	// returned early on failure above). On SEND failure, re-enqueue
-	// so cleanUpStaleQueue can retry — preserves recovery for non-
-	// interactive drains where no operator can type the prompt
-	// manually (codex iter-13 P2).
+	successorRec := newRec
+	supersededSession := ""
+	supersededID := ""
 	if autoResume {
-		if err := spawn.SendPromptKeys(newRec.TmuxSession,
-			handoff.ResumePrompt(docPath)); err != nil {
-			_, _ = fmt.Fprintf(stderr,
-				"warning: send resume prompt to %s: %v (re-enqueuing for retry)\n",
-				newRec.TmuxSession, err)
-			// Re-enqueue: oldRec is now archived, so a retry
-			// will land in cleanUpStaleQueue, which sends + deletes.
-			var override *bool
-			if disableAutoResume != oldRec.DisableAutoResume {
-				v := disableAutoResume
-				override = &v
+		deliveredRec, err := deliverResumePrompt(oldRec.Project, isCoordSwap, leaseWrappedSuccessor,
+			newRec, docPath, stdout, stderr)
+		if err != nil {
+			return fmt.Errorf("resume: prompt delivery pending for %s: %w (queue preserved at %s)",
+				newRec.ID, err, queuePath)
+		}
+		if deliveredRec != nil {
+			successorRec = deliveredRec
+		}
+		if isCoordSwap && successorRec.ID != newRec.ID {
+			if err := retargetArchivedHandoffSuccessor(oldRec.ID, successorRec.ID); err != nil {
+				return fmt.Errorf("resume: prompt delivered to lock owner %s but handoff archive retarget failed: %w (queue preserved at %s)",
+					successorRec.ID, err, queuePath)
 			}
-			if _, werr := queue.WriteSpawnFresh(queue.SpawnFresh{
-				OldAgentID:        oldRec.ID,
-				HandoffDoc:        docPath,
-				Project:           oldRec.Project,
-				TaskID:            oldRec.TaskID,
-				NewAgentID:        newRec.ID,
-				NewSession:        newRec.TmuxSession,
-				DisableAutoResume: override,
-				// Spawn already happened on this drain pass, so the
-				// cap was effectively approved — mark so future
-				// retries don't re-check (codex iter-7 P1).
-				CapApproved: true,
-			}); werr != nil {
-				// Send failed AND re-enqueue failed → replacement
-				// is alive but un-prompted, no journal entry to
-				// recover from. Surface as error so the drainer
-				// reports failure instead of silent success
-				// (codex review iter-19 P2).
-				return fmt.Errorf(
-					"resume: send prompt to %s failed (%w) AND re-enqueue failed (%w); replacement %s alive but idle, retry handoff manually",
-					newRec.TmuxSession, err, werr, newRec.ID)
-			}
+			// Defer the superseded-record drop until AFTER queue.Delete: if the
+			// delete fails the queue still names newRec, so a recovery pass must
+			// be able to reload it (codex P2). Mirrors cmd/fleet/handoff.go.
+			supersededSession = newRec.TmuxSession
+			supersededID = newRec.ID
+		}
+	}
+	if err := queue.Delete(queuePath); err != nil {
+		return fmt.Errorf(
+			"resume: %s archived but queue file delete failed; rerun fleet drain (or fleet handoff) to deliver the resume prompt: %w",
+			oldRec.ID, err)
+	}
+	if supersededID != "" {
+		if err := DropReplacementRecord(supersededSession, supersededID, stderr); err != nil {
+			return fmt.Errorf("resume: prompt delivered to lock owner %s but superseded replacement %s cleanup failed: %w",
+				successorRec.ID, supersededID, err)
 		}
 	}
 
-	_, _ = fmt.Fprintf(stdout, "drained %s → %s\n", oldRec.ID, newRec.ID)
-	_, _ = fmt.Fprintf(stdout, "  task:    %s\n", newRec.TaskID)
-	_, _ = fmt.Fprintf(stdout, "  project: %s\n", newRec.Project)
-	_, _ = fmt.Fprintf(stdout, "  tmux:    %s\n", newRec.TmuxSession)
+	_, _ = fmt.Fprintf(stdout, "drained %s → %s\n", oldRec.ID, successorRec.ID)
+	_, _ = fmt.Fprintf(stdout, "  task:    %s\n", successorRec.TaskID)
+	_, _ = fmt.Fprintf(stdout, "  project: %s\n", successorRec.Project)
+	_, _ = fmt.Fprintf(stdout, "  tmux:    %s\n", successorRec.TmuxSession)
 	_, _ = fmt.Fprintf(stdout, "  handoff: %s\n", docPath)
 	_, _ = fmt.Fprintf(stdout, "  number:  %d (was %d)\n",
-		newRec.HandoffNumber, oldRec.HandoffNumber)
+		successorRec.HandoffNumber, oldRec.HandoffNumber)
 	return nil
 }

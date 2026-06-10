@@ -2132,11 +2132,29 @@ func writeCoordSpawnMarkerLocked(projectName, agentID string) error {
 // up a real flock holder for the full 2s budget.
 var coordlockAcquireFn = coordlock.Acquire
 
-// dispatchAgentIDPattern matches the first line of `fleet dispatch`
-// stdout: "agent <8-hex-id> spawned". We extract the ID so the
-// follow-up lock-poll knows whose holder to expect. The stdout shape
-// is stable across v0.1 / v0.2 — see cmd/fleet/dispatch.go runDispatch.
+// dispatchAgentIDPattern matches an "agent <8-hex-id> spawned" line in
+// `fleet dispatch` stdout. We extract the ID so the follow-up lock-poll
+// knows whose holder to expect + which session to attach to. The stdout
+// shape is stable across v0.1 / v0.2 — see cmd/fleet/dispatch.go runDispatch.
+//
+// IMPORTANT — take the LAST match, not the first. Dead-coord recovery prints
+// the freshly-spawned standby's id first, then (if a RACING standby won the
+// coord lease) re-emits an authoritative `agent <winner> spawned` line AFTER
+// lock-owner delivery. The winner is always last, so dispatchAgentID returns
+// the live coordinator the resume prompt + coord marker actually landed on —
+// never the losing standby (codex iter-27 P1).
 var dispatchAgentIDPattern = regexp.MustCompile(`(?m)^agent ([0-9a-f]{8}) spawned`)
+
+// dispatchAgentID returns the id of the agent dispatch ended up promoting —
+// the LAST "agent <id> spawned" line (the post-delivery lock winner when the
+// recovery path retargeted), or "" if no line matched.
+func dispatchAgentID(out string) string {
+	matches := dispatchAgentIDPattern.FindAllStringSubmatch(out, -1)
+	if len(matches) == 0 {
+		return ""
+	}
+	return matches[len(matches)-1][1]
+}
 
 // dispatchPromptFailedMarker is the stdout sigil printed by
 // runDispatch when SendInitialPrompt failed. The dispatch CLI exits 0
@@ -2211,14 +2229,13 @@ func (m Model) startCoordSpawn(projectName, cwd string) tea.Cmd {
 		// failure as fatal so the operator notices the dispatch output
 		// drift; the agent record itself remains on disk and the
 		// operator can attach via [a] on its right-column row.
-		match := dispatchAgentIDPattern.FindStringSubmatch(out)
-		if len(match) != 2 {
+		agentID := dispatchAgentID(out)
+		if agentID == "" {
 			return coordSpawnDoneMsg{
 				projectName: projectName,
 				err:         fmt.Errorf("dispatch output missing agent ID line:\n%s", out),
 			}
 		}
-		agentID := match[1]
 		// Codex iter-5 P2: if dispatch's stdout warned about a prompt
 		// delivery failure, the coord skill never started — propagate
 		// the signal so model.Update skips the marker write.

@@ -556,6 +556,26 @@ func TestParseSpawnedAgentID_NoMatch(t *testing.T) {
 	}
 }
 
+// TestParseSpawnedAgentID_RacingStandbyTakesLast pins codex iter-30 P1: when
+// dead-coord recovery re-emits an authoritative `agent <winner> spawned` line
+// after a racing standby won the coord lease, CLI attach must target the LAST
+// such line (the lock winner), NOT the first (the losing spawned standby).
+// Otherwise `fleet attach` probes/attaches the wrong/dead session — the same
+// bug the TUI's dispatchAgentID last-match fix closes.
+func TestParseSpawnedAgentID_RacingStandbyTakesLast(t *testing.T) {
+	out := `agent 11111111 spawned
+  task:    coord-demo
+note: another standby (22222222) won the coord lease for project demo; resume prompt + coord marker delivered there
+agent 22222222 spawned
+
+attach with: fleet attach 22222222
+`
+	got := parseSpawnedAgentID(out)
+	if got != "22222222" {
+		t.Errorf("parseSpawnedAgentID: got %q want 22222222 (must take the LAST spawn line — the racing lock winner)", got)
+	}
+}
+
 // TestBuildCoordSpawnArgs_MalformedMetaFailsClosed — codex review iter-7
 // P2. A corrupt meta.json (invalid JSON) must surface a clear error
 // rather than silently respawn the coord in the operator's shell cwd

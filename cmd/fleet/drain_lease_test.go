@@ -30,6 +30,7 @@ import (
 
 	"github.com/edisonshen/fleet/internal/agent"
 	"github.com/edisonshen/fleet/internal/coord"
+	"github.com/edisonshen/fleet/internal/coordlock"
 	"github.com/edisonshen/fleet/internal/queue"
 	"github.com/edisonshen/fleet/internal/state"
 )
@@ -1003,11 +1004,13 @@ func TestRecoverHandoffTail_WritesMarkerAndSendsPrompt(t *testing.T) {
 	origReady := recoverWaitForReadyFn
 	origAlive := recoverSessionAliveFn
 	origPrompt := recoverSendPromptVerifiedFn
+	origCurrentOwner := recoverCurrentOwnerFn
 	t.Cleanup(func() {
 		recoverWriteMarkerFn = origMarker
 		recoverWaitForReadyFn = origReady
 		recoverSessionAliveFn = origAlive
 		recoverSendPromptVerifiedFn = origPrompt
+		recoverCurrentOwnerFn = origCurrentOwner
 	})
 	recoverWriteMarkerFn = func(project, id string) error { gotMarkerProj, gotMarkerID = project, id; return nil }
 	recoverWaitForReadyFn = func(string) error { return nil }
@@ -1020,6 +1023,12 @@ func TestRecoverHandoffTail_WritesMarkerAndSendsPrompt(t *testing.T) {
 	rec := agent.New("newcoord9")
 	rec.Project = "projects-fleet"
 	rec.TmuxSession = "fleet-newcoord9"
+	if err := rec.Write(); err != nil {
+		t.Fatalf("write rec: %v", err)
+	}
+	recoverCurrentOwnerFn = func(project string) (coordlock.Owner, bool) {
+		return coordlock.Owner{AgentID: rec.ID, PID: 4242, PidStart: 99}, true
+	}
 	if err := recoverHandoffTail(oldRec, rec, "/tmp/handoff.md", false, &bytes.Buffer{}, &bytes.Buffer{}); err != nil {
 		t.Fatalf("recoverHandoffTail returned %v", err)
 	}
@@ -1051,11 +1060,13 @@ func TestRecoverHandoffTail_DisableAutoResume_NoPromptStillMarks(t *testing.T) {
 	origReady := recoverWaitForReadyFn
 	origAlive := recoverSessionAliveFn
 	origPrompt := recoverSendPromptVerifiedFn
+	origCurrentOwner := recoverCurrentOwnerFn
 	t.Cleanup(func() {
 		recoverWriteMarkerFn = origMarker
 		recoverWaitForReadyFn = origReady
 		recoverSessionAliveFn = origAlive
 		recoverSendPromptVerifiedFn = origPrompt
+		recoverCurrentOwnerFn = origCurrentOwner
 	})
 	recoverWriteMarkerFn = func(string, string) error { markerWritten = true; return nil }
 	recoverWaitForReadyFn = func(string) error { return nil }
@@ -1069,6 +1080,12 @@ func TestRecoverHandoffTail_DisableAutoResume_NoPromptStillMarks(t *testing.T) {
 	rec := agent.New("newcoord9")
 	rec.Project = "projects-fleet"
 	rec.TmuxSession = "fleet-newcoord9"
+	if err := rec.Write(); err != nil {
+		t.Fatalf("write rec: %v", err)
+	}
+	recoverCurrentOwnerFn = func(project string) (coordlock.Owner, bool) {
+		return coordlock.Owner{AgentID: rec.ID, PID: 4242, PidStart: 99}, true
+	}
 	if err := recoverHandoffTail(oldRec, rec, "/tmp/handoff.md", true, &bytes.Buffer{}, &bytes.Buffer{}); err != nil {
 		t.Fatalf("recoverHandoffTail returned %v", err)
 	}
@@ -1078,5 +1095,70 @@ func TestRecoverHandoffTail_DisableAutoResume_NoPromptStillMarks(t *testing.T) {
 	}
 	if promptSent {
 		t.Error("resume prompt must NOT be sent when DisableAutoResume is set")
+	}
+}
+
+// codex iter-15 [P2] REGRESSION: the lock-owner delivery branch of
+// deliverRecoverResumePrompt must honor the at-most-once sentinel just like the
+// direct path. If takeoverAndRecover's queue.Delete fails after a successful
+// send, the adopt-retry re-enters this branch; without the sentinel it
+// re-submits the same resume prompt to the owner.
+func TestDeliverRecoverResumePrompt_LockOwner_AtMostOnce(t *testing.T) {
+	t.Setenv("FLEET_HOME", t.TempDir())
+	if _, err := state.Bootstrap(); err != nil {
+		t.Fatalf("bootstrap: %v", err)
+	}
+	const project = "projects-fleet"
+	pdir, err := state.EnsureProjectInitialized(project)
+	if err != nil {
+		t.Fatalf("EnsureProjectInitialized: %v", err)
+	}
+	// The sentinel lives under <project>/.locks/; create it so the marker write
+	// lands (matches the lazily-created lock dir in production).
+	if err := os.MkdirAll(filepath.Join(pdir, ".locks"), 0o755); err != nil {
+		t.Fatalf("mkdir .locks: %v", err)
+	}
+
+	rec := agent.New("newcoord9")
+	rec.Project = project
+	rec.TmuxSession = "fleet-newcoord9"
+	if err := rec.Write(); err != nil {
+		t.Fatalf("write rec: %v", err)
+	}
+
+	var sends int
+	origReady := recoverWaitForReadyFn
+	origAlive := recoverSessionAliveFn
+	origPrompt := recoverSendPromptVerifiedFn
+	origCurrentOwner := recoverCurrentOwnerFn
+	origMarker := recoverWriteMarkerFn
+	t.Cleanup(func() {
+		recoverWaitForReadyFn = origReady
+		recoverSessionAliveFn = origAlive
+		recoverSendPromptVerifiedFn = origPrompt
+		recoverCurrentOwnerFn = origCurrentOwner
+		recoverWriteMarkerFn = origMarker
+	})
+	recoverWaitForReadyFn = func(string) error { return nil }
+	recoverSessionAliveFn = func(string) (bool, error) { return true, nil }
+	recoverWriteMarkerFn = func(string, string) error { return nil }
+	recoverCurrentOwnerFn = func(string) (coordlock.Owner, bool) {
+		return coordlock.Owner{AgentID: rec.ID, PID: 4242, PidStart: 99}, true
+	}
+	recoverSendPromptVerifiedFn = func(string, string) (bool, error) {
+		sends++
+		return true, nil
+	}
+
+	// First pass: delivers + writes the sentinel.
+	if err := deliverRecoverResumePrompt(rec, "/tmp/handoff.md", false, true, &bytes.Buffer{}, &bytes.Buffer{}); err != nil {
+		t.Fatalf("first delivery: %v", err)
+	}
+	// Second pass (adopt-retry after queue.Delete failed): sentinel short-circuits.
+	if err := deliverRecoverResumePrompt(rec, "/tmp/handoff.md", false, true, &bytes.Buffer{}, &bytes.Buffer{}); err != nil {
+		t.Fatalf("second delivery: %v", err)
+	}
+	if sends != 1 {
+		t.Fatalf("lock-owner resume prompt sent %d times, want exactly 1 (at-most-once)", sends)
 	}
 }

@@ -32,6 +32,17 @@ import (
 	"github.com/edisonshen/fleet/internal/state"
 )
 
+// Owner is the public, read-only view of the active coordinator lease
+// owner. PID/PidStart identify the lease-holding coord-run supervisor;
+// AgentID links that supervisor back to the Fleet agent record whose tmux
+// session owns the actual engine pane.
+type Owner struct {
+	AgentID       string
+	PID           int
+	PidStart      int64
+	EngineStamped bool
+}
+
 // Acquire takes an NB-flock on
 // ~/.fleet/projects/<project>/.locks/coord-spawn.lock so the
 // (live-coord veto + agent-record-write + spawn) tuple inside both

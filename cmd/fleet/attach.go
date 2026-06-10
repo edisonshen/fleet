@@ -1032,7 +1032,15 @@ func shellCoordSpawn(project string) (coordSpawnResult, error) {
 // dispatch spawn line `agent <id> spawned`. Returns "" when no match.
 // Whitespace-tolerant so trailing newlines / mixed line endings don't
 // trip the scan. Codex review iter-9 P1.
+//
+// Returns the LAST matching line, not the first (codex iter-30 P1). Dead-coord
+// recovery prints the freshly-spawned standby's id first, then re-emits an
+// authoritative `agent <winner> spawned` line AFTER lock-owner delivery when a
+// RACING standby won the lease. The winner is always last, so CLI attach
+// targets the live coordinator the resume prompt + coord marker landed on —
+// never the losing standby (mirrors the TUI's dispatchAgentID last-match).
 func parseSpawnedAgentID(out string) string {
+	last := ""
 	for _, line := range strings.Split(out, "\n") {
 		trimmed := strings.TrimSpace(line)
 		// Pattern: "agent <id> spawned" (no prefix tolerance beyond
@@ -1052,10 +1060,10 @@ func parseSpawnedAgentID(out string) string {
 			continue
 		}
 		if isAgentIDShape(fields[0]) {
-			return fields[0]
+			last = fields[0]
 		}
 	}
-	return ""
+	return last
 }
 
 // isAgentIDShape mirrors internal/projectlookup.isAgentIDShape (kept

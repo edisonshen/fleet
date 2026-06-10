@@ -1293,6 +1293,48 @@ func CurrentActiveOwnerPID(project string) (pid int, ok bool) {
 	return rec.Owner.Pid, true
 }
 
+// CurrentOwner reports the full active lease owner tuple for project, or
+// ok=false if there is no readable HEALTHY active owner. It is the delivery-side
+// companion to CurrentActiveOwnerPID: callers that need to type a handoff
+// resume prompt must address the agent record named by the lease owner, not a
+// preselected standby that may have lost the lock race.
+//
+// It applies the SAME holderHealthy predicate AcquireLease / LeaderPresent use
+// (codex iter-19 [P2]), not a bare state==active check: a stale/expired active
+// record or a dead/cross-boot prior holder is NOT a deliverable owner — its
+// process is gone, so DeliverToCurrentOwner must keep polling for the healthy
+// takeover owner rather than type the resume prompt into a corpse's session.
+func CurrentOwner(project string) (Owner, bool) {
+	return currentOwnerWithCfg(project, defaultLeaseConfig())
+}
+
+func currentOwnerWithCfg(project string, cfg leaseConfig) (Owner, bool) {
+	paths, err := resolvePaths(project)
+	if err != nil {
+		return Owner{}, false
+	}
+	rec, err := readEpoch(paths.epoch)
+	if err != nil {
+		return Owner{}, false
+	}
+	if rec.Owner.Pid <= 0 || rec.Owner.AgentID == "" {
+		return Owner{}, false
+	}
+	// Throwaway lease carrying the seams so holderHealthy applies the same
+	// boot-id + TTL + pid-liveness logic the acquire path does (self is zero;
+	// we only read the foreign record).
+	l := &Lease{cfg: cfg, paths: paths, boot: cfg.boot()}
+	if !l.holderHealthy(rec) {
+		return Owner{}, false
+	}
+	return Owner{
+		AgentID:       rec.Owner.AgentID,
+		PID:           rec.Owner.Pid,
+		PidStart:      rec.Owner.PidStart,
+		EngineStamped: rec.Owner.AgentID != "" && rec.Owner.PidStart > 0,
+	}, true
+}
+
 // CurrentEpoch returns the project's current on-disk fencing epoch (the
 // monotonic token) and ok=false if no epoch record exists / is unreadable.
 // It is the value the graceful handoff stamps into its
@@ -1309,6 +1351,35 @@ func CurrentEpoch(project string) (epoch int64, ok bool) {
 		return 0, false
 	}
 	return rec.Epoch, true
+}
+
+// LeaseRecordActive reports whether a readable epoch record exists on disk in a
+// NON-terminal state (active or fencing) — i.e. a lease generation is live for
+// project even if its current owner is momentarily unhealthy/stale or a takeover
+// is mid-flight. It is the "is this a real lease, or a legacy/bare coord that
+// never wrote an epoch" discriminator for handoff delivery (codex iter-22 [P1]):
+// CurrentOwner suppresses a stale/dead active owner as ok=false, but that is NOT
+// the same as "no lease exists". Delivery must keep the doc PENDING for a healthy
+// takeover when a lease record is present, and only direct-send (legacy fallback)
+// when there is genuinely no lease record. Read-only; a missing/torn/terminal
+// record degrades to false.
+func LeaseRecordActive(project string) bool {
+	paths, err := resolvePaths(project)
+	if err != nil {
+		return false
+	}
+	rec, err := readEpoch(paths.epoch)
+	if err != nil {
+		return false
+	}
+	// active / fencing / fenced_not_acquired all denote a real lease generation
+	// (a healthy holder, a mid-flight takeover, or a failed takeover awaiting
+	// doctor recovery with a possibly-unreaped old holder). Only released or a
+	// missing record means "no lease" (codex iter-23 [P1]: a failed takeover
+	// must NOT be mistaken for a legacy/bare coord and direct-sent).
+	return rec.State == stateActive ||
+		rec.State == stateFencing ||
+		rec.State == stateFencedNotAcquired
 }
 
 // BarrierPath returns the absolute path of the graceful-handoff completion

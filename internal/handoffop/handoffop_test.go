@@ -11,6 +11,7 @@ import (
 
 	"github.com/edisonshen/fleet/internal/agent"
 	"github.com/edisonshen/fleet/internal/coordlock"
+	"github.com/edisonshen/fleet/internal/handoffdelivery"
 	"github.com/edisonshen/fleet/internal/queue"
 	"github.com/edisonshen/fleet/internal/spawn"
 	"github.com/edisonshen/fleet/internal/state"
@@ -1393,6 +1394,36 @@ func TestDrain_LeaseFailoverCoordHandoff_ResumeFallbackCompletes(t *testing.T) {
 	}
 
 	req, qp := writeCoordSkillQueue(t, oldRec)
+	origDeliveryDeps := handoffDeliveryDepsFn
+	origDeliveryTimeout := handoffDeliveryTimeout
+	origDeliveryPoll := handoffDeliveryPoll
+	origSendPromptKeysVerified := sendPromptKeysVerified
+	t.Cleanup(func() {
+		handoffDeliveryDepsFn = origDeliveryDeps
+		handoffDeliveryTimeout = origDeliveryTimeout
+		handoffDeliveryPoll = origDeliveryPoll
+		sendPromptKeysVerified = origSendPromptKeysVerified
+	})
+	handoffDeliveryTimeout = time.Second
+	handoffDeliveryPoll = time.Millisecond
+	handoffDeliveryDepsFn = func() handoffdelivery.Deps {
+		deps := handoffdelivery.DefaultDeps()
+		deps.CurrentOwner = func(project string) (coordlock.Owner, bool) {
+			t.Fatalf("legacy bare coord resume must not poll lock owner for project %q", project)
+			return coordlock.Owner{}, false
+		}
+		deps.WaitReady = func(string) error { return nil }
+		deps.SessionAlive = func(string) (bool, error) { return true, nil }
+		deps.SendVerified = func(string, string) (bool, error) { return true, nil }
+		deps.Sleep = func(time.Duration) {}
+		return deps
+	}
+	var sentSession, sentPrompt string
+	sendPromptKeysVerified = func(session, prompt string) (bool, error) {
+		sentSession = session
+		sentPrompt = prompt
+		return true, nil
+	}
 	out := &bytes.Buffer{}
 	if err := Resume(req, qp, 0, out, out); err != nil {
 		t.Fatalf("Resume must complete the drain cold-resume fallback, got: %v\n%s", err, out.String())
@@ -1411,6 +1442,325 @@ func TestDrain_LeaseFailoverCoordHandoff_ResumeFallbackCompletes(t *testing.T) {
 		t.Fatalf("replacement record should remain live after fallback resume: %v", lerr)
 	}
 	t.Cleanup(func() { _ = tmux.Kill(newRec.TmuxSession) })
+	if sentSession != newRec.TmuxSession {
+		t.Fatalf("resume prompt sent to %q, want direct successor session %q", sentSession, newRec.TmuxSession)
+	}
+	if !strings.Contains(sentPrompt, req.HandoffDoc) {
+		t.Fatalf("resume prompt %q does not reference handoff doc %q", sentPrompt, req.HandoffDoc)
+	}
+}
+
+func TestDrain_LeaseFailoverCoordHandoff_FinalizesDeliveredLockOwner(t *testing.T) {
+	requireTmux(t)
+	t.Setenv("FLEET_LEASE_FAILOVER", "1")
+	setupFleetHome(t)
+
+	oldRec := spawnSeedAgent(t)
+	if _, err := state.EnsureProjectInitialized(oldRec.Project); err != nil {
+		t.Fatalf("EnsureProjectInitialized: %v", err)
+	}
+	if err := state.WriteCoordSpawnMarker(oldRec.Project, oldRec.ID); err != nil {
+		t.Fatalf("WriteCoordSpawnMarker: %v", err)
+	}
+
+	winner := agent.New(agent.NewID())
+	winner.TaskID = oldRec.TaskID
+	winner.Project = oldRec.Project
+	winner.Cwd = oldRec.Cwd
+	winner.Command = oldRec.Command
+	winner.TmuxSession = tmux.SessionName(winner.ID)
+	winner.SpawnedAt = time.Now().UTC()
+	winner.LastActivityTS = winner.SpawnedAt
+	winner.SupervisorPID = 9001
+	winner.SupervisorPidStart = 99
+	if err := winner.Write(); err != nil {
+		t.Fatalf("write lock-winning standby: %v", err)
+	}
+
+	req, qp, _ := writeSkillQueue(t, oldRec)
+	// codex iter-24 [P2]: spawnAndRetire COLD-SPAWNS the successor (bare for
+	// coords via DisableLeaseWrap; a worker is never lease-wrapped). Such a
+	// successor records LeaseWrapped=false, so delivery must go DIRECTLY to it,
+	// never poll the lock owner — polling would target the old/dead owner. So
+	// CurrentOwner must NOT be consulted here.
+	_ = winner
+	origDeliveryDeps := handoffDeliveryDepsFn
+	origSend := sendPromptKeysVerified
+	t.Cleanup(func() {
+		handoffDeliveryDepsFn = origDeliveryDeps
+		sendPromptKeysVerified = origSend
+	})
+	handoffDeliveryDepsFn = func() handoffdelivery.Deps {
+		deps := handoffdelivery.DefaultDeps()
+		deps.CurrentOwner = func(string) (coordlock.Owner, bool) {
+			t.Fatalf("cold-spawned (bare) successor must NOT poll the lock owner")
+			return coordlock.Owner{}, false
+		}
+		return deps
+	}
+	var sentSession, sentPrompt string
+	sendPromptKeysVerified = func(session, prompt string) (bool, error) {
+		sentSession, sentPrompt = session, prompt
+		return true, nil
+	}
+
+	out := &bytes.Buffer{}
+	if err := Resume(req, qp, 0, out, out); err != nil {
+		t.Fatalf("Resume should deliver directly to the cold-spawned successor: %v\n%s", err, out.String())
+	}
+	newRec, lerr := agent.Load(req.NewAgentID)
+	if lerr != nil {
+		t.Fatalf("cold-spawned successor record should exist: %v", lerr)
+	}
+	t.Cleanup(func() { _ = tmux.Kill(newRec.TmuxSession) })
+	if sentSession != newRec.TmuxSession {
+		t.Fatalf("resume prompt sent to %q, want cold-spawned successor %q", sentSession, newRec.TmuxSession)
+	}
+	if !strings.Contains(sentPrompt, "Read your handoff doc at ") {
+		t.Fatalf("resume prompt has wrong shape: %q", sentPrompt)
+	}
+	arc, err := agent.LoadArchive(oldRec.ID)
+	if err != nil {
+		t.Fatalf("LoadArchive(%s): %v", oldRec.ID, err)
+	}
+	if arc.SuccessorID != req.NewAgentID {
+		t.Fatalf("archive successor = %q, want cold-spawned successor %q", arc.SuccessorID, req.NewAgentID)
+	}
+	if _, statErr := os.Stat(qp); !errors.Is(statErr, os.ErrNotExist) {
+		t.Fatalf("queue file should be consumed after verified delivery, stat err=%v", statErr)
+	}
+}
+
+func TestDrain_LeaseFailoverCoordStaleQueue_UsesLockOwnerForCapApprovedCoord(t *testing.T) {
+	requireTmux(t)
+	t.Setenv("FLEET_LEASE_FAILOVER", "1")
+	setupFleetHome(t)
+
+	const project = "rainier"
+	cwd := seedCoordRepoMeta(t, project)
+	oldRec := spawnSeedCoord(t, project, cwd)
+	newRec := agent.New(agent.NewID())
+	newRec.TaskID = oldRec.TaskID
+	newRec.Project = oldRec.Project
+	newRec.Cwd = oldRec.Cwd
+	newRec.Command = oldRec.Command
+	newRec.TmuxSession = tmux.SessionName(newRec.ID)
+	newRec.SpawnedAt = time.Now().UTC()
+	newRec.LastActivityTS = newRec.SpawnedAt
+	newRec.LeaseWrapped = true // a lease-wrapped replacement -> lock-owner delivery
+	if err := tmux.Spawn(newRec.TmuxSession, newRec.Cwd, newRec.Command,
+		[]string{"FLEET_AGENT_ID=" + newRec.ID}); err != nil {
+		t.Fatalf("spawn journaled replacement: %v", err)
+	}
+	t.Cleanup(func() { _ = tmux.Kill(newRec.TmuxSession) })
+	if err := newRec.Write(); err != nil {
+		t.Fatalf("write journaled replacement: %v", err)
+	}
+
+	winner := agent.New(agent.NewID())
+	winner.TaskID = oldRec.TaskID
+	winner.Project = oldRec.Project
+	winner.Cwd = oldRec.Cwd
+	winner.Command = oldRec.Command
+	winner.TmuxSession = tmux.SessionName(winner.ID)
+	winner.SpawnedAt = time.Now().UTC()
+	winner.LastActivityTS = winner.SpawnedAt
+	winner.SupervisorPID = 9001
+	winner.SupervisorPidStart = 99
+	if err := winner.Write(); err != nil {
+		t.Fatalf("write lock-winning standby: %v", err)
+	}
+	if _, err := state.EnsureProjectInitialized(project); err != nil {
+		t.Fatalf("EnsureProjectInitialized: %v", err)
+	}
+	if err := state.WriteCoordSpawnMarker(project, newRec.ID); err != nil {
+		t.Fatalf("WriteCoordSpawnMarker: %v", err)
+	}
+	if err := oldRec.ArchiveWithHandoff(newRec.ID); err != nil {
+		t.Fatalf("archive old coord: %v", err)
+	}
+
+	req, qp := writeCoordSkillQueue(t, oldRec)
+	req.NewAgentID = newRec.ID
+	req.NewSession = newRec.TmuxSession
+	req.CapApproved = true
+	if _, err := queue.WriteSpawnFresh(req); err != nil {
+		t.Fatalf("rewrite stale queue: %v", err)
+	}
+
+	origDeliveryDeps := handoffDeliveryDepsFn
+	origDeliveryTimeout := handoffDeliveryTimeout
+	origDeliveryPoll := handoffDeliveryPoll
+	t.Cleanup(func() {
+		handoffDeliveryDepsFn = origDeliveryDeps
+		handoffDeliveryTimeout = origDeliveryTimeout
+		handoffDeliveryPoll = origDeliveryPoll
+	})
+	handoffDeliveryTimeout = time.Second
+	handoffDeliveryPoll = time.Millisecond
+	var sentSession string
+	handoffDeliveryDepsFn = func() handoffdelivery.Deps {
+		deps := handoffdelivery.DefaultDeps()
+		deps.CurrentOwner = func(project string) (coordlock.Owner, bool) {
+			if project != oldRec.Project {
+				t.Fatalf("current owner checked for project %q, want %q", project, oldRec.Project)
+			}
+			return coordlock.Owner{AgentID: winner.ID, PID: winner.SupervisorPID, PidStart: winner.SupervisorPidStart}, true
+		}
+		deps.WaitReady = func(session string) error {
+			if session != winner.TmuxSession {
+				t.Fatalf("wait-ready session = %q, want delivered owner session %q", session, winner.TmuxSession)
+			}
+			return nil
+		}
+		deps.SessionAlive = func(session string) (bool, error) {
+			if session != winner.TmuxSession {
+				t.Fatalf("session-alive probe = %q, want delivered owner session %q", session, winner.TmuxSession)
+			}
+			return true, nil
+		}
+		deps.SendVerified = func(session, prompt string) (bool, error) {
+			sentSession = session
+			if session != winner.TmuxSession {
+				t.Fatalf("resume prompt session = %q, want delivered owner session %q", session, winner.TmuxSession)
+			}
+			if !strings.Contains(prompt, "Read your handoff doc at ") {
+				t.Fatalf("resume prompt has wrong shape: %q", prompt)
+			}
+			return true, nil
+		}
+		deps.Sleep = func(time.Duration) {}
+		return deps
+	}
+
+	out := &bytes.Buffer{}
+	if err := cleanUpStaleQueue(req, qp, out); err != nil {
+		t.Fatalf("cleanUpStaleQueue should deliver to lock owner: %v\n%s", err, out.String())
+	}
+	if sentSession != winner.TmuxSession {
+		t.Fatalf("resume prompt sent to %q, want %q", sentSession, winner.TmuxSession)
+	}
+	arc, err := agent.LoadArchive(oldRec.ID)
+	if err != nil {
+		t.Fatalf("LoadArchive(%s): %v", oldRec.ID, err)
+	}
+	if arc.SuccessorID != winner.ID {
+		t.Fatalf("archive successor = %q, want delivered lock owner %q", arc.SuccessorID, winner.ID)
+	}
+	if _, lerr := agent.Load(newRec.ID); !errors.Is(lerr, state.ErrNotFound) {
+		t.Fatalf("superseded replacement %s should have been removed, load err=%v", newRec.ID, lerr)
+	}
+	if got := state.ReadCoordSpawnMarker(project); got != winner.ID {
+		t.Fatalf("coord marker = %q, want delivered lock owner %q", got, winner.ID)
+	}
+	if _, statErr := os.Stat(qp); !errors.Is(statErr, os.ErrNotExist) {
+		t.Fatalf("queue file should be consumed after verified delivery, stat err=%v", statErr)
+	}
+}
+
+// TestDrain_LeaseFailoverCoord_DeadLoserSession_StillDeliversToLockOwner pins
+// codex iter-31 P1: when the stale queue names a lease-wrapped replacement that
+// was SUPERSEDED by a racing standby and has since EXITED, cleanUpStaleQueue
+// must NOT abort on the dead replacement session. For a coord lock-owner
+// delivery the live coordinator is the lock WINNER (discovered via
+// CurrentOwner), not the dead queued loser — so delivery proceeds to the winner
+// and the queue is consumed, instead of being stranded pending forever.
+func TestDrain_LeaseFailoverCoord_DeadLoserSession_StillDeliversToLockOwner(t *testing.T) {
+	requireTmux(t)
+	t.Setenv("FLEET_LEASE_FAILOVER", "1")
+	setupFleetHome(t)
+
+	const project = "rainier"
+	cwd := seedCoordRepoMeta(t, project)
+	oldRec := spawnSeedCoord(t, project, cwd)
+
+	// The queued replacement (the LOSER): lease-wrapped, but its session is
+	// NEVER spawned — it exited after losing the lock race. tmux.HasSession is
+	// false for it; pre-iter-31 this aborted cleanUpStaleQueue.
+	newRec := agent.New(agent.NewID())
+	newRec.TaskID = oldRec.TaskID
+	newRec.Project = oldRec.Project
+	newRec.Cwd = oldRec.Cwd
+	newRec.Command = oldRec.Command
+	newRec.TmuxSession = tmux.SessionName(newRec.ID) // session deliberately NOT spawned
+	newRec.SpawnedAt = time.Now().UTC()
+	newRec.LastActivityTS = newRec.SpawnedAt
+	newRec.LeaseWrapped = true // lease-wrapped -> coord lock-owner delivery
+	if err := newRec.Write(); err != nil {
+		t.Fatalf("write journaled (dead) replacement: %v", err)
+	}
+
+	// The live winner (a racing standby that won the lock).
+	winner := agent.New(agent.NewID())
+	winner.TaskID = oldRec.TaskID
+	winner.Project = oldRec.Project
+	winner.Cwd = oldRec.Cwd
+	winner.Command = oldRec.Command
+	winner.TmuxSession = tmux.SessionName(winner.ID)
+	winner.SpawnedAt = time.Now().UTC()
+	winner.LastActivityTS = winner.SpawnedAt
+	winner.SupervisorPID = 9002
+	winner.SupervisorPidStart = 77
+	if err := winner.Write(); err != nil {
+		t.Fatalf("write lock-winning standby: %v", err)
+	}
+	if _, err := state.EnsureProjectInitialized(project); err != nil {
+		t.Fatalf("EnsureProjectInitialized: %v", err)
+	}
+	if err := state.WriteCoordSpawnMarker(project, newRec.ID); err != nil {
+		t.Fatalf("WriteCoordSpawnMarker: %v", err)
+	}
+	if err := oldRec.ArchiveWithHandoff(newRec.ID); err != nil {
+		t.Fatalf("archive old coord: %v", err)
+	}
+
+	req, qp := writeCoordSkillQueue(t, oldRec)
+	req.NewAgentID = newRec.ID
+	req.NewSession = newRec.TmuxSession
+	req.CapApproved = true
+	if _, err := queue.WriteSpawnFresh(req); err != nil {
+		t.Fatalf("rewrite stale queue: %v", err)
+	}
+
+	origDeliveryDeps := handoffDeliveryDepsFn
+	origDeliveryTimeout := handoffDeliveryTimeout
+	origDeliveryPoll := handoffDeliveryPoll
+	t.Cleanup(func() {
+		handoffDeliveryDepsFn = origDeliveryDeps
+		handoffDeliveryTimeout = origDeliveryTimeout
+		handoffDeliveryPoll = origDeliveryPoll
+	})
+	handoffDeliveryTimeout = time.Second
+	handoffDeliveryPoll = time.Millisecond
+	var sentSession string
+	handoffDeliveryDepsFn = func() handoffdelivery.Deps {
+		deps := handoffdelivery.DefaultDeps()
+		deps.CurrentOwner = func(string) (coordlock.Owner, bool) {
+			return coordlock.Owner{AgentID: winner.ID, PID: winner.SupervisorPID, PidStart: winner.SupervisorPidStart}, true
+		}
+		deps.WaitReady = func(string) error { return nil }
+		deps.SessionAlive = func(string) (bool, error) { return true, nil }
+		deps.SendVerified = func(session, _ string) (bool, error) {
+			sentSession = session
+			return true, nil
+		}
+		deps.Sleep = func(time.Duration) {}
+		return deps
+	}
+
+	out := &bytes.Buffer{}
+	if err := cleanUpStaleQueue(req, qp, out); err != nil {
+		t.Fatalf("cleanUpStaleQueue must deliver to the lock owner despite the dead loser session: %v\n%s", err, out.String())
+	}
+	if sentSession != winner.TmuxSession {
+		t.Fatalf("resume prompt sent to %q, want lock winner %q (must not require dead loser session)", sentSession, winner.TmuxSession)
+	}
+	if got := state.ReadCoordSpawnMarker(project); got != winner.ID {
+		t.Fatalf("coord marker = %q, want delivered lock owner %q", got, winner.ID)
+	}
+	if _, statErr := os.Stat(qp); !errors.Is(statErr, os.ErrNotExist) {
+		t.Fatalf("queue file must be consumed after delivery to the lock owner, stat err=%v", statErr)
+	}
 }
 
 // TestDrain_WorkerHandoff_NoMarkerWrite pins
@@ -1688,5 +2038,237 @@ func TestDrain_ContentionPreservesQueueFile(t *testing.T) {
 	// contention live.
 	if !strings.Contains(stderr.String(), "coordlock.Acquire") {
 		t.Errorf("expected stderr to mention coordlock.Acquire warning; got: %q", stderr.String())
+	}
+}
+
+// codex iter-16 [P2] REGRESSION: deliverResumePrompt's lock-owner branch must
+// fall back to a direct send when the successor is a legacy/bare coord whose
+// lease epoch is never stamped (CurrentOwner returns ErrNoOwnerObserved). The
+// drain helper previously propagated the sentinel, leaving the queue pending
+// forever even though the replacement session was live. Mirrors the
+// cmd/fleet/handoff.go fallback.
+func TestDeliverResumePrompt_LeaseWrapped_NoOwner_FallsBackToDirectSend(t *testing.T) {
+	t.Setenv("FLEET_LEASE_FAILOVER", "1")
+	setupFleetHome(t)
+
+	rec := agent.New("legacynew1")
+	rec.Project = "rainier"
+	rec.TmuxSession = "fleet-legacynew1"
+
+	origDeps := handoffDeliveryDepsFn
+	origTimeout := handoffDeliveryTimeout
+	origPoll := handoffDeliveryPoll
+	origSend := sendPromptKeysVerified
+	t.Cleanup(func() {
+		handoffDeliveryDepsFn = origDeps
+		handoffDeliveryTimeout = origTimeout
+		handoffDeliveryPoll = origPoll
+		sendPromptKeysVerified = origSend
+	})
+	handoffDeliveryTimeout = 100 * time.Millisecond
+	handoffDeliveryPoll = time.Millisecond
+	// Lock-owner branch entered (leaseWrappedSuccessor=true) but no owner ever
+	// resolves -> ErrNoOwnerObserved -> direct-send fallback.
+	handoffDeliveryDepsFn = func() handoffdelivery.Deps {
+		deps := handoffdelivery.DefaultDeps()
+		deps.CurrentOwner = func(string) (coordlock.Owner, bool) {
+			return coordlock.Owner{}, false
+		}
+		deps.Sleep = func(time.Duration) {}
+		return deps
+	}
+	var sentSession, sentPrompt string
+	sendPromptKeysVerified = func(session, prompt string) (bool, error) {
+		sentSession, sentPrompt = session, prompt
+		return true, nil
+	}
+
+	out := &bytes.Buffer{}
+	delivered, err := deliverResumePrompt(rec.Project, true, true, rec, "/tmp/handoff.md", out, out)
+	if err != nil {
+		t.Fatalf("expected direct-send fallback, got error: %v\n%s", err, out.String())
+	}
+	if delivered == nil || delivered.ID != rec.ID {
+		t.Fatalf("fallback delivered = %+v, want replacement %s", delivered, rec.ID)
+	}
+	if sentSession != rec.TmuxSession {
+		t.Fatalf("resume prompt sent to %q, want direct successor session %q", sentSession, rec.TmuxSession)
+	}
+	if !strings.Contains(sentPrompt, "/tmp/handoff.md") {
+		t.Fatalf("resume prompt %q must reference the handoff doc", sentPrompt)
+	}
+}
+
+// codex iter-18 [P1] REGRESSION: the case-3 Resume path (old record still live,
+// replacement already spawned) routes through retireOldAgent. For a CapApproved
+// coord handoff under FLEET_LEASE_FAILOVER=1 the resume prompt MUST go to the
+// lock WINNER (DeliverToCurrentOwner), not the queued session which may have
+// lost the lease. Before the leaseWrappedSuccessor threading, retireOldAgent
+// derived lease-wrapping from TaskID alone and direct-sent to the loser.
+func TestResume_Case3_CapApprovedCoord_DeliversToLockOwner(t *testing.T) {
+	requireTmux(t)
+	t.Setenv("FLEET_LEASE_FAILOVER", "1")
+	setupFleetHome(t)
+
+	const project = "rainier"
+	cwd := seedCoordRepoMeta(t, project)
+	oldRec := spawnSeedCoord(t, project, cwd) // NOT archived → case-3
+
+	// Journaled replacement: spawned + alive, named by the queue.
+	newRec := agent.New(agent.NewID())
+	newRec.TaskID = oldRec.TaskID
+	newRec.Project = oldRec.Project
+	newRec.Cwd = oldRec.Cwd
+	newRec.Command = oldRec.Command
+	newRec.TmuxSession = tmux.SessionName(newRec.ID)
+	newRec.SpawnedAt = time.Now().UTC()
+	newRec.LastActivityTS = newRec.SpawnedAt
+	newRec.LeaseWrapped = true // lease-wrapped replacement -> lock-owner delivery
+	if err := tmux.Spawn(newRec.TmuxSession, newRec.Cwd, newRec.Command,
+		[]string{"FLEET_AGENT_ID=" + newRec.ID}); err != nil {
+		t.Fatalf("spawn journaled replacement: %v", err)
+	}
+	t.Cleanup(func() { _ = tmux.Kill(newRec.TmuxSession) })
+	if err := newRec.Write(); err != nil {
+		t.Fatalf("write journaled replacement: %v", err)
+	}
+
+	// Lock winner: a different standby that won the lease.
+	winner := agent.New(agent.NewID())
+	winner.TaskID = oldRec.TaskID
+	winner.Project = oldRec.Project
+	winner.Cwd = oldRec.Cwd
+	winner.Command = oldRec.Command
+	winner.TmuxSession = tmux.SessionName(winner.ID)
+	winner.SpawnedAt = time.Now().UTC()
+	winner.LastActivityTS = winner.SpawnedAt
+	winner.SupervisorPID = 9001
+	winner.SupervisorPidStart = 99
+	if err := winner.Write(); err != nil {
+		t.Fatalf("write lock-winning standby: %v", err)
+	}
+	if _, err := state.EnsureProjectInitialized(project); err != nil {
+		t.Fatalf("EnsureProjectInitialized: %v", err)
+	}
+	// Marker == oldRec.ID → isCoordSwap fires in case-3.
+	if err := state.WriteCoordSpawnMarker(project, oldRec.ID); err != nil {
+		t.Fatalf("WriteCoordSpawnMarker: %v", err)
+	}
+
+	req, qp := writeCoordSkillQueue(t, oldRec)
+	req.NewAgentID = newRec.ID
+	req.NewSession = newRec.TmuxSession
+	req.CapApproved = true // the authoritative lease-wrapped signal
+	if _, err := queue.WriteSpawnFresh(req); err != nil {
+		t.Fatalf("rewrite queue: %v", err)
+	}
+
+	origDeliveryDeps := handoffDeliveryDepsFn
+	origDeliveryTimeout := handoffDeliveryTimeout
+	origDeliveryPoll := handoffDeliveryPoll
+	t.Cleanup(func() {
+		handoffDeliveryDepsFn = origDeliveryDeps
+		handoffDeliveryTimeout = origDeliveryTimeout
+		handoffDeliveryPoll = origDeliveryPoll
+	})
+	handoffDeliveryTimeout = time.Second
+	handoffDeliveryPoll = time.Millisecond
+	var sentSession string
+	handoffDeliveryDepsFn = func() handoffdelivery.Deps {
+		deps := handoffdelivery.DefaultDeps()
+		deps.CurrentOwner = func(string) (coordlock.Owner, bool) {
+			return coordlock.Owner{AgentID: winner.ID, PID: winner.SupervisorPID, PidStart: winner.SupervisorPidStart}, true
+		}
+		deps.WaitReady = func(string) error { return nil }
+		deps.SessionAlive = func(string) (bool, error) { return true, nil }
+		deps.SendVerified = func(session, prompt string) (bool, error) {
+			sentSession = session
+			return true, nil
+		}
+		deps.Sleep = func(time.Duration) {}
+		return deps
+	}
+
+	out := &bytes.Buffer{}
+	if err := Resume(req, qp, 0, out, out); err != nil {
+		t.Fatalf("Resume case-3 should deliver to lock owner: %v\n%s", err, out.String())
+	}
+	if sentSession != winner.TmuxSession {
+		t.Fatalf("resume prompt sent to %q, want lock WINNER %q (not the queued loser %q)",
+			sentSession, winner.TmuxSession, newRec.TmuxSession)
+	}
+	if got := state.ReadCoordSpawnMarker(project); got != winner.ID {
+		t.Fatalf("coord marker = %q, want delivered lock owner %q", got, winner.ID)
+	}
+	if _, statErr := os.Stat(qp); !errors.Is(statErr, os.ErrNotExist) {
+		t.Fatalf("queue file should be consumed after verified delivery, stat err=%v", statErr)
+	}
+}
+
+// codex iter-20 [P2] REGRESSION: spawnAndRetire COLD-spawns a coord successor
+// with DisableLeaseWrap (a bare/direct successor). Even with req.CapApproved=true
+// the resume prompt MUST be delivered DIRECTLY to that freshly-spawned successor,
+// not routed through DeliverToCurrentOwner — polling the lock owner here would
+// target the old/dead owner and strand recovery. CurrentOwner must NOT be polled.
+func TestDrain_CoordColdSpawn_CapApproved_DeliversDirectNotLockOwner(t *testing.T) {
+	requireTmux(t)
+	t.Setenv("FLEET_LEASE_FAILOVER", "1")
+	setupFleetHome(t)
+
+	const project = "rainier"
+	seedCoordRepoMeta(t, project)
+	// Old coord (taskID coord-<project> → legacyCoordResume=true), NOT archived,
+	// NO pre-spawned replacement → Resume routes to spawnAndRetire (cold spawn).
+	oldRec := spawnSeedCoord(t, project, t.TempDir())
+	if _, err := state.EnsureProjectInitialized(project); err != nil {
+		t.Fatalf("EnsureProjectInitialized: %v", err)
+	}
+	if err := state.WriteCoordSpawnMarker(project, oldRec.ID); err != nil {
+		t.Fatalf("WriteCoordSpawnMarker: %v", err)
+	}
+
+	req, qp := writeCoordSkillQueue(t, oldRec)
+	req.CapApproved = true
+	if _, err := queue.WriteSpawnFresh(req); err != nil {
+		t.Fatalf("rewrite queue: %v", err)
+	}
+
+	origDeliveryDeps := handoffDeliveryDepsFn
+	origSend := sendPromptKeysVerified
+	t.Cleanup(func() {
+		handoffDeliveryDepsFn = origDeliveryDeps
+		sendPromptKeysVerified = origSend
+	})
+	handoffDeliveryDepsFn = func() handoffdelivery.Deps {
+		deps := handoffdelivery.DefaultDeps()
+		deps.CurrentOwner = func(string) (coordlock.Owner, bool) {
+			t.Fatalf("cold-spawned coord must NOT poll the lock owner (direct send expected)")
+			return coordlock.Owner{}, false
+		}
+		return deps
+	}
+	var sentSession, sentPrompt string
+	sendPromptKeysVerified = func(session, prompt string) (bool, error) {
+		sentSession, sentPrompt = session, prompt
+		return true, nil
+	}
+
+	out := &bytes.Buffer{}
+	if err := Resume(req, qp, 0, out, out); err != nil {
+		t.Fatalf("Resume cold-spawn coord should deliver directly: %v\n%s", err, out.String())
+	}
+	newRec, lerr := agent.Load(req.NewAgentID)
+	if lerr != nil {
+		t.Fatalf("cold-spawned successor record should exist: %v", lerr)
+	}
+	t.Cleanup(func() { _ = tmux.Kill(newRec.TmuxSession) })
+	if sentSession != newRec.TmuxSession {
+		t.Fatalf("resume prompt sent to %q, want freshly-spawned successor %q", sentSession, newRec.TmuxSession)
+	}
+	if !strings.Contains(sentPrompt, "Read your handoff doc at ") {
+		t.Fatalf("resume prompt has wrong shape: %q", sentPrompt)
+	}
+	if _, statErr := os.Stat(qp); !errors.Is(statErr, os.ErrNotExist) {
+		t.Fatalf("queue file should be consumed after verified delivery, stat err=%v", statErr)
 	}
 }
