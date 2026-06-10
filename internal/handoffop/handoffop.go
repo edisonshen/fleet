@@ -90,6 +90,24 @@ func deliverResumePrompt(project string, isCoordSwap, leaseWrappedSuccessor bool
 			Stderr:        stderr,
 		}, handoffDeliveryDepsFn())
 		if err != nil {
+			// Legacy/bare coord with no lease record: the owner-poll can never
+			// converge, so fall back to a direct send into the live replacement
+			// (matches deliverHandoffResumePrompt in cmd/fleet/handoff.go). A
+			// genuine owner-seen-but-undeliverable error is NOT this sentinel and
+			// still propagates so the queue stays pending for a real-owner retry.
+			if errors.Is(err, handoffdelivery.ErrNoOwnerObserved) {
+				_, _ = fmt.Fprintf(stderr,
+					"  resume: no lease owner for project %s (legacy coord?); delivering directly to %s\n",
+					project, rec.TmuxSession)
+				submitted, serr := sendPromptKeysVerified(rec.TmuxSession, prompt)
+				if serr != nil {
+					return nil, serr
+				}
+				if !submitted {
+					return nil, fmt.Errorf("resume prompt to %s was typed but not submitted", rec.TmuxSession)
+				}
+				return rec, nil
+			}
 			return nil, err
 		}
 		if delivered != nil {

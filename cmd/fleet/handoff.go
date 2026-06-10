@@ -393,6 +393,13 @@ func runHandoff(opts *handoffOpts, stdout, stderr io.Writer) error {
 					"agent %s already archived BUT replacement %s tmux session %s exited during readiness wait — task has no live agent",
 					opts.oldID, pending.NewAgentID, newRec.TmuxSession)
 			}
+			// Track a superseded queued replacement (lock owner won the
+			// delivery instead of pending.NewAgentID). The DROP of that record
+			// is deferred until AFTER queue.Delete succeeds — if queue.Delete
+			// fails the queue still names the queued replacement, and the next
+			// recovery pass must be able to reload it (codex P2).
+			supersededSession := ""
+			supersededID := ""
 			if autoResume {
 				coordDelivery := spawn.IsCoordSpawn(newRec.TaskID, newRec.Project) ||
 					(newRec.Project != "" && state.ReadCoordSpawnMarker(newRec.Project) == newRec.ID)
@@ -406,32 +413,32 @@ func runHandoff(opts *handoffOpts, stdout, stderr io.Writer) error {
 				if deliveredRec != nil {
 					if deliveredRec.ID != newRec.ID {
 						// Lock owner != queued replacement. Retarget OLD's
-						// archive to the owner that actually got the prompt
-						// BEFORE dropping the queued record, else chain-follow
-						// (`fleet attach <old>`) resolves to a record we are
-						// about to delete (codex P2). Mirrors runHandoff:1192.
+						// archive to the owner that actually got the prompt so
+						// chain-follow (`fleet attach <old>`) resolves correctly.
 						if rtErr := retargetArchivedHandoffSuccessor(opts.oldID, deliveredRec.ID); rtErr != nil {
 							return fmt.Errorf(
 								"agent %s already archived BUT delivered lock owner %s superseded replacement %s and archive retarget failed: %w (queue preserved at %s)",
 								opts.oldID, deliveredRec.ID, newRec.ID, rtErr, pendingPath)
 						}
-						if dropErr := handoffop.DropReplacementRecord(newRec.TmuxSession, newRec.ID, stderr); dropErr != nil {
-							return fmt.Errorf(
-								"agent %s already archived BUT delivered lock owner %s superseded replacement %s and cleanup failed: %w (queue preserved at %s)",
-								opts.oldID, deliveredRec.ID, newRec.ID, dropErr, pendingPath)
-						}
+						supersededSession = newRec.TmuxSession
+						supersededID = newRec.ID
 					}
 					newRec = deliveredRec
 				}
 			}
 			if err := queue.Delete(pendingPath); err != nil {
-				// queue.Delete failed → SendPromptKeys was skipped,
-				// so the replacement is still un-prompted and the
-				// journal entry persists. Surface as error so the
-				// operator retries (codex review iter-19 P2).
+				// queue.Delete failed → the journal entry persists. Surface as
+				// error so the operator retries (codex review iter-19 P2).
 				return fmt.Errorf(
 					"agent %s already archived BUT queue cleanup failed; rerun `fleet handoff %s` to deliver the resume prompt",
 					opts.oldID, opts.oldID)
+			}
+			if supersededID != "" {
+				if dropErr := handoffop.DropReplacementRecord(supersededSession, supersededID, stderr); dropErr != nil {
+					return fmt.Errorf(
+						"agent %s already handed off → %s BUT superseded replacement %s cleanup failed: %w",
+						opts.oldID, newRec.ID, supersededID, dropErr)
+				}
 			}
 			_, _ = fmt.Fprintf(stdout,
 				"agent %s already handed off → %s (cleaned stale queue file)\n",
@@ -1207,6 +1214,7 @@ func runHandoff(opts *handoffOpts, stdout, stderr io.Writer) error {
 	//     eventual lock owner.
 	successorRec := newRec
 	promptDelivered := !autoResume
+	supersededReplacement := false
 	if autoResume {
 		deliveredRec, err := deliverHandoffResumePrompt(oldRec.Project, isCoordSwap,
 			newRec, docPath, stdout, stderr)
@@ -1218,25 +1226,36 @@ func runHandoff(opts *handoffOpts, stdout, stderr io.Writer) error {
 			successorRec = deliveredRec
 		}
 		if isCoordSwap && successorRec.ID != newRec.ID {
+			// Retarget OLD's archive to the owner that got the prompt so
+			// chain-follow resolves correctly even if queue cleanup below
+			// fails. Do NOT drop the superseded newRec record yet — the queue
+			// still names it, and if queue.Delete fails the next recovery pass
+			// must be able to reload it (codex P2). Defer the drop until AFTER
+			// the queue is consumed.
 			if err := retargetArchivedHandoffSuccessor(oldRec.ID, successorRec.ID); err != nil {
 				return fmt.Errorf("resume prompt delivered to lock owner %s but handoff archive retarget failed: %w (queue preserved at %s)",
 					successorRec.ID, err, queuePath)
 			}
-			if err := handoffop.DropReplacementRecord(newRec.TmuxSession, newRec.ID, stderr); err != nil {
-				return fmt.Errorf("resume prompt delivered to lock owner %s but superseded replacement %s cleanup failed: %w (queue preserved at %s)",
-					successorRec.ID, newRec.ID, err, queuePath)
-			}
+			supersededReplacement = true
 		}
 		promptDelivered = true
 	}
 
 	// 14. Mark the durable inbox consumed only after verified delivery (or
 	//     when auto-resume is explicitly disabled and there is nothing to
-	//     deliver).
+	//     deliver). Delete the queue BEFORE dropping any superseded replacement
+	//     record, so a queue.Delete failure never leaves the queue pointing at
+	//     a record we already removed.
 	queueDeleted := true
 	if err := queue.Delete(queuePath); err != nil {
 		_, _ = fmt.Fprintf(stderr, "warning: delete queue file: %v\n", err)
 		queueDeleted = false
+	}
+	if queueDeleted && supersededReplacement {
+		if err := handoffop.DropReplacementRecord(newRec.TmuxSession, newRec.ID, stderr); err != nil {
+			return fmt.Errorf("resume prompt delivered to lock owner %s but superseded replacement %s cleanup failed: %w",
+				successorRec.ID, newRec.ID, err)
+		}
 	}
 
 	_, _ = fmt.Fprintf(stdout, "agent %s handed off → %s\n", oldRec.ID, successorRec.ID)
@@ -1433,6 +1452,8 @@ func resumeHandoff(opts *handoffOpts, stdout, stderr io.Writer,
 		}
 	}
 	successorRec := newRec
+	supersededSession := ""
+	supersededID := ""
 	if autoResume {
 		deliveredRec, err := deliverHandoffResumePrompt(oldRec.Project, isCoordSwap,
 			newRec, docPath, stdout, stderr)
@@ -1448,10 +1469,11 @@ func resumeHandoff(opts *handoffOpts, stdout, stderr io.Writer,
 				return fmt.Errorf("resume handoff: prompt delivered to lock owner %s but handoff archive retarget failed: %w (queue preserved at %s)",
 					successorRec.ID, err, queuePath)
 			}
-			if err := handoffop.DropReplacementRecord(newRec.TmuxSession, newRec.ID, stderr); err != nil {
-				return fmt.Errorf("resume handoff: prompt delivered to lock owner %s but superseded replacement %s cleanup failed: %w (queue preserved at %s)",
-					successorRec.ID, newRec.ID, err, queuePath)
-			}
+			// Defer the superseded-record drop until AFTER queue.Delete: if the
+			// delete fails the queue still names newRec, so a recovery pass must
+			// be able to reload it (codex P2).
+			supersededSession = newRec.TmuxSession
+			supersededID = newRec.ID
 		}
 	}
 	if err := queue.Delete(queuePath); err != nil {
@@ -1464,6 +1486,11 @@ func resumeHandoff(opts *handoffOpts, stdout, stderr io.Writer,
 				oldRec.ID, successorRec.ID, oldRec.ID)
 		}
 		_, _ = fmt.Fprintf(stderr, "warning: delete queue file: %v\n", err)
+	} else if supersededID != "" {
+		if err := handoffop.DropReplacementRecord(supersededSession, supersededID, stderr); err != nil {
+			return fmt.Errorf("resume handoff: prompt delivered to lock owner %s but superseded replacement %s cleanup failed: %w",
+				successorRec.ID, supersededID, err)
+		}
 	}
 
 	_, _ = fmt.Fprintf(stdout, "resumed crashed handoff: %s → %s (replacement was already spawned)\n",

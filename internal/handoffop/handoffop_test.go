@@ -1954,3 +1954,61 @@ func TestDrain_ContentionPreservesQueueFile(t *testing.T) {
 		t.Errorf("expected stderr to mention coordlock.Acquire warning; got: %q", stderr.String())
 	}
 }
+
+// codex iter-16 [P2] REGRESSION: deliverResumePrompt's lock-owner branch must
+// fall back to a direct send when the successor is a legacy/bare coord whose
+// lease epoch is never stamped (CurrentOwner returns ErrNoOwnerObserved). The
+// drain helper previously propagated the sentinel, leaving the queue pending
+// forever even though the replacement session was live. Mirrors the
+// cmd/fleet/handoff.go fallback.
+func TestDeliverResumePrompt_LeaseWrapped_NoOwner_FallsBackToDirectSend(t *testing.T) {
+	t.Setenv("FLEET_LEASE_FAILOVER", "1")
+	setupFleetHome(t)
+
+	rec := agent.New("legacynew1")
+	rec.Project = "rainier"
+	rec.TmuxSession = "fleet-legacynew1"
+
+	origDeps := handoffDeliveryDepsFn
+	origTimeout := handoffDeliveryTimeout
+	origPoll := handoffDeliveryPoll
+	origSend := sendPromptKeysVerified
+	t.Cleanup(func() {
+		handoffDeliveryDepsFn = origDeps
+		handoffDeliveryTimeout = origTimeout
+		handoffDeliveryPoll = origPoll
+		sendPromptKeysVerified = origSend
+	})
+	handoffDeliveryTimeout = 100 * time.Millisecond
+	handoffDeliveryPoll = time.Millisecond
+	// Lock-owner branch entered (leaseWrappedSuccessor=true) but no owner ever
+	// resolves -> ErrNoOwnerObserved -> direct-send fallback.
+	handoffDeliveryDepsFn = func() handoffdelivery.Deps {
+		deps := handoffdelivery.DefaultDeps()
+		deps.CurrentOwner = func(string) (coordlock.Owner, bool) {
+			return coordlock.Owner{}, false
+		}
+		deps.Sleep = func(time.Duration) {}
+		return deps
+	}
+	var sentSession, sentPrompt string
+	sendPromptKeysVerified = func(session, prompt string) (bool, error) {
+		sentSession, sentPrompt = session, prompt
+		return true, nil
+	}
+
+	out := &bytes.Buffer{}
+	delivered, err := deliverResumePrompt(rec.Project, true, true, rec, "/tmp/handoff.md", out, out)
+	if err != nil {
+		t.Fatalf("expected direct-send fallback, got error: %v\n%s", err, out.String())
+	}
+	if delivered == nil || delivered.ID != rec.ID {
+		t.Fatalf("fallback delivered = %+v, want replacement %s", delivered, rec.ID)
+	}
+	if sentSession != rec.TmuxSession {
+		t.Fatalf("resume prompt sent to %q, want direct successor session %q", sentSession, rec.TmuxSession)
+	}
+	if !strings.Contains(sentPrompt, "/tmp/handoff.md") {
+		t.Fatalf("resume prompt %q must reference the handoff doc", sentPrompt)
+	}
+}
