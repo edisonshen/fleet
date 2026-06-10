@@ -1946,3 +1946,118 @@ func TestHandoff_NoMarkerUpdate_WhenNoMarkerExists(t *testing.T) {
 		t.Errorf("marker created from nothing: got %q want empty", got)
 	}
 }
+
+// Codex P1 regression: a coord handoff with FLEET_LEASE_FAILOVER=1 against a
+// LEGACY/bare coord (no lease record, so CurrentOwner never resolves an owner)
+// must NOT loop the owner-poll until timeout and fail. deliverHandoffResumePrompt
+// detects ErrNoOwnerObserved and falls back to a direct send into the live
+// replacement's session — the pre-PR2 delivery path.
+func TestDeliverHandoffResumePrompt_NoLeaseOwner_FallsBackToDirectSend(t *testing.T) {
+	requireTmux(t)
+	setupFleetHome(t)
+	t.Setenv("FLEET_LEASE_FAILOVER", "1")
+
+	const project = "rainier"
+	// Live replacement with an idle shell so the typed prompt stays visible in
+	// the pane for capture (the verified send types + submits into this pane).
+	rep, err := agentSpawnForTest(t, t.TempDir(),
+		[]string{"sh", "-c", "sleep 30"},
+		project, "coord-"+project)
+	if err != nil {
+		t.Fatalf("seed replacement: %v", err)
+	}
+	t.Cleanup(func() { _ = tmux.Kill(rep.TmuxSession) })
+
+	docPath := filepath.Join(t.TempDir(), "handoff.md")
+	if err := os.WriteFile(docPath, []byte("stub doc"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	origDeps := handoffDeliveryDepsFn
+	origTimeout := handoffDeliveryTimeout
+	origPoll := handoffDeliveryPoll
+	t.Cleanup(func() {
+		handoffDeliveryDepsFn = origDeps
+		handoffDeliveryTimeout = origTimeout
+		handoffDeliveryPoll = origPoll
+	})
+	handoffDeliveryTimeout = 200 * time.Millisecond
+	handoffDeliveryPoll = time.Millisecond
+	// CurrentOwner never resolves an owner -> the legacy/bare-coord case.
+	handoffDeliveryDepsFn = func() handoffdelivery.Deps {
+		deps := handoffdelivery.DefaultDeps()
+		deps.CurrentOwner = func(string) (coordlock.Owner, bool) {
+			return coordlock.Owner{}, false
+		}
+		deps.Sleep = func(time.Duration) {}
+		return deps
+	}
+
+	out := &bytes.Buffer{}
+	delivered, err := deliverHandoffResumePrompt(project, true, rep, docPath, out, out)
+	if err != nil {
+		t.Fatalf("expected direct-send fallback, got error: %v\n%s", err, out.String())
+	}
+	if delivered == nil || delivered.ID != rep.ID {
+		t.Fatalf("fallback delivered = %+v, want replacement %s", delivered, rep.ID)
+	}
+
+	// The verified send already confirmed submission (delivered != nil above);
+	// the pane carries the prompt text (tmux wraps long lines, so strip \n).
+	want := "Read your handoff doc at " + docPath
+	deadline := time.Now().Add(2 * time.Second)
+	var lastOut []byte
+	for time.Now().Before(deadline) {
+		captured, cerr := tmux.CapturePane(rep.TmuxSession)
+		if cerr == nil {
+			lastOut = captured
+			if strings.Contains(strings.ReplaceAll(string(captured), "\n", ""), want) {
+				return
+			}
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	t.Errorf("fallback did not deliver prompt; want %q in:\n%s", want, string(lastOut))
+}
+
+// Codex P2 regression: retargetArchivedHandoffSuccessor rewrites the archived
+// predecessor's SuccessorID so chain-follow (`fleet attach <old>`) resolves to
+// the record that actually received the resume prompt. The stale-queue recovery
+// path relies on this before dropping a superseded queued replacement; without
+// it, attach chained to a just-deleted record.
+func TestRetargetArchivedHandoffSuccessor_RewritesChain(t *testing.T) {
+	setupFleetHome(t)
+
+	old := agent.New(agent.NewID())
+	old.Project = "rainier"
+	old.TaskID = "coord-rainier"
+	old.TmuxSession = tmux.SessionName(old.ID)
+	old.SuccessorID = "droppedreplacement"
+	if err := old.Write(); err != nil {
+		t.Fatalf("write old: %v", err)
+	}
+	if err := old.Archive(); err != nil {
+		t.Fatalf("archive old: %v", err)
+	}
+
+	const lockOwner = "actuallockowner"
+	if err := retargetArchivedHandoffSuccessor(old.ID, lockOwner); err != nil {
+		t.Fatalf("retarget: %v", err)
+	}
+
+	arc, err := agent.LoadArchive(old.ID)
+	if err != nil {
+		t.Fatalf("LoadArchive: %v", err)
+	}
+	if arc.SuccessorID != lockOwner {
+		t.Fatalf("archive successor = %q, want retargeted %q", arc.SuccessorID, lockOwner)
+	}
+	if arc.ArchivedCause != agent.ArchivedCauseHandoff {
+		t.Fatalf("archive cause = %q, want %q", arc.ArchivedCause, agent.ArchivedCauseHandoff)
+	}
+
+	// Empty successor is a programming error, not a silent no-op.
+	if err := retargetArchivedHandoffSuccessor(old.ID, ""); err == nil {
+		t.Fatal("expected error on empty successorID")
+	}
+}

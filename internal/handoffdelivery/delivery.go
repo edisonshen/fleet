@@ -1,6 +1,7 @@
 package handoffdelivery
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"time"
@@ -11,6 +12,15 @@ import (
 	"github.com/edisonshen/fleet/internal/state"
 	"github.com/edisonshen/fleet/internal/tmux"
 )
+
+// ErrNoOwnerObserved is returned when the timeout elapses without ever seeing
+// an active lock owner for the project (e.g. a legacy/bare coord from before
+// the lease wrapper, which never stamps a lease record). Callers that still
+// hold a live successor handle (rec.TmuxSession) use this sentinel to fall back
+// to a direct send rather than retrying the same doomed owner-poll. It is
+// distinct from a delivery error where an owner WAS observed but its send
+// failed — that one must stay pending so a real owner can pick it up.
+var ErrNoOwnerObserved = errors.New("handoff delivery: no active lock owner observed before timeout")
 
 // Deps are the delivery seams. Tests inject these to avoid real lease/tmux
 // polling; production callers use DefaultDeps.
@@ -125,10 +135,15 @@ func DeliverToCurrentOwner(opts Options, deps Deps) (*agent.Record, error) {
 		}
 		if !deps.Now().Before(deadline) {
 			if lastErr != nil {
+				// An owner WAS observed but its send/load failed — keep this
+				// pending (do NOT wrap ErrNoOwnerObserved) so a retry re-targets
+				// the real owner instead of falling back to a direct send.
 				return nil, fmt.Errorf("handoff delivery: no deliverable lock owner for project %s before timeout: %w",
 					opts.Project, lastErr)
 			}
-			return nil, fmt.Errorf("handoff delivery: no active lock owner for project %s before timeout", opts.Project)
+			// No owner ever observed — a legacy/bare coord that never stamps a
+			// lease record. Signal the caller to fall back to a direct send.
+			return nil, fmt.Errorf("%w for project %s", ErrNoOwnerObserved, opts.Project)
 		}
 		wait := poll
 		if rem := deadline.Sub(deps.Now()); rem < wait {

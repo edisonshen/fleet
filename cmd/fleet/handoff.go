@@ -188,6 +188,25 @@ func deliverHandoffResumePrompt(project string, isCoordSwap bool, rec *agent.Rec
 			Stderr:        stderr,
 		}, handoffDeliveryDepsFn())
 		if err != nil {
+			// Legacy/bare coord: no lease owner was ever stamped, so the
+			// owner-poll cannot converge and would time out on every retry.
+			// The replacement (rec) is already live, so fall back to a direct
+			// send to its session — the pre-PR2 delivery path. A genuine
+			// owner-was-seen-but-undeliverable error is NOT this sentinel, so
+			// it still propagates and stays pending for a real-owner retry.
+			if errors.Is(err, handoffdelivery.ErrNoOwnerObserved) {
+				_, _ = fmt.Fprintf(stderr,
+					"warning: no lease owner for project %s (legacy coord?); delivering resume prompt directly to %s\n",
+					project, rec.TmuxSession)
+				submitted, serr := spawn.SendPromptKeysVerified(rec.TmuxSession, prompt)
+				if serr != nil {
+					return nil, serr
+				}
+				if !submitted {
+					return nil, fmt.Errorf("resume prompt to %s was typed but not submitted", rec.TmuxSession)
+				}
+				return rec, nil
+			}
 			return nil, err
 		}
 		if delivered != nil {
@@ -386,6 +405,16 @@ func runHandoff(opts *handoffOpts, stdout, stderr io.Writer) error {
 				}
 				if deliveredRec != nil {
 					if deliveredRec.ID != newRec.ID {
+						// Lock owner != queued replacement. Retarget OLD's
+						// archive to the owner that actually got the prompt
+						// BEFORE dropping the queued record, else chain-follow
+						// (`fleet attach <old>`) resolves to a record we are
+						// about to delete (codex P2). Mirrors runHandoff:1192.
+						if rtErr := retargetArchivedHandoffSuccessor(opts.oldID, deliveredRec.ID); rtErr != nil {
+							return fmt.Errorf(
+								"agent %s already archived BUT delivered lock owner %s superseded replacement %s and archive retarget failed: %w (queue preserved at %s)",
+								opts.oldID, deliveredRec.ID, newRec.ID, rtErr, pendingPath)
+						}
 						if dropErr := handoffop.DropReplacementRecord(newRec.TmuxSession, newRec.ID, stderr); dropErr != nil {
 							return fmt.Errorf(
 								"agent %s already archived BUT delivered lock owner %s superseded replacement %s and cleanup failed: %w (queue preserved at %s)",
@@ -1225,16 +1254,18 @@ func runHandoff(opts *handoffOpts, stdout, stderr io.Writer) error {
 		_, _ = fmt.Fprintf(stdout,
 			"then say: read the handoff doc at %s and continue\n", docPath)
 	case promptDelivered && !queueDeleted:
-		// queue.Delete failed → SendPromptKeys was skipped for the
-		// at-most-once guarantee. The journal is still on disk;
-		// running fleet handoff again triggers cleanUpStaleQueue
-		// which delivers the prompt + cleans up. Telling the
-		// operator to type the prompt manually here would race
-		// with that recovery and produce a double-send (codex
-		// review iter-17 P2).
-		_, _ = fmt.Fprintf(stdout,
-			"queue cleanup failed; rerun `fleet handoff %s` to deliver the resume prompt\n",
-			oldRec.ID)
+		// The prompt WAS delivered, but queue.Delete failed so the durable
+		// inbox is still on disk. Returning success here would let a
+		// programmatic caller treat the handoff as fully done while a stale
+		// queue lingers; the next handoff/drain retry sees that queue and
+		// re-delivers the same prompt (the at-most-once regression codex
+		// flagged P2). Surface a non-zero exit so the stale queue is not
+		// silently reported as a clean handoff. The duplicate-on-retry is
+		// the deliberately-accepted mark-after-verified-send cost (§5c);
+		// the operator/coord reruns to clear the queue.
+		return fmt.Errorf(
+			"agent %s handed off → %s BUT queue cleanup failed; rerun `fleet handoff %s` to clear the stale inbox (resume prompt already delivered)",
+			oldRec.ID, successorRec.ID, oldRec.ID)
 	}
 	return nil
 }

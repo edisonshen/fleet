@@ -1,6 +1,8 @@
 package handoffdelivery
 
 import (
+	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -8,6 +10,73 @@ import (
 	"github.com/edisonshen/fleet/internal/agent"
 	"github.com/edisonshen/fleet/internal/coordlock"
 )
+
+// fakeClock advances deterministically on each Sleep so the delivery loop hits
+// its deadline without real wall-clock sleeps.
+func fakeClock() (now func() time.Time, sleep func(time.Duration)) {
+	cur := time.Unix(0, 0)
+	now = func() time.Time { return cur }
+	sleep = func(d time.Duration) { cur = cur.Add(d) }
+	return now, sleep
+}
+
+// No owner is ever observed (legacy/bare coord, no lease record). The call must
+// time out with ErrNoOwnerObserved so the caller can fall back to a direct send
+// instead of looping the same doomed owner-poll forever.
+func TestDeliverToCurrentOwner_NoOwnerEver_ReturnsSentinel(t *testing.T) {
+	now, sleep := fakeClock()
+	_, err := DeliverToCurrentOwner(Options{
+		Project: "rainier",
+		Prompt:  "read the doc",
+		Timeout: time.Second,
+		Poll:    100 * time.Millisecond,
+	}, Deps{
+		CurrentOwner: func(string) (coordlock.Owner, bool) {
+			return coordlock.Owner{}, false // never an owner
+		},
+		LoadAgent:    func(string) (*agent.Record, error) { return nil, nil },
+		WaitReady:    func(string) error { return nil },
+		SessionAlive: func(string) (bool, error) { return true, nil },
+		SendVerified: func(string, string) (bool, error) { return true, nil },
+		Now:          now,
+		Sleep:        sleep,
+	})
+	if err == nil {
+		t.Fatal("expected timeout error when no owner is ever observed")
+	}
+	if !errors.Is(err, ErrNoOwnerObserved) {
+		t.Fatalf("error = %v, want ErrNoOwnerObserved", err)
+	}
+}
+
+// An owner WAS observed but its record never loads (transient). The error must
+// NOT be ErrNoOwnerObserved — the caller must keep the doc pending for a
+// real-owner retry rather than fall back to a stale direct send.
+func TestDeliverToCurrentOwner_OwnerSeenButUndeliverable_NotSentinel(t *testing.T) {
+	now, sleep := fakeClock()
+	_, err := DeliverToCurrentOwner(Options{
+		Project: "rainier",
+		Prompt:  "read the doc",
+		Timeout: time.Second,
+		Poll:    100 * time.Millisecond,
+	}, Deps{
+		CurrentOwner: func(string) (coordlock.Owner, bool) {
+			return coordlock.Owner{AgentID: "winner1", PID: 1, PidStart: 2}, true
+		},
+		LoadAgent:    func(string) (*agent.Record, error) { return nil, fmt.Errorf("transient load failure") },
+		WaitReady:    func(string) error { return nil },
+		SessionAlive: func(string) (bool, error) { return true, nil },
+		SendVerified: func(string, string) (bool, error) { return true, nil },
+		Now:          now,
+		Sleep:        sleep,
+	})
+	if err == nil {
+		t.Fatal("expected timeout error when owner is undeliverable")
+	}
+	if errors.Is(err, ErrNoOwnerObserved) {
+		t.Fatalf("error = %v, must NOT be ErrNoOwnerObserved (owner was observed)", err)
+	}
+}
 
 func TestDeliverToCurrentOwnerTargetsLeaseOwnerAndPromotesMarker(t *testing.T) {
 	winner := &agent.Record{
