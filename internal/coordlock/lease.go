@@ -1372,7 +1372,14 @@ func LeaseRecordActive(project string) bool {
 	if err != nil {
 		return false
 	}
-	return rec.State == stateActive || rec.State == stateFencing
+	// active / fencing / fenced_not_acquired all denote a real lease generation
+	// (a healthy holder, a mid-flight takeover, or a failed takeover awaiting
+	// doctor recovery with a possibly-unreaped old holder). Only released or a
+	// missing record means "no lease" (codex iter-23 [P1]: a failed takeover
+	// must NOT be mistaken for a legacy/bare coord and direct-sent).
+	return rec.State == stateActive ||
+		rec.State == stateFencing ||
+		rec.State == stateFencedNotAcquired
 }
 
 // BarrierPath returns the absolute path of the graceful-handoff completion

@@ -2038,3 +2038,32 @@ func TestReleaseSurfacesDemoteFaultOnCorruptEpoch(t *testing.T) {
 		t.Fatalf("Release must surface a warning on a real demote fault; stderr was:\n%s", out)
 	}
 }
+
+// codex iter-23 [P1] regression: LeaseRecordActive distinguishes a real lease
+// generation (active / fencing / fenced_not_acquired) from "no lease" (released
+// / missing). A failed takeover (fenced_not_acquired) MUST count as a real lease
+// so handoff delivery stays pending/doctor-gated instead of direct-sending to a
+// queued replacement as if the coord were legacy/bare.
+func TestLeaseRecordActive(t *testing.T) {
+	setupHome(t)
+	const project = "lra-test"
+
+	if LeaseRecordActive(project) {
+		t.Fatal("no epoch record -> LeaseRecordActive should be false")
+	}
+	owner := identity{Pid: 4242, PidStart: 222222, AgentID: "owner1", Project: project}
+	for _, tc := range []struct {
+		state string
+		want  bool
+	}{
+		{stateActive, true},
+		{stateFencing, true},
+		{stateFencedNotAcquired, true},
+		{stateReleased, false},
+	} {
+		writeEpochRaw(t, project, epochRecord{Epoch: 5, State: tc.state, Owner: owner, BootID: "test-boot-1"})
+		if got := LeaseRecordActive(project); got != tc.want {
+			t.Fatalf("LeaseRecordActive(state=%q) = %v, want %v", tc.state, got, tc.want)
+		}
+	}
+}
