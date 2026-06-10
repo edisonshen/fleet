@@ -27,10 +27,12 @@ from pathlib import Path
 # Model name -> context-window size in tokens.
 # Mirrors skills/fleet-guard/health.py:CONTEXT_LIMITS — keep byte-consistent
 # (test_health.py::TestContextLimitsParity asserts the two are identical).
-# Update as Anthropic ships new model IDs. Unknown models do NOT silently
-# fall back to a guessed limit — see the model-resolution block below for
-# why null + context_limit_known=False is preferable to a wrong percentage.
+# Update as Anthropic ships new model IDs. Unknown models default to
+# DEFAULT_CONTEXT_LIMIT (1M) with a loud stderr flag — operator directive
+# 2026-06-10 ("dont let it silo"); context_limit_known=False still records
+# that the limit was a default, so Q3 accuracy analysis can exclude it.
 CONTEXT_LIMITS = {
+    "claude-fable-5":    1_000_000,
     "claude-opus-4-8":   1_000_000,
     "claude-opus-4-7":   1_000_000,
     "claude-opus-4-6":     200_000,
@@ -45,6 +47,10 @@ CONTEXT_LIMITS = {
 # base model's default limit — see skills/fleet-guard/health.py for the full
 # rationale (codex P2, 2026-06-03).
 ONE_M_BRACKET_TOKENS = 1_000_000
+
+# Fallback window for an unresolvable model id. Mirrors
+# skills/fleet-guard/health.py:DEFAULT_CONTEXT_LIMIT (bug D policy).
+DEFAULT_CONTEXT_LIMIT = 1_000_000
 
 
 def _normalize_model(raw):
@@ -66,10 +72,10 @@ def _normalize_model(raw):
     return s
 
 
-def _resolve_limit(raw):
-    """Resolve a model id to its context-window size, or None when unknown.
-    Mirrors skills/fleet-guard/health.py:_resolve_limit: exact hit -> "[1m]"
-    variant means 1M -> stripped base lookup -> None.
+def _lookup_limit(raw):
+    """Table/bracket resolution: exact hit -> "[1m]" variant means 1M ->
+    stripped base lookup -> None. Mirrors
+    skills/fleet-guard/health.py:_lookup_limit.
     """
     if not raw:
         return None
@@ -82,6 +88,25 @@ def _resolve_limit(raw):
         if close_b > open_b and raw[open_b + 1:close_b].strip().lower() == "1m":
             return ONE_M_BRACKET_TOKENS
     return CONTEXT_LIMITS.get(_normalize_model(raw))
+
+
+def _resolve_limit(raw):
+    """Resolve a model id to a usable context-window size — never None for a
+    non-empty id. Unknown ids default to DEFAULT_CONTEXT_LIMIT (1M) + loud
+    stderr flag. Mirrors skills/fleet-guard/health.py:_resolve_limit (bug D
+    policy, operator directive 2026-06-10)."""
+    if not raw:
+        return None
+    limit = _lookup_limit(raw)
+    if limit is not None:
+        return limit
+    print(
+        f"spike/stop-hook: unknown model id '{raw}' — defaulting context "
+        f"limit to {DEFAULT_CONTEXT_LIMIT} (1M). Add it to CONTEXT_LIMITS in "
+        f"skills/fleet-guard/health.py AND spike/stop-hook.py.",
+        file=sys.stderr,
+    )
+    return DEFAULT_CONTEXT_LIMIT
 
 SPIKE_DIR = Path.home() / ".fleet" / "spike"
 PAYLOAD_DIR = SPIKE_DIR / "payloads"
@@ -225,21 +250,18 @@ def main() -> int:
         "context_total": total,
     }
 
-    # If the model isn't in our table, do NOT guess a limit — that produces
-    # plausible-looking but wrong percentages that poison Q3 (accuracy). The
-    # fire still counts for Q1 (we have tokens), but pct stays null until
-    # the model is added to CONTEXT_LIMITS.
-    # Resolve via the shared policy (exact -> "[1m]"=1M -> stripped base).
-    # Mirrors health.py:read_context_pct.
+    # Resolve via the shared policy (exact -> "[1m]"=1M -> stripped base ->
+    # 1M default + flag). Mirrors health.py:read_context_pct. An unknown
+    # model now computes a pct against the 1M default (bug D policy) instead
+    # of going null; context_limit_known=False marks the fire as defaulted so
+    # Q3 (accuracy) analysis can exclude it.
+    known = _lookup_limit(record["model"]) is not None
     limit = _resolve_limit(record["model"])
-    known = limit is not None
     record["context_limit_known"] = known
-    if known:
-        record["context_limit"] = limit
-        record["computed_pct"] = round(total * 100.0 / limit, 2)
-    else:
-        record["context_limit"] = None
-        record["computed_pct"] = None
+    record["context_limit"] = limit
+    record["computed_pct"] = (
+        round(total * 100.0 / limit, 2) if limit else None
+    )
 
     record["latency_ms"] = int((time.perf_counter() - t0) * 1000)
     _append(METRICS_FILE, record)

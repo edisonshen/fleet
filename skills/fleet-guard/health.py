@@ -27,10 +27,14 @@ from typing import Any
 # tests/test_health.py::TestContextLimitsParity asserts the two tables are
 # identical so they can't drift again. Future operator-overridable via
 # ~/.fleet/config.yaml:context_limits (TODOS F11) — not yet wired. Unknown
-# models (after normalization) leave context_pct=None rather than guess a
-# limit; a wrong limit produces a plausible-looking but wrong percentage that
-# would fire (or suppress) the 50/70 handoff at the wrong moment.
+# models (after normalization) default to DEFAULT_CONTEXT_LIMIT (1M) with a
+# LOUD stderr flag — operator directive 2026-06-10: "if you dont know you
+# should flag it, and set default value to 1 million, dont let it silo."
+# (Supersedes the old no-guess-None policy: a silently-null context_pct kills
+# the 50/70 auto-handoff with no warning — bug D of
+# docs/DESIGN-handoff-lifecycle-hardening.md, live coord 80de593d.)
 CONTEXT_LIMITS: dict[str, int] = {
+    "claude-fable-5":    1_000_000,
     "claude-opus-4-8":   1_000_000,
     "claude-opus-4-7":   1_000_000,
     "claude-opus-4-6":     200_000,
@@ -47,6 +51,13 @@ CONTEXT_LIMITS: dict[str, int] = {
 # entry — doing so would compute a 1M context against a 200k base limit and
 # fire the red handoff far too early (codex P2, 2026-06-03).
 ONE_M_BRACKET_TOKENS = 1_000_000
+
+# Fallback window for a model id the table cannot resolve. Operator policy
+# (2026-06-10): default to 1M + flag loudly rather than silo to None. A wrong
+# percentage with a visible flag beats a dead threshold engine with no
+# warning — current frontier models all carry 1M windows, so 1M is also the
+# most-likely-correct guess.
+DEFAULT_CONTEXT_LIMIT = 1_000_000
 
 
 def _normalize_model(raw: str) -> str:
@@ -78,9 +89,9 @@ def _normalize_model(raw: str) -> str:
     return s
 
 
-def _resolve_limit(raw: str | None) -> int | None:
-    """Resolve a transcript model id to its context-window size, or None when
-    unknown. Resolution policy (shared with spike/stop-hook.py):
+def _lookup_limit(raw: str | None) -> int | None:
+    """Table/bracket resolution of a transcript model id, or None when the id
+    cannot be resolved. Resolution policy (shared with spike/stop-hook.py):
 
       1. Exact table hit on the raw id wins (covers any future id we add
          verbatim, including a decorated one).
@@ -90,7 +101,8 @@ def _resolve_limit(raw: str | None) -> int | None:
          200k sonnet entry.
       3. Otherwise, look up the decoration-stripped form (date pin, non-[1m]
          bracket) against the table.
-      4. No match -> None (unknown stays unknown; never guess a limit).
+      4. No match -> None. Callers that need a usable number go through
+         _resolve_limit, which applies the flag-and-default policy.
     """
     if not raw:
         return None
@@ -105,6 +117,32 @@ def _resolve_limit(raw: str | None) -> int | None:
         if close_b > open_b and raw[open_b + 1:close_b].strip().lower() == "1m":
             return ONE_M_BRACKET_TOKENS
     return CONTEXT_LIMITS.get(_normalize_model(raw))
+
+
+def _resolve_limit(raw: str | None) -> int | None:
+    """Resolve a model id to its context-window size — NEVER None for a
+    non-empty id. Unknown ids default to DEFAULT_CONTEXT_LIMIT (1M) with a
+    loud stderr flag naming the unresolved id, per the operator directive of
+    2026-06-10 ("if you dont know you should flag it, and set default value
+    to 1 million, dont let it silo"). A silently-null context_pct disables
+    the 50/70 auto-handoff with no warning (bug D, coord 80de593d).
+
+    Empty/None input still returns None: there is no id to flag, and
+    read_context_pct handles the no-model case on its own explicit path.
+    """
+    if not raw:
+        return None
+    limit = _lookup_limit(raw)
+    if limit is not None:
+        return limit
+    print(
+        f"fleet-guard: unknown model id '{raw}' — defaulting context limit "
+        f"to {DEFAULT_CONTEXT_LIMIT} (1M). Add it to CONTEXT_LIMITS in "
+        f"skills/fleet-guard/health.py AND spike/stop-hook.py (byte-"
+        f"consistent pair) so the 50/70 handoff uses the real window.",
+        file=sys.stderr,
+    )
+    return DEFAULT_CONTEXT_LIMIT
 
 # Schema version for ~/.fleet/agents/<id>.json. Mirrors
 # internal/agent.SchemaVersion. Bumped only when the on-disk shape changes
@@ -147,8 +185,12 @@ def read_context_pct(payload: dict[str, Any]) -> tuple[float | None, str | None]
     """Walk the transcript JSONL referenced by payload['transcript_path'] and
     compute context_pct from the most-recent message.usage.
 
-    Returns (context_pct, model_name). Either may be None — the skill records
-    None rather than guessing when data is missing or the model is unknown.
+    Returns (context_pct, model_name). pct is None only when the transcript
+    yields no usage/model data at all (missing path, unreadable file, no
+    usage blocks) — and the no-usage case flags loudly to stderr, because a
+    persistent (None, None) is the frozen-health-writer fingerprint (bug D).
+    An UNKNOWN model no longer yields None: _resolve_limit defaults it to 1M
+    with a stderr flag (operator directive 2026-06-10).
 
     Mirrors spike/stop-hook.py logic so the skill and the spike compute the
     same number against the same transcript. Output tokens are excluded
@@ -185,6 +227,17 @@ def read_context_pct(payload: dict[str, Any]) -> tuple[float | None, str | None]
         return (None, None)
 
     if not last_usage:
+        # Loud flag, not a silent freeze: a transcript with zero usage blocks
+        # means the threshold engine is blind this fire. Persistent
+        # recurrence = the frozen-health-writer fingerprint (bug D, coord
+        # 80de593d 2026-06-10) — either the Stop hook is handed the wrong
+        # transcript_path or the session writes no message.usage.
+        print(
+            f"fleet-guard: no usage found in transcript {transcript_path} — "
+            f"context_pct unavailable this fire (transcript has no "
+            f"message.usage block; check the hook's transcript_path wiring).",
+            file=sys.stderr,
+        )
         return (None, last_model or None)
 
     in_t = int(last_usage.get("input_tokens", 0) or 0)
@@ -197,6 +250,8 @@ def read_context_pct(payload: dict[str, Any]) -> tuple[float | None, str | None]
         return (None, None)
     # Return the RAW model id either way so an unknown model still surfaces its
     # real name for diagnostics / a future config-driven table entry.
+    # _resolve_limit never returns None for a non-empty id (unknown -> 1M
+    # default + stderr flag); the guard below is belt-and-suspenders only.
     limit = _resolve_limit(model)
     if limit is None:
         return (None, model)
