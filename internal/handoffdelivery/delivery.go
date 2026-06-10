@@ -91,9 +91,11 @@ func DeliverToCurrentOwner(opts Options, deps Deps) (*agent.Record, error) {
 	}
 	deadline := deps.Now().Add(timeout)
 	var lastErr error
+	ownerObserved := false
 	for {
 		owner, ok := deps.CurrentOwner(opts.Project)
 		if ok && owner.AgentID != "" {
+			ownerObserved = true
 			rec, err := deps.LoadAgent(owner.AgentID)
 			if err == nil {
 				if werr := deps.WaitReady(rec.TmuxSession); werr != nil {
@@ -140,6 +142,16 @@ func DeliverToCurrentOwner(opts Options, deps Deps) (*agent.Record, error) {
 				// the real owner instead of falling back to a direct send.
 				return nil, fmt.Errorf("handoff delivery: no deliverable lock owner for project %s before timeout: %w",
 					opts.Project, lastErr)
+			}
+			if ownerObserved {
+				// An owner was observed every pass but ownership kept flipping
+				// in the pre-send recheck window (finishDelivery returned
+				// (false,nil)) so we never landed a verified send. Real owners
+				// DO exist — keep the doc pending (NOT ErrNoOwnerObserved) so a
+				// retry targets the eventual stable owner instead of
+				// direct-sending to the queued/losing replacement (codex P2).
+				return nil, fmt.Errorf("handoff delivery: lock owner for project %s kept changing before a verified send",
+					opts.Project)
 			}
 			// No owner ever observed — a legacy/bare coord that never stamps a
 			// lease record. Signal the caller to fall back to a direct send.

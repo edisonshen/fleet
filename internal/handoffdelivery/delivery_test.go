@@ -234,3 +234,39 @@ func TestDeliverToCurrentOwnerUnsubmittedIsNotDelivered(t *testing.T) {
 		t.Fatalf("error = %v, want not submitted", err)
 	}
 }
+
+// codex P2 regression: an owner is observed every pass but ownership flips in
+// the pre-send recheck window (finishDelivery returns (false,nil)) until the
+// deadline. The error must NOT be ErrNoOwnerObserved — owners DID exist, so the
+// caller must keep the doc pending for a retry, never direct-send to the loser.
+func TestDeliverToCurrentOwner_OwnerKeepsFlipping_NotSentinel(t *testing.T) {
+	now, sleep := fakeClock()
+	flip := 0
+	_, err := DeliverToCurrentOwner(Options{
+		Project: "rainier",
+		Prompt:  "read the doc",
+		Timeout: time.Second,
+		Poll:    100 * time.Millisecond,
+	}, Deps{
+		// Each CurrentOwner call returns a DIFFERENT owner, so the post-read
+		// recheck inside finishDelivery never matches -> (false,nil), loop.
+		CurrentOwner: func(string) (coordlock.Owner, bool) {
+			flip++
+			return coordlock.Owner{AgentID: fmt.Sprintf("owner%d", flip), PID: flip, PidStart: int64(flip)}, true
+		},
+		LoadAgent: func(id string) (*agent.Record, error) {
+			return &agent.Record{ID: id, TmuxSession: "fleet-" + id}, nil
+		},
+		WaitReady:    func(string) error { return nil },
+		SessionAlive: func(string) (bool, error) { return true, nil },
+		SendVerified: func(string, string) (bool, error) { return true, nil },
+		Now:          now,
+		Sleep:        sleep,
+	})
+	if err == nil {
+		t.Fatal("expected error when ownership never stabilizes")
+	}
+	if errors.Is(err, ErrNoOwnerObserved) {
+		t.Fatalf("error = %v, must NOT be ErrNoOwnerObserved (owners were observed)", err)
+	}
+}
