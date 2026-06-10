@@ -1113,7 +1113,7 @@ func runDispatch(opts *dispatchOpts, stdout io.Writer) error {
 		}
 	}
 
-	rec, err := spawn.Spawn(spawn.Options{
+	rec, err := dispatchSpawnFn(spawn.Options{
 		OldRecord:         oldRecord,
 		NewDocPath:        newDocPath,
 		TaskID:            opts.taskID,
@@ -1152,6 +1152,43 @@ func runDispatch(opts *dispatchOpts, stdout io.Writer) error {
 				_, _ = fmt.Fprintf(os.Stderr,
 					"warning: coord-spawn pending-claim cleanup after lease stand-down failed (%v) — claim ages out in %s\n",
 					clrErr, coordFreshnessWindow)
+			}
+		}
+		// Stood-down RECOVERY delivery (codex iter-29 P1): a racing standby won
+		// the lease so early that THIS spawn stood down before booting a
+		// session. But we already synthesized a recovery handoff doc
+		// (newDocPath) from the dead coord's in-flight worker state. If we just
+		// return the veto, the winning coord boots WITHOUT that doc and the
+		// dead coord's workers are orphaned. So before vetoing, deliver the
+		// synth recovery prompt to the actual lock owner (the winner) — the
+		// durable doc-inbox makes this idempotent + lock-coupled, identical to
+		// the post-spawn delivery on the success path. Gated on
+		// !disableAutoResume to honor --no-auto-resume.
+		if opts.coordSpawn && newDocPath != "" && !disableAutoResume && leaseFailoverEnabled() {
+			ownerRec, derr := deliverToCurrentOwner(handoffdelivery.Options{
+				Project:       opts.project,
+				Prompt:        handoff.ResumePrompt(newDocPath),
+				PromoteMarker: true,
+				Stdout:        stdout,
+				Stderr:        os.Stderr,
+			})
+			switch {
+			case derr == nil && ownerRec != nil && ownerRec.ID != "":
+				_, _ = fmt.Fprintf(stdout,
+					"recovery doc delivered to live coord %s for project %s after lease stand-down\n",
+					ownerRec.ID, opts.project)
+			case errors.Is(derr, handoffdelivery.ErrNoOwnerObserved):
+				// No lease owner converged (legacy/bare leader). The durable
+				// doc stays pending; the next [a] attach recovers from it.
+				_, _ = fmt.Fprintf(os.Stderr,
+					"warning: lease stand-down but no lock owner observed for project %s; recovery doc stays pending for next attach\n",
+					opts.project)
+			case derr != nil:
+				// Delivery failed → doc stays pending (mark-after-verified-send),
+				// so the next attach re-delivers. Surface, don't silo.
+				_, _ = fmt.Fprintf(os.Stderr,
+					"warning: recovery doc delivery to lock owner after lease stand-down failed (%v) for project %s; stays pending for next attach\n",
+					derr, opts.project)
 			}
 		}
 		return &vetoError{msg: fmt.Sprintf(
@@ -1435,6 +1472,11 @@ func buildCoordRemoteControlSessionName(agentID, project string) string {
 func buildHandoffRemoteControlSessionName(agentID, project string) string {
 	return spawn.HandoffRemoteControlSessionName(agentID, project)
 }
+
+// dispatchSpawnFn is a var so tests can stub spawn.Spawn — in particular to
+// return spawn.ErrCoordStoodDown deterministically without seeding a live
+// competing lease. Production is spawn.Spawn.
+var dispatchSpawnFn = spawn.Spawn
 
 // deliverToCurrentOwner is a var so tests can stub the lock-owner delivery
 // without seeding a live lease + healthy foreign owner PID + real tmux

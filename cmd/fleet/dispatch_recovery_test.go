@@ -18,6 +18,7 @@ import (
 	"github.com/edisonshen/fleet/internal/agent"
 	"github.com/edisonshen/fleet/internal/handoff"
 	"github.com/edisonshen/fleet/internal/handoffdelivery"
+	"github.com/edisonshen/fleet/internal/spawn"
 	"github.com/edisonshen/fleet/internal/state"
 	"github.com/edisonshen/fleet/internal/tasks"
 	"github.com/edisonshen/fleet/internal/tmux"
@@ -1946,5 +1947,94 @@ func TestRunDispatch_DeadCoordRecovery_AdvertisesLockWinner(t *testing.T) {
 	if idx := strings.LastIndex(got, "agent "); !strings.HasPrefix(got[idx:], winnerSpawn) {
 		t.Errorf("the LAST 'agent ... spawned' line must name the winner %s (TUI takes last match); got tail:\n%s",
 			winnerID, got[idx:])
+	}
+}
+
+// TestRunDispatch_DeadCoordRecovery_StandDownDeliversRecoveryDoc pins codex
+// iter-29 P1: when a racing standby wins the coord lease so early that THIS
+// recovery spawn stands down (spawn.Spawn returns ErrCoordStoodDown), dispatch
+// must STILL deliver the synthesized recovery doc to the actual lock owner
+// before returning the veto. Otherwise the winning coord boots without the
+// dead coord's in-flight worker context and orphans that state.
+func TestRunDispatch_DeadCoordRecovery_StandDownDeliversRecoveryDoc(t *testing.T) {
+	requireTmux(t)
+	setupFleetHome(t)
+	t.Setenv("FLEET_LEASE_FAILOVER", "1")
+
+	// Stub spawn to stand down (a racing standby won the lease first).
+	prevSpawn := dispatchSpawnFn
+	dispatchSpawnFn = func(spawn.Options) (*agent.Record, error) {
+		return nil, spawn.ErrCoordStoodDown
+	}
+	t.Cleanup(func() { dispatchSpawnFn = prevSpawn })
+
+	// Capture the recovery-doc delivery to the lock owner.
+	const winnerID = "standwin1"
+	winnerRec := agent.New(winnerID)
+	winnerRec.Project = "myproj"
+	winnerRec.TmuxSession = "fleet-" + winnerID
+	var deliveredPrompt string
+	var deliveredMarker bool
+	prevDeliver := deliverToCurrentOwner
+	deliverToCurrentOwner = func(opts handoffdelivery.Options) (*agent.Record, error) {
+		deliveredPrompt = opts.Prompt
+		deliveredMarker = opts.PromoteMarker
+		if opts.Project != "myproj" {
+			t.Errorf("delivery project = %q, want myproj", opts.Project)
+		}
+		return winnerRec, nil
+	}
+	t.Cleanup(func() { deliverToCurrentOwner = prevDeliver })
+
+	deadRec := agent.New("deadc0d4")
+	deadRec.TaskID = "coord-myproj"
+	deadRec.Project = "myproj"
+	deadRec.PID = 99999 // not alive → recovery synth doc
+	deadRec.TmuxSession = "fleet-deadc0d4"
+	deadRec.Engine = "claude-code"
+	if err := deadRec.Write(); err != nil {
+		t.Fatalf("seed dead record: %v", err)
+	}
+	root := os.Getenv("FLEET_HOME")
+	seedRecoveryRepo(t, root, "myproj")
+	pdir := filepath.Join(root, "projects", "myproj")
+	if err := os.MkdirAll(pdir, 0o755); err != nil {
+		t.Fatalf("mkdir project dir: %v", err)
+	}
+	cs := map[string]any{"worker_agent_ids": map[string]string{}}
+	csData, _ := json.Marshal(cs)
+	csPath := filepath.Join(pdir, "coord-state.json")
+	if err := os.WriteFile(csPath, csData, 0o644); err != nil {
+		t.Fatalf("write coord-state: %v", err)
+	}
+	stale := time.Now().Add(-2 * coordFreshnessWindow)
+	if err := os.Chtimes(csPath, stale, stale); err != nil {
+		t.Fatalf("chtimes coord-state: %v", err)
+	}
+
+	opts := &dispatchOpts{
+		taskID:          "coord-myproj",
+		project:         "myproj",
+		projectExplicit: true,
+		coordSpawn:      true,
+		command:         []string{"sleep", "60"},
+		commandExplicit: true,
+	}
+	var out bytes.Buffer
+	err := runDispatch(opts, &out)
+	// Stand-down maps to a veto (exit 75) — the live leader handles the work.
+	if err == nil {
+		t.Fatalf("expected a veto error on lease stand-down; got nil\n%s", out.String())
+	}
+	// The CRUX: the recovery doc was delivered to the winner with a resume
+	// prompt + marker promotion, despite this spawn standing down.
+	if deliveredPrompt == "" {
+		t.Errorf("recovery doc must be delivered to the lock owner on stand-down; deliverToCurrentOwner got empty prompt\n%s", out.String())
+	}
+	if !deliveredMarker {
+		t.Errorf("stand-down recovery delivery must promote the coord-spawn marker to the winner")
+	}
+	if !strings.Contains(out.String(), "recovery doc delivered to live coord "+winnerID) {
+		t.Errorf("expected stand-down recovery-delivery confirmation for %s; got:\n%s", winnerID, out.String())
 	}
 }
