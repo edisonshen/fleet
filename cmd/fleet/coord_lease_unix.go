@@ -200,11 +200,20 @@ func sweepStaleCompetitors(selfAgentID, project string, stderr io.Writer) {
 			continue // never target our own record
 		}
 		if r.SupervisorPID <= 0 {
-			// Losing standby before supervisor identity stamp: after we
-			// hold the lease, another same-project coord-spawn record is
-			// by definition not the leader. Reap the Fleet-owned tmux
-			// session so a polling loser cannot linger invisibly.
-			if spawn.IsCoordSpawn(r.TaskID, r.Project) && r.TmuxSession != "" {
+			// Unstamped record: SupervisorPID==0 means either (a) a
+			// lease-wrapped standby that lost the race / hasn't stamped its
+			// supervisor identity yet — safe to reap, OR (b) a live LEGACY/
+			// BARE coord that never runs a supervisor at all. We must NOT
+			// blind-kill (b): a bare coord can be the only working
+			// coordinator, and reaping its session bypasses the handoff
+			// readiness/rollback path and can strand the project coord-less
+			// mid-handoff (codex iter-28 P1).
+			//
+			// LeaseWrapped is the authoritative discriminator (agent.go):
+			// true ONLY for `coord-run --standby` spawns, false/absent for
+			// legacy + bare/direct successors. Reap only the lease-wrapped,
+			// not-yet-stamped losing standby.
+			if r.LeaseWrapped && spawn.IsCoordSpawn(r.TaskID, r.Project) && r.TmuxSession != "" {
 				if err := sweepKillSessionFn(r.TmuxSession); err != nil &&
 					!errors.Is(err, tmux.ErrNoSession) {
 					_, _ = fmt.Fprintf(stderr, "coord-run: sweep reap standby session=%s agent=%s: %v\n",
