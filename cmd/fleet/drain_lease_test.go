@@ -786,10 +786,6 @@ func TestDrainLease_NoEpochColdSpawnsViaResume(t *testing.T) {
 	}
 }
 
-// codex PR3 iter-4 [P1]: the cold Resume path SERIALIZES via a per-agent lock
-// (Resume's contract) — coldResume takes LockAgent around Resume. This is the
-// stealable-lease cold-spawn case, NOT the hung-leader swap, so the brief lock
-// does not reintroduce the 81-leak.
 // coldResumeDeps returns deps pinned so drainOneLeaseAwareWith routes to
 // coldResume DETERMINISTICALLY — no lease epoch (stealable), no live leader,
 // OLD not on disk — regardless of the host's REAL ~/.fleet lease state. A
@@ -806,6 +802,10 @@ func coldResumeDeps() drainLeaseDeps {
 	}
 }
 
+// codex PR3 iter-4 [P1]: the cold Resume path SERIALIZES via a per-agent lock
+// (Resume's contract) — coldResume takes LockAgent around Resume. This is the
+// stealable-lease cold-spawn case, NOT the hung-leader swap, so the brief lock
+// does not reintroduce the 81-leak.
 func TestDrainLease_ColdResume_HoldsPerAgentLock(t *testing.T) {
 	out := &bytes.Buffer{}
 	var lockedDuringResume bool
