@@ -2117,3 +2117,71 @@ func TestResume_Case3_CapApprovedCoord_DeliversToLockOwner(t *testing.T) {
 		t.Fatalf("queue file should be consumed after verified delivery, stat err=%v", statErr)
 	}
 }
+
+// codex iter-20 [P2] REGRESSION: spawnAndRetire COLD-spawns a coord successor
+// with DisableLeaseWrap (a bare/direct successor). Even with req.CapApproved=true
+// the resume prompt MUST be delivered DIRECTLY to that freshly-spawned successor,
+// not routed through DeliverToCurrentOwner — polling the lock owner here would
+// target the old/dead owner and strand recovery. CurrentOwner must NOT be polled.
+func TestDrain_CoordColdSpawn_CapApproved_DeliversDirectNotLockOwner(t *testing.T) {
+	requireTmux(t)
+	t.Setenv("FLEET_LEASE_FAILOVER", "1")
+	setupFleetHome(t)
+
+	const project = "rainier"
+	seedCoordRepoMeta(t, project)
+	// Old coord (taskID coord-<project> → legacyCoordResume=true), NOT archived,
+	// NO pre-spawned replacement → Resume routes to spawnAndRetire (cold spawn).
+	oldRec := spawnSeedCoord(t, project, t.TempDir())
+	if _, err := state.EnsureProjectInitialized(project); err != nil {
+		t.Fatalf("EnsureProjectInitialized: %v", err)
+	}
+	if err := state.WriteCoordSpawnMarker(project, oldRec.ID); err != nil {
+		t.Fatalf("WriteCoordSpawnMarker: %v", err)
+	}
+
+	req, qp := writeCoordSkillQueue(t, oldRec)
+	req.CapApproved = true
+	if _, err := queue.WriteSpawnFresh(req); err != nil {
+		t.Fatalf("rewrite queue: %v", err)
+	}
+
+	origDeliveryDeps := handoffDeliveryDepsFn
+	origSend := sendPromptKeysVerified
+	t.Cleanup(func() {
+		handoffDeliveryDepsFn = origDeliveryDeps
+		sendPromptKeysVerified = origSend
+	})
+	handoffDeliveryDepsFn = func() handoffdelivery.Deps {
+		deps := handoffdelivery.DefaultDeps()
+		deps.CurrentOwner = func(string) (coordlock.Owner, bool) {
+			t.Fatalf("cold-spawned coord must NOT poll the lock owner (direct send expected)")
+			return coordlock.Owner{}, false
+		}
+		return deps
+	}
+	var sentSession, sentPrompt string
+	sendPromptKeysVerified = func(session, prompt string) (bool, error) {
+		sentSession, sentPrompt = session, prompt
+		return true, nil
+	}
+
+	out := &bytes.Buffer{}
+	if err := Resume(req, qp, 0, out, out); err != nil {
+		t.Fatalf("Resume cold-spawn coord should deliver directly: %v\n%s", err, out.String())
+	}
+	newRec, lerr := agent.Load(req.NewAgentID)
+	if lerr != nil {
+		t.Fatalf("cold-spawned successor record should exist: %v", lerr)
+	}
+	t.Cleanup(func() { _ = tmux.Kill(newRec.TmuxSession) })
+	if sentSession != newRec.TmuxSession {
+		t.Fatalf("resume prompt sent to %q, want freshly-spawned successor %q", sentSession, newRec.TmuxSession)
+	}
+	if !strings.Contains(sentPrompt, "Read your handoff doc at ") {
+		t.Fatalf("resume prompt has wrong shape: %q", sentPrompt)
+	}
+	if _, statErr := os.Stat(qp); !errors.Is(statErr, os.ErrNotExist) {
+		t.Fatalf("queue file should be consumed after verified delivery, stat err=%v", statErr)
+	}
+}

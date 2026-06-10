@@ -846,8 +846,15 @@ func spawnAndRetire(req queue.SpawnFresh, queuePath string,
 		}
 	}
 
-	leaseWrappedSuccessor := req.CapApproved ||
-		!spawn.IsCoordSpawn(newRec.TaskID, newRec.Project)
+	// This path COLD-SPAWNS the successor above with
+	// DisableLeaseWrap: legacyCoordResume — i.e. a coord successor here is a
+	// BARE/direct successor, NOT lease-wrapped (codex iter-20 P2). So the
+	// lease-wrapped state is exactly !DisableLeaseWrap == !legacyCoordResume,
+	// regardless of req.CapApproved (which only describes the producer's cap
+	// accounting, not how THIS spawn was wrapped). Delivering through the
+	// owner-poll here would mis-route to the old/dead lease owner instead of
+	// the successor we just spawned.
+	leaseWrappedSuccessor := !legacyCoordResume
 	return retireOldAgent(oldRec, newRec, req.HandoffDoc, queuePath,
 		thisHandoffDisableAutoResume, graceMillis, isCoordSwap, leaseWrappedSuccessor, stdout, stderr)
 }
