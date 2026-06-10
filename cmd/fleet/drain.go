@@ -23,12 +23,35 @@ import (
 // lease-aware path that returns it is linux/darwin only.
 var ErrEscalatedToTakeOver = errors.New("fleet drain: escalated to safety-net takeover")
 
+// ErrResumeBackgrounded is the typed signal coldResume returns when a
+// handoff Resume exceeds the --resume-timeout-ms budget. It is NOT a
+// failure: the resume goroutine keeps running (holding the bounded
+// per-agent lock until Resume unwinds) and completes the handoff in the
+// background; the drain merely stops waiting. runDrain counts it as
+// processed — modeled on ErrEscalatedToTakeOver — so a merely-slow handoff
+// never reports "every pending handoff failed" with exit 1 while the
+// handoff in fact completes (DESIGN-handoff-lifecycle-hardening bug A,
+// observed live 2026-06-10). Declared here (the all-platform file) so the
+// loop can reference it on every GOOS; the path that returns it is
+// linux/darwin only.
+var ErrResumeBackgrounded = errors.New("fleet drain: resume exceeded the budget; handoff completing in the background")
+
 // defaultResumeTimeoutMillis bounds a single per-queue-file Resume on the
 // lease-failover drain path (FLEET_LEASE_FAILOVER on). It is the wall-clock
 // budget after which the drain STOPS waiting on a slow handoff and escalates
 // to the safety-net takeover instead of blocking forever — the structural
 // fix for the 81-drain leak. Legacy (flag-off) drains ignore it.
-const defaultResumeTimeoutMillis = 30000
+//
+// 120s, not 30s (DESIGN-handoff-lifecycle-hardening bug A, operator: "wait
+// at least 2 mins"): a real coord resume — tmux spawn + readiness waits —
+// routinely outlives 30s, and a budget that trips on the happy path turns
+// every slow-but-succeeding handoff into a false alarm.
+const defaultResumeTimeoutMillis = 120000
+
+// drainOneFn is a test seam over drainOne (same pattern as drainProcStartFn /
+// drainRunNow): runDrain's accounting is exercised without a real tmux/lease
+// Resume behind it. Production never reassigns it.
+var drainOneFn = drainOne
 
 func newDrainCmd() *cobra.Command {
 	var (
@@ -130,8 +153,18 @@ func runDrain(stdout, stderr io.Writer, graceMillis, resumeTimeoutMillis int) er
 			failed++
 			continue
 		}
-		err := drainOne(req, path, graceMillis, resumeTimeoutMillis, stdout, stderr)
+		err := drainOneFn(req, path, graceMillis, resumeTimeoutMillis, stdout, stderr)
 		switch {
+		case errors.Is(err, ErrResumeBackgrounded):
+			// Not a failure (DESIGN-handoff-lifecycle-hardening bug A): the
+			// resume was merely SLOW. The goroutine keeps the bounded per-agent
+			// lock and finishes the handoff in the background; a contending
+			// drain stands down, so no duplicate spawn. Count it processed so a
+			// slow handoff never produces exit 1 + "every pending handoff
+			// failed" while the handoff in fact completes.
+			_, _ = fmt.Fprintf(stdout,
+				"fleet drain: %s resume still running; handoff completing in the background\n", req.OldAgentID)
+			processed++
 		case errors.Is(err, ErrEscalatedToTakeOver):
 			// Not a failure (codex PR3 iter-2 [P2]): the bounded drain did its
 			// job — it stopped waiting on a slow/hung handoff and handed

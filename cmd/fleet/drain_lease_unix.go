@@ -1086,14 +1086,20 @@ func coldResume(req queue.SpawnFresh, path string, graceMillis, resumeTimeoutMil
 	case rerr := <-done:
 		return rerr
 	case <-timer.C:
-		// Resume hung past the budget. Return without blocking; the goroutine
+		// Resume ran past the budget. Return without blocking; the goroutine
 		// keeps the bounded lock until Resume unwinds (a contending drain times
 		// out + stands down, never a duplicate spawn). Surface so the operator
-		// sees the stuck handoff (fleet doctor / a later drain can retry).
+		// sees the slow handoff (fleet doctor / a later drain can retry).
+		//
+		// The wrapped ErrResumeBackgrounded sentinel tells runDrain this is
+		// in-progress, NOT failed — the handoff usually completes in the
+		// background, and counting it failed produced a false "every pending
+		// handoff failed" exit 1 (DESIGN-handoff-lifecycle-hardening bug A).
 		_, _ = fmt.Fprintf(stderr,
 			"fleet drain: resume for %s exceeded the %dms budget; returning (the handoff completes in the background or a later drain retries)\n",
 			req.Project, resumeTimeoutMillis)
-		return fmt.Errorf("fleet drain: resume for %s exceeded the %dms resume-timeout budget", req.Project, resumeTimeoutMillis)
+		return fmt.Errorf("fleet drain: resume for %s exceeded the %dms resume-timeout budget: %w",
+			req.Project, resumeTimeoutMillis, ErrResumeBackgrounded)
 	}
 }
 

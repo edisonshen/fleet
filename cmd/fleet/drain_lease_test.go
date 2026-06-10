@@ -795,7 +795,9 @@ func TestDrainLease_ColdResume_HoldsPerAgentLock(t *testing.T) {
 	var lockedDuringResume bool
 	var locked, released int32
 	d := drainLeaseDeps{
-		CurrentEpoch: func(string) (int64, bool) { return 0, false }, // stealable
+		CurrentEpoch:  func(string) (int64, bool) { return 0, false }, // stealable
+		LeaderPresent: func(string) bool { return false },             // pin: no live leader on this host
+		LoadAgent:     func(string) (*agent.Record, error) { return nil, state.ErrNotFound },
 		LockAgent: func(string) (func(), error) {
 			atomic.AddInt32(&locked, 1)
 			return func() { atomic.AddInt32(&released, 1) }, nil
@@ -828,8 +830,10 @@ func TestDrainLease_ColdResume_HonorsResumeTimeout(t *testing.T) {
 	block := make(chan struct{})
 	t.Cleanup(func() { close(block) }) // unblock the abandoned goroutine at test end
 	d := drainLeaseDeps{
-		CurrentEpoch: func(string) (int64, bool) { return 0, false }, // stealable -> coldResume
-		LockAgent:    func(string) (func(), error) { return func() {}, nil },
+		CurrentEpoch:  func(string) (int64, bool) { return 0, false }, // stealable -> coldResume
+		LeaderPresent: func(string) bool { return false },             // pin: no live leader on this host
+		LoadAgent:     func(string) (*agent.Record, error) { return nil, state.ErrNotFound },
+		LockAgent:     func(string) (func(), error) { return func() {}, nil },
 		Resume: func(queue.SpawnFresh, string, int, io.Writer, io.Writer) error {
 			<-block // hang past the budget
 			return nil
@@ -865,8 +869,10 @@ func TestDrainLease_ColdResume_FastResumeWithinBudget(t *testing.T) {
 	out := &bytes.Buffer{}
 	var resumed int32
 	d := drainLeaseDeps{
-		CurrentEpoch: func(string) (int64, bool) { return 0, false }, // stealable -> coldResume
-		LockAgent:    func(string) (func(), error) { return func() {}, nil },
+		CurrentEpoch:  func(string) (int64, bool) { return 0, false }, // stealable -> coldResume
+		LeaderPresent: func(string) bool { return false },             // pin: no live leader on this host
+		LoadAgent:     func(string) (*agent.Record, error) { return nil, state.ErrNotFound },
+		LockAgent:     func(string) (func(), error) { return func() {}, nil },
 		Resume: func(queue.SpawnFresh, string, int, io.Writer, io.Writer) error {
 			atomic.AddInt32(&resumed, 1)
 			return nil
@@ -887,8 +893,10 @@ func TestDrainLease_ColdResume_GenuineErrorNotBackgrounded(t *testing.T) {
 	out := &bytes.Buffer{}
 	boom := errors.New("spawn replacement: boom")
 	d := drainLeaseDeps{
-		CurrentEpoch: func(string) (int64, bool) { return 0, false }, // stealable -> coldResume
-		LockAgent:    func(string) (func(), error) { return func() {}, nil },
+		CurrentEpoch:  func(string) (int64, bool) { return 0, false }, // stealable -> coldResume
+		LeaderPresent: func(string) bool { return false },             // pin: no live leader on this host
+		LoadAgent:     func(string) (*agent.Record, error) { return nil, state.ErrNotFound },
+		LockAgent:     func(string) (func(), error) { return func() {}, nil },
 		Resume: func(queue.SpawnFresh, string, int, io.Writer, io.Writer) error {
 			return boom
 		},
