@@ -2012,3 +2012,108 @@ func TestDeliverResumePrompt_LeaseWrapped_NoOwner_FallsBackToDirectSend(t *testi
 		t.Fatalf("resume prompt %q must reference the handoff doc", sentPrompt)
 	}
 }
+
+// codex iter-18 [P1] REGRESSION: the case-3 Resume path (old record still live,
+// replacement already spawned) routes through retireOldAgent. For a CapApproved
+// coord handoff under FLEET_LEASE_FAILOVER=1 the resume prompt MUST go to the
+// lock WINNER (DeliverToCurrentOwner), not the queued session which may have
+// lost the lease. Before the leaseWrappedSuccessor threading, retireOldAgent
+// derived lease-wrapping from TaskID alone and direct-sent to the loser.
+func TestResume_Case3_CapApprovedCoord_DeliversToLockOwner(t *testing.T) {
+	requireTmux(t)
+	t.Setenv("FLEET_LEASE_FAILOVER", "1")
+	setupFleetHome(t)
+
+	const project = "rainier"
+	cwd := seedCoordRepoMeta(t, project)
+	oldRec := spawnSeedCoord(t, project, cwd) // NOT archived → case-3
+
+	// Journaled replacement: spawned + alive, named by the queue.
+	newRec := agent.New(agent.NewID())
+	newRec.TaskID = oldRec.TaskID
+	newRec.Project = oldRec.Project
+	newRec.Cwd = oldRec.Cwd
+	newRec.Command = oldRec.Command
+	newRec.TmuxSession = tmux.SessionName(newRec.ID)
+	newRec.SpawnedAt = time.Now().UTC()
+	newRec.LastActivityTS = newRec.SpawnedAt
+	if err := tmux.Spawn(newRec.TmuxSession, newRec.Cwd, newRec.Command,
+		[]string{"FLEET_AGENT_ID=" + newRec.ID}); err != nil {
+		t.Fatalf("spawn journaled replacement: %v", err)
+	}
+	t.Cleanup(func() { _ = tmux.Kill(newRec.TmuxSession) })
+	if err := newRec.Write(); err != nil {
+		t.Fatalf("write journaled replacement: %v", err)
+	}
+
+	// Lock winner: a different standby that won the lease.
+	winner := agent.New(agent.NewID())
+	winner.TaskID = oldRec.TaskID
+	winner.Project = oldRec.Project
+	winner.Cwd = oldRec.Cwd
+	winner.Command = oldRec.Command
+	winner.TmuxSession = tmux.SessionName(winner.ID)
+	winner.SpawnedAt = time.Now().UTC()
+	winner.LastActivityTS = winner.SpawnedAt
+	winner.SupervisorPID = 9001
+	winner.SupervisorPidStart = 99
+	if err := winner.Write(); err != nil {
+		t.Fatalf("write lock-winning standby: %v", err)
+	}
+	if _, err := state.EnsureProjectInitialized(project); err != nil {
+		t.Fatalf("EnsureProjectInitialized: %v", err)
+	}
+	// Marker == oldRec.ID → isCoordSwap fires in case-3.
+	if err := state.WriteCoordSpawnMarker(project, oldRec.ID); err != nil {
+		t.Fatalf("WriteCoordSpawnMarker: %v", err)
+	}
+
+	req, qp := writeCoordSkillQueue(t, oldRec)
+	req.NewAgentID = newRec.ID
+	req.NewSession = newRec.TmuxSession
+	req.CapApproved = true // the authoritative lease-wrapped signal
+	if _, err := queue.WriteSpawnFresh(req); err != nil {
+		t.Fatalf("rewrite queue: %v", err)
+	}
+
+	origDeliveryDeps := handoffDeliveryDepsFn
+	origDeliveryTimeout := handoffDeliveryTimeout
+	origDeliveryPoll := handoffDeliveryPoll
+	t.Cleanup(func() {
+		handoffDeliveryDepsFn = origDeliveryDeps
+		handoffDeliveryTimeout = origDeliveryTimeout
+		handoffDeliveryPoll = origDeliveryPoll
+	})
+	handoffDeliveryTimeout = time.Second
+	handoffDeliveryPoll = time.Millisecond
+	var sentSession string
+	handoffDeliveryDepsFn = func() handoffdelivery.Deps {
+		deps := handoffdelivery.DefaultDeps()
+		deps.CurrentOwner = func(string) (coordlock.Owner, bool) {
+			return coordlock.Owner{AgentID: winner.ID, PID: winner.SupervisorPID, PidStart: winner.SupervisorPidStart}, true
+		}
+		deps.WaitReady = func(string) error { return nil }
+		deps.SessionAlive = func(string) (bool, error) { return true, nil }
+		deps.SendVerified = func(session, prompt string) (bool, error) {
+			sentSession = session
+			return true, nil
+		}
+		deps.Sleep = func(time.Duration) {}
+		return deps
+	}
+
+	out := &bytes.Buffer{}
+	if err := Resume(req, qp, 0, out, out); err != nil {
+		t.Fatalf("Resume case-3 should deliver to lock owner: %v\n%s", err, out.String())
+	}
+	if sentSession != winner.TmuxSession {
+		t.Fatalf("resume prompt sent to %q, want lock WINNER %q (not the queued loser %q)",
+			sentSession, winner.TmuxSession, newRec.TmuxSession)
+	}
+	if got := state.ReadCoordSpawnMarker(project); got != winner.ID {
+		t.Fatalf("coord marker = %q, want delivered lock owner %q", got, winner.ID)
+	}
+	if _, statErr := os.Stat(qp); !errors.Is(statErr, os.ErrNotExist) {
+		t.Fatalf("queue file should be consumed after verified delivery, stat err=%v", statErr)
+	}
+}

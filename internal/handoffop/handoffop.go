@@ -410,8 +410,10 @@ func Resume(req queue.SpawnFresh, queuePath string,
 			isCoordSwap = true
 		}
 	}
+	leaseWrappedSuccessor := req.CapApproved ||
+		!spawn.IsCoordSpawn(newRec.TaskID, newRec.Project)
 	return retireOldAgent(oldRec, newRec, req.HandoffDoc, queuePath,
-		thisHandoffDisable, graceMillis, isCoordSwap, stdout, stderr)
+		thisHandoffDisable, graceMillis, isCoordSwap, leaseWrappedSuccessor, stdout, stderr)
 }
 
 // cleanUpStaleQueue handles the "old record already archived" branch.
@@ -844,8 +846,10 @@ func spawnAndRetire(req queue.SpawnFresh, queuePath string,
 		}
 	}
 
+	leaseWrappedSuccessor := req.CapApproved ||
+		!spawn.IsCoordSpawn(newRec.TaskID, newRec.Project)
 	return retireOldAgent(oldRec, newRec, req.HandoffDoc, queuePath,
-		thisHandoffDisableAutoResume, graceMillis, isCoordSwap, stdout, stderr)
+		thisHandoffDisableAutoResume, graceMillis, isCoordSwap, leaseWrappedSuccessor, stdout, stderr)
 }
 
 // retireOldAgent runs the post-spawn tail in this order: wait for
@@ -887,9 +891,17 @@ func spawnAndRetire(req queue.SpawnFresh, queuePath string,
 // Rollback semantics on Kill failure: kill the new session, delete
 // the new record + queue, surface the live old session for operator
 // triage.
+// leaseWrappedSuccessor reports whether newRec is a lease-wrapped successor
+// (spawned via coord-run --standby), in which case the resume prompt must be
+// delivered to whoever wins the coordinator lease (DeliverToCurrentOwner)
+// rather than the queued session, which may have lost the race. The caller
+// threads it in because the queue's CapApproved flag — the authoritative
+// signal — is not reconstructable from the agent record alone (codex iter-18
+// [P1]: deriving it from TaskID here mis-routed recovered coord prompts to the
+// losing session).
 func retireOldAgent(oldRec, newRec *agent.Record, docPath, queuePath string,
 	disableAutoResume bool,
-	graceMillis int, isCoordSwap bool, stdout, stderr io.Writer) error {
+	graceMillis int, isCoordSwap, leaseWrappedSuccessor bool, stdout, stderr io.Writer) error {
 
 	// disableAutoResume comes from the caller so per-handoff
 	// overrides (queue's *bool) win over newRec's baseline policy
@@ -1028,7 +1040,6 @@ func retireOldAgent(oldRec, newRec *agent.Record, docPath, queuePath string,
 	supersededSession := ""
 	supersededID := ""
 	if autoResume {
-		leaseWrappedSuccessor := !spawn.IsCoordSpawn(newRec.TaskID, newRec.Project)
 		deliveredRec, err := deliverResumePrompt(oldRec.Project, isCoordSwap, leaseWrappedSuccessor,
 			newRec, docPath, stdout, stderr)
 		if err != nil {
