@@ -1235,6 +1235,16 @@ func runDispatch(opts *dispatchOpts, stdout io.Writer) error {
 	if newDocPath != "" && !disableAutoResume {
 		opts.prompt = handoff.ResumePrompt(newDocPath)
 	}
+	// attachID is the identity the operator/TUI should attach to. It defaults
+	// to the freshly-spawned standby (rec.ID), but the dead-coord recovery
+	// path may deliver to a DIFFERENT lock winner (a racing standby that won
+	// the lease first). In that case the authoritative coord is the delivered
+	// owner, not rec — so we retarget the "attach with" line to the owner
+	// DeliverToCurrentOwner returns (it already promoted the coord-spawn
+	// marker onto that owner). Without this, dispatch would advertise rec.ID,
+	// the TUI would re-stamp the marker onto the losing standby, and discovery
+	// would attach the operator to the wrong/dead session (codex iter-26 P1).
+	attachID := rec.ID
 	if opts.prompt != "" {
 		// Best-effort: a SendInitialPrompt failure here logs a warning
 		// to stderr but does NOT fail the dispatch — the session is up,
@@ -1261,13 +1271,25 @@ func runDispatch(opts *dispatchOpts, stdout io.Writer) error {
 		submitted := false
 		var perr error
 		if opts.coordSpawn && newDocPath != "" && leaseFailoverEnabled() {
-			_, perr = handoffdelivery.DeliverToCurrentOwner(handoffdelivery.Options{
+			var ownerRec *agent.Record
+			ownerRec, perr = deliverToCurrentOwner(handoffdelivery.Options{
 				Project:       rec.Project,
 				Prompt:        opts.prompt,
 				PromoteMarker: true,
 				Stdout:        stdout,
 				Stderr:        stdout,
-			}, handoffdelivery.DefaultDeps())
+			})
+			if perr == nil && ownerRec != nil && ownerRec.ID != "" {
+				attachID = ownerRec.ID
+				if ownerRec.ID != rec.ID {
+					// A racing standby won the lease; the doc + marker landed
+					// on it, not on the standby we just spawned. Tell the
+					// operator the real coord so they don't attach to the loser.
+					_, _ = fmt.Fprintf(stdout,
+						"note: another standby (%s) won the coord lease for project %s; resume prompt + coord marker delivered there\n",
+						ownerRec.ID, rec.Project)
+				}
+			}
 			if errors.Is(perr, handoffdelivery.ErrNoOwnerObserved) {
 				// Legacy/bare coord with no lease record: the owner-poll never
 				// converges. The freshly-spawned coord (rec) is live, so fall
@@ -1305,7 +1327,7 @@ func runDispatch(opts *dispatchOpts, stdout io.Writer) error {
 			_, _ = fmt.Fprintf(stdout, "  prompt:  delivered\n")
 		}
 	}
-	_, _ = fmt.Fprintf(stdout, "\nattach with: fleet attach %s\n", rec.ID)
+	_, _ = fmt.Fprintf(stdout, "\nattach with: fleet attach %s\n", attachID)
 	return nil
 }
 
@@ -1403,6 +1425,17 @@ func buildCoordRemoteControlSessionName(agentID, project string) string {
 // for the suffix-extension rationale.
 func buildHandoffRemoteControlSessionName(agentID, project string) string {
 	return spawn.HandoffRemoteControlSessionName(agentID, project)
+}
+
+// deliverToCurrentOwner is a var so tests can stub the lock-owner delivery
+// without seeding a live lease + healthy foreign owner PID + real tmux
+// session. Production calls handoffdelivery.DeliverToCurrentOwner with the
+// real lease/tmux deps. The returned record is the actual lease WINNER (which
+// may differ from the standby this dispatch just spawned when a racing standby
+// won first); callers must advertise the winner's identity, not the spawned
+// rec's (codex iter-26 P1).
+var deliverToCurrentOwner = func(opts handoffdelivery.Options) (*agent.Record, error) {
+	return handoffdelivery.DeliverToCurrentOwner(opts, handoffdelivery.DefaultDeps())
 }
 
 // sendInitialPrompt is a var so tests can stub the tmux interaction.
