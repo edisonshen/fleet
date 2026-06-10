@@ -34,9 +34,11 @@ package handoffop
 import (
 	"fmt"
 	"io"
+	"time"
 
 	"github.com/edisonshen/fleet/internal/agent"
 	"github.com/edisonshen/fleet/internal/coordlock"
+	"github.com/edisonshen/fleet/internal/spawn"
 	"github.com/edisonshen/fleet/internal/state"
 )
 
@@ -55,6 +57,10 @@ type GracefulHandoffInputs struct {
 	// rolling coord-checkpoint.md the skill maintains is the fallback).
 	CheckpointPath string
 	Checkpoint     []byte
+	// StandbyTimeout is passed to the SpawnStandby seam so production
+	// closures wire spawn.Options.StandbyTimeout for the one standby. 0 uses
+	// spawn.DefaultStandbyTimeout.
+	StandbyTimeout time.Duration
 }
 
 // GracefulHandoffDeps are the injectable seams that keep GracefulHandoff
@@ -63,11 +69,11 @@ type GracefulHandoffInputs struct {
 type GracefulHandoffDeps struct {
 	// SpawnStandby spawns exactly ONE warm-standby coord
 	// (coord-run --standby) in the background. Production wires a closure
-	// that calls spawn.Spawn with Options{Standby: true}. It MUST be called
-	// exactly once per GracefulHandoff. It should return enough context (via
-	// a closure capture) for ReapStandby to tear the standby down on a
-	// post-spawn abort.
-	SpawnStandby func() error
+	// that calls spawn.Spawn with Options{StandbyTimeout: timeout}. It MUST
+	// be called exactly once per GracefulHandoff. It should return enough
+	// context (via a closure capture) for ReapStandby to tear the standby
+	// down on a post-spawn abort.
+	SpawnStandby func(timeout time.Duration) error
 	// ReapStandby tears down the standby spawned by SpawnStandby. It is
 	// called ONLY when a post-spawn step fails (doc/checkpoint/drain/barrier)
 	// so a half-done graceful handoff does not leave a warm standby polling
@@ -157,7 +163,11 @@ func GracefulHandoff(in GracefulHandoffInputs, d GracefulHandoffDeps) error {
 	// no-leader gap. A spawn failure aborts: without a standby the graceful
 	// path has no receiver, so we must not proceed to write the barrier (the
 	// drain safety net / a retry handles it).
-	if err := d.SpawnStandby(); err != nil {
+	standbyTimeout := in.StandbyTimeout
+	if standbyTimeout <= 0 {
+		standbyTimeout = spawn.DefaultStandbyTimeout
+	}
+	if err := d.SpawnStandby(standbyTimeout); err != nil {
 		return fmt.Errorf("handoffop.GracefulHandoff: spawn standby for project %q: %w", project, err)
 	}
 	_, _ = fmt.Fprintf(stderr, "graceful-handoff: spawned standby coord for %s (epoch %d)\n", project, epoch)

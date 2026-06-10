@@ -45,6 +45,7 @@ func setupFleetHome(t *testing.T) string {
 func requireTmux(t *testing.T) {
 	t.Helper()
 	tmuxtest.RequireTmux(t)
+	t.Setenv("FLEET_LEASE_FAILOVER", "0")
 	// runHandoff calls spawn.SendInitialPrompt between step 8a and
 	// step 9; the helper polls pane stability before typing. Pin
 	// small windows so tests don't pay the production 30 s cap on
@@ -557,6 +558,133 @@ func TestHandoff_CoordRefusesWhenUnresolvable(t *testing.T) {
 			t.Cleanup(func() { _ = tmux.Kill(l.TmuxSession) })
 			t.Errorf("coord handoff spawned a replacement %q despite refusal", l.ID)
 		}
+	}
+}
+
+func TestHandoff_LeaseFailoverCoordHandoffRefusesBeforeRetiringOld(t *testing.T) {
+	requireTmux(t)
+	t.Setenv("FLEET_LEASE_FAILOVER", "1")
+	root := setupFleetHome(t)
+
+	const project = "rainier"
+	cwd := seedRecoveryRepo(t, root, project)
+	old := agent.New(agent.NewID())
+	old.TaskID = "coord-" + project
+	old.Project = project
+	old.Cwd = cwd
+	old.Command = []string{"sleep", "60"}
+	old.TmuxSession = tmux.SessionName(old.ID)
+	old.SpawnedAt = time.Now().UTC()
+	old.LastActivityTS = old.SpawnedAt
+	old.SupervisorPID = 4242
+	origOwner := handoffLeaseActiveOwnerPIDFn
+	origLeader := handoffLeaseLeaderPresentFn
+	handoffLeaseActiveOwnerPIDFn = func(p string) (int, bool) {
+		if p != project {
+			t.Fatalf("active owner checked for project %q, want %q", p, project)
+		}
+		return old.SupervisorPID, true
+	}
+	handoffLeaseLeaderPresentFn = func(p string) bool {
+		if p != project {
+			t.Fatalf("leader checked for project %q, want %q", p, project)
+		}
+		return true
+	}
+	t.Cleanup(func() {
+		handoffLeaseActiveOwnerPIDFn = origOwner
+		handoffLeaseLeaderPresentFn = origLeader
+	})
+	if err := tmux.Spawn(old.TmuxSession, old.Cwd, old.Command, []string{"FLEET_AGENT_ID=" + old.ID}); err != nil {
+		t.Fatalf("spawn old coord: %v", err)
+	}
+	t.Cleanup(func() { _ = tmux.Kill(old.TmuxSession) })
+	if err := old.Write(); err != nil {
+		t.Fatalf("write old coord: %v", err)
+	}
+	if _, err := state.EnsureProjectInitialized(project); err != nil {
+		t.Fatalf("EnsureProjectInitialized: %v", err)
+	}
+	if err := state.WriteCoordSpawnMarker(project, old.ID); err != nil {
+		t.Fatalf("seed marker: %v", err)
+	}
+
+	out := &bytes.Buffer{}
+	err := runHandoff(&handoffOpts{
+		oldID:       old.ID,
+		command:     []string{"sleep", "60"},
+		graceMillis: 0,
+	}, out, out)
+	if err == nil {
+		t.Fatal("expected failover coord handoff to refuse before retiring old")
+	}
+	if !strings.Contains(err.Error(), "cannot verify its child before retiring old coord") {
+		t.Fatalf("refusal did not explain child verification gap: %v\n%s", err, out.String())
+	}
+	if _, lerr := agent.Load(old.ID); lerr != nil {
+		t.Fatalf("old coord record was not preserved: %v", lerr)
+	}
+	if got := state.ReadCoordSpawnMarker(project); got != old.ID {
+		t.Fatalf("coord marker = %q, want old id %q", got, old.ID)
+	}
+	qp, qerr := state.QueuePath(queue.SpawnFreshName(old.ID))
+	if qerr != nil {
+		t.Fatalf("QueuePath: %v", qerr)
+	}
+	if _, statErr := os.Stat(qp); statErr != nil {
+		t.Fatalf("queue file should be preserved for retry: %v", statErr)
+	}
+}
+
+func TestHandoff_ShouldRefuseLeaseWrappedCoordHandoffRetire_RequiresLiveOld(t *testing.T) {
+	t.Setenv("FLEET_LEASE_FAILOVER", "1")
+	oldRec := &agent.Record{ID: "oldcoord", Project: "rainier", SupervisorPID: 4242}
+
+	origOwner := handoffLeaseActiveOwnerPIDFn
+	origLeader := handoffLeaseLeaderPresentFn
+	handoffLeaseActiveOwnerPIDFn = func(project string) (int, bool) {
+		if project != oldRec.Project {
+			t.Fatalf("active owner checked for project %q, want %q", project, oldRec.Project)
+		}
+		return 0, false
+	}
+	handoffLeaseLeaderPresentFn = func(string) bool { return true }
+	t.Cleanup(func() {
+		handoffLeaseActiveOwnerPIDFn = origOwner
+		handoffLeaseLeaderPresentFn = origLeader
+	})
+
+	refuse, err := shouldRefuseLeaseWrappedCoordHandoffRetire(oldRec)
+	if err != nil {
+		t.Fatalf("shouldRefuseLeaseWrappedCoordHandoffRetire: %v", err)
+	}
+	if refuse {
+		t.Fatal("old coord is not the active lease owner; handoff must not drop a valid standby")
+	}
+
+	ownerReads := 0
+	handoffLeaseActiveOwnerPIDFn = func(string) (int, bool) {
+		ownerReads++
+		if ownerReads == 1 {
+			return oldRec.SupervisorPID, true
+		}
+		return oldRec.SupervisorPID + 1, true
+	}
+	refuse, err = shouldRefuseLeaseWrappedCoordHandoffRetire(oldRec)
+	if err != nil {
+		t.Fatalf("shouldRefuseLeaseWrappedCoordHandoffRetire owner-race: %v", err)
+	}
+	if refuse {
+		t.Fatal("active owner moved to successor after health check; must not drop standby")
+	}
+
+	handoffLeaseActiveOwnerPIDFn = func(string) (int, bool) { return oldRec.SupervisorPID, true }
+	refuse, err = shouldRefuseLeaseWrappedCoordHandoffRetire(oldRec)
+	if err != nil {
+		t.Fatalf("shouldRefuseLeaseWrappedCoordHandoffRetire active-old: %v", err)
+	}
+	if !refuse {
+		t.Fatal("old coord owns the active lease; PR1 must refuse before retiring it behind a standby supervisor")
 	}
 }
 

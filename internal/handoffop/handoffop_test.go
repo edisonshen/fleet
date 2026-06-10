@@ -37,6 +37,7 @@ func setupFleetHome(t *testing.T) string {
 func requireTmux(t *testing.T) {
 	t.Helper()
 	tmuxtest.RequireTmux(t)
+	t.Setenv("FLEET_LEASE_FAILOVER", "0")
 	// retireOldAgent calls spawn.SendInitialPrompt, which polls the
 	// pane for stability. Production windows (500 ms stable / 30 s
 	// max) would balloon the suite; tests pin small values that
@@ -1370,6 +1371,46 @@ func TestDrain_CoordHandoff_WritesMarkerBeforeInject(t *testing.T) {
 	if calls[0] != oldRec.Project {
 		t.Errorf("first writeMarkerFn call: got project=%q want %q", calls[0], oldRec.Project)
 	}
+}
+
+func TestDrain_LeaseFailoverCoordHandoff_ResumeFallbackCompletes(t *testing.T) {
+	requireTmux(t)
+	t.Setenv("FLEET_LEASE_FAILOVER", "1")
+	setupFleetHome(t)
+
+	const project = "rainier"
+	cwd := seedCoordRepoMeta(t, project)
+	oldRec := spawnSeedCoord(t, project, cwd)
+	oldRec.SupervisorPID = 4242
+	if err := oldRec.Write(); err != nil {
+		t.Fatalf("rewrite old coord supervisor pid: %v", err)
+	}
+	if _, err := state.EnsureProjectInitialized(oldRec.Project); err != nil {
+		t.Fatalf("EnsureProjectInitialized: %v", err)
+	}
+	if err := state.WriteCoordSpawnMarker(oldRec.Project, oldRec.ID); err != nil {
+		t.Fatalf("WriteCoordSpawnMarker: %v", err)
+	}
+
+	req, qp := writeCoordSkillQueue(t, oldRec)
+	out := &bytes.Buffer{}
+	if err := Resume(req, qp, 0, out, out); err != nil {
+		t.Fatalf("Resume must complete the drain cold-resume fallback, got: %v\n%s", err, out.String())
+	}
+	if _, lerr := agent.Load(oldRec.ID); !errors.Is(lerr, state.ErrNotFound) {
+		t.Fatalf("old coord record should be archived after fallback resume, load err=%v", lerr)
+	}
+	if got := state.ReadCoordSpawnMarker(oldRec.Project); got != req.NewAgentID {
+		t.Fatalf("coord marker = %q, want new id %q", got, req.NewAgentID)
+	}
+	if _, statErr := os.Stat(qp); !errors.Is(statErr, os.ErrNotExist) {
+		t.Fatalf("queue file should be consumed, stat err=%v", statErr)
+	}
+	newRec, lerr := agent.Load(req.NewAgentID)
+	if lerr != nil {
+		t.Fatalf("replacement record should remain live after fallback resume: %v", lerr)
+	}
+	t.Cleanup(func() { _ = tmux.Kill(newRec.TmuxSession) })
 }
 
 // TestDrain_WorkerHandoff_NoMarkerWrite pins

@@ -1125,14 +1125,9 @@ func runDispatch(opts *dispatchOpts, stdout io.Writer) error {
 		Engine:            engineName,
 		// LeaderCheck lets spawn distinguish a clean lease stand-down from
 		// a supervisor failure on the lease-wrapped coord path (PR2).
-		LeaderCheck: coordLeaderCheck,
-		// RecoverDeadCoord: when oldRecord != nil on the DISPATCH path it
-		// is a DEAD-coord recovery (findRecoveryCandidate found it dead) —
-		// a FRESH leader whose predecessor is gone, so it MUST be
-		// lease-wrapped (codex PR2 iter-8 [P1]). This is distinct from a
-		// LIVE handoff successor (internal/handoffop), where the outgoing
-		// coord still holds the lease and the successor must NOT be wrapped.
-		RecoverDeadCoord: oldRecord != nil,
+		LeaderCheck:    coordLeaderCheck,
+		ActiveOwnerPID: leaseActiveOwnerPID,
+		StandbyTimeout: spawn.DefaultStandbyTimeout,
 	})
 	// Lease stand-down (DESIGN-handoff-drain-storm-leak PR2): the wrapped
 	// coord-run supervisor found a healthy leader already holding the

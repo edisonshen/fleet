@@ -654,7 +654,8 @@ func spawnAndRetire(req queue.SpawnFresh, queuePath string,
 	// unresolvable project. persist=true (handoff is operator-initiated).
 	// Worker handoffs keep inheriting oldRec.Cwd.
 	spawnCwd := oldRec.Cwd
-	if spawn.IsCoordSpawn(oldRec.TaskID, oldRec.Project) {
+	legacyCoordResume := spawn.IsCoordSpawn(oldRec.TaskID, oldRec.Project)
+	if legacyCoordResume {
 		resolved, rerr := coordrepo.ResolveProjectRepo(oldRec.Project, true)
 		if rerr != nil {
 			return fmt.Errorf("resume: coord handoff for project %q: %w", oldRec.Project, rerr)
@@ -674,6 +675,8 @@ func spawnAndRetire(req queue.SpawnFresh, queuePath string,
 		// legacy case). A v1 drain shouldn't permanently flip the
 		// new record's baseline to opt-out (codex iter-18 P2).
 		DisableAutoResume: disableAutoResume,
+		StandbyTimeout:    spawn.DefaultStandbyTimeout,
+		DisableLeaseWrap:  legacyCoordResume,
 	})
 	if err != nil {
 		return fmt.Errorf("resume: spawn replacement: %w", err)
@@ -798,7 +801,6 @@ func retireOldAgent(oldRec, newRec *agent.Record, docPath, queuePath string,
 	// this respects the iter-2 P2 invariant. If the new agent dies
 	// during the wait, OLD is still alive; roll back the new and
 	// return so operator/recovery can retry cleanly.
-	//
 	// Always runs, even when auto-resume is disabled (codex iter-9
 	// P1): the wait doubles as a post-spawn liveness check, catching
 	// wrappers that survive the immediate HasSession check but crash

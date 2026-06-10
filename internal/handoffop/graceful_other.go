@@ -13,6 +13,7 @@ package handoffop
 import (
 	"errors"
 	"io"
+	"time"
 
 	"github.com/edisonshen/fleet/internal/agent"
 )
@@ -31,11 +32,12 @@ type GracefulHandoffInputs struct {
 	HandoffDoc     []byte
 	CheckpointPath string
 	Checkpoint     []byte
+	StandbyTimeout time.Duration
 }
 
 // GracefulHandoffDeps mirrors the linux/darwin definition.
 type GracefulHandoffDeps struct {
-	SpawnStandby  func() error
+	SpawnStandby  func(timeout time.Duration) error
 	ReapStandby   func() error
 	WriteAtomic   func(path string, data []byte) error
 	DrainInFlight func() error

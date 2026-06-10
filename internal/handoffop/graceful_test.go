@@ -17,6 +17,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/edisonshen/fleet/internal/agent"
 )
@@ -76,15 +77,19 @@ const (
 // + checkpoint BEFORE the barrier, and the barrier names the captured epoch.
 func TestGracefulHandoff_EndToEnd_OneStandby_BarrierLast(t *testing.T) {
 	rec := newGracefulRecorder()
+	wantTimeout := 3 * time.Minute
+	var gotTimeout time.Duration
 	in := GracefulHandoffInputs{
 		OldRec:         oldRecForGraceful(),
 		HandoffDocPath: gracefulDocPath,
 		HandoffDoc:     []byte("# handoff doc\n"),
 		CheckpointPath: gracefulCheckpointPath,
 		Checkpoint:     []byte(`{"state":"snapshot"}`),
+		StandbyTimeout: wantTimeout,
 	}
 	deps := GracefulHandoffDeps{
-		SpawnStandby: func() error {
+		SpawnStandby: func(timeout time.Duration) error {
+			gotTimeout = timeout
 			rec.mu.Lock()
 			rec.standbyRuns++
 			rec.mu.Unlock()
@@ -105,6 +110,9 @@ func TestGracefulHandoff_EndToEnd_OneStandby_BarrierLast(t *testing.T) {
 
 	if standby != 1 {
 		t.Errorf("standby spawned %d times, want exactly 1", standby)
+	}
+	if gotTimeout != wantTimeout {
+		t.Errorf("standby timeout = %s, want %s", gotTimeout, wantTimeout)
 	}
 	// The barrier must be the LAST write, and it must come after the doc +
 	// checkpoint writes AND the drain.
@@ -155,7 +163,7 @@ func TestGracefulHandoff_CheckpointError_NoBarrier(t *testing.T) {
 		Checkpoint:     []byte("{}"),
 	}
 	deps := GracefulHandoffDeps{
-		SpawnStandby: func() error { rec.standbyRuns++; return nil },
+		SpawnStandby: func(time.Duration) error { rec.standbyRuns++; return nil },
 		WriteAtomic: func(path string, data []byte) error {
 			if path == gracefulCheckpointPath {
 				return wantErr // torn checkpoint
@@ -188,7 +196,7 @@ func TestGracefulHandoff_DrainError_NoBarrier(t *testing.T) {
 		Checkpoint:     []byte("{}"),
 	}
 	deps := GracefulHandoffDeps{
-		SpawnStandby:  func() error { return nil },
+		SpawnStandby:  func(time.Duration) error { return nil },
 		WriteAtomic:   rec.write,
 		DrainInFlight: func() error { return wantErr },
 		CurrentEpoch:  func(string) (int64, bool) { return 7, true },
@@ -219,7 +227,7 @@ func TestGracefulHandoff_PostSpawnAbort_ReapsStandby(t *testing.T) {
 		Checkpoint:     []byte("{}"),
 	}
 	deps := GracefulHandoffDeps{
-		SpawnStandby: func() error { rec.standbyRuns++; return nil },
+		SpawnStandby: func(time.Duration) error { rec.standbyRuns++; return nil },
 		ReapStandby:  func() error { reaped++; return nil },
 		WriteAtomic: func(path string, data []byte) error {
 			if path == gracefulCheckpointPath {
@@ -255,7 +263,7 @@ func TestGracefulHandoff_Success_DoesNotReapStandby(t *testing.T) {
 		Checkpoint:     []byte("{}"),
 	}
 	deps := GracefulHandoffDeps{
-		SpawnStandby: func() error { rec.standbyRuns++; return nil },
+		SpawnStandby: func(time.Duration) error { rec.standbyRuns++; return nil },
 		ReapStandby:  func() error { reaped++; return nil },
 		WriteAtomic:  rec.write,
 		CurrentEpoch: func(string) (int64, bool) { return 7, true },
@@ -282,7 +290,7 @@ func TestGracefulHandoff_SpawnError_NothingWritten(t *testing.T) {
 		Checkpoint:     []byte("{}"),
 	}
 	deps := GracefulHandoffDeps{
-		SpawnStandby: func() error { return wantErr },
+		SpawnStandby: func(time.Duration) error { return wantErr },
 		WriteAtomic:  rec.write,
 		CurrentEpoch: func(string) (int64, bool) { return 7, true },
 		BarrierPath:  func(_ string, _ int64) (string, error) { return gracefulBarrierPath, nil },
@@ -302,7 +310,7 @@ func TestGracefulHandoff_NoEpoch_Refuses(t *testing.T) {
 	rec := newGracefulRecorder()
 	in := GracefulHandoffInputs{OldRec: oldRecForGraceful()}
 	deps := GracefulHandoffDeps{
-		SpawnStandby: func() error { rec.standbyRuns++; return nil },
+		SpawnStandby: func(time.Duration) error { rec.standbyRuns++; return nil },
 		WriteAtomic:  rec.write,
 		CurrentEpoch: func(string) (int64, bool) { return 0, false }, // no lease
 		BarrierPath:  func(_ string, _ int64) (string, error) { return gracefulBarrierPath, nil },

@@ -113,6 +113,24 @@ const (
 	unsubmittedTailLines = 12
 )
 
+var (
+	supervisorStampWaitAttempts = 25
+	supervisorStampWaitDelay    = 100 * time.Millisecond
+)
+
+func waitForSupervisorStamp(agentID string) {
+	for i := 0; i < supervisorStampWaitAttempts; i++ {
+		rec, err := agent.Load(agentID)
+		if errors.Is(err, state.ErrNotFound) {
+			return
+		}
+		if err == nil && rec.SupervisorPID > 0 {
+			return
+		}
+		time.Sleep(supervisorStampWaitDelay)
+	}
+}
+
 func initialPromptStableWindow() time.Duration {
 	return envDuration("FLEET_INITIAL_PROMPT_STABLE_MS",
 		defaultInitialPromptStableWindow)
@@ -198,37 +216,32 @@ var propagatedRuntimeEnv = []string{
 // default-ON flag from wrapping coords on a platform where the supervisor
 // can't actually hold a lease.
 
+// DefaultStandbyTimeout is the single generous bound every lease-wrapped
+// coordinator spawn passes to `fleet coord-run --standby`.
+const DefaultStandbyTimeout = 10 * time.Minute
+
 // shouldLeaseWrap decides whether this spawn wraps the coord in the
-// `fleet coord-run` lease supervisor (DESIGN-handoff-drain-storm-leak
-// PR2). ALL must hold: failover on; this is a coord spawn; and it is NOT
-// a LIVE handoff/drain successor.
-//
-// A live handoff successor is spawned while the outgoing coord still
-// holds the lease, so wrapping it would make it stand down and never
-// start — lease-transfer handoff is PR3 (codex PR2 iter-7 [P1]). A
-// dead-coord RECOVERY, by contrast, is a fresh leader (predecessor gone)
-// and IS wrapped, so the caller must NOT classify a recovery as a live
-// successor (codex PR2 iter-8 [P1] — see Options.RecoverDeadCoord).
-func shouldLeaseWrap(failoverOn, isCoord, liveHandoffSuccessor bool) bool {
-	return failoverOn && isCoord && !liveHandoffSuccessor
+// `fleet coord-run` lease supervisor. PR1 collapses fresh dispatch and
+// dead-coord recovery onto coord-run --standby when failover is enabled, while
+// workers, unsupported platforms, and explicit legacy fallbacks stay bare.
+func shouldLeaseWrap(failoverOn, isCoord, disable bool) bool {
+	return failoverOn && isCoord && !disable
 }
 
 // coordRunWrap builds the lease-failover exec argv: the engine argv
-// supervised by `fleet coord-run` (DESIGN-handoff-drain-storm-leak PR2/PR3).
+// supervised by `fleet coord-run --standby`.
 // Pure + does not mutate argv. The persisted rec.Command stays clean;
-// only the EXECUTION argv is wrapped. When standby is set, `--standby` is
-// added so the supervisor POLLS a busy lease (PR3 warm standby) instead of
-// standing down.
+// only the EXECUTION argv is wrapped. `--standby` polls a busy healthy
+// leader until it releases or the standby timeout expires.
 //
 //	["<fleetBin>","coord-run","--agent",<id>,"--project",<p>,
-//	 ("--standby",)? "--",<argv...>]
-func coordRunWrap(fleetBin, agentID, project string, standby bool, argv []string) []string {
-	wrapped := make([]string, 0, len(argv)+8)
+//	 "--standby","--standby-timeout",<T>,"--",<argv...>]
+func coordRunWrap(fleetBin, agentID, project string, standbyTimeout time.Duration, argv []string) []string {
+	standbyTimeout = standbyTimeoutOrDefault(standbyTimeout)
+	wrapped := make([]string, 0, len(argv)+10)
 	wrapped = append(wrapped, fleetBin, "coord-run",
 		"--agent", agentID, "--project", project)
-	if standby {
-		wrapped = append(wrapped, "--standby")
-	}
+	wrapped = append(wrapped, "--standby", "--standby-timeout", standbyTimeout.String())
 	wrapped = append(wrapped, "--")
 	return append(wrapped, argv...)
 }
@@ -241,6 +254,50 @@ func coordRunWrap(fleetBin, agentID, project string, standby bool, argv []string
 func alreadyCoordRunWrapped(argv []string) bool {
 	return len(argv) >= 2 && argv[1] == "coord-run" &&
 		strings.Contains(strings.ToLower(filepath.Base(argv[0])), "fleet")
+}
+
+func standbyTimeoutOrDefault(d time.Duration) time.Duration {
+	if d <= 0 {
+		return DefaultStandbyTimeout
+	}
+	return d
+}
+
+func augmentCoordRunWrap(argv []string, standbyTimeout time.Duration) []string {
+	standbyTimeout = standbyTimeoutOrDefault(standbyTimeout)
+	sep := len(argv)
+	for i, arg := range argv {
+		if arg == "--" {
+			sep = i
+			break
+		}
+	}
+
+	head := argv[:sep]
+	tail := argv[sep:]
+	out := make([]string, 0, len(argv)+3)
+	hasStandby := false
+	for i := 0; i < len(head); i++ {
+		arg := head[i]
+		switch {
+		case arg == "--standby":
+			hasStandby = true
+			out = append(out, arg)
+		case arg == "--standby-timeout":
+			if i+1 < len(head) {
+				i++
+			}
+		case strings.HasPrefix(arg, "--standby-timeout="):
+			// Replaced below with the caller's current timeout value.
+		default:
+			out = append(out, arg)
+		}
+	}
+	if !hasStandby {
+		out = append(out, "--standby")
+	}
+	out = append(out, "--standby-timeout", standbyTimeout.String())
+	return append(out, tail...)
 }
 
 func envDuration(key string, fallback time.Duration) time.Duration {
@@ -670,29 +727,32 @@ type Options struct {
 	// coordlock.CurrentActiveOwnerPID via cmd/fleet (spawn cannot import
 	// coordlock — it is build-tagged to linux/darwin while spawn is
 	// all-platforms).
-	LeaderCheck func(project string) bool
+	LeaderCheck    func(project string) bool
+	ActiveOwnerPID func(project string) (int, bool)
 
-	// RecoverDeadCoord marks an OldRecord-carrying spawn as a DEAD-coord
-	// RECOVERY (the predecessor is gone) rather than a LIVE handoff
-	// successor. It flips the lease-wrap decision: a recovery is a fresh
-	// leader and MUST be lease-wrapped, while a live handoff successor must
-	// NOT (the outgoing coord still holds the lease). Set by the dispatch
-	// recovery path; left false by internal/handoffop's live handoff
-	// (codex PR2 iter-8 [P1]). Ignored when OldRecord is nil.
-	RecoverDeadCoord bool
+	// StandbyTimeout bounds how long a lease-wrapped coord-run --standby
+	// polls behind a healthy leader before self-exiting cleanly. 0 uses
+	// DefaultStandbyTimeout. Ignored when failover is off or this is not a
+	// coord spawn.
+	StandbyTimeout time.Duration
 
-	// Standby marks this spawn as a WARM-STANDBY coord
-	// (DESIGN-handoff-drain-storm-leak §3(A), PR3). A standby is lease-
-	// wrapped with `fleet coord-run --standby` so that — unlike a normal
-	// live handoff successor (which is spawned UNWRAPPED, see
-	// liveHandoffSuccessor) — it POLLS the busy lease until the outgoing
-	// leader exits rather than standing down. The OLD coord spawns exactly
-	// one standby at the start of a graceful handoff (internal/handoffop's
-	// GracefulHandoff), then retires; the standby's next poll acquires the
-	// kernel-released flock and becomes leader. Forces the coord-run wrap
-	// even though OldRecord is set (it is the receiving half of the
-	// lease-transfer handoff PR2 deferred). Ignored when failover is off.
-	Standby bool
+	// DisableLeaseWrap keeps a coord spawn on the legacy bare-engine path even
+	// when lease failover is enabled. It is reserved for handoffop's drain
+	// cold-resume fallback, where the existing contract requires the successor
+	// to start immediately instead of waiting behind the still-live leader.
+	DisableLeaseWrap bool
+}
+
+func shouldStandDownLeaseWrappedSpawn(project string, supervisorPID int,
+	leaderCheck func(string) bool, activeOwnerPID func(string) (int, bool)) bool {
+	if leaderCheck == nil || activeOwnerPID == nil || supervisorPID <= 0 {
+		return false
+	}
+	if !leaderCheck(project) {
+		return false
+	}
+	ownerPID, ok := activeOwnerPID(project)
+	return ok && ownerPID > 0 && ownerPID != supervisorPID
 }
 
 // Spawn creates a fresh agent (or a handoff replacement, if
@@ -937,46 +997,24 @@ func Spawn(opts Options) (*agent.Record, error) {
 	}
 
 	// Lease-failover supervisor wrap (DESIGN-handoff-drain-storm-leak
-	// PR2). Applied HERE — not at the dispatch call site — so the wrap
-	// covers the fresh `fleet dispatch --coord-spawn` path regardless of
-	// caller. Wrapping the EXECUTION argv only (rc-rewrite preserved as
-	// the tail) keeps the persisted rec.Command clean.
-	//
-	//	execArgv = ["<fleetBin>","coord-run","--agent",<id>,
-	//	            "--project",<p>,"--", <prev execArgv ...>]
-	//
-	// FRESH COORDS ONLY (opts.OldRecord == nil) — codex PR2 iter-7 [P1].
-	// A handoff/drain SUCCESSOR (OldRecord != nil) is spawned while the
-	// OUTGOING coord is STILL ALIVE and holding the lease; if we wrapped
-	// the successor it would AcquireLease, see the healthy outgoing
-	// leader, STAND DOWN, and never start — so the handoff could never
-	// produce a replacement. Lease-transfer handoff (the outgoing coord
-	// releases, a warm `--standby` successor POLLS until it acquires) is
-	// PR3's job. Until PR3, a successor spawns UNWRAPPED (no lease); the
-	// dispatch veto + coord-spawn.lock remain the singleton guard for the
-	// successor, and FLEET_LEASE_FAILOVER stays OFF/unsupported (see
-	// internal/coordlock/lease.go) until that transfer path lands.
-	//
-	// leaseWrapped also stays true for an already-coord-run-wrapped
-	// ExecCommand (codex iter-6 [P2]) so the pre-launch record +
-	// stand-down lifecycle handling below still applies — but only on the
-	// fresh path; a handoff successor is never wrapped here.
-	// A LIVE handoff successor = OldRecord present AND not a dead-coord
-	// recovery. A dead-coord recovery (RecoverDeadCoord) is a fresh leader
-	// and IS wrapped.
-	// A WARM STANDBY (PR3) is the one OldRecord-carrying spawn that IS
-	// wrapped: it must run `coord-run --standby` so it polls the busy lease
-	// instead of standing down. So a standby is NOT a "live handoff
-	// successor" for the wrap decision even though OldRecord is set.
-	liveHandoffSuccessor := opts.OldRecord != nil && !opts.RecoverDeadCoord && !opts.Standby
+	// PR1 spawn-collapse: every coord spawn runs under
+	// `fleet coord-run --standby --standby-timeout T` when lease failover
+	// is enabled. Applied HERE — not at individual call sites — so fresh
+	// dispatch and dead-coord recovery share the same heartbeat-owning
+	// supervisor path. Wrapping the EXECUTION argv only keeps the persisted
+	// rec.Command clean. Handoffop's documented drain cold-resume fallback can
+	// opt out with DisableLeaseWrap because it must start a bare successor
+	// while the old leader is still live.
 	leaseWrapped := false
-	if shouldLeaseWrap(leaseFailoverEnabled(), isCoordSpawn(rec.TaskID, rec.Project), liveHandoffSuccessor) {
+	if shouldLeaseWrap(leaseFailoverEnabled(), isCoordSpawn(rec.TaskID, rec.Project), opts.DisableLeaseWrap) {
+		standbyTimeout := standbyTimeoutOrDefault(opts.StandbyTimeout)
 		switch {
 		case alreadyCoordRunWrapped(execArgv):
+			execArgv = augmentCoordRunWrap(execArgv, standbyTimeout)
 			leaseWrapped = true // a supervisor will run; apply lifecycle handling
 		default:
 			if fleetBin, exeErr := os.Executable(); exeErr == nil && fleetBin != "" {
-				execArgv = coordRunWrap(fleetBin, id, rec.Project, opts.Standby, execArgv)
+				execArgv = coordRunWrap(fleetBin, id, rec.Project, standbyTimeout, execArgv)
 				leaseWrapped = true
 			} else {
 				_, _ = fmt.Fprintf(os.Stderr,
@@ -1031,17 +1069,13 @@ func Spawn(opts Options) (*agent.Record, error) {
 	// resolveEnginePid blocks up to pidResolveTimeout; on timeout it
 	// returns the pane pid as a best-effort fallback (wrong-but-live
 	// beats os.Getpid which is dead by construction).
-	// WARM STANDBY (PR3): the wrapped `coord-run --standby` supervisor does
-	// NOT launch the engine child until it acquires the lease (after the old
-	// leader exits). So the pane's process tree contains ONLY the supervisor
-	// right now — running the engine-pid resolver would block the full timeout
-	// and then fall back to the pane/supervisor pid, corrupting the
-	// PID==engine vs SupervisorPID==lease-holder split (codex PR3 iter-12
-	// [P2]). Skip it: leave rec.PID provisional; the supervisor stamps the
-	// real engine pid after it acquires + starts the engine (via the
-	// fleet-guard heartbeat / supervisor identity stamp). Non-standby spawns
-	// resolve immediately as before.
-	if !opts.Standby {
+	// Lease-wrapped coords always run through `coord-run --standby`. The
+	// supervisor may not launch the engine until after Spawn returns (busy
+	// lease), and even a free lease stamps the real engine pid itself after
+	// child start. Running the tmux engine-pid resolver here would observe
+	// the supervisor rather than the child on the busy path. Non-lease
+	// spawns keep the legacy resolver.
+	if !leaseWrapped {
 		disambiguator := pidResolveDisambiguator(id, execArgv)
 		engineHint := pidResolveEngineHint(rec.Engine, opts.OldRecord, opts.Command)
 		resolvedPid, _, resolveErr := resolveEnginePid(
@@ -1091,6 +1125,9 @@ func Spawn(opts Options) (*agent.Record, error) {
 	// stand-down disambiguation (iter-3/6) inside the same critical
 	// section.
 	if leaseWrapped {
+		if opts.LeaderCheck != nil && opts.ActiveOwnerPID != nil {
+			waitForSupervisorStamp(id)
+		}
 		unlock, lkErr := state.LockAgent(id)
 		if lkErr != nil {
 			_ = tmux.Kill(session)
@@ -1127,16 +1164,24 @@ func Spawn(opts Options) (*agent.Record, error) {
 			rec.SupervisorPID = onDisk.SupervisorPID
 			rec.SupervisorPidStart = onDisk.SupervisorPidStart
 			rec.SupervisorExePath = onDisk.SupervisorExePath
-			// WARM STANDBY (codex PR3 iter-14 [P2]): a standby spawn SKIPPED
-			// engine-pid resolution, so our in-memory rec.PID is still the
-			// provisional spawning-CLI pid. If `coord-run --standby` already
-			// acquired the lease and stamped the REAL engine child pid (via
-			// agent.StampEnginePID) before this final locked write, onDisk.PID
-			// holds it — carry it forward so we don't clobber the live successor's
-			// pid back to the dead provisional one. (Non-standby spawns resolved
-			// rec.PID themselves above, so this preserves their value too when
-			// onDisk agrees; only adopt onDisk.PID when it differs and is live.)
-			if opts.Standby && onDisk.PID > 0 && onDisk.PID != rec.PID {
+			if shouldStandDownLeaseWrappedSpawn(rec.Project, rec.SupervisorPID,
+				opts.LeaderCheck, opts.ActiveOwnerPID) {
+				unlock()
+				_ = tmux.Kill(session)
+				if livePath, perr := state.AgentPath(id); perr == nil {
+					_ = os.Remove(livePath)
+				}
+				_, _ = fmt.Fprintf(os.Stderr,
+					"spawn: coord %s stood down — a healthy leader already holds the lease "+
+						"for %q; not leaving an idle standby record\n", id, rec.Project)
+				return rec, ErrCoordStoodDown
+			}
+			// A lease-wrapped standby spawn skipped engine-pid resolution, so
+			// our in-memory rec.PID may still be the provisional spawning-CLI
+			// pid. If coord-run already acquired the lease and stamped the real
+			// engine child pid before this final locked write, carry it forward
+			// so the merge does not clobber it back to the provisional pid.
+			if onDisk.PID > 0 && onDisk.PID != rec.PID {
 				rec.PID = onDisk.PID
 			}
 		}

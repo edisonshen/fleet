@@ -977,6 +977,41 @@ func TestHeartbeatRenewsRenewedAt(t *testing.T) {
 	}
 }
 
+func TestIdleLeaderHeartbeatRenewsAcrossIntervals(t *testing.T) {
+	setupHome(t)
+	const project = "idle-renew"
+	clk := &fakeClock{}
+	live := newFakeLiveness()
+	cfg := testCfg(clk, live)
+	paths, _ := resolvePaths(project)
+
+	l := &Lease{
+		cfg: cfg, paths: paths,
+		self: identity{Pid: os.Getpid(), PidStart: selfStart, AgentID: "idle-coord", Project: project},
+		host: "h", boot: "test-boot-1", epoch: 3,
+	}
+	writeEpochRaw(t, project, epochRecord{
+		Epoch: 3, State: stateActive, Owner: l.self,
+		BootID: "test-boot-1", RenewedAtMono: 0,
+	})
+
+	for i := 1; i <= 5; i++ {
+		clk.advance(cfg.heartbeat)
+		ok, err := l.heartbeatOnce()
+		if err != nil || !ok {
+			t.Fatalf("heartbeat %d should renew an idle leader, got ok=%v err=%v", i, ok, err)
+		}
+		rec := readEpochFor(t, project)
+		want := int64(time.Duration(i) * cfg.heartbeat)
+		if rec.RenewedAtMono != want {
+			t.Fatalf("heartbeat %d renewed_at_mono = %d, want %d", i, rec.RenewedAtMono, want)
+		}
+		if rec.Epoch != 3 || rec.Owner.AgentID != "idle-coord" {
+			t.Fatalf("heartbeat %d changed lease identity: epoch=%d owner=%s", i, rec.Epoch, rec.Owner.AgentID)
+		}
+	}
+}
+
 // ---- Failover gate ----
 
 // TestAcquireLeaseRefusesWhenFailoverDisabled: T41 — with the PR4 flip the
