@@ -2,6 +2,8 @@ package main
 
 import (
 	"bytes"
+	"errors"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -2044,5 +2046,307 @@ func TestRetargetArchivedHandoffSuccessor_RewritesChain(t *testing.T) {
 	// Empty successor is a programming error, not a silent no-op.
 	if err := retargetArchivedHandoffSuccessor(old.ID, ""); err == nil {
 		t.Fatal("expected error on empty successorID")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// PR3 (DESIGN-coord-spawn-unified-standby §6) — the MANUAL `fleet handoff`
+// live-coord path routes through the GracefulHandoff barrier
+// (handoffGracefulSwapFn) instead of the bespoke AtomicCoordSwap +
+// step-13 deliverHandoffResumePrompt sequence. The doc is injected INSIDE
+// the barrier completion; runHandoff must not deliver a second time.
+// ---------------------------------------------------------------------------
+
+// seedGracefulHandoffOld seeds a live coord OLD agent (marker -> OLD).
+func seedGracefulHandoffOld(t *testing.T, project, cwd string) *agent.Record {
+	t.Helper()
+	old := agent.New(agent.NewID())
+	old.TaskID = "coord-" + project
+	old.Project = project
+	old.Cwd = cwd
+	old.Command = []string{"sleep", "60"}
+	old.TmuxSession = tmux.SessionName(old.ID)
+	old.SpawnedAt = time.Now().UTC()
+	old.LastActivityTS = old.SpawnedAt
+	old.SupervisorPID = 4242
+	if err := tmux.Spawn(old.TmuxSession, old.Cwd, old.Command,
+		[]string{"FLEET_AGENT_ID=" + old.ID}); err != nil {
+		t.Fatalf("spawn old coord: %v", err)
+	}
+	t.Cleanup(func() { _ = tmux.Kill(old.TmuxSession) })
+	if err := old.Write(); err != nil {
+		t.Fatalf("write old coord: %v", err)
+	}
+	if _, err := state.EnsureProjectInitialized(project); err != nil {
+		t.Fatalf("EnsureProjectInitialized: %v", err)
+	}
+	if err := state.WriteCoordSpawnMarker(project, old.ID); err != nil {
+		t.Fatalf("seed marker: %v", err)
+	}
+	return old
+}
+
+// forbidHandoffDeliveryOutsideBarrier fails the test if runHandoff polls the
+// lock owner itself — on the graceful route the swap closure owns delivery.
+func forbidHandoffDeliveryOutsideBarrier(t *testing.T) {
+	t.Helper()
+	origDeps := handoffDeliveryDepsFn
+	t.Cleanup(func() { handoffDeliveryDepsFn = origDeps })
+	handoffDeliveryDepsFn = func() handoffdelivery.Deps {
+		deps := handoffdelivery.DefaultDeps()
+		deps.CurrentOwner = func(string) (coordlock.Owner, bool) {
+			t.Error("graceful route must not poll the lock owner outside the barrier")
+			return coordlock.Owner{}, false
+		}
+		return deps
+	}
+}
+
+func TestHandoff_GracefulRoute_SwapsViaBarrier(t *testing.T) {
+	requireTmux(t)
+	t.Setenv("FLEET_LEASE_FAILOVER", "1")
+	root := setupFleetHome(t)
+
+	const project = "rainier"
+	cwd := seedRecoveryRepo(t, root, project)
+	old := seedGracefulHandoffOld(t, project, cwd)
+	forbidHandoffDeliveryOutsideBarrier(t)
+
+	winner := agent.New(agent.NewID())
+	winner.TaskID = "coord-" + project
+	winner.Project = project
+	winner.Cwd = cwd
+	winner.Command = []string{"sleep", "60"}
+	winner.TmuxSession = tmux.SessionName(winner.ID)
+	winner.SpawnedAt = time.Now().UTC()
+	winner.LastActivityTS = winner.SpawnedAt
+	if err := winner.Write(); err != nil {
+		t.Fatalf("write winner: %v", err)
+	}
+
+	origElig := handoffGracefulEligibleFn
+	origSwap := handoffGracefulSwapFn
+	t.Cleanup(func() {
+		handoffGracefulEligibleFn = origElig
+		handoffGracefulSwapFn = origSwap
+	})
+	handoffGracefulEligibleFn = func(rec *agent.Record, autoResume bool) bool {
+		if rec == nil || rec.ID != old.ID {
+			t.Errorf("eligibility consulted for %+v, want old coord %s", rec, old.ID)
+		}
+		return true
+	}
+	swapCalls := 0
+	var swapNewID string
+	handoffGracefulSwapFn = func(o, n *agent.Record, docPath string, grace time.Duration,
+		deliver func() (*agent.Record, error), stderr io.Writer) (*agent.Record, error) {
+		swapCalls++
+		if o.ID != old.ID {
+			t.Errorf("graceful swap got old=%s, want %s", o.ID, old.ID)
+		}
+		if !n.LeaseWrapped {
+			t.Error("graceful swap successor is not lease-wrapped — its lease would lapse")
+		}
+		if deliver == nil {
+			t.Error("graceful swap got a nil deliver closure")
+		}
+		swapNewID = n.ID
+		// Simulate the barrier completion: OLD retired, doc on the winner.
+		if err := o.ArchiveWithHandoff(n.ID); err != nil {
+			t.Fatalf("simulated retire: %v", err)
+		}
+		_ = tmux.Kill(o.TmuxSession)
+		return winner, nil
+	}
+
+	out := &bytes.Buffer{}
+	err := runHandoff(&handoffOpts{
+		oldID:       old.ID,
+		command:     []string{"sleep", "60"},
+		graceMillis: 0,
+	}, out, out)
+	if err != nil {
+		t.Fatalf("graceful-route handoff failed: %v\n%s", err, out.String())
+	}
+	if swapCalls != 1 {
+		t.Fatalf("graceful swap ran %d times, want 1", swapCalls)
+	}
+	arc, aerr := agent.LoadArchive(old.ID)
+	if aerr != nil {
+		t.Fatalf("LoadArchive(%s): %v", old.ID, aerr)
+	}
+	if arc.SuccessorID != winner.ID {
+		t.Fatalf("archive successor = %q, want lock winner %q", arc.SuccessorID, winner.ID)
+	}
+	// The superseded freshly-spawned replacement is dropped post-queue-delete.
+	if _, lerr := agent.Load(swapNewID); lerr == nil {
+		t.Fatalf("superseded replacement %s should be dropped", swapNewID)
+	}
+	if !strings.Contains(out.String(), "handed off → "+winner.ID) {
+		t.Fatalf("output did not report the winner %q:\n%s", winner.ID, out.String())
+	}
+	qp, qerr := state.QueuePath(queue.SpawnFreshName(old.ID))
+	if qerr != nil {
+		t.Fatalf("QueuePath: %v", qerr)
+	}
+	if _, statErr := os.Stat(qp); !os.IsNotExist(statErr) {
+		t.Fatalf("queue file should be consumed, statErr=%v", statErr)
+	}
+}
+
+func TestHandoff_GracefulRouteError_PreservesQueueAndOld(t *testing.T) {
+	requireTmux(t)
+	t.Setenv("FLEET_LEASE_FAILOVER", "1")
+	root := setupFleetHome(t)
+
+	const project = "rainier"
+	cwd := seedRecoveryRepo(t, root, project)
+	old := seedGracefulHandoffOld(t, project, cwd)
+	forbidHandoffDeliveryOutsideBarrier(t)
+
+	origElig := handoffGracefulEligibleFn
+	origSwap := handoffGracefulSwapFn
+	t.Cleanup(func() {
+		handoffGracefulEligibleFn = origElig
+		handoffGracefulSwapFn = origSwap
+	})
+	handoffGracefulEligibleFn = func(*agent.Record, bool) bool { return true }
+	wantErr := errors.New("winner never converged")
+	handoffGracefulSwapFn = func(_, _ *agent.Record, _ string, _ time.Duration,
+		_ func() (*agent.Record, error), _ io.Writer) (*agent.Record, error) {
+		return nil, wantErr
+	}
+
+	out := &bytes.Buffer{}
+	err := runHandoff(&handoffOpts{
+		oldID:       old.ID,
+		command:     []string{"sleep", "60"},
+		graceMillis: 0,
+	}, out, out)
+	if err == nil || !strings.Contains(err.Error(), "winner never converged") {
+		t.Fatalf("graceful route error not surfaced: %v", err)
+	}
+	// OLD stays live and the queue stays pending for the retry.
+	if _, lerr := agent.Load(old.ID); lerr != nil {
+		t.Fatalf("old coord record must survive a graceful-route failure: %v", lerr)
+	}
+	qp, qerr := state.QueuePath(queue.SpawnFreshName(old.ID))
+	if qerr != nil {
+		t.Fatalf("QueuePath: %v", qerr)
+	}
+	if _, statErr := os.Stat(qp); statErr != nil {
+		t.Fatalf("queue file must be preserved on a graceful-route failure: %v", statErr)
+	}
+}
+
+func TestResumeHandoff_GracefulRoute_SwapsViaBarrier(t *testing.T) {
+	requireTmux(t)
+	t.Setenv("FLEET_LEASE_FAILOVER", "1")
+	root := setupFleetHome(t)
+
+	const project = "rainier"
+	cwd := seedRecoveryRepo(t, root, project)
+	old := seedGracefulHandoffOld(t, project, cwd)
+	forbidHandoffDeliveryOutsideBarrier(t)
+
+	// Journaled replacement: already spawned + alive + lease-wrapped, so the
+	// recovery probe dispatches to resumeHandoff (crashed-mid-handoff case).
+	newRec := agent.New(agent.NewID())
+	newRec.TaskID = old.TaskID
+	newRec.Project = project
+	newRec.Cwd = cwd
+	newRec.Command = old.Command
+	newRec.TmuxSession = tmux.SessionName(newRec.ID)
+	newRec.SpawnedAt = time.Now().UTC()
+	newRec.LastActivityTS = newRec.SpawnedAt
+	newRec.LeaseWrapped = true
+	if err := tmux.Spawn(newRec.TmuxSession, newRec.Cwd, newRec.Command,
+		[]string{"FLEET_AGENT_ID=" + newRec.ID}); err != nil {
+		t.Fatalf("spawn journaled replacement: %v", err)
+	}
+	t.Cleanup(func() { _ = tmux.Kill(newRec.TmuxSession) })
+	if err := newRec.Write(); err != nil {
+		t.Fatalf("write journaled replacement: %v", err)
+	}
+	docPath, derr := state.HandoffPath(old.ID, time.Now().UTC())
+	if derr != nil {
+		t.Fatalf("HandoffPath: %v", derr)
+	}
+	if err := os.MkdirAll(filepath.Dir(docPath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(docPath, []byte("# doc\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := queue.WriteSpawnFresh(queue.SpawnFresh{
+		OldAgentID: old.ID,
+		HandoffDoc: docPath,
+		Project:    project,
+		TaskID:     old.TaskID,
+		NewAgentID: newRec.ID,
+		NewSession: newRec.TmuxSession,
+	}); err != nil {
+		t.Fatalf("WriteSpawnFresh: %v", err)
+	}
+
+	winner := agent.New(agent.NewID())
+	winner.TaskID = old.TaskID
+	winner.Project = project
+	winner.Cwd = cwd
+	winner.Command = old.Command
+	winner.TmuxSession = tmux.SessionName(winner.ID)
+	winner.SpawnedAt = time.Now().UTC()
+	winner.LastActivityTS = winner.SpawnedAt
+	if err := winner.Write(); err != nil {
+		t.Fatalf("write winner: %v", err)
+	}
+
+	origElig := handoffGracefulEligibleFn
+	origSwap := handoffGracefulSwapFn
+	t.Cleanup(func() {
+		handoffGracefulEligibleFn = origElig
+		handoffGracefulSwapFn = origSwap
+	})
+	handoffGracefulEligibleFn = func(*agent.Record, bool) bool { return true }
+	swapCalls := 0
+	handoffGracefulSwapFn = func(o, n *agent.Record, gotDoc string, _ time.Duration,
+		deliver func() (*agent.Record, error), _ io.Writer) (*agent.Record, error) {
+		swapCalls++
+		if o.ID != old.ID || n.ID != newRec.ID {
+			t.Errorf("graceful swap got old=%s new=%s, want %s/%s", o.ID, n.ID, old.ID, newRec.ID)
+		}
+		if gotDoc != docPath {
+			t.Errorf("graceful swap doc = %q, want %q", gotDoc, docPath)
+		}
+		if err := o.ArchiveWithHandoff(n.ID); err != nil {
+			t.Fatalf("simulated retire: %v", err)
+		}
+		_ = tmux.Kill(o.TmuxSession)
+		return winner, nil
+	}
+
+	out := &bytes.Buffer{}
+	err := runHandoff(&handoffOpts{
+		oldID:       old.ID,
+		graceMillis: 0,
+	}, out, out)
+	if err != nil {
+		t.Fatalf("resumeHandoff graceful route failed: %v\n%s", err, out.String())
+	}
+	if swapCalls != 1 {
+		t.Fatalf("graceful swap ran %d times, want 1", swapCalls)
+	}
+	arc, aerr := agent.LoadArchive(old.ID)
+	if aerr != nil {
+		t.Fatalf("LoadArchive(%s): %v", old.ID, aerr)
+	}
+	if arc.SuccessorID != winner.ID {
+		t.Fatalf("archive successor = %q, want lock winner %q", arc.SuccessorID, winner.ID)
+	}
+	if _, lerr := agent.Load(newRec.ID); lerr == nil {
+		t.Fatalf("superseded replacement %s should be dropped", newRec.ID)
+	}
+	if !strings.Contains(out.String(), winner.ID) {
+		t.Fatalf("output does not name the winner %s:\n%s", winner.ID, out.String())
 	}
 }

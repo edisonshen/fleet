@@ -3,6 +3,7 @@ package handoffop
 import (
 	"bytes"
 	"errors"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -2281,5 +2282,291 @@ func TestDrain_CoordColdSpawn_CapApproved_DeliversDirectNotLockOwner(t *testing.
 	}
 	if _, statErr := os.Stat(qp); !errors.Is(statErr, os.ErrNotExist) {
 		t.Fatalf("queue file should be consumed after verified delivery, stat err=%v", statErr)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// PR3 (DESIGN-coord-spawn-unified-standby §6) — the live-coord auto/drain
+// handoff routes through the GracefulHandoff barrier (gracefulCoordSwapFn)
+// instead of the bespoke AtomicCoordSwap + separate deliverResumePrompt
+// sequence, and the successor for that route spawns LEASE-WRAPPED so the
+// winner heartbeats the lease (a bare successor's lease lapses — the
+// fd4ee2e6 duplicate-coord incident).
+// ---------------------------------------------------------------------------
+
+// seedGracefulRouteCase3 builds the Resume case-3 shape (old coord live +
+// journaled replacement already spawned + alive + lease-wrapped) that the
+// graceful-route tests drive.
+func seedGracefulRouteCase3(t *testing.T) (oldRec, newRec *agent.Record, req queue.SpawnFresh, qp string) {
+	t.Helper()
+	const project = "rainier"
+	cwd := seedCoordRepoMeta(t, project)
+	oldRec = spawnSeedCoord(t, project, cwd)
+
+	newRec = agent.New(agent.NewID())
+	newRec.TaskID = oldRec.TaskID
+	newRec.Project = oldRec.Project
+	newRec.Cwd = oldRec.Cwd
+	newRec.Command = oldRec.Command
+	newRec.TmuxSession = tmux.SessionName(newRec.ID)
+	newRec.SpawnedAt = time.Now().UTC()
+	newRec.LastActivityTS = newRec.SpawnedAt
+	newRec.LeaseWrapped = true
+	if err := tmux.Spawn(newRec.TmuxSession, newRec.Cwd, newRec.Command,
+		[]string{"FLEET_AGENT_ID=" + newRec.ID}); err != nil {
+		t.Fatalf("spawn journaled replacement: %v", err)
+	}
+	t.Cleanup(func() { _ = tmux.Kill(newRec.TmuxSession) })
+	if err := newRec.Write(); err != nil {
+		t.Fatalf("write journaled replacement: %v", err)
+	}
+	if _, err := state.EnsureProjectInitialized(project); err != nil {
+		t.Fatalf("EnsureProjectInitialized: %v", err)
+	}
+	if err := state.WriteCoordSpawnMarker(project, oldRec.ID); err != nil {
+		t.Fatalf("WriteCoordSpawnMarker: %v", err)
+	}
+	req, qp = writeCoordSkillQueue(t, oldRec)
+	req.NewAgentID = newRec.ID
+	req.NewSession = newRec.TmuxSession
+	if _, err := queue.WriteSpawnFresh(req); err != nil {
+		t.Fatalf("rewrite queue: %v", err)
+	}
+	return oldRec, newRec, req, qp
+}
+
+// forbidSeparateDelivery makes any use of the bespoke delivery machinery a
+// test failure: on the graceful route the doc is injected INSIDE the barrier
+// completion (the swap closure), never by retireOldAgent's own send.
+func forbidSeparateDelivery(t *testing.T) {
+	t.Helper()
+	origDeps := handoffDeliveryDepsFn
+	origSend := sendPromptKeysVerified
+	t.Cleanup(func() {
+		handoffDeliveryDepsFn = origDeps
+		sendPromptKeysVerified = origSend
+	})
+	handoffDeliveryDepsFn = func() handoffdelivery.Deps {
+		deps := handoffdelivery.DefaultDeps()
+		deps.CurrentOwner = func(string) (coordlock.Owner, bool) {
+			t.Error("graceful route must not poll the lock owner outside the barrier")
+			return coordlock.Owner{}, false
+		}
+		return deps
+	}
+	sendPromptKeysVerified = func(session, prompt string) (bool, error) {
+		t.Errorf("graceful route must not direct-send (got send to %q)", session)
+		return true, nil
+	}
+}
+
+func TestResume_Case3_GracefulRoute_SwapsViaBarrier(t *testing.T) {
+	requireTmux(t)
+	t.Setenv("FLEET_LEASE_FAILOVER", "1")
+	setupFleetHome(t)
+
+	oldRec, newRec, req, qp := seedGracefulRouteCase3(t)
+	forbidSeparateDelivery(t)
+
+	winner := agent.New(agent.NewID())
+	winner.TaskID = oldRec.TaskID
+	winner.Project = oldRec.Project
+	winner.Cwd = oldRec.Cwd
+	winner.Command = oldRec.Command
+	winner.TmuxSession = tmux.SessionName(winner.ID)
+	winner.SpawnedAt = time.Now().UTC()
+	winner.LastActivityTS = winner.SpawnedAt
+	if err := winner.Write(); err != nil {
+		t.Fatalf("write winner: %v", err)
+	}
+
+	origElig := gracefulSwapEligibleFn
+	origSwap := gracefulCoordSwapFn
+	t.Cleanup(func() {
+		gracefulSwapEligibleFn = origElig
+		gracefulCoordSwapFn = origSwap
+	})
+	gracefulSwapEligibleFn = func(rec *agent.Record, autoResume bool) bool {
+		if rec == nil || rec.ID != oldRec.ID {
+			t.Errorf("eligibility consulted for %+v, want old coord %s", rec, oldRec.ID)
+		}
+		if !autoResume {
+			t.Error("eligibility consulted with autoResume=false on an auto-resume handoff")
+		}
+		return true
+	}
+	swapCalls := 0
+	gracefulCoordSwapFn = func(o, n *agent.Record, docPath string, grace time.Duration,
+		deliver func() (*agent.Record, error), stderr io.Writer) (*agent.Record, error) {
+		swapCalls++
+		if o.ID != oldRec.ID || n.ID != newRec.ID {
+			t.Errorf("graceful swap got old=%s new=%s, want %s/%s", o.ID, n.ID, oldRec.ID, newRec.ID)
+		}
+		if docPath != req.HandoffDoc {
+			t.Errorf("graceful swap doc = %q, want %q", docPath, req.HandoffDoc)
+		}
+		if deliver == nil {
+			t.Error("graceful swap got a nil deliver closure")
+		}
+		// Simulate the barrier completion: AtomicCoordSwap retired OLD and
+		// the doc landed on the lock WINNER.
+		if err := o.ArchiveWithHandoff(n.ID); err != nil {
+			t.Fatalf("simulated retire: %v", err)
+		}
+		return winner, nil
+	}
+
+	out := &bytes.Buffer{}
+	if err := Resume(req, qp, 0, out, out); err != nil {
+		t.Fatalf("Resume should complete via the graceful barrier route: %v\n%s", err, out.String())
+	}
+	if swapCalls != 1 {
+		t.Fatalf("graceful swap ran %d times, want 1", swapCalls)
+	}
+	// The archive follows the WINNER (retargeted after barrier delivery).
+	arc, err := agent.LoadArchive(oldRec.ID)
+	if err != nil {
+		t.Fatalf("LoadArchive(%s): %v", oldRec.ID, err)
+	}
+	if arc.SuccessorID != winner.ID {
+		t.Fatalf("archive successor = %q, want lock winner %q", arc.SuccessorID, winner.ID)
+	}
+	// The superseded queued replacement is dropped; the queue is consumed.
+	if _, lerr := agent.Load(newRec.ID); !errors.Is(lerr, state.ErrNotFound) {
+		t.Fatalf("superseded replacement %s should be dropped, load err=%v", newRec.ID, lerr)
+	}
+	if _, statErr := os.Stat(qp); !errors.Is(statErr, os.ErrNotExist) {
+		t.Fatalf("queue file should be consumed, stat err=%v", statErr)
+	}
+	if !strings.Contains(out.String(), winner.ID) {
+		t.Fatalf("output does not name the winner %s:\n%s", winner.ID, out.String())
+	}
+}
+
+func TestResume_Case3_GracefulRouteError_PreservesQueue(t *testing.T) {
+	requireTmux(t)
+	t.Setenv("FLEET_LEASE_FAILOVER", "1")
+	setupFleetHome(t)
+
+	oldRec, newRec, req, qp := seedGracefulRouteCase3(t)
+	forbidSeparateDelivery(t)
+
+	origElig := gracefulSwapEligibleFn
+	origSwap := gracefulCoordSwapFn
+	t.Cleanup(func() {
+		gracefulSwapEligibleFn = origElig
+		gracefulCoordSwapFn = origSwap
+	})
+	gracefulSwapEligibleFn = func(*agent.Record, bool) bool { return true }
+	wantErr := errors.New("winner never converged")
+	gracefulCoordSwapFn = func(_, _ *agent.Record, _ string, _ time.Duration,
+		_ func() (*agent.Record, error), _ io.Writer) (*agent.Record, error) {
+		return nil, wantErr
+	}
+
+	out := &bytes.Buffer{}
+	err := Resume(req, qp, 0, out, out)
+	if !errors.Is(err, wantErr) {
+		t.Fatalf("graceful route error not surfaced: %v", err)
+	}
+	// Queue stays PENDING for the retry; the journaled replacement record
+	// survives so the recovery pass can reload it.
+	if _, statErr := os.Stat(qp); statErr != nil {
+		t.Fatalf("queue file must be preserved on a graceful-route failure: %v", statErr)
+	}
+	if _, lerr := agent.Load(newRec.ID); lerr != nil {
+		t.Fatalf("journaled replacement record must survive the failure: %v", lerr)
+	}
+	_ = oldRec
+}
+
+func TestResume_Case3_GracefulNotEligible_BespokePathRuns(t *testing.T) {
+	requireTmux(t)
+	t.Setenv("FLEET_LEASE_FAILOVER", "1")
+	setupFleetHome(t)
+
+	oldRec, newRec, req, qp := seedGracefulRouteCase3(t)
+
+	// Not eligible (e.g. dead-coord recovery: OLD no longer owns the lease)
+	// -> the proven bespoke path: AtomicCoordSwap + owner-poll delivery.
+	origElig := gracefulSwapEligibleFn
+	origSwap := gracefulCoordSwapFn
+	origDeps := handoffDeliveryDepsFn
+	origTimeout := handoffDeliveryTimeout
+	origPoll := handoffDeliveryPoll
+	t.Cleanup(func() {
+		gracefulSwapEligibleFn = origElig
+		gracefulCoordSwapFn = origSwap
+		handoffDeliveryDepsFn = origDeps
+		handoffDeliveryTimeout = origTimeout
+		handoffDeliveryPoll = origPoll
+	})
+	gracefulSwapEligibleFn = func(*agent.Record, bool) bool { return false }
+	gracefulCoordSwapFn = func(_, _ *agent.Record, _ string, _ time.Duration,
+		_ func() (*agent.Record, error), _ io.Writer) (*agent.Record, error) {
+		t.Error("graceful swap must not run when not eligible")
+		return nil, nil
+	}
+	handoffDeliveryTimeout = time.Second
+	handoffDeliveryPoll = time.Millisecond
+	var sentSession string
+	handoffDeliveryDepsFn = func() handoffdelivery.Deps {
+		deps := handoffdelivery.DefaultDeps()
+		deps.CurrentOwner = func(string) (coordlock.Owner, bool) {
+			return coordlock.Owner{AgentID: newRec.ID, PID: 9001, PidStart: 99}, true
+		}
+		deps.WaitReady = func(string) error { return nil }
+		deps.SessionAlive = func(string) (bool, error) { return true, nil }
+		deps.SendVerified = func(session, _ string) (bool, error) {
+			sentSession = session
+			return true, nil
+		}
+		deps.Sleep = func(time.Duration) {}
+		return deps
+	}
+
+	out := &bytes.Buffer{}
+	if err := Resume(req, qp, 0, out, out); err != nil {
+		t.Fatalf("bespoke fallback should complete: %v\n%s", err, out.String())
+	}
+	if sentSession != newRec.TmuxSession {
+		t.Fatalf("bespoke delivery went to %q, want %q", sentSession, newRec.TmuxSession)
+	}
+	if _, lerr := agent.Load(oldRec.ID); !errors.Is(lerr, state.ErrNotFound) {
+		t.Fatalf("old coord should be archived by the bespoke path, load err=%v", lerr)
+	}
+}
+
+// The drain/auto path's coord successor spawns LEASE-WRAPPED exactly when
+// the live-coord graceful route will complete the handoff; dead-coord
+// recovery keeps the bare cold-resume shape (a standby polling a dead
+// owner's lease has no live releaser to wait on).
+func TestLiveCoordGracefulSpawn_DecidesLeaseWrap(t *testing.T) {
+	oldRec := agent.New("oldcoord1")
+	oldRec.Project = "rainier"
+
+	origElig := gracefulSwapEligibleFn
+	t.Cleanup(func() { gracefulSwapEligibleFn = origElig })
+
+	consulted := 0
+	gracefulSwapEligibleFn = func(rec *agent.Record, autoResume bool) bool {
+		consulted++
+		if rec.ID != oldRec.ID {
+			t.Errorf("eligibility consulted for %s, want %s", rec.ID, oldRec.ID)
+		}
+		return autoResume // mirror autoResume so the table below exercises it
+	}
+
+	if liveCoordGracefulSpawn(oldRec, false, true) {
+		t.Error("worker resume must never take the graceful coord route")
+	}
+	if consulted != 0 {
+		t.Error("eligibility consulted for a non-coord resume")
+	}
+	if !liveCoordGracefulSpawn(oldRec, true, true) {
+		t.Error("live-coord auto-resume should take the graceful route")
+	}
+	if liveCoordGracefulSpawn(oldRec, true, false) {
+		t.Error("auto-resume off must not take the graceful route")
 	}
 }
