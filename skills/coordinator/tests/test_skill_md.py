@@ -260,8 +260,9 @@ def test_skill_md_step6_documents_three_stage_flow():
 def test_skill_md_step5_documents_task_plan_review_sop():
     """Step 5 must carry the dual-review SOP: the coord never reviews
     inline, every TASK-PLAN doc set gets a dispatched codex + Claude
-    dual review before promote, the fix/re-review loop runs until both
-    are P0/P1-clean, and reviews-clean never auto-promotes. Drift here
+    dual review before promote (reviewers launched in parallel, per-plan
+    reviewers fanned out in parallel), the fix/re-review loop runs until
+    both are P0/P1-clean, and reviews-clean never auto-promotes. Drift here
     lets a handed-off coord regress to inline self-review or skip the
     pre-promote review gate entirely.
 
@@ -291,9 +292,16 @@ def test_skill_md_step5_documents_task_plan_review_sop():
         "The coord NEVER reviews inline (no codex exec, no self-review).",
         "All review / debug / investigation / PR-review work is "
         "DISPATCHED to subagents",
-        # The dual review is a pre-promote gate, via dispatched subagents.
+        # The dual review is a pre-promote gate, via dispatched subagents,
+        # launched in parallel (operator amendment 2026-06-11).
         "Before promote, every TASK-PLAN doc set gets one dual review via "
-        "dispatched subagents",
+        "dispatched subagents, launched in parallel (codex and Claude "
+        "concurrently)",
+        # Per-plan reviewers fan out in parallel; only the seam pass needs
+        # the full plan set in one context.
+        "Fan-out: with many task plans, per-plan reviewers also dispatch "
+        "in parallel; only the cross-task-seam pass needs the full plan "
+        "set in one reviewer's context",
         "a codex reviewer (codex exec, high reasoning) — design-fidelity, "
         "code-reality, implementability",
         "an independent Claude reviewer — cross-task seams between the "

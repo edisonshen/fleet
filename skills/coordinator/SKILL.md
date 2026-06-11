@@ -132,11 +132,14 @@ Before any task is promoted to ready, save its worker-ready task plan doc.
   debug / investigation / PR-review work is DISPATCHED to subagents; the coord
   only talks to the operator, dispatches, and enforces return contracts.
 - Before promote, every TASK-PLAN doc set gets one dual review via dispatched
-  subagents:
+  subagents, launched in parallel (codex and Claude concurrently):
   1. a codex reviewer (codex exec, high reasoning) — design-fidelity,
      code-reality, implementability;
   2. an independent Claude reviewer — cross-task seams between the plans,
      testability, plus the same lenses.
+- Fan-out: with many task plans, per-plan reviewers also dispatch in parallel;
+  only the cross-task-seam pass needs the full plan set in one reviewer's
+  context.
 - Loop: the coord applies doc-level fixes (plan docs are its only allowed write
   surface) and re-dispatches confirm reviews until BOTH return no P0/P1.
 - Reviews-clean never auto-promotes — the operator promote gate remains
