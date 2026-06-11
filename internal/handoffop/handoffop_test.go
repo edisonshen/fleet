@@ -2096,7 +2096,7 @@ func TestDeliverResumePrompt_LeaseWrapped_NoOwner_FallsBackToDirectSend(t *testi
 	}
 
 	out := &bytes.Buffer{}
-	delivered, err := deliverResumePrompt(rec.Project, true, true, rec, "/tmp/handoff.md", out, out)
+	delivered, err := deliverResumePrompt(rec.Project, true, true, false, rec, "/tmp/handoff.md", out, out)
 	if err != nil {
 		t.Fatalf("expected direct-send fallback, got error: %v\n%s", err, out.String())
 	}
@@ -2592,5 +2592,54 @@ func TestLiveCoordGracefulSpawn_DecidesLeaseWrap(t *testing.T) {
 	}
 	if consulted != 0 {
 		t.Error("eligibility consulted despite a stale marker (marker gate must short-circuit)")
+	}
+}
+
+// codex PR3-completion iter-7 [P1]: on the GRACEFUL route the successor is
+// lease-wrapped by construction, so ErrNoOwnerObserved means "standby has not
+// acquired YET" — the legacy direct-send fallback would type into the
+// coord-run supervisor pane and could falsely report success, consuming the
+// durable queue with the doc undelivered. requireOwner=true (what the
+// graceful deliver closure passes) must propagate the error instead.
+func TestDeliverResumePrompt_RequireOwner_NoOwner_NoFallback(t *testing.T) {
+	t.Setenv("FLEET_LEASE_FAILOVER", "1")
+	setupFleetHome(t)
+
+	rec := agent.New("standby02")
+	rec.Project = "rainier"
+	rec.TmuxSession = "fleet-standby02"
+
+	origDeps := handoffDeliveryDepsFn
+	origTimeout := handoffDeliveryTimeout
+	origPoll := handoffDeliveryPoll
+	origSend := sendPromptKeysVerified
+	t.Cleanup(func() {
+		handoffDeliveryDepsFn = origDeps
+		handoffDeliveryTimeout = origTimeout
+		handoffDeliveryPoll = origPoll
+		sendPromptKeysVerified = origSend
+	})
+	handoffDeliveryTimeout = 100 * time.Millisecond
+	handoffDeliveryPoll = time.Millisecond
+	handoffDeliveryDepsFn = func() handoffdelivery.Deps {
+		deps := handoffdelivery.DefaultDeps()
+		deps.CurrentOwner = func(string) (coordlock.Owner, bool) {
+			return coordlock.Owner{}, false
+		}
+		deps.Sleep = func(time.Duration) {}
+		return deps
+	}
+	sendPromptKeysVerified = func(session, _ string) (bool, error) {
+		t.Errorf("requireOwner delivery direct-sent to %q — must stay pending", session)
+		return true, nil
+	}
+
+	out := &bytes.Buffer{}
+	delivered, err := deliverResumePrompt(rec.Project, true, true, true, rec, "/tmp/handoff.md", out, out)
+	if !errors.Is(err, handoffdelivery.ErrNoOwnerObserved) {
+		t.Fatalf("want ErrNoOwnerObserved propagated (queue stays pending), got %v", err)
+	}
+	if delivered != nil {
+		t.Fatalf("delivered = %+v on the no-owner path, want nil", delivered)
 	}
 }

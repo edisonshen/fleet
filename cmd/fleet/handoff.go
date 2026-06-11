@@ -180,7 +180,14 @@ var (
 	handoffGracefulSwapFn     = handoffop.GracefulCoordSwap
 )
 
-func deliverHandoffResumePrompt(project string, isCoordSwap bool, rec *agent.Record,
+// requireOwner suppresses the legacy ErrNoOwnerObserved direct-send fallback
+// (codex PR3-completion iter-7 [P1]): the GRACEFUL route's successor is
+// lease-wrapped by construction, so "no owner observed" means the standby has
+// not acquired YET, never a legacy bare coord — a direct send would type into
+// the coord-run supervisor pane and could falsely report success, consuming
+// the durable queue with the doc undelivered. Owner-only callers keep the
+// queue pending for the next drain/attach re-delivery.
+func deliverHandoffResumePrompt(project string, isCoordSwap, requireOwner bool, rec *agent.Record,
 	docPath string, stdout, stderr io.Writer) (*agent.Record, error) {
 	prompt := handoff.ResumePrompt(docPath)
 	// Route through the lock owner ONLY when the successor was actually
@@ -205,7 +212,7 @@ func deliverHandoffResumePrompt(project string, isCoordSwap bool, rec *agent.Rec
 			// send to its session — the pre-PR2 delivery path. A genuine
 			// owner-was-seen-but-undeliverable error is NOT this sentinel, so
 			// it still propagates and stays pending for a real-owner retry.
-			if errors.Is(err, handoffdelivery.ErrNoOwnerObserved) {
+			if errors.Is(err, handoffdelivery.ErrNoOwnerObserved) && !requireOwner {
 				_, _ = fmt.Fprintf(stderr,
 					"warning: no lease owner for project %s (legacy coord?); delivering resume prompt directly to %s\n",
 					project, rec.TmuxSession)
@@ -414,7 +421,7 @@ func runHandoff(opts *handoffOpts, stdout, stderr io.Writer) error {
 			if autoResume {
 				coordDelivery := spawn.IsCoordSpawn(newRec.TaskID, newRec.Project) ||
 					(newRec.Project != "" && state.ReadCoordSpawnMarker(newRec.Project) == newRec.ID)
-				deliveredRec, err := deliverHandoffResumePrompt(newRec.Project, coordDelivery,
+				deliveredRec, err := deliverHandoffResumePrompt(newRec.Project, coordDelivery, false,
 					newRec, pending.HandoffDoc, stdout, stderr)
 				if err != nil {
 					return fmt.Errorf(
@@ -1073,7 +1080,7 @@ func runHandoff(opts *handoffOpts, stdout, stderr io.Writer) error {
 		winner, gerr := handoffGracefulSwapFn(oldRec, newRec, docPath,
 			time.Duration(opts.graceMillis)*time.Millisecond,
 			func() (*agent.Record, error) {
-				return deliverHandoffResumePrompt(oldRec.Project, isCoordSwap,
+				return deliverHandoffResumePrompt(oldRec.Project, isCoordSwap, true,
 					newRec, docPath, stdout, stderr)
 			}, stderr)
 		if gerr != nil {
@@ -1224,7 +1231,7 @@ func runHandoff(opts *handoffOpts, stdout, stderr io.Writer) error {
 			deliveredRec = gracefulWinner
 		} else {
 			var err error
-			deliveredRec, err = deliverHandoffResumePrompt(oldRec.Project, isCoordSwap,
+			deliveredRec, err = deliverHandoffResumePrompt(oldRec.Project, isCoordSwap, false,
 				newRec, docPath, stdout, stderr)
 			if err != nil {
 				return fmt.Errorf("resume prompt delivery pending for %s: %w (queue preserved at %s)",
@@ -1417,7 +1424,7 @@ func resumeHandoff(opts *handoffOpts, stdout, stderr io.Writer,
 		winner, gerr := handoffGracefulSwapFn(oldRec, newRec, docPath,
 			time.Duration(opts.graceMillis)*time.Millisecond,
 			func() (*agent.Record, error) {
-				return deliverHandoffResumePrompt(oldRec.Project, isCoordSwap,
+				return deliverHandoffResumePrompt(oldRec.Project, isCoordSwap, true,
 					newRec, docPath, stdout, stderr)
 			}, stderr)
 		if gerr != nil {
@@ -1488,7 +1495,7 @@ func resumeHandoff(opts *handoffOpts, stdout, stderr io.Writer,
 			deliveredRec = gracefulWinner
 		} else {
 			var err error
-			deliveredRec, err = deliverHandoffResumePrompt(oldRec.Project, isCoordSwap,
+			deliveredRec, err = deliverHandoffResumePrompt(oldRec.Project, isCoordSwap, false,
 				newRec, docPath, stdout, stderr)
 			if err != nil {
 				return fmt.Errorf("resume handoff: prompt delivery pending for %s: %w (queue preserved at %s)",

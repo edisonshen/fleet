@@ -91,7 +91,15 @@ func liveCoordGracefulSpawn(oldRec *agent.Record, isCoordResume, autoResume bool
 	return gracefulSwapEligibleFn(oldRec, autoResume)
 }
 
-func deliverResumePrompt(project string, isCoordSwap, leaseWrappedSuccessor bool, rec *agent.Record,
+// requireOwner suppresses the legacy ErrNoOwnerObserved direct-send fallback
+// (codex PR3-completion iter-7 [P1]): on the GRACEFUL route the successor is
+// lease-wrapped by construction (a coord-run --standby supervisor), so "no
+// owner ever observed" means the standby has not acquired YET — never a
+// legacy bare coord. Direct-sending there types into the supervisor pane and
+// can report a false success, letting the caller consume the durable queue
+// with the doc undelivered. Owner-only callers keep the queue pending so the
+// next drain/attach pass re-delivers to the eventual winner.
+func deliverResumePrompt(project string, isCoordSwap, leaseWrappedSuccessor, requireOwner bool, rec *agent.Record,
 	docPath string, stdout, stderr io.Writer) (*agent.Record, error) {
 	prompt := handoff.ResumePrompt(docPath)
 	if coordlock.FailoverEnabled() && isCoordSwap && leaseWrappedSuccessor && project != "" {
@@ -110,7 +118,7 @@ func deliverResumePrompt(project string, isCoordSwap, leaseWrappedSuccessor bool
 			// (matches deliverHandoffResumePrompt in cmd/fleet/handoff.go). A
 			// genuine owner-seen-but-undeliverable error is NOT this sentinel and
 			// still propagates so the queue stays pending for a real-owner retry.
-			if errors.Is(err, handoffdelivery.ErrNoOwnerObserved) {
+			if errors.Is(err, handoffdelivery.ErrNoOwnerObserved) && !requireOwner {
 				_, _ = fmt.Fprintf(stderr,
 					"  resume: no lease owner for project %s (legacy coord?); delivering directly to %s\n",
 					project, rec.TmuxSession)
@@ -532,7 +540,7 @@ func cleanUpStaleQueue(req queue.SpawnFresh, queuePath string,
 		// record (codex iter-24 [P2]), not the producer's cap-approval bit: a
 		// bare drain cold-resume coord records false even on a CapApproved queue.
 		leaseWrappedSuccessor := newRec.LeaseWrapped
-		deliveredRec, err := deliverResumePrompt(newRec.Project, coordDelivery, leaseWrappedSuccessor,
+		deliveredRec, err := deliverResumePrompt(newRec.Project, coordDelivery, leaseWrappedSuccessor, false,
 			newRec, req.HandoffDoc, stdout, stdout)
 		if err != nil {
 			return fmt.Errorf(
@@ -1025,7 +1033,7 @@ func retireOldAgent(oldRec, newRec *agent.Record, docPath, queuePath string,
 			time.Duration(graceMillis)*time.Millisecond,
 			func() (*agent.Record, error) {
 				return deliverResumePrompt(oldRec.Project, isCoordSwap,
-					leaseWrappedSuccessor, newRec, docPath, stdout, stderr)
+					leaseWrappedSuccessor, true, newRec, docPath, stdout, stderr)
 			}, stderr)
 		if gerr != nil {
 			// Same contract as the bespoke branches: queue preserved so a
@@ -1117,7 +1125,7 @@ func retireOldAgent(oldRec, newRec *agent.Record, docPath, queuePath string,
 			deliveredRec = gracefulWinner
 		} else {
 			var err error
-			deliveredRec, err = deliverResumePrompt(oldRec.Project, isCoordSwap, leaseWrappedSuccessor,
+			deliveredRec, err = deliverResumePrompt(oldRec.Project, isCoordSwap, leaseWrappedSuccessor, false,
 				newRec, docPath, stdout, stderr)
 			if err != nil {
 				return fmt.Errorf("resume: prompt delivery pending for %s: %w (queue preserved at %s)",

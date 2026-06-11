@@ -1981,7 +1981,7 @@ func TestDeliverHandoffResumePrompt_NoLeaseOwner_FallsBackToDirectSend(t *testin
 	}
 
 	out := &bytes.Buffer{}
-	delivered, err := deliverHandoffResumePrompt(project, true, rep, docPath, out, out)
+	delivered, err := deliverHandoffResumePrompt(project, true, false, rep, docPath, out, out)
 	if err != nil {
 		t.Fatalf("expected direct-send fallback, got error: %v\n%s", err, out.String())
 	}
@@ -2348,5 +2348,51 @@ func TestResumeHandoff_GracefulRoute_SwapsViaBarrier(t *testing.T) {
 	}
 	if !strings.Contains(out.String(), winner.ID) {
 		t.Fatalf("output does not name the winner %s:\n%s", winner.ID, out.String())
+	}
+}
+
+// codex PR3-completion iter-7 [P1]: the graceful route's deliver closure
+// passes requireOwner=true — ErrNoOwnerObserved must propagate (queue stays
+// pending for the next drain/attach), never the legacy direct-send fallback
+// into the lease-wrapped successor's supervisor pane.
+func TestDeliverHandoffResumePrompt_RequireOwner_NoOwner_NoFallback(t *testing.T) {
+	setupFleetHome(t)
+	t.Setenv("FLEET_LEASE_FAILOVER", "1")
+
+	rep := agent.New(agent.NewID())
+	rep.Project = "rainier"
+	rep.TmuxSession = tmux.SessionName(rep.ID)
+	rep.LeaseWrapped = true
+
+	origDeps := handoffDeliveryDepsFn
+	origTimeout := handoffDeliveryTimeout
+	origPoll := handoffDeliveryPoll
+	t.Cleanup(func() {
+		handoffDeliveryDepsFn = origDeps
+		handoffDeliveryTimeout = origTimeout
+		handoffDeliveryPoll = origPoll
+	})
+	handoffDeliveryTimeout = 100 * time.Millisecond
+	handoffDeliveryPoll = time.Millisecond
+	handoffDeliveryDepsFn = func() handoffdelivery.Deps {
+		deps := handoffdelivery.DefaultDeps()
+		deps.CurrentOwner = func(string) (coordlock.Owner, bool) {
+			return coordlock.Owner{}, false
+		}
+		deps.SendVerified = func(session, _ string) (bool, error) {
+			t.Errorf("requireOwner delivery sent to %q — must stay pending", session)
+			return true, nil
+		}
+		deps.Sleep = func(time.Duration) {}
+		return deps
+	}
+
+	out := &bytes.Buffer{}
+	delivered, err := deliverHandoffResumePrompt(rep.Project, true, true, rep, "/tmp/handoff.md", out, out)
+	if !errors.Is(err, handoffdelivery.ErrNoOwnerObserved) {
+		t.Fatalf("want ErrNoOwnerObserved propagated (queue stays pending), got %v", err)
+	}
+	if delivered != nil {
+		t.Fatalf("delivered = %+v on the no-owner path, want nil", delivered)
 	}
 }
