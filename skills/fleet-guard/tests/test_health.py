@@ -178,20 +178,28 @@ class TestReadContextPct:
         pct, _ = health.read_context_pct({"transcript_path": str(path)})
         assert pct == 50.0
 
-    def test_unknown_model(self, tmp_path: Path) -> None:
-        """An unknown model leaves pct=None but still surfaces the model name
-        so a future operator can add it to CONTEXT_LIMITS via config."""
+    def test_unknown_model_defaults_to_1m(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture,
+    ) -> None:
+        """Bug D policy change (operator directive 2026-06-10: "if you dont
+        know you should flag it, and set default value to 1 million, dont let
+        it silo"): an unknown model no longer silos to pct=None — it computes
+        against the 1M default AND flags loudly on stderr. The raw model name
+        still surfaces for diagnostics."""
         path = tmp_path / "t.jsonl"
         path.write_text(json.dumps({
             "type": "assistant",
             "message": {
                 "model": "claude-future-99",
-                "usage": {"input_tokens": 1000},
+                "usage": {"input_tokens": 500_000},
             },
         }) + "\n", encoding="utf-8")
         pct, model = health.read_context_pct({"transcript_path": str(path)})
-        assert pct is None
+        assert pct == 50.0  # 500k / 1_000_000 default
         assert model == "claude-future-99"
+        err = capsys.readouterr().err
+        assert "claude-future-99" in err
+        assert "unknown model" in err.lower()
 
     def test_missing_transcript_path(self) -> None:
         pct, model = health.read_context_pct({})
@@ -205,12 +213,22 @@ class TestReadContextPct:
         assert pct is None
         assert model is None
 
-    def test_transcript_with_no_usage_lines(self, tmp_path: Path) -> None:
+    def test_transcript_with_no_usage_lines_flags_loudly(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture,
+    ) -> None:
+        """Bug D: the no-usage return path is the frozen-health-writer
+        fingerprint (RC coord 80de593d, 2026-06-10). It must emit a loud
+        stderr diagnostic naming the transcript path instead of silently
+        returning (None, None)."""
         path = tmp_path / "t.jsonl"
         path.write_text(json.dumps({"type": "user", "content": "hi"}) + "\n",
                         encoding="utf-8")
-        pct, _ = health.read_context_pct({"transcript_path": str(path)})
+        pct, model = health.read_context_pct({"transcript_path": str(path)})
         assert pct is None
+        assert model is None
+        err = capsys.readouterr().err
+        assert str(path) in err
+        assert "no usage" in err.lower()
 
     def test_malformed_lines_are_skipped(self, tmp_path: Path) -> None:
         """A garbage line in the middle of the JSONL must not crash the walk."""
@@ -321,7 +339,7 @@ class TestNormalizeModel:
             assert pct == 50.0, f"{variant} did not resolve to 1M limit"
             assert model == variant
 
-        # Genuinely unknown -> None, raw id preserved.
+        # Genuinely unknown -> 1M default (bug D policy), raw id preserved.
         path = tmp_path / "unknown.jsonl"
         path.write_text(json.dumps({
             "type": "assistant",
@@ -331,7 +349,7 @@ class TestNormalizeModel:
             },
         }) + "\n", encoding="utf-8")
         pct, model = health.read_context_pct({"transcript_path": str(path)})
-        assert pct is None
+        assert pct == 50.0
         assert model == "claude-future-99"
 
 
@@ -369,17 +387,48 @@ class TestResolveLimit:
         the 1M window."""
         assert health._resolve_limit("claude-sonnet-4-6[v1m]") == 200_000
         assert health._resolve_limit("claude-sonnet-4-6[not-1m]") == 200_000
-        # An unknown base with a non-exact-1m bracket stays unknown.
-        assert health._resolve_limit("claude-future-99[v1m]") is None
+        # An unknown base with a non-exact-1m bracket falls to the 1M
+        # default (bug D policy) — same number as the [1m] tag but via the
+        # unknown-model flag path, not the bracket fast path.
+        assert health._resolve_limit("claude-future-99[v1m]") == 1_000_000
 
     def test_one_m_bracket_is_case_insensitive(self) -> None:
         assert health._resolve_limit("claude-sonnet-4-6[1M]") == 1_000_000
 
-    def test_unknown_returns_none(self) -> None:
-        assert health._resolve_limit("claude-future-99") is None
+    def test_unknown_defaults_to_1m_with_flag(
+        self, capsys: pytest.CaptureFixture,
+    ) -> None:
+        """Bug D policy change: unknown model -> 1_000_000 default + loud
+        stderr flag naming the unresolved id (was: None, silent). Empty /
+        missing model still returns None — there is no id to flag and the
+        caller handles the no-model case explicitly."""
+        assert health._resolve_limit("totally-new-model") == 1_000_000
+        err = capsys.readouterr().err
+        assert "totally-new-model" in err
+        assert "unknown model" in err.lower()
         assert health._resolve_limit("claude-future-99[1m]") == 1_000_000  # [1m] tag wins
         assert health._resolve_limit("") is None
         assert health._resolve_limit(None) is None
+
+    def test_bracket_1m_regression_no_unknown_flag(
+        self, capsys: pytest.CaptureFixture,
+    ) -> None:
+        """Regression guard (verified correct this incident — do NOT change
+        [1m] semantics): the bracketed 1M variant resolves via the bracket
+        fast path with NO unknown-model flag on stderr."""
+        assert health._resolve_limit("claude-opus-4-8[1m]") == 1_000_000
+        assert capsys.readouterr().err == ""
+
+    def test_fable_5_resolves_from_table_no_flag(
+        self, capsys: pytest.CaptureFixture,
+    ) -> None:
+        """Bug D root cause: the live RC coord (80de593d, 2026-06-10) ran
+        claude-fable-5, which was absent from CONTEXT_LIMITS -> context_pct
+        null every turn. Bare claude-fable-5 must be a TABLE hit (1M window
+        per the harness model catalog), not an unknown-model default — so
+        no flag is emitted."""
+        assert health._resolve_limit("claude-fable-5") == 1_000_000
+        assert capsys.readouterr().err == ""
 
     def test_sonnet_1m_over_70_fires_red(self, tmp_path: Path) -> None:
         """End-to-end through read_context_pct: a 750k context on
@@ -434,6 +483,13 @@ class TestContextLimitsParity:
         assert health.CONTEXT_LIMITS.get("claude-opus-4-8") == 1_000_000
         assert stop_hook.CONTEXT_LIMITS.get("claude-opus-4-8") == 1_000_000
 
+    def test_fable_5_present_in_both(self) -> None:
+        """Bug D: claude-fable-5 (operator's model as of 2026-06-10; 1M
+        window per the harness model catalog) must be in BOTH tables."""
+        stop_hook = _load_stop_hook()
+        assert health.CONTEXT_LIMITS.get("claude-fable-5") == 1_000_000
+        assert stop_hook.CONTEXT_LIMITS.get("claude-fable-5") == 1_000_000
+
     def test_resolve_limit_agrees_across_modules(self) -> None:
         """The shared resolution policy (_resolve_limit) must produce the same
         limit in both modules for representative ids, including the [1m] tag and
@@ -442,6 +498,8 @@ class TestContextLimitsParity:
         for mid in ("claude-opus-4-8",
                     "claude-opus-4-8[1m]",
                     "claude-opus-4-8-20260601",
+                    "claude-fable-5",
+                    "claude-fable-5[1m]",
                     "claude-sonnet-4-6",
                     "claude-sonnet-4-6[1m]",
                     "claude-sonnet-4-6[beta]",

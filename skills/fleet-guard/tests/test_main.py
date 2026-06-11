@@ -527,3 +527,70 @@ class TestNeverBlocks:
         assert rc == 0
         assert "dispatch error" in err
         assert "boom" in err
+
+
+# -- bug D: RC coord health must advance every turn ---------------------------
+
+def _fable_transcript(tmp_path: Path, turns: list[int]) -> Path:
+    """A multi-turn transcript on claude-fable-5 (the live RC coord's model,
+    2026-06-10). One assistant line per entry in `turns`, each carrying that
+    turn's cumulative input_tokens — the last one is the live context size."""
+    path = tmp_path / "rc-transcript.jsonl"
+    lines = [json.dumps({
+        "type": "assistant",
+        "message": {
+            "model": "claude-fable-5",
+            "usage": {"input_tokens": t},
+        },
+    }) for t in turns]
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return path
+
+
+class TestRCCoordHealthAdvances:
+    """Bug D regression (coord 80de593d, 2026-06-10): an RC coord on
+    claude-fable-5 froze at context_pct=null because the model was absent
+    from CONTEXT_LIMITS and the unknown-model branch silently returned None.
+    Simulate Stop-hook payloads across N turns with usage: the agent record's
+    context_pct and last_activity_ts must advance EVERY turn."""
+
+    def test_context_pct_advances_across_turns(
+        self, fleet_home_tmp: Path, tmp_path: Path,
+        capsys: pytest.CaptureFixture,
+    ) -> None:
+        record_path = _seed_record(fleet_home_tmp,
+                                   last_activity_ts="2026-04-28T00:00:00Z")
+        seen_pcts: list[float] = []
+        # Three turns, growing context: 10% -> 20% -> 30% of the 1M window.
+        for turn_tokens in ([100_000], [100_000, 200_000],
+                            [100_000, 200_000, 300_000]):
+            tp = _fable_transcript(tmp_path, turn_tokens)
+            rc, _, _ = _run({
+                "hook_event_name": "Stop",
+                "transcript_path": str(tp),
+            }, capsys)
+            assert rc == 0
+            record = json.loads(record_path.read_text(encoding="utf-8"))
+            assert record["context_pct"] is not None, (
+                "context_pct silently null on a fable-5 RC turn — the bug D "
+                "frozen-health-writer fingerprint"
+            )
+            assert record["context_source"] == "hook"
+            assert record["last_activity_ts"] != "2026-04-28T00:00:00Z"
+            seen_pcts.append(record["context_pct"])
+        assert seen_pcts == [10.0, 20.0, 30.0]
+
+    def test_unresolved_context_emits_diagnostic(
+        self, fleet_home_tmp: Path, capsys: pytest.CaptureFixture,
+    ) -> None:
+        """Bug D part 4 instrumentation: when context_pct cannot be resolved
+        on a Stop fire, main.py emits a stderr diagnostic naming the hook
+        event and transcript_path — never a silent null write."""
+        _seed_record(fleet_home_tmp)
+        rc, _, err = _run({
+            "hook_event_name": "Stop",
+            "transcript_path": "/nonexistent/rc-transcript.jsonl",
+        }, capsys)
+        assert rc == 0
+        assert "context_pct unresolved" in err
+        assert "/nonexistent/rc-transcript.jsonl" in err

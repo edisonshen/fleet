@@ -106,7 +106,24 @@ def _on_stop(payload: dict, agent_id: str, session: str,
     processing the injected content (caught by codex review iter-2 P2
     on inbox-driven Stops).
     """
-    pct, _model = health.read_context_pct(payload)
+    pct, model = health.read_context_pct(payload)
+    if pct is None:
+        # Bug D part-4 instrumentation (RC-freeze root-cause, 2026-06-10):
+        # never write a null context_pct silently. Name the hook event +
+        # transcript_path so a frozen health record is diagnosable from hook
+        # stderr alone. Root cause found live: the Stop hook DOES fire on
+        # --remote-control turns and the transcript DOES carry usage — the
+        # null came from an unknown model id (claude-fable-5 missing from
+        # CONTEXT_LIMITS), which _resolve_limit now defaults to 1M. Remaining
+        # null paths here are transcript-shaped (missing/unreadable path, no
+        # usage blocks) and must stay loud.
+        print(
+            f"fleet-guard: context_pct unresolved on "
+            f"{payload.get('hook_event_name', 'Stop')} "
+            f"(transcript_path={payload.get('transcript_path', '')!r}, "
+            f"model={model!r}) — agent record will show context_pct=null.",
+            file=sys.stderr,
+        )
     health.update_record(
         agent_id,
         context_pct=pct,
