@@ -252,3 +252,39 @@ def test_skill_md_step6_documents_three_stage_flow():
     assert "rate-limited" in body and "unavailable" in body
     # /review is never skippable (load-bearing reviewer).
     assert "NEVER skippable" in body or "never skippable" in body
+
+
+# ---------- Task-plan review SOP (operator-approved 2026-06-11) ----------
+
+
+def test_skill_md_step5_documents_task_plan_review_sop():
+    """Step 5 must carry the dual-review SOP: the coord never reviews
+    inline, every TASK-PLAN doc set gets a dispatched codex + Claude
+    dual review before promote, the fix/re-review loop runs until both
+    are P0/P1-clean, and reviews-clean never auto-promotes. Drift here
+    lets a handed-off coord regress to inline self-review or skip the
+    pre-promote review gate entirely."""
+    body = _read_skill_md()
+    assert "Task-plan review SOP (operator-approved 2026-06-11, all projects)" in body, (
+        "SKILL.md Step 5 missing the task-plan review SOP header — "
+        "handed-off coords lose the pre-promote dual-review gate."
+    )
+    for marker in (
+        # Coord never reviews inline; all review work is dispatched.
+        "NEVER reviews inline",
+        "no codex exec, no self-review",
+        # Dual review: dispatched codex + independent Claude reviewers.
+        "codex reviewer",
+        "independent Claude reviewer",
+        "cross-task seams",
+        # Loop until both reviewers are clean.
+        "no P0/P1",
+        # Doc-level fixes are the coord's only allowed write surface.
+        "only allowed write",
+        # Clean reviews never bypass the operator promote gate.
+        "never auto-promotes",
+    ):
+        assert marker in body, (
+            f"SKILL.md task-plan review SOP missing {marker!r} — "
+            f"SOP wording drifted from the operator-approved text."
+        )

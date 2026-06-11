@@ -126,6 +126,22 @@ Before any task is promoted to ready, save its worker-ready task plan doc.
 - Promotion: run `fleet tasks promote <slug>` only after the doc exists and is
   linked or embedded in worker-visible task text.
 
+**Task-plan review SOP (operator-approved 2026-06-11, all projects):**
+
+- The coord NEVER reviews inline (no codex exec, no self-review). All review /
+  debug / investigation / PR-review work is DISPATCHED to subagents; the coord
+  only talks to the operator, dispatches, and enforces return contracts.
+- Before promote, every TASK-PLAN doc set gets one dual review via dispatched
+  subagents:
+  1. a codex reviewer (codex exec, high reasoning) — design-fidelity,
+     code-reality, implementability;
+  2. an independent Claude reviewer — cross-task seams between the plans,
+     testability, plus the same lenses.
+- Loop: the coord applies doc-level fixes (plan docs are its only allowed write
+  surface) and re-dispatches confirm reviews until BOTH return no P0/P1.
+- Reviews-clean never auto-promotes — the operator promote gate remains
+  separate.
+
 ### Plan & design-doc writing standard
 
 Every PLAN-DOC and TASK-PLAN-DOC is **problem-first and readable by a
