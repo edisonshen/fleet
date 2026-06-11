@@ -214,7 +214,9 @@ func GracefulHandoff(in GracefulHandoffInputs, d GracefulHandoffDeps) error {
 	if err := d.SpawnStandby(standbyTimeout); err != nil {
 		return fmt.Errorf("handoffop.GracefulHandoff: spawn standby for project %q: %w", project, err)
 	}
-	_, _ = fmt.Fprintf(stderr, "graceful-handoff: spawned standby coord for %s (epoch %d)\n", project, epoch)
+	// "ready", not "spawned": on the converged GracefulCoordSwap route the
+	// standby was already spawned by the caller and the seam is a no-op.
+	_, _ = fmt.Fprintf(stderr, "graceful-handoff: standby coord ready for %s (epoch %d)\n", project, epoch)
 
 	// Steps 2-5 run AFTER the standby is alive. If ANY of them fails we must
 	// REAP the standby (codex PR3 iter-2 [P2]): a standby left polling after a

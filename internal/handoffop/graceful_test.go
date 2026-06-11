@@ -388,7 +388,7 @@ func TestGracefulHandoff_Completion_RetireAfterBarrier_ThenDeliver(t *testing.T)
 	if iBarrier == -1 || iRetire == -1 || iDeliver == -1 {
 		t.Fatalf("missing completion steps; order=%v", order)
 	}
-	if !(iBarrier < iRetire && iRetire < iDeliver) {
+	if iBarrier >= iRetire || iRetire >= iDeliver {
 		t.Fatalf("completion out of order (want barrier < retire < deliver): %v", order)
 	}
 	if delivered == nil || delivered.ID != "winner01" {
@@ -636,7 +636,7 @@ func TestGracefulCoordSwap_BarrierThenSwapThenDeliver_ReturnsWinner(t *testing.T
 	iSwap := orderIdx(order, "atomic-swap")
 	iDeliver := orderIdx(order, "deliver")
 	if iBarrier == -1 || iSwap == -1 || iDeliver == -1 ||
-		!(iBarrier < iSwap && iSwap < iDeliver) {
+		iBarrier >= iSwap || iSwap >= iDeliver {
 		t.Fatalf("want barrier < atomic-swap < deliver; order=%v", order)
 	}
 	// The doc is already durable on disk (the caller wrote it before spawn);
