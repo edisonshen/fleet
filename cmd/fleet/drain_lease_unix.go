@@ -117,6 +117,16 @@ type drainLeaseDeps struct {
 	// resolved against OLD's baseline — codex PR3 iter-14 [P2]); it gates both the
 	// spawn record's policy and whether recoverHandoffTail types the resume prompt.
 	RecoverSpawn func(oldRec *agent.Record, docPath, preAllocatedID string, disableAutoResume bool, stdout, stderr io.Writer) error
+	// DeliverPending delivers the still-pending handoff doc to the CONFIRMED
+	// healthy successor BEFORE drainGraceful cleans the queue (codex
+	// PR3-completion iter-2 [P1]). The barrier proves doc durability, not
+	// DELIVERY — a GracefulCoordSwap completion that failed/crashed between
+	// retiring OLD and injecting the doc leaves the queue as the only durable
+	// "successor never got its prompt" signal; deleting it without delivering
+	// would strand the winner blank (§5c). Production:
+	// drainGracefulDeliverPending (at-most-once via the lock-owner sentinel;
+	// errors preserve the queue). oldRec may be nil (already archived).
+	DeliverPending func(req queue.SpawnFresh, oldRec *agent.Record, stdout, stderr io.Writer) error
 	// BarrierPoll is the interval between barrier-existence checks while
 	// waiting (bounded) for a graceful handoff to complete. 0 = default.
 	BarrierPoll time.Duration
@@ -167,11 +177,12 @@ func defaultDrainLeaseDeps() drainLeaseDeps {
 			}
 			return acquired, err
 		},
-		Resume:       handoffop.Resume,
-		LockAgent:    state.LockAgent,
-		RecoverSpawn: productionRecoverSpawn,
-		BarrierPoll:  defaultBarrierPoll,
-		Self:         os.Getpid,
+		Resume:         handoffop.Resume,
+		LockAgent:      state.LockAgent,
+		RecoverSpawn:   productionRecoverSpawn,
+		DeliverPending: drainGracefulDeliverPending,
+		BarrierPoll:    defaultBarrierPoll,
+		Self:           os.Getpid,
 	}
 }
 
@@ -571,6 +582,10 @@ func drainGraceful(req queue.SpawnFresh, path string, epoch int64, deadline time
 		// owner (a present-but-crashed active-epoch owner is not a live successor
 		// — codex PR3 iter-14 [P1]).
 		if d.waitForHealthySuccessor(req.Project, 0, deadline) {
+			if derr := d.DeliverPending(req, nil, stdout, stderr); derr != nil {
+				return fmt.Errorf("fleet drain: deliver pending handoff doc to %s's successor: %w (queue %s preserved)",
+					req.OldAgentID, derr, path)
+			}
 			_, _ = fmt.Fprintf(stdout,
 				"fleet drain: %s retired and a healthy successor holds the lease; cleaning queue\n", req.OldAgentID)
 			return queue.Delete(path)
@@ -609,6 +624,10 @@ func drainGraceful(req queue.SpawnFresh, path string, epoch int64, deadline time
 			// keep waiting. On the deadline fall through to takeover+recover,
 			// which brings up a successor so the project is never left coordless.
 			if op, ok := d.healthySuccessorPresent(req.Project, oldRec.SupervisorPID); ok {
+				if derr := d.DeliverPending(req, oldRec, stdout, stderr); derr != nil {
+					return fmt.Errorf("fleet drain: deliver pending handoff doc to %s's successor: %w (queue %s preserved)",
+						oldRec.ID, derr, path)
+				}
 				_, _ = fmt.Fprintf(stdout,
 					"fleet drain: %s released the lease and healthy successor pid %d acquired it; handoff complete\n",
 					oldRec.ID, op)
@@ -636,8 +655,12 @@ func drainGraceful(req queue.SpawnFresh, path string, epoch int64, deadline time
 	case ownerOK && ownerPid != oldRec.SupervisorPID && d.LeaderPresent(req.Project):
 		// A HEALTHY SUCCESSOR already leads (a standby acquired and is
 		// heartbeating). OLD's record is still present but it released the lease —
-		// reap its lingering supervisor through the authenticated primitive, then
-		// the queue is cleaned. The handoff is confirmed complete.
+		// deliver the still-pending doc to the winner, then reap OLD's lingering
+		// supervisor through the authenticated primitive and clean the queue.
+		if derr := d.DeliverPending(req, oldRec, stdout, stderr); derr != nil {
+			return fmt.Errorf("fleet drain: deliver pending handoff doc to %s's successor: %w (queue %s preserved)",
+				oldRec.ID, derr, path)
+		}
 		return drainReapOld(oldRec, req, path, epoch, stdout, stderr, d)
 
 	default:
@@ -653,6 +676,10 @@ func drainGraceful(req queue.SpawnFresh, path string, epoch int64, deadline time
 			"fleet drain: %s released the lease but no healthy successor owns it yet; waiting for a confirmed successor\n",
 			oldRec.ID)
 		if d.waitForHealthySuccessor(req.Project, oldRec.SupervisorPID, deadline) {
+			if derr := d.DeliverPending(req, oldRec, stdout, stderr); derr != nil {
+				return fmt.Errorf("fleet drain: deliver pending handoff doc to %s's successor: %w (queue %s preserved)",
+					oldRec.ID, derr, path)
+			}
 			_, _ = fmt.Fprintf(stdout,
 				"fleet drain: a healthy successor acquired the lease for %s; reaping the old supervisor and finishing\n",
 				req.Project)
@@ -663,6 +690,36 @@ func drainGraceful(req queue.SpawnFresh, path string, epoch int64, deadline time
 			oldRec.ID)
 		return takeoverAndRecover(req, path, oldRec, stdout, stderr, d)
 	}
+}
+
+// drainGracefulDeliverPending delivers the still-pending handoff doc to the
+// CONFIRMED healthy successor BEFORE drainGraceful cleans the queue (codex
+// PR3-completion iter-2 [P1]). The barrier proves doc + checkpoint
+// DURABILITY, not DELIVERY: the GracefulCoordSwap completion can fail or
+// crash between retiring OLD and injecting the doc, leaving the queue as the
+// only durable signal that the successor never got its resume prompt.
+// Deleting the queue here without delivering would consume that signal and
+// strand the winner blank (§5c: "doc stays pending; next drain re-delivers").
+//
+// At-most-once via deliverRecoverResumePrompt's lock-owner sentinel
+// (.locks/resume-prompt-sent-<id>): a pass that delivered but crashed before
+// queue.Delete re-enters here and short-circuits. A doc the barrier
+// completion ALREADY injected (delivery ok, only queue.Delete lost) has no
+// sentinel and is re-sent once — the benign §5c duplicate, preferred over a
+// silent strand. Errors propagate so the caller preserves the queue.
+//
+// oldRec may be nil (OLD already archived); the auto-resume policy then
+// falls back to the queue override alone. The sentinel keys on the queue's
+// journaled successor id (stable across passes), else OLD's id.
+func drainGracefulDeliverPending(req queue.SpawnFresh, oldRec *agent.Record,
+	stdout, stderr io.Writer) error {
+	id := req.NewAgentID
+	if id == "" {
+		id = req.OldAgentID
+	}
+	rec := &agent.Record{ID: id, Project: req.Project}
+	return deliverRecoverResumePrompt(rec, req.HandoffDoc,
+		effectiveDisableAutoResume(req, oldRec), true, stdout, stderr)
 }
 
 // healthySuccessorPresent reports whether a HEALTHY successor (not OLD) holds
@@ -1134,6 +1191,9 @@ func fillDrainLeaseDeps(d drainLeaseDeps) drainLeaseDeps {
 	}
 	if d.RecoverSpawn == nil {
 		d.RecoverSpawn = def.RecoverSpawn
+	}
+	if d.DeliverPending == nil {
+		d.DeliverPending = def.DeliverPending
 	}
 	if d.BarrierPoll == 0 {
 		d.BarrierPoll = def.BarrierPoll
