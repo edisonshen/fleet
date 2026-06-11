@@ -502,6 +502,22 @@ type fsEventMsg struct{}
 // completes without operator intervention.
 type queueEventMsg struct{}
 
+// drainBackgroundedMarker is the substring `fleet drain` prints on its
+// stdout when a resume exceeded the budget and was counted in-progress
+// (DESIGN-handoff-lifecycle-hardening bug A; the Fprintf in
+// cmd/fleet/drain.go's ErrResumeBackgrounded branch). The TUI matches
+// it to know the drain child exited 0 with a handoff still pending —
+// output-shape contract pinned on the producer side by
+// TestDrain_BackgroundedResumeCountsBackgrounded.
+const drainBackgroundedMarker = "completing in the background"
+
+// redrainDelay is how long the TUI waits before re-running `fleet
+// drain` after a backgrounded resume. The kept queue file is UNCHANGED
+// on disk, so fsnotify will never re-fire for it — this scheduled
+// retry is the only automatic recovery on the TUI path (codex iter-2
+// [P1]). var, not const: tests shrink it to keep the retry assertable.
+var redrainDelay = 30 * time.Second
+
 // upgradeAvailableMsg carries the rendered nudge text when a newer
 // release is on disk. Empty text leaves m.upgradeBanner cleared
 // (no banner) — every failure mode in the version package collapses
@@ -693,8 +709,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case drainDoneMsg:
 		// Surface drain output as a flash if there's anything
-		// interesting (errors or non-empty output). Empty success runs
-		// are silent — we don't want every queue event to spam the
+		// interesting (errors or a backgrounded resume). Routine success
+		// runs are silent — we don't want every queue event to spam the
 		// banner.
 		if msg.err != nil {
 			fl := flashMsg{
@@ -702,6 +718,28 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				isErr: true,
 			}
 			m.flash = &fl
+			return m, loadAgentsCmd()
+		}
+		// Backgrounded resume (DESIGN-handoff-lifecycle-hardening bug A,
+		// codex iter-2 [P1]): the drain exited 0 but a slow handoff is
+		// still pending — the drain child process is gone (its resume
+		// goroutine died with it) and the kept queue file is UNCHANGED on
+		// disk, so fsnotify will never re-fire for it. Without this
+		// branch a slow resume becomes a silently stuck handoff until an
+		// unrelated queue event lands. Surface a non-error flash AND
+		// schedule a delayed re-drain; the retry re-runs Resume, which
+		// finishes the handoff or reconciles an already-completed one and
+		// deletes the queue file — the next drain then prints no marker,
+		// so the re-drain loop converges.
+		if strings.Contains(msg.out, drainBackgroundedMarker) {
+			fl := flashMsg{
+				text:  fmt.Sprintf("drain: slow handoff still completing; re-draining in %s", redrainDelay),
+				isErr: false,
+			}
+			m.flash = &fl
+			return m, tea.Batch(loadAgentsCmd(), tea.Tick(redrainDelay, func(time.Time) tea.Msg {
+				return queueEventMsg{}
+			}))
 		}
 		return m, loadAgentsCmd()
 

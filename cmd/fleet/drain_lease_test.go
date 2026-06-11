@@ -786,6 +786,22 @@ func TestDrainLease_NoEpochColdSpawnsViaResume(t *testing.T) {
 	}
 }
 
+// coldResumeDeps returns deps pinned so drainOneLeaseAwareWith routes to
+// coldResume DETERMINISTICALLY — no lease epoch (stealable), no live leader,
+// OLD not on disk — regardless of the host's REAL ~/.fleet lease state. A
+// developer machine often runs a live projects-fleet coord whose heartbeat
+// would flip the default LeaderPresent and reroute these tests through the
+// live-leader fallback (flaky stand-down nils). Tests override Resume (and
+// LockAgent when they observe it).
+func coldResumeDeps() drainLeaseDeps {
+	return drainLeaseDeps{
+		CurrentEpoch:  func(string) (int64, bool) { return 0, false },
+		LeaderPresent: func(string) bool { return false },
+		LoadAgent:     func(string) (*agent.Record, error) { return nil, state.ErrNotFound },
+		LockAgent:     func(string) (func(), error) { return func() {}, nil },
+	}
+}
+
 // codex PR3 iter-4 [P1]: the cold Resume path SERIALIZES via a per-agent lock
 // (Resume's contract) — coldResume takes LockAgent around Resume. This is the
 // stealable-lease cold-spawn case, NOT the hung-leader swap, so the brief lock
@@ -794,17 +810,15 @@ func TestDrainLease_ColdResume_HoldsPerAgentLock(t *testing.T) {
 	out := &bytes.Buffer{}
 	var lockedDuringResume bool
 	var locked, released int32
-	d := drainLeaseDeps{
-		CurrentEpoch: func(string) (int64, bool) { return 0, false }, // stealable
-		LockAgent: func(string) (func(), error) {
-			atomic.AddInt32(&locked, 1)
-			return func() { atomic.AddInt32(&released, 1) }, nil
-		},
-		Resume: func(queue.SpawnFresh, string, int, io.Writer, io.Writer) error {
-			// The lock must be held while Resume runs (serialization).
-			lockedDuringResume = atomic.LoadInt32(&locked) == 1 && atomic.LoadInt32(&released) == 0
-			return nil
-		},
+	d := coldResumeDeps()
+	d.LockAgent = func(string) (func(), error) {
+		atomic.AddInt32(&locked, 1)
+		return func() { atomic.AddInt32(&released, 1) }, nil
+	}
+	d.Resume = func(queue.SpawnFresh, string, int, io.Writer, io.Writer) error {
+		// The lock must be held while Resume runs (serialization).
+		lockedDuringResume = atomic.LoadInt32(&locked) == 1 && atomic.LoadInt32(&released) == 0
+		return nil
 	}
 	// resumeTimeoutMillis=0 -> coldResume runs synchronously (no timeout), so the
 	// lock-held-then-released ordering is deterministic for this contract test.
@@ -827,13 +841,10 @@ func TestDrainLease_ColdResume_HonorsResumeTimeout(t *testing.T) {
 	out := &bytes.Buffer{}
 	block := make(chan struct{})
 	t.Cleanup(func() { close(block) }) // unblock the abandoned goroutine at test end
-	d := drainLeaseDeps{
-		CurrentEpoch: func(string) (int64, bool) { return 0, false }, // stealable -> coldResume
-		LockAgent:    func(string) (func(), error) { return func() {}, nil },
-		Resume: func(queue.SpawnFresh, string, int, io.Writer, io.Writer) error {
-			<-block // hang past the budget
-			return nil
-		},
+	d := coldResumeDeps()
+	d.Resume = func(queue.SpawnFresh, string, int, io.Writer, io.Writer) error {
+		<-block // hang past the budget
+		return nil
 	}
 	done := make(chan error, 1)
 	go func() {
@@ -848,8 +859,54 @@ func TestDrainLease_ColdResume_HonorsResumeTimeout(t *testing.T) {
 		if !strings.Contains(err.Error(), "resume-timeout") {
 			t.Errorf("expected a resume-timeout error, got %v", err)
 		}
+		// DESIGN-handoff-lifecycle-hardening bug A: the timeout is BACKGROUNDED,
+		// not failed — it must carry the typed sentinel so runDrain counts it
+		// backgrounded (codex iter-1 [P1]: not processed — the handoff may
+		// still be pending) instead of reporting "every pending handoff
+		// failed".
+		if !errors.Is(err, ErrResumeBackgrounded) {
+			t.Errorf("timeout must wrap ErrResumeBackgrounded, got %v", err)
+		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("coldResume BLOCKED past the budget — resume-timeout not honored (drain-storm regression)")
+	}
+}
+
+// Bug A, test 1: a Resume that completes WITHIN the budget behaves exactly as
+// today — nil error (counted processed, the only completion signal), no
+// backgrounding.
+func TestDrainLease_ColdResume_FastResumeWithinBudget(t *testing.T) {
+	out := &bytes.Buffer{}
+	var resumed int32
+	d := coldResumeDeps()
+	d.Resume = func(queue.SpawnFresh, string, int, io.Writer, io.Writer) error {
+		atomic.AddInt32(&resumed, 1)
+		return nil
+	}
+	// Generous budget; Resume returns immediately — must come back nil.
+	if err := drainOneLeaseAwareWith(leaseDrainReq(), "/tmp/q.json", 0, 60000, out, out, d); err != nil {
+		t.Fatalf("fast resume within budget must return nil, got %v", err)
+	}
+	if atomic.LoadInt32(&resumed) != 1 {
+		t.Errorf("Resume ran %d times, want 1", resumed)
+	}
+}
+
+// Bug A, test 5 (coldResume seam): a GENUINE Resume error returned before the
+// budget propagates as-is — never the backgrounded sentinel.
+func TestDrainLease_ColdResume_GenuineErrorNotBackgrounded(t *testing.T) {
+	out := &bytes.Buffer{}
+	boom := errors.New("spawn replacement: boom")
+	d := coldResumeDeps()
+	d.Resume = func(queue.SpawnFresh, string, int, io.Writer, io.Writer) error {
+		return boom
+	}
+	err := drainOneLeaseAwareWith(leaseDrainReq(), "/tmp/q.json", 0, 60000, out, out, d)
+	if !errors.Is(err, boom) {
+		t.Fatalf("genuine resume error must propagate, got %v", err)
+	}
+	if errors.Is(err, ErrResumeBackgrounded) {
+		t.Error("genuine resume error wrongly classified as backgrounded — masks real failures")
 	}
 }
 
