@@ -331,9 +331,11 @@ func GracefulCoordSwap(oldRec, newRec *agent.Record, docPath string,
 		return nil, fmt.Errorf("handoffop.GracefulCoordSwap: deliver closure required")
 	}
 	var winner *agent.Record
+	retireStarted := false
 	deps := gracefulSwapDepsFn()
 	deps.SpawnStandby = func(time.Duration) error { return nil } // standby == newRec, already spawned
 	deps.RetireOld = func() error {
+		retireStarted = true
 		_, err := atomicCoordSwapFn(AtomicCoordSwapInputs{
 			Project:              oldRec.Project,
 			OldRec:               oldRec,
@@ -355,9 +357,42 @@ func GracefulCoordSwap(oldRec, newRec *agent.Record, docPath string,
 		OldRec:         oldRec,
 		HandoffDocPath: docPath, // already durable — empty HandoffDoc skips the write
 	}, deps); err != nil {
+		// Pre-retire failure (epoch read / barrier write / seam validation):
+		// AtomicCoordSwap never ran, so its marker rollback (codex iter-10/16)
+		// never ran either. The callers eagerly wrote the coord-spawn marker
+		// → newRec.ID before invoking us; without an undo the marker keeps
+		// naming a polling standby while OLD is still leader — a retry's
+		// `marker == oldRec.ID` coord-swap detection then misroutes the coord
+		// handoff down the WORKER path, and [a] discovery follows the marker
+		// into a supervisor pane (codex PR3-completion iter-1 [P1]). Once
+		// RetireOld has started, marker ownership belongs to AtomicCoordSwap
+		// (pre-commit failures roll back internally; post-commit failures
+		// legitimately leave the marker at NEW) — never undo it here.
+		if !retireStarted {
+			rollbackEagerCoordMarker(oldRec, newRec, stderr)
+		}
 		return nil, err
 	}
 	return winner, nil
+}
+
+// rollbackEagerCoordMarker undoes a caller's eager coord-spawn-marker write
+// (marker → NEW before the swap) after a failure that happened BEFORE the
+// retire phase ran. CAS-guarded: only restores when the marker actually
+// points at NEW — an eager write that never landed, or a concurrent
+// takeover's marker, is left alone. Best-effort; surface-don't-silo.
+func rollbackEagerCoordMarker(oldRec, newRec *agent.Record, stderr io.Writer) {
+	if oldRec == nil || newRec == nil || oldRec.Project == "" {
+		return
+	}
+	if state.ReadCoordSpawnMarker(oldRec.Project) != newRec.ID {
+		return
+	}
+	if werr := writeCoordSpawnMarkerFn(oldRec.Project, oldRec.ID); werr != nil && stderr != nil {
+		_, _ = fmt.Fprintf(stderr,
+			"warning: graceful coord swap: rollback coord-spawn marker for project %s to %s failed: %v (operator: re-write manually if dashboard misses OLD)\n",
+			oldRec.Project, oldRec.ID, werr)
+	}
 }
 
 // gracefulDurableSteps runs steps 2-5 (doc, checkpoint, drain, barrier) in
