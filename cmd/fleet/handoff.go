@@ -172,6 +172,12 @@ var (
 	handoffDeliveryDepsFn        = handoffdelivery.DefaultDeps
 	handoffDeliveryTimeout       = 30 * time.Second
 	handoffDeliveryPoll          = 100 * time.Millisecond
+	// PR3 graceful-route seams (DESIGN-coord-spawn-unified-standby §6): a
+	// LIVE-coord manual handoff routes through the GracefulHandoff barrier
+	// (barrier → AtomicCoordSwap → deliver-to-lock-winner) instead of the
+	// bespoke swap-then-deliver sequence. Vars so tests inject fakes.
+	handoffGracefulEligibleFn = handoffop.GracefulSwapEligible
+	handoffGracefulSwapFn     = handoffop.GracefulCoordSwap
 )
 
 func deliverHandoffResumePrompt(project string, isCoordSwap bool, rec *agent.Record,
@@ -1052,7 +1058,34 @@ func runHandoff(opts *handoffOpts, stdout, stderr io.Writer) error {
 	// Worker swap (the else branch below) keeps the existing inline
 	// sequence; its transactional refactor is deferred (different
 	// semantics: task-row CAS, not marker rename).
-	if isCoordSwap {
+	//
+	// PR3 (DESIGN-coord-spawn-unified-standby §6): a LIVE-coord swap —
+	// OLD currently owns the lease, the successor is a lease-wrapped
+	// standby, and the prompt will be auto-delivered — routes through the
+	// GracefulHandoff BARRIER: barrier write (doc already durable at step
+	// 5) → AtomicCoordSwap (OLD's coord-run exit releases the lease) →
+	// poll the lock winner → inject the doc. Delivery happens INSIDE the
+	// barrier completion, so step 13 must not send a second prompt.
+	var gracefulWinner *agent.Record
+	gracefulRouted := false
+	if isCoordSwap && autoResume && newRec.LeaseWrapped &&
+		handoffGracefulEligibleFn(oldRec, autoResume) {
+		winner, gerr := handoffGracefulSwapFn(oldRec, newRec, docPath,
+			time.Duration(opts.graceMillis)*time.Millisecond,
+			func() (*agent.Record, error) {
+				return deliverHandoffResumePrompt(oldRec.Project, isCoordSwap,
+					newRec, docPath, stdout, stderr)
+			}, stderr)
+		if gerr != nil {
+			// Queue stays PENDING (queue.Delete only runs below on
+			// success) so a retry / next drain pass finishes from the
+			// durable journal. Swap sentinels stay errors.Is-reachable.
+			return fmt.Errorf("graceful coord handoff for %s: %w (queue preserved at %s)",
+				oldRec.ID, gerr, queuePath)
+		}
+		gracefulRouted = true
+		gracefulWinner = winner
+	} else if isCoordSwap {
 		_, swapErr := handoffop.AtomicCoordSwap(handoffop.AtomicCoordSwapInputs{
 			Project:              oldRec.Project,
 			OldRec:               oldRec,
@@ -1184,11 +1217,19 @@ func runHandoff(opts *handoffOpts, stdout, stderr io.Writer) error {
 	promptDelivered := !autoResume
 	supersededReplacement := false
 	if autoResume {
-		deliveredRec, err := deliverHandoffResumePrompt(oldRec.Project, isCoordSwap,
-			newRec, docPath, stdout, stderr)
-		if err != nil {
-			return fmt.Errorf("resume prompt delivery pending for %s: %w (queue preserved at %s)",
-				newRec.ID, err, queuePath)
+		var deliveredRec *agent.Record
+		if gracefulRouted {
+			// The doc already landed on the lock winner inside the barrier
+			// completion — a second send here would be a duplicate prompt.
+			deliveredRec = gracefulWinner
+		} else {
+			var err error
+			deliveredRec, err = deliverHandoffResumePrompt(oldRec.Project, isCoordSwap,
+				newRec, docPath, stdout, stderr)
+			if err != nil {
+				return fmt.Errorf("resume prompt delivery pending for %s: %w (queue preserved at %s)",
+					newRec.ID, err, queuePath)
+			}
 		}
 		if deliveredRec != nil {
 			successorRec = deliveredRec
@@ -1367,7 +1408,25 @@ func resumeHandoff(opts *handoffOpts, stdout, stderr io.Writer,
 			"resume handoff: replacement %s tmux session %s exited during readiness wait; old agent %s untouched, retry handoff",
 			newRec.ID, newRec.TmuxSession, oldRec.ID)
 	}
-	if isCoordSwap {
+	// PR3: same graceful-barrier route as runHandoff — the crash-recovery
+	// resume of a LIVE-coord swap must not regress to the bespoke sequence.
+	var gracefulWinner *agent.Record
+	gracefulRouted := false
+	if isCoordSwap && autoResume && newRec.LeaseWrapped &&
+		handoffGracefulEligibleFn(oldRec, autoResume) {
+		winner, gerr := handoffGracefulSwapFn(oldRec, newRec, docPath,
+			time.Duration(opts.graceMillis)*time.Millisecond,
+			func() (*agent.Record, error) {
+				return deliverHandoffResumePrompt(oldRec.Project, isCoordSwap,
+					newRec, docPath, stdout, stderr)
+			}, stderr)
+		if gerr != nil {
+			return fmt.Errorf("resume handoff: graceful coord swap for %s: %w (queue preserved at %s)",
+				oldRec.ID, gerr, queuePath)
+		}
+		gracefulRouted = true
+		gracefulWinner = winner
+	} else if isCoordSwap {
 		_, swapErr := handoffop.AtomicCoordSwap(handoffop.AtomicCoordSwapInputs{
 			Project:              oldRec.Project,
 			OldRec:               oldRec,
@@ -1423,11 +1482,18 @@ func resumeHandoff(opts *handoffOpts, stdout, stderr io.Writer,
 	supersededSession := ""
 	supersededID := ""
 	if autoResume {
-		deliveredRec, err := deliverHandoffResumePrompt(oldRec.Project, isCoordSwap,
-			newRec, docPath, stdout, stderr)
-		if err != nil {
-			return fmt.Errorf("resume handoff: prompt delivery pending for %s: %w (queue preserved at %s)",
-				newRec.ID, err, queuePath)
+		var deliveredRec *agent.Record
+		if gracefulRouted {
+			// Already delivered inside the barrier completion.
+			deliveredRec = gracefulWinner
+		} else {
+			var err error
+			deliveredRec, err = deliverHandoffResumePrompt(oldRec.Project, isCoordSwap,
+				newRec, docPath, stdout, stderr)
+			if err != nil {
+				return fmt.Errorf("resume handoff: prompt delivery pending for %s: %w (queue preserved at %s)",
+					newRec.ID, err, queuePath)
+			}
 		}
 		if deliveredRec != nil {
 			successorRec = deliveredRec

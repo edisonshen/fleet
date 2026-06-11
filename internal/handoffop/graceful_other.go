@@ -37,13 +37,15 @@ type GracefulHandoffInputs struct {
 
 // GracefulHandoffDeps mirrors the linux/darwin definition.
 type GracefulHandoffDeps struct {
-	SpawnStandby  func(timeout time.Duration) error
-	ReapStandby   func() error
-	WriteAtomic   func(path string, data []byte) error
-	DrainInFlight func() error
-	CurrentEpoch  func(project string) (int64, bool)
-	BarrierPath   func(project string, epoch int64) (string, error)
-	Stderr        io.Writer
+	SpawnStandby       func(timeout time.Duration) error
+	ReapStandby        func() error
+	WriteAtomic        func(path string, data []byte) error
+	DrainInFlight      func() error
+	CurrentEpoch       func(project string) (int64, bool)
+	BarrierPath        func(project string, epoch int64) (string, error)
+	RetireOld          func() error
+	DeliverDocToWinner func() (*agent.Record, error)
+	Stderr             io.Writer
 }
 
 // DefaultGracefulHandoffDeps returns empty deps on unsupported platforms.
@@ -52,4 +54,16 @@ func DefaultGracefulHandoffDeps() GracefulHandoffDeps { return GracefulHandoffDe
 // GracefulHandoff refuses on unsupported platforms.
 func GracefulHandoff(GracefulHandoffInputs, GracefulHandoffDeps) error {
 	return ErrGracefulHandoffUnsupported
+}
+
+// GracefulSwapEligible is always false on platforms without the lease
+// primitive: there is no lease owner to follow, so the live-coord handoff
+// paths keep their bespoke (direct-send) shape.
+func GracefulSwapEligible(*agent.Record, bool) bool { return false }
+
+// GracefulCoordSwap refuses on unsupported platforms. Unreachable in
+// practice — callers gate on GracefulSwapEligible, which is false here.
+func GracefulCoordSwap(_, _ *agent.Record, _ string, _ time.Duration,
+	_ func() (*agent.Record, error), _ io.Writer) (*agent.Record, error) {
+	return nil, ErrGracefulHandoffUnsupported
 }
