@@ -421,7 +421,13 @@ func runHandoff(opts *handoffOpts, stdout, stderr io.Writer) error {
 			if autoResume {
 				coordDelivery := spawn.IsCoordSpawn(newRec.TaskID, newRec.Project) ||
 					(newRec.Project != "" && state.ReadCoordSpawnMarker(newRec.Project) == newRec.ID)
-				deliveredRec, err := deliverHandoffResumePrompt(newRec.Project, coordDelivery, false,
+				// requireOwner = newRec.LeaseWrapped (codex PR3-completion
+				// iter-8 [P1]): a graceful swap that retired OLD but timed
+				// out on delivery retries through THIS archived-OLD branch.
+				// For a lease-wrapped replacement, no-owner means
+				// mid-acquire — the direct-send fallback would type into the
+				// coord-run supervisor pane and falsely consume the queue.
+				deliveredRec, err := deliverHandoffResumePrompt(newRec.Project, coordDelivery, newRec.LeaseWrapped,
 					newRec, pending.HandoffDoc, stdout, stderr)
 				if err != nil {
 					return fmt.Errorf(

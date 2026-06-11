@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -2394,5 +2395,103 @@ func TestDeliverHandoffResumePrompt_RequireOwner_NoOwner_NoFallback(t *testing.T
 	}
 	if delivered != nil {
 		t.Fatalf("delivered = %+v on the no-owner path, want nil", delivered)
+	}
+}
+
+// codex PR3-completion iter-8 [P1]: a graceful swap that retired OLD but
+// timed out on delivery retries through runHandoff's archived-OLD recovery
+// branch. With a LEASE-WRAPPED journaled replacement and no lock owner
+// observed yet (standby mid-acquire), the recovery must keep the queue
+// PENDING — the legacy direct-send fallback would type into the coord-run
+// supervisor pane, report success, and consume the only durable inbox.
+func TestHandoff_ArchivedOldRecovery_LeaseWrapped_NoOwner_PreservesQueue(t *testing.T) {
+	requireTmux(t)
+	t.Setenv("FLEET_LEASE_FAILOVER", "1")
+	root := setupFleetHome(t)
+
+	const project = "rainier"
+	cwd := seedRecoveryRepo(t, root, project)
+
+	// OLD already retired+archived by the crashed graceful run.
+	old := agent.New(agent.NewID())
+	old.TaskID = "coord-" + project
+	old.Project = project
+	old.Cwd = cwd
+	old.Command = []string{"sleep", "60"}
+	old.TmuxSession = tmux.SessionName(old.ID)
+	if err := old.Write(); err != nil {
+		t.Fatalf("write old: %v", err)
+	}
+
+	// Journaled LEASE-WRAPPED replacement, alive (a polling standby).
+	newRec := agent.New(agent.NewID())
+	newRec.TaskID = old.TaskID
+	newRec.Project = project
+	newRec.Cwd = cwd
+	newRec.Command = []string{"sleep", "60"}
+	newRec.TmuxSession = tmux.SessionName(newRec.ID)
+	newRec.LeaseWrapped = true
+	if err := tmux.Spawn(newRec.TmuxSession, newRec.Cwd, newRec.Command,
+		[]string{"FLEET_AGENT_ID=" + newRec.ID}); err != nil {
+		t.Fatalf("spawn replacement: %v", err)
+	}
+	t.Cleanup(func() { _ = tmux.Kill(newRec.TmuxSession) })
+	if err := newRec.Write(); err != nil {
+		t.Fatalf("write replacement: %v", err)
+	}
+
+	docPath := filepath.Join(t.TempDir(), "handoff.md")
+	if err := os.WriteFile(docPath, []byte("# doc\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	qp, err := queue.WriteSpawnFresh(queue.SpawnFresh{
+		OldAgentID: old.ID,
+		HandoffDoc: docPath,
+		Project:    project,
+		TaskID:     old.TaskID,
+		NewAgentID: newRec.ID,
+		NewSession: newRec.TmuxSession,
+	})
+	if err != nil {
+		t.Fatalf("WriteSpawnFresh: %v", err)
+	}
+	if err := old.ArchiveWithHandoff(newRec.ID); err != nil {
+		t.Fatalf("archive old: %v", err)
+	}
+
+	origDeps := handoffDeliveryDepsFn
+	origTimeout := handoffDeliveryTimeout
+	origPoll := handoffDeliveryPoll
+	t.Cleanup(func() {
+		handoffDeliveryDepsFn = origDeps
+		handoffDeliveryTimeout = origTimeout
+		handoffDeliveryPoll = origPoll
+	})
+	handoffDeliveryTimeout = 100 * time.Millisecond
+	handoffDeliveryPoll = time.Millisecond
+	var directSends int32
+	handoffDeliveryDepsFn = func() handoffdelivery.Deps {
+		deps := handoffdelivery.DefaultDeps()
+		deps.CurrentOwner = func(string) (coordlock.Owner, bool) {
+			return coordlock.Owner{}, false // standby mid-acquire, no owner yet
+		}
+		deps.SendVerified = func(session, _ string) (bool, error) {
+			atomic.AddInt32(&directSends, 1)
+			return true, nil
+		}
+		deps.Sleep = func(time.Duration) {}
+		return deps
+	}
+
+	out := &bytes.Buffer{}
+	err = runHandoff(&handoffOpts{oldID: old.ID, graceMillis: 0}, out, out)
+	if err == nil || !strings.Contains(err.Error(), "delivery is still pending") {
+		t.Fatalf("archived-OLD recovery with no owner must stay pending, got %v\n%s", err, out.String())
+	}
+	if _, statErr := os.Stat(qp); statErr != nil {
+		t.Fatalf("queue must be preserved for the next retry: %v", statErr)
+	}
+	if n := atomic.LoadInt32(&directSends); n != 0 {
+		t.Fatalf("owner-poll send ran %d times with no owner, want 0", n)
 	}
 }

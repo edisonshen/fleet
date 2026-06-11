@@ -539,8 +539,18 @@ func cleanUpStaleQueue(req queue.SpawnFresh, queuePath string,
 		// Read the ACTUAL wrap state from the already-spawned replacement
 		// record (codex iter-24 [P2]), not the producer's cap-approval bit: a
 		// bare drain cold-resume coord records false even on a CapApproved queue.
+		//
+		// requireOwner = leaseWrappedSuccessor (codex PR3-completion iter-8
+		// [P1]): this archived-OLD retry is exactly where a graceful swap that
+		// retired OLD but timed out on delivery resumes. A LEASE-WRAPPED
+		// replacement with no observed owner is a standby that has not
+		// acquired YET — the legacy direct-send fallback would type into its
+		// coord-run supervisor pane, report success, and consume the queue
+		// while the eventual winner never gets the doc. Bare legacy
+		// replacements (leaseWrappedSuccessor=false) skip the owner-poll
+		// entirely, so the fallback remains for genuinely lease-less coords.
 		leaseWrappedSuccessor := newRec.LeaseWrapped
-		deliveredRec, err := deliverResumePrompt(newRec.Project, coordDelivery, leaseWrappedSuccessor, false,
+		deliveredRec, err := deliverResumePrompt(newRec.Project, coordDelivery, leaseWrappedSuccessor, leaseWrappedSuccessor,
 			newRec, req.HandoffDoc, stdout, stdout)
 		if err != nil {
 			return fmt.Errorf(
