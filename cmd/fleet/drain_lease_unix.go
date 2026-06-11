@@ -960,6 +960,13 @@ func takeoverAndRecover(req queue.SpawnFresh, path string, cachedOld *agent.Reco
 	// healthy successor means the handoff is complete — clean the queue and stand
 	// down instead of cold-spawning a redundant replacement.
 	if op, ok := d.healthySuccessorPresent(project, 0); ok {
+		// The warm standby that acquired during the takeover gap never got
+		// the doc through THIS pass — deliver it before the queue is cleaned
+		// (codex PR3-completion iter-3 [P1]; sentinel dedupes re-sends).
+		if derr := d.DeliverPending(req, cachedOld, stdout, stderr); derr != nil {
+			return fmt.Errorf("fleet drain: deliver pending handoff doc to %s's successor: %w (queue %s preserved)",
+				req.OldAgentID, derr, path)
+		}
 		_, _ = fmt.Fprintf(stdout,
 			"fleet drain: a healthy successor (pid %d) acquired the lease for %s after takeover; standing down (no recovery spawn)\n",
 			op, project)
@@ -1012,7 +1019,19 @@ func drainLiveLeaderFallback(req queue.SpawnFresh, path string, deadline time.Ti
 
 	oldRec, err := d.LoadAgent(req.OldAgentID)
 	if errors.Is(err, state.ErrNotFound) {
-		// OLD already archived -> handoff already completed; stale queue.
+		// OLD already archived -> OLD's retire completed, but that is NOT
+		// proof the doc was DELIVERED (codex PR3-completion iter-3 [P1]): a
+		// GracefulCoordSwap that retired OLD but failed delivery leaves this
+		// exact shape once the standby acquires (the epoch advanced, so the
+		// barrier check upstream missed OLD's barrier). Deliver the pending
+		// doc to the live leader before cleaning the queue — the at-most-once
+		// sentinel short-circuits if a prior pass already delivered; a doc the
+		// swap itself already injected is re-sent once (the benign §5c
+		// duplicate, preferred over consuming the only durable inbox).
+		if derr := d.DeliverPending(req, nil, stdout, stderr); derr != nil {
+			return fmt.Errorf("fleet drain: deliver pending handoff doc to %s's successor: %w (queue %s preserved)",
+				req.OldAgentID, derr, path)
+		}
 		_, _ = fmt.Fprintf(stdout,
 			"fleet drain: coord live for %s and %s already retired; cleaning stale queue\n",
 			req.Project, req.OldAgentID)
@@ -1054,6 +1073,13 @@ func drainLiveLeaderFallback(req queue.SpawnFresh, path string, deadline time.Ti
 	// coordless (same class as the graceful path).
 	if err == nil && oldRec != nil && oldRec.SupervisorPID > 0 {
 		if ownerPid, ok := d.healthySuccessorPresent(req.Project, oldRec.SupervisorPID); ok {
+			// Same delivery-before-delete contract as drainGraceful (codex
+			// PR3-completion iter-3 [P1]): the successor leading does not
+			// prove the doc landed; the sentinel dedupes a re-send.
+			if derr := d.DeliverPending(req, oldRec, stdout, stderr); derr != nil {
+				return fmt.Errorf("fleet drain: deliver pending handoff doc to %s's successor: %w (queue %s preserved)",
+					oldRec.ID, derr, path)
+			}
 			_, _ = fmt.Fprintf(stdout,
 				"fleet drain: a healthy successor already leads %s (active owner pid %d != old %d); handoff complete, cleaning queue\n",
 				req.Project, ownerPid, oldRec.SupervisorPID)
