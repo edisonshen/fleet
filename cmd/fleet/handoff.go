@@ -364,8 +364,13 @@ func runHandoff(opts *handoffOpts, stdout, stderr io.Writer) error {
 			case nerr != nil:
 				return fmt.Errorf("recovery probe: load replacement %s failed: %w", pending.NewAgentID, nerr)
 			}
-			// Resolve auto-resume EARLY (queue override + newRec baseline,
-			// schema v2+ gate) — coordOwnerDelivery below needs it.
+			// Resolve auto-resume EARLY — coordOwnerDelivery below needs
+			// it. Queue override + newRec baseline (codex iter-12 P2: the
+			// original handoff may have specified --no-auto-resume /
+			// --auto-resume), gated on schema v2+ (codex iter-15 P2: v1
+			// queue files predate auto-resume entirely, so an unconditional
+			// send would inject a prompt into a replacement the operator
+			// already kicked off manually).
 			disableAutoResume := newRec.DisableAutoResume
 			if pending.DisableAutoResume != nil {
 				disableAutoResume = *pending.DisableAutoResume
@@ -395,16 +400,6 @@ func runHandoff(opts *handoffOpts, stdout, stderr io.Writer) error {
 			// AFTER queue.Delete in runHandoff). Send the prompt
 			// now to cover that gap, then delete the queue.
 			//
-			// Resolve auto-resume from queue override + newRec
-			// baseline (codex review iter-12 P2): the original
-			// handoff may have specified --no-auto-resume /
-			// --auto-resume.
-			//
-			// Gate on schema v2+ (codex review iter-15 P2): older
-			// queue files predate auto-resume entirely, so an
-			// unconditional send here would inject a prompt into
-			// a replacement the operator already kicked off
-			// manually back when those v1 files were written.
 			// Wait + liveness check ALWAYS run; the readiness wait
 			// doubles as a post-spawn liveness probe that catches
 			// wrappers crashing shortly after step 8a's check
