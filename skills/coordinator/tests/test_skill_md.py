@@ -263,28 +263,50 @@ def test_skill_md_step5_documents_task_plan_review_sop():
     dual review before promote, the fix/re-review loop runs until both
     are P0/P1-clean, and reviews-clean never auto-promotes. Drift here
     lets a handed-off coord regress to inline self-review or skip the
-    pre-promote review gate entirely."""
+    pre-promote review gate entirely.
+
+    Assertions are scoped to the Step 5 section (not the whole file) so
+    review-flavored text in Step 6 can never mask deletion of an SOP
+    line, and pin full operator-approved clauses (hard wraps flattened)
+    rather than word fragments so the meaning can't drift while the
+    keywords survive."""
     body = _read_skill_md()
-    assert "Task-plan review SOP (operator-approved 2026-06-11, all projects)" in body, (
-        "SKILL.md Step 5 missing the task-plan review SOP header — "
-        "handed-off coords lose the pre-promote dual-review gate."
+    header = "Task-plan review SOP (operator-approved 2026-06-11, all projects)"
+    assert header in body, (
+        "SKILL.md missing the task-plan review SOP header — handed-off "
+        "coords lose the pre-promote dual-review gate."
     )
-    for marker in (
+    # Scope to Step 5: the SOP must live at the TASK-PLAN-DOC gate, not
+    # drift into a footnote where a promoting coord never re-reads it.
+    assert "### Step 5 — TASK-PLAN-DOC" in body
+    step5 = body.split("### Step 5 — TASK-PLAN-DOC", 1)[1].split("\n### ", 1)[0]
+    assert header in step5, (
+        "Task-plan review SOP moved out of the Step 5 — TASK-PLAN-DOC "
+        "section — the pre-promote gate must sit where promotion is defined."
+    )
+    # Flatten hard line wraps so full clauses can be pinned as substrings.
+    flat = " ".join(step5.split())
+    for clause in (
         # Coord never reviews inline; all review work is dispatched.
-        "NEVER reviews inline",
-        "no codex exec, no self-review",
-        # Dual review: dispatched codex + independent Claude reviewers.
-        "codex reviewer",
-        "independent Claude reviewer",
-        "cross-task seams",
-        # Loop until both reviewers are clean.
-        "no P0/P1",
-        # Doc-level fixes are the coord's only allowed write surface.
-        "only allowed write",
+        "The coord NEVER reviews inline (no codex exec, no self-review).",
+        "All review / debug / investigation / PR-review work is "
+        "DISPATCHED to subagents",
+        # The dual review is a pre-promote gate, via dispatched subagents.
+        "Before promote, every TASK-PLAN doc set gets one dual review via "
+        "dispatched subagents",
+        "a codex reviewer (codex exec, high reasoning) — design-fidelity, "
+        "code-reality, implementability",
+        "an independent Claude reviewer — cross-task seams between the "
+        "plans, testability, plus the same lenses",
+        # Fix/re-review loop until both reviewers are P0/P1-clean.
+        "the coord applies doc-level fixes (plan docs are its only allowed "
+        "write surface) and re-dispatches confirm reviews until BOTH "
+        "return no P0/P1",
         # Clean reviews never bypass the operator promote gate.
-        "never auto-promotes",
+        "Reviews-clean never auto-promotes — the operator promote gate "
+        "remains separate",
     ):
-        assert marker in body, (
-            f"SKILL.md task-plan review SOP missing {marker!r} — "
+        assert clause in flat, (
+            f"SKILL.md task-plan review SOP missing clause {clause!r} — "
             f"SOP wording drifted from the operator-approved text."
         )
