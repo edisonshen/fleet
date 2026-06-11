@@ -75,8 +75,20 @@ var (
 // duplicate-coord incident). Dead-coord recovery (OLD not the live lease
 // owner) keeps the bare cold-resume shape: a standby polling a dead owner's
 // lease has no live releaser to wait on.
+// Gates on the SAME marker predicate retireOldAgent's isCoordSwap uses
+// (codex PR3-completion iter-6 [P2]): a coord-shaped task whose coord-spawn
+// marker is missing/stale takes the worker/inline retire path later, where a
+// lease-wrapped standby would receive its prompt via direct-send into the
+// supervisor pane instead of the lock-owner poll. Keeping the wrap decision
+// aligned with the route decision prevents that split.
 func liveCoordGracefulSpawn(oldRec *agent.Record, isCoordResume, autoResume bool) bool {
-	return isCoordResume && gracefulSwapEligibleFn(oldRec, autoResume)
+	if !isCoordResume || oldRec == nil || oldRec.Project == "" {
+		return false
+	}
+	if state.ReadCoordSpawnMarker(oldRec.Project) != oldRec.ID {
+		return false
+	}
+	return gracefulSwapEligibleFn(oldRec, autoResume)
 }
 
 func deliverResumePrompt(project string, isCoordSwap, leaseWrappedSuccessor bool, rec *agent.Record,

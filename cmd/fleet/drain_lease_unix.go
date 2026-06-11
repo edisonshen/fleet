@@ -274,6 +274,14 @@ var (
 // falls back to the override or false. Honors `fleet handoff --no-auto-resume` /
 // `--auto-resume` on the escalated takeover-recovery path.
 func effectiveDisableAutoResume(req queue.SpawnFresh, cachedOld *agent.Record) bool {
+	// v1 queues predate auto-resume; handoffop.Resume / resumeHandoff treat
+	// them as autoResume=false (`req.SchemaVersion >= 2` gates the send).
+	// The drain delivery/recovery paths must agree (codex PR3-completion
+	// iter-6 [P2]) or an upgraded drain types a resume prompt while cleaning
+	// a lingering v1 queue.
+	if req.SchemaVersion < 2 {
+		return true
+	}
 	if req.DisableAutoResume != nil {
 		return *req.DisableAutoResume
 	}

@@ -2542,8 +2542,17 @@ func TestResume_Case3_GracefulNotEligible_BespokePathRuns(t *testing.T) {
 // recovery keeps the bare cold-resume shape (a standby polling a dead
 // owner's lease has no live releaser to wait on).
 func TestLiveCoordGracefulSpawn_DecidesLeaseWrap(t *testing.T) {
+	setupFleetHome(t)
 	oldRec := agent.New("oldcoord1")
 	oldRec.Project = "rainier"
+	if _, err := state.EnsureProjectInitialized(oldRec.Project); err != nil {
+		t.Fatalf("EnsureProjectInitialized: %v", err)
+	}
+	// The wrap decision gates on the SAME marker predicate retireOldAgent's
+	// isCoordSwap uses (codex PR3-completion iter-6 [P2]).
+	if err := state.WriteCoordSpawnMarker(oldRec.Project, oldRec.ID); err != nil {
+		t.Fatalf("seed marker: %v", err)
+	}
 
 	origElig := gracefulSwapEligibleFn
 	t.Cleanup(func() { gracefulSwapEligibleFn = origElig })
@@ -2568,5 +2577,20 @@ func TestLiveCoordGracefulSpawn_DecidesLeaseWrap(t *testing.T) {
 	}
 	if liveCoordGracefulSpawn(oldRec, true, false) {
 		t.Error("auto-resume off must not take the graceful route")
+	}
+
+	// Marker missing/stale -> the later retire takes the worker/inline path
+	// (isCoordSwap=false), so the wrap decision must say NO too — a
+	// lease-wrapped standby would otherwise get its prompt direct-sent into
+	// the supervisor pane (codex PR3-completion iter-6 [P2]).
+	if err := state.WriteCoordSpawnMarker(oldRec.Project, "someoneelse1"); err != nil {
+		t.Fatalf("re-point marker: %v", err)
+	}
+	consulted = 0
+	if liveCoordGracefulSpawn(oldRec, true, true) {
+		t.Error("stale coord-spawn marker must not take the graceful route")
+	}
+	if consulted != 0 {
+		t.Error("eligibility consulted despite a stale marker (marker gate must short-circuit)")
 	}
 }

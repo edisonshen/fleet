@@ -37,10 +37,11 @@ import (
 
 func leaseDrainReq() queue.SpawnFresh {
 	return queue.SpawnFresh{
-		OldAgentID: "oldcoord1",
-		Project:    "projects-fleet",
-		TaskID:     "coord",
-		HandoffDoc: "/tmp/doc.md",
+		SchemaVersion: queue.SchemaVersion,
+		OldAgentID:    "oldcoord1",
+		Project:       "projects-fleet",
+		TaskID:        "coord",
+		HandoffDoc:    "/tmp/doc.md",
 	}
 }
 
@@ -1420,10 +1421,11 @@ func TestDrainGracefulDeliverPending_ArchivedOldPolicy_NoPrompt(t *testing.T) {
 	}
 
 	req := queue.SpawnFresh{
-		OldAgentID: old.ID,
-		Project:    project,
-		TaskID:     "coord",
-		HandoffDoc: "/tmp/handoff.md",
+		SchemaVersion: queue.SchemaVersion,
+		OldAgentID:    old.ID,
+		Project:       project,
+		TaskID:        "coord",
+		HandoffDoc:    "/tmp/handoff.md",
 	}
 	if err := drainGracefulDeliverPending(req, nil, &bytes.Buffer{}, &bytes.Buffer{}); err != nil {
 		t.Fatalf("delivery with archived opt-out OLD: %v", err)
@@ -1440,5 +1442,26 @@ func TestDrainGracefulDeliverPending_ArchivedOldPolicy_NoPrompt(t *testing.T) {
 	}
 	if sends != 1 {
 		t.Fatalf("resume prompt sent %d times with the auto-resume override, want 1", sends)
+	}
+}
+
+// codex PR3-completion iter-6 [P2]: v1 (schema_version < 2) queues predate
+// auto-resume; Resume/resumeHandoff never type a resume prompt for them. The
+// drain delivery/recovery paths must agree — cleaning a lingering v1 queue
+// must NOT send a prompt.
+func TestEffectiveDisableAutoResume_LegacySchemaNeverPrompts(t *testing.T) {
+	req := leaseDrainReq()
+	req.SchemaVersion = 1
+	if !effectiveDisableAutoResume(req, nil) {
+		t.Error("v1 queue must resolve to disableAutoResume=true (Resume parity)")
+	}
+	override := false
+	req.DisableAutoResume = &override
+	if !effectiveDisableAutoResume(req, nil) {
+		t.Error("v1 queue must stay opt-out even with an override field (Resume gates on schema first)")
+	}
+	req = leaseDrainReq() // schema v2
+	if effectiveDisableAutoResume(req, nil) {
+		t.Error("v2 queue with no override/baseline must default to auto-resume")
 	}
 }
