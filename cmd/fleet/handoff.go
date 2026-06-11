@@ -364,7 +364,25 @@ func runHandoff(opts *handoffOpts, stdout, stderr io.Writer) error {
 			case nerr != nil:
 				return fmt.Errorf("recovery probe: load replacement %s failed: %w", pending.NewAgentID, nerr)
 			}
-			if !tmux.HasSession(newRec.TmuxSession) {
+			// Resolve auto-resume EARLY (queue override + newRec baseline,
+			// schema v2+ gate) — coordOwnerDelivery below needs it.
+			disableAutoResume := newRec.DisableAutoResume
+			if pending.DisableAutoResume != nil {
+				disableAutoResume = *pending.DisableAutoResume
+			}
+			autoResume := !disableAutoResume && pending.SchemaVersion >= 2
+			// Coord lock-owner delivery (PR2 §5a; codex PR3-completion
+			// iter-9 [P2], mirrors cleanUpStaleQueue's iter-31 exception):
+			// when the prompt follows the project's CURRENT LOCK OWNER, the
+			// queued replacement may be a racing standby that LOST the lock
+			// and was reaped by the winner. The queued-session liveness
+			// aborts must NOT fire then — they would strand the queue
+			// pending even though DeliverToCurrentOwner can reach the live
+			// winner.
+			coordOwnerDelivery := autoResume && leaseFailoverEnabled() && newRec.LeaseWrapped &&
+				(spawn.IsCoordSpawn(newRec.TaskID, newRec.Project) ||
+					(newRec.Project != "" && state.ReadCoordSpawnMarker(newRec.Project) == newRec.ID))
+			if !tmux.HasSession(newRec.TmuxSession) && !coordOwnerDelivery {
 				return fmt.Errorf(
 					"agent %s already archived BUT replacement %s tmux session %s is gone — task has no live agent; investigate before deleting queue file %s",
 					opts.oldID, pending.NewAgentID, newRec.TmuxSession, pendingPath)
@@ -387,11 +405,6 @@ func runHandoff(opts *handoffOpts, stdout, stderr io.Writer) error {
 			// unconditional send here would inject a prompt into
 			// a replacement the operator already kicked off
 			// manually back when those v1 files were written.
-			disableAutoResume := newRec.DisableAutoResume
-			if pending.DisableAutoResume != nil {
-				disableAutoResume = *pending.DisableAutoResume
-			}
-			autoResume := !disableAutoResume && pending.SchemaVersion >= 2
 			// Wait + liveness check ALWAYS run; the readiness wait
 			// doubles as a post-spawn liveness probe that catches
 			// wrappers crashing shortly after step 8a's check
@@ -406,7 +419,10 @@ func runHandoff(opts *handoffOpts, stdout, stderr io.Writer) error {
 				_, _ = fmt.Fprintf(stderr,
 					"warning: post-readiness probe for %s failed: %v (proceeding anyway)\n",
 					newRec.TmuxSession, perr)
-			} else if !alive {
+			} else if !alive && !coordOwnerDelivery {
+				// For a coord lock-owner delivery the queued replacement
+				// exiting is EXPECTED when a racing standby won — delivery
+				// targets CurrentOwner, not this dead session (iter-31 P1).
 				return fmt.Errorf(
 					"agent %s already archived BUT replacement %s tmux session %s exited during readiness wait — task has no live agent",
 					opts.oldID, pending.NewAgentID, newRec.TmuxSession)
