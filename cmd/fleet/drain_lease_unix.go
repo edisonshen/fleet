@@ -718,8 +718,20 @@ func drainGracefulDeliverPending(req queue.SpawnFresh, oldRec *agent.Record,
 		id = req.OldAgentID
 	}
 	rec := &agent.Record{ID: id, Project: req.Project}
+	policyRec := oldRec
+	if policyRec == nil {
+		// OLD already archived: recover the inherited auto-resume baseline
+		// from the ARCHIVE (codex PR3-completion iter-4 [P2]). A handoff
+		// that opted out (DisableAutoResume, no queue override) must not get
+		// a resume prompt typed into a successor that was meant to stay
+		// idle. Best-effort: a missing archive falls back to the queue
+		// override / default, same as a nil cachedOld elsewhere.
+		if arc, aerr := agent.LoadArchive(req.OldAgentID); aerr == nil {
+			policyRec = arc
+		}
+	}
 	return deliverRecoverResumePrompt(rec, req.HandoffDoc,
-		effectiveDisableAutoResume(req, oldRec), true, stdout, stderr)
+		effectiveDisableAutoResume(req, policyRec), true, stdout, stderr)
 }
 
 // healthySuccessorPresent reports whether a HEALTHY successor (not OLD) holds

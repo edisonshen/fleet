@@ -1361,3 +1361,84 @@ func TestDrainLease_MissedBarrierStandDown_DeliveryFailurePreservesQueue(t *test
 		t.Errorf("queue must be PRESERVED on a delivery failure: %v", statErr)
 	}
 }
+
+// codex PR3-completion iter-4 [P2]: when OLD is already archived, the
+// drain delivery paths must recover the inherited DisableAutoResume baseline
+// from the ARCHIVE — an opt-out handoff (no queue override) must not get a
+// resume prompt typed into a successor that was meant to stay idle.
+func TestDrainGracefulDeliverPending_ArchivedOldPolicy_NoPrompt(t *testing.T) {
+	t.Setenv("FLEET_HOME", t.TempDir())
+	if _, err := state.Bootstrap(); err != nil {
+		t.Fatalf("bootstrap: %v", err)
+	}
+	const project = "projects-fleet"
+	if _, err := state.EnsureProjectInitialized(project); err != nil {
+		t.Fatalf("EnsureProjectInitialized: %v", err)
+	}
+
+	// OLD opted out of auto-resume, then was archived (its retire completed).
+	old := agent.New("oldcoord1")
+	old.Project = project
+	old.TaskID = "coord"
+	old.DisableAutoResume = true
+	if err := old.Write(); err != nil {
+		t.Fatalf("write old: %v", err)
+	}
+	if err := old.Archive(); err != nil {
+		t.Fatalf("archive old: %v", err)
+	}
+
+	winner := agent.New("winner01")
+	winner.Project = project
+	winner.TmuxSession = "fleet-winner01"
+	if err := winner.Write(); err != nil {
+		t.Fatalf("write winner: %v", err)
+	}
+
+	var sends int
+	origReady := recoverWaitForReadyFn
+	origAlive := recoverSessionAliveFn
+	origPrompt := recoverSendPromptVerifiedFn
+	origCurrentOwner := recoverCurrentOwnerFn
+	origMarker := recoverWriteMarkerFn
+	t.Cleanup(func() {
+		recoverWaitForReadyFn = origReady
+		recoverSessionAliveFn = origAlive
+		recoverSendPromptVerifiedFn = origPrompt
+		recoverCurrentOwnerFn = origCurrentOwner
+		recoverWriteMarkerFn = origMarker
+	})
+	recoverWaitForReadyFn = func(string) error { return nil }
+	recoverSessionAliveFn = func(string) (bool, error) { return true, nil }
+	recoverWriteMarkerFn = func(string, string) error { return nil }
+	recoverCurrentOwnerFn = func(string) (coordlock.Owner, bool) {
+		return coordlock.Owner{AgentID: winner.ID, PID: 4242, PidStart: 99}, true
+	}
+	recoverSendPromptVerifiedFn = func(string, string) (bool, error) {
+		sends++
+		return true, nil
+	}
+
+	req := queue.SpawnFresh{
+		OldAgentID: old.ID,
+		Project:    project,
+		TaskID:     "coord",
+		HandoffDoc: "/tmp/handoff.md",
+	}
+	if err := drainGracefulDeliverPending(req, nil, &bytes.Buffer{}, &bytes.Buffer{}); err != nil {
+		t.Fatalf("delivery with archived opt-out OLD: %v", err)
+	}
+	if sends != 0 {
+		t.Fatalf("resume prompt sent %d times for an opt-out handoff (archived baseline ignored), want 0", sends)
+	}
+
+	// Control: an explicit queue override back to auto-resume DOES prompt.
+	override := false
+	req.DisableAutoResume = &override
+	if err := drainGracefulDeliverPending(req, nil, &bytes.Buffer{}, &bytes.Buffer{}); err != nil {
+		t.Fatalf("delivery with auto-resume override: %v", err)
+	}
+	if sends != 1 {
+		t.Fatalf("resume prompt sent %d times with the auto-resume override, want 1", sends)
+	}
+}

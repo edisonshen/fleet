@@ -368,6 +368,15 @@ func GracefulCoordSwap(oldRec, newRec *agent.Record, docPath string,
 		// RetireOld has started, marker ownership belongs to AtomicCoordSwap
 		// (pre-commit failures roll back internally; post-commit failures
 		// legitimately leave the marker at NEW) — never undo it here.
+		//
+		// The standby (newRec) is deliberately NOT reaped on this path
+		// (codex iter-4 [P1] reviewed + rejected): the callers preserve the
+		// durable queue AND the journaled replacement so the retry
+		// (resumeHandoff / Resume case 3) REUSES the live standby instead of
+		// spawning a second one. If OLD crashes before the retry and the
+		// standby wins the freed lease, the pending queue's lock-owner
+		// delivery heals it (§5c) — it is never a blank strand. A standby
+		// that never wins self-reaps at the standby timeout (10 min).
 		if !retireStarted {
 			rollbackEagerCoordMarker(oldRec, newRec, stderr)
 		}
