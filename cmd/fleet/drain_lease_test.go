@@ -1447,21 +1447,62 @@ func TestDrainGracefulDeliverPending_ArchivedOldPolicy_NoPrompt(t *testing.T) {
 
 // codex PR3-completion iter-6 [P2]: v1 (schema_version < 2) queues predate
 // auto-resume; Resume/resumeHandoff never type a resume prompt for them. The
-// drain delivery/recovery paths must agree — cleaning a lingering v1 queue
-// must NOT send a prompt.
-func TestEffectiveDisableAutoResume_LegacySchemaNeverPrompts(t *testing.T) {
+// drain delivery path must agree — cleaning a lingering v1 queue must NOT
+// send a prompt. The suppression is a TRANSIENT send gate in
+// drainGracefulDeliverPending; effectiveDisableAutoResume itself stays a
+// pure BASELINE resolver because its value is persisted into a recovered
+// successor's record by RecoverSpawn (codex iter-10 [P2]).
+func TestDrainGracefulDeliverPending_LegacySchemaNeverPrompts(t *testing.T) {
+	t.Setenv("FLEET_HOME", t.TempDir())
+	if _, err := state.Bootstrap(); err != nil {
+		t.Fatalf("bootstrap: %v", err)
+	}
+	const project = "projects-fleet"
+	if _, err := state.EnsureProjectInitialized(project); err != nil {
+		t.Fatalf("EnsureProjectInitialized: %v", err)
+	}
+	winner := agent.New("winner02")
+	winner.Project = project
+	winner.TmuxSession = "fleet-winner02"
+	if err := winner.Write(); err != nil {
+		t.Fatalf("write winner: %v", err)
+	}
+
+	var sends int
+	origReady := recoverWaitForReadyFn
+	origAlive := recoverSessionAliveFn
+	origPrompt := recoverSendPromptVerifiedFn
+	origCurrentOwner := recoverCurrentOwnerFn
+	origMarker := recoverWriteMarkerFn
+	t.Cleanup(func() {
+		recoverWaitForReadyFn = origReady
+		recoverSessionAliveFn = origAlive
+		recoverSendPromptVerifiedFn = origPrompt
+		recoverCurrentOwnerFn = origCurrentOwner
+		recoverWriteMarkerFn = origMarker
+	})
+	recoverWaitForReadyFn = func(string) error { return nil }
+	recoverSessionAliveFn = func(string) (bool, error) { return true, nil }
+	recoverWriteMarkerFn = func(string, string) error { return nil }
+	recoverCurrentOwnerFn = func(string) (coordlock.Owner, bool) {
+		return coordlock.Owner{AgentID: winner.ID, PID: 4242, PidStart: 99}, true
+	}
+	recoverSendPromptVerifiedFn = func(string, string) (bool, error) {
+		sends++
+		return true, nil
+	}
+
 	req := leaseDrainReq()
 	req.SchemaVersion = 1
-	if !effectiveDisableAutoResume(req, nil) {
-		t.Error("v1 queue must resolve to disableAutoResume=true (Resume parity)")
+	if err := drainGracefulDeliverPending(req, nil, &bytes.Buffer{}, &bytes.Buffer{}); err != nil {
+		t.Fatalf("v1-queue delivery pass: %v", err)
 	}
-	override := false
-	req.DisableAutoResume = &override
-	if !effectiveDisableAutoResume(req, nil) {
-		t.Error("v1 queue must stay opt-out even with an override field (Resume gates on schema first)")
+	if sends != 0 {
+		t.Fatalf("resume prompt sent %d times for a v1 queue, want 0 (Resume parity)", sends)
 	}
-	req = leaseDrainReq() // schema v2
+	// Baseline resolver must NOT bake the schema gate in (it is persisted by
+	// RecoverSpawn into the successor record — codex iter-10 [P2]).
 	if effectiveDisableAutoResume(req, nil) {
-		t.Error("v2 queue with no override/baseline must default to auto-resume")
+		t.Error("effectiveDisableAutoResume must stay a pure baseline resolver (no schema gate)")
 	}
 }

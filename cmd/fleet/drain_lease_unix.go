@@ -273,15 +273,13 @@ var (
 // OLD's baseline DisableAutoResume. A nil cachedOld (record could not be cached)
 // falls back to the override or false. Honors `fleet handoff --no-auto-resume` /
 // `--auto-resume` on the escalated takeover-recovery path.
+// NOTE: this resolves the PERSISTED baseline only — the v1-schema send
+// suppression is a TRANSIENT per-handoff gate applied at the delivery sites
+// (drainGracefulDeliverPending), NOT here (codex PR3-completion iter-10
+// [P2]): this value flows into RecoverSpawn -> spawn.Options.DisableAutoResume
+// and would otherwise permanently flip a recovered successor's baseline to
+// opt-out just because the queue file predates the auto-resume schema.
 func effectiveDisableAutoResume(req queue.SpawnFresh, cachedOld *agent.Record) bool {
-	// v1 queues predate auto-resume; handoffop.Resume / resumeHandoff treat
-	// them as autoResume=false (`req.SchemaVersion >= 2` gates the send).
-	// The drain delivery/recovery paths must agree (codex PR3-completion
-	// iter-6 [P2]) or an upgraded drain types a resume prompt while cleaning
-	// a lingering v1 queue.
-	if req.SchemaVersion < 2 {
-		return true
-	}
 	if req.DisableAutoResume != nil {
 		return *req.DisableAutoResume
 	}
@@ -738,8 +736,14 @@ func drainGracefulDeliverPending(req queue.SpawnFresh, oldRec *agent.Record,
 			policyRec = arc
 		}
 	}
+	// v1 queues predate auto-resume; handoffop.Resume / resumeHandoff treat
+	// them as autoResume=false (`req.SchemaVersion >= 2` gates the send).
+	// This drain delivery must agree (codex PR3-completion iter-6 [P2]) or an
+	// upgraded drain types a resume prompt while cleaning a lingering v1
+	// queue. TRANSIENT send gate only — never persisted (iter-10 [P2]).
+	disable := effectiveDisableAutoResume(req, policyRec) || req.SchemaVersion < 2
 	return deliverRecoverResumePrompt(rec, req.HandoffDoc,
-		effectiveDisableAutoResume(req, policyRec), true, stdout, stderr)
+		disable, true, stdout, stderr)
 }
 
 // healthySuccessorPresent reports whether a HEALTHY successor (not OLD) holds
