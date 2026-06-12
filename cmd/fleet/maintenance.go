@@ -347,14 +347,16 @@ func runMaintenancePruneOrphanTmux(
 func newMaintenanceBootstrapRemoteControlCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "bootstrap-remote-control",
-		Short: "Survey live agents missing the --remote-control flag",
+		Short: "Survey live COORD agents missing the --remote-control flag",
 		Long: `bootstrap-remote-control walks ~/.fleet/agents/*.json and
-identifies live agents whose persisted Command lacks --remote-control.
+identifies live COORD agents (the project's coord-spawn marker
+resolves to the agent ID) whose persisted Command lacks
+--remote-control. Workers / Agent-tool subagents are out of scope —
+they never carry the flag by design (push-storm protection).
 Live = the record's tmux session is currently alive (HasSession). For
 each match, the command prints a one-line remediation suggestion
-("fleet handoff <id>" is the typical fix; the replacement spawn goes
-through the relaxed wrapper-pattern matcher and gets the flag injected
-automatically).
+("fleet handoff <id>" is the typical fix; the replacement spawn bakes
+in the native flag automatically).
 
 This is REPORT-ONLY in v1. An actual live retrofit would require
 restarting the agent's tmux session, which is the operator's call —
@@ -380,10 +382,24 @@ Exit codes:
 // listFn / hasSessionFn injection lets tests substitute fake
 // agent-store and tmux-presence views (no real tmux required).
 //
-// Native model: the survey differentiates "RC disabled for project"
-// (operator opt-out via `fleet rc down` — no remediation needed) from
-// "RC enabled (the default) but agent's persisted argv lacks the
-// flag" (pre-native agent that needs a handoff to pick up native RC).
+// Native model (codex review iter-1 [P2]): RC rides ONLY on coord
+// spawns, and rc.Enabled is default-on — so the survey must scope to
+// COORD agents (the project's coord-spawn marker resolves to the
+// agent's ID). Workers / Agent-tool subagents are intentionally never
+// flagged: reporting them would generate false "needs remediation"
+// noise for every normal default-on project. Within coords, the
+// survey differentiates "RC disabled for project" (operator opt-out
+// via `fleet rc down` — no action) from "RC enabled (the default) but
+// persisted argv lacks the flag" (pre-native coord — handoff respawns
+// it with native RC).
+//
+// Caveat (documented, accepted): native coords persist the CLEAN
+// command (the flag rides on the per-spawn exec argv only), so a
+// freshly-spawned native coord also shows up here until its record
+// observes a flagged persisted command. The survey is REPORT-ONLY and
+// the suggested remediation (handoff) is harmless-idempotent for that
+// case; teaching the survey to ps the live argv is deliberately out
+// of scope for this report.
 func runMaintenanceBootstrapRemoteControl(
 	stdout io.Writer,
 	listFn func() ([]*agent.Record, error),
@@ -404,6 +420,15 @@ func runMaintenanceBootstrapRemoteControl(
 	var rcDisabledSkipped []missing
 	for _, r := range records {
 		if r == nil {
+			continue
+		}
+		// Coord-only scope (codex review iter-1 [P2]): workers and
+		// Agent-tool subagents never get --remote-control by design;
+		// surveying them under the default-on gate would flag every
+		// worker on every project. Same predicate as the handoff /
+		// drain inject gates: the coord-spawn marker resolves to this
+		// agent's ID.
+		if r.Project == "" || state.ReadCoordSpawnMarker(r.Project) != r.ID {
 			continue
 		}
 		if commandHasRemoteControl(r.Command) {

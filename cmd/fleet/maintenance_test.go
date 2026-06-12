@@ -46,6 +46,22 @@ func stateBootstrapForTest() (string, error) { return state.Bootstrap() }
 // it did before the precondition was wired in.
 func pruneDirSaneOK() error { return nil }
 
+// seedCoordMarkerForTest stamps the per-project coord-spawn marker so
+// the RC survey's coord-only scope (codex review iter-1 [P2]) treats
+// the agent as the project's coord.
+func seedCoordMarkerForTest(t *testing.T, project, agentID string) {
+	t.Helper()
+	if _, err := state.Bootstrap(); err != nil {
+		t.Fatalf("Bootstrap: %v", err)
+	}
+	if _, err := state.EnsureProjectInitialized(project); err != nil {
+		t.Fatalf("EnsureProjectInitialized: %v", err)
+	}
+	if err := state.WriteCoordSpawnMarker(project, agentID); err != nil {
+		t.Fatalf("WriteCoordSpawnMarker: %v", err)
+	}
+}
+
 // TestMaintenanceBootstrapReport_FlagsLiveAgentsMissingRC pins the
 // reporter contract: only LIVE agents (HasSession true) whose
 // persisted Command lacks the literal `--remote-control` substring
@@ -55,10 +71,15 @@ func pruneDirSaneOK() error { return nil }
 func TestMaintenanceBootstrapReport_FlagsLiveAgentsMissingRC(t *testing.T) {
 	rcTestFleetHome(t)
 	// Native model: RC is default-on, so the test agent's project is in
-	// the enabled bucket with no marker setup at all — the survey
+	// the enabled bucket with no rc-marker setup — the survey
 	// distinguishes "RC enabled (default) but missing flag" (real
 	// remediation: handoff) from "RC disabled via rc-disabled opt-out"
-	// (no action).
+	// (no action). All three records are stamped as their project's
+	// coord so the coord-only scope admits them; exclusions below must
+	// come from the flag / dead-session filters, not the coord filter.
+	seedCoordMarkerForTest(t, "projects-fleet", "ca7eb43e")
+	seedCoordMarkerForTest(t, "other", "deadbeef")
+	seedCoordMarkerForTest(t, "stale", "ghost123")
 
 	now := time.Date(2026, 5, 9, 13, 20, 42, 0, time.UTC)
 	records := []*agent.Record{
@@ -145,9 +166,12 @@ func TestMaintenanceBootstrapReport_FlagsLiveAgentsMissingRC(t *testing.T) {
 // the flag, the operator sees a clean confirmation rather than an
 // awkward "0 agents" header.
 func TestMaintenanceBootstrapReport_AllAgentsFlagged_PrintsCleanMessage(t *testing.T) {
+	rcTestFleetHome(t)
+	seedCoordMarkerForTest(t, "alpha-proj", "alpha")
 	records := []*agent.Record{
 		{
 			ID:          "alpha",
+			Project:     "alpha-proj",
 			TmuxSession: "fleet-alpha",
 			Command: []string{
 				"sh", "-c",
@@ -171,20 +195,26 @@ func TestMaintenanceBootstrapReport_AllAgentsFlagged_PrintsCleanMessage(t *testi
 // sort order: oldest-spawned first (then ID alphabetical for
 // tie-breaks). Operators triage the longest-stuck agents first.
 func TestMaintenanceBootstrapReport_StableOrderByOldestFirst(t *testing.T) {
+	rcTestFleetHome(t)
 	t0 := time.Date(2026, 5, 9, 0, 0, 0, 0, time.UTC)
+	for _, pair := range [][2]string{
+		{"p-newer", "newer"}, {"p-oldest", "oldest"}, {"p-middle", "middle"},
+	} {
+		seedCoordMarkerForTest(t, pair[0], pair[1])
+	}
 	records := []*agent.Record{
 		{
-			ID: "newer", TmuxSession: "s-newer",
+			ID: "newer", Project: "p-newer", TmuxSession: "s-newer",
 			SpawnedAt: t0.Add(2 * time.Hour),
 			Command:   []string{"sh", "-c", `claude --dangerously-skip-permissions`},
 		},
 		{
-			ID: "oldest", TmuxSession: "s-oldest",
+			ID: "oldest", Project: "p-oldest", TmuxSession: "s-oldest",
 			SpawnedAt: t0,
 			Command:   []string{"sh", "-c", `claude --dangerously-skip-permissions`},
 		},
 		{
-			ID: "middle", TmuxSession: "s-middle",
+			ID: "middle", Project: "p-middle", TmuxSession: "s-middle",
 			SpawnedAt: t0.Add(1 * time.Hour),
 			Command:   []string{"sh", "-c", `claude --dangerously-skip-permissions`},
 		},
@@ -926,5 +956,47 @@ func TestPruneOrphanTmux_AbortsWhenAgentsDirMissing(t *testing.T) {
 	// No output rows either.
 	if stdout.Len() != 0 {
 		t.Errorf("stdout should be empty after sanity-check failure; got: %q", stdout.String())
+	}
+}
+
+// TestMaintenanceBootstrapReport_SkipsNonCoordAgents pins the codex
+// review iter-1 [P2] fix: under the native default-on gate, the survey
+// scopes to COORD agents only. A live worker whose persisted command
+// lacks --remote-control is BY DESIGN (push-storm protection) and must
+// not be reported as needing remediation.
+func TestMaintenanceBootstrapReport_SkipsNonCoordAgents(t *testing.T) {
+	rcTestFleetHome(t)
+	// The project's coord is someone ELSE — the surveyed agent is a
+	// worker in the same (default-enabled) project.
+	seedCoordMarkerForTest(t, "busy-proj", "c0ffee00")
+
+	now := time.Date(2026, 5, 9, 13, 20, 42, 0, time.UTC)
+	records := []*agent.Record{
+		{
+			ID:          "feedface",
+			Project:     "busy-proj",
+			TmuxSession: "fleet-feedface",
+			TaskID:      "worker-task",
+			SpawnedAt:   now,
+			Command:     []string{"sh", "-c", `claude --dangerously-skip-permissions`},
+		},
+		{
+			// No project at all (legacy / untargeted) — also skipped.
+			ID:          "0ddba11d",
+			TmuxSession: "fleet-0ddba11d",
+			SpawnedAt:   now,
+			Command:     []string{"sh", "-c", `claude --dangerously-skip-permissions`},
+		},
+	}
+	listFn := func() ([]*agent.Record, error) { return records, nil }
+	hasSessionFn := func(string) bool { return true }
+
+	var out bytes.Buffer
+	if err := runMaintenanceBootstrapRemoteControl(&out, listFn, hasSessionFn); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	got := out.String()
+	if !strings.Contains(got, "no live agents are missing") {
+		t.Errorf("worker / untargeted agents must not be flagged; got:\n%s", got)
 	}
 }
