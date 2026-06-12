@@ -308,3 +308,42 @@ func TestRCCLI_ExitCodeMappingStable(t *testing.T) {
 		}
 	}
 }
+
+// TestRCCLI_StatusNoArg_AllDefaultOn_ExitsZero (codex review iter-2
+// [P2] regression): on a clean install with zero rc-disabled markers,
+// no-arg `fleet rc status` is the HEALTHY steady-state and must exit 0
+// (success outcome, empty projects list) — not absent/exit 11, which
+// broke shell health checks.
+func TestRCCLI_StatusNoArg_AllDefaultOn_ExitsZero(t *testing.T) {
+	rcTestFleetHome(t)
+	out := &bytes.Buffer{}
+	if err := runRCStatus(out, "", false); err != nil {
+		t.Fatalf("no-arg status on all-default-on host must succeed (exit 0); got %v", err)
+	}
+	var resp rcResponse
+	if err := json.Unmarshal(out.Bytes(), &resp); err != nil {
+		t.Fatalf("invalid JSON envelope: %v\nstdout:\n%s", err, out.String())
+	}
+	if resp.Outcome != rc.OutcomeAcquired {
+		t.Errorf("outcome=%q want acquired (healthy default-on)", resp.Outcome)
+	}
+	if len(resp.Projects) != 0 {
+		t.Errorf("projects=%v want empty (no opt-outs)", resp.Projects)
+	}
+
+	// With an opt-out present, the list carries it (still exit 0).
+	if err := rc.WriteDisabledMarker("optout"); err != nil {
+		t.Fatalf("WriteDisabledMarker: %v", err)
+	}
+	out.Reset()
+	if err := runRCStatus(out, "", false); err != nil {
+		t.Fatalf("no-arg status with opt-outs must still succeed: %v", err)
+	}
+	resp = rcResponse{}
+	if err := json.Unmarshal(out.Bytes(), &resp); err != nil {
+		t.Fatalf("invalid JSON envelope: %v", err)
+	}
+	if len(resp.Projects) != 1 || resp.Projects[0] != "optout" {
+		t.Errorf("projects=%v want [optout]", resp.Projects)
+	}
+}

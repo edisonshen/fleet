@@ -259,15 +259,14 @@ func runRCStatus(stdout io.Writer, project string, healthy bool) error {
 	if project == "" {
 		// No-arg status: enumerate the exceptions — projects with the
 		// rc-disabled opt-out marker (everything else is enabled by
-		// default under the native model).
+		// default under the native model). An EMPTY list is the
+		// healthy steady-state ("RC enabled everywhere"), so it maps
+		// to a success outcome / exit 0 — health checks must not fail
+		// on a clean install (codex review iter-2 [P2]). JSON
+		// consumers distinguish via the empty/omitted projects array.
 		projs, err := rc.ListDisabled()
 		if err != nil {
 			return emitRC(stdout, rcResponse{Outcome: rc.OutcomeError, Cmd: "status", Error: err.Error()})
-		}
-		// absent = "no opt-outs anywhere; all projects default-on" —
-		// an unambiguous signal for JSON consumers.
-		if len(projs) == 0 {
-			return emitRC(stdout, rcResponse{Outcome: rc.OutcomeAbsent, Cmd: "status", Projects: nil})
 		}
 		return emitRC(stdout, rcResponse{Outcome: rc.OutcomeAcquired, Cmd: "status", Projects: projs})
 	}
