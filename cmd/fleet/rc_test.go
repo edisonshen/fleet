@@ -152,6 +152,11 @@ func TestRCCLI_DownEmitsJSONEnvelope(t *testing.T) {
 	if rc.Enabled("demo") {
 		t.Errorf("project must be disabled after rc down")
 	}
+	// Kill-switch honesty (/review adversarial F3): the response must
+	// tell the operator a LIVE coord keeps RC until exit/handoff.
+	if !strings.Contains(resp.Diagnostic, "fleet handoff") {
+		t.Errorf("down diagnostic must surface the live-coord handoff remediation; got %q", resp.Diagnostic)
+	}
 
 	// Second down: already_released sentinel (exit 0).
 	out.Reset()

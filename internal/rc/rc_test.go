@@ -429,6 +429,32 @@ func TestReset_PreservesOptOut(t *testing.T) {
 	}
 }
 
+// TestReset_RemovesCorruptState: resetOne no longer delegates to Down,
+// so pin the corrupt-rc-state.json cleanup (the operator-emergency case
+// Reset exists for) directly on Reset.
+func TestReset_RemovesCorruptState(t *testing.T) {
+	root := withFleetHome(t)
+	projDir := root + "/projects/demo"
+	if err := os.MkdirAll(projDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	statePath := projDir + "/rc-state.json"
+	if err := os.WriteFile(statePath, []byte("{not valid json}"), 0o644); err != nil {
+		t.Fatalf("write corrupt state: %v", err)
+	}
+
+	out, err := Reset("demo")
+	if err != nil {
+		t.Fatalf("Reset: %v", err)
+	}
+	if out != OutcomeReleased {
+		t.Fatalf("outcome=%q want %q", out, OutcomeReleased)
+	}
+	if _, statErr := os.Stat(statePath); !errors.Is(statErr, os.ErrNotExist) {
+		t.Fatalf("corrupt rc-state.json should have been removed by Reset; stat err=%v", statErr)
+	}
+}
+
 // TestResetAll_EnumeratesMarkerlessState (codex round-5 P2, kept):
 // reset-all must catch legacy-markered projects AND markerless
 // state-only projects; opt-out markers are preserved (/review
