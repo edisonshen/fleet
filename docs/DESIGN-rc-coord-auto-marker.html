@@ -1,254 +1,390 @@
-<!DOCTYPE html>
+<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="viewport" content="width=device-width,initial-scale=1">
 <title>DESIGN: Coord-Spawn Auto-Writes RC Marker</title>
 <style>
-:root {
-  --bg: #fdfdfc;
-  --fg: #1a1a1a;
-  --muted: #6b6b6b;
-  --accent: #0066cc;
-  --border: #e3e3e0;
-  --code-bg: #f4f4f1;
-  --code-fg: #1a1a1a;
-  --table-stripe: #f9f9f7;
-  --blockquote-border: #d0d0cd;
-  --blockquote-bg: #f7f7f4;
-  --kbd-bg: #f0f0ec;
-}
-@media (prefers-color-scheme: dark) {
   :root {
-    --bg: #1a1a1a;
-    --fg: #e8e8e6;
-    --muted: #9a9a98;
-    --accent: #7ab8ff;
-    --border: #333331;
-    --code-bg: #252523;
-    --code-fg: #e8e8e6;
-    --table-stripe: #222220;
-    --blockquote-border: #444442;
-    --blockquote-bg: #222220;
-    --kbd-bg: #2e2e2c;
+    color-scheme: light dark;
+    --bg: #fbfaf7;
+    --paper: #fffefb;
+    --surface: #f4f1ea;
+    --surface-2: #ede8dc;
+    --fg: #1d2024;
+    --muted: #626b73;
+    --subtle: #8a9299;
+    --border: #ded7ca;
+    --border-strong: #c9bfad;
+    --accent: #0f766e;
+    --accent-rgb: 15, 118, 110;
+    --code-bg: #efebe2;
+    --row-alt: #f6f3ec;
+    --shadow: 0 1px 2px rgba(36, 32, 24, 0.04), 0 12px 28px rgba(36, 32, 24, 0.06);
   }
-}
-* { box-sizing: border-box; }
-html, body {
-  margin: 0;
-  padding: 0;
-  background: var(--bg);
-  color: var(--fg);
-  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
-  font-size: 16px;
-  line-height: 1.6;
-  -webkit-font-smoothing: antialiased;
-}
-.wrap {
-  display: grid;
-  grid-template-columns: 240px 1fr;
-  max-width: 1240px;
-  margin: 0 auto;
-  padding: 2rem 1.5rem;
-  gap: 2rem;
-}
-@media (max-width: 900px) {
-  .wrap { grid-template-columns: 1fr; }
-  .toc { position: static !important; max-height: none !important; }
-}
-.toc {
-  position: sticky;
-  top: 1rem;
-  align-self: start;
-  max-height: calc(100vh - 2rem);
-  overflow-y: auto;
-  font-size: 14px;
-  padding-right: 0.5rem;
-}
-.toc h2 {
-  font-size: 12px;
-  text-transform: uppercase;
-  letter-spacing: 0.06em;
-  color: var(--muted);
-  margin: 0 0 0.5rem 0;
-  font-weight: 600;
-}
-.toc ul {
-  list-style: none;
-  padding: 0;
-  margin: 0;
-}
-.toc ul ul { padding-left: 1rem; }
-.toc li { margin: 0.25rem 0; }
-.toc a {
-  color: var(--fg);
-  text-decoration: none;
-  display: block;
-  padding: 0.15rem 0;
-  border-left: 2px solid transparent;
-  padding-left: 0.5rem;
-  margin-left: -0.5rem;
-  transition: color 0.1s, border-color 0.1s;
-}
-.toc a:hover {
-  color: var(--accent);
-  border-left-color: var(--accent);
-}
-main {
-  min-width: 0;
-}
-.doc-meta {
-  font-size: 13px;
-  color: var(--muted);
-  margin-bottom: 2rem;
-  padding-bottom: 1rem;
-  border-bottom: 1px solid var(--border);
-}
-.doc-meta strong { color: var(--fg); }
-h1, h2, h3, h4, h5, h6 {
-  margin: 1.8em 0 0.5em 0;
-  line-height: 1.25;
-  font-weight: 600;
-}
-h1 { font-size: 2rem; margin-top: 0; }
-h2 { font-size: 1.5rem; padding-bottom: 0.3rem; border-bottom: 1px solid var(--border); }
-h3 { font-size: 1.2rem; }
-h4 { font-size: 1.05rem; }
-h5, h6 { font-size: 1rem; color: var(--muted); }
-h1 .anchor, h2 .anchor, h3 .anchor, h4 .anchor, h5 .anchor, h6 .anchor {
-  visibility: hidden;
-  margin-left: 0.3rem;
-  text-decoration: none;
-  color: var(--muted);
-  font-weight: 400;
-}
-h1:hover .anchor, h2:hover .anchor, h3:hover .anchor,
-h4:hover .anchor, h5:hover .anchor, h6:hover .anchor {
-  visibility: visible;
-}
-p { margin: 0.8em 0; }
-a { color: var(--accent); text-decoration: underline; text-decoration-thickness: 1px; text-underline-offset: 2px; }
-a:hover { text-decoration-thickness: 2px; }
-ul, ol { padding-left: 1.5rem; }
-li { margin: 0.3em 0; }
-strong { font-weight: 600; }
-em { font-style: italic; }
-code {
-  font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
-  font-size: 0.92em;
-  background: var(--code-bg);
-  color: var(--code-fg);
-  padding: 0.15em 0.4em;
-  border-radius: 3px;
-}
-pre {
-  background: var(--code-bg);
-  color: var(--code-fg);
-  padding: 1rem 1.2rem;
-  border-radius: 5px;
-  overflow-x: auto;
-  font-size: 13.5px;
-  line-height: 1.5;
-  border: 1px solid var(--border);
-}
-pre code {
-  background: none;
-  padding: 0;
-  border-radius: 0;
-  font-size: inherit;
-}
-blockquote {
-  border-left: 3px solid var(--blockquote-border);
-  background: var(--blockquote-bg);
-  margin: 1em 0;
-  padding: 0.5em 1em;
-  color: var(--fg);
-  font-style: normal;
-}
-blockquote p:first-child { margin-top: 0; }
-blockquote p:last-child { margin-bottom: 0; }
-table {
-  border-collapse: collapse;
-  width: 100%;
-  margin: 1em 0;
-  font-size: 14px;
-  display: block;
-  overflow-x: auto;
-}
-thead { background: var(--table-stripe); }
-th, td {
-  border: 1px solid var(--border);
-  padding: 0.5rem 0.8rem;
-  text-align: left;
-  vertical-align: top;
-}
-th { font-weight: 600; }
-tbody tr:nth-child(even) { background: var(--table-stripe); }
-hr {
-  border: none;
-  border-top: 1px solid var(--border);
-  margin: 2em 0;
-}
-kbd {
-  background: var(--kbd-bg);
-  border: 1px solid var(--border);
-  border-radius: 3px;
-  padding: 0.1em 0.4em;
-  font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
-  font-size: 0.9em;
-  box-shadow: 0 1px 0 var(--border);
-}
-.toc-anchor {
-  display: inline-block;
-  width: 0;
-  height: 0;
-  overflow: hidden;
-}
-input[type="checkbox"][disabled] { margin-right: 0.4em; }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #101312;
+      --paper: #171b19;
+      --surface: #1d2320;
+      --surface-2: #242b27;
+      --fg: #e9e5dc;
+      --muted: #a2aaa4;
+      --subtle: #727c75;
+      --border: #303832;
+      --border-strong: #465047;
+      --accent: #7bd9c7;
+      --accent-rgb: 123, 217, 199;
+      --code-bg: #222821;
+      --row-alt: #1b211e;
+      --shadow: 0 1px 2px rgba(0, 0, 0, 0.22), 0 18px 40px rgba(0, 0, 0, 0.24);
+    }
+  }
+  html {
+    background: var(--bg);
+    color: var(--fg);
+    scroll-behavior: smooth;
+    text-rendering: optimizeLegibility;
+    -webkit-font-smoothing: antialiased;
+    font-kerning: normal;
+  }
+  body {
+    background: var(--bg);
+    color: var(--fg);
+    font: 16px/1.68 ui-sans-serif, -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", sans-serif;
+    display: grid;
+    grid-template-columns: 250px minmax(0, 780px);
+    column-gap: 64px;
+    max-width: 1180px;
+    margin: 0 auto;
+    padding: 56px 32px 112px;
+  }
+  body > header,
+  body > section,
+  body > footer { grid-column: 2; }
+  header {
+    border-bottom: 1px solid var(--border);
+    padding: 0 0 28px;
+    margin-bottom: 40px;
+  }
+  h1, h2, h3, h4, h5, h6 {
+    font-kerning: normal;
+    letter-spacing: 0;
+    text-wrap: balance;
+    scroll-margin-top: 32px;
+  }
+  h1 {
+    font-size: clamp(2.35rem, 4vw, 3.7rem);
+    line-height: 1.04;
+    font-weight: 720;
+    margin: 0 0 12px;
+    max-width: 18ch;
+  }
+  h2 {
+    font-size: 1.42rem;
+    line-height: 1.22;
+    margin: 72px 0 18px;
+    font-weight: 680;
+    padding-top: 2px;
+  }
+  section:first-of-type h2 { margin-top: 0; }
+  h3 {
+    font-size: 1.08rem;
+    line-height: 1.34;
+    margin: 36px 0 10px;
+    font-weight: 650;
+  }
+  h4 {
+    font-size: 0.98rem;
+    line-height: 1.4;
+    margin: 22px 0 8px;
+    font-weight: 650;
+    color: var(--accent);
+  }
+  h5, h6 {
+    font-size: 0.92rem;
+    margin: 18px 0 6px;
+    font-weight: 650;
+    color: var(--muted);
+  }
+  .heading-anchor {
+    opacity: 0;
+    border-bottom: 0;
+    color: var(--subtle);
+    font-weight: 500;
+    margin-left: 0.45rem;
+    text-decoration: none;
+    transition: opacity 140ms ease, color 140ms ease;
+  }
+  :is(h1, h2, h3, h4, h5, h6):hover .heading-anchor,
+  .heading-anchor:focus {
+    opacity: 1;
+    color: var(--accent);
+  }
+  .meta {
+    color: var(--muted);
+    font-size: 0.86rem;
+    line-height: 1.55;
+  }
+  .meta code { font-size: 0.92em; }
+  p, li { margin: 0 0 12px; }
+  p { max-width: 72ch; }
+  ul, ol { padding-left: 24px; }
+  li > p { margin-bottom: 6px; }
+  li > h4 { margin-top: 28px; }
+  strong { font-weight: 680; }
+  em { font-style: italic; }
+  code, pre {
+    font-family: "SF Mono", ui-monospace, Menlo, Consolas, monospace;
+    font-size: 0.86em;
+  }
+  code {
+    background: var(--code-bg);
+    border: 1px solid rgba(var(--accent-rgb), 0.08);
+    padding: 1px 5px;
+    border-radius: 4px;
+  }
+  pre {
+    background: var(--code-bg);
+    border: 1px solid var(--border);
+    padding: 18px 20px;
+    border-radius: 8px;
+    overflow-x: auto;
+    line-height: 1.45;
+  }
+  pre code { background: transparent; border: 0; padding: 0; }
+  pre.diagram-block {
+    position: relative;
+    text-align: center;
+    margin: 28px auto 40px;
+    padding: 24px 24px 26px;
+    background:
+      linear-gradient(180deg, rgba(var(--accent-rgb), 0.07), transparent 55%),
+      var(--paper);
+    box-shadow: var(--shadow);
+  }
+  pre.diagram-block code {
+    display: inline-block;
+    min-width: max-content;
+    text-align: left;
+  }
+  blockquote {
+    border-left: 3px solid var(--accent);
+    margin: 20px 0 24px;
+    padding: 12px 18px;
+    color: var(--fg);
+    background: rgba(var(--accent-rgb), 0.08);
+    border-radius: 0 8px 8px 0;
+  }
+  blockquote p:first-child { margin-top: 0; }
+  blockquote p:last-child { margin-bottom: 0; }
+  table {
+    border-collapse: separate;
+    border-spacing: 0;
+    width: 100%;
+    margin: 24px 0 36px;
+    font-size: 0.91rem;
+    line-height: 1.52;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    overflow: hidden;
+    background: var(--paper);
+    display: block;
+    overflow-x: auto;
+  }
+  th, td {
+    text-align: left;
+    vertical-align: top;
+    padding: 12px 14px;
+    border-bottom: 1px solid var(--border);
+  }
+  th { font-weight: 650; color: var(--fg); background: var(--surface); }
+  tbody tr:last-child td { border-bottom: 0; }
+  tbody tr:nth-child(even) td { background: var(--row-alt); }
+  tbody tr:hover td { background: rgba(var(--accent-rgb), 0.07); }
+  td.rank { font-variant-numeric: tabular-nums; white-space: nowrap; font-weight: 600; }
+  a { color: var(--accent); text-decoration: none; border-bottom: 1px solid transparent; }
+  a:hover { border-bottom-color: var(--accent); }
+  hr { border: none; border-top: 1px solid var(--border); margin: 40px 0; }
+  kbd {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    padding: 1px 6px;
+    font-family: "SF Mono", ui-monospace, Menlo, Consolas, monospace;
+    font-size: 0.82em;
+    box-shadow: 0 1px 0 var(--border);
+  }
+  nav.toc {
+    grid-column: 1;
+    grid-row: 2 / span 40;
+    position: sticky;
+    top: 28px;
+    align-self: start;
+    max-height: calc(100vh - 56px);
+    overflow-y: auto;
+    background: var(--paper);
+    border: 1px solid var(--border);
+    padding: 18px 18px 16px;
+    border-radius: 8px;
+    font-size: 0.86rem;
+    line-height: 1.45;
+    box-shadow: var(--shadow);
+  }
+  nav.toc strong {
+    display: block;
+    margin: 0 0 10px;
+    font-size: 0.74rem;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: var(--muted);
+    font-weight: 650;
+  }
+  nav.toc ol { padding-left: 19px; margin: 0; }
+  nav.toc li { margin: 5px 0; padding-left: 2px; }
+  nav.toc a {
+    color: var(--fg);
+    border-bottom: 0;
+    display: block;
+    padding: 1px 0;
+  }
+  nav.toc a:hover { color: var(--accent); border-bottom: 0; }
+  .pill {
+    display: inline-block;
+    font-size: 0.72rem;
+    line-height: 1.4;
+    padding: 2px 7px;
+    border-radius: 999px;
+    margin-left: 6px;
+    font-weight: 650;
+    vertical-align: 0.08em;
+    background: rgba(var(--accent-rgb), 0.12);
+    color: var(--accent);
+    border: 1px solid rgba(var(--accent-rgb), 0.2);
+  }
+  .qbox {
+    position: relative;
+    border: 1px solid var(--border);
+    padding: 4px 20px 8px 22px;
+    border-radius: 8px;
+    margin: 20px 0;
+    background:
+      linear-gradient(90deg, rgba(var(--accent-rgb), 0.11), transparent 34%),
+      var(--paper);
+    box-shadow: var(--shadow);
+  }
+  .qbox::before {
+    content: "";
+    position: absolute;
+    left: -1px;
+    top: 12px;
+    bottom: 12px;
+    width: 3px;
+    border-radius: 999px;
+    background: var(--accent);
+  }
+  .qbox > :is(h2, h3, h4, h5, h6):first-child {
+    margin-top: 14px;
+    color: var(--accent);
+    font-family: "SF Mono", ui-monospace, Menlo, monospace;
+    font-size: 0.95rem;
+    font-weight: 720;
+  }
+  .layer {
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 20px 22px;
+    margin: 18px 0;
+    background: var(--paper);
+    box-shadow: var(--shadow);
+  }
+  .layer > :is(h3, h4):first-child { margin-top: 0; }
+  footer {
+    margin-top: 72px;
+    padding: 22px 0 0;
+    border-top: 1px solid var(--border);
+    color: var(--muted);
+    font-size: 0.86rem;
+  }
+  @media (max-width: 1023px) {
+    body { display: block; max-width: 820px; padding: 40px 24px 88px; }
+    header { margin-bottom: 24px; }
+    h1 { max-width: none; }
+    h2 { margin-top: 56px; }
+    nav.toc { position: static; max-height: none; margin: 0 0 44px; }
+  }
+  @media (max-width: 720px) {
+    body { padding: 32px 18px 72px; }
+    h1 { font-size: 2.2rem; }
+    pre.diagram-block { text-align: left; padding: 20px 18px; }
+  }
+  @media print {
+    @page { margin: 0.75in; }
+    :root {
+      --bg: #ffffff;
+      --paper: #ffffff;
+      --surface: #ffffff;
+      --surface-2: #ffffff;
+      --fg: #111111;
+      --muted: #555555;
+      --subtle: #777777;
+      --border: #cccccc;
+      --accent: #111111;
+      --accent-rgb: 17, 17, 17;
+      --code-bg: #f3f3f3;
+      --row-alt: #f7f7f7;
+      --shadow: none;
+    }
+    html { scroll-behavior: auto; }
+    body { display: block; max-width: none; padding: 0; font-size: 11pt; line-height: 1.5; }
+    nav.toc { position: static; box-shadow: none; margin: 0 0 24pt; page-break-after: avoid; max-height: none; }
+    h1 { font-size: 28pt; max-width: none; }
+    h2 { font-size: 16pt; margin-top: 28pt; page-break-after: avoid; }
+    h3, h4 { page-break-after: avoid; }
+    .heading-anchor { display: none; }
+    a { color: inherit; border-bottom: 0; text-decoration: underline; }
+    pre, table, blockquote, .qbox, .layer { break-inside: avoid; box-shadow: none; }
+    table { font-size: 9pt; }
+    footer { margin-top: 32pt; }
+  }
 </style>
 </head>
 <body>
-<div class="wrap">
-  <nav class="toc" aria-label="table of contents">
-    <h2>Contents</h2>
-    <div class="toc">
-<ul>
-<li><a href="#tldr">TL;DR</a></li>
-<li><a href="#problem-reproduction">Problem reproduction</a></li>
-<li><a href="#root-cause">Root cause</a></li>
-<li><a href="#design-decision">Design decision</a></li>
-<li><a href="#implementation">Implementation</a><ul>
-<li><a href="#change-1-cmdfleetdispatchgo-coord-spawn-branch">Change 1 — cmd/fleet/dispatch.go coord-spawn branch</a></li>
-<li><a href="#change-2-cmdfleethandoffgo-coord-replacement-spawn">Change 2 — cmd/fleet/handoff.go coord-replacement spawn</a></li>
-<li><a href="#change-3-log-line">Change 3 — log line</a></li>
-<li><a href="#change-4-none-in-internalrc">Change 4 — none in internal/rc/</a></li>
-<li><a href="#change-5-none-in-workersubagent-path">Change 5 — none in worker/subagent path</a></li>
-</ul>
-</li>
-<li><a href="#e2e-test">E2E test</a><ul>
-<li><a href="#test-1-coord-spawn-auto-writes-marker-injects-flag">Test 1 — Coord-spawn auto-writes marker + injects flag</a></li>
-<li><a href="#test-2-worker-spawn-does-not-write-marker-or-inject-flag">Test 2 — Worker spawn does NOT write marker or inject flag</a></li>
-<li><a href="#test-3-fleet-rc-connect-succeeds-post-coord-spawn">Test 3 — fleet rc connect succeeds post-coord-spawn</a></li>
-<li><a href="#test-4-fleet_rc_bootstrap_disabled-still-overrides">Test 4 — FLEET_RC_BOOTSTRAP_DISABLED still overrides</a></li>
-<li><a href="#test-5-rcwritemarker-failure-is-non-fatal">Test 5 — rc.WriteMarker failure is non-fatal</a></li>
-</ul>
-</li>
-<li><a href="#non-goals-out-of-scope-for-this-pr">Non-goals (out of scope for this PR)</a></li>
-<li><a href="#acceptance-gate">Acceptance gate</a></li>
-<li><a href="#task-split">Task split</a></li>
-<li><a href="#operator-approval-timestamp">Operator approval timestamp</a></li>
-</ul>
-</div>
-
-  </nav>
-  <main>
-    <div class="doc-meta">
-      <strong>Source:</strong> <code>DESIGN-rc-coord-auto-marker.md</code> &mdash;
-      <strong>Rendered:</strong> 2026-05-19 00:16 UTC &mdash;
-      Agents read the <code>.md</code>; humans read the <code>.html</code>.
-    </div>
-    <h1 id="design-coord-spawn-auto-writes-rc-marker">DESIGN: Coord-Spawn Auto-Writes RC Marker<a class="anchor" href="#design-coord-spawn-auto-writes-rc-marker" title="Permalink to this section">¶</a></h1>
+<header>
+  <h1>DESIGN: Coord-Spawn Auto-Writes RC Marker</h1>
+  <div class="meta">
+    <strong>Source:</strong> <code>DESIGN-rc-coord-auto-marker.md</code> &middot;
+    <strong>Rendered:</strong> 2026-06-12 05:31 UTC &middot;
+    agents read the <code>.md</code>, humans read the <code>.html</code>.
+  </div>
+</header>
+<nav class="toc" aria-label="Contents">
+  <strong>Contents</strong>
+  <ol>
+  <li><a href="#1-tldr">1. TL;DR</a></li>
+  <li><a href="#2-problem-reproduction">2. Problem reproduction</a></li>
+  <li><a href="#3-root-cause">3. Root cause</a></li>
+  <li><a href="#4-design-decision">4. Design decision</a></li>
+  <li><a href="#5-implementation">5. Implementation</a></li>
+  <li><a href="#6-e2e-test">6. E2E test</a></li>
+  <li><a href="#7-non-goals-out-of-scope-for-this-pr">7. Non-goals (out of scope for this PR)</a></li>
+  <li><a href="#8-acceptance-gate">8. Acceptance gate</a></li>
+  <li><a href="#9-task-split">9. Task split</a></li>
+  <li><a href="#10-operator-approval-timestamp">10. Operator approval timestamp</a></li>
+</ol>
+</nav>
+<section id="overview">
 <p><strong>Status:</strong> v1 — operator approved 2026-05-18 (G2 gate cleared). Ready to split into tasks.
+<strong>SUPERSEDED (2026-06-11, rc-default-native-startu-a2ce):</strong> remote
+control is now NATIVE and DEFAULT-ON — every coord spawn bakes
+<code>claude --remote-control "fleet-coord-&lt;id&gt;-&lt;project&gt;"</code> into the
+coord's own argv. The standalone listener daemon, the per-tick Python
+respawn (<code>spawn_daemon_if_needed</code>), and the <code>fleet rc connect</code>
+send-keys path described in this document are retired. The rc-enabled
+opt-in marker is replaced by an rc-disabled opt-OUT marker
+(<code>fleet rc down &lt;project&gt;</code>). This document is kept as historical
+context for the v0.12/v0.13 architecture and its cleanup paths
+(Down/Reset/sweep still reap leftover legacy daemons).
 <strong>Author:</strong> coord agent 5f05977b (Feng Shen's session, projects-fleet)
 <strong>Reviewers:</strong> operator (G2); codex + /review at PR time per CLAUDE.md §4.
 <strong>Target version:</strong> v0.12.1 (point release on top of v0.12.0 RC architecture).
@@ -257,12 +393,16 @@ input[type="checkbox"][disabled] { margin-right: 0.4em; }
 <strong>Supersedes:</strong> none — narrows one gate inside <code>DESIGN-rc-listener-lifecycle.md</code> v8.
 <strong>Does NOT change:</strong> <code>rc.Enabled()</code> semantics, the marker shape, listener spawn ownership in <code>internal/rc</code>, worker/subagent attach behavior, or the FLEET_RC_BOOTSTRAP_DISABLED env-gate.</p>
 <hr>
-<h2 id="tldr">TL;DR<a class="anchor" href="#tldr" title="Permalink to this section">¶</a></h2>
+</section>
+<section id="1-tldr">
+<h2 class="hub-section" id="1-tldr">1. TL;DR<a class="heading-anchor" href="#1-tldr" title="Permalink to this section">¶</a></h2>
 <p>Today: <code>fleet dispatch</code> spawns a coord. The coord-spawn branch in <code>cmd/fleet/dispatch.go</code> tries to inject <code>--remote-control "fleet-coord-&lt;id&gt;-&lt;project&gt;"</code> into the claude argv, but <code>injectRemoteControlFlagProject</code> consults <code>rc.Enabled(project)</code> — which reads the per-project <code>rc-enabled</code> marker. The marker is only written by <code>fleet rc up &lt;project&gt;</code> (operator opt-in). So a fresh coord spawn that hasn't been opt-in'd gets NO <code>--remote-control</code> flag, NO marker, and <code>fleet rc connect &lt;project&gt;</code> returns <code>marker absent</code>.</p>
 <p><strong>This design adds one line to coord-spawn: write the marker before injecting the flag.</strong> Every coord that fleet dispatches is auto-opt-in for RC. Workers and subagents don't reach this branch (<code>opts.coordSpawn=false</code>) so they stay plain — the v0.12 push-storm protection (which targeted runaway <em>reviewer subagents</em>, not coords) is preserved.</p>
 <p><code>rc.Enabled()</code> keeps its role as the single source of truth for "should attach surfaces inject <code>--remote-control</code>." The marker just becomes auto-populated for coords at the moment of spawn.</p>
 <hr>
-<h2 id="problem-reproduction">Problem reproduction<a class="anchor" href="#problem-reproduction" title="Permalink to this section">¶</a></h2>
+</section>
+<section id="2-problem-reproduction">
+<h2 class="hub-section" id="2-problem-reproduction">2. Problem reproduction<a class="heading-anchor" href="#2-problem-reproduction" title="Permalink to this section">¶</a></h2>
 <pre><code>$ fleet rc connect projects-fleet
 {&quot;outcome&quot;:&quot;not_enabled&quot;,&quot;project&quot;:&quot;projects-fleet&quot;,&quot;cmd&quot;:&quot;connect&quot;,
  &quot;error&quot;:&quot;rc.Connect: marker absent for project \&quot;projects-fleet\&quot; (run `fleet rc up projects-fleet` first)&quot;}
@@ -270,7 +410,9 @@ input[type="checkbox"][disabled] { margin-right: 0.4em; }
 <p>Inspection of the 4 live coords on the operator's host (rainier/spark/fleet/tatoosh) confirmed <strong>none</strong> had <code>--remote-control</code> in their persisted <code>command</code>. Every coord was spawned via the standard <code>fleet dispatch</code> coord-spawn path, which means the inject was attempted and gated out by <code>rc.Enabled(project) == false</code>.</p>
 <p>The operator's workflow assumption: "I just spawned a coord; <code>/remote-control</code> and <code>fleet rc connect</code> should work." Today they don't.</p>
 <hr>
-<h2 id="root-cause">Root cause<a class="anchor" href="#root-cause" title="Permalink to this section">¶</a></h2>
+</section>
+<section id="3-root-cause">
+<h2 class="hub-section" id="3-root-cause">3. Root cause<a class="heading-anchor" href="#3-root-cause" title="Permalink to this section">¶</a></h2>
 <p><code>cmd/fleet/dispatch.go:891</code> — <code>injectRemoteControlFlagProject</code>:</p>
 <pre><code class="language-go">func injectRemoteControlFlagProject(command []string, sessionName, project string) []string {
     if os.Getenv(&quot;FLEET_RC_BOOTSTRAP_DISABLED&quot;) != &quot;&quot; {
@@ -285,7 +427,9 @@ input[type="checkbox"][disabled] { margin-right: 0.4em; }
 <p>The gate is correct in isolation. The bug is upstream: coord-spawn never plants the marker that the gate reads.</p>
 <p>V0.12's design (<code>DESIGN-rc-listener-lifecycle.md</code>) made the marker an <strong>operator-explicit opt-in</strong> to retire the implicit-spawn architecture that produced ~5,620 mobile-push events from a runaway reviewer subagent. That hazard was about <em>subagents</em>, not coords; the coord-spawn lockout is collateral damage.</p>
 <hr>
-<h2 id="design-decision">Design decision<a class="anchor" href="#design-decision" title="Permalink to this section">¶</a></h2>
+</section>
+<section id="4-design-decision">
+<h2 class="hub-section" id="4-design-decision">4. Design decision<a class="heading-anchor" href="#4-design-decision" title="Permalink to this section">¶</a></h2>
 <p><strong>Coord-spawn auto-writes the marker.</strong> Subagents and workers do not.</p>
 <p>Why this is safe:
 - The original push-storm came from a reviewer subagent that re-entered <code>seed_inbox</code> thousands of times. That subagent never has <code>opts.coordSpawn=true</code> — it's dispatched as a <code>general-purpose</code> Agent from inside the coord, not via <code>fleet dispatch --coord-spawn</code>. So gating coord-spawn separately from subagent-spawn is the right axis to cut.
@@ -295,8 +439,10 @@ input[type="checkbox"][disabled] { margin-right: 0.4em; }
 - The marker is read by ~10 surfaces in <code>internal/rc/</code> and elsewhere. Dropping the gate would force every reader to know about coord-spawn-vs-subagent context, which they don't have.
 - Operator still wants <code>fleet rc down &lt;project&gt;</code> to actually disable RC for a project (e.g. to silence a noisy listener). Keeping the marker keeps this teardown path working.</p>
 <hr>
-<h2 id="implementation">Implementation<a class="anchor" href="#implementation" title="Permalink to this section">¶</a></h2>
-<h3 id="change-1-cmdfleetdispatchgo-coord-spawn-branch">Change 1 — <code>cmd/fleet/dispatch.go</code> coord-spawn branch<a class="anchor" href="#change-1-cmdfleetdispatchgo-coord-spawn-branch" title="Permalink to this section">¶</a></h3>
+</section>
+<section id="5-implementation">
+<h2 class="hub-section" id="5-implementation">5. Implementation<a class="heading-anchor" href="#5-implementation" title="Permalink to this section">¶</a></h2>
+<h3 id="change-1-cmdfleetdispatchgo-coord-spawn-branch">Change 1 — <code>cmd/fleet/dispatch.go</code> coord-spawn branch<a class="heading-anchor" href="#change-1-cmdfleetdispatchgo-coord-spawn-branch" title="Permalink to this section">¶</a></h3>
 <p>In the <code>if opts.coordSpawn { ... }</code> block at line 435, before <code>injectRemoteControlFlagProject</code>:</p>
 <pre><code class="language-go">if opts.coordSpawn {
     preAllocatedID = agent.NewID()
@@ -325,18 +471,20 @@ input[type="checkbox"][disabled] { margin-right: 0.4em; }
 - <code>rc.WriteMarker</code> is already idempotent (zero-byte sentinel; re-writing is a no-op for readers). No "first time only" check needed.
 - Failure of <code>WriteMarker</code> is logged but doesn't fail the dispatch — degrades gracefully to the pre-fix behavior (operator runs <code>fleet rc up</code> manually).
 - Marker write happens BEFORE injection so the same dispatch call writes-then-reads its own marker (no race; same goroutine).</p>
-<h3 id="change-2-cmdfleethandoffgo-coord-replacement-spawn">Change 2 — <code>cmd/fleet/handoff.go</code> coord-replacement spawn<a class="anchor" href="#change-2-cmdfleethandoffgo-coord-replacement-spawn" title="Permalink to this section">¶</a></h3>
+<h3 id="change-2-cmdfleethandoffgo-coord-replacement-spawn">Change 2 — <code>cmd/fleet/handoff.go</code> coord-replacement spawn<a class="heading-anchor" href="#change-2-cmdfleethandoffgo-coord-replacement-spawn" title="Permalink to this section">¶</a></h3>
 <p>The same fix shape applies at the handoff spawn site (per <code>cmd/fleet/handoff.go</code>'s coord-replacement path). When a coord is replaced via handoff, the replacement is also a coord — it should also auto-opt-in. Locate the analogous coord-spawn branch and add the same <code>rc.WriteMarker(opts.project)</code> call. (Idempotent if the marker is already present from the predecessor coord, which is the common case.)</p>
-<h3 id="change-3-log-line">Change 3 — log line<a class="anchor" href="#change-3-log-line" title="Permalink to this section">¶</a></h3>
+<h3 id="change-3-log-line">Change 3 — log line<a class="heading-anchor" href="#change-3-log-line" title="Permalink to this section">¶</a></h3>
 <p><code>log.Printf</code> is already used in <code>cmd/fleet/dispatch.go</code> for non-fatal warnings. Match that style.</p>
-<h3 id="change-4-none-in-internalrc">Change 4 — none in <code>internal/rc/</code><a class="anchor" href="#change-4-none-in-internalrc" title="Permalink to this section">¶</a></h3>
+<h3 id="change-4-none-in-internalrc">Change 4 — none in <code>internal/rc/</code><a class="heading-anchor" href="#change-4-none-in-internalrc" title="Permalink to this section">¶</a></h3>
 <p><code>rc.WriteMarker</code> is already exported and used by <code>rc.Up</code>. No new helpers needed. <code>rc.Enabled</code> unchanged.</p>
-<h3 id="change-5-none-in-workersubagent-path">Change 5 — none in worker/subagent path<a class="anchor" href="#change-5-none-in-workersubagent-path" title="Permalink to this section">¶</a></h3>
+<h3 id="change-5-none-in-workersubagent-path">Change 5 — none in worker/subagent path<a class="heading-anchor" href="#change-5-none-in-workersubagent-path" title="Permalink to this section">¶</a></h3>
 <p><code>opts.coordSpawn == false</code> for workers and Agent-tool subagents. They never enter the modified branch. Verified by reading <code>internal/spawn/spawn.go</code> — the spawn surface is the same but the per-dispatch options differ.</p>
 <hr>
-<h2 id="e2e-test">E2E test<a class="anchor" href="#e2e-test" title="Permalink to this section">¶</a></h2>
+</section>
+<section id="6-e2e-test">
+<h2 class="hub-section" id="6-e2e-test">6. E2E test<a class="heading-anchor" href="#6-e2e-test" title="Permalink to this section">¶</a></h2>
 <p>New test file: <code>cmd/fleet/dispatch_rc_auto_marker_test.go</code> (or extend <code>dispatch_test.go</code>).</p>
-<h3 id="test-1-coord-spawn-auto-writes-marker-injects-flag">Test 1 — Coord-spawn auto-writes marker + injects flag<a class="anchor" href="#test-1-coord-spawn-auto-writes-marker-injects-flag" title="Permalink to this section">¶</a></h3>
+<h3 id="test-1-coord-spawn-auto-writes-marker-injects-flag">Test 1 — Coord-spawn auto-writes marker + injects flag<a class="heading-anchor" href="#test-1-coord-spawn-auto-writes-marker-injects-flag" title="Permalink to this section">¶</a></h3>
 <pre><code>Given: a clean ~/.fleet/projects/&lt;test-project&gt;/ (no marker)
 When:  dispatch a coord via fleet dispatch --coord-spawn --project &lt;test-project&gt;
 Then:
@@ -345,19 +493,19 @@ Then:
   - persisted exec_command contains &quot;fleet-coord-&lt;id&gt;-&lt;test-project&gt;&quot;
   - exec_command's session-name disambiguator matches the agent id
 </code></pre>
-<h3 id="test-2-worker-spawn-does-not-write-marker-or-inject-flag">Test 2 — Worker spawn does NOT write marker or inject flag<a class="anchor" href="#test-2-worker-spawn-does-not-write-marker-or-inject-flag" title="Permalink to this section">¶</a></h3>
+<h3 id="test-2-worker-spawn-does-not-write-marker-or-inject-flag">Test 2 — Worker spawn does NOT write marker or inject flag<a class="heading-anchor" href="#test-2-worker-spawn-does-not-write-marker-or-inject-flag" title="Permalink to this section">¶</a></h3>
 <pre><code>Given: a clean ~/.fleet/projects/&lt;test-project&gt;/ (no marker)
 When:  dispatch a worker via fleet dispatch --project &lt;test-project&gt; (no --coord-spawn)
 Then:
   - ~/.fleet/projects/&lt;test-project&gt;/rc-enabled does NOT exist
   - persisted agent.Record.command does NOT contain &quot;--remote-control&quot;
 </code></pre>
-<h3 id="test-3-fleet-rc-connect-succeeds-post-coord-spawn">Test 3 — <code>fleet rc connect</code> succeeds post-coord-spawn<a class="anchor" href="#test-3-fleet-rc-connect-succeeds-post-coord-spawn" title="Permalink to this section">¶</a></h3>
+<h3 id="test-3-fleet-rc-connect-succeeds-post-coord-spawn">Test 3 — <code>fleet rc connect</code> succeeds post-coord-spawn<a class="heading-anchor" href="#test-3-fleet-rc-connect-succeeds-post-coord-spawn" title="Permalink to this section">¶</a></h3>
 <p>This is the user-facing assertion. After Test 1's coord spawn:</p>
 <pre><code>When: fleet rc connect &lt;test-project&gt;
 Then: outcome != &quot;not_enabled&quot; (specifically: outcome ∈ {acquired, already_connected} — listener-spawn outcome is out of scope for this gate-only test)
 </code></pre>
-<h3 id="test-4-fleet_rc_bootstrap_disabled-still-overrides">Test 4 — <code>FLEET_RC_BOOTSTRAP_DISABLED</code> still overrides<a class="anchor" href="#test-4-fleet_rc_bootstrap_disabled-still-overrides" title="Permalink to this section">¶</a></h3>
+<h3 id="test-4-fleet_rc_bootstrap_disabled-still-overrides">Test 4 — <code>FLEET_RC_BOOTSTRAP_DISABLED</code> still overrides<a class="heading-anchor" href="#test-4-fleet_rc_bootstrap_disabled-still-overrides" title="Permalink to this section">¶</a></h3>
 <pre><code>Given: FLEET_RC_BOOTSTRAP_DISABLED=1 in env
 When:  dispatch a coord via fleet dispatch --coord-spawn --project &lt;test-project&gt;
 Then:
@@ -365,10 +513,12 @@ Then:
   - marker MAY OR MAY NOT exist (degraded path — we'll mark MUST-EXIST for clarity since the env-gate is about inject, not marker)
 </code></pre>
 <p>Test 4 pins the invariant that the env-gate retains precedence; v0.13 retires it after the marker-gate is proven via the existing <code>cmd/fleet/rc_invariant_test.go</code>.</p>
-<h3 id="test-5-rcwritemarker-failure-is-non-fatal">Test 5 — <code>rc.WriteMarker</code> failure is non-fatal<a class="anchor" href="#test-5-rcwritemarker-failure-is-non-fatal" title="Permalink to this section">¶</a></h3>
+<h3 id="test-5-rcwritemarker-failure-is-non-fatal">Test 5 — <code>rc.WriteMarker</code> failure is non-fatal<a class="heading-anchor" href="#test-5-rcwritemarker-failure-is-non-fatal" title="Permalink to this section">¶</a></h3>
 <p>Mock or make-readonly the project dir to force <code>WriteMarker</code> failure; verify dispatch succeeds, logs a warning, argv is plain claude (graceful degrade to pre-fix behavior).</p>
 <hr>
-<h2 id="non-goals-out-of-scope-for-this-pr">Non-goals (out of scope for this PR)<a class="anchor" href="#non-goals-out-of-scope-for-this-pr" title="Permalink to this section">¶</a></h2>
+</section>
+<section id="7-non-goals-out-of-scope-for-this-pr">
+<h2 class="hub-section" id="7-non-goals-out-of-scope-for-this-pr">7. Non-goals (out of scope for this PR)<a class="heading-anchor" href="#7-non-goals-out-of-scope-for-this-pr" title="Permalink to this section">¶</a></h2>
 <ul>
 <li>Listener-spawn behavior (PR #159 owns that).</li>
 <li>The FLEET_RC_BOOTSTRAP_DISABLED env-gate retirement (v0.13).</li>
@@ -378,7 +528,9 @@ Then:
 <li>Renaming <code>--remote-control</code> to <code>--rc</code> (Claude Code CLI surface, not fleet's).</li>
 </ul>
 <hr>
-<h2 id="acceptance-gate">Acceptance gate<a class="anchor" href="#acceptance-gate" title="Permalink to this section">¶</a></h2>
+</section>
+<section id="8-acceptance-gate">
+<h2 class="hub-section" id="8-acceptance-gate">8. Acceptance gate<a class="heading-anchor" href="#8-acceptance-gate" title="Permalink to this section">¶</a></h2>
 <ul>
 <li><code>go build ./...</code> clean.</li>
 <li><code>go test -race -count=1 ./cmd/fleet/... ./internal/rc/...</code> green.</li>
@@ -389,7 +541,9 @@ Then:
 <li>PR body documents: the v0.12 "operator-explicit opt-in" stance is narrowed to "explicit for workers/subagents, automatic for coords." Update <code>docs/DESIGN-rc-listener-lifecycle.md</code> operator-behavior section to reflect this (one-paragraph amendment, not a full rewrite).</li>
 </ul>
 <hr>
-<h2 id="task-split">Task split<a class="anchor" href="#task-split" title="Permalink to this section">¶</a></h2>
+</section>
+<section id="9-task-split">
+<h2 class="hub-section" id="9-task-split">9. Task split<a class="heading-anchor" href="#9-task-split" title="Permalink to this section">¶</a></h2>
 <p>One worker task, three bookkeeping tasks (the bookkeeping items the operator already approved in the answers preceding this design):</p>
 <ol>
 <li><strong><code>rc-coord-auto-marker-&lt;hash&gt;</code></strong> (P0) — implement Changes 1+2, add 5 e2e tests, update <code>DESIGN-rc-listener-lifecycle.md</code> operator-behavior paragraph. Branch off current main.</li>
@@ -399,9 +553,14 @@ Then:
 </ol>
 <p>Tasks 2 and 3 don't need TASK-PLAN-DOCs (mechanical / operator-pre-approved). Task 1 will get a <code>docs/TASK-PLAN-rc-coord-auto-marker-&lt;hash&gt;.md</code> before promotion.</p>
 <hr>
-<h2 id="operator-approval-timestamp">Operator approval timestamp<a class="anchor" href="#operator-approval-timestamp" title="Permalink to this section">¶</a></h2>
+</section>
+<section id="10-operator-approval-timestamp">
+<h2 class="hub-section" id="10-operator-approval-timestamp">10. Operator approval timestamp<a class="heading-anchor" href="#10-operator-approval-timestamp" title="Permalink to this section">¶</a></h2>
 <p><strong>G2 cleared:</strong> 2026-05-18, operator response "yes, save the design doc" to the design proposal in chat.</p>
-  </main>
-</div>
+</section>
+
+<footer>
+  <p>Rendered from <code>DESIGN-rc-coord-auto-marker.md</code> by <code>scripts/render-design-doc.py</code> in hub style. The <code>.md</code> is the source of truth; regenerate this file after editing it.</p>
+</footer>
 </body>
 </html>

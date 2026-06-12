@@ -1,6 +1,16 @@
 # DESIGN: Remote-Control Listener as Operator-Managed Project Resource
 
 **Status:** v8 ✅ **plan-eng-review CLEARED** — codex rounds 1-7 + plan-eng 5 decisions folded in. Ready for operator final approval (G2) → file P1 task → dispatch.
+**SUPERSEDED (2026-06-11, rc-default-native-startu-a2ce):** remote
+control is now NATIVE and DEFAULT-ON — every coord spawn bakes
+`claude --remote-control "fleet-coord-<id>-<project>"` into the
+coord's own argv. The standalone listener daemon, the per-tick Python
+respawn (`spawn_daemon_if_needed`), and the `fleet rc connect`
+send-keys path described in this document are retired. The rc-enabled
+opt-in marker is replaced by an rc-disabled opt-OUT marker
+(`fleet rc down <project>`). This document is kept as historical
+context for the v0.12/v0.13 architecture and its cleanup paths
+(Down/Reset/sweep still reap leftover legacy daemons).
 **Author:** coord agent (Feng Shen's session, post-PR-#157-spam-incident)
 **Reviewers:** codex (round 1 returned NEEDS_REVISION_BEFORE_DRAFTING; round 2+ pending), plan-eng-review (pending), operator (G2 approval gate)
 **Target version:** v0.12.0 — independent of dispatch-lifecycle stack

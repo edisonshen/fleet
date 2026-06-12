@@ -1,6 +1,16 @@
 # DESIGN: Coord-Spawn Auto-Writes RC Marker
 
 **Status:** v1 — operator approved 2026-05-18 (G2 gate cleared). Ready to split into tasks.
+**SUPERSEDED (2026-06-11, rc-default-native-startu-a2ce):** remote
+control is now NATIVE and DEFAULT-ON — every coord spawn bakes
+`claude --remote-control "fleet-coord-<id>-<project>"` into the
+coord's own argv. The standalone listener daemon, the per-tick Python
+respawn (`spawn_daemon_if_needed`), and the `fleet rc connect`
+send-keys path described in this document are retired. The rc-enabled
+opt-in marker is replaced by an rc-disabled opt-OUT marker
+(`fleet rc down <project>`). This document is kept as historical
+context for the v0.12/v0.13 architecture and its cleanup paths
+(Down/Reset/sweep still reap leftover legacy daemons).
 **Author:** coord agent 5f05977b (Feng Shen's session, projects-fleet)
 **Reviewers:** operator (G2); codex + /review at PR time per CLAUDE.md §4.
 **Target version:** v0.12.1 (point release on top of v0.12.0 RC architecture).
