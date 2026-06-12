@@ -34,3 +34,6 @@ __pycache__/
 
 # Local Go build cache (accidental sweep guard)
 .gocache/
+
+# Design-doc HTML renders are local-only (.md is committed and canonical)
+docs/*.html
