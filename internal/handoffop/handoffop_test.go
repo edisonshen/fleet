@@ -13,6 +13,7 @@ import (
 	"github.com/edisonshen/fleet/internal/coordlock"
 	"github.com/edisonshen/fleet/internal/handoffdelivery"
 	"github.com/edisonshen/fleet/internal/queue"
+	"github.com/edisonshen/fleet/internal/rc"
 	"github.com/edisonshen/fleet/internal/spawn"
 	"github.com/edisonshen/fleet/internal/state"
 	"github.com/edisonshen/fleet/internal/testutil/tmuxtest"
@@ -1297,80 +1298,77 @@ func TestIsCoordHandoffForAgent_GatesOnCoordSpawnMarker(t *testing.T) {
 
 // -- v0.12.2 P0: drain-path RC marker backfill ------------------------------
 //
-// The drain path (handoffop.spawnAndRetire) consumes queue files written
-// by fleet-guard / crash recovery. PR #163 closed the FRESH-spawn marker
-// hole at the dispatch layer; the deferred [P2] (2) is the drain path
-// equivalent: when a pre-v0.12.1 coord that never wrote the rc-enabled
-// marker triggers an auto-handoff, the drain path injects
-// `--remote-control` only when rc.Enabled(project) holds. Without a
-// marker, rc.GateAttachFlag returns the plain argv → coord-spawn
-// replacement misses RC pairing.
-//
-// Fix: inside the existing `if isCoordHandoffForAgent(...)` block in
-// spawnAndRetire (where the inject already runs), write the rc-enabled
-// marker BEFORE the inject. Mirrors cmd/fleet/handoff.go's pattern.
-//
-// Tests below pin three behaviors:
-//
-//   - T-drain-coord-marker-write: a coord handoff (marker == oldRec.ID)
-//     calls writeMarkerFn(oldRec.Project) exactly once before injecting.
-//
-//   - T-drain-worker-no-marker-write: a worker handoff
-//     (isCoordHandoffForAgent=false) NEVER calls writeMarkerFn.
-//     Preserves the v0.12 push-storm protection for non-coord agents.
-//
-//   - T-drain-marker-write-failure-non-fatal: when writeMarkerFn returns
-//     an error inside the coord block, drain logs to stderr and
-//     continues; the spawn proceeds (and the inject no-ops because the
-//     marker is absent — graceful degrade).
+// Native-RC drain coverage: a COORD drain replacement gets
+// `--remote-control` baked into its exec argv by default — no marker
+// write, no opt-in step. coordDrainExecArgv is the extracted decision
+// helper (unit-tested below so the suite never execs a rewritten
+// claude argv for real); the isCoordHandoffForAgent call-site gate is
+// the worker carve-out (push-storm protection), pinned by
+// TestIsCoordHandoffForAgent_GatesOnCoordSpawnMarker above and the
+// worker integration test below.
 
-// TestDrain_CoordHandoff_WritesMarkerBeforeInject pins
-// T-drain-coord-marker-write. The drain path's coord branch must call
-// the writeMarkerFn seam exactly once with the project, BEFORE the
-// inject runs. We verify via the seam (call count + arg captured) so
-// the test doesn't depend on rc.WriteMarker's on-disk side effect
-// timing inside Resume.
-func TestDrain_CoordHandoff_WritesMarkerBeforeInject(t *testing.T) {
-	requireTmux(t)
+// TestCoordDrainExecArgv_DefaultInjects: native default-on — the
+// default claude wrapper shape gets the flag baked in.
+func TestCoordDrainExecArgv_DefaultInjects(t *testing.T) {
 	setupFleetHome(t)
-	oldRec := spawnSeedAgent(t)
+	t.Setenv("FLEET_RC_BOOTSTRAP_DISABLED", "")
 
-	// Marker = oldRec.ID makes isCoordHandoffForAgent fire.
-	if _, err := state.EnsureProjectInitialized(oldRec.Project); err != nil {
-		t.Fatalf("EnsureProjectInitialized: %v", err)
+	command := []string{"sh", "-c", "claude --dangerously-skip-permissions; exec bash"}
+	got := coordDrainExecArgv("rainier", command, "fleet-coord-abcd1234-rainier")
+	if got == nil {
+		t.Fatalf("coord drain exec argv must carry --remote-control by default; got nil (pass-through)")
 	}
-	if err := state.WriteCoordSpawnMarker(oldRec.Project, oldRec.ID); err != nil {
-		t.Fatalf("WriteCoordSpawnMarker: %v", err)
+	joined := strings.Join(got, " ")
+	if !strings.Contains(joined, `--remote-control "fleet-coord-abcd1234-rainier"`) {
+		t.Fatalf("rewritten argv missing --remote-control session name; got %v", got)
 	}
+	// No marker side effects.
+	if rc.MarkerPresent("rainier") {
+		t.Errorf("inject must not write the legacy rc-enabled marker")
+	}
+	if !rc.Enabled("rainier") {
+		t.Errorf("inject must not opt the project out")
+	}
+}
 
-	// Stub the seam to count + capture invocations.
-	prev := writeMarkerFn
-	var calls []string
-	writeMarkerFn = func(project string) error {
-		calls = append(calls, project)
-		return nil
-	}
-	t.Cleanup(func() { writeMarkerFn = prev })
-
-	req, qp, _ := writeSkillQueue(t, oldRec)
-	out := &bytes.Buffer{}
-	if err := Resume(req, qp, 0, out, out); err != nil {
-		t.Fatalf("Resume: %v\n%s", err, out.String())
-	}
-
-	// Cleanup the replacement agent's tmux session.
-	if newRec, lerr := agent.Load(req.NewAgentID); lerr == nil {
-		t.Cleanup(func() { _ = tmux.Kill(newRec.TmuxSession) })
+// TestCoordDrainExecArgv_OptOutSuppresses: the rc-disabled marker wins.
+func TestCoordDrainExecArgv_OptOutSuppresses(t *testing.T) {
+	setupFleetHome(t)
+	t.Setenv("FLEET_RC_BOOTSTRAP_DISABLED", "")
+	if err := rc.WriteDisabledMarker("rainier"); err != nil {
+		t.Fatalf("WriteDisabledMarker: %v", err)
 	}
 
-	if len(calls) == 0 {
-		t.Fatalf("expected drain coord handoff to call writeMarkerFn at least once; got 0 invocations")
+	command := []string{"sh", "-c", "claude --dangerously-skip-permissions; exec bash"}
+	got := coordDrainExecArgv("rainier", command, "fleet-coord-abcd1234-rainier")
+	if got != nil {
+		t.Fatalf("opted-out project must yield nil exec argv (plain spawn); got %v", got)
 	}
-	// First call MUST be the coord project (this PR's fix). Later
-	// calls inside the same drain (if any from other paths added in
-	// future) are fine.
-	if calls[0] != oldRec.Project {
-		t.Errorf("first writeMarkerFn call: got project=%q want %q", calls[0], oldRec.Project)
+}
+
+// TestCoordDrainExecArgv_EnvGateSuppresses: FLEET_RC_BOOTSTRAP_DISABLED
+// keeps test paths flag-free even though the default is on.
+func TestCoordDrainExecArgv_EnvGateSuppresses(t *testing.T) {
+	setupFleetHome(t)
+	t.Setenv("FLEET_RC_BOOTSTRAP_DISABLED", "1")
+
+	command := []string{"sh", "-c", "claude --dangerously-skip-permissions; exec bash"}
+	got := coordDrainExecArgv("rainier", command, "fleet-coord-abcd1234-rainier")
+	if got != nil {
+		t.Fatalf("env-gate must suppress the inject; got %v", got)
+	}
+}
+
+// TestCoordDrainExecArgv_CustomCommandPassesThrough: non-wrapper argv
+// shapes (operator-overridden --command) are never mutated; the helper
+// returns nil so spawn.Spawn sees no Command/ExecCommand divergence.
+func TestCoordDrainExecArgv_CustomCommandPassesThrough(t *testing.T) {
+	setupFleetHome(t)
+	t.Setenv("FLEET_RC_BOOTSTRAP_DISABLED", "")
+
+	got := coordDrainExecArgv("rainier", []string{"sleep", "60"}, "fleet-coord-abcd1234-rainier")
+	if got != nil {
+		t.Fatalf("custom command must pass through (nil exec argv); got %v", got)
 	}
 }
 
@@ -1768,21 +1766,19 @@ func TestDrain_LeaseFailoverCoord_DeadLoserSession_StillDeliversToLockOwner(t *t
 // pointing elsewhere) MUST NOT touch the rc-enabled marker via the
 // drain path. Preserves the v0.12 strict opt-in for workers /
 // subagents (push-storm protection).
-func TestDrain_WorkerHandoff_NoMarkerWrite(t *testing.T) {
+// TestDrain_WorkerHandoff_NeverCarriesRemoteControl pins the worker
+// carve-out under the native default-on model: RC is enabled
+// project-wide by default, but a WORKER handoff replacement must never
+// inherit --remote-control — the push-storm protection lives at the
+// isCoordHandoffForAgent call-site gate.
+func TestDrain_WorkerHandoff_NeverCarriesRemoteControl(t *testing.T) {
 	requireTmux(t)
 	setupFleetHome(t)
+	t.Setenv("FLEET_RC_BOOTSTRAP_DISABLED", "")
 	oldRec := spawnSeedAgent(t)
 
-	// Marker absent on the project tree → isCoordHandoffForAgent=false.
+	// Coord-spawn marker absent → isCoordHandoffForAgent=false.
 	// (We deliberately do NOT WriteCoordSpawnMarker.)
-
-	prev := writeMarkerFn
-	var calls []string
-	writeMarkerFn = func(project string) error {
-		calls = append(calls, project)
-		return nil
-	}
-	t.Cleanup(func() { writeMarkerFn = prev })
 
 	req, qp, _ := writeSkillQueue(t, oldRec)
 	out := &bytes.Buffer{}
@@ -1790,65 +1786,16 @@ func TestDrain_WorkerHandoff_NoMarkerWrite(t *testing.T) {
 		t.Fatalf("Resume: %v\n%s", err, out.String())
 	}
 
-	if newRec, lerr := agent.Load(req.NewAgentID); lerr == nil {
-		t.Cleanup(func() { _ = tmux.Kill(newRec.TmuxSession) })
+	newRec, lerr := agent.Load(req.NewAgentID)
+	if lerr != nil {
+		t.Fatalf("load replacement record: %v", lerr)
 	}
+	t.Cleanup(func() { _ = tmux.Kill(newRec.TmuxSession) })
 
-	if len(calls) != 0 {
-		t.Fatalf("expected drain worker handoff to skip writeMarkerFn; got %d calls (args=%v)",
-			len(calls), calls)
-	}
-}
-
-// TestDrain_CoordHandoff_MarkerWriteFailure_NonFatal pins
-// T-drain-marker-write-failure-non-fatal. If writeMarkerFn returns an
-// error inside the drain coord branch, the handoff continues (logs a
-// warning to stderr) — graceful degrade matches dispatch.go's
-// non-fatal contract pinned by TestCoordSpawn_MarkerWriteFailure_Degrades.
-func TestDrain_CoordHandoff_MarkerWriteFailure_NonFatal(t *testing.T) {
-	requireTmux(t)
-	setupFleetHome(t)
-	oldRec := spawnSeedAgent(t)
-
-	if _, err := state.EnsureProjectInitialized(oldRec.Project); err != nil {
-		t.Fatalf("EnsureProjectInitialized: %v", err)
-	}
-	if err := state.WriteCoordSpawnMarker(oldRec.Project, oldRec.ID); err != nil {
-		t.Fatalf("WriteCoordSpawnMarker: %v", err)
-	}
-
-	prev := writeMarkerFn
-	stubErr := errors.New("simulated drain marker write failure")
-	writeMarkerFn = func(string) error { return stubErr }
-	t.Cleanup(func() { writeMarkerFn = prev })
-
-	req, qp, _ := writeSkillQueue(t, oldRec)
-	stdout := &bytes.Buffer{}
-	stderr := &bytes.Buffer{}
-	err := Resume(req, qp, 0, stdout, stderr)
-	if err != nil && strings.Contains(err.Error(), "simulated drain marker write failure") {
-		t.Fatalf("marker-write failure MUST be non-fatal in drain coord branch; surfaced as: %v", err)
-	}
-	// Resume itself may still return nil (happy spawn after the
-	// non-fatal warning); the contract is just "marker failure
-	// isn't the cause of any error returned."
-	if err != nil {
-		// Non-fatal contract: any error returned must NOT mention
-		// our stubbed marker failure. Other errors from spawn /
-		// retire are unrelated and acceptable here.
-		if strings.Contains(err.Error(), stubErr.Error()) {
-			t.Fatalf("drain returned error attributable to marker failure: %v", err)
+	for _, el := range newRec.Command {
+		if strings.Contains(el, "--remote-control") {
+			t.Fatalf("worker drain replacement must NEVER carry --remote-control (push-storm protection); argv=%v", newRec.Command)
 		}
-	}
-
-	if newRec, lerr := agent.Load(req.NewAgentID); lerr == nil {
-		t.Cleanup(func() { _ = tmux.Kill(newRec.TmuxSession) })
-	}
-
-	// Warning MUST be written to stderr so the operator can recover
-	// via `fleet rc up <project>`. Mirrors dispatch.go's warning shape.
-	if !strings.Contains(stderr.String(), "rc.WriteMarker") {
-		t.Errorf("expected stderr warning mentioning rc.WriteMarker; got: %q", stderr.String())
 	}
 }
 
@@ -1892,12 +1839,6 @@ func TestDrainAndDispatch_ShareSameLock(t *testing.T) {
 		t.Fatalf("outer coordlock.Acquire: %v", err)
 	}
 	defer release()
-
-	// Stub writeMarkerFn so a side effect of the drain block does
-	// not depend on the rc package's real disk state.
-	prev := writeMarkerFn
-	writeMarkerFn = func(string) error { return nil }
-	t.Cleanup(func() { writeMarkerFn = prev })
 
 	req, qp, _ := writeSkillQueue(t, oldRec)
 	stdout := &bytes.Buffer{}
@@ -1947,10 +1888,6 @@ func TestDrain_LockReleasedOnReturn(t *testing.T) {
 	if err := state.WriteCoordSpawnMarker(oldRec.Project, oldRec.ID); err != nil {
 		t.Fatalf("WriteCoordSpawnMarker: %v", err)
 	}
-
-	prev := writeMarkerFn
-	writeMarkerFn = func(string) error { return nil }
-	t.Cleanup(func() { writeMarkerFn = prev })
 
 	req, qp, _ := writeSkillQueue(t, oldRec)
 	stdout := &bytes.Buffer{}
@@ -2003,10 +1940,6 @@ func TestDrain_ContentionPreservesQueueFile(t *testing.T) {
 		t.Fatalf("outer coordlock.Acquire: %v", err)
 	}
 	defer release()
-
-	prev := writeMarkerFn
-	writeMarkerFn = func(string) error { return nil }
-	t.Cleanup(func() { writeMarkerFn = prev })
 
 	req, qp, _ := writeSkillQueue(t, oldRec)
 	stdout := &bytes.Buffer{}

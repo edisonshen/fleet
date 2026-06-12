@@ -60,12 +60,6 @@ func TestRunDispatch_Concurrent_OnlyOneSpawns(t *testing.T) {
 		t.Fatalf("EnsureProjectInitialized: %v", err)
 	}
 
-	// Stub writeMarkerFn so marker writes don't affect on-disk
-	// state; we only care about who gets past the lock.
-	prevMarker := writeMarkerFn
-	writeMarkerFn = func(string) error { return nil }
-	t.Cleanup(func() { writeMarkerFn = prevMarker })
-
 	// Barrier: both goroutines call runDispatch as close to
 	// simultaneously as the scheduler permits, maximizing the race
 	// window for the lock to catch.

@@ -46,10 +46,14 @@ func withFleetHome(t *testing.T) string {
 func TestMarker_AbsentByDefault(t *testing.T) {
 	withFleetHome(t)
 	if MarkerPresent("demo") {
-		t.Fatalf("marker should be absent under fresh FLEET_HOME")
+		t.Fatalf("legacy marker should be absent under fresh FLEET_HOME")
 	}
-	if Enabled("demo") {
-		t.Fatalf("Enabled should be false when marker absent")
+	if DisabledMarkerPresent("demo") {
+		t.Fatalf("disabled marker should be absent under fresh FLEET_HOME")
+	}
+	// Native model: no markers at all means ENABLED (default-on).
+	if !Enabled("demo") {
+		t.Fatalf("Enabled should default to true with no markers (native model)")
 	}
 }
 
@@ -60,9 +64,6 @@ func TestMarker_WriteRemove_Idempotent(t *testing.T) {
 	}
 	if !MarkerPresent("demo") {
 		t.Fatalf("marker should be present after WriteMarker")
-	}
-	if !Enabled("demo") {
-		t.Fatalf("Enabled should be true after WriteMarker")
 	}
 	// Second WriteMarker is idempotent.
 	if err := WriteMarker("demo"); err != nil {
@@ -112,5 +113,67 @@ func TestMarker_RejectsInvalidProject(t *testing.T) {
 	withFleetHome(t)
 	if _, err := MarkerPath("../escape"); err == nil {
 		t.Fatalf("MarkerPath should reject path-traversal")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// rc-disabled opt-out marker (native model).
+// ---------------------------------------------------------------------------
+
+func TestDisabledMarker_WriteRemove_Idempotent(t *testing.T) {
+	withFleetHome(t)
+	if err := WriteDisabledMarker("demo"); err != nil {
+		t.Fatalf("WriteDisabledMarker: %v", err)
+	}
+	if !DisabledMarkerPresent("demo") {
+		t.Fatalf("disabled marker should be present after WriteDisabledMarker")
+	}
+	// Second write is idempotent.
+	if err := WriteDisabledMarker("demo"); err != nil {
+		t.Fatalf("second WriteDisabledMarker: %v", err)
+	}
+	if err := RemoveDisabledMarker("demo"); err != nil {
+		t.Fatalf("RemoveDisabledMarker: %v", err)
+	}
+	if DisabledMarkerPresent("demo") {
+		t.Fatalf("disabled marker should be absent after RemoveDisabledMarker")
+	}
+	// Second remove is idempotent (no error on missing file).
+	if err := RemoveDisabledMarker("demo"); err != nil {
+		t.Fatalf("second RemoveDisabledMarker: %v", err)
+	}
+}
+
+func TestDisabledMarker_PathShape(t *testing.T) {
+	root := withFleetHome(t)
+	path, err := DisabledMarkerPath("demo")
+	if err != nil {
+		t.Fatalf("DisabledMarkerPath: %v", err)
+	}
+	want := filepath.Join(root, "projects", "demo", "rc-disabled")
+	if path != want {
+		t.Fatalf("DisabledMarkerPath shape:\n got %q\nwant %q", path, want)
+	}
+}
+
+func TestDisabledMarker_ZeroByteFile(t *testing.T) {
+	withFleetHome(t)
+	if err := WriteDisabledMarker("demo"); err != nil {
+		t.Fatalf("WriteDisabledMarker: %v", err)
+	}
+	path, _ := DisabledMarkerPath("demo")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	if len(data) != 0 {
+		t.Fatalf("disabled marker should be zero-byte; got %d bytes", len(data))
+	}
+}
+
+func TestDisabledMarker_RejectsInvalidProject(t *testing.T) {
+	withFleetHome(t)
+	if _, err := DisabledMarkerPath("../escape"); err == nil {
+		t.Fatalf("DisabledMarkerPath should reject path-traversal")
 	}
 }

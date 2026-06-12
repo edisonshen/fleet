@@ -1812,23 +1812,16 @@ func TestHandoff_CoordReplacementLineageGetsCoordinatorPrompt(t *testing.T) {
 		t.Fatalf("read doc: %v", err)
 	}
 	doc := string(body)
-	// Both slash commands must appear. /remote-control bootstraps the
-	// daemon; /coordinator restarts the supervisor loop so the new
-	// agent's ID lands in the project's coordinator.lock body.
-	if !strings.Contains(doc, "`/remote-control`") {
-		t.Errorf("handoff doc missing /remote-control instruction:\n%s", doc)
+	// Native model: RC is baked into the replacement's spawn argv, so
+	// the doc carries a status note (--remote-control mention) instead
+	// of a /remote-control instruction. /coordinator must still appear
+	// — it restarts the supervisor loop so the new agent's ID lands in
+	// the project's coordinator.lock body.
+	if !strings.Contains(doc, "--remote-control") {
+		t.Errorf("handoff doc missing native RC status note:\n%s", doc)
 	}
 	if !strings.Contains(doc, "`/coordinator`") {
 		t.Errorf("handoff doc missing /coordinator instruction:\n%s", doc)
-	}
-	// Order: remote-control must appear first so the freshly-spawned
-	// chat session attaches to the operator's mobile pairing BEFORE
-	// the supervisor's startup output begins streaming.
-	rcIdx := strings.Index(doc, "`/remote-control`")
-	coordIdx := strings.Index(doc, "`/coordinator`")
-	if rcIdx >= coordIdx {
-		t.Errorf("expected /remote-control before /coordinator; rc=%d coord=%d in:\n%s",
-			rcIdx, coordIdx, doc)
 	}
 }
 

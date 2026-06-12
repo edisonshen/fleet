@@ -146,6 +146,25 @@ func retargetArchivedHandoffSuccessor(agentID, successorID string) error {
 // Mirrors cmd/fleet/handoff.go's isCoordHandoffForProject (same
 // predicate, package-local copy to keep the handoffop package self-
 // contained without importing cmd/fleet/main).
+// coordDrainExecArgv computes the per-spawn exec argv for a COORD
+// drain replacement: routes the clean persisted Command through
+// rc.GateAttachFlag (native default-on; suppressed by the rc-disabled
+// opt-out marker or the FLEET_RC_BOOTSTRAP_DISABLED env-gate) and
+// returns nil when the rewrite is a no-op so spawn.Spawn doesn't see a
+// pointless Command/ExecCommand divergence. Workers never reach this —
+// the isCoordHandoffForAgent call-site gate is the push-storm
+// protection.
+//
+// Extracted for unit-testable coverage without driving a full
+// spawnAndRetire (which would exec the rewritten argv for real).
+func coordDrainExecArgv(project string, command []string, rcSessionName string) []string {
+	rewritten := rc.GateAttachFlag(project, command, rcSessionName)
+	if spawn.SameCommand(rewritten, command) {
+		return nil
+	}
+	return rewritten
+}
+
 func isCoordHandoffForAgent(project, agentID string) bool {
 	if project == "" {
 		return false
@@ -716,13 +735,10 @@ func spawnAndRetire(req queue.SpawnFresh, queuePath string,
 		defer release()
 
 		// Native model: no marker backfill needed — rc.Enabled is
-		// default-on; rc.GateAttachFlag bakes the flag unless the
+		// default-on; coordDrainExecArgv bakes the flag unless the
 		// operator opted the project out (rc-disabled) or the test
 		// env-gate is set.
-		rewrittenExecArgv = rc.GateAttachFlag(oldRec.Project, oldRec.Command, rcSessionName)
-		if spawn.SameCommand(rewrittenExecArgv, oldRec.Command) {
-			rewrittenExecArgv = nil
-		}
+		rewrittenExecArgv = coordDrainExecArgv(oldRec.Project, oldRec.Command, rcSessionName)
 	}
 
 	// COORD drain handoffs resolve the repo binding via the shared
