@@ -380,11 +380,10 @@ Exit codes:
 // listFn / hasSessionFn injection lets tests substitute fake
 // agent-store and tmux-presence views (no real tmux required).
 //
-// v0.12 (DESIGN-rc-listener-lifecycle.md §"cmd/fleet/maintenance.go:
-// 348-351 survey rewrite"): the survey now differentiates "RC not
-// enabled for project" (operator opt-out, no remediation needed)
-// from "RC enabled but agent's persisted argv lacks the flag"
-// (legacy / pre-v0.12 agent that needs a handoff to re-attach).
+// Native model: the survey differentiates "RC disabled for project"
+// (operator opt-out via `fleet rc down` — no remediation needed) from
+// "RC enabled (the default) but agent's persisted argv lacks the
+// flag" (pre-native agent that needs a handoff to pick up native RC).
 func runMaintenanceBootstrapRemoteControl(
 	stdout io.Writer,
 	listFn func() ([]*agent.Record, error),
@@ -453,22 +452,22 @@ func runMaintenanceBootstrapRemoteControl(
 		for _, m := range rcEnabledMissing {
 			_, _ = fmt.Fprintf(stdout,
 				"  %s  project=%s  task=%s  spawned=%s\n"+
-					"     remediation: fleet handoff %s   (replacement spawn auto-injects the flag)\n"+
-					"                  or: fleet rc connect %s    (drives /remote-control on the live coord)\n\n",
-				m.id, m.project, m.taskID, m.spawnedAt, m.id, m.project)
+					"     remediation: fleet handoff %s   (replacement spawn bakes in native --remote-control)\n"+
+					"                  or: type /remote-control in the agent's pane\n\n",
+				m.id, m.project, m.taskID, m.spawnedAt, m.id)
 		}
 	}
 	if len(rcDisabledSkipped) > 0 {
 		_, _ = fmt.Fprintf(stdout,
-			"%d live agent(s) without --remote-control (RC NOT enabled for project — no action needed):\n\n",
+			"%d live agent(s) without --remote-control (RC disabled for project — no action needed):\n\n",
 			len(rcDisabledSkipped))
 		for _, m := range rcDisabledSkipped {
 			_, _ = fmt.Fprintf(stdout,
 				"  %s  project=%s  task=%s  spawned=%s\n"+
-					"     status: RC opt-in absent (no `~/.fleet/projects/%s/rc-enabled` marker)\n"+
-					"     remediation (only if pairing wanted): fleet rc up %s && fleet rc connect %s\n\n",
+					"     status: RC opted out (`~/.fleet/projects/%s/rc-disabled` marker present, or no project)\n"+
+					"     remediation (only if pairing wanted): fleet rc up %s && fleet handoff %s\n\n",
 				m.id, m.project, m.taskID, m.spawnedAt,
-				m.project, m.project, m.project)
+				m.project, m.project, m.id)
 		}
 	}
 	return nil

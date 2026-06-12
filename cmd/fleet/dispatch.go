@@ -80,16 +80,6 @@ const dispatchReconcileMaxAge = 24 * time.Hour
 // pass closures instead).
 var tmuxHasSession = tmux.HasSession
 
-// writeMarkerFn is the seam for the v0.12.1 P0 coord-spawn auto-marker
-// write (DESIGN-rc-coord-auto-marker.md). Production wires
-// rc.WriteMarker; tests stub to exercise the non-fatal-on-failure
-// contract pinned by TestCoordSpawn_MarkerWriteFailure_Degrades.
-//
-// Both dispatch.go (coord-spawn branch) and handoff.go (coord
-// replacement branch) call through this var, so a single test stub
-// covers both auto-marker call sites.
-var writeMarkerFn = rc.WriteMarker
-
 // dispatchOpts captures cobra-parsed flags so the run() func is testable
 // without poking at globals.
 type dispatchOpts struct {
@@ -492,19 +482,16 @@ func runDispatch(opts *dispatchOpts, stdout io.Writer) error {
 			opts.taskID, opts.project)
 	}
 
-	// Issue #73 + dispatch-flag-injection P0 (mobile pairing broken):
-	// coord-spawn dispatches inject Claude Code's documented
-	// `--remote-control "<session>"` flag so the operator's `[a]`
-	// re-attach can reach the coord's tools without manually running
-	// `/remote-control` inside the session.
+	// Native RC at coord spawn (issue #73 lineage; operator directive
+	// 2026-05-29): coord-spawn dispatches bake Claude Code's documented
+	// `--remote-control "<session>"` flag into the coord's own claude
+	// argv so the session is Remote-Control-enabled the moment it
+	// starts — mobile / claude.ai pairing with no daemon, no
+	// slash-command injection, no tick-lag.
 	//
-	// Session-name prefix MUST be "fleet-coord" — that's the prefix
-	// `bootstrap_remote_control` (skills/coordinator/remote_control.py)
-	// passes via `--remote-control-session-name-prefix` when it spawns
-	// the daemon on the coord's first tick. Names that don't share
-	// this prefix would never attach to the daemon (codex review #73
-	// iter-2 P1). We append the agent_id so each coord registers as
-	// a unique session within the same daemon scope.
+	// Session names keep the "fleet-coord" prefix
+	// (`fleet-coord-<id>-<project>`) so the operator can distinguish
+	// coords across projects on claude.ai / mobile.
 	//
 	// Pre-allocate the agent ID HERE (instead of letting spawn.Spawn
 	// call agent.NewID()) so we can interpolate it into the shell
@@ -518,62 +505,11 @@ func runDispatch(opts *dispatchOpts, stdout io.Writer) error {
 	// oldRec.Command doesn't inherit a stale `--remote-control
 	// "fleet-coord-<old-id>"` flag (codex review #73 iter-1 P1).
 	//
-	// HISTORY — daemon-presence gate REMOVED (this commit). The
-	// previous code path was:
-	//
-	//     if opts.coordSpawn && remoteControlDaemonRunning() { ... }
-	//
-	// The daemon-presence gate (codex review #73 iter-5 P1) was a
-	// belt-and-braces guard against "claude exits non-zero when the
-	// daemon isn't listening yet". It turned out to be exactly the
-	// wrong half of a chicken-and-egg loop with Bug 1 in
-	// skills/coordinator/remote_control.py:
-	//
-	//   - The Python skill's spawn_daemon_if_needed used a broad
-	//     `pgrep -f "claude remote-control"` guard. When ANY
-	//     remote-control daemon was running (e.g. the operator's
-	//     fleet-handoff daemon from a prior handoff), the coord skill
-	//     silently SKIPPED its own daemon launch.
-	//   - This dispatch path's gate `remoteControlDaemonRunning()`
-	//     correctly narrowed on the fleet-coord prefix. With no
-	//     fleet-coord daemon ever launching, this gate ALWAYS
-	//     returned false on coord spawn → the flag was NEVER
-	//     injected → mobile pairing was broken on every coord across
-	//     the operator's whole fleet.
-	//
-	// Survey at the time of this fix found ALL 7 live agents on the
-	// operator's machine (4 coords + 3 workers, where 2 coords were
-	// the in-flight ones we needed to pair) missing the
-	// --remote-control flag in their persisted command. The Python
-	// pgrep fix (Bug 1) closes one half of the chicken-and-egg, but
-	// keeping the gate here re-creates the same failure on every
-	// fresh coord boot until /tmp gets cleared — because the gate
-	// asks "is the daemon up *right now*", and on a clean dispatch
-	// the answer is always no (the bash bootstrap inside the coord
-	// runs many seconds AFTER tmux.Spawn returns).
-	//
-	// Why dropping the gate is safe:
-	//   - claude --remote-control "<name>" retries on its own
-	//     internal connection loop. The CLI does not exit non-zero
-	//     when the daemon is briefly absent; it waits and connects
-	//     when the daemon comes up. The wrapper's RC=$? branch only
-	//     fires on a real claude process exit (Ctrl-D, /exit, or a
-	//     hard error), not on transient connection retries.
-	//   - The fleet-coord daemon launches on the coord's first tick
-	//     (skills/coordinator/remote_control.py:spawn_daemon_if_needed)
-	//     within seconds of the agent booting. Worst case is a few
-	//     seconds of "daemon not yet up" while claude retries.
-	//   - The inbox-relay path
-	//     (skills/coordinator/remote_control.py:seed_inbox) still
-	//     runs as a belt-and-braces fallback: even if the daemon
-	//     comes up but the spawned claude session doesn't latch
-	//     onto it for some reason, the seeded /remote-control inbox
-	//     message will land on the next Stop hook.
-	//
-	// remoteControlDaemonRunning() and its tests have been removed
-	// (search the git log for the deletion commit). Any new code
-	// that wants to check daemon presence should NOT gate flag
-	// injection on it — the gate is the bug.
+	// HISTORY — the standalone listener daemon + the Python skill's
+	// per-tick respawn (spawn_daemon_if_needed) + the daemon-presence
+	// gate (remoteControlDaemonRunning) are all RETIRED. The native
+	// `claude --remote-control "<name>"` flag carries the whole
+	// mechanism now; see internal/rc's package doc for the lineage.
 	//
 	// Non-coord dispatches (workers, operator-shelled `fleet dispatch`)
 	// keep the original command unchanged: they don't get auto-attach,
@@ -587,19 +523,10 @@ func runDispatch(opts *dispatchOpts, stdout io.Writer) error {
 	var rewrittenExecArgv []string
 	if opts.coordSpawn {
 		preAllocatedID = agent.NewID()
-		// v0.12.1 P0: marker write + fresh-spawn inject were originally
-		// here, before the early-refusal gates (ListStrict, live-coord
-		// veto, FLEET_MAX_SESSIONS, dead-coord recovery). Codex review
-		// iter-4 [P1] caught the lifecycle hole: writing the rc-enabled
-		// marker before knowing whether the spawn will actually proceed
-		// can persist RC opt-in for a project even when the spawn is
-		// refused. The pathological case: operator runs `fleet rc down
-		// <project>`, then `fleet dispatch --coord-spawn` writes the
-		// marker back, then the live-coord veto refuses (existing coord
-		// alive) — net effect is the opt-out is silently undone with
-		// no new coord. Both moved DOWN to after the gates, immediately
-		// before spawn.Spawn (see "v0.12.1 deferred marker+inject" block
-		// near line ~724).
+		// The fresh-spawn --remote-control inject runs AFTER the
+		// early-refusal gates (ListStrict, live-coord veto,
+		// FLEET_MAX_SESSIONS, dead-coord recovery), immediately before
+		// spawn.Spawn — see the "Native RC at coord spawn" block below.
 	}
 
 	// Pre-fetch the agent record list ONCE so the live-coord veto AND
@@ -1028,48 +955,25 @@ func runDispatch(opts *dispatchOpts, stdout io.Writer) error {
 		disableAutoResume = true
 	}
 
-	// v0.12.1 P0 deferred marker+inject (DESIGN-rc-coord-auto-marker.md,
-	// operator G2 2026-05-18; codex review iter-4 [P1]): coord-spawn
-	// auto-opts-in to RC so the rc.Enabled(project) gate inside
-	// injectRemoteControlFlagProject passes on the same dispatch.
-	// Without this, freshly-dispatched coords spawn with plain claude
-	// argv and `/remote-control` + `fleet rc connect <project>` return
-	// `not_enabled` until the operator manually runs `fleet rc up`.
-	//
-	// Runs HERE (after ListStrict / live-coord veto / FLEET_MAX_SESSIONS
-	// / dead-coord recovery — all the gates that can refuse the spawn),
-	// not back at the original site near line ~445. Earlier placement
-	// could persist the rc-enabled marker even when the spawn was
-	// rejected, silently undoing an operator's `fleet rc down`.
+	// Native RC at coord spawn (rc-default-native-startup, operator
+	// directive 2026-05-29): bake `--remote-control
+	// "fleet-coord-<id>-<project>"` into the coord's own claude argv.
+	// DEFAULT-ON — no marker write, no opt-in step; the only
+	// suppressors inside injectRemoteControlFlagProject are the
+	// per-project rc-disabled opt-out marker (`fleet rc down`) and the
+	// FLEET_RC_BOOTSTRAP_DISABLED env-gate (test hygiene).
 	//
 	// Scope carve-out: workers / Agent-tool subagents
-	// (opts.coordSpawn=false) do NOT enter this branch, so the v0.12
-	// push-storm protection that targeted runaway reviewer subagents
-	// is preserved — only coords are auto-opted-in.
+	// (opts.coordSpawn=false) do NOT enter this branch — reviewer
+	// loops and worker dispatches never get the flag, preserving the
+	// v0.12 push-storm protection at the call-site level.
 	//
-	// Recovery-spawn argv inheritance (the inject inside the
-	// findRecoveryCandidate block above at line ~673) ALSO consumes
-	// this marker: that path runs AFTER the gates so its inject
-	// either reads the marker we just wrote here, or — if recovery
-	// already wrote rewrittenExecArgv — we leave it untouched
-	// (sameCommand short-circuit below).
-	//
-	// Failure is non-fatal: log a warning and continue with plain
-	// claude argv (operator can still recover with `fleet rc up`).
+	// Only inject when the recovery path didn't already set
+	// rewrittenExecArgv (skips wasted work + avoids double-rewriting
+	// a custom command). The recovery-spawn inject inside the
+	// findRecoveryCandidate block above runs first; if it fired,
+	// rewrittenExecArgv is set and we honor it as-is.
 	if opts.coordSpawn && opts.project != "" {
-		if err := writeMarkerFn(opts.project); err != nil {
-			_, _ = fmt.Fprintf(os.Stderr,
-				"warning: rc.WriteMarker(%q) failed: %v (continuing with plain claude argv; run `fleet rc up %s` to recover)\n",
-				opts.project, err, opts.project)
-		}
-		// Only inject when the recovery path didn't already set
-		// rewrittenExecArgv (skips wasted work + avoids double-rewriting
-		// a custom command). The recovery-spawn inject at line ~673
-		// runs inside the dead-coord-recovery branch; if it fired,
-		// rewrittenExecArgv is set and we honor it as-is. Otherwise,
-		// this is a fresh-spawn coord (or a recovery that inherited
-		// the engine-default wrapper without inheriting opts.command)
-		// and we do the rewrite here.
 		if rewrittenExecArgv == nil {
 			rcSessionName := buildCoordRemoteControlSessionName(preAllocatedID, opts.project)
 			rewritten := injectRemoteControlFlagProject(opts.command, rcSessionName, opts.project)
@@ -1418,22 +1322,22 @@ func injectRemoteControlFlag(command []string, sessionName string) []string {
 	return spawn.InjectRemoteControlFlag(command, sessionName)
 }
 
-// injectRemoteControlFlagProject is the v0.12 project-aware variant.
-// Adds an rc.Enabled(project) check on top of the existing env-gate.
-// Used by coord-spawn + dispatch-recovery (handoff replacement uses
-// the same gate at cmd/fleet/handoff.go).
+// injectRemoteControlFlagProject is the project-aware variant. Adds
+// an rc.Enabled(project) check on top of the existing env-gate. Used
+// by coord-spawn + dispatch-recovery (handoff replacement uses the
+// same gate at cmd/fleet/handoff.go).
 //
-// Two-layer gate (v0.12 DESIGN-rc-listener-lifecycle.md §"Attach-
-// surface gates"):
+// Two-layer gate (native model — default ON):
 //
-//  1. PRIMARY: rc.Enabled(project) — per-project marker. Absent means
-//     operator hasn't opted in; no flag injection.
-//  2. SECONDARY (defense-in-depth from PR #157, retired in v0.13):
-//     FLEET_RC_BOOTSTRAP_DISABLED env var.
+//  1. PRIMARY: rc.Enabled(project) — opt-OUT semantics. False only
+//     for an empty/invalid project or when the operator wrote the
+//     rc-disabled marker via `fleet rc down <project>`.
+//  2. SECONDARY (defense-in-depth from PR #157): the
+//     FLEET_RC_BOOTSTRAP_DISABLED env var, set by the test suite so
+//     no test-spawned argv ever carries the flag.
 //
 // Empty project (legacy / untargeted dispatch) returns false from
-// rc.Enabled, so the gate fires the same way as for projects-without-
-// markers.
+// rc.Enabled, so those spawns stay flag-free.
 func injectRemoteControlFlagProject(command []string, sessionName, project string) []string {
 	if os.Getenv("FLEET_RC_BOOTSTRAP_DISABLED") != "" {
 		return command

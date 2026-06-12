@@ -867,64 +867,27 @@ func runHandoff(opts *handoffOpts, stdout, stderr io.Writer) error {
 	// (the Claude remote-control daemon only attaches sessions whose
 	// name starts with its --remote-control-session-name-prefix).
 	//
-	// codex round-6 P1: post-v0.12 there is no longer a per-handoff
-	// bash bootstrap (S2/S3 gates replaced it with operator-instruction
-	// markdown). The only live listener now is the one `fleet rc up`
-	// starts with prefix "fleet-coord". Injecting "fleet-handoff-..."
-	// session names into the replacement coord would point at a prefix
-	// the listener can't see → silent pairing failure post-handoff.
-	// Use the coord session-name shape so the single live listener
-	// matches both fresh-spawn and handoff replacements.
-	// v0.12.1 P0 (DESIGN-rc-coord-auto-marker.md, operator G2
-	// 2026-05-18): coord handoff replacements ARE coords too —
-	// auto-opt-in to RC so the rc.Enabled gate inside
-	// injectRemoteControlFlagProject below passes. Common case is
-	// idempotent (marker already present from the predecessor coord's
-	// auto-write); guards against the degenerate case where the
-	// marker was removed between the predecessor's spawn and this
-	// handoff (e.g. operator ran `fleet rc down <project>` then
-	// realized they want pairing back). Failure is non-fatal —
-	// operator can recover via `fleet rc up`.
+	// codex round-6 P1 (historical): session names use the coord shape
+	// (`fleet-coord-<id>-<project>`) so fresh-spawn and handoff
+	// replacements are uniform on claude.ai / mobile.
 	//
-	// codex review iter-1 [P1] + iter-5 [P1]: gate BOTH the marker
-	// write AND the --remote-control inject on isCoordHandoffForProject.
-	// `fleet handoff` runs for BOTH coord and worker handoffs (same
-	// code path; agent type comes from oldRec). Two separate hazards
-	// motivate the dual gate:
+	// Native model: the replacement coord gets `--remote-control` baked
+	// into its exec argv by DEFAULT — no marker write, no opt-in. The
+	// only suppressors inside injectRemoteControlFlagProject are the
+	// rc-disabled opt-out marker (`fleet rc down <project>`) and the
+	// FLEET_RC_BOOTSTRAP_DISABLED env-gate.
 	//
-	//   (1) Writing the rc-enabled marker on a worker handoff would
-	//       globally opt the project into RC, undoing an operator's
-	//       explicit opt-out via `fleet rc down`. Fixed in iter-1.
-	//
-	//   (2) Even WITHOUT writing the marker, the helper below
-	//       (injectRemoteControlFlagProject) consults
-	//       rc.Enabled(project) — which is project-wide. If ANOTHER
-	//       agent (e.g., the project's coord) already triggered the
-	//       auto-write, a worker handoff would silently inherit RC
-	//       attach, violating the v0.12 push-storm protection (workers
-	//       and subagents stay strict opt-in even when the project is
-	//       RC-enabled). Iter-5 [P1] catches this; gate the inject on
-	//       isCoordHandoff so the handoff carve-out matches the
-	//       dispatch-side carve-out (opts.coordSpawn).
+	// codex review iter-1 [P1] + iter-5 [P1] (kept): gate the inject on
+	// isCoordHandoffForProject. `fleet handoff` runs for BOTH coord and
+	// worker handoffs (same code path; agent type comes from oldRec),
+	// and workers / Agent-tool subagents must NEVER carry
+	// --remote-control — the push-storm protection lives at this
+	// call-site gate, not in a marker.
 	//
 	// Detect coord via the coord-spawn marker (mirrors line ~817
 	// isCoordSwap check); skip on workers.
 	var rewrittenExecArgv []string
 	if isCoordHandoffForProject(oldRec.Project, oldRec.ID) {
-		if err := writeMarkerFn(oldRec.Project); err != nil {
-			// Use injected stderr for parity with the rest of
-			// runHandoff's warnings (codex review iter-3 [P3]).
-			_, _ = fmt.Fprintf(stderr,
-				"warning: rc.WriteMarker(%q) failed during handoff: %v (continuing with plain claude argv; run `fleet rc up %s` to recover)\n",
-				oldRec.Project, err, oldRec.Project)
-		}
-
-		// v0.12 (DESIGN §"Attach-surface gates" I2): gate on the
-		// per-project rc-enabled marker. Without it (operator hasn't
-		// run `fleet rc up <project>`), the handoff replacement does
-		// NOT carry --remote-control. FirstAction's operator-instruction
-		// text tells the operator to run `fleet rc connect <project>`
-		// in their terminal to re-attach pairing.
 		rcSessionName := buildCoordRemoteControlSessionName(newID, oldRec.Project)
 		rewritten := injectRemoteControlFlagProject(command, rcSessionName, oldRec.Project)
 		// Only set ExecCommand when the rewrite actually changed

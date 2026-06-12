@@ -1,24 +1,24 @@
 // Package main — `fleet rc` operator-facing CLI subtree.
 //
-// Implements docs/DESIGN-rc-listener-lifecycle.md v8. The operator
-// controls per-project remote-control listeners via:
+// Native model (v0.14): remote control is DEFAULT-ON. Every coord
+// spawn bakes `--remote-control "fleet-coord-<id>-<project>"` into
+// the coord's own claude argv; there is no standalone listener daemon
+// and no send-keys injection. The CLI manages the per-project opt-OUT
+// marker and cleans up legacy (pre-native) listener daemons:
 //
-//	fleet rc up      <project> [--cwd <path>] [--idempotent]
-//	fleet rc down    <project>
-//	fleet rc connect <project> [--coord <id>]
+//	fleet rc up      <project>            — re-enable (remove opt-out marker)
+//	fleet rc down    <project>            — disable (write opt-out marker; reap legacy listener)
+//	fleet rc connect <project>            — DEPRECATED no-op (native startup replaced it)
 //	fleet rc status  [<project>] [--healthy]
-//	fleet rc list
-//	fleet rc reset   [<project>]
+//	fleet rc list                         — projects with RC DISABLED (the exceptions)
+//	fleet rc reset   [<project>]          — back to pristine default-on
 //
-// Stable JSON envelopes + exit codes; the Python skill
-// (skills/coordinator/remote_control.py:spawn_daemon_if_needed)
-// consumes `fleet rc up --idempotent` and routes ALL spawn through
-// the Go controller (codex round 2: single owner).
+// Stable JSON envelopes + exit codes.
 //
 // Exit-code table (mirrors fleet claims):
 //
 //	acquired / already_acquired / released / already_released /
-//	connected           → 0
+//	native_default      → 0
 //	not_enabled         → 10
 //	not_owned           → 10
 //	absent              → 11
@@ -83,12 +83,7 @@ func rcExitCode(outcome string) int {
 		rc.OutcomeAlreadyAcquired,
 		rc.OutcomeReleased,
 		rc.OutcomeAlreadyReleased,
-		rc.OutcomeConnected,
-		// leak-rc-daemon-lifecycle PR-B: self-heal outcomes are
-		// success codes (the daemon is now alive at the requested
-		// version with the new owner). Treat the same as acquired.
-		rc.OutcomeRespawnedStaleVersion,
-		rc.OutcomeRespawnedDeadOwner:
+		rc.OutcomeNativeDefault:
 		return 0
 	case rc.OutcomeNotEnabled, rc.OutcomeNotOwned:
 		return 10
@@ -104,16 +99,23 @@ func rcExitCode(outcome string) int {
 func newRCCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "rc",
-		Short: "Manage per-project remote-control listeners (claude remote-control)",
-		Long: `fleet rc — operator-managed per-project listener lifecycle.
+		Short: "Manage per-project remote control (native, default-on; opt-out via rc-disabled)",
+		Long: `fleet rc — per-project remote-control gate (native model).
 
-Replaces implicit-spawn (PR #157 env-gate) with an explicit marker +
-state.json controlled by 'fleet rc up/down/connect'. The 6 attach-
-surface gates (dispatch, handoff, auto-handoff drain, skills) consult
-rc.Enabled(<project>) before injecting --remote-control or spawning a
-listener.
+Remote control is DEFAULT-ON: every coord spawn bakes
+--remote-control "fleet-coord-<id>-<project>" into the coord's own
+claude argv, so pairing from mobile / claude.ai works the moment the
+coord starts. No standalone listener daemon, no slash-command
+injection.
 
-See docs/DESIGN-rc-listener-lifecycle.md for the design spec.`,
+'fleet rc down <p>' opts a project OUT (writes
+~/.fleet/projects/<p>/rc-disabled; takes effect on the next coord
+spawn). 'fleet rc up <p>' removes the opt-out. The attach-surface
+gates (dispatch, handoff, auto-handoff drain) consult
+rc.Enabled(<project>) before baking the flag.
+
+Legacy (pre-native) standalone listeners are reaped by 'fleet rc
+down/reset' and the background sweep; nothing spawns new ones.`,
 	}
 	cmd.AddCommand(newRCUpCmd())
 	cmd.AddCommand(newRCDownCmd())
@@ -131,45 +133,36 @@ func newRCUpCmd() *cobra.Command {
 	var coordID string
 	cmd := &cobra.Command{
 		Use:   "up <project>",
-		Short: "Enable RC for project (create marker + spawn listener; idempotent)",
+		Short: "Re-enable RC for project (remove the rc-disabled opt-out marker; takes effect on next coord spawn)",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(c *cobra.Command, args []string) error {
-			return runRCUp(c.OutOrStdout(), args[0], cwd, idempotent, respawnOnly, coordID)
+			return runRCUp(c.OutOrStdout(), args[0], respawnOnly)
 		},
 	}
-	cmd.Flags().StringVar(&cwd, "cwd", "", "explicit working_dir override (highest priority resolution source)")
-	cmd.Flags().BoolVar(&idempotent, "idempotent", false, "skill-friendly invocation: never error when already up (alias for stable-zero exit on already_acquired)")
-	cmd.Flags().BoolVar(&respawnOnly, "respawn-only", false, "respawn dead listener only; refuse to create marker (Python coord-tick safety: never auto-enable RC on a project the operator hasn't opted in to)")
-	cmd.Flags().StringVar(&coordID, "coord-id", "",
-		"owning coord agent ID, persisted in rc-state.json so self-healing Up can detect dead-owner across crashes (leak-rc-daemon-lifecycle PR-B)")
-	_ = idempotent // currently absorbed by Up's idempotent semantics
+	// Legacy flags — accepted and IGNORED so pre-native skill copies
+	// (which shell out `fleet rc up <p> --respawn-only --idempotent
+	// [--coord-id <id>] [--cwd <path>]` every coord tick) keep getting
+	// a stable zero-exit no-op instead of a cobra unknown-flag error.
+	// --respawn-only retains its load-bearing back-compat semantics
+	// (never enable, never spawn — see rc.UpOpts.RespawnOnly).
+	cmd.Flags().StringVar(&cwd, "cwd", "", "DEPRECATED no-op (legacy listener working_dir override)")
+	cmd.Flags().BoolVar(&idempotent, "idempotent", false, "DEPRECATED no-op (up is always idempotent)")
+	cmd.Flags().BoolVar(&respawnOnly, "respawn-only", false, "legacy coord-tick compat: pure no-op, never enables RC (exit 10 when opted out, 0 otherwise)")
+	cmd.Flags().StringVar(&coordID, "coord-id", "", "DEPRECATED no-op (legacy listener owner tracking)")
+	_ = cwd
+	_ = idempotent
+	_ = coordID
 	return cmd
 }
 
-func runRCUp(stdout io.Writer, project, cwd string, _ bool, respawnOnly bool, coordID string) error {
+func runRCUp(stdout io.Writer, project string, respawnOnly bool) error {
 	if _, err := state.Bootstrap(); err != nil {
 		return emitRC(stdout, rcResponse{Outcome: rc.OutcomeError, Cmd: "up", Project: project, Error: err.Error()})
 	}
-	// codex P2: validate --coord-id before it is persisted as
-	// owning_coord_id. An invalid value has no agents/<id>.json, so
-	// defaultOwnerAlive would classify it dead-owner and reap+respawn the
-	// daemon repeatedly with the same bad owner. Reject a malformed flag
-	// outright (surface-don't-silo) rather than persist a poison value;
-	// this mirrors the Python coord tick, which drops non-canonical IDs.
-	if coordID != "" && !fleetAgentIDPattern.MatchString(coordID) {
-		return emitRC(stdout, rcResponse{
-			Outcome: rc.OutcomeError, Cmd: "up", Project: project,
-			Error: fmt.Sprintf("invalid --coord-id %q: must be a fleet agent ID (8 lowercase hex chars)", coordID),
-		})
-	}
-	out, err := rc.Up(project, rc.UpOpts{Cwd: cwd, RespawnOnly: respawnOnly, CoordID: coordID})
+	out, err := rc.Up(project, rc.UpOpts{RespawnOnly: respawnOnly})
 	resp := rcResponse{Outcome: out, Cmd: "up", Project: project}
 	if err != nil {
 		resp.Error = err.Error()
-	}
-	if s, sErr := rc.Inspect(project); sErr == nil {
-		resp.ListenerPID = s.ListenerPID
-		resp.WorkingDir = s.WorkingDir
 	}
 	return emitRC(stdout, resp)
 }
@@ -177,7 +170,7 @@ func runRCUp(stdout io.Writer, project, cwd string, _ bool, respawnOnly bool, co
 func newRCDownCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "down <project>",
-		Short: "Disable RC for project (kill listener + remove marker)",
+		Short: "Disable RC for project (write rc-disabled opt-out marker; reap any legacy listener)",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(c *cobra.Command, args []string) error {
 			return runRCDown(c.OutOrStdout(), args[0])
@@ -202,41 +195,50 @@ func newRCConnectCmd() *cobra.Command {
 	var coordID string
 	cmd := &cobra.Command{
 		Use:   "connect <project>",
-		Short: "Drive in-session /remote-control on the project's coord pane (submit-verified send-keys)",
+		Short: "DEPRECATED no-op: RC starts natively with the coord (claude --remote-control at spawn)",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(c *cobra.Command, args []string) error {
-			return runRCConnect(c.OutOrStdout(), args[0], coordID)
+			return runRCConnect(c.OutOrStdout(), args[0])
 		},
 	}
-	cmd.Flags().StringVar(&coordID, "coord", "", "target coord agent ID (default: coord-spawn-marker holder)")
+	// Accepted and ignored for script back-compat.
+	cmd.Flags().StringVar(&coordID, "coord", "", "DEPRECATED no-op (legacy send-keys target selection)")
+	_ = coordID
 	return cmd
 }
 
-func runRCConnect(stdout io.Writer, project, coordID string) error {
+// runRCConnect is the deprecation shim for the retired send-keys
+// attach path. The v0.12 implementation drove the /remote-control
+// slash command into the coord's tmux pane; the native model bakes
+// --remote-control into the coord spawn argv, so there is nothing to
+// connect after the fact. Exit 0 with a diagnostic — failing here
+// would break legacy handoff docs that still instruct the operator to
+// run `fleet rc connect <project>`.
+func runRCConnect(stdout io.Writer, project string) error {
 	if _, err := state.Bootstrap(); err != nil {
 		return emitRC(stdout, rcResponse{Outcome: rc.OutcomeError, Cmd: "connect", Project: project, Error: err.Error()})
 	}
-	res, err := rc.Connect(project, rc.ConnectOpts{CoordID: coordID})
-	resp := rcResponse{
-		Outcome:     res.Outcome,
-		Cmd:         "connect",
-		Project:     project,
-		CoordID:     res.CoordID,
-		TmuxSession: res.TmuxSession,
-		Retried:     res.Retried,
-		Warn:        res.Warn,
+	diag := "deprecated: remote control starts natively with the coord " +
+		"(claude --remote-control at spawn) — nothing to connect. "
+	if !rc.Enabled(project) {
+		diag += fmt.Sprintf("NOTE: RC is currently DISABLED for project %q; "+
+			"run `fleet rc up %s` to re-enable on the next coord spawn. ", project, project)
 	}
-	if err != nil {
-		resp.Error = err.Error()
-	}
-	return emitRC(stdout, resp)
+	diag += "For a coord spawned before the native model, `fleet handoff <coord-id>` " +
+		"respawns it with RC, or type /remote-control in its pane."
+	return emitRC(stdout, rcResponse{
+		Outcome:    rc.OutcomeNativeDefault,
+		Cmd:        "connect",
+		Project:    project,
+		Diagnostic: diag,
+	})
 }
 
 func newRCStatusCmd() *cobra.Command {
 	var healthy bool
 	cmd := &cobra.Command{
 		Use:   "status [<project>]",
-		Short: "Report observed RC state (marker present? listener alive?). --healthy probes claude daemon registry.",
+		Short: "Report RC state (enabled = no rc-disabled marker; legacy listener fields if any). --healthy probes claude daemon registry.",
 		Args:  cobra.MaximumNArgs(1),
 		RunE: func(c *cobra.Command, args []string) error {
 			var project string
@@ -255,13 +257,15 @@ func runRCStatus(stdout io.Writer, project string, healthy bool) error {
 		return emitRC(stdout, rcResponse{Outcome: rc.OutcomeError, Cmd: "status", Project: project, Error: err.Error()})
 	}
 	if project == "" {
-		// No-arg status: enumerate all marked projects.
-		projs, err := rc.List()
+		// No-arg status: enumerate the exceptions — projects with the
+		// rc-disabled opt-out marker (everything else is enabled by
+		// default under the native model).
+		projs, err := rc.ListDisabled()
 		if err != nil {
 			return emitRC(stdout, rcResponse{Outcome: rc.OutcomeError, Cmd: "status", Error: err.Error()})
 		}
-		// Use absent when no projects are enabled so JSON consumers
-		// have a unambiguous "nothing to inspect" signal.
+		// absent = "no opt-outs anywhere; all projects default-on" —
+		// an unambiguous signal for JSON consumers.
 		if len(projs) == 0 {
 			return emitRC(stdout, rcResponse{Outcome: rc.OutcomeAbsent, Cmd: "status", Projects: nil})
 		}
@@ -277,6 +281,8 @@ func runRCStatus(stdout io.Writer, project string, healthy bool) error {
 		Project: project,
 		State:   &s,
 	}
+	// absent = opted out (rc-disabled marker present). Enabled is the
+	// default; the listener fields in State are legacy observability.
 	if !s.Enabled {
 		resp.Outcome = rc.OutcomeAbsent
 	}
@@ -291,7 +297,7 @@ func runRCStatus(stdout io.Writer, project string, healthy bool) error {
 func newRCListCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "list",
-		Short: "Enumerate projects with RC enabled (marker present)",
+		Short: "Enumerate projects with RC DISABLED (rc-disabled opt-out marker present)",
 		Args:  cobra.NoArgs,
 		RunE: func(c *cobra.Command, args []string) error {
 			return runRCList(c.OutOrStdout())
@@ -304,7 +310,7 @@ func runRCList(stdout io.Writer) error {
 	if _, err := state.Bootstrap(); err != nil {
 		return emitRC(stdout, rcResponse{Outcome: rc.OutcomeError, Cmd: "list", Error: err.Error()})
 	}
-	projs, err := rc.List()
+	projs, err := rc.ListDisabled()
 	if err != nil {
 		return emitRC(stdout, rcResponse{Outcome: rc.OutcomeError, Cmd: "list", Error: err.Error()})
 	}
@@ -314,7 +320,7 @@ func runRCList(stdout io.Writer) error {
 func newRCResetCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "reset [<project>]",
-		Short: "Operator emergency: remove marker + kill listener (or all projects)",
+		Short: "Operator emergency: back to pristine default-on (reap legacy listener, remove ALL rc markers)",
 		Args:  cobra.MaximumNArgs(1),
 		RunE: func(c *cobra.Command, args []string) error {
 			var project string
@@ -356,13 +362,7 @@ func emitRC(stdout io.Writer, resp rcResponse) error {
 		rc.OutcomeAlreadyAcquired,
 		rc.OutcomeReleased,
 		rc.OutcomeAlreadyReleased,
-		rc.OutcomeConnected,
-		// codex P3: self-heal outcomes are successes (rcExitCode maps them
-		// to 0). They must return nil here too, or an in-process caller of
-		// runRCUp / Cobra Execute sees an error for a SUCCESSFUL respawn —
-		// inconsistent with the exit-code contract.
-		rc.OutcomeRespawnedStaleVersion,
-		rc.OutcomeRespawnedDeadOwner:
+		rc.OutcomeNativeDefault:
 		return nil
 	default:
 		return errRC{outcome: resp.Outcome}
