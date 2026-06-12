@@ -63,10 +63,16 @@ MILESTONE = "MILESTONE"
 # and therefore NEVER fired on a real pane — the auto-handoff's central
 # trigger was dead (the 2026-06 coord that climbed to 52% in auto-yellow
 # with handoff_type never committing). Tolerate a leading run of
-# whitespace + the agent turn glyph / list-bullet markers, but keep the
-# trailing `MILESTONE$` anchored so `MILESTONES` and `MILESTONE: foo`
-# still do NOT match (no false trigger). The `⏺` is U+23FA (Claude Code's
-# turn glyph).
+# whitespace + the agent turn glyph, but keep the trailing `MILESTONE$`
+# anchored so `MILESTONES` and `MILESTONE: foo` still do NOT match (no
+# false trigger). The `⏺` is U+23FA (Claude Code's turn glyph).
+#
+# List-bullet markers (`-`, `*`, `•`) are DELIBERATELY EXCLUDED (codex
+# review iter-5 [P2]): an agent narrating its plan in response to the
+# request ("- MILESTONE once the tests pass") is NOT the terminal
+# signal; the injected instruction demands a single token on its own
+# line, which renders as `⏺ MILESTONE` (or whitespace-indented), never
+# as a list item.
 #
 # `>` is DELIBERATELY EXCLUDED from the prefix class. The injected
 # HANDOFF REQUESTED prompt (inject_handoff_requested) literally contains a
@@ -76,7 +82,7 @@ MILESTONE = "MILESTONE"
 # OWN instruction echo the instant Yellow injects — cutting off active work
 # before the agent ever responds. The agent's genuine signal carries the
 # `⏺` assistant glyph (or no prefix), never `>`.
-_MILESTONE_LINE_RE = re.compile(r"^[\s*\-•⏺]*MILESTONE\s*$")
+_MILESTONE_LINE_RE = re.compile(r"^[\s⏺]*MILESTONE\s*$")
 
 # Type values mirroring internal/handoff/handoff.go:30-36. The skill never
 # writes "manual" (that's Week 4a's operator path).
@@ -256,8 +262,17 @@ def find_milestone(session: str) -> bool:
     first injection bounds the cycle: within a single live pane there is
     only one Yellow cycle (a completed handoff replaces the agent in a
     fresh pane), so any MILESTONE after the first injection belongs to
-    THIS cycle. Historical narration that predates injection #1 is still
-    correctly excluded.
+    THIS cycle.
+
+    The anchor requires the injected shape `HANDOFF REQUESTED:` (token +
+    colon — every injection renders it; see inject_handoff_requested),
+    not the bare token (codex review iter-5 [P2]): scrollback can
+    contain the bare marker in historical narration ("the doc mentions
+    HANDOFF REQUESTED handling"), and anchoring there would admit
+    pre-cycle MILESTONE lines. A historical quote of the FULL injected
+    phrase can still false-anchor — accepted residual; the blast radius
+    is a premature-but-valid handoff, and Red at 70% remains the
+    safety net.
 
     Match tolerates a leading turn-glyph / bullet prefix
     (`⏺ MILESTONE`, `  MILESTONE`) via _MILESTONE_LINE_RE but keeps
@@ -280,12 +295,15 @@ def find_milestone(session: str) -> bool:
     if not out:
         return False
     lines = out.splitlines()
-    # Find the FIRST occurrence of HANDOFF REQUESTED — the line that opened
-    # this Yellow cycle. Re-injections land BELOW the agent's MILESTONE, so
-    # anchoring on the last one would window a valid MILESTONE out.
+    # Find the FIRST occurrence of the INJECTED request shape (token +
+    # colon) — the line that opened this Yellow cycle. Re-injections land
+    # BELOW the agent's MILESTONE, so anchoring on the last one would
+    # window a valid MILESTONE out; the colon requirement keeps bare-token
+    # historical narration from anchoring too early.
+    request_sentinel = HANDOFF_REQUESTED + ":"
     first_request = -1
     for i, line in enumerate(lines):
-        if HANDOFF_REQUESTED in line:
+        if request_sentinel in line:
             first_request = i
             break
     if first_request == -1:

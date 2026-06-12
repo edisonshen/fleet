@@ -757,6 +757,38 @@ class TestFindMilestone:
         )
         assert handoff.find_milestone("fleet-abc") is True
 
+    def test_list_bullet_milestone_does_not_match(
+        self, fake_tmux: _FakeTmux,
+    ) -> None:
+        """codex review iter-5 [P2] regression: an agent narrating its
+        plan as a checklist ("- MILESTONE", "* MILESTONE", "• MILESTONE")
+        in response to the request is NOT the terminal signal — only a
+        standalone token (optionally behind the ⏺ turn glyph) commits
+        the handoff."""
+        for bullet in ("- MILESTONE", "* MILESTONE", "• MILESTONE"):
+            fake_tmux.output = (
+                f"{handoff.HANDOFF_REQUESTED}: context window over 50%\n"
+                "plan:\n"
+                f"{bullet}\n"
+            )
+            assert handoff.find_milestone("fleet-abc") is False, bullet
+
+    def test_bare_token_narration_does_not_anchor(
+        self, fake_tmux: _FakeTmux,
+    ) -> None:
+        """codex review iter-5 [P2] regression: a historical bare-token
+        mention of HANDOFF REQUESTED (no colon — not the injected shape)
+        earlier in scrollback must NOT anchor the window; a pre-cycle
+        MILESTONE after it stays excluded until the real injection."""
+        fake_tmux.output = (
+            "the docs mention HANDOFF REQUESTED handling\n"  # narration
+            "MILESTONE\n"                                     # pre-cycle
+            "more work\n"
+            f"{handoff.HANDOFF_REQUESTED}: context window over 50%\n"
+            "agent is wrapping up...\n"
+        )
+        assert handoff.find_milestone("fleet-abc") is False
+
     def test_no_handoff_requested_in_pane_returns_false(
         self, fake_tmux: _FakeTmux,
     ) -> None:
