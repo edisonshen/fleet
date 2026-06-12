@@ -789,6 +789,20 @@ class TestFindMilestone:
         )
         assert handoff.find_milestone("fleet-abc") is False
 
+    def test_ansi_colored_milestone_matches(
+        self, fake_tmux: _FakeTmux,
+    ) -> None:
+        """codex review iter-6 [P2] regression: a colored pane wraps the
+        assistant glyph in SGR codes (`\x1b[33m⏺\x1b[0m MILESTONE`);
+        find_milestone must strip ANSI before matching or auto-yellow
+        stays pending until Red."""
+        fake_tmux.output = (
+            f"{handoff.HANDOFF_REQUESTED}: context window over 50%\n"
+            "wrapping...\n"
+            "\x1b[33m\u23fa\x1b[0m MILESTONE\n"
+        )
+        assert handoff.find_milestone("fleet-abc") is True
+
     def test_no_handoff_requested_in_pane_returns_false(
         self, fake_tmux: _FakeTmux,
     ) -> None:

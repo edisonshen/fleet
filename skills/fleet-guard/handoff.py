@@ -294,7 +294,12 @@ def find_milestone(session: str) -> bool:
     out = _capture_pane(session, lines=10000)
     if not out:
         return False
-    lines = out.splitlines()
+    # Strip ANSI SGR codes BEFORE matching (codex review iter-6 [P2]):
+    # a colored pane renders the milestone as e.g.
+    # `\x1b[..m⏺\x1b[0m MILESTONE`, which the raw-line regex would miss —
+    # leaving auto-yellow stuck re-injecting until Red. capture_recent
+    # already strips with the same regex.
+    lines = _ANSI_SGR_RE.sub("", out).splitlines()
     # Find the FIRST occurrence of the INJECTED request shape (token +
     # colon) — the line that opened this Yellow cycle. Re-injections land
     # BELOW the agent's MILESTONE, so anchoring on the last one would
