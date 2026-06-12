@@ -37,7 +37,12 @@ type HealthResult struct {
 func Health(project string) HealthResult {
 	cur, err := ReadState(project)
 	if err != nil {
-		return HealthResult{Status: HealthUnknown, Diagnostic: "no rc-state.json on disk"}
+		return HealthResult{
+			Status: HealthUnknown,
+			Diagnostic: "no rc-state.json on disk — NORMAL under the native model " +
+				"(RC rides on the coord's own claude process; no standalone listener " +
+				"is recorded). This probe only diagnoses LEGACY pre-native listeners.",
+		}
 	}
 	if cur.PID <= 0 || !IsAlive(cur.PID) {
 		return HealthResult{Status: HealthDeadPID, Diagnostic: fmt.Sprintf("recorded PID %d not alive", cur.PID)}

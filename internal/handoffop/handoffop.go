@@ -146,6 +146,18 @@ func retargetArchivedHandoffSuccessor(agentID, successorID string) error {
 // Mirrors cmd/fleet/handoff.go's isCoordHandoffForProject (same
 // predicate, package-local copy to keep the handoffop package self-
 // contained without importing cmd/fleet/main).
+// isCoordHandoffForAgent reports whether (project, agentID) identifies
+// the project's current coord — i.e. the coord-spawn marker resolves
+// to agentID. spawnAndRetire calls this to gate the v0.12.1 RC inject
+// (codex review iter-7 [P1]): worker handoffs that happen during
+// fleet drain / crash recovery must NOT silently inherit
+// --remote-control just because the project is RC-enabled — that
+// would reopen the v0.12 push-storm class for the auto-drained
+// successor agent.
+//
+// Mirrors cmd/fleet/handoff.go's isCoordHandoffForProject (same
+// predicate, package-local copy to keep the handoffop package self-
+// contained without importing cmd/fleet/main).
 // coordDrainExecArgv computes the per-spawn exec argv for a COORD
 // drain replacement: routes the clean persisted Command through
 // rc.GateAttachFlag (native default-on; suppressed by the rc-disabled

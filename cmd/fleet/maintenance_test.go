@@ -1000,3 +1000,40 @@ func TestMaintenanceBootstrapReport_SkipsNonCoordAgents(t *testing.T) {
 		t.Errorf("worker / untargeted agents must not be flagged; got:\n%s", got)
 	}
 }
+
+// TestMaintenanceBootstrapReport_SkipsLiveNativeCoord (/review
+// adversarial F8): a native coord persists the CLEAN command forever —
+// only its LIVE process argv carries --remote-control. The survey must
+// probe the live argv and skip healthy native coords instead of
+// reporting them as permanent false positives.
+func TestMaintenanceBootstrapReport_SkipsLiveNativeCoord(t *testing.T) {
+	rcTestFleetHome(t)
+	seedCoordMarkerForTest(t, "native-proj", "ab12cd34")
+
+	prev := liveArgvHasRCFn
+	liveArgvHasRCFn = func(pid int) bool { return pid == 4242 }
+	t.Cleanup(func() { liveArgvHasRCFn = prev })
+
+	now := time.Date(2026, 6, 11, 9, 0, 0, 0, time.UTC)
+	records := []*agent.Record{
+		{
+			ID:          "ab12cd34",
+			Project:     "native-proj",
+			TmuxSession: "fleet-ab12cd34",
+			TaskID:      "coord-native-proj",
+			SpawnedAt:   now,
+			PID:         4242, // live argv carries the flag
+			Command:     []string{"sh", "-c", `claude --dangerously-skip-permissions; cat`},
+		},
+	}
+	listFn := func() ([]*agent.Record, error) { return records, nil }
+	hasSessionFn := func(string) bool { return true }
+
+	var out bytes.Buffer
+	if err := runMaintenanceBootstrapRemoteControl(&out, listFn, hasSessionFn); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if !strings.Contains(out.String(), "no live agents are missing") {
+		t.Errorf("live native coord (flag in process argv) must not be reported; got:\n%s", out.String())
+	}
+}

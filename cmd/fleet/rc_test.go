@@ -231,13 +231,19 @@ func TestRCCLI_ListEmitsDisabledProjects(t *testing.T) {
 	if resp.Cmd != "list" {
 		t.Errorf("cmd=%q want list", resp.Cmd)
 	}
-	if len(resp.Projects) != 2 {
-		t.Errorf("projects len=%d want 2 disabled projects (%v)", len(resp.Projects), resp.Projects)
+	if len(resp.DisabledProjects) != 2 {
+		t.Errorf("disabled_projects len=%d want 2 (%v)", len(resp.DisabledProjects), resp.DisabledProjects)
 	}
-	for _, p := range resp.Projects {
+	for _, p := range resp.DisabledProjects {
 		if p == "legacy" {
 			t.Errorf("legacy rc-enabled marker must not appear in the disabled list")
 		}
+	}
+	// /review adversarial F5: the v0.12 "projects" key (which listed
+	// ENABLED projects) must stay empty so stale consumers fail loudly
+	// instead of silently inverting meaning.
+	if len(resp.Projects) != 0 {
+		t.Errorf("legacy projects key must stay unset; got %v", resp.Projects)
 	}
 }
 
@@ -327,8 +333,8 @@ func TestRCCLI_StatusNoArg_AllDefaultOn_ExitsZero(t *testing.T) {
 	if resp.Outcome != rc.OutcomeAcquired {
 		t.Errorf("outcome=%q want acquired (healthy default-on)", resp.Outcome)
 	}
-	if len(resp.Projects) != 0 {
-		t.Errorf("projects=%v want empty (no opt-outs)", resp.Projects)
+	if len(resp.DisabledProjects) != 0 {
+		t.Errorf("disabled_projects=%v want empty (no opt-outs)", resp.DisabledProjects)
 	}
 
 	// With an opt-out present, the list carries it (still exit 0).
@@ -343,7 +349,7 @@ func TestRCCLI_StatusNoArg_AllDefaultOn_ExitsZero(t *testing.T) {
 	if err := json.Unmarshal(out.Bytes(), &resp); err != nil {
 		t.Fatalf("invalid JSON envelope: %v", err)
 	}
-	if len(resp.Projects) != 1 || resp.Projects[0] != "optout" {
-		t.Errorf("projects=%v want [optout]", resp.Projects)
+	if len(resp.DisabledProjects) != 1 || resp.DisabledProjects[0] != "optout" {
+		t.Errorf("disabled_projects=%v want [optout]", resp.DisabledProjects)
 	}
 }

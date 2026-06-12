@@ -20,8 +20,10 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -393,13 +395,14 @@ Exit codes:
 // persisted argv lacks the flag" (pre-native coord — handoff respawns
 // it with native RC).
 //
-// Caveat (documented, accepted): native coords persist the CLEAN
-// command (the flag rides on the per-spawn exec argv only), so a
-// freshly-spawned native coord also shows up here until its record
-// observes a flagged persisted command. The survey is REPORT-ONLY and
-// the suggested remediation (handoff) is harmless-idempotent for that
-// case; teaching the survey to ps the live argv is deliberately out
-// of scope for this report.
+// Native coords persist the CLEAN command FOREVER (the flag rides on
+// the per-spawn exec argv only), so the persisted-Command check alone
+// would flag every healthy native coord as a permanent false positive
+// (/review adversarial F8). The survey therefore ALSO probes the LIVE
+// process argv (`ps -p <pid> -o args=`, via the liveArgvHasRCFn seam):
+// a coord whose running process carries --remote-control is healthy
+// and skipped. PID<=0 / probe failure falls back to the persisted
+// check (report-only; better a rare false positive than a kill).
 func runMaintenanceBootstrapRemoteControl(
 	stdout io.Writer,
 	listFn func() ([]*agent.Record, error),
@@ -432,6 +435,12 @@ func runMaintenanceBootstrapRemoteControl(
 			continue
 		}
 		if commandHasRemoteControl(r.Command) {
+			continue
+		}
+		// Live-argv probe: native coords never persist the flag, but
+		// the running claude process carries it. Healthy native coord
+		// → skip.
+		if r.PID > 0 && liveArgvHasRCFn(r.PID) {
 			continue
 		}
 		if !hasSessionFn(r.TmuxSession) {
@@ -496,6 +505,19 @@ func runMaintenanceBootstrapRemoteControl(
 		}
 	}
 	return nil
+}
+
+// liveArgvHasRCFn probes whether the LIVE process at pid carries the
+// --remote-control flag in its argv. Production shells out to
+// `ps -p <pid> -o args=`; tests stub via the package var. Best-effort:
+// any probe failure returns false (fall back to the persisted-command
+// heuristic — the survey is report-only).
+var liveArgvHasRCFn = func(pid int) bool {
+	out, err := exec.Command("ps", "-p", strconv.Itoa(pid), "-o", "args=").Output()
+	if err != nil {
+		return false
+	}
+	return strings.Contains(string(out), "--remote-control")
 }
 
 // commandHasRemoteControl returns true iff any element of the

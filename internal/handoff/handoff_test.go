@@ -261,7 +261,27 @@ func TestRender_SkillByteGolden(t *testing.T) {
 		"handoff_type: \"auto-yellow\"\n" +
 		"---\n" +
 		"\n" +
-		"## First Action (auto)\n" + FirstAction(d.Project) + "\n\n" +
+		// LITERAL FirstAction bytes — deliberately NOT FirstAction(d.Project).
+		// The Python golden (skills/fleet-guard/tests/test_handoff.py:
+		// EXPECTED_GOLDEN) pins the same literal; building the Go want from
+		// FirstAction itself would make this segment self-referential and a
+		// Go-side drift from the Python literal would never fail any test
+		// (/review specialist S3).
+		"## First Action (auto)\n" +
+		"Mobile/web pairing (Remote Control) is native: this replacement coord\n" +
+		"was spawned with `--remote-control` baked into its claude argv, so\n" +
+		"pairing carries through automatically — nothing to re-attach. If\n" +
+		"pairing looks broken, check:\n" +
+		"\n" +
+		"    fleet rc status myproj\n" +
+		"\n" +
+		"If RC was disabled for this project (`fleet rc down myproj`),\n" +
+		"re-enable it with `fleet rc up myproj` — it takes effect on the\n" +
+		"next coord spawn (`fleet handoff <coord-id>` respawns the live coord).\n" +
+		"\n" +
+		"Then run the slash command `/coordinator` (in the chat, not bash) to resume the per-project supervisor tick loop. The /coordinator skill is idempotent — running it on a coord session that already holds the NB-flock is a no-op (the flock skips when held), and on a non-coord lineage it exits cleanly with no project to supervise.\n" +
+		"\n" +
+		"Then continue with the sections below." + "\n\n" +
 		"## Completed\nWrote tests for foo\n\n" +
 		"## Key Decisions\n" + Placeholder + "\n\n" +
 		"## Files Modified\n" + Placeholder + "\n\n" +

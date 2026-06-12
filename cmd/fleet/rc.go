@@ -43,20 +43,26 @@ import (
 // populate the subset they care about. Optional fields are omitempty
 // so the JSON parses identically whether or not they're present.
 type rcResponse struct {
-	Outcome     string    `json:"outcome"`
-	Project     string    `json:"project,omitempty"`
-	Cmd         string    `json:"cmd,omitempty"`
-	ListenerPID int       `json:"listener_pid,omitempty"`
-	WorkingDir  string    `json:"working_dir,omitempty"`
-	CoordID     string    `json:"coord_id,omitempty"`
-	TmuxSession string    `json:"tmux_session,omitempty"`
-	Retried     bool      `json:"retried,omitempty"`
-	Warn        string    `json:"warn,omitempty"`
-	Health      string    `json:"health,omitempty"`
-	Diagnostic  string    `json:"diagnostic,omitempty"`
-	Projects    []string  `json:"projects,omitempty"`
-	State       *rc.State `json:"state,omitempty"`
-	Error       string    `json:"error,omitempty"`
+	Outcome     string   `json:"outcome"`
+	Project     string   `json:"project,omitempty"`
+	Cmd         string   `json:"cmd,omitempty"`
+	ListenerPID int      `json:"listener_pid,omitempty"`
+	WorkingDir  string   `json:"working_dir,omitempty"`
+	CoordID     string   `json:"coord_id,omitempty"`
+	TmuxSession string   `json:"tmux_session,omitempty"`
+	Retried     bool     `json:"retried,omitempty"`
+	Warn        string   `json:"warn,omitempty"`
+	Health      string   `json:"health,omitempty"`
+	Diagnostic  string   `json:"diagnostic,omitempty"`
+	Projects    []string `json:"projects,omitempty"`
+	// DisabledProjects is the native-model enumeration (rc-disabled
+	// opt-out markers). Deliberately a DIFFERENT key from the v0.12
+	// "projects" array (which listed ENABLED projects): a stale
+	// consumer parsing "projects" sees nothing rather than silently
+	// inverting the meaning (/review adversarial F5).
+	DisabledProjects []string  `json:"disabled_projects,omitempty"`
+	State            *rc.State `json:"state,omitempty"`
+	Error            string    `json:"error,omitempty"`
 }
 
 // errRC is a sentinel carrying the outcome so main.go derives the
@@ -188,6 +194,16 @@ func runRCDown(stdout io.Writer, project string) error {
 	if err != nil {
 		resp.Error = err.Error()
 	}
+	// Kill-switch honesty (/review adversarial F3): the opt-out takes
+	// effect on the NEXT coord spawn. A coord already running with
+	// native --remote-control keeps its RC session until it exits or
+	// hands off — surface that so an operator mid-push-storm doesn't
+	// assume `rc down` silenced the live pusher.
+	if out == rc.OutcomeReleased || out == rc.OutcomeAlreadyReleased {
+		resp.Diagnostic = "opt-out takes effect on the next coord spawn; a LIVE coord keeps " +
+			"its RC session until exit/handoff — run `fleet handoff <coord-id>` to respawn it " +
+			"without RC now"
+	}
 	return emitRC(stdout, resp)
 }
 
@@ -268,7 +284,7 @@ func runRCStatus(stdout io.Writer, project string, healthy bool) error {
 		if err != nil {
 			return emitRC(stdout, rcResponse{Outcome: rc.OutcomeError, Cmd: "status", Error: err.Error()})
 		}
-		return emitRC(stdout, rcResponse{Outcome: rc.OutcomeAcquired, Cmd: "status", Projects: projs})
+		return emitRC(stdout, rcResponse{Outcome: rc.OutcomeAcquired, Cmd: "status", DisabledProjects: projs})
 	}
 	s, err := rc.Inspect(project)
 	if err != nil {
@@ -313,13 +329,13 @@ func runRCList(stdout io.Writer) error {
 	if err != nil {
 		return emitRC(stdout, rcResponse{Outcome: rc.OutcomeError, Cmd: "list", Error: err.Error()})
 	}
-	return emitRC(stdout, rcResponse{Outcome: rc.OutcomeAcquired, Cmd: "list", Projects: projs})
+	return emitRC(stdout, rcResponse{Outcome: rc.OutcomeAcquired, Cmd: "list", DisabledProjects: projs})
 }
 
 func newRCResetCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "reset [<project>]",
-		Short: "Operator emergency: back to pristine default-on (reap legacy listener, remove ALL rc markers)",
+		Short: "Operator emergency: reap legacy listener + clean legacy/corrupt rc files (opt-out markers preserved)",
 		Args:  cobra.MaximumNArgs(1),
 		RunE: func(c *cobra.Command, args []string) error {
 			var project string

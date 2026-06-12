@@ -25,7 +25,9 @@
 //     control-session-name-prefix fleet-coord'` (PIDs sorted).
 //  2. Drive the attach-flag helpers through default-on / opt-out /
 //     empty-project / env-gate cases. Assert rewrite vs pass-through.
-//  3. Snapshot post-state: same pgrep query. Assert pre == post.
+//  3. Snapshot post-state: same pgrep query. Assert no NEW PID
+//     appeared (unrelated legacy listeners exiting mid-test are
+//     tolerated; an appearing one is the violation).
 //
 // The surfaces covered here:
 //
@@ -60,7 +62,7 @@ func TestRCInvariant_NativeDefaultOn_OptOutHonored_NoListenerSpawn(t *testing.T)
 	t.Setenv("FLEET_RC_BOOTSTRAP_DISABLED", "")
 
 	// Pre-state pgrep snapshot. Best-effort: pgrep absent / non-zero
-	// exit collapses to empty. The post-state must match exactly.
+	// exit collapses to empty.
 	pre := snapshotListenerPIDs()
 
 	defaultArgv := []string{"sh", "-c", "claude --print"}
@@ -119,11 +121,20 @@ func TestRCInvariant_NativeDefaultOn_OptOutHonored_NoListenerSpawn(t *testing.T)
 
 	// Invariant 5 — zero listener spawn. Everything above is argv-only
 	// rewriting; production no longer contains a listener spawner at
-	// all. PIDs must be unchanged.
+	// all. Assert no NEW PID appears (post ⊆ pre) rather than exact
+	// equality — an unrelated legacy listener on the host exiting
+	// mid-test must not fail the suite (/review specialist note); only
+	// an APPEARING listener is an invariant violation.
 	post := snapshotListenerPIDs()
-	if !equalStringSlice(pre, post) {
-		t.Errorf("listener PID snapshot drifted across test:\npre:  %v\npost: %v\ninvariant violation — a code path under test spawned a real `claude remote-control` listener.",
-			pre, post)
+	preSet := map[string]bool{}
+	for _, p := range pre {
+		preSet[p] = true
+	}
+	for _, p := range post {
+		if !preSet[p] {
+			t.Errorf("NEW listener PID %s appeared across test:\npre:  %v\npost: %v\ninvariant violation — a code path under test spawned a real `claude remote-control` listener.",
+				p, pre, post)
+		}
 	}
 }
 
@@ -149,18 +160,6 @@ func snapshotListenerPIDs() []string {
 	}
 	sort.Strings(pids)
 	return pids
-}
-
-func equalStringSlice(a, b []string) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	for i := range a {
-		if a[i] != b[i] {
-			return false
-		}
-	}
-	return true
 }
 
 func sameArgvHelper(a, b []string) bool {

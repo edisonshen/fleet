@@ -291,21 +291,21 @@ a stale block and a replay block both arrive.
 - `FLEET_AGENT_ID` — coord's 8-hex ID. Without it the skill exits silently (fleet-guard discipline).
 - `FLEET_HOME` — defaults to `~/.fleet/`. Override for sandboxed tests.
 - `FLEET_PROJECT` — set by the dispatch path; falls back to argv[0] when invoked manually.
-- `FLEET_RC_BOOTSTRAP_DISABLED` — when set to any non-empty value, the coord skips invoking `fleet rc up` in `remote_control.spawn_daemon_if_needed`. **v0.12:** the primary gate is now the per-project `~/.fleet/projects/<p>/rc-enabled` marker (operator opts in via `fleet rc up <project>`); the env-gate is kept as defense-in-depth and retires in v0.13 once the marker-gate is field-proven via the CI-invariant test in `cmd/fleet/rc_invariant_test.go`. Set by `skills/coordinator/tests/conftest.py` for the whole pytest session so test runs don't fork real listeners that emit mobile push notifications.
+- `FLEET_RC_BOOTSTRAP_DISABLED` — test-hygiene env-gate: when set to any non-empty value, the Go attach-flag helpers never bake `--remote-control` into a spawn argv. Set by `skills/coordinator/tests/conftest.py` (and the Go suites' TestMain) so test runs never produce a flagged argv. The coord skill itself no longer invokes any RC bootstrap (native model below).
 
-## v0.12 Remote-control workflow
+## Remote control (native, default-on)
 
-`claude remote-control` listener lifecycle is operator-managed via the `fleet rc` CLI (DESIGN-rc-listener-lifecycle.md). The coord skill calls `fleet rc up <project> --respawn-only --idempotent` on each tick via `remote_control.spawn_daemon_if_needed`; the Go controller (`internal/rc`) is the SINGLE owner of spawn, marker, and state.json. The `--respawn-only` flag ensures the Python coord tick can only respawn a dead listener for an already-enabled project — it can never auto-create the per-project marker. Only the operator's explicit `fleet rc up <project>` enables RC.
+Remote control is NATIVE: `fleet dispatch --coord-spawn` (and the handoff / drain replacement paths) bake `claude --remote-control "fleet-coord-<id>-<project>"` into the coord's own claude argv, so mobile / claude.ai pairing is live the moment the coord starts. There is NO standalone `claude remote-control` listener daemon, NO per-tick respawn (`remote_control.spawn_daemon_if_needed` is a retired no-op shim), and NO send-keys injection. The gate is opt-OUT: the per-project `~/.fleet/projects/<p>/rc-disabled` marker (written by `fleet rc down`) suppresses the flag on the next coord spawn.
+
+Workers and Agent-tool subagents NEVER carry the flag — every inject site is gated on coord-ness (`--coord-spawn` / coord-spawn marker). That call-site carve-out is the architectural fix that retires the 5,620-mobile-push reviewer-loop hazard: there is no listener to respawn and no path that attaches RC to a reviewer loop.
 
 Operator commands:
-- `fleet rc up <project>` — opt in: write the marker, spawn (or adopt) the listener.
-- `fleet rc down <project>` — kill listener + remove marker.
-- `fleet rc connect <project>` — drive `/remote-control` slash-command in the project's coord pane (submit-verified tmux send-keys).
-- `fleet rc status [<project>] [--healthy]` — observability; `--healthy` probes `claude daemon remote-control list`.
-- `fleet rc list` — enumerate marked projects.
-- `fleet rc reset [<project>]` — emergency: clean slate.
-
-Without `fleet rc up <project>`, the coord's `bootstrap_remote_control` tick is a no-op (no listener spawn, no marker, no mobile push). This is the architectural fix that retires the 5,620-mobile-push reviewer-loop hazard.
+- `fleet rc up <project>` — re-enable: remove the rc-disabled opt-out marker (takes effect on next coord spawn).
+- `fleet rc down <project>` — disable: write the opt-out marker + reap any legacy (pre-native) listener. A LIVE coord keeps its RC session until exit/handoff — `fleet handoff <coord-id>` respawns it without RC.
+- `fleet rc connect <project>` — DEPRECATED no-op (native startup replaced the send-keys attach).
+- `fleet rc status [<project>] [--healthy]` — observability; enabled = no opt-out marker.
+- `fleet rc list` — enumerate projects with RC DISABLED (the exceptions).
+- `fleet rc reset [<project>]` — emergency: reap legacy listener state + corrupt rc files (opt-out markers preserved).
 
 ## Resume after handoff
 

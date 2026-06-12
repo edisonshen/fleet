@@ -13,7 +13,6 @@ import (
 	"github.com/edisonshen/fleet/internal/coordlock"
 	"github.com/edisonshen/fleet/internal/handoffdelivery"
 	"github.com/edisonshen/fleet/internal/queue"
-	"github.com/edisonshen/fleet/internal/rc"
 	"github.com/edisonshen/fleet/internal/spawn"
 	"github.com/edisonshen/fleet/internal/state"
 	"github.com/edisonshen/fleet/internal/testutil/tmuxtest"
@@ -1587,16 +1586,9 @@ func TestHandoff_ReplacementSpawnedWithRemoteControlFlag(t *testing.T) {
 	enableRCBootstrapForTest(t)
 	requireTmux(t)
 	setupFleetHome(t)
-	// v0.12: the handoff path now gates --remote-control injection
-	// on the per-project rc-enabled marker (DESIGN-rc-listener-
-	// lifecycle.md §"Attach-surface gates" I2). Without the marker
-	// the replacement spawn correctly does NOT carry the flag. The
-	// contract under test here is the WITH-marker path, so opt in
-	// for the duration of the test.
-	if err := rc.WriteMarker("rainier"); err != nil {
-		t.Fatalf("WriteMarker: %v", err)
-	}
-	t.Cleanup(func() { _ = rc.RemoveMarker("rainier") })
+	// Native model: injection is DEFAULT-ON for coord handoffs — no
+	// marker setup needed (the legacy rc-enabled marker is ignored by
+	// the gate; only the rc-disabled opt-out or the env-gate suppress).
 
 	// Wrapper body that (a) starts with `claude ` (matcher trigger),
 	// (b) is observable in the pane regardless of whether claude is

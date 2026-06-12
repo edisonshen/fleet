@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"errors"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -82,6 +83,34 @@ func spawnSeedAgent(t *testing.T) *agent.Record {
 		t.Fatalf("tmux.Spawn: %v", err)
 	}
 	rec.PID = 0 // not asserted; tmux owns the process
+	if err := rec.Write(); err != nil {
+		_ = tmux.Kill(rec.TmuxSession)
+		t.Fatalf("agent.Write: %v", err)
+	}
+	t.Cleanup(func() { _ = tmux.Kill(rec.TmuxSession) })
+	return rec
+}
+
+// spawnSeedAgentWithCommand is spawnSeedAgent with a caller-supplied
+// command (e.g. the wrapper-shaped `sh -c "claude ..."` body the RC
+// inject matcher recognizes).
+func spawnSeedAgentWithCommand(t *testing.T, command []string) *agent.Record {
+	t.Helper()
+	now := time.Now().UTC()
+	rec := agent.New(agent.NewID())
+	rec.TaskID = "auth-fix"
+	rec.Project = "rainier"
+	rec.SpawnedAt = now
+	rec.LastActivityTS = now
+	rec.Cwd = t.TempDir()
+	rec.Command = append([]string(nil), command...)
+	rec.TmuxSession = tmux.SessionName(rec.ID)
+
+	if err := tmux.Spawn(rec.TmuxSession, rec.Cwd, rec.Command,
+		[]string{"FLEET_AGENT_ID=" + rec.ID, "PATH=" + os.Getenv("PATH")}); err != nil {
+		t.Fatalf("tmux.Spawn: %v", err)
+	}
+	rec.PID = 0
 	if err := rec.Write(); err != nil {
 		_ = tmux.Kill(rec.TmuxSession)
 		t.Fatalf("agent.Write: %v", err)
@@ -1771,11 +1800,35 @@ func TestDrain_LeaseFailoverCoord_DeadLoserSession_StillDeliversToLockOwner(t *t
 // project-wide by default, but a WORKER handoff replacement must never
 // inherit --remote-control — the push-storm protection lives at the
 // isCoordHandoffForAgent call-site gate.
+//
+// /review specialist S1: asserting on the persisted Command alone is
+// tautological (spawn ALWAYS persists the clean command; the flag
+// rides on the per-spawn exec argv). So this test observes the argv
+// the replacement pane ACTUALLY execs, via the PATH-shim technique
+// from cmd/fleet/handoff_test.go:TestHandoff_ReplacementSpawnedWith
+// RemoteControlFlag: a fake `claude` script echoes its argv into the
+// pane; the wrapper-shaped Command makes the inject eligible, so if
+// the coord gate ever stopped carving out workers, the flag WOULD
+// appear in the pane and this test fails.
 func TestDrain_WorkerHandoff_NeverCarriesRemoteControl(t *testing.T) {
 	requireTmux(t)
 	setupFleetHome(t)
 	t.Setenv("FLEET_RC_BOOTSTRAP_DISABLED", "")
-	oldRec := spawnSeedAgent(t)
+
+	// Fake `claude` shim on PATH: echoes argv lines into the pane,
+	// then blocks on cat so the session stays alive for capture.
+	shimDir := t.TempDir()
+	shimPath := filepath.Join(shimDir, "claude")
+	if err := os.WriteFile(shimPath,
+		[]byte("#!/bin/sh\nprintf 'SHIM-ARGV %s\\n' \"$@\"\ncat\n"), 0o755); err != nil {
+		t.Fatalf("write shim: %v", err)
+	}
+	t.Setenv("PATH", shimDir+":"+os.Getenv("PATH"))
+
+	// Wrapper-shaped seed command — the inject matcher WOULD rewrite
+	// this shape, so a missing worker carve-out is observable.
+	oldRec := spawnSeedAgentWithCommand(t,
+		[]string{"sh", "-c", `claude --dangerously-skip-permissions; cat`})
 
 	// Coord-spawn marker absent → isCoordHandoffForAgent=false.
 	// (We deliberately do NOT WriteCoordSpawnMarker.)
@@ -1792,9 +1845,34 @@ func TestDrain_WorkerHandoff_NeverCarriesRemoteControl(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = tmux.Kill(newRec.TmuxSession) })
 
+	// Wait for the shim's positive signal in the pane, then assert the
+	// flag is absent from the echoed argv.
+	deadline := time.Now().Add(3 * time.Second)
+	var pane string
+	for time.Now().Before(deadline) {
+		raw, capErr := exec.Command(
+			"tmux", "-S", os.Getenv("FLEET_TMUX_SOCKET"),
+			"capture-pane", "-pt", newRec.TmuxSession,
+		).Output()
+		if capErr == nil {
+			pane = string(raw)
+			if strings.Contains(pane, "SHIM-ARGV") {
+				break
+			}
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if !strings.Contains(pane, "SHIM-ARGV") {
+		t.Fatalf("shim never echoed argv (positive signal missing); pane:\n%s", pane)
+	}
+	if strings.Contains(pane, "--remote-control") {
+		t.Fatalf("worker drain replacement must NEVER exec --remote-control (push-storm protection); pane:\n%s", pane)
+	}
+	// Persisted record stays clean too (secondary, non-tautological
+	// here only as lineage hygiene).
 	for _, el := range newRec.Command {
 		if strings.Contains(el, "--remote-control") {
-			t.Fatalf("worker drain replacement must NEVER carry --remote-control (push-storm protection); argv=%v", newRec.Command)
+			t.Fatalf("persisted Command must stay clean; argv=%v", newRec.Command)
 		}
 	}
 }

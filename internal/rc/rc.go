@@ -35,10 +35,14 @@ const (
 	OutcomeReleased        = "released"
 	OutcomeAlreadyReleased = "already_released"
 	OutcomeNotEnabled      = "not_enabled"
-	OutcomeNotOwned        = "not_owned"
-	OutcomeAbsent          = "absent"
-	OutcomeContested       = "contested"
-	OutcomeError           = "error"
+	// OutcomeNotOwned has no producer left (its emitter was the
+	// retired Connect path); kept as a reserved wire-compat value so
+	// external scripts matching the documented exit-code table don't
+	// break.
+	OutcomeNotOwned  = "not_owned"
+	OutcomeAbsent    = "absent"
+	OutcomeContested = "contested"
+	OutcomeError     = "error"
 
 	// OutcomeNativeDefault — emitted by the deprecated `fleet rc
 	// connect` surface. The native model attaches RC at coord spawn
@@ -212,8 +216,9 @@ func Up(project string, opts UpOpts) (string, error) {
 	})
 }
 
-// healReason* are the internal labels for Up's self-healing branch.
-// computeHealReason returns one of these (or empty for "healthy").
+// healReason* are the labels for the legacy-daemon sweep rubric
+// (SweepAllProjects / reapStaleLegacyDaemon). computeHealReason
+// returns one of these (or empty for "leave the daemon alone").
 const (
 	healReasonStaleVersion = "stale claude version"
 	healReasonDeadOwner    = "owning coord is gone"
@@ -449,32 +454,32 @@ func listProjectsWith(pred func(project string) bool) ([]string, error) {
 	return out, nil
 }
 
-// Reset returns project (or all projects when project=="") to the
-// pristine default-on state: kills any legacy listener Fleet owns,
-// removes the legacy rc-enabled marker + rc-state.json, AND removes
-// the rc-disabled opt-out marker (a reset project is RC-enabled — the
-// default).
+// Reset cleans project's LEGACY listener state (or all projects when
+// project==""): kills any legacy daemon Fleet owns (strict PID
+// verification), removes the legacy rc-enabled marker + rc-state.json
+// (including corrupt ones — the operator-emergency case Reset exists
+// for).
 //
-// Operator emergency: when rc-state.json is corrupt or pointing at a
-// dead PID, Reset gives a clean slate.
+// Reset NEVER touches the rc-disabled opt-out marker (/review
+// adversarial F4): the opt-out is operator INTENT, not corruptible
+// listener state, and under the default-on model `fleet rc down` is
+// the push kill-switch — an emergency command must not silently
+// re-arm RC on projects the operator disarmed. Use `fleet rc up` to
+// clear an opt-out explicitly.
 //
 // codex round-5 P2 (kept from v0.12): reset-all must enumerate
-// legacy-markered projects, markerless state-only projects (Glob),
-// AND opt-out-markered projects — a project carrying only an
-// rc-disabled marker must also return to the default.
+// legacy-markered projects AND markerless state-only projects (Glob).
 func Reset(project string) (string, error) {
 	if project == "" {
 		seen := map[string]struct{}{}
 
-		// Legacy rc-enabled markers + rc-disabled opt-out markers.
-		for _, lister := range []func() ([]string, error){List, ListDisabled} {
-			projs, err := lister()
-			if err != nil {
-				return OutcomeError, err
-			}
-			for _, p := range projs {
-				seen[p] = struct{}{}
-			}
+		// Legacy rc-enabled markers.
+		projs, err := List()
+		if err != nil {
+			return OutcomeError, err
+		}
+		for _, p := range projs {
+			seen[p] = struct{}{}
 		}
 
 		// Add markerless state-only projects so emergency cleanup
@@ -501,18 +506,50 @@ func Reset(project string) (string, error) {
 	return resetOne(project)
 }
 
-// resetOne is the per-project Reset body: Down (legacy reap + opt-out
-// write) followed by removing the opt-out marker so the project lands
-// back on the default-on state.
+// resetOne is the per-project Reset body: legacy reap + legacy file
+// cleanup, with the rc-disabled opt-out marker preserved bit-for-bit
+// (present stays present, absent stays absent).
 func resetOne(project string) (string, error) {
-	out, err := Down(project)
-	if err != nil {
-		return out, err
+	if project == "" {
+		return OutcomeError, errors.New("rc.resetOne: empty project")
 	}
-	if err := RemoveDisabledMarker(project); err != nil {
-		return OutcomeError, err
-	}
-	return OutcomeReleased, nil
+	return withLock(project, func() (string, error) {
+		cur, stateErr := ReadState(project)
+		stateHad := stateErr == nil
+		stateCorrupt := stateErr != nil && !errors.Is(stateErr, ErrStateMissing)
+		if stateCorrupt {
+			fmt.Fprintf(os.Stderr,
+				"rc.Reset: project %q has malformed rc-state.json (%v); removing it as part of cleanup\n",
+				project, stateErr)
+		}
+		// Kill the legacy daemon with the same PID-reuse + cross-host
+		// defenses Down uses.
+		if stateHad && cur.PID > 0 {
+			host, _ := os.Hostname()
+			if cur.HostID == "" || cur.HostID == host {
+				if workers.IsAlive(cur.PID) {
+					prefix := cur.SessionPrefix
+					if prefix == "" {
+						prefix = SessionPrefix
+					}
+					if verifyPIDIsListener(cur.PID, prefix, cur.WorkingDir) {
+						killFn(cur.PID)
+					} else {
+						fmt.Fprintf(os.Stderr,
+							"rc.Reset: project %q recorded PID %d alive but argv/cwd does not match; skipping kill (likely PID reuse)\n",
+							project, cur.PID)
+					}
+				}
+			}
+		}
+		if err := RemoveMarker(project); err != nil {
+			return OutcomeError, err
+		}
+		if err := RemoveState(project); err != nil {
+			return OutcomeError, err
+		}
+		return OutcomeReleased, nil
+	})
 }
 
 // SweepAllProjects is the cross-project reconcile hook for LEGACY

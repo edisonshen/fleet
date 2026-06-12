@@ -40,10 +40,23 @@ from __future__ import annotations
 # callers. The only value the retired shims ever return is
 # STATUS_NATIVE.
 STATUS_NATIVE = "native_default"
-# Legacy constants retained so stale imports don't AttributeError.
+# The FULL legacy constant surface is retained as inert strings so a
+# half-upgraded install (pre-native loop.py copy + this module) never
+# AttributeErrors mid-tick — the old loop dereferences STATUS_FAILED_*
+# and BOOTSTRAP_LOG after calling bootstrap_remote_control (/review
+# adversarial F7).
 STATUS_OK = "ok"
 STATUS_SKIPPED_MARKER = "skipped_marker"
+STATUS_SKIPPED_INVALID = "skipped_invalid"
+STATUS_SKIPPED_NO_ARGS = "skipped_no_args"
+STATUS_SKIPPED_INBOX_BUSY = "skipped_inbox_busy"
+STATUS_NOT_ENABLED = "not_enabled"
+STATUS_FAILED_SEED = "failed_seed"
+STATUS_FAILED_MARKER = "failed_marker"
 SPAWN_OK = "ok"
+SPAWN_NOT_ENABLED = "not_enabled"
+SPAWN_TRANSIENT_ERROR = "transient_error"
+BOOTSTRAP_LOG = "/tmp/fleet-bootstrap.log"
 
 
 def bootstrap_remote_control(
@@ -79,5 +92,14 @@ __all__ = [
     "STATUS_NATIVE",
     "STATUS_OK",
     "STATUS_SKIPPED_MARKER",
+    "STATUS_SKIPPED_INVALID",
+    "STATUS_SKIPPED_NO_ARGS",
+    "STATUS_SKIPPED_INBOX_BUSY",
+    "STATUS_NOT_ENABLED",
+    "STATUS_FAILED_SEED",
+    "STATUS_FAILED_MARKER",
     "SPAWN_OK",
+    "SPAWN_NOT_ENABLED",
+    "SPAWN_TRANSIENT_ERROR",
+    "BOOTSTRAP_LOG",
 ]

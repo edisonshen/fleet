@@ -393,11 +393,15 @@ func TestDown_KillsWhenPIDVerified(t *testing.T) {
 // Reset — back to pristine default-on.
 // ---------------------------------------------------------------------------
 
-// TestReset_RemovesDisabledMarker: a reset project lands ENABLED (the
-// default), not opted out — Reset removes the rc-disabled marker that
-// its internal Down writes.
-func TestReset_RemovesDisabledMarker(t *testing.T) {
+// TestReset_PreservesOptOut (/review adversarial F4): Reset cleans
+// LEGACY listener state only — the rc-disabled opt-out marker is
+// operator intent and must survive bit-for-bit in both directions.
+// `fleet rc down` is the push kill-switch; an emergency command must
+// not silently re-arm RC on a disarmed project.
+func TestReset_PreservesOptOut(t *testing.T) {
 	withFleetHome(t)
+
+	// Opted-out project stays opted out across Reset.
 	if err := WriteDisabledMarker("demo"); err != nil {
 		t.Fatalf("WriteDisabledMarker: %v", err)
 	}
@@ -408,17 +412,27 @@ func TestReset_RemovesDisabledMarker(t *testing.T) {
 	if out != OutcomeReleased {
 		t.Fatalf("outcome=%q want %q", out, OutcomeReleased)
 	}
-	if DisabledMarkerPresent("demo") {
-		t.Fatalf("Reset must remove the rc-disabled marker (pristine = default-on)")
+	if !DisabledMarkerPresent("demo") {
+		t.Fatalf("Reset must PRESERVE the rc-disabled opt-out marker (operator intent)")
 	}
-	if !Enabled("demo") {
-		t.Fatalf("project must be enabled after Reset")
+
+	// Default-on project stays default-on across Reset (no marker
+	// appears as a side effect).
+	if _, err := Reset("plain"); err != nil {
+		t.Fatalf("Reset plain: %v", err)
+	}
+	if DisabledMarkerPresent("plain") {
+		t.Fatalf("Reset must not opt a default-on project out")
+	}
+	if !Enabled("plain") {
+		t.Fatalf("default-on project must stay enabled after Reset")
 	}
 }
 
-// TestResetAll_EnumeratesMarkerlessState (codex round-5 P2, kept +
-// extended): reset-all must catch legacy-markered projects, markerless
-// state-only projects, AND opt-out-only projects.
+// TestResetAll_EnumeratesMarkerlessState (codex round-5 P2, kept):
+// reset-all must catch legacy-markered projects AND markerless
+// state-only projects; opt-out markers are preserved (/review
+// adversarial F4).
 func TestResetAll_EnumeratesMarkerlessState(t *testing.T) {
 	root := withFleetHome(t)
 
@@ -457,7 +471,7 @@ func TestResetAll_EnumeratesMarkerlessState(t *testing.T) {
 		t.Fatalf("test precondition: orphan must have no marker")
 	}
 
-	// Opt-out-only project (ListDisabled path).
+	// Opt-out-only project — must be untouched by reset-all.
 	if err := WriteDisabledMarker("optedout"); err != nil {
 		t.Fatalf("WriteDisabledMarker: %v", err)
 	}
@@ -480,13 +494,17 @@ func TestResetAll_EnumeratesMarkerlessState(t *testing.T) {
 	if _, sErr := ReadState("orphan"); !errors.Is(sErr, ErrStateMissing) {
 		t.Fatalf("orphan (markerless) state should be removed by reset-all; err=%v", sErr)
 	}
-	for _, p := range []string{"markered", "orphan", "optedout"} {
+	for _, p := range []string{"markered", "orphan"} {
 		if DisabledMarkerPresent(p) {
-			t.Errorf("reset-all must leave %q on default-on (no rc-disabled marker)", p)
+			t.Errorf("reset-all must not opt %q out (no rc-disabled side effect)", p)
 		}
 		if MarkerPresent(p) {
 			t.Errorf("reset-all must remove %q's legacy rc-enabled marker", p)
 		}
+	}
+	// Operator opt-out survives reset-all.
+	if !DisabledMarkerPresent("optedout") {
+		t.Errorf("reset-all must PRESERVE the rc-disabled opt-out marker")
 	}
 }
 
@@ -1130,9 +1148,12 @@ func TestSweepAllProjects_ReleasesMarkerlessOrphans(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("WriteState: %v", err)
 	}
-	// The healthy entry's heal rubric must see a current version + live
-	// owner so it survives the sweep (empty recorded version would be
-	// treated as stale).
+	// Stub curVer="" — the PROBE-DEGRADED path: computeHealReason
+	// SKIPS the version check entirely on an empty current version, so
+	// the healthy entry survives via the degraded-probe skip (NOT via
+	// a version match). Stubbing a real version here would flip this
+	// fixture into the reap path because its recorded ClaudeVersion is
+	// empty (/review specialist note).
 	withStubVersionAndOwner(t, "")
 
 	restoreVerify := SetVerifyPIDIsListenerForTest(func(pid int, prefix, expectedCwd string) bool { return true })

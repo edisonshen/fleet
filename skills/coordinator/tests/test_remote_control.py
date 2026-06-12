@@ -107,28 +107,23 @@ class TestNoSpawnPossible:
 
     def test_no_popen_or_run_references(self):
         src = (SKILL_DIR / "remote_control.py").read_text(encoding="utf-8")
-        for needle in ("Popen", "subprocess.run", "os.system", "os.exec"):
-            # Docstrings may mention the history; check code lines only.
-            code_lines = [
-                line
-                for line in src.splitlines()
-                if not line.lstrip().startswith(("#",))
-            ]
-            # Strip the module docstring via ast for a precise check.
-            tree = ast.parse(src)
-            body_src = ast.unparse(
-                ast.Module(
-                    body=[
-                        n
-                        for n in tree.body
-                        if not (
-                            isinstance(n, ast.Expr)
-                            and isinstance(n.value, ast.Constant)
-                        )
-                    ],
-                    type_ignores=[],
-                )
+        # Strip docstrings/constant-expressions via ast so historical
+        # mentions in comments don't false-positive; check code only.
+        tree = ast.parse(src)
+        body_src = ast.unparse(
+            ast.Module(
+                body=[
+                    n
+                    for n in tree.body
+                    if not (
+                        isinstance(n, ast.Expr)
+                        and isinstance(n.value, ast.Constant)
+                    )
+                ],
+                type_ignores=[],
             )
+        )
+        for needle in ("Popen", "subprocess.run", "os.system", "os.exec"):
             assert needle not in body_src, (
                 f"remote_control.py code references {needle!r}; the retired "
                 "module must be spawn-free"
