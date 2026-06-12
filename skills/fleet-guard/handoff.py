@@ -85,47 +85,20 @@ _COMMITTED_TYPES = frozenset({TYPE_AUTO_RED, TYPE_PRECOMPACT})
 PLACEHOLDER = "_(operator-triggered handoff — fill in before resuming)_"
 
 # first_action(project) returns the body of the "First Action (auto)"
-# section for the given project. It instructs the resuming agent to
-# spawn `claude remote-control` in the background so the operator's
-# mobile / claude.ai pairing carries through the fleet-guard handoff.
-# Idempotent (pgrep guards re-launch when the daemon is already up).
+# section for the given project.
 #
-# Per-project (rc-session-name-include): the daemon prefix carries
-# the project name (`fleet-handoff-<project>`) so per-project handoff
-# daemons coexist on the host and the operator can distinguish
-# per-project sessions on phone / claude.ai. The pgrep guard is
-# narrowed on the project-scoped prefix with a word-boundary
-# terminator `( |$)` so a hypothetical longer prefix like
-# `fleet-handoff-sparkX` doesn't false-positive — mirrors the
-# coord-side pattern in skills/coordinator/remote_control.py.
+# Native-RC model (rc-default-native-startup): replacement coords are
+# spawned with `--remote-control "fleet-coord-<id>-<project>"` baked
+# into their claude argv, so mobile / claude.ai pairing carries
+# through the handoff automatically. The section is a status note plus
+# the opt-out escape hatch (`fleet rc up <project>` after a prior
+# `fleet rc down`), followed by the load-bearing /coordinator
+# paragraph that resumes the per-project supervisor loop.
 #
-# Empty project falls back to the legacy generic
-# `--remote-control-session-name-prefix "fleet-handoff"` shape so
-# rendered docs without a project (legacy records / tests) still
-# produce a well-formed bash block.
+# Slash commands run in chat (not bash). NO bash block — the "exec
+# arbitrary bash from a markdown file" semantics stays gone (v0.12).
 #
-# Body order is load-bearing:
-#   1. Bash block: bootstrap the `claude remote-control` daemon (pgrep
-#      guard makes it idempotent).
-#   2. `/remote-control` slash command (issue #56): attach this fresh
-#      chat session to the daemon so the operator's mobile pairing
-#      reconnects. Must run BEFORE /coordinator so any supervisor
-#      startup output streams through the operator's mobile.
-#   3. `/coordinator` slash command (handoff-coord-spawn-prompt-fix):
-#      resume the per-project supervisor loop so the new agent
-#      acquires ~/.fleet/projects/<p>/.locks/coordinator.lock with its
-#      own 8-hex ID. Without this paragraph, replacement coord
-#      sessions never run /coordinator — the predecessor's lock body
-#      persists, the TUI dashboard's coord display shows the OLD ID,
-#      and the task queue stops draining silently. Universal
-#      (non-coord lineages also get the line) because /coordinator is
-#      idempotent: NB-flock skips when held, and a non-coord cwd has
-#      no project to supervise → exit clean.
-#
-# Slash commands run in chat (not bash), so they're separate
-# paragraphs after the bash block, not piped continuations of it.
-#
-# Issue #31, #56. MUST stay byte-identical with
+# Issue #31, #56 lineage. MUST stay byte-identical with
 # internal/handoff.FirstAction (Go side) — auto-handoffs (this file) and
 # operator-triggered handoffs (Go) emit the same doc shape, and
 # renderers are tested for byte-equality.
@@ -146,15 +119,14 @@ def _escape_project_for_pgrep(s: str) -> str:
 
 
 def first_action(project: str) -> str:
-    """Return the v0.12 operator-instruction body for the "First Action
-    (auto)" handoff section.
+    """Return the native-RC status body for the "First Action (auto)"
+    handoff section.
 
-    v0.12 (DESIGN-rc-listener-lifecycle.md §"Handoff doc rewrite"):
-    the embedded bash bootstrap is GONE. The body directs the operator
-    to run `fleet rc connect <project>` to re-attach mobile/web
-    pairing — a small UX regression (operator types one command) for a
-    large architectural win (no bash exec from a markdown file → no
-    5,620-mobile-push regressions from a stuck reviewer loop).
+    Native model (rc-default-native-startup): the replacement coord is
+    spawned with `--remote-control` baked into its claude argv —
+    pairing carries through automatically; nothing to re-attach. The
+    body is a status note + the opt-out escape hatch, then the
+    /coordinator resume paragraph.
 
     Empty project falls back to `<project>` placeholder text so legacy
     records / tests produce well-formed output.
@@ -165,19 +137,16 @@ def first_action(project: str) -> str:
     """
     display = project if project else "<project>"
     return (
-        "To re-attach mobile/web pairing for this coord, run in your terminal:\n"
+        "Mobile/web pairing (Remote Control) is native: this replacement coord\n"
+        "was spawned with `--remote-control` baked into its claude argv, so\n"
+        "pairing carries through automatically — nothing to re-attach. If\n"
+        "pairing looks broken, check:\n"
         "\n"
-        f"    fleet rc connect {display}\n"
+        f"    fleet rc status {display}\n"
         "\n"
-        "(Or `/remote-control` from within Claude Code.) The pairing resumes\n"
-        "from where the previous coord left off, provided RC was previously\n"
-        f"enabled via `fleet rc up {display}`.\n"
-        "\n"
-        "If RC was not previously enabled, run:\n"
-        "\n"
-        f"    fleet rc up {display}\n"
-        "\n"
-        f"first, then `fleet rc connect {display}`.\n"
+        f"If RC was disabled for this project (`fleet rc down {display}`),\n"
+        f"re-enable it with `fleet rc up {display}` — it takes effect on the\n"
+        "next coord spawn (`fleet handoff <coord-id>` respawns the live coord).\n"
         "\n"
         "Then run the slash command `/coordinator` (in the chat, not bash) to resume the per-project supervisor tick loop. The /coordinator skill is idempotent — running it on a coord session that already holds the NB-flock is a no-op (the flock skips when held), and on a non-coord lineage it exits cleanly with no project to supervise.\n"
         "\n"

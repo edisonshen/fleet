@@ -45,7 +45,6 @@ import dispatch as dispatch_mod
 import parse
 import pr_watch as pr_watch_mod
 import reaper as reaper_mod
-import remote_control
 import supervisor as supervisor_mod
 import worktree as worktree_mod
 
@@ -486,38 +485,11 @@ def _tick_locked(
     now_unix: float,
 ) -> TickResult:
     """Body of the tick once we hold the coord lock."""
-    # 1.1. Auto-inject /remote-control on first tick per coord (issue #56).
-    # Fresh coordinator agents need to attach to `claude remote-control`
-    # so the operator's mobile / claude.ai pairing follows the agent.
-    # Handoff replacements get this via internal/handoff.FirstAction;
-    # this call covers the FRESH path (first dispatch, no prior doc).
-    # Idempotent + fail-soft: bootstrap_remote_control short-circuits
-    # on the per-coord marker file, and any I/O failure is logged + the
-    # tick continues. NEVER blocks the coord; matches fleet-guard
-    # discipline.
-    #
-    # Returns a status string (see remote_control module docstring).
-    # Non-OK / non-skipped-marker results land in BOOTSTRAP_LOG inside
-    # the function itself. We additionally surface FAILED_* on the
-    # tick's errors list so the operator (via `fleet status` or
-    # equivalent) sees a breadcrumb when bootstrap can't make progress.
-    try:
-        status = remote_control.bootstrap_remote_control(
-            project, coord_id, fleet_home=home,
-        )
-        if status in (
-            remote_control.STATUS_FAILED_SEED,
-            remote_control.STATUS_FAILED_MARKER,
-        ):
-            result.errors.append(
-                f"remote-control bootstrap: {status} "
-                f"(see {remote_control.BOOTSTRAP_LOG} for details)"
-            )
-    except Exception as exc:
-        # bootstrap_remote_control already wraps each side-effect in
-        # try/except, but a programming error in this module shouldn't
-        # take down the tick. Caller's TickResult.errors records it.
-        result.errors.append(f"remote-control bootstrap: {exc}")
+    # 1.1. (RETIRED) remote-control bootstrap. RC is native at coord
+    # startup — `fleet dispatch --coord-spawn` bakes `--remote-control
+    # "fleet-coord-<id>-<project>"` into the coord's own claude argv,
+    # so there is no daemon to spawn and no /remote-control nudge to
+    # seed. See skills/coordinator/remote_control.py for the lineage.
 
     # 1.5. Orphan-worktree cleanup. A coord that crashed mid-tick can
     # leave a worktree directory + its git registry entry behind; the

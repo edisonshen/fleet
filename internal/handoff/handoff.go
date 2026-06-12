@@ -190,31 +190,28 @@ func NewManualStub(agentID, taskID, project string, number int, prev *string, ts
 // FirstAction is the body of the "First Action (auto)" section that
 // every handoff doc carries.
 //
-// v0.12 rewrite (DESIGN-rc-listener-lifecycle.md §"Handoff doc
-// rewrite"): the bash bootstrap block is GONE. The new first-action
-// is operator-instruction markdown — a small UX regression (operator
-// types one command on resume) traded for a large architectural win
-// (no exec'd bash from a markdown file → no 5,620-mobile-push
-// regressions from a stuck reviewer loop).
+// Native-RC rewrite (rc-default-native-startup, operator directive
+// 2026-05-29): replacement coords are spawned with `--remote-control
+// "fleet-coord-<id>-<project>"` baked into their claude argv, so
+// mobile/web pairing carries through the handoff automatically —
+// there is no re-attach command for the operator to run. The section
+// is now a status note plus the opt-out escape hatch.
 //
 // Body order is load-bearing:
 //
-//  1. Instruction: run `fleet rc connect <project>` in a terminal to
-//     re-attach mobile/web pairing. Or `/remote-control` from inside
-//     Claude Code (the in-session slash-command). Pairing resumes from
-//     where the previous coord left off PROVIDED RC was previously
-//     enabled via `fleet rc up <project>` — the per-project marker is
-//     the operator opt-in signal (Single source of truth).
+//  1. Status note: pairing is native at spawn; `fleet rc status
+//     <project>` is the diagnostic if it looks broken. If the project
+//     was opted out (`fleet rc down <project>`), re-enable with
+//     `fleet rc up <project>` and respawn via `fleet handoff`.
 //  2. `/coordinator` slash command: resume the per-project supervisor
 //     loop (idempotent — NB-flock skips when held). Same load-bearing
 //     paragraph as before; universal (worker handoffs also run it as
 //     a no-op).
 //
-// Slash commands run in chat (not bash). NO bash block. The "exec
-// arbitrary bash from a markdown file" semantics that caused the
-// test pollution is gone.
+// Slash commands run in chat (not bash). NO bash block — the "exec
+// arbitrary bash from a markdown file" semantics stays gone (v0.12).
 //
-// Issue #31, #56 (closed under v0.12). Must stay byte-identical with
+// Issue #31, #56 lineage. Must stay byte-identical with
 // skills/fleet-guard/handoff.py:first_action(project) — the Python
 // skill writes the same handoff doc shape on auto-handoff and
 // renderers are tested for byte-equality (TestRender_SkillByteGolden).
@@ -228,19 +225,16 @@ func FirstAction(project string) string {
 	if display == "" {
 		display = "<project>"
 	}
-	return "To re-attach mobile/web pairing for this coord, run in your terminal:\n" +
+	return "Mobile/web pairing (Remote Control) is native: this replacement coord\n" +
+		"was spawned with `--remote-control` baked into its claude argv, so\n" +
+		"pairing carries through automatically — nothing to re-attach. If\n" +
+		"pairing looks broken, check:\n" +
 		"\n" +
-		"    fleet rc connect " + display + "\n" +
+		"    fleet rc status " + display + "\n" +
 		"\n" +
-		"(Or `/remote-control` from within Claude Code.) The pairing resumes\n" +
-		"from where the previous coord left off, provided RC was previously\n" +
-		"enabled via `fleet rc up " + display + "`.\n" +
-		"\n" +
-		"If RC was not previously enabled, run:\n" +
-		"\n" +
-		"    fleet rc up " + display + "\n" +
-		"\n" +
-		"first, then `fleet rc connect " + display + "`.\n" +
+		"If RC was disabled for this project (`fleet rc down " + display + "`),\n" +
+		"re-enable it with `fleet rc up " + display + "` — it takes effect on the\n" +
+		"next coord spawn (`fleet handoff <coord-id>` respawns the live coord).\n" +
 		"\n" +
 		"Then run the slash command `/coordinator` (in the chat, not bash) to resume the per-project supervisor tick loop. The /coordinator skill is idempotent — running it on a coord session that already holds the NB-flock is a no-op (the flock skips when held), and on a non-coord lineage it exits cleanly with no project to supervise.\n" +
 		"\n" +
