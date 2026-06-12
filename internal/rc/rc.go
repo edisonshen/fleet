@@ -1071,4 +1071,3 @@ func SetOwnerAliveFnForTest(fn func(coordID string) bool) func() {
 	ownerAliveFn = fn
 	return func() { ownerAliveFn = prev }
 }
-

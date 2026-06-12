@@ -56,6 +56,28 @@ import ids
 HANDOFF_REQUESTED = "HANDOFF REQUESTED"
 MILESTONE = "MILESTONE"
 
+# A MILESTONE-only assistant turn does NOT render as a bare "MILESTONE"
+# line in the tmux pane: Claude Code prefixes every assistant turn with a
+# bullet glyph (`⏺ `), so the pane shows `⏺ MILESTONE`. The agent may also
+# indent the token. `.strip() == MILESTONE` demanded an exact bare match
+# and therefore NEVER fired on a real pane — the auto-handoff's central
+# trigger was dead (the 2026-06 coord that climbed to 52% in auto-yellow
+# with handoff_type never committing). Tolerate a leading run of
+# whitespace + the agent turn glyph / list-bullet markers, but keep the
+# trailing `MILESTONE$` anchored so `MILESTONES` and `MILESTONE: foo`
+# still do NOT match (no false trigger). The `⏺` is U+23FA (Claude Code's
+# turn glyph).
+#
+# `>` is DELIBERATELY EXCLUDED from the prefix class. The injected
+# HANDOFF REQUESTED prompt (inject_handoff_requested) literally contains a
+# standalone `MILESTONE` instruction line, and an injected user message
+# renders in the pane with a `>` quote prefix on every line (`> MILESTONE`).
+# Matching `>`-prefixed lines would make find_milestone fire on the skill's
+# OWN instruction echo the instant Yellow injects — cutting off active work
+# before the agent ever responds. The agent's genuine signal carries the
+# `⏺` assistant glyph (or no prefix), never `>`.
+_MILESTONE_LINE_RE = re.compile(r"^[\s*\-•⏺]*MILESTONE\s*$")
+
 # Type values mirroring internal/handoff/handoff.go:30-36. The skill never
 # writes "manual" (that's Week 4a's operator path).
 TYPE_AUTO_YELLOW = "auto-yellow"
@@ -209,19 +231,43 @@ def _is_handoff_committed(record: dict[str, Any]) -> bool:
 
 def find_milestone(session: str) -> bool:
     """Capture the agent's tmux pane and search for a MILESTONE line that
-    appeared AFTER the most recent HANDOFF REQUESTED injection. Returns
+    appeared AFTER the Yellow cycle's HANDOFF REQUESTED injection. Returns
     False on tmux failure — the skill is non-blocking, and a missed
     MILESTONE just means the next fire tries again.
 
     Bounded to "after HANDOFF REQUESTED" because the pane scrollback can
     contain prior MILESTONE lines (the agent's own narration of the
-    handoff token, an earlier discussion that quoted the marker, even
-    a previous Yellow cycle's wrap-up). Counting any historical
-    MILESTONE would fire the handoff the moment Yellow first injects —
-    cutting off active work mid-subtask.
+    handoff token, an earlier discussion that quoted the marker). Counting
+    any historical MILESTONE would fire the handoff the moment Yellow first
+    injects — cutting off active work mid-subtask.
 
-    Match is exact (`^MILESTONE$` after stripping whitespace), so the
-    word "MILESTONES" or "MILESTONE: foo" never falsely triggers.
+    Windowing anchors on the FIRST HANDOFF REQUESTED, not the last. The
+    Stop hook / stuck-pending watchdog RE-injects HANDOFF REQUESTED on
+    later fires, so the pane shape during a stuck Yellow cycle is:
+
+        HANDOFF REQUESTED   (injection #1, opens the cycle)
+        ... agent wraps up ...
+        ⏺ MILESTONE         (the valid handoff signal)
+        HANDOFF REQUESTED   (injection #2, re-injected after MILESTONE)
+
+    Anchoring on the LAST HANDOFF REQUESTED would window the valid
+    MILESTONE OUT — the exact bug behind the 2026-06 coord that looped on
+    the request forever while context climbed toward auto-compact. The
+    first injection bounds the cycle: within a single live pane there is
+    only one Yellow cycle (a completed handoff replaces the agent in a
+    fresh pane), so any MILESTONE after the first injection belongs to
+    THIS cycle. Historical narration that predates injection #1 is still
+    correctly excluded.
+
+    Match tolerates a leading turn-glyph / bullet prefix
+    (`⏺ MILESTONE`, `  MILESTONE`) via _MILESTONE_LINE_RE but keeps
+    `MILESTONE$` anchored, so "MILESTONES" / "MILESTONE: foo" never
+    falsely trigger. `>`-prefixed lines are excluded — the injected
+    HANDOFF REQUESTED prompt echoes a `> MILESTONE` instruction line that
+    must NOT self-trigger (see _MILESTONE_LINE_RE). A bare
+    `.strip() == "MILESTONE"` — what this used to do — never matched a
+    real Claude Code pane, where the MILESTONE-only turn renders as
+    `⏺ MILESTONE`.
 
     Capture extends into scrollback (10000 lines) so a long-running
     Yellow cycle — the agent has produced many turns of output between
@@ -234,14 +280,15 @@ def find_milestone(session: str) -> bool:
     if not out:
         return False
     lines = out.splitlines()
-    # Find the LAST occurrence of HANDOFF REQUESTED. Multiple matches are
-    # plausible — the injection itself, the agent quoting it, etc. The
-    # most recent one is what bounds the new MILESTONE search.
-    last_request = -1
+    # Find the FIRST occurrence of HANDOFF REQUESTED — the line that opened
+    # this Yellow cycle. Re-injections land BELOW the agent's MILESTONE, so
+    # anchoring on the last one would window a valid MILESTONE out.
+    first_request = -1
     for i, line in enumerate(lines):
         if HANDOFF_REQUESTED in line:
-            last_request = i
-    if last_request == -1:
+            first_request = i
+            break
+    if first_request == -1:
         # No HANDOFF REQUESTED visible — either it scrolled off or
         # never fired. Conservative: don't trigger. The pending check
         # in maybe_trigger would have called this only when the record
@@ -249,8 +296,8 @@ def find_milestone(session: str) -> bool:
         # DID fire on a prior turn; if it scrolled off, the agent
         # eventually crosses 70% and emergency triggers via Red.
         return False
-    for line in lines[last_request + 1:]:
-        if line.strip() == MILESTONE:
+    for line in lines[first_request + 1:]:
+        if _MILESTONE_LINE_RE.match(line):
             return True
     return False
 

@@ -1,15 +1,13 @@
-"""v0.12 FIRST_ACTION render: the auto-handoff doc's body is operator-
-instruction markdown (not bash bootstrap). Mirrors the Go-side
-regression at internal/handoff/firstaction_project_test.go. Both sides
-MUST emit byte-identical text for the same project — the byte-golden
-test in test_handoff.py asserts the exact bytes.
+"""Native-RC FIRST_ACTION render (rc-default-native-startup): the
+auto-handoff doc's body is a status note — pairing is native at coord
+spawn (`--remote-control` baked into the replacement's claude argv) —
+plus the opt-out escape hatch. Mirrors the Go-side regression at
+internal/handoff/firstaction_project_test.go. Both sides MUST emit
+byte-identical text for the same project — the byte-golden test in
+test_handoff.py asserts the exact bytes.
 
-DESIGN-rc-listener-lifecycle.md §"Handoff doc rewrite" retires the
-embedded bash bootstrap. The new body directs the operator to run
-`fleet rc connect <project>` to re-attach mobile/web pairing — a
-small UX regression (one terminal command) traded for a large
-architectural win (no exec'd bash from a markdown file → no
-5,620-mobile-push regressions from a stuck reviewer loop).
+No bash bootstrap (gone since v0.12) and no retired `fleet rc connect`
+instruction.
 """
 
 from __future__ import annotations
@@ -24,8 +22,8 @@ import handoff  # noqa: E402
 
 
 class TestFirstActionPerProject:
-    """v0.12: every handoff doc's First Action body tells the operator
-    to run `fleet rc connect <project>`. The body is plain markdown
+    """Native model: every handoff doc's First Action body is a status
+    note (pairing is native) + opt-out escape hatch. Plain markdown
     with NO `claude remote-control` bash exec.
     """
 
@@ -36,17 +34,20 @@ class TestFirstActionPerProject:
         body = handoff.first_action("spark")
         assert isinstance(body, str)
 
-    def test_first_action_references_fleet_rc_connect(self) -> None:
+    def test_first_action_references_native_rc_surfaces(self) -> None:
         body = handoff.first_action("spark")
         for want in (
-            "fleet rc connect spark",
+            "--remote-control",
+            "fleet rc status spark",
             "fleet rc up spark",
-            "/remote-control",
             "/coordinator",
         ):
             assert want in body, (
                 f"first_action('spark') must contain {want!r}; got body:\n{body}"
             )
+        assert "fleet rc connect" not in body, (
+            "first_action must NOT reference the retired `fleet rc connect`"
+        )
 
     def test_first_action_no_bash_bootstrap(self) -> None:
         """v0.12 retired the embedded bash bootstrap — regression
@@ -58,6 +59,7 @@ class TestFirstActionPerProject:
             "pgrep -f",
             "```bash",
             "--remote-control-session-name-prefix",
+            "fleet rc connect",  # retired send-keys attach path
         ):
             assert forbidden not in body, (
                 f"first_action MUST NOT contain {forbidden!r} (v0.12 "
@@ -74,7 +76,7 @@ class TestFirstActionPerProject:
 
     def test_first_action_empty_project_fallback(self) -> None:
         body = handoff.first_action("")
-        assert "fleet rc connect <project>" in body, (
+        assert "fleet rc status <project>" in body, (
             f"first_action('') should emit `<project>` placeholder; got:\n{body}"
         )
 
@@ -91,7 +93,7 @@ class TestFirstActionPerProject:
             ts=ts,
             recent_activity="x",
         )
-        assert b"fleet rc connect tatoosh" in got, (
-            "rendered doc must embed the project-scoped fleet rc connect "
-            f"instruction; got:\n{got.decode('utf-8', errors='replace')}"
+        assert b"fleet rc status tatoosh" in got, (
+            "rendered doc must embed the project-scoped native RC status "
+            f"note; got:\n{got.decode('utf-8', errors='replace')}"
         )

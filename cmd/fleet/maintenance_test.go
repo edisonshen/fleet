@@ -10,7 +10,6 @@ import (
 	"time"
 
 	"github.com/edisonshen/fleet/internal/agent"
-	"github.com/edisonshen/fleet/internal/rc"
 	"github.com/edisonshen/fleet/internal/state"
 	"github.com/edisonshen/fleet/internal/tmux"
 )
@@ -55,15 +54,11 @@ func pruneDirSaneOK() error { return nil }
 // spawned-at and a one-line remediation suggestion.
 func TestMaintenanceBootstrapReport_FlagsLiveAgentsMissingRC(t *testing.T) {
 	rcTestFleetHome(t)
-	// v0.12: the survey now distinguishes "RC enabled but missing
-	// flag" (real remediation: handoff) from "RC not enabled for
-	// project" (no action). Write the marker so the test agent's
-	// project is in the rc-enabled bucket, mirroring the original
-	// "agent should be flagged" intent.
-	if err := rc.WriteMarker("projects-fleet"); err != nil {
-		t.Fatalf("WriteMarker: %v", err)
-	}
-	t.Cleanup(func() { _ = rc.RemoveMarker("projects-fleet") })
+	// Native model: RC is default-on, so the test agent's project is in
+	// the enabled bucket with no marker setup at all — the survey
+	// distinguishes "RC enabled (default) but missing flag" (real
+	// remediation: handoff) from "RC disabled via rc-disabled opt-out"
+	// (no action).
 
 	now := time.Date(2026, 5, 9, 13, 20, 42, 0, time.UTC)
 	records := []*agent.Record{
