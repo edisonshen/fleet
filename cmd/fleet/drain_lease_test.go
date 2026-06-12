@@ -33,6 +33,7 @@ import (
 	"github.com/edisonshen/fleet/internal/coordlock"
 	"github.com/edisonshen/fleet/internal/queue"
 	"github.com/edisonshen/fleet/internal/state"
+	"github.com/edisonshen/fleet/internal/testutil/tmuxtest"
 )
 
 func leaseDrainReq() queue.SpawnFresh {
@@ -1453,6 +1454,14 @@ func TestDrainGracefulDeliverPending_ArchivedOldPolicy_NoPrompt(t *testing.T) {
 // pure BASELINE resolver because its value is persisted into a recovered
 // successor's record by RecoverSpawn (codex iter-10 [P2]).
 func TestDrainGracefulDeliverPending_LegacySchemaNeverPrompts(t *testing.T) {
+	// Every tmux-reaching function var is stubbed below, so this test
+	// never touches a real server — but isolate the socket anyway
+	// (tmuxtest.IsolateSocket, NOT RequireTmux: no skip on tmux-less CI)
+	// so a future stub removal fails loudly instead of leaking onto the
+	// operator's default tmux server. Also satisfies
+	// scripts/lint-test-isolation.sh, whose `Resume(` trigger matches
+	// the effectiveDisableAutoResume call at the end of this test.
+	tmuxtest.IsolateSocket(t)
 	t.Setenv("FLEET_HOME", t.TempDir())
 	if _, err := state.Bootstrap(); err != nil {
 		t.Fatalf("bootstrap: %v", err)
