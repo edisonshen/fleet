@@ -1764,6 +1764,36 @@ def test_idle_agent_archive_pass_exempts_coord_explicit_field(
     assert path.exists(), "coord record file must remain on disk"
 
 
+def test_idle_agent_archive_pass_exempts_coord_explicit_field_in_isolation(
+    fleet_home: Path, monkeypatch,
+) -> None:
+    """Test 1b — Signal 2 (is_coord) exempts ALONE, with task_id pointing
+    at a NON-coord slug so Signal 1 cannot also fire. This pins the
+    explicit field's runtime guarantee — the design's "immune to a future
+    task-id rename" claim. Without it, Test 1 (which sets BOTH signals)
+    would still pass via the task_id branch even if the `is_coord is True`
+    clause were deleted, so the OR's left operand had zero isolated
+    coverage."""
+    project = "fleet"
+    path = _write_agent_record(
+        fleet_home, "cccc0005",
+        project=project,
+        last_activity_ts="2026-05-11T00:00:00Z",
+        task_id="renamed-coord-slug",  # NOT coord-<project>: Signal 1 off.
+        is_coord=True,                 # Signal 2 on, and it alone.
+    )
+    now_unix, calls = _exempt_setup(monkeypatch)
+
+    archived = supervisor._run_idle_agent_archive_pass(
+        project=project, home=fleet_home, fleet_bin="fleet",
+        now_unix=now_unix, log_stream=io.StringIO(),
+    )
+
+    assert archived == 0, f"is_coord alone must exempt; calls: {calls}"
+    assert not [c for c in calls if "rm" in c], f"no rm for coord: {calls}"
+    assert path.exists(), "coord record file must remain on disk"
+
+
 def test_idle_agent_archive_pass_archives_worker_with_task_id(
     fleet_home: Path, monkeypatch,
 ) -> None:
