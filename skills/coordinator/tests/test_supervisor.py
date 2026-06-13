@@ -1607,11 +1607,17 @@ def _write_agent_record(
     needs_input: bool = False,
     blocked: bool = False,
     engine: str = "claude-code",
+    task_id: str | None = None,
+    is_coord: bool | None = None,
 ) -> Path:
     """Seed ~/.fleet/agents/<id>.json with the minimal shape the sweep
     reads. Mirrors internal/agent.Record's json:"..." tag names verbatim
     so changing the Go schema here without updating the test is caught
-    by an assertion failure (defensive against schema drift)."""
+    by an assertion failure (defensive against schema drift).
+
+    task_id / is_coord are optional so legacy-record tests can leave the
+    field absent entirely (matching omitempty on the Go side): pass None
+    (default) to omit, or an explicit value to emit it."""
     agents_dir = fleet_home / "agents"
     agents_dir.mkdir(parents=True, exist_ok=True)
     rec = {
@@ -1623,6 +1629,10 @@ def _write_agent_record(
         "needs_input": needs_input,
         "blocked": blocked,
     }
+    if task_id is not None:
+        rec["task_id"] = task_id
+    if is_coord is not None:
+        rec["is_coord"] = is_coord
     path = agents_dir / f"{agent_id}.json"
     path.write_text(json.dumps(rec), encoding="utf-8")
     return path
@@ -1698,6 +1708,144 @@ def test_idle_agent_archive_pass_archives_stale_record(
     assert archived == 1, f"expected 1 archive, recorded calls: {calls}"
     rm_calls = [c for c in calls if c[1:3] == ["rm", "aaaa0001"]]
     assert rm_calls, f"expected `fleet rm aaaa0001`, got: {calls}"
+
+
+# ---------- coord-idle-exempt: coords are NEVER idle-archived ----------
+# DESIGN-coord-idle-exempt §4 — exempt on two structural signals,
+# OR-combined: is_coord==true (explicit) OR task_id=="coord-<project>"
+# (intrinsic, backs up a missing field on legacy records). Workers stay
+# fully reapable on the same TTL.
+
+
+def _exempt_setup(monkeypatch):
+    """Shared rig: TTL=1h, a stale heartbeat 70 min in the past, and a
+    fake `fleet rm` that records every shell so the test can assert the
+    coord was NOT rm'd. Returns (now_unix, calls)."""
+    calls: list[list[str]] = []
+
+    def fake_run(cmd, capture_output=True, text=True, timeout=None, check=False):
+        calls.append(list(cmd))
+        return subprocess.CompletedProcess(
+            args=cmd, returncode=0, stdout="", stderr="",
+        )
+
+    last_heartbeat = supervisor._parse_rfc3339("2026-05-11T00:00:00Z")
+    assert last_heartbeat is not None
+    now_unix = last_heartbeat + 70 * 60  # 70 min idle, well past TTL=1h
+
+    monkeypatch.setenv("FLEET_COORD_IDLE_TTL_H", "1")
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    return now_unix, calls
+
+
+def test_idle_agent_archive_pass_exempts_coord_explicit_field(
+    fleet_home: Path, monkeypatch,
+) -> None:
+    """Test 1 — coord NOT archived (explicit signal). A record with
+    is_coord=true, idle 70 min past TTL, must NOT be `fleet rm`'d; the
+    record file stays on disk."""
+    project = "fleet"
+    path = _write_agent_record(
+        fleet_home, "cccc0001",
+        project=project,
+        last_activity_ts="2026-05-11T00:00:00Z",
+        task_id=f"coord-{project}",
+        is_coord=True,
+    )
+    now_unix, calls = _exempt_setup(monkeypatch)
+
+    archived = supervisor._run_idle_agent_archive_pass(
+        project=project, home=fleet_home, fleet_bin="fleet",
+        now_unix=now_unix, log_stream=io.StringIO(),
+    )
+
+    assert archived == 0, f"coord must not be archived; calls: {calls}"
+    assert not [c for c in calls if "rm" in c], f"no rm for coord: {calls}"
+    assert path.exists(), "coord record file must remain on disk"
+
+
+def test_idle_agent_archive_pass_archives_worker_with_task_id(
+    fleet_home: Path, monkeypatch,
+) -> None:
+    """Test 2 — worker IS archived (unchanged). A record with a real
+    task slug and no is_coord field, idle past TTL, still reaps."""
+    project = "fleet"
+    _write_agent_record(
+        fleet_home, "dddd0002",
+        project=project,
+        last_activity_ts="2026-05-11T00:00:00Z",
+        task_id="some-feature-slug-1234",
+    )
+    now_unix, calls = _exempt_setup(monkeypatch)
+
+    archived = supervisor._run_idle_agent_archive_pass(
+        project=project, home=fleet_home, fleet_bin="fleet",
+        now_unix=now_unix, log_stream=io.StringIO(),
+    )
+
+    assert archived == 1, f"worker must archive; calls: {calls}"
+    assert [c for c in calls if c[1:3] == ["rm", "dddd0002"]], (
+        f"expected `fleet rm dddd0002`, got: {calls}"
+    )
+
+
+def test_idle_agent_archive_pass_exempts_coord_legacy_fallback(
+    fleet_home: Path, monkeypatch,
+) -> None:
+    """Test 3 — coord NOT archived via fallback (legacy). A record with
+    task_id=="coord-<project>" but NO is_coord field (predates the stamp)
+    is still exempt — Signal 1 (the task_id convention) backs up the
+    missing explicit field."""
+    project = "fleet"
+    path = _write_agent_record(
+        fleet_home, "cccc0003",
+        project=project,
+        last_activity_ts="2026-05-11T00:00:00Z",
+        task_id=f"coord-{project}",
+        # is_coord intentionally absent (legacy record).
+    )
+    now_unix, calls = _exempt_setup(monkeypatch)
+
+    archived = supervisor._run_idle_agent_archive_pass(
+        project=project, home=fleet_home, fleet_bin="fleet",
+        now_unix=now_unix, log_stream=io.StringIO(),
+    )
+
+    assert archived == 0, f"legacy coord must not archive; calls: {calls}"
+    assert not [c for c in calls if "rm" in c], f"no rm for coord: {calls}"
+    assert path.exists(), "legacy coord record file must remain on disk"
+
+
+def test_idle_agent_archive_pass_coord_exempt_respects_zero_ttl(
+    fleet_home: Path, monkeypatch,
+) -> None:
+    """Regression guard: TTL=0 still disables the whole sweep (the
+    exemption clause must not accidentally short-circuit past the
+    disable check). Coord present, but the sweep does nothing."""
+    project = "fleet"
+    _write_agent_record(
+        fleet_home, "cccc0004",
+        project=project,
+        last_activity_ts="2020-01-01T00:00:00Z",
+        task_id=f"coord-{project}",
+        is_coord=True,
+    )
+    calls: list[list[str]] = []
+
+    def fake_run(cmd, capture_output=True, text=True, timeout=None, check=False):
+        calls.append(list(cmd))
+        return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="", stderr="")
+
+    monkeypatch.setenv("FLEET_COORD_IDLE_TTL_H", "0")
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    archived = supervisor._run_idle_agent_archive_pass(
+        project=project, home=fleet_home, fleet_bin="fleet",
+        now_unix=1_000_000_000.0, log_stream=io.StringIO(),
+    )
+
+    assert archived == 0
+    assert calls == [], f"TTL=0 disables the whole sweep; got: {calls}"
 
 
 def test_idle_agent_archive_pass_disabled_by_zero_ttl(

@@ -205,6 +205,20 @@ type Record struct {
 	// wrapping — read this persisted truth instead. Empty/false for legacy
 	// records and bare/direct successors.
 	LeaseWrapped bool `json:"lease_wrapped,omitempty"`
+	// IsCoord marks a coordinator record. Stamped at spawn, derived from
+	// spawn.IsCoordSpawn(taskID, project) at the single record-build
+	// chokepoint so it cannot drift from the intrinsic task_id ==
+	// "coord-<project>" convention — it is a persisted projection of that
+	// predicate, NOT a hand-maintained second source of truth.
+	//
+	// Read by the Python idle-TTL archive sweep
+	// (skills/coordinator/supervisor.py:_run_idle_agent_archive_pass) as
+	// the EXPLICIT exemption signal: a coord is never idle-archived, so a
+	// project left quiet past FLEET_COORD_IDLE_TTL_H doesn't `fleet rm`
+	// its own coord (DESIGN-coord-idle-exempt §4). Empty/false on workers
+	// and legacy records; the task_id convention is the fallback
+	// discriminator the sweep ORs in for those.
+	IsCoord bool `json:"is_coord,omitempty"`
 }
 
 // NewID generates a short hex agent identifier (8 chars from 4 random

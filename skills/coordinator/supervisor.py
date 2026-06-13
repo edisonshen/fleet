@@ -1853,6 +1853,26 @@ def _run_idle_agent_archive_pass(
             continue
         if not isinstance(rec, dict):
             continue
+        # Coordinators are NEVER idle-archived (DESIGN-coord-idle-exempt
+        # §4). A coord is the long-lived owner of the project; archiving
+        # it on the same idle timer as ephemeral workers kills a healthy
+        # project the morning after a quiet day. We decide "is this a
+        # coord?" on TWO structural signals, OR-combined so neither
+        # failure mode resurrects the bug:
+        #   Signal 1 (intrinsic): task_id == "coord-<project>" — fleet's
+        #     canonical coord discriminator (Go spawn.IsCoordSpawn).
+        #     Present on every coord incl. bare/legacy; immune to a
+        #     missed stamp.
+        #   Signal 2 (explicit): is_coord == true — stamped at spawn
+        #     from isCoordSpawn; immune to a future task-id rename.
+        # role is NOT usable — coords carry role="executor" like workers.
+        # Exact-match the project-scoped id (not startswith("coord-")) so
+        # the predicate is unambiguous and project-scoped. The literal
+        # "coord-{project}" is pinned to the Go coordTaskIDPrefix by a
+        # drift-guard test (internal/spawn/coord_idle_exempt_test.go).
+        task_id = str(rec.get("task_id", "") or "")
+        if rec.get("is_coord") is True or task_id == f"coord-{project}":
+            continue
         # Scope to this project. Every project's coord runs its own
         # sweep; a sibling project's stale agent is that coord's
         # responsibility, not ours.
