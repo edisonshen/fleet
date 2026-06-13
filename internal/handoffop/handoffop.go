@@ -58,7 +58,48 @@ var (
 	sendPromptKeysVerified = spawn.SendPromptKeysVerified
 )
 
-func deliverResumePrompt(project string, isCoordSwap, leaseWrappedSuccessor bool, rec *agent.Record,
+// gracefulSwapEligibleFn / gracefulCoordSwapFn are the PR3 graceful-route
+// seams (DESIGN-coord-spawn-unified-standby §6): the live-coord swap routes
+// through the GracefulHandoff barrier instead of the bespoke
+// AtomicCoordSwap-then-deliver sequence. Package vars so tests inject fakes
+// without a real lease.
+var (
+	gracefulSwapEligibleFn = GracefulSwapEligible
+	gracefulCoordSwapFn    = GracefulCoordSwap
+)
+
+// liveCoordGracefulSpawn reports whether a coord successor on the drain/auto
+// path should spawn LEASE-WRAPPED (coord-run --standby) because the handoff
+// will complete through the GracefulHandoff barrier: the winner heartbeats
+// the lease, so it never lapses (a BARE successor's lease did — the fd4ee2e6
+// duplicate-coord incident). Dead-coord recovery (OLD not the live lease
+// owner) keeps the bare cold-resume shape: a standby polling a dead owner's
+// lease has no live releaser to wait on.
+// Gates on the SAME marker predicate retireOldAgent's isCoordSwap uses
+// (codex PR3-completion iter-6 [P2]): a coord-shaped task whose coord-spawn
+// marker is missing/stale takes the worker/inline retire path later, where a
+// lease-wrapped standby would receive its prompt via direct-send into the
+// supervisor pane instead of the lock-owner poll. Keeping the wrap decision
+// aligned with the route decision prevents that split.
+func liveCoordGracefulSpawn(oldRec *agent.Record, isCoordResume, autoResume bool) bool {
+	if !isCoordResume || oldRec == nil || oldRec.Project == "" {
+		return false
+	}
+	if state.ReadCoordSpawnMarker(oldRec.Project) != oldRec.ID {
+		return false
+	}
+	return gracefulSwapEligibleFn(oldRec, autoResume)
+}
+
+// requireOwner suppresses the legacy ErrNoOwnerObserved direct-send fallback
+// (codex PR3-completion iter-7 [P1]): on the GRACEFUL route the successor is
+// lease-wrapped by construction (a coord-run --standby supervisor), so "no
+// owner ever observed" means the standby has not acquired YET — never a
+// legacy bare coord. Direct-sending there types into the supervisor pane and
+// can report a false success, letting the caller consume the durable queue
+// with the doc undelivered. Owner-only callers keep the queue pending so the
+// next drain/attach pass re-delivers to the eventual winner.
+func deliverResumePrompt(project string, isCoordSwap, leaseWrappedSuccessor, requireOwner bool, rec *agent.Record,
 	docPath string, stdout, stderr io.Writer) (*agent.Record, error) {
 	prompt := handoff.ResumePrompt(docPath)
 	if coordlock.FailoverEnabled() && isCoordSwap && leaseWrappedSuccessor && project != "" {
@@ -77,7 +118,7 @@ func deliverResumePrompt(project string, isCoordSwap, leaseWrappedSuccessor bool
 			// (matches deliverHandoffResumePrompt in cmd/fleet/handoff.go). A
 			// genuine owner-seen-but-undeliverable error is NOT this sentinel and
 			// still propagates so the queue stays pending for a real-owner retry.
-			if errors.Is(err, handoffdelivery.ErrNoOwnerObserved) {
+			if errors.Is(err, handoffdelivery.ErrNoOwnerObserved) && !requireOwner {
 				_, _ = fmt.Fprintf(stderr,
 					"  resume: no lease owner for project %s (legacy coord?); delivering directly to %s\n",
 					project, rec.TmuxSession)
@@ -498,8 +539,18 @@ func cleanUpStaleQueue(req queue.SpawnFresh, queuePath string,
 		// Read the ACTUAL wrap state from the already-spawned replacement
 		// record (codex iter-24 [P2]), not the producer's cap-approval bit: a
 		// bare drain cold-resume coord records false even on a CapApproved queue.
+		//
+		// requireOwner = leaseWrappedSuccessor (codex PR3-completion iter-8
+		// [P1]): this archived-OLD retry is exactly where a graceful swap that
+		// retired OLD but timed out on delivery resumes. A LEASE-WRAPPED
+		// replacement with no observed owner is a standby that has not
+		// acquired YET — the legacy direct-send fallback would type into its
+		// coord-run supervisor pane, report success, and consume the queue
+		// while the eventual winner never gets the doc. Bare legacy
+		// replacements (leaseWrappedSuccessor=false) skip the owner-poll
+		// entirely, so the fallback remains for genuinely lease-less coords.
 		leaseWrappedSuccessor := newRec.LeaseWrapped
-		deliveredRec, err := deliverResumePrompt(newRec.Project, coordDelivery, leaseWrappedSuccessor,
+		deliveredRec, err := deliverResumePrompt(newRec.Project, coordDelivery, leaseWrappedSuccessor, leaseWrappedSuccessor,
 			newRec, req.HandoffDoc, stdout, stdout)
 		if err != nil {
 			return fmt.Errorf(
@@ -758,6 +809,15 @@ func spawnAndRetire(req queue.SpawnFresh, queuePath string,
 		spawnCwd = resolved
 	}
 
+	// PR3 (DESIGN-coord-spawn-unified-standby §5b/§6): a LIVE-coord handoff
+	// (OLD currently owns the lease + the doc will be auto-delivered) spawns
+	// a LEASE-WRAPPED standby successor and completes through the
+	// GracefulHandoff barrier in retireOldAgent — the winner heartbeats the
+	// lease so it never lapses. Only the dead-coord cold resume keeps the
+	// bare/direct shape (see liveCoordGracefulSpawn).
+	gracefulCoordRoute := liveCoordGracefulSpawn(oldRec, legacyCoordResume,
+		!thisHandoffDisableAutoResume)
+
 	newRec, err := spawn.Spawn(spawn.Options{
 		OldRecord:      oldRec,
 		NewDocPath:     req.HandoffDoc,
@@ -771,7 +831,7 @@ func spawnAndRetire(req queue.SpawnFresh, queuePath string,
 		// new record's baseline to opt-out (codex iter-18 P2).
 		DisableAutoResume: disableAutoResume,
 		StandbyTimeout:    spawn.DefaultStandbyTimeout,
-		DisableLeaseWrap:  legacyCoordResume,
+		DisableLeaseWrap:  legacyCoordResume && !gracefulCoordRoute,
 	})
 	if err != nil {
 		return fmt.Errorf("resume: spawn replacement: %w", err)
@@ -838,13 +898,13 @@ func spawnAndRetire(req queue.SpawnFresh, queuePath string,
 		}
 	}
 
-	// This path COLD-SPAWNS the successor above with
-	// DisableLeaseWrap: legacyCoordResume — i.e. a coord successor here is a
-	// BARE/direct successor, NOT lease-wrapped (codex iter-20 P2). spawn.Spawn
-	// stamped the ACTUAL wrap state onto the record, so read that authoritative
-	// value (codex iter-24 P2) rather than the producer's cap-approval bit.
-	// Delivering through the owner-poll for a bare successor would mis-route to
-	// the old/dead lease owner instead of the successor we just spawned.
+	// A coord successor here is BARE on the dead-coord cold resume
+	// (DisableLeaseWrap above; codex iter-20 P2) but LEASE-WRAPPED on the
+	// PR3 live-coord graceful route. spawn.Spawn stamped the ACTUAL wrap
+	// state onto the record, so read that authoritative value (codex
+	// iter-24 P2) rather than the producer's cap-approval bit. Delivering
+	// through the owner-poll for a bare successor would mis-route to the
+	// old/dead lease owner instead of the successor we just spawned.
 	leaseWrappedSuccessor := newRec.LeaseWrapped
 	return retireOldAgent(oldRec, newRec, req.HandoffDoc, queuePath,
 		thisHandoffDisableAutoResume, graceMillis, isCoordSwap, leaseWrappedSuccessor, stdout, stderr)
@@ -965,7 +1025,37 @@ func retireOldAgent(oldRec, newRec *agent.Record, docPath, queuePath string,
 	// the NEW agent record and (b) probed NEW alive. AtomicCoordSwap's
 	// AlreadySpawnedNewRec entrypoint skips its own spawn + probe
 	// steps and proceeds straight to the marker commit.
-	if isCoordSwap {
+	//
+	// PR3 (DESIGN-coord-spawn-unified-standby §6): a LIVE-coord swap —
+	// OLD currently owns the lease, the successor is a lease-wrapped
+	// standby, and the doc will be auto-delivered — routes through the
+	// GracefulHandoff BARRIER instead: barrier write (doc already
+	// durable) → AtomicCoordSwap (OLD's coord-run exit releases the
+	// lease) → poll the lock winner → inject the doc. The barrier lets a
+	// concurrent `fleet drain` see graceful-in-flight (drainGraceful)
+	// instead of racing a second successor in. Delivery happens INSIDE
+	// the barrier completion, so the autoResume send below is skipped.
+	var gracefulWinner *agent.Record
+	gracefulRouted := false
+	if isCoordSwap && leaseWrappedSuccessor && autoResume &&
+		gracefulSwapEligibleFn(oldRec, autoResume) {
+		winner, gerr := gracefulCoordSwapFn(oldRec, newRec, docPath,
+			time.Duration(graceMillis)*time.Millisecond,
+			func() (*agent.Record, error) {
+				return deliverResumePrompt(oldRec.Project, isCoordSwap,
+					leaseWrappedSuccessor, true, newRec, docPath, stdout, stderr)
+			}, stderr)
+		if gerr != nil {
+			// Same contract as the bespoke branches: queue preserved so a
+			// retry (Resume / next drain pass / lazy attach) finishes from
+			// the durable journal. AtomicCoordSwap sentinels stay
+			// errors.Is-reachable through the wrap.
+			return fmt.Errorf("resume: graceful coord swap for %s: %w (queue preserved at %s)",
+				oldRec.ID, gerr, queuePath)
+		}
+		gracefulRouted = true
+		gracefulWinner = winner
+	} else if isCoordSwap {
 		_, swapErr := AtomicCoordSwap(AtomicCoordSwapInputs{
 			Project:              oldRec.Project,
 			OldRec:               oldRec,
@@ -1038,11 +1128,19 @@ func retireOldAgent(oldRec, newRec *agent.Record, docPath, queuePath string,
 	supersededSession := ""
 	supersededID := ""
 	if autoResume {
-		deliveredRec, err := deliverResumePrompt(oldRec.Project, isCoordSwap, leaseWrappedSuccessor,
-			newRec, docPath, stdout, stderr)
-		if err != nil {
-			return fmt.Errorf("resume: prompt delivery pending for %s: %w (queue preserved at %s)",
-				newRec.ID, err, queuePath)
+		var deliveredRec *agent.Record
+		if gracefulRouted {
+			// The doc already landed on the lock winner inside the barrier
+			// completion — a second send here would be a duplicate prompt.
+			deliveredRec = gracefulWinner
+		} else {
+			var err error
+			deliveredRec, err = deliverResumePrompt(oldRec.Project, isCoordSwap, leaseWrappedSuccessor, false,
+				newRec, docPath, stdout, stderr)
+			if err != nil {
+				return fmt.Errorf("resume: prompt delivery pending for %s: %w (queue preserved at %s)",
+					newRec.ID, err, queuePath)
+			}
 		}
 		if deliveredRec != nil {
 			successorRec = deliveredRec

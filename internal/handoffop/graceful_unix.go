@@ -1,27 +1,40 @@
 //go:build linux || darwin
 
-// graceful_unix.go — the IN-PROCESS graceful handoff the OLD coord drives
-// itself (DESIGN-handoff-drain-storm-leak §3(A), PR3). It replaces the
-// external "army of fleet drain processes racing a forever-held lock" with
-// a self-driven sequence:
+// graceful_unix.go — the graceful handoff barrier + its completion phase
+// (DESIGN-handoff-drain-storm-leak §3(A) PR3 prepared the barrier;
+// DESIGN-coord-spawn-unified-standby §5b/§6 PR3 built the completion).
+// It replaces the external "army of fleet drain processes racing a
+// forever-held lock" with one fixed sequence:
 //
-//	┌─────────────────────────────────────────────────────────────────┐
-//	│ OLD coord (leader, holds lease)            STANDBY coord (warm)   │
-//	│   GracefulHandoff():                                              │
-//	│     1. spawn ONE standby (coord-run --standby) ─────▶ poll loop   │
-//	│     2. write handoff doc        (atomic, fsync)      (busy: BUSY) │
-//	│     3. write checkpoint         (atomic, fsync)                   │
-//	│     4. drain in-flight work safely (no crash)                     │
-//	│     5. write handoff-complete-<epoch>.json BARRIER                │
-//	│        (atomic, ONLY after 2+3 fsynced)                           │
-//	│   OLD exits ──▶ kernel releases flock ──▶ standby poll ACQUIRES   │
-//	└─────────────────────────────────────────────────────────────────┘
+//	┌───────────────────────────────────────────────────────────────────┐
+//	│ ORCHESTRATOR (fleet handoff / drain)       STANDBY coord (warm)    │
+//	│   GracefulHandoff():                                               │
+//	│     1. spawn ONE standby (coord-run --standby) ─────▶ poll loop    │
+//	│     2. write handoff doc        (atomic, fsync)      (busy: BUSY)  │
+//	│     3. write checkpoint         (atomic, fsync)                    │
+//	│     4. drain in-flight work safely (no crash)                      │
+//	│     5. write handoff-complete-<epoch>.json BARRIER                 │
+//	│        (atomic, ONLY after 2+3 fsynced)                            │
+//	│   ── completion phase (only when the seams are wired) ──           │
+//	│     6. RetireOld: OLD releases lease + exits ──▶ poll ACQUIRES     │
+//	│                                                  (winner reaps     │
+//	│                                                  losing siblings)  │
+//	│     7. DeliverDocToWinner: poll lock owner ─────▶ inject doc       │
+//	│        (mark-after-verified-send; §5c)                             │
+//	└───────────────────────────────────────────────────────────────────┘
 //
 // The barrier ordering is load-bearing: the barrier is the drain
 // verifier's "safe to graceful-kill OLD" signal, so it must NEVER appear on
 // disk before the doc + checkpoint are durable. If any earlier step fails,
 // GracefulHandoff returns WITHOUT writing the barrier (the drain path then
 // escalates to the safety net rather than seeing a false "all clean").
+//
+// Completion-phase failure semantics are the inverse: once the barrier is
+// durable the standby is NEVER reaped — it (or the lazy [a]-attach recovery
+// from the still-pending doc) is the vehicle that finishes a half-done
+// handoff. Retire/delivery errors propagate so the caller keeps its durable
+// queue PENDING; the next drain/attach pass re-delivers (a benign duplicate
+// is preferred over a silent strand, §5c).
 //
 // Build-tagged linux||darwin because the lease primitive it reads
 // (coordlock.CurrentEpoch / BarrierPath) is itself gated to those GOOS
@@ -97,6 +110,22 @@ type GracefulHandoffDeps struct {
 	// BarrierPath resolves the handoff-complete-<epoch>.json path.
 	// Production: coordlock.BarrierPath.
 	BarrierPath func(project string, epoch int64) (string, error)
+	// RetireOld retires the OLD coord AFTER the barrier is durable — the
+	// marker-commit + /exit + grace + kill + archive sequence (production:
+	// an AtomicCoordSwap closure; GracefulCoordSwap wires it). Retiring OLD
+	// makes its coord-run supervisor exit, which releases the lease so a
+	// polling standby can win it. nil (with DeliverDocToWinner nil) =
+	// prepare-only mode: GracefulHandoff returns right after the barrier
+	// and the OLD coord self-retires (the original stub contract).
+	RetireOld func() error
+	// DeliverDocToWinner polls the project lock for the WINNING standby and
+	// injects the handoff-doc resume prompt into it (production: a caller
+	// closure over handoffdelivery.DeliverToCurrentOwner — verified send,
+	// marker promotion). The winner reaps losing sibling standbys itself on
+	// acquire (coord-run's sweepStaleCompetitors, PR2); this seam only
+	// addresses whoever won. Returns the record that received the doc.
+	// Must be set iff RetireOld is set.
+	DeliverDocToWinner func() (*agent.Record, error)
 	// Stderr receives progress + diagnostic output (surface-don't-silo).
 	// nil = io.Discard (the caller usually passes the drain/coord stderr).
 	Stderr io.Writer
@@ -125,11 +154,17 @@ func DefaultGracefulHandoffDeps() GracefulHandoffDeps {
 //  3. write checkpoint       (atomic, fsync)  } barrier — load-bearing
 //  4. drain in-flight work safely (no crash)
 //  5. write handoff-complete-<epoch>.json     (atomic; barrier)
+//  6. RetireOld    — OLD releases the lease + exits        } completion
+//  7. DeliverDocToWinner — poll lock winner, inject doc    } (PR3; only
+//     } when wired)
 //
-// On success the OLD coord may exit; the kernel releases the flock and the
-// standby's next poll acquires it. On any error the barrier is absent and
-// the OLD coord stays leader until the drain safety net (or a retry)
-// recovers — never a torn/false barrier.
+// Prepare-only mode (nil completion seams): on success the OLD coord may
+// exit; the kernel releases the flock and the standby's next poll acquires
+// it. On any pre-barrier error the barrier is absent and the OLD coord
+// stays leader until the drain safety net (or a retry) recovers — never a
+// torn/false barrier. Post-barrier (completion) errors leave the barrier in
+// place and the standby alive: the drain verifier / lazy attach recovery
+// finishes from the durable doc.
 func GracefulHandoff(in GracefulHandoffInputs, d GracefulHandoffDeps) error {
 	d = fillGracefulDeps(d)
 	stderr := d.Stderr
@@ -143,6 +178,15 @@ func GracefulHandoff(in GracefulHandoffInputs, d GracefulHandoffDeps) error {
 	}
 	if d.SpawnStandby == nil {
 		return fmt.Errorf("handoffop.GracefulHandoff: SpawnStandby seam required")
+	}
+	// The completion seams come as a PAIR. Retiring OLD without a delivery
+	// seam would strand the doc behind an exited coord; delivering without
+	// retiring would poll a lock OLD never releases. Refuse before ANY side
+	// effect so a mis-wired caller can't half-run the handoff.
+	if (d.RetireOld == nil) != (d.DeliverDocToWinner == nil) {
+		return fmt.Errorf(
+			"handoffop.GracefulHandoff: completion seams must be set together (RetireOld set=%v, DeliverDocToWinner set=%v)",
+			d.RetireOld != nil, d.DeliverDocToWinner != nil)
 	}
 
 	// Capture the epoch FIRST — the barrier must name the lease generation
@@ -170,7 +214,9 @@ func GracefulHandoff(in GracefulHandoffInputs, d GracefulHandoffDeps) error {
 	if err := d.SpawnStandby(standbyTimeout); err != nil {
 		return fmt.Errorf("handoffop.GracefulHandoff: spawn standby for project %q: %w", project, err)
 	}
-	_, _ = fmt.Fprintf(stderr, "graceful-handoff: spawned standby coord for %s (epoch %d)\n", project, epoch)
+	// "ready", not "spawned": on the converged GracefulCoordSwap route the
+	// standby was already spawned by the caller and the seam is a no-op.
+	_, _ = fmt.Fprintf(stderr, "graceful-handoff: standby coord ready for %s (epoch %d)\n", project, epoch)
 
 	// Steps 2-5 run AFTER the standby is alive. If ANY of them fails we must
 	// REAP the standby (codex PR3 iter-2 [P2]): a standby left polling after a
@@ -192,7 +238,170 @@ func GracefulHandoff(in GracefulHandoffInputs, d GracefulHandoffDeps) error {
 		}
 		return err
 	}
+
+	// Completion phase (PR3). Prepare-only callers stop at the barrier.
+	if d.RetireOld == nil {
+		return nil
+	}
+
+	// Step 6: retire OLD. The barrier is durable, so OLD may now release the
+	// lease and exit; the polling standby (or a duplicate-attach racer — the
+	// winner reaps the losers on acquire, PR2) wins the freed lock. On error
+	// the standby is NOT reaped: the barrier is up, so the drain verifier /
+	// a retry finishes the handoff — the standby is the recovery vehicle.
+	if err := d.RetireOld(); err != nil {
+		return fmt.Errorf(
+			"handoffop.GracefulHandoff: retire old coord %s for project %q: %w (barrier %d stays; standby left polling for recovery)",
+			in.OldRec.ID, project, err, epoch)
+	}
+
+	// Step 7: deliver the doc to whoever WON the lock. On error the doc /
+	// caller queue stays PENDING so a later drain/attach re-delivers (§5c) —
+	// again no standby reap (the winner may be the live coord by now).
+	winner, err := d.DeliverDocToWinner()
+	if err != nil {
+		return fmt.Errorf(
+			"handoffop.GracefulHandoff: deliver handoff doc to the lock winner for project %q: %w (doc stays pending; next drain/attach re-delivers)",
+			project, err)
+	}
+	if winner != nil {
+		_, _ = fmt.Fprintf(stderr,
+			"graceful-handoff: delivered handoff doc to lock winner %s (%s) for %s\n",
+			winner.ID, winner.TmuxSession, project)
+	}
 	return nil
+}
+
+// gracefulEligibleOwnerFn is the seam GracefulSwapEligible reads the current
+// healthy lease owner through. Production: coordlock.CurrentOwner; tests
+// inject a deterministic fake.
+var gracefulEligibleOwnerFn = coordlock.CurrentOwner
+
+// GracefulSwapEligible reports whether a coord swap should route through the
+// GracefulHandoff barrier (DESIGN-coord-spawn-unified-standby §6 PR3): lease
+// failover is on, OLD is the project's CURRENT healthy lease owner (a
+// live-coord handoff — a dead-coord recovery has no live releaser and keeps
+// the proven cold/bespoke path), and the resume prompt will be auto-delivered
+// (completion IS delivery; an opt-out handoff has nothing to inject).
+//
+// Callers additionally gate on the successor being lease-wrapped
+// (newRec.LeaseWrapped): only a coord-run --standby poller can win the freed
+// lock and heartbeat the lease — a bare successor's lease lapses (the
+// fd4ee2e6 duplicate-coord incident).
+func GracefulSwapEligible(oldRec *agent.Record, autoResume bool) bool {
+	if oldRec == nil || oldRec.Project == "" || !autoResume {
+		return false
+	}
+	if !coordlock.FailoverEnabled() {
+		return false
+	}
+	owner, ok := gracefulEligibleOwnerFn(oldRec.Project)
+	return ok && owner.AgentID == oldRec.ID
+}
+
+// gracefulSwapDepsFn / atomicCoordSwapFn are GracefulCoordSwap's seams.
+// Production: the package defaults; tests inject fakes so the composition is
+// testable without a real lease/tmux.
+var (
+	gracefulSwapDepsFn = DefaultGracefulHandoffDeps
+	atomicCoordSwapFn  = AtomicCoordSwap
+)
+
+// GracefulCoordSwap is the production composition the live-coord handoff
+// paths (manual `fleet handoff`, drain-of-live, auto 50/70% — via
+// cmd/fleet/handoff.go and retireOldAgent) route through, retiring the
+// bespoke "AtomicCoordSwap then separately deliver" sequence PR2 added:
+//
+//	barrier write (doc is ALREADY durable on disk — the caller wrote it
+//	before spawn)  →  retire OLD via AtomicCoordSwap (its coord-run exit
+//	releases the lease)  →  deliver(): poll the lock winner, inject the doc.
+//
+// newRec is the lease-wrapped standby the caller already spawned and probed
+// alive — so the SpawnStandby seam is satisfied with a no-op (the "exactly
+// one standby" invariant holds: this run spawns zero additional standbys).
+// deliver is the caller's lock-owner delivery closure (each caller carries
+// its own fallback/IO shape); the record it returns is the WINNER that got
+// the doc. AtomicCoordSwap's sentinel errors (ErrOrphanSurvived,
+// ErrOldKillProbeAmbiguous, ...) stay errors.Is-reachable through the wrap.
+func GracefulCoordSwap(oldRec, newRec *agent.Record, docPath string,
+	graceWindow time.Duration, deliver func() (*agent.Record, error),
+	stderr io.Writer) (*agent.Record, error) {
+
+	if deliver == nil {
+		return nil, fmt.Errorf("handoffop.GracefulCoordSwap: deliver closure required")
+	}
+	var winner *agent.Record
+	retireStarted := false
+	deps := gracefulSwapDepsFn()
+	deps.SpawnStandby = func(time.Duration) error { return nil } // standby == newRec, already spawned
+	deps.RetireOld = func() error {
+		retireStarted = true
+		_, err := atomicCoordSwapFn(AtomicCoordSwapInputs{
+			Project:              oldRec.Project,
+			OldRec:               oldRec,
+			AlreadySpawnedNewRec: newRec,
+			GraceWindow:          graceWindow,
+		}, stderr)
+		return err
+	}
+	deps.DeliverDocToWinner = func() (*agent.Record, error) {
+		w, err := deliver()
+		if err != nil {
+			return nil, err
+		}
+		winner = w
+		return w, nil
+	}
+	deps.Stderr = stderr
+	if err := GracefulHandoff(GracefulHandoffInputs{
+		OldRec:         oldRec,
+		HandoffDocPath: docPath, // already durable — empty HandoffDoc skips the write
+	}, deps); err != nil {
+		// Pre-retire failure (epoch read / barrier write / seam validation):
+		// AtomicCoordSwap never ran, so its marker rollback (codex iter-10/16)
+		// never ran either. The callers eagerly wrote the coord-spawn marker
+		// → newRec.ID before invoking us; without an undo the marker keeps
+		// naming a polling standby while OLD is still leader — a retry's
+		// `marker == oldRec.ID` coord-swap detection then misroutes the coord
+		// handoff down the WORKER path, and [a] discovery follows the marker
+		// into a supervisor pane (codex PR3-completion iter-1 [P1]). Once
+		// RetireOld has started, marker ownership belongs to AtomicCoordSwap
+		// (pre-commit failures roll back internally; post-commit failures
+		// legitimately leave the marker at NEW) — never undo it here.
+		//
+		// The standby (newRec) is deliberately NOT reaped on this path
+		// (codex iter-4 [P1] reviewed + rejected): the callers preserve the
+		// durable queue AND the journaled replacement so the retry
+		// (resumeHandoff / Resume case 3) REUSES the live standby instead of
+		// spawning a second one. If OLD crashes before the retry and the
+		// standby wins the freed lease, the pending queue's lock-owner
+		// delivery heals it (§5c) — it is never a blank strand. A standby
+		// that never wins self-reaps at the standby timeout (10 min).
+		if !retireStarted {
+			rollbackEagerCoordMarker(oldRec, newRec, stderr)
+		}
+		return nil, err
+	}
+	return winner, nil
+}
+
+// rollbackEagerCoordMarker undoes a caller's eager coord-spawn-marker write
+// (marker → NEW before the swap) after a failure that happened BEFORE the
+// retire phase ran. CAS-guarded: only restores when the marker actually
+// points at NEW — an eager write that never landed, or a concurrent
+// takeover's marker, is left alone. Best-effort; surface-don't-silo.
+func rollbackEagerCoordMarker(oldRec, newRec *agent.Record, stderr io.Writer) {
+	if oldRec == nil || newRec == nil || oldRec.Project == "" {
+		return
+	}
+	if state.ReadCoordSpawnMarker(oldRec.Project) != newRec.ID {
+		return
+	}
+	if werr := writeCoordSpawnMarkerFn(oldRec.Project, oldRec.ID); werr != nil && stderr != nil {
+		_, _ = fmt.Fprintf(stderr,
+			"warning: graceful coord swap: rollback coord-spawn marker for project %s to %s failed: %v (operator: re-write manually if dashboard misses OLD)\n",
+			oldRec.Project, oldRec.ID, werr)
+	}
 }
 
 // gracefulDurableSteps runs steps 2-5 (doc, checkpoint, drain, barrier) in

@@ -14,12 +14,15 @@ package handoffop
 
 import (
 	"errors"
+	"io"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/edisonshen/fleet/internal/agent"
+	"github.com/edisonshen/fleet/internal/coordlock"
+	"github.com/edisonshen/fleet/internal/state"
 )
 
 // gracefulRecorder captures the ordered side effects of a GracefulHandoff
@@ -332,4 +335,481 @@ func TestGracefulHandoff_NilSpawnSeam_Refuses(t *testing.T) {
 	if err := GracefulHandoff(in, deps); err == nil {
 		t.Fatal("expected refusal when SpawnStandby seam is nil")
 	}
+}
+
+// ---------------------------------------------------------------------------
+// PR3 — completion phase (DESIGN-coord-spawn-unified-standby §5b / §6 PR3):
+// after the barrier is durable the handoff COMPLETES in-process —
+// retire OLD (releases the lease) → poll the lock winner → inject the doc.
+// The winner reaps losing sibling standbys itself on acquire (coord-run's
+// sweepStaleCompetitors, PR2); the orchestrator only addresses the winner.
+// ---------------------------------------------------------------------------
+
+func orderIdx(order []string, s string) int {
+	for i, v := range order {
+		if v == s {
+			return i
+		}
+	}
+	return -1
+}
+
+// Completion ordering: barrier FIRST (durable), then retire OLD, then
+// deliver. A retire that ran before the barrier would let OLD exit with no
+// "all clean" signal for the drain verifier; a delivery before retire would
+// poll a lock OLD still holds.
+func TestGracefulHandoff_Completion_RetireAfterBarrier_ThenDeliver(t *testing.T) {
+	rec := newGracefulRecorder()
+	winner := agent.New("winner01")
+	var delivered *agent.Record
+	in := GracefulHandoffInputs{
+		OldRec:         oldRecForGraceful(),
+		HandoffDocPath: gracefulDocPath,
+		HandoffDoc:     []byte("# doc\n"),
+	}
+	deps := GracefulHandoffDeps{
+		SpawnStandby: func(time.Duration) error { rec.note("spawn-standby"); return nil },
+		WriteAtomic:  rec.write,
+		CurrentEpoch: func(string) (int64, bool) { return 7, true },
+		BarrierPath:  func(string, int64) (string, error) { return gracefulBarrierPath, nil },
+		RetireOld:    func() error { rec.note("retire-old"); return nil },
+		DeliverDocToWinner: func() (*agent.Record, error) {
+			rec.note("deliver")
+			delivered = winner
+			return winner, nil
+		},
+	}
+	if err := GracefulHandoff(in, deps); err != nil {
+		t.Fatalf("GracefulHandoff with completion seams: %v", err)
+	}
+	order, _, _ := rec.snapshot()
+	iBarrier := orderIdx(order, "write:"+gracefulBarrierPath)
+	iRetire := orderIdx(order, "retire-old")
+	iDeliver := orderIdx(order, "deliver")
+	if iBarrier == -1 || iRetire == -1 || iDeliver == -1 {
+		t.Fatalf("missing completion steps; order=%v", order)
+	}
+	if iBarrier >= iRetire || iRetire >= iDeliver {
+		t.Fatalf("completion out of order (want barrier < retire < deliver): %v", order)
+	}
+	if delivered == nil || delivered.ID != "winner01" {
+		t.Fatalf("doc not delivered to the winner: %+v", delivered)
+	}
+}
+
+// A retire failure aborts BEFORE delivery. The barrier stays on disk (it is
+// truthful — doc + checkpoint are durable) and the standby is NOT reaped:
+// post-barrier the standby/lazy-attach recovery is the vehicle that finishes
+// the handoff, so tearing it down would strand the project.
+func TestGracefulHandoff_Completion_RetireError_NoDeliver_NoReap(t *testing.T) {
+	rec := newGracefulRecorder()
+	wantErr := errors.New("old coord kill failed")
+	reaped := 0
+	deliverCalls := 0
+	in := GracefulHandoffInputs{
+		OldRec:         oldRecForGraceful(),
+		HandoffDocPath: gracefulDocPath,
+		HandoffDoc:     []byte("# doc\n"),
+	}
+	deps := GracefulHandoffDeps{
+		SpawnStandby: func(time.Duration) error { return nil },
+		ReapStandby:  func() error { reaped++; return nil },
+		WriteAtomic:  rec.write,
+		CurrentEpoch: func(string) (int64, bool) { return 7, true },
+		BarrierPath:  func(string, int64) (string, error) { return gracefulBarrierPath, nil },
+		RetireOld:    func() error { return wantErr },
+		DeliverDocToWinner: func() (*agent.Record, error) {
+			deliverCalls++
+			return nil, nil
+		},
+	}
+	err := GracefulHandoff(in, deps)
+	if !errors.Is(err, wantErr) {
+		t.Fatalf("retire error not surfaced (want errors.Is): %v", err)
+	}
+	if deliverCalls != 0 {
+		t.Errorf("delivery ran %d times after a retire failure, want 0", deliverCalls)
+	}
+	if reaped != 0 {
+		t.Errorf("standby reaped %d times post-barrier, want 0 (it is the recovery vehicle)", reaped)
+	}
+	_, writes, _ := rec.snapshot()
+	if _, ok := writes[gracefulBarrierPath]; !ok {
+		t.Errorf("barrier missing after a post-barrier retire failure (it must stay)")
+	}
+}
+
+// A delivery failure propagates (errors.Is preserved) so the caller keeps the
+// durable doc/queue PENDING — the next attach/drain re-delivers (§5c). The
+// standby is NOT reaped: the winner is the live coord.
+func TestGracefulHandoff_Completion_DeliverError_Propagates_NoReap(t *testing.T) {
+	rec := newGracefulRecorder()
+	wantErr := errors.New("owner poll timed out")
+	reaped := 0
+	in := GracefulHandoffInputs{
+		OldRec:         oldRecForGraceful(),
+		HandoffDocPath: gracefulDocPath,
+		HandoffDoc:     []byte("# doc\n"),
+	}
+	deps := GracefulHandoffDeps{
+		SpawnStandby: func(time.Duration) error { return nil },
+		ReapStandby:  func() error { reaped++; return nil },
+		WriteAtomic:  rec.write,
+		CurrentEpoch: func(string) (int64, bool) { return 7, true },
+		BarrierPath:  func(string, int64) (string, error) { return gracefulBarrierPath, nil },
+		RetireOld:    func() error { return nil },
+		DeliverDocToWinner: func() (*agent.Record, error) {
+			return nil, wantErr
+		},
+	}
+	err := GracefulHandoff(in, deps)
+	if !errors.Is(err, wantErr) {
+		t.Fatalf("delivery error not surfaced (want errors.Is): %v", err)
+	}
+	if reaped != 0 {
+		t.Errorf("standby reaped %d times after a delivery failure, want 0 (winner is the live coord)", reaped)
+	}
+}
+
+// The completion seams come as a PAIR. Retiring OLD without a delivery seam
+// would orphan the doc behind a dead coord; delivering without retiring
+// would poll a lock OLD never releases. Refuse before any side effect.
+func TestGracefulHandoff_Completion_SeamsMustPair(t *testing.T) {
+	for name, deps := range map[string]GracefulHandoffDeps{
+		"retire-only": {
+			SpawnStandby: func(time.Duration) error { t.Error("spawned despite invalid seams"); return nil },
+			CurrentEpoch: func(string) (int64, bool) { return 7, true },
+			RetireOld:    func() error { return nil },
+		},
+		"deliver-only": {
+			SpawnStandby:       func(time.Duration) error { t.Error("spawned despite invalid seams"); return nil },
+			CurrentEpoch:       func(string) (int64, bool) { return 7, true },
+			DeliverDocToWinner: func() (*agent.Record, error) { return nil, nil },
+		},
+	} {
+		in := GracefulHandoffInputs{OldRec: oldRecForGraceful()}
+		if err := GracefulHandoff(in, deps); err == nil {
+			t.Errorf("%s: expected refusal when completion seams are not paired", name)
+		}
+	}
+}
+
+// Nil completion seams = the original prepare-only stub contract: return
+// right after the barrier (OLD self-retires; drain verifier finishes).
+// Pinned so the PR3 completion phase stays opt-in for legacy callers.
+func TestGracefulHandoff_PrepareOnly_NoCompletionSeams_StopsAtBarrier(t *testing.T) {
+	rec := newGracefulRecorder()
+	in := GracefulHandoffInputs{
+		OldRec:         oldRecForGraceful(),
+		HandoffDocPath: gracefulDocPath,
+		HandoffDoc:     []byte("# doc\n"),
+	}
+	deps := GracefulHandoffDeps{
+		SpawnStandby: func(time.Duration) error { return nil },
+		WriteAtomic:  rec.write,
+		CurrentEpoch: func(string) (int64, bool) { return 7, true },
+		BarrierPath:  func(string, int64) (string, error) { return gracefulBarrierPath, nil },
+	}
+	if err := GracefulHandoff(in, deps); err != nil {
+		t.Fatalf("prepare-only GracefulHandoff: %v", err)
+	}
+	order, _, _ := rec.snapshot()
+	if i := orderIdx(order, "write:"+gracefulBarrierPath); i != len(order)-1 {
+		t.Fatalf("barrier is not the final side effect in prepare-only mode; order=%v", order)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// GracefulSwapEligible — the route gate for converging the live-coord
+// handoff paths onto the barrier (§6 PR3). True only when failover is on,
+// OLD is the project's CURRENT healthy lease owner (a live-coord handoff,
+// not a dead-coord recovery) and the doc will be auto-delivered.
+// ---------------------------------------------------------------------------
+
+func TestGracefulSwapEligible(t *testing.T) {
+	old := oldRecForGraceful()
+	swapOwner := func(t *testing.T, fn func(string) (coordlock.Owner, bool)) {
+		t.Helper()
+		orig := gracefulEligibleOwnerFn
+		gracefulEligibleOwnerFn = fn
+		t.Cleanup(func() { gracefulEligibleOwnerFn = orig })
+	}
+	ownerIsOld := func(p string) (coordlock.Owner, bool) {
+		if p != old.Project {
+			t.Fatalf("owner consulted for project %q, want %q", p, old.Project)
+		}
+		return coordlock.Owner{AgentID: old.ID, PID: 4242, PidStart: 9}, true
+	}
+
+	t.Run("live owner + auto-resume -> eligible", func(t *testing.T) {
+		swapOwner(t, ownerIsOld)
+		if !GracefulSwapEligible(old, true) {
+			t.Fatal("want eligible when OLD owns the lease and auto-resume is on")
+		}
+	})
+	t.Run("owner is someone else -> not eligible", func(t *testing.T) {
+		swapOwner(t, func(string) (coordlock.Owner, bool) {
+			return coordlock.Owner{AgentID: "other666", PID: 1, PidStart: 1}, true
+		})
+		if GracefulSwapEligible(old, true) {
+			t.Fatal("want not-eligible when another agent owns the lease")
+		}
+	})
+	t.Run("no healthy owner -> not eligible (dead-coord recovery path)", func(t *testing.T) {
+		swapOwner(t, func(string) (coordlock.Owner, bool) { return coordlock.Owner{}, false })
+		if GracefulSwapEligible(old, true) {
+			t.Fatal("want not-eligible with no healthy lease owner")
+		}
+	})
+	t.Run("auto-resume off -> not eligible (nothing to inject)", func(t *testing.T) {
+		swapOwner(t, ownerIsOld)
+		if GracefulSwapEligible(old, false) {
+			t.Fatal("want not-eligible when auto-resume is off")
+		}
+	})
+	t.Run("failover off -> not eligible", func(t *testing.T) {
+		swapOwner(t, ownerIsOld)
+		t.Setenv("FLEET_LEASE_FAILOVER", "0")
+		if GracefulSwapEligible(old, true) {
+			t.Fatal("want not-eligible with FLEET_LEASE_FAILOVER=0")
+		}
+	})
+	t.Run("nil / projectless record -> not eligible", func(t *testing.T) {
+		swapOwner(t, func(string) (coordlock.Owner, bool) {
+			t.Error("owner consulted for an invalid record")
+			return coordlock.Owner{}, false
+		})
+		if GracefulSwapEligible(nil, true) {
+			t.Fatal("want not-eligible for a nil record")
+		}
+		bare := agent.New("noproj01")
+		if GracefulSwapEligible(bare, true) {
+			t.Fatal("want not-eligible for a projectless record")
+		}
+	})
+}
+
+// ---------------------------------------------------------------------------
+// GracefulCoordSwap — the production composition the live-coord handoff
+// paths route through: barrier (doc already durable on disk) → retire OLD
+// via AtomicCoordSwap → deliver to the lock winner. Returns the winner.
+// ---------------------------------------------------------------------------
+
+func TestGracefulCoordSwap_BarrierThenSwapThenDeliver_ReturnsWinner(t *testing.T) {
+	rec := newGracefulRecorder()
+	oldRec := oldRecForGraceful()
+	newRec := agent.New("standby01")
+	newRec.Project = oldRec.Project
+	winner := agent.New("winner01")
+
+	origDeps := gracefulSwapDepsFn
+	origSwap := atomicCoordSwapFn
+	t.Cleanup(func() {
+		gracefulSwapDepsFn = origDeps
+		atomicCoordSwapFn = origSwap
+	})
+	gracefulSwapDepsFn = func() GracefulHandoffDeps {
+		return GracefulHandoffDeps{
+			WriteAtomic:  rec.write,
+			CurrentEpoch: func(string) (int64, bool) { return 7, true },
+			BarrierPath:  func(string, int64) (string, error) { return gracefulBarrierPath, nil },
+		}
+	}
+	var gotSwap AtomicCoordSwapInputs
+	atomicCoordSwapFn = func(in AtomicCoordSwapInputs, _ io.Writer) (AtomicCoordSwapResult, error) {
+		rec.note("atomic-swap")
+		gotSwap = in
+		return AtomicCoordSwapResult{}, nil
+	}
+
+	got, err := GracefulCoordSwap(oldRec, newRec, gracefulDocPath,
+		1500*time.Millisecond,
+		func() (*agent.Record, error) { rec.note("deliver"); return winner, nil },
+		io.Discard)
+	if err != nil {
+		t.Fatalf("GracefulCoordSwap: %v", err)
+	}
+	if got == nil || got.ID != winner.ID {
+		t.Fatalf("winner = %+v, want %s", got, winner.ID)
+	}
+	order, writes, _ := rec.snapshot()
+	iBarrier := orderIdx(order, "write:"+gracefulBarrierPath)
+	iSwap := orderIdx(order, "atomic-swap")
+	iDeliver := orderIdx(order, "deliver")
+	if iBarrier == -1 || iSwap == -1 || iDeliver == -1 ||
+		iBarrier >= iSwap || iSwap >= iDeliver {
+		t.Fatalf("want barrier < atomic-swap < deliver; order=%v", order)
+	}
+	// The doc is already durable on disk (the caller wrote it before spawn);
+	// GracefulCoordSwap must NOT rewrite it.
+	if _, ok := writes[gracefulDocPath]; ok {
+		t.Errorf("handoff doc rewritten; it was already durable")
+	}
+	if gotSwap.Project != oldRec.Project || gotSwap.OldRec != oldRec ||
+		gotSwap.AlreadySpawnedNewRec != newRec ||
+		gotSwap.GraceWindow != 1500*time.Millisecond {
+		t.Errorf("AtomicCoordSwap inputs wrong: %+v", gotSwap)
+	}
+}
+
+func TestGracefulCoordSwap_SwapError_Propagates_NoDeliver(t *testing.T) {
+	rec := newGracefulRecorder()
+	oldRec := oldRecForGraceful()
+	newRec := agent.New("standby01")
+	newRec.Project = oldRec.Project
+	wantErr := errors.New("orphan survived")
+	deliverCalls := 0
+
+	origDeps := gracefulSwapDepsFn
+	origSwap := atomicCoordSwapFn
+	t.Cleanup(func() {
+		gracefulSwapDepsFn = origDeps
+		atomicCoordSwapFn = origSwap
+	})
+	gracefulSwapDepsFn = func() GracefulHandoffDeps {
+		return GracefulHandoffDeps{
+			WriteAtomic:  rec.write,
+			CurrentEpoch: func(string) (int64, bool) { return 7, true },
+			BarrierPath:  func(string, int64) (string, error) { return gracefulBarrierPath, nil },
+		}
+	}
+	atomicCoordSwapFn = func(AtomicCoordSwapInputs, io.Writer) (AtomicCoordSwapResult, error) {
+		return AtomicCoordSwapResult{}, wantErr
+	}
+
+	got, err := GracefulCoordSwap(oldRec, newRec, gracefulDocPath, 0,
+		func() (*agent.Record, error) { deliverCalls++; return nil, nil },
+		io.Discard)
+	if !errors.Is(err, wantErr) {
+		t.Fatalf("swap error not surfaced via errors.Is (callers branch on swap sentinels): %v", err)
+	}
+	if got != nil {
+		t.Errorf("winner = %+v on the error path, want nil", got)
+	}
+	if deliverCalls != 0 {
+		t.Errorf("delivery ran %d times after a swap failure, want 0", deliverCalls)
+	}
+}
+
+// Pre-retire failure (epoch read / barrier write): AtomicCoordSwap never ran,
+// so its marker rollback never ran either — GracefulCoordSwap itself must
+// undo the caller's eager marker → NEW write, or a retry's
+// `marker == oldRec.ID` coord-swap detection misroutes the coord handoff
+// down the worker path (codex PR3-completion iter-1 [P1]). Once the retire
+// phase HAS started, marker ownership belongs to AtomicCoordSwap and the
+// graceful layer must never second-guess it.
+func TestGracefulCoordSwap_PreRetireError_RollsBackEagerMarker(t *testing.T) {
+	setupFleetHome(t)
+	oldRec := oldRecForGraceful()
+	newRec := agent.New("standby01")
+	newRec.Project = oldRec.Project
+	if _, err := state.EnsureProjectInitialized(oldRec.Project); err != nil {
+		t.Fatalf("EnsureProjectInitialized: %v", err)
+	}
+
+	seedEagerMarker := func(t *testing.T) {
+		t.Helper()
+		if err := state.WriteCoordSpawnMarker(oldRec.Project, newRec.ID); err != nil {
+			t.Fatalf("seed eager marker: %v", err)
+		}
+	}
+	swapSeams := func(t *testing.T, deps GracefulHandoffDeps,
+		swap func(AtomicCoordSwapInputs, io.Writer) (AtomicCoordSwapResult, error)) {
+		t.Helper()
+		origDeps := gracefulSwapDepsFn
+		origSwap := atomicCoordSwapFn
+		t.Cleanup(func() {
+			gracefulSwapDepsFn = origDeps
+			atomicCoordSwapFn = origSwap
+		})
+		gracefulSwapDepsFn = func() GracefulHandoffDeps { return deps }
+		atomicCoordSwapFn = swap
+	}
+
+	t.Run("pre-retire failure restores marker to OLD", func(t *testing.T) {
+		seedEagerMarker(t)
+		rec := newGracefulRecorder()
+		swapSeams(t, GracefulHandoffDeps{
+			WriteAtomic: rec.write,
+			// Epoch read fails — the earliest pre-barrier abort.
+			CurrentEpoch: func(string) (int64, bool) { return 0, false },
+			BarrierPath:  func(string, int64) (string, error) { return gracefulBarrierPath, nil },
+		}, func(AtomicCoordSwapInputs, io.Writer) (AtomicCoordSwapResult, error) {
+			t.Error("AtomicCoordSwap must not run on a pre-barrier failure")
+			return AtomicCoordSwapResult{}, nil
+		})
+		if _, err := GracefulCoordSwap(oldRec, newRec, gracefulDocPath, 0,
+			func() (*agent.Record, error) { return nil, nil }, io.Discard); err == nil {
+			t.Fatal("want error from a pre-barrier epoch failure")
+		}
+		if got := state.ReadCoordSpawnMarker(oldRec.Project); got != oldRec.ID {
+			t.Fatalf("marker = %q after pre-retire failure, want rollback to OLD %q", got, oldRec.ID)
+		}
+	})
+
+	t.Run("retire-phase failure leaves marker to AtomicCoordSwap", func(t *testing.T) {
+		seedEagerMarker(t)
+		rec := newGracefulRecorder()
+		swapSeams(t, GracefulHandoffDeps{
+			WriteAtomic:  rec.write,
+			CurrentEpoch: func(string) (int64, bool) { return 7, true },
+			BarrierPath:  func(string, int64) (string, error) { return gracefulBarrierPath, nil },
+		}, func(AtomicCoordSwapInputs, io.Writer) (AtomicCoordSwapResult, error) {
+			// Simulates a post-commit swap failure (e.g. ErrOrphanSurvived):
+			// the marker legitimately stays at NEW; the graceful layer must
+			// not clobber AtomicCoordSwap's own marker handling.
+			return AtomicCoordSwapResult{}, errors.New("orphan survived")
+		})
+		if _, err := GracefulCoordSwap(oldRec, newRec, gracefulDocPath, 0,
+			func() (*agent.Record, error) { return nil, nil }, io.Discard); err == nil {
+			t.Fatal("want error from a retire-phase failure")
+		}
+		if got := state.ReadCoordSpawnMarker(oldRec.Project); got != newRec.ID {
+			t.Fatalf("marker = %q after retire-phase failure, want untouched %q (AtomicCoordSwap owns it)", got, newRec.ID)
+		}
+	})
+
+	t.Run("delivery failure leaves committed marker at NEW", func(t *testing.T) {
+		seedEagerMarker(t)
+		rec := newGracefulRecorder()
+		swapSeams(t, GracefulHandoffDeps{
+			WriteAtomic:  rec.write,
+			CurrentEpoch: func(string) (int64, bool) { return 7, true },
+			BarrierPath:  func(string, int64) (string, error) { return gracefulBarrierPath, nil },
+		}, func(AtomicCoordSwapInputs, io.Writer) (AtomicCoordSwapResult, error) {
+			return AtomicCoordSwapResult{}, nil // swap committed
+		})
+		if _, err := GracefulCoordSwap(oldRec, newRec, gracefulDocPath, 0,
+			func() (*agent.Record, error) { return nil, errors.New("owner poll timed out") },
+			io.Discard); err == nil {
+			t.Fatal("want error from a delivery failure")
+		}
+		if got := state.ReadCoordSpawnMarker(oldRec.Project); got != newRec.ID {
+			t.Fatalf("marker = %q after delivery failure, want committed %q", got, newRec.ID)
+		}
+	})
+
+	t.Run("pre-retire failure with marker elsewhere is left alone", func(t *testing.T) {
+		// A concurrent takeover (or no eager write) means the marker does
+		// NOT point at NEW — the CAS guard must not clobber it.
+		if err := state.WriteCoordSpawnMarker(oldRec.Project, "thirdcoord1"); err != nil {
+			t.Fatalf("seed third-party marker: %v", err)
+		}
+		rec := newGracefulRecorder()
+		swapSeams(t, GracefulHandoffDeps{
+			WriteAtomic:  rec.write,
+			CurrentEpoch: func(string) (int64, bool) { return 0, false },
+			BarrierPath:  func(string, int64) (string, error) { return gracefulBarrierPath, nil },
+		}, func(AtomicCoordSwapInputs, io.Writer) (AtomicCoordSwapResult, error) {
+			t.Error("AtomicCoordSwap must not run on a pre-barrier failure")
+			return AtomicCoordSwapResult{}, nil
+		})
+		if _, err := GracefulCoordSwap(oldRec, newRec, gracefulDocPath, 0,
+			func() (*agent.Record, error) { return nil, nil }, io.Discard); err == nil {
+			t.Fatal("want error from a pre-barrier epoch failure")
+		}
+		if got := state.ReadCoordSpawnMarker(oldRec.Project); got != "thirdcoord1" {
+			t.Fatalf("marker = %q, want third-party marker left alone", got)
+		}
+	})
 }

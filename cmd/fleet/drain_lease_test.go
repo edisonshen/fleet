@@ -33,14 +33,16 @@ import (
 	"github.com/edisonshen/fleet/internal/coordlock"
 	"github.com/edisonshen/fleet/internal/queue"
 	"github.com/edisonshen/fleet/internal/state"
+	"github.com/edisonshen/fleet/internal/testutil/tmuxtest"
 )
 
 func leaseDrainReq() queue.SpawnFresh {
 	return queue.SpawnFresh{
-		OldAgentID: "oldcoord1",
-		Project:    "projects-fleet",
-		TaskID:     "coord",
-		HandoffDoc: "/tmp/doc.md",
+		SchemaVersion: queue.SchemaVersion,
+		OldAgentID:    "oldcoord1",
+		Project:       "projects-fleet",
+		TaskID:        "coord",
+		HandoffDoc:    "/tmp/doc.md",
 	}
 }
 
@@ -75,11 +77,12 @@ func TestDrainLease_StandDownStaleQueueUnderLiveLeader(t *testing.T) {
 	var killed, resumed int32
 	out := &bytes.Buffer{}
 	d := drainLeaseDeps{
-		LeaderPresent: func(string) bool { return true },
-		CurrentEpoch:  func(string) (int64, bool) { return 5, true },
-		BarrierExists: func(string, int64) bool { return false },
-		LoadAgent:     func(string) (*agent.Record, error) { return nil, state.ErrNotFound }, // OLD archived
-		KillCoord:     func(coord.KillTarget) error { atomic.AddInt32(&killed, 1); return nil },
+		DeliverPending: func(queue.SpawnFresh, *agent.Record, io.Writer, io.Writer) error { return nil },
+		LeaderPresent:  func(string) bool { return true },
+		CurrentEpoch:   func(string) (int64, bool) { return 5, true },
+		BarrierExists:  func(string, int64) bool { return false },
+		LoadAgent:      func(string) (*agent.Record, error) { return nil, state.ErrNotFound }, // OLD archived
+		KillCoord:      func(coord.KillTarget) error { atomic.AddInt32(&killed, 1); return nil },
 		Resume: func(queue.SpawnFresh, string, int, io.Writer, io.Writer) error {
 			atomic.AddInt32(&resumed, 1)
 			return nil
@@ -109,9 +112,10 @@ func TestDrainLease_LiveLeaderPendingHandoff_FallsBackToResume(t *testing.T) {
 	var resumed, locked int32
 	out := &bytes.Buffer{}
 	d := drainLeaseDeps{
-		LeaderPresent: func(string) bool { return true },
-		CurrentEpoch:  func(string) (int64, bool) { return 5, true },
-		BarrierExists: func(string, int64) bool { return false }, // graceful producer never ran
+		DeliverPending: func(queue.SpawnFresh, *agent.Record, io.Writer, io.Writer) error { return nil },
+		LeaderPresent:  func(string) bool { return true },
+		CurrentEpoch:   func(string) (int64, bool) { return 5, true },
+		BarrierExists:  func(string, int64) bool { return false }, // graceful producer never ran
 		// OLD stays the active owner so the poll doesn't early-break — it polls
 		// the (absent) barrier to the budget, then falls back to legacy Resume.
 		ActiveOwnerPID: func(string) (int, bool) { return 424242, true },
@@ -143,7 +147,7 @@ func TestDrainLease_LiveLeaderPendingHandoff_FallsBackToResume(t *testing.T) {
 // path (wait for OLD's self-release), NOT spawn a second successor via legacy
 // Resume.
 func TestDrainLease_LiveLeaderBarrierAppearsMidPoll_NoDuplicateResume(t *testing.T) {
-	var resumed, barrierReads int32
+	var resumed, barrierReads, delivered int32
 	out := &bytes.Buffer{}
 	d := drainLeaseDeps{
 		LeaderPresent: func(string) bool { return true },
@@ -162,7 +166,11 @@ func TestDrainLease_LiveLeaderBarrierAppearsMidPoll_NoDuplicateResume(t *testing
 			atomic.AddInt32(&resumed, 1)
 			return nil
 		},
-		LockAgent:   func(string) (func(), error) { return func() {}, nil },
+		LockAgent: func(string) (func(), error) { return func() {}, nil },
+		DeliverPending: func(queue.SpawnFresh, *agent.Record, io.Writer, io.Writer) error {
+			atomic.AddInt32(&delivered, 1)
+			return nil
+		},
 		BarrierPoll: time.Millisecond,
 	}
 	if err := drainOneLeaseAwareWith(leaseDrainReq(), existingQueuePath(t), 0, 1000, out, out, d); err != nil {
@@ -170,6 +178,9 @@ func TestDrainLease_LiveLeaderBarrierAppearsMidPoll_NoDuplicateResume(t *testing
 	}
 	if atomic.LoadInt32(&resumed) != 0 {
 		t.Errorf("legacy Resume ran %d times — barrier appeared, should have finished graceful path (no duplicate)", resumed)
+	}
+	if atomic.LoadInt32(&delivered) != 1 {
+		t.Errorf("pending doc delivered %d times before queue clean, want 1 (codex PR3-completion iter-2 [P1])", delivered)
 	}
 }
 
@@ -183,6 +194,7 @@ func TestDrainLease_SuccessorAlreadyLeads_NoDuplicateSpawn(t *testing.T) {
 	var resumed int32
 	out := &bytes.Buffer{}
 	d := drainLeaseDeps{
+		DeliverPending: func(queue.SpawnFresh, *agent.Record, io.Writer, io.Writer) error { return nil },
 		LeaderPresent:  func(string) bool { return true },                                 // the SUCCESSOR is healthy
 		CurrentEpoch:   func(string) (int64, bool) { return 6, true },                     // successor's new epoch
 		BarrierExists:  func(string, int64) bool { return false },                         // no barrier at epoch 6 (OLD's was epoch 5)
@@ -220,6 +232,7 @@ func TestDrainLease_LiveLeaderFallback_CrashedSuccessorNotCompletion(t *testing.
 	// LeaderPresent reads occur.
 	var leaderReads int32
 	d := drainLeaseDeps{
+		DeliverPending: func(queue.SpawnFresh, *agent.Record, io.Writer, io.Writer) error { return nil },
 		LeaderPresent:  func(string) bool { return atomic.AddInt32(&leaderReads, 1) == 1 },
 		CurrentEpoch:   func(string) (int64, bool) { return 6, true },
 		BarrierExists:  func(string, int64) bool { return false },
@@ -249,11 +262,12 @@ func TestDrainLease_NoBarrierNoGracefulKill_Escalates(t *testing.T) {
 	var recoveredID string
 	out := &bytes.Buffer{}
 	d := drainLeaseDeps{
-		LeaderPresent: func(string) bool { return false }, // hung/stealable
-		CurrentEpoch:  func(string) (int64, bool) { return 5, true },
-		BarrierExists: func(string, int64) bool { return false }, // never
-		LoadAgent:     func(string) (*agent.Record, error) { return oldCoordRec(), nil },
-		KillCoord:     func(coord.KillTarget) error { atomic.AddInt32(&killed, 1); return nil },
+		DeliverPending: func(queue.SpawnFresh, *agent.Record, io.Writer, io.Writer) error { return nil },
+		LeaderPresent:  func(string) bool { return false }, // hung/stealable
+		CurrentEpoch:   func(string) (int64, bool) { return 5, true },
+		BarrierExists:  func(string, int64) bool { return false }, // never
+		LoadAgent:      func(string) (*agent.Record, error) { return oldCoordRec(), nil },
+		KillCoord:      func(coord.KillTarget) error { atomic.AddInt32(&killed, 1); return nil },
 		TakeOver: func(string, string) (bool, error) {
 			atomic.AddInt32(&tookOver, 1)
 			return true, nil
@@ -307,11 +321,12 @@ func TestDrainLease_ConcurrentRecovery_NoDuplicate(t *testing.T) {
 	// The queue file is ALREADY gone (a peer drain deleted it after recovering).
 	gonePath := filepath.Join(t.TempDir(), "already-deleted.json")
 	d := drainLeaseDeps{
-		LeaderPresent: func(string) bool { return false },
-		CurrentEpoch:  func(string) (int64, bool) { return 5, true },
-		BarrierExists: func(string, int64) bool { return false },
-		LoadAgent:     func(string) (*agent.Record, error) { return oldCoordRec(), nil },
-		TakeOver:      func(string, string) (bool, error) { atomic.AddInt32(&tookOver, 1); return true, nil },
+		DeliverPending: func(queue.SpawnFresh, *agent.Record, io.Writer, io.Writer) error { return nil },
+		LeaderPresent:  func(string) bool { return false },
+		CurrentEpoch:   func(string) (int64, bool) { return 5, true },
+		BarrierExists:  func(string, int64) bool { return false },
+		LoadAgent:      func(string) (*agent.Record, error) { return oldCoordRec(), nil },
+		TakeOver:       func(string, string) (bool, error) { atomic.AddInt32(&tookOver, 1); return true, nil },
 		RecoverSpawn: func(*agent.Record, string, string, bool, io.Writer, io.Writer) error {
 			atomic.AddInt32(&recovered, 1)
 			return nil
@@ -338,10 +353,11 @@ func TestDrainLease_HungOldEscalatesToTakeOver(t *testing.T) {
 	out := &bytes.Buffer{}
 	done := make(chan error, 1)
 	d := drainLeaseDeps{
-		LeaderPresent: func(string) bool { return false },
-		CurrentEpoch:  func(string) (int64, bool) { return 9, true },
-		BarrierExists: func(string, int64) bool { return false },
-		LoadAgent:     func(string) (*agent.Record, error) { return oldCoordRec(), nil },
+		DeliverPending: func(queue.SpawnFresh, *agent.Record, io.Writer, io.Writer) error { return nil },
+		LeaderPresent:  func(string) bool { return false },
+		CurrentEpoch:   func(string) (int64, bool) { return 9, true },
+		BarrierExists:  func(string, int64) bool { return false },
+		LoadAgent:      func(string) (*agent.Record, error) { return oldCoordRec(), nil },
 		TakeOver: func(project, _ string) (bool, error) {
 			tookOverProject = project
 			return true, nil // takeover acquired -> OLD confirmed gone
@@ -384,9 +400,10 @@ func TestDrainLease_TakeoverRecovery_HonorsQueueAutoResumeOverride(t *testing.T)
 	req := leaseDrainReq()
 	req.DisableAutoResume = &disable
 	d := drainLeaseDeps{
-		LeaderPresent: func(string) bool { return false },
-		CurrentEpoch:  func(string) (int64, bool) { return 9, true },
-		BarrierExists: func(string, int64) bool { return false },
+		DeliverPending: func(queue.SpawnFresh, *agent.Record, io.Writer, io.Writer) error { return nil },
+		LeaderPresent:  func(string) bool { return false },
+		CurrentEpoch:   func(string) (int64, bool) { return 9, true },
+		BarrierExists:  func(string, int64) bool { return false },
 		LoadAgent: func(string) (*agent.Record, error) {
 			r := oldCoordRec()
 			r.DisableAutoResume = false // baseline DIFFERS from the override
@@ -425,11 +442,12 @@ func TestDrainLease_BareCoordRoutesToLegacyResume_NoDuplicate(t *testing.T) {
 	bareRec.TaskID = "coord"
 	// SupervisorPID intentionally 0 -> bare coord (never coord-run-wrapped).
 	d := drainLeaseDeps{
-		LeaderPresent: func(string) bool { return false }, // released epoch, no healthy leader
-		CurrentEpoch:  func(string) (int64, bool) { return 9, true },
-		BarrierExists: func(string, int64) bool { return false },
-		LoadAgent:     func(string) (*agent.Record, error) { return bareRec, nil },
-		LockAgent:     func(string) (func(), error) { return func() {}, nil },
+		DeliverPending: func(queue.SpawnFresh, *agent.Record, io.Writer, io.Writer) error { return nil },
+		LeaderPresent:  func(string) bool { return false }, // released epoch, no healthy leader
+		CurrentEpoch:   func(string) (int64, bool) { return 9, true },
+		BarrierExists:  func(string, int64) bool { return false },
+		LoadAgent:      func(string) (*agent.Record, error) { return bareRec, nil },
+		LockAgent:      func(string) (func(), error) { return func() {}, nil },
 		Resume: func(queue.SpawnFresh, string, int, io.Writer, io.Writer) error {
 			atomic.AddInt32(&resumed, 1)
 			return nil
@@ -479,7 +497,8 @@ func TestDrainLease_GracefulKillRefusalSurfaced(t *testing.T) {
 			target = kt
 			return refusal
 		},
-		BarrierPoll: time.Millisecond,
+		DeliverPending: func(queue.SpawnFresh, *agent.Record, io.Writer, io.Writer) error { return nil },
+		BarrierPoll:    time.Millisecond,
 	}
 	err := drainOneLeaseAwareWith(leaseDrainReq(), "/tmp/q.json", 0, 1000, out, out, d)
 	if err == nil || !errors.Is(err, refusal) {
@@ -499,10 +518,12 @@ func TestDrainLease_GracefulKillRefusalSurfaced(t *testing.T) {
 // gone) — clean the queue, no kill, no error.
 func TestDrainLease_GracefulOldAlreadyArchived(t *testing.T) {
 	out := &bytes.Buffer{}
-	var killed int32
+	var killed, delivered int32
 	// OLD archived AND a successor holds the lease -> genuinely complete: clean
 	// the queue, no kill. (codex PR3 iter-14 [P1]: a confirmed successor, not
-	// merely OLD's archive, is what proves completion.)
+	// merely OLD's archive, is what proves completion.) The still-pending doc
+	// is delivered to the successor BEFORE the queue is cleaned (codex
+	// PR3-completion iter-2 [P1]); OLD is archived so the policy record is nil.
 	d := drainLeaseDeps{
 		LeaderPresent:  func(string) bool { return true },
 		CurrentEpoch:   func(string) (int64, bool) { return 5, true },
@@ -510,7 +531,17 @@ func TestDrainLease_GracefulOldAlreadyArchived(t *testing.T) {
 		ActiveOwnerPID: func(string) (int, bool) { return 555555, true }, // successor leads
 		LoadAgent:      func(string) (*agent.Record, error) { return nil, state.ErrNotFound },
 		KillCoord:      func(coord.KillTarget) error { atomic.AddInt32(&killed, 1); return nil },
-		BarrierPoll:    time.Millisecond,
+		DeliverPending: func(req queue.SpawnFresh, oldRec *agent.Record, _, _ io.Writer) error {
+			atomic.AddInt32(&delivered, 1)
+			if oldRec != nil {
+				t.Errorf("delivery got oldRec %+v, want nil (OLD archived)", oldRec)
+			}
+			if req.HandoffDoc != leaseDrainReq().HandoffDoc {
+				t.Errorf("delivery doc = %q, want %q", req.HandoffDoc, leaseDrainReq().HandoffDoc)
+			}
+			return nil
+		},
+		BarrierPoll: time.Millisecond,
 	}
 	qp := existingQueuePath(t)
 	if err := drainOneLeaseAwareWith(leaseDrainReq(), qp, 0, 1000, out, out, d); err != nil {
@@ -518,6 +549,9 @@ func TestDrainLease_GracefulOldAlreadyArchived(t *testing.T) {
 	}
 	if atomic.LoadInt32(&killed) != 0 {
 		t.Errorf("kill ran %d times though OLD was already archived", killed)
+	}
+	if atomic.LoadInt32(&delivered) != 1 {
+		t.Errorf("pending doc delivered %d times before queue clean, want 1", delivered)
 	}
 	if _, statErr := os.Stat(qp); !errors.Is(statErr, os.ErrNotExist) {
 		t.Errorf("queue must be deleted when archived OLD has a confirmed successor")
@@ -534,6 +568,7 @@ func TestDrainLease_GracefulOldArchivedNoSuccessor_PreservesQueue(t *testing.T) 
 	out := &bytes.Buffer{}
 	var killed int32
 	d := drainLeaseDeps{
+		DeliverPending: func(queue.SpawnFresh, *agent.Record, io.Writer, io.Writer) error { return nil },
 		LeaderPresent:  func(string) bool { return true },
 		CurrentEpoch:   func(string) (int64, bool) { return 5, true },
 		BarrierExists:  func(string, int64) bool { return true },
@@ -561,7 +596,7 @@ func TestDrainLease_GracefulOldArchivedNoSuccessor_PreservesQueue(t *testing.T) 
 // complete and the queue is cleaned — no kill, no escalation.
 func TestDrainLease_GracefulWaitsForSelfRelease(t *testing.T) {
 	out := &bytes.Buffer{}
-	var killed, tookOver int32
+	var killed, tookOver, delivered int32
 	// OLD is the active owner for the first two reads, then a SUCCESSOR (a
 	// DIFFERENT pid) acquires the freed flock. Completion requires a confirmed
 	// successor owner, not merely OLD's absence (codex PR3 iter-14 [P1]).
@@ -577,9 +612,13 @@ func TestDrainLease_GracefulWaitsForSelfRelease(t *testing.T) {
 			}
 			return successorPid, true // standby acquired the freed lease
 		},
-		LoadAgent:   func(string) (*agent.Record, error) { return oldCoordRec(), nil },
-		KillCoord:   func(coord.KillTarget) error { atomic.AddInt32(&killed, 1); return nil },
-		TakeOver:    func(string, string) (bool, error) { atomic.AddInt32(&tookOver, 1); return true, nil },
+		LoadAgent: func(string) (*agent.Record, error) { return oldCoordRec(), nil },
+		KillCoord: func(coord.KillTarget) error { atomic.AddInt32(&killed, 1); return nil },
+		TakeOver:  func(string, string) (bool, error) { atomic.AddInt32(&tookOver, 1); return true, nil },
+		DeliverPending: func(queue.SpawnFresh, *agent.Record, io.Writer, io.Writer) error {
+			atomic.AddInt32(&delivered, 1)
+			return nil
+		},
 		BarrierPoll: time.Millisecond,
 	}
 	err := drainOneLeaseAwareWith(leaseDrainReq(), "/tmp/q.json", 0, 1000, out, out, d)
@@ -591,6 +630,9 @@ func TestDrainLease_GracefulWaitsForSelfRelease(t *testing.T) {
 	}
 	if atomic.LoadInt32(&tookOver) != 0 {
 		t.Errorf("escalated to takeover %d times — successor acquired cleanly, no escalation needed", tookOver)
+	}
+	if atomic.LoadInt32(&delivered) != 1 {
+		t.Errorf("pending doc delivered %d times before queue clean, want 1 (codex PR3-completion iter-2 [P1])", delivered)
 	}
 	if !strings.Contains(out.String(), "successor pid 555555 acquired") {
 		t.Errorf("expected confirmed-successor completion message, got: %q", out.String())
@@ -607,8 +649,9 @@ func TestDrainLease_GracefulOldReleasedNoSuccessor_Escalates(t *testing.T) {
 	var killed, tookOver, recovered int32
 	var reads int32
 	d := drainLeaseDeps{
-		CurrentEpoch:  func(string) (int64, bool) { return 5, true },
-		BarrierExists: func(string, int64) bool { return true },
+		DeliverPending: func(queue.SpawnFresh, *agent.Record, io.Writer, io.Writer) error { return nil },
+		CurrentEpoch:   func(string) (int64, bool) { return 5, true },
+		BarrierExists:  func(string, int64) bool { return true },
 		ActiveOwnerPID: func(string) (int, bool) {
 			if atomic.AddInt32(&reads, 1) == 1 {
 				return 424242, true // OLD still leader -> enters the self-release wait
@@ -648,8 +691,9 @@ func TestDrainLease_GracefulSuccessorCrashedAfterEpoch_Escalates(t *testing.T) {
 	var tookOver, recovered int32
 	var reads int32
 	d := drainLeaseDeps{
-		CurrentEpoch:  func(string) (int64, bool) { return 5, true },
-		BarrierExists: func(string, int64) bool { return true },
+		DeliverPending: func(queue.SpawnFresh, *agent.Record, io.Writer, io.Writer) error { return nil },
+		CurrentEpoch:   func(string) (int64, bool) { return 5, true },
+		BarrierExists:  func(string, int64) bool { return true },
 		// OLD active on first read (enters self-release wait); then a DIFFERENT
 		// pid owns the active epoch — but it crashed, so LeaderPresent=false.
 		ActiveOwnerPID: func(string) (int, bool) {
@@ -688,8 +732,9 @@ func TestDrainLease_GracefulOldHoldsLeasePastBudget_Escalates(t *testing.T) {
 	var tookOver int32
 	var recovered int32
 	d := drainLeaseDeps{
-		CurrentEpoch:  func(string) (int64, bool) { return 5, true },
-		BarrierExists: func(string, int64) bool { return true },
+		DeliverPending: func(queue.SpawnFresh, *agent.Record, io.Writer, io.Writer) error { return nil },
+		CurrentEpoch:   func(string) (int64, bool) { return 5, true },
+		BarrierExists:  func(string, int64) bool { return true },
 		// OLD holds the lease past the budget; after TakeOver fences+kills it the
 		// lease is free with no successor (the post-takeover re-check sees !ok),
 		// so RecoverSpawn brings up a replacement.
@@ -728,11 +773,12 @@ func TestDrainLease_TakeoverNotAcquired_NoRecoverSpawn(t *testing.T) {
 	out := &bytes.Buffer{}
 	var recovered int32
 	d := drainLeaseDeps{
-		LeaderPresent: func(string) bool { return false },
-		CurrentEpoch:  func(string) (int64, bool) { return 5, true },
-		BarrierExists: func(string, int64) bool { return false },
-		LoadAgent:     func(string) (*agent.Record, error) { return oldCoordRec(), nil },
-		TakeOver:      func(string, string) (bool, error) { return false, nil }, // did NOT acquire
+		DeliverPending: func(queue.SpawnFresh, *agent.Record, io.Writer, io.Writer) error { return nil },
+		LeaderPresent:  func(string) bool { return false },
+		CurrentEpoch:   func(string) (int64, bool) { return 5, true },
+		BarrierExists:  func(string, int64) bool { return false },
+		LoadAgent:      func(string) (*agent.Record, error) { return oldCoordRec(), nil },
+		TakeOver:       func(string, string) (bool, error) { return false, nil }, // did NOT acquire
 		RecoverSpawn: func(*agent.Record, string, string, bool, io.Writer, io.Writer) error {
 			atomic.AddInt32(&recovered, 1)
 			return nil
@@ -757,6 +803,7 @@ func TestDrainLease_NoEpochColdSpawnsViaResume(t *testing.T) {
 	var resumed, tookOver int32
 	var locked int32
 	d := drainLeaseDeps{
+		DeliverPending: func(queue.SpawnFresh, *agent.Record, io.Writer, io.Writer) error { return nil },
 		LeaderPresent:  func(string) bool { return false },
 		CurrentEpoch:   func(string) (int64, bool) { return 0, false }, // no lease ever held
 		BarrierExists:  func(string, int64) bool { return false },
@@ -937,8 +984,9 @@ func TestDrainLease_GracefulPath_HoldsNoPerAgentLock(t *testing.T) {
 			}
 			return 555555, true
 		},
-		LoadAgent:   func(string) (*agent.Record, error) { return oldCoordRec(), nil },
-		BarrierPoll: 50 * time.Millisecond,
+		LoadAgent:      func(string) (*agent.Record, error) { return oldCoordRec(), nil },
+		DeliverPending: func(queue.SpawnFresh, *agent.Record, io.Writer, io.Writer) error { return nil },
+		BarrierPoll:    50 * time.Millisecond,
 		// LockAgent must NEVER be called on the graceful path; fail loudly if so.
 		LockAgent: func(string) (func(), error) {
 			t.Error("graceful path took the per-agent lock — must be lock-free")
@@ -992,10 +1040,11 @@ func TestDrainLease_TakeoverDoesNotHoldLockAcrossKill(t *testing.T) {
 	var recovered int32
 
 	d := drainLeaseDeps{
-		LeaderPresent: func(string) bool { return false },
-		CurrentEpoch:  func(string) (int64, bool) { return 9, true },
-		BarrierExists: func(string, int64) bool { return false },
-		LoadAgent:     func(string) (*agent.Record, error) { return oldCoordRec(), nil },
+		DeliverPending: func(queue.SpawnFresh, *agent.Record, io.Writer, io.Writer) error { return nil },
+		LeaderPresent:  func(string) bool { return false },
+		CurrentEpoch:   func(string) (int64, bool) { return 9, true },
+		BarrierExists:  func(string, int64) bool { return false },
+		LoadAgent:      func(string) (*agent.Record, error) { return oldCoordRec(), nil },
 		// REAL per-agent lock — the same primitive coord.Cleanup's archive uses.
 		LockAgent: state.LockAgent,
 		TakeOver: func(string, string) (bool, error) {
@@ -1217,5 +1266,252 @@ func TestDeliverRecoverResumePrompt_LockOwner_AtMostOnce(t *testing.T) {
 	}
 	if sends != 1 {
 		t.Fatalf("lock-owner resume prompt sent %d times, want exactly 1 (at-most-once)", sends)
+	}
+}
+
+// codex PR3-completion iter-2 [P1]: the barrier proves doc DURABILITY, not
+// DELIVERY. A GracefulCoordSwap completion that failed/crashed between
+// retiring OLD and injecting the doc leaves the queue as the only durable
+// "successor never got its prompt" signal. drainGraceful must deliver the
+// pending doc to the confirmed healthy successor BEFORE queue.Delete — and a
+// delivery failure must PRESERVE the queue (next pass retries; at-most-once
+// sentinel dedupes), never silently consume the only recovery request.
+func TestDrainLease_GracefulDeliveryFails_PreservesQueue(t *testing.T) {
+	out := &bytes.Buffer{}
+	var killed int32
+	wantErr := errors.New("owner readiness never converged")
+	d := drainLeaseDeps{
+		LeaderPresent:  func(string) bool { return true },
+		CurrentEpoch:   func(string) (int64, bool) { return 5, true },
+		BarrierExists:  func(string, int64) bool { return true },
+		ActiveOwnerPID: func(string) (int, bool) { return 555555, true }, // successor leads
+		LoadAgent:      func(string) (*agent.Record, error) { return nil, state.ErrNotFound },
+		KillCoord:      func(coord.KillTarget) error { atomic.AddInt32(&killed, 1); return nil },
+		DeliverPending: func(queue.SpawnFresh, *agent.Record, io.Writer, io.Writer) error {
+			return wantErr
+		},
+		BarrierPoll: time.Millisecond,
+	}
+	qp := existingQueuePath(t)
+	err := drainOneLeaseAwareWith(leaseDrainReq(), qp, 0, 1000, out, out, d)
+	if !errors.Is(err, wantErr) {
+		t.Fatalf("delivery failure not surfaced (want errors.Is): %v", err)
+	}
+	if _, statErr := os.Stat(qp); statErr != nil {
+		t.Errorf("queue must be PRESERVED on a delivery failure (it is the only durable inbox): %v", statErr)
+	}
+	if atomic.LoadInt32(&killed) != 0 {
+		t.Errorf("kill ran %d times though OLD was already archived", killed)
+	}
+}
+
+// codex PR3-completion iter-3 [P1]: a GracefulCoordSwap that retired OLD but
+// FAILED delivery leaves the queue pending; once the standby acquires, the
+// epoch advances so a later drain MISSES OLD's barrier and routes through
+// drainLiveLeaderFallback's "OLD archived -> stale queue" stand-down. That
+// cleanup must deliver the pending doc to the live leader BEFORE deleting
+// the queue (the queue is the only durable inbox), and a delivery failure
+// must preserve it.
+func TestDrainLease_MissedBarrierStandDown_DeliversBeforeClean(t *testing.T) {
+	out := &bytes.Buffer{}
+	var delivered int32
+	d := drainLeaseDeps{
+		LeaderPresent: func(string) bool { return true },
+		CurrentEpoch:  func(string) (int64, bool) { return 6, true }, // successor's NEW epoch
+		BarrierExists: func(string, int64) bool { return false },     // OLD's epoch-5 barrier missed
+		LoadAgent:     func(string) (*agent.Record, error) { return nil, state.ErrNotFound },
+		DeliverPending: func(req queue.SpawnFresh, oldRec *agent.Record, _, _ io.Writer) error {
+			atomic.AddInt32(&delivered, 1)
+			if oldRec != nil {
+				t.Errorf("delivery got oldRec %+v, want nil (OLD archived)", oldRec)
+			}
+			return nil
+		},
+		BarrierPoll: time.Millisecond,
+	}
+	qp := existingQueuePath(t)
+	if err := drainOneLeaseAwareWith(leaseDrainReq(), qp, 0, 50, out, out, d); err != nil {
+		t.Fatalf("missed-barrier stand-down should complete cleanly, got %v", err)
+	}
+	if atomic.LoadInt32(&delivered) != 1 {
+		t.Errorf("pending doc delivered %d times before the stale-queue clean, want 1", delivered)
+	}
+	if _, statErr := os.Stat(qp); !errors.Is(statErr, os.ErrNotExist) {
+		t.Errorf("queue must be deleted after a successful deliver-then-clean")
+	}
+}
+
+func TestDrainLease_MissedBarrierStandDown_DeliveryFailurePreservesQueue(t *testing.T) {
+	out := &bytes.Buffer{}
+	wantErr := errors.New("owner readiness never converged")
+	d := drainLeaseDeps{
+		LeaderPresent: func(string) bool { return true },
+		CurrentEpoch:  func(string) (int64, bool) { return 6, true },
+		BarrierExists: func(string, int64) bool { return false },
+		LoadAgent:     func(string) (*agent.Record, error) { return nil, state.ErrNotFound },
+		DeliverPending: func(queue.SpawnFresh, *agent.Record, io.Writer, io.Writer) error {
+			return wantErr
+		},
+		BarrierPoll: time.Millisecond,
+	}
+	qp := existingQueuePath(t)
+	err := drainOneLeaseAwareWith(leaseDrainReq(), qp, 0, 50, out, out, d)
+	if !errors.Is(err, wantErr) {
+		t.Fatalf("delivery failure not surfaced (want errors.Is): %v", err)
+	}
+	if _, statErr := os.Stat(qp); statErr != nil {
+		t.Errorf("queue must be PRESERVED on a delivery failure: %v", statErr)
+	}
+}
+
+// codex PR3-completion iter-4 [P2]: when OLD is already archived, the
+// drain delivery paths must recover the inherited DisableAutoResume baseline
+// from the ARCHIVE — an opt-out handoff (no queue override) must not get a
+// resume prompt typed into a successor that was meant to stay idle.
+func TestDrainGracefulDeliverPending_ArchivedOldPolicy_NoPrompt(t *testing.T) {
+	t.Setenv("FLEET_HOME", t.TempDir())
+	if _, err := state.Bootstrap(); err != nil {
+		t.Fatalf("bootstrap: %v", err)
+	}
+	const project = "projects-fleet"
+	if _, err := state.EnsureProjectInitialized(project); err != nil {
+		t.Fatalf("EnsureProjectInitialized: %v", err)
+	}
+
+	// OLD opted out of auto-resume, then was archived (its retire completed).
+	old := agent.New("oldcoord1")
+	old.Project = project
+	old.TaskID = "coord"
+	old.DisableAutoResume = true
+	if err := old.Write(); err != nil {
+		t.Fatalf("write old: %v", err)
+	}
+	if err := old.Archive(); err != nil {
+		t.Fatalf("archive old: %v", err)
+	}
+
+	winner := agent.New("winner01")
+	winner.Project = project
+	winner.TmuxSession = "fleet-winner01"
+	if err := winner.Write(); err != nil {
+		t.Fatalf("write winner: %v", err)
+	}
+
+	var sends int
+	origReady := recoverWaitForReadyFn
+	origAlive := recoverSessionAliveFn
+	origPrompt := recoverSendPromptVerifiedFn
+	origCurrentOwner := recoverCurrentOwnerFn
+	origMarker := recoverWriteMarkerFn
+	t.Cleanup(func() {
+		recoverWaitForReadyFn = origReady
+		recoverSessionAliveFn = origAlive
+		recoverSendPromptVerifiedFn = origPrompt
+		recoverCurrentOwnerFn = origCurrentOwner
+		recoverWriteMarkerFn = origMarker
+	})
+	recoverWaitForReadyFn = func(string) error { return nil }
+	recoverSessionAliveFn = func(string) (bool, error) { return true, nil }
+	recoverWriteMarkerFn = func(string, string) error { return nil }
+	recoverCurrentOwnerFn = func(string) (coordlock.Owner, bool) {
+		return coordlock.Owner{AgentID: winner.ID, PID: 4242, PidStart: 99}, true
+	}
+	recoverSendPromptVerifiedFn = func(string, string) (bool, error) {
+		sends++
+		return true, nil
+	}
+
+	req := queue.SpawnFresh{
+		SchemaVersion: queue.SchemaVersion,
+		OldAgentID:    old.ID,
+		Project:       project,
+		TaskID:        "coord",
+		HandoffDoc:    "/tmp/handoff.md",
+	}
+	if err := drainGracefulDeliverPending(req, nil, &bytes.Buffer{}, &bytes.Buffer{}); err != nil {
+		t.Fatalf("delivery with archived opt-out OLD: %v", err)
+	}
+	if sends != 0 {
+		t.Fatalf("resume prompt sent %d times for an opt-out handoff (archived baseline ignored), want 0", sends)
+	}
+
+	// Control: an explicit queue override back to auto-resume DOES prompt.
+	override := false
+	req.DisableAutoResume = &override
+	if err := drainGracefulDeliverPending(req, nil, &bytes.Buffer{}, &bytes.Buffer{}); err != nil {
+		t.Fatalf("delivery with auto-resume override: %v", err)
+	}
+	if sends != 1 {
+		t.Fatalf("resume prompt sent %d times with the auto-resume override, want 1", sends)
+	}
+}
+
+// codex PR3-completion iter-6 [P2]: v1 (schema_version < 2) queues predate
+// auto-resume; Resume/resumeHandoff never type a resume prompt for them. The
+// drain delivery path must agree — cleaning a lingering v1 queue must NOT
+// send a prompt. The suppression is a TRANSIENT send gate in
+// drainGracefulDeliverPending; effectiveDisableAutoResume itself stays a
+// pure BASELINE resolver because its value is persisted into a recovered
+// successor's record by RecoverSpawn (codex iter-10 [P2]).
+func TestDrainGracefulDeliverPending_LegacySchemaNeverPrompts(t *testing.T) {
+	// Every tmux-reaching function var is stubbed below, so this test
+	// never touches a real server — but isolate the socket anyway
+	// (tmuxtest.IsolateSocket, NOT RequireTmux: no skip on tmux-less CI)
+	// so a future stub removal fails loudly instead of leaking onto the
+	// operator's default tmux server. Also satisfies
+	// scripts/lint-test-isolation.sh, whose `Resume(` trigger matches
+	// the effectiveDisableAutoResume call at the end of this test.
+	tmuxtest.IsolateSocket(t)
+	t.Setenv("FLEET_HOME", t.TempDir())
+	if _, err := state.Bootstrap(); err != nil {
+		t.Fatalf("bootstrap: %v", err)
+	}
+	const project = "projects-fleet"
+	if _, err := state.EnsureProjectInitialized(project); err != nil {
+		t.Fatalf("EnsureProjectInitialized: %v", err)
+	}
+	winner := agent.New("winner02")
+	winner.Project = project
+	winner.TmuxSession = "fleet-winner02"
+	if err := winner.Write(); err != nil {
+		t.Fatalf("write winner: %v", err)
+	}
+
+	var sends int
+	origReady := recoverWaitForReadyFn
+	origAlive := recoverSessionAliveFn
+	origPrompt := recoverSendPromptVerifiedFn
+	origCurrentOwner := recoverCurrentOwnerFn
+	origMarker := recoverWriteMarkerFn
+	t.Cleanup(func() {
+		recoverWaitForReadyFn = origReady
+		recoverSessionAliveFn = origAlive
+		recoverSendPromptVerifiedFn = origPrompt
+		recoverCurrentOwnerFn = origCurrentOwner
+		recoverWriteMarkerFn = origMarker
+	})
+	recoverWaitForReadyFn = func(string) error { return nil }
+	recoverSessionAliveFn = func(string) (bool, error) { return true, nil }
+	recoverWriteMarkerFn = func(string, string) error { return nil }
+	recoverCurrentOwnerFn = func(string) (coordlock.Owner, bool) {
+		return coordlock.Owner{AgentID: winner.ID, PID: 4242, PidStart: 99}, true
+	}
+	recoverSendPromptVerifiedFn = func(string, string) (bool, error) {
+		sends++
+		return true, nil
+	}
+
+	req := leaseDrainReq()
+	req.SchemaVersion = 1
+	if err := drainGracefulDeliverPending(req, nil, &bytes.Buffer{}, &bytes.Buffer{}); err != nil {
+		t.Fatalf("v1-queue delivery pass: %v", err)
+	}
+	if sends != 0 {
+		t.Fatalf("resume prompt sent %d times for a v1 queue, want 0 (Resume parity)", sends)
+	}
+	// Baseline resolver must NOT bake the schema gate in (it is persisted by
+	// RecoverSpawn into the successor record — codex iter-10 [P2]).
+	if effectiveDisableAutoResume(req, nil) {
+		t.Error("effectiveDisableAutoResume must stay a pure baseline resolver (no schema gate)")
 	}
 }
