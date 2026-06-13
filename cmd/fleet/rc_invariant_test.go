@@ -1,37 +1,40 @@
-// rc_invariant_test.go pins the A3 CI invariant from
-// docs/DESIGN-rc-listener-lifecycle.md plan-eng-review decisions.
+// rc_invariant_test.go pins the native-model RC invariants
+// (rc-default-native-startup; lineage: the v0.12 A3 CI invariant from
+// docs/DESIGN-rc-listener-lifecycle.md).
 //
-// THE LOAD-BEARING TEST: v0.12 ships the env-gate
-// FLEET_RC_BOOTSTRAP_DISABLED as defense-in-depth on top of the new
-// per-project rc-enabled marker. v0.13 retires the env-gate after
-// marker-gate is field-proven. This test EXPLICITLY UNSETS the env
-// gate, ensures NO markers exist, and asserts zero new
-// `claude remote-control --remote-control-session-name-prefix
-// fleet-coord` listeners spawn across a representative test sweep —
-// proving the marker-gate is sufficient on its own.
+// THE LOAD-BEARING TEST. Native model:
+//
+//   - RC is DEFAULT-ON: with no markers and the env-gate unset, the
+//     attach-flag helpers DO rewrite a coord argv to carry
+//     `--remote-control` — that's the feature.
+//   - The opt-out is honored: the per-project rc-disabled marker
+//     (`fleet rc down`) suppresses the rewrite on every surface.
+//   - Empty/invalid projects never get the flag.
+//   - The FLEET_RC_BOOTSTRAP_DISABLED env-gate (test hygiene) beats
+//     everything, so the test suite can never produce a flagged argv
+//     that something might exec.
+//   - NO CODE PATH SPAWNS A STANDALONE LISTENER. The v0.12 listener
+//     spawner is deleted from production; this test pins the absence
+//     with a pgrep pre/post snapshot. The 5,620-mobile-push incident
+//     class (reviewer loop respawning listeners) is structurally
+//     impossible when nothing can spawn one.
 //
 // Test mechanism:
 //
 //  1. Snapshot pre-state: `pgrep -f 'claude remote-control --remote-
 //     control-session-name-prefix fleet-coord'` (PIDs sorted).
-//  2. Sweep representative dispatch + handoff attach-flag injection
-//     code paths with rc-enabled marker ABSENT and env-gate UNSET.
-//     Assert: argv unchanged (no `--remote-control` injection).
-//  3. Snapshot post-state: same pgrep query.
-//  4. Assert pre == post (zero new listeners).
+//  2. Drive the attach-flag helpers through default-on / opt-out /
+//     empty-project / env-gate cases. Assert rewrite vs pass-through.
+//  3. Snapshot post-state: same pgrep query. Assert no NEW PID
+//     appeared (unrelated legacy listeners exiting mid-test are
+//     tolerated; an appearing one is the violation).
 //
-// This is NOT an exhaustive "run the full suite in a subprocess"
-// test — that would re-shell the host's test binary recursively and
-// timeout the parent. Instead it covers the load-bearing attach-
-// surface gates and trusts each surface's dedicated unit test to
-// pin its own no-spawn invariant. The surfaces tested here:
+// The surfaces covered here:
 //
-//   - injectRemoteControlFlag (dispatch.go) — env-gate-only gate.
 //   - injectRemoteControlFlagProject (dispatch.go) — env-gate AND
-//     marker-gate. The marker-gate-only test path proves the
-//     marker is sufficient even when the env-gate is off.
+//     opt-out gate; used by coord-spawn, recovery, and handoff.
 //   - rc.GateAttachFlag (internal/rc) — same two-layer gate, the
-//     I3 handoffop chokepoint.
+//     handoffop drain chokepoint.
 //
 // Any new attach surface added without going through one of these
 // helpers MUST add a sibling test here.
@@ -46,88 +49,99 @@ import (
 	"github.com/edisonshen/fleet/internal/rc"
 )
 
-// TestRCInvariant_NoListenerSpawnWithoutMarker is THE load-bearing
-// A3 test. With env-gate DISABLED and no markers anywhere, none of
-// the attach surfaces inject `--remote-control` — and therefore no
-// listener can ever be spawned by the production code paths.
-func TestRCInvariant_NoListenerSpawnWithoutMarker(t *testing.T) {
-	withFleetHome := func(t *testing.T) {
-		t.Helper()
-		dir := t.TempDir()
-		t.Setenv("FLEET_HOME", dir)
-		// CRITICAL: env-gate DISABLED. The whole point of this test
-		// is to prove the marker-gate is sufficient WITHOUT the
-		// env-gate. cmd/fleet/main_test.go's TestMain sets this to
-		// "1" globally; t.Setenv overrides for this test's scope.
-		t.Setenv("FLEET_RC_BOOTSTRAP_DISABLED", "")
-	}
-	withFleetHome(t)
+// TestRCInvariant_NativeDefaultOn_OptOutHonored_NoListenerSpawn is THE
+// load-bearing invariant test for the native model.
+func TestRCInvariant_NativeDefaultOn_OptOutHonored_NoListenerSpawn(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("FLEET_HOME", dir)
+	// CRITICAL: env-gate CLEARED. This test proves the opt-out marker
+	// gate is sufficient WITHOUT the env-gate, and that even the
+	// default-on rewrite path cannot spawn a listener (it's argv-only;
+	// the spawner no longer exists). cmd/fleet/main_test.go's TestMain
+	// sets the gate to "1" globally; t.Setenv overrides for this scope.
+	t.Setenv("FLEET_RC_BOOTSTRAP_DISABLED", "")
 
 	// Pre-state pgrep snapshot. Best-effort: pgrep absent / non-zero
-	// exit collapses to empty. The post-state must match exactly.
+	// exit collapses to empty.
 	pre := snapshotListenerPIDs()
 
-	// Sample argvs representative of the production attach surfaces.
 	defaultArgv := []string{"sh", "-c", "claude --print"}
 	sessionName := "fleet-coord-deadbeef-demo"
 
-	// Surface 1: injectRemoteControlFlag (dispatch.go default path,
-	// env-gate ONLY — does NOT consult marker). With env-gate UNSET,
-	// this WOULD inject. The v0.12 promise is that callers route
-	// through injectRemoteControlFlagProject instead (which IS
-	// marker-gated). This test asserts the GATED helper is the only
-	// one wired into the load-bearing dispatch path.
-	//
-	// Validate: with no marker, injectRemoteControlFlagProject must
-	// pass through unchanged.
-	for _, project := range []string{"", "demo", "spark"} {
-		got := injectRemoteControlFlagProject(defaultArgv, sessionName, project)
+	// Invariant 1 — DEFAULT-ON: a valid project with no markers gets
+	// the flag on both surfaces.
+	for _, surface := range []struct {
+		name string
+		fn   func(project string) []string
+	}{
+		{"injectRemoteControlFlagProject", func(p string) []string {
+			return injectRemoteControlFlagProject(defaultArgv, sessionName, p)
+		}},
+		{"rc.GateAttachFlag", func(p string) []string {
+			return rc.GateAttachFlag(p, defaultArgv, sessionName)
+		}},
+	} {
+		got := surface.fn("demo")
+		if sameArgvHelper(got, defaultArgv) {
+			t.Errorf("%s(demo): native default-on MUST inject with no markers; got pass-through %v",
+				surface.name, got)
+		}
+
+		// Invariant 2 — empty project never gets the flag.
+		got = surface.fn("")
 		if !sameArgvHelper(got, defaultArgv) {
-			t.Errorf("injectRemoteControlFlagProject(%q): marker absent + env-gate unset MUST NOT inject; got %v want %v",
-				project, got, defaultArgv)
+			t.Errorf("%s(\"\"): empty project MUST NOT inject; got %v", surface.name, got)
 		}
 	}
 
-	// Surface 2: rc.GateAttachFlag (the I3 chokepoint). Same
-	// invariant: no marker → argv unchanged.
-	for _, project := range []string{"", "demo", "spark"} {
-		got := rc.GateAttachFlag(project, defaultArgv, sessionName)
-		if !sameArgvHelper(got, defaultArgv) {
-			t.Errorf("rc.GateAttachFlag(%q): marker absent MUST NOT inject; got %v want %v",
-				project, got, defaultArgv)
-		}
+	// Invariant 3 — OPT-OUT honored: rc-disabled suppresses on both
+	// surfaces.
+	if err := rc.WriteDisabledMarker("demo"); err != nil {
+		t.Fatalf("WriteDisabledMarker: %v", err)
+	}
+	if got := injectRemoteControlFlagProject(defaultArgv, sessionName, "demo"); !sameArgvHelper(got, defaultArgv) {
+		t.Errorf("injectRemoteControlFlagProject(demo): rc-disabled marker MUST suppress inject; got %v", got)
+	}
+	if got := rc.GateAttachFlag("demo", defaultArgv, sessionName); !sameArgvHelper(got, defaultArgv) {
+		t.Errorf("rc.GateAttachFlag(demo): rc-disabled marker MUST suppress inject; got %v", got)
+	}
+	if err := rc.RemoveDisabledMarker("demo"); err != nil {
+		t.Fatalf("RemoveDisabledMarker: %v", err)
 	}
 
-	// Surface 3: with marker PRESENT, the gates DO inject — the
-	// flow that production callers exercise. This is the positive
-	// branch: it proves the gate isn't broken into permanent off.
-	if err := rc.WriteMarker("demo"); err != nil {
-		t.Fatalf("WriteMarker: %v", err)
+	// Invariant 4 — env-gate beats default-on (the test suite's global
+	// hygiene guarantee).
+	t.Setenv("FLEET_RC_BOOTSTRAP_DISABLED", "1")
+	if got := injectRemoteControlFlagProject(defaultArgv, sessionName, "demo"); !sameArgvHelper(got, defaultArgv) {
+		t.Errorf("injectRemoteControlFlagProject(demo): env-gate MUST suppress inject; got %v", got)
 	}
-	defer func() { _ = rc.RemoveMarker("demo") }()
-
-	got := rc.GateAttachFlag("demo", defaultArgv, sessionName)
-	if sameArgvHelper(got, defaultArgv) {
-		t.Fatalf("rc.GateAttachFlag(demo): marker present + env unset MUST inject; got pass-through %v",
-			got)
+	if got := rc.GateAttachFlag("demo", defaultArgv, sessionName); !sameArgvHelper(got, defaultArgv) {
+		t.Errorf("rc.GateAttachFlag(demo): env-gate MUST suppress inject; got %v", got)
 	}
 
-	// Even with the marker present, we did NOT spawn a real
-	// listener — InjectRemoteControlFlag is argv-only.
-
-	// Post-state pgrep snapshot. The test exercised gate helpers
-	// but no exec.Command-style spawn. PIDs must be unchanged.
+	// Invariant 5 — zero listener spawn. Everything above is argv-only
+	// rewriting; production no longer contains a listener spawner at
+	// all. Assert no NEW PID appears (post ⊆ pre) rather than exact
+	// equality — an unrelated legacy listener on the host exiting
+	// mid-test must not fail the suite (/review specialist note); only
+	// an APPEARING listener is an invariant violation.
 	post := snapshotListenerPIDs()
-	if !equalStringSlice(pre, post) {
-		t.Errorf("listener PID snapshot drifted across test:\npre:  %v\npost: %v\nA3 invariant violation — a code path under test spawned a real `claude remote-control` listener.",
-			pre, post)
+	preSet := map[string]bool{}
+	for _, p := range pre {
+		preSet[p] = true
+	}
+	for _, p := range post {
+		if !preSet[p] {
+			t.Errorf("NEW listener PID %s appeared across test:\npre:  %v\npost: %v\ninvariant violation — a code path under test spawned a real `claude remote-control` listener.",
+				p, pre, post)
+		}
 	}
 }
 
-// snapshotListenerPIDs runs pgrep against the fleet-coord listener
-// argv pattern. Returns sorted PID strings; absent pgrep / no
-// matches → empty slice (both non-failure paths, since the v0.12
-// architecture means "no listeners is the expected state").
+// snapshotListenerPIDs runs pgrep against the legacy fleet-coord
+// listener argv pattern. Returns sorted PID strings; absent pgrep / no
+// matches → empty slice (both non-failure paths — "no listeners" is
+// the only expected state under the native model).
 func snapshotListenerPIDs() []string {
 	cmd := exec.Command("pgrep", "-f",
 		"claude remote-control --remote-control-session-name-prefix fleet-coord")
@@ -146,18 +160,6 @@ func snapshotListenerPIDs() []string {
 	}
 	sort.Strings(pids)
 	return pids
-}
-
-func equalStringSlice(a, b []string) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	for i := range a {
-		if a[i] != b[i] {
-			return false
-		}
-	}
-	return true
 }
 
 func sameArgvHelper(a, b []string) bool {

@@ -178,19 +178,16 @@ EXPECTED_GOLDEN = (
     b"---\n"
     b"\n"
     b"## First Action (auto)\n"
-    b"To re-attach mobile/web pairing for this coord, run in your terminal:\n"
+    b"Mobile/web pairing (Remote Control) is native: this replacement coord\n"
+    b"was spawned with `--remote-control` baked into its claude argv, so\n"
+    b"pairing carries through automatically \xe2\x80\x94 nothing to re-attach. If\n"
+    b"pairing looks broken, check:\n"
     b"\n"
-    b"    fleet rc connect myproj\n"
+    b"    fleet rc status myproj\n"
     b"\n"
-    b"(Or `/remote-control` from within Claude Code.) The pairing resumes\n"
-    b"from where the previous coord left off, provided RC was previously\n"
-    b"enabled via `fleet rc up myproj`.\n"
-    b"\n"
-    b"If RC was not previously enabled, run:\n"
-    b"\n"
-    b"    fleet rc up myproj\n"
-    b"\n"
-    b"first, then `fleet rc connect myproj`.\n"
+    b"If RC was disabled for this project (`fleet rc down myproj`),\n"
+    b"re-enable it with `fleet rc up myproj` \xe2\x80\x94 it takes effect on the\n"
+    b"next coord spawn (`fleet handoff <coord-id>` respawns the live coord).\n"
     b"\n"
     b"Then run the slash command `/coordinator` (in the chat, not bash) to resume the per-project supervisor tick loop. The /coordinator skill is idempotent \xe2\x80\x94 running it on a coord session that already holds the NB-flock is a no-op (the flock skips when held), and on a non-coord lineage it exits cleanly with no project to supervise.\n"
     b"\n"
@@ -254,21 +251,22 @@ class TestRenderByteGolden:
         # the body never has a literal blank section.
         assert handoff.PLACEHOLDER.encode("utf-8") in got
 
-    def test_first_action_carries_fleet_rc_connect(self) -> None:
-        """v0.12 contract: the First Action body directs the operator
-        to run `fleet rc connect <project>` and mentions
-        `/remote-control` parenthetically as the in-session alternative.
-        Bash bootstrap is gone (DESIGN-rc-listener-lifecycle.md §"Handoff
-        doc rewrite"). The byte-golden above covers exact-byte
-        verification; this test gives a focused regression signal.
+    def test_first_action_carries_native_rc_status_note(self) -> None:
+        """Native contract: the First Action body is a status note —
+        pairing is native at coord spawn — with `fleet rc status` as
+        the diagnostic and `fleet rc up` as the re-enable path. The
+        retired `fleet rc connect` must not reappear. The byte-golden
+        above covers exact-byte verification; this test gives a
+        focused regression signal.
         """
         body = handoff.first_action("myproj").encode("utf-8")
         for want in (
-            b"fleet rc connect myproj",
+            b"--remote-control",
+            b"fleet rc status myproj",
             b"fleet rc up myproj",
-            b"`/remote-control`",
         ):
             assert want in body, f"first_action body missing {want!r}"
+        assert b"fleet rc connect" not in body
         # Also confirm the rendered doc carries it.
         ts = datetime(2026, 4, 28, 12, 34, 56, tzinfo=timezone.utc)
         got = handoff._render_doc(
@@ -282,7 +280,7 @@ class TestRenderByteGolden:
             ts=ts,
             recent_activity="x",
         )
-        assert b"fleet rc connect myproj" in got
+        assert b"fleet rc status myproj" in got
 
     def test_first_action_instructs_coordinator_run(self) -> None:
         """handoff-coord-spawn-prompt-fix regression: first_action
@@ -299,15 +297,10 @@ class TestRenderByteGolden:
         # successor agent inspecting the doc understands why running
         # /coordinator on a non-coord lineage is safe.
         assert b"idempotent" in body.encode("utf-8")
-        # Order pin: /remote-control attaches the chat session to the
-        # operator's mobile pairing; that must complete BEFORE
-        # /coordinator's supervisor startup output begins streaming.
-        rc_idx = body.find("`/remote-control`")
-        coord_idx = body.find("`/coordinator`")
-        assert rc_idx >= 0 and coord_idx >= 0
-        assert rc_idx < coord_idx, (
-            f"/remote-control must precede /coordinator: rc={rc_idx} coord={coord_idx}"
-        )
+        # Native model: there is no /remote-control instruction left in
+        # the body — pairing is attached at spawn via the baked-in
+        # --remote-control flag, so the old ordering pin is moot.
+        assert "`/remote-control`" not in body
 
 
 class TestActiveSubagentsRender:
@@ -764,6 +757,52 @@ class TestFindMilestone:
         )
         assert handoff.find_milestone("fleet-abc") is True
 
+    def test_list_bullet_milestone_does_not_match(
+        self, fake_tmux: _FakeTmux,
+    ) -> None:
+        """codex review iter-5 [P2] regression: an agent narrating its
+        plan as a checklist ("- MILESTONE", "* MILESTONE", "• MILESTONE")
+        in response to the request is NOT the terminal signal — only a
+        standalone token (optionally behind the ⏺ turn glyph) commits
+        the handoff."""
+        for bullet in ("- MILESTONE", "* MILESTONE", "• MILESTONE"):
+            fake_tmux.output = (
+                f"{handoff.HANDOFF_REQUESTED}: context window over 50%\n"
+                "plan:\n"
+                f"{bullet}\n"
+            )
+            assert handoff.find_milestone("fleet-abc") is False, bullet
+
+    def test_bare_token_narration_does_not_anchor(
+        self, fake_tmux: _FakeTmux,
+    ) -> None:
+        """codex review iter-5 [P2] regression: a historical bare-token
+        mention of HANDOFF REQUESTED (no colon — not the injected shape)
+        earlier in scrollback must NOT anchor the window; a pre-cycle
+        MILESTONE after it stays excluded until the real injection."""
+        fake_tmux.output = (
+            "the docs mention HANDOFF REQUESTED handling\n"  # narration
+            "MILESTONE\n"                                     # pre-cycle
+            "more work\n"
+            f"{handoff.HANDOFF_REQUESTED}: context window over 50%\n"
+            "agent is wrapping up...\n"
+        )
+        assert handoff.find_milestone("fleet-abc") is False
+
+    def test_ansi_colored_milestone_matches(
+        self, fake_tmux: _FakeTmux,
+    ) -> None:
+        """codex review iter-6 [P2] regression: a colored pane wraps the
+        assistant glyph in SGR codes (`\x1b[33m⏺\x1b[0m MILESTONE`);
+        find_milestone must strip ANSI before matching or auto-yellow
+        stays pending until Red."""
+        fake_tmux.output = (
+            f"{handoff.HANDOFF_REQUESTED}: context window over 50%\n"
+            "wrapping...\n"
+            "\x1b[33m\u23fa\x1b[0m MILESTONE\n"
+        )
+        assert handoff.find_milestone("fleet-abc") is True
+
     def test_no_handoff_requested_in_pane_returns_false(
         self, fake_tmux: _FakeTmux,
     ) -> None:
@@ -812,6 +851,125 @@ class TestFindMilestone:
         assert fake_tmux.calls[0][:5] == [
             "tmux", "capture-pane", "-t", "fleet-deadbeef", "-p",
         ]
+
+    # -- glyph-rendering regression (P0: auto-handoff was fully dead) --------
+    #
+    # THE bug. A MILESTONE-only assistant turn renders in a real Claude Code
+    # tmux pane as `⏺ MILESTONE` (U+23FA turn glyph + space), never a bare
+    # `MILESTONE`. The old `line.strip() == MILESTONE` demanded an exact bare
+    # match, so it NEVER fired on a live pane — the 2026-06 coord climbed to
+    # 52% in auto-yellow with handoff_type never committing. These fixtures
+    # use REAL captured-pane shapes (with the `⏺` glyph + `>`-quoted injected
+    # prompt) so the test protects against rendering drift. Each one FAILS on
+    # the pre-fix code.
+
+    def test_glyph_milestone_after_handoff_requested_matches(
+        self, fake_tmux: _FakeTmux,
+    ) -> None:
+        """REGRESSION: the agent emits a MILESTONE-only turn, which Claude
+        Code renders as `⏺ MILESTONE`. The injected HANDOFF REQUESTED prompt
+        renders as `>`-quoted lines (including a `> MILESTONE` instruction
+        echo). find_milestone must detect the agent's `⏺ MILESTONE` and NOT
+        the injected echo. Pre-fix: returns False (bare-match miss) — handoff
+        never fires. This is the exact live-coord fingerprint."""
+        # Real captured-pane shape: injected user prompt (>-quoted, contains
+        # the instruction's own MILESTONE line), then the agent's turn.
+        fake_tmux.output = (
+            "> HANDOFF REQUESTED: context window is over 50%. Wrap up the\n"
+            ">   current sub-task at the next safe boundary, then on its own\n"
+            ">   line write a single token:\n"
+            ">\n"
+            "> MILESTONE\n"
+            ">\n"
+            "> This signals fleet-guard to write your handoff doc.\n"
+            "\n"
+            "⏺ I've wrapped up the current sub-task. Writing the marker now.\n"
+            "\n"
+            "⏺ MILESTONE\n"
+        )
+        assert handoff.find_milestone("fleet-abc") is True
+
+    def test_glyph_milestone_bare_token_turn_matches(
+        self, fake_tmux: _FakeTmux,
+    ) -> None:
+        """A MILESTONE-only turn with no surrounding prose still renders with
+        the leading turn glyph. Must match."""
+        fake_tmux.output = (
+            f"{handoff.HANDOFF_REQUESTED}: wrap up\n"
+            "⏺ MILESTONE\n"
+        )
+        assert handoff.find_milestone("fleet-abc") is True
+
+    def test_injected_quoted_milestone_echo_does_not_self_trigger(
+        self, fake_tmux: _FakeTmux,
+    ) -> None:
+        """The injected HANDOFF REQUESTED prompt literally CONTAINS a
+        standalone MILESTONE instruction line, rendered `> MILESTONE`. If
+        find_milestone matched `>`-quoted lines it would fire the instant
+        Yellow injects — before the agent ever responds, cutting off active
+        work. Only the injection echo is present here (no agent ⏺ MILESTONE),
+        so the result must be False."""
+        fake_tmux.output = (
+            "> HANDOFF REQUESTED: context window is over 50%. ...token:\n"
+            ">\n"
+            "> MILESTONE\n"
+            ">\n"
+            "> This signals fleet-guard...\n"
+            "\n"
+            "⏺ Understood. Let me finish writing the failing test first\n"
+            "  before I emit the marker.\n"
+        )
+        assert handoff.find_milestone("fleet-abc") is False
+
+    def test_milestone_after_reinjection_still_detected(
+        self, fake_tmux: _FakeTmux,
+    ) -> None:
+        """REGRESSION (windowing): the stuck-pending watchdog re-injects
+        HANDOFF REQUESTED on later fires. The pane then has the agent's valid
+        `⏺ MILESTONE` SANDWICHED before a re-injected HANDOFF REQUESTED.
+        Anchoring the search on the LAST HANDOFF REQUESTED (the pre-fix
+        behavior) windows the valid MILESTONE OUT → handoff never fires. The
+        fix anchors on the FIRST HANDOFF REQUESTED, so the MILESTONE in this
+        cycle is still found even after a re-injection landed below it."""
+        fake_tmux.output = (
+            "> HANDOFF REQUESTED: context window is over 50%. ...\n"   # inj #1
+            "\n"
+            "⏺ Wrapped up. Writing the marker.\n"
+            "\n"
+            "⏺ MILESTONE\n"                                            # valid
+            "\n"
+            "> HANDOFF REQUESTED: context window is over 50%. ...\n"   # inj #2
+            ">\n"
+            "> MILESTONE\n"                                            # echo
+        )
+        assert handoff.find_milestone("fleet-abc") is True
+
+    def test_glyph_milestones_word_does_not_match(
+        self, fake_tmux: _FakeTmux,
+    ) -> None:
+        """Even with the turn glyph, the plural / suffixed forms must not
+        match — the trailing MILESTONE$ anchor holds regardless of prefix."""
+        fake_tmux.output = (
+            f"{handoff.HANDOFF_REQUESTED}: wrap up\n"
+            "⏺ MILESTONES are tracked in docs/MILESTONES.md\n"
+            "⏺ MILESTONE: phase 2 complete\n"
+        )
+        assert handoff.find_milestone("fleet-abc") is False
+
+    def test_glyph_milestone_before_handoff_requested_excluded(
+        self, fake_tmux: _FakeTmux,
+    ) -> None:
+        """A glyph-rendered MILESTONE that predates the (only) HANDOFF
+        REQUESTED is historical narration from before the Yellow cycle and
+        must NOT trigger — anchoring on the first HANDOFF REQUESTED still
+        excludes everything above it."""
+        fake_tmux.output = (
+            "⏺ MILESTONE\n"                                  # historical
+            "⏺ more work after the old marker\n"
+            "> HANDOFF REQUESTED: context window over 50%\n"  # cycle opens
+            "⏺ agent is still wrapping up, no new marker yet\n"
+        )
+        assert handoff.find_milestone("fleet-abc") is False
 
 
 # -- capture_recent ----------------------------------------------------------
@@ -963,6 +1121,49 @@ class TestMaybeTrigger:
         assert q["schema_version"] == 2
         assert q["task_id"] == "demo-task"
         assert q["project"] == "myproj"
+
+    def test_yellow_pending_glyph_milestone_commits_handoff_e2e(
+        self, fleet_home_tmp: Path, fake_tmux: _FakeTmux, tmp_path: Path,
+    ) -> None:
+        """END-TO-END REGRESSION: an armed auto-yellow agent whose pane shows
+        a real glyph-rendered `⏺ MILESTONE` (after a `>`-quoted injection that
+        re-echoes the instruction's own MILESTONE) must COMMIT the handoff —
+        doc written + spawn-fresh queue enqueued. Pre-fix: find_milestone
+        misses the `⏺ MILESTONE`, maybe_trigger noops, and the agent loops on
+        the request forever while context climbs to auto-compact. This is the
+        full live-coord fingerprint, mocked end-to-end on disk."""
+        _seed_record(fleet_home_tmp, "agent_e2e",
+                     handoff_type=handoff.TYPE_AUTO_YELLOW)
+        # Real captured-pane shape: >-quoted injection (with its echoed
+        # MILESTONE instruction line) + the agent's glyph-rendered marker.
+        fake_tmux.output = (
+            "> HANDOFF REQUESTED: context window is over 50%. ...token:\n"
+            ">\n"
+            "> MILESTONE\n"
+            ">\n"
+            "> This signals fleet-guard to write your handoff doc.\n"
+            "\n"
+            "⏺ Wrapped up the current sub-task. Emitting the marker.\n"
+            "\n"
+            "⏺ MILESTONE\n"
+        )
+        result = handoff.maybe_trigger(
+            {"transcript_path": str(_transcript(tmp_path, input_tokens=110_000))},
+            agent_id="agent_e2e", session="fleet-agent_e2e",
+        )
+        assert result is None  # silent on the doc-written path
+        # Doc written.
+        docs = list((fleet_home_tmp / "handoffs").glob("agent_e2e-*.md"))
+        assert len(docs) == 1, "handoff doc not written — glyph MILESTONE missed"
+        assert b'handoff_type: "auto-yellow"' in docs[0].read_bytes()
+        # spawn-fresh queue enqueued.
+        queue_files = list(
+            (fleet_home_tmp / "queue").glob("spawn-fresh-agent_e2e.json")
+        )
+        assert len(queue_files) == 1, "spawn-fresh queue file not enqueued"
+        q = json.loads(queue_files[0].read_text(encoding="utf-8"))
+        assert q["old_agent_id"] == "agent_e2e"
+        assert q["handoff_doc"] == str(docs[0])
 
     def test_yellow_pending_fresh_timestamp_noops(
         self, fleet_home_tmp: Path, fake_tmux: _FakeTmux, tmp_path: Path,

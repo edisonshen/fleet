@@ -34,73 +34,36 @@ const (
 	OutcomeAlreadyAcquired = "already_acquired"
 	OutcomeReleased        = "released"
 	OutcomeAlreadyReleased = "already_released"
-	OutcomeConnected       = "connected"
 	OutcomeNotEnabled      = "not_enabled"
-	OutcomeNotOwned        = "not_owned"
-	OutcomeAbsent          = "absent"
-	OutcomeContested       = "contested"
-	OutcomeError           = "error"
+	// OutcomeNotOwned has no producer left (its emitter was the
+	// retired Connect path); kept as a reserved wire-compat value so
+	// external scripts matching the documented exit-code table don't
+	// break.
+	OutcomeNotOwned  = "not_owned"
+	OutcomeAbsent    = "absent"
+	OutcomeContested = "contested"
+	OutcomeError     = "error"
 
-	// OutcomeRespawnedStaleVersion / OutcomeRespawnedDeadOwner — emitted
-	// by Up's self-healing idempotent branch when the recorded daemon
-	// must be killed and replaced. leak-rc-daemon-lifecycle PR-B:
-	// before this, a stale-version daemon would return already_acquired
-	// forever and the old `claude remote-control` binary would live on
-	// across upgrades (5 daemons across 4 versions found during the
-	// 2026-05-29 OOM). Both are success codes; the CLI maps them the
-	// same as acquired (exit 0).
-	OutcomeRespawnedStaleVersion = "respawned-stale-version"
-	OutcomeRespawnedDeadOwner    = "respawned-dead-owner"
+	// OutcomeNativeDefault — emitted by the deprecated `fleet rc
+	// connect` surface. The native model attaches RC at coord spawn
+	// via the baked-in `--remote-control` flag, so there is nothing
+	// for connect to drive; the CLI reports this outcome (exit 0)
+	// with a diagnostic pointing at the native flow.
+	OutcomeNativeDefault = "native_default"
 )
 
-// UpOpts carries operator overrides for Up.
+// UpOpts carries flags for Up.
 type UpOpts struct {
-	// Cwd is the explicit working_dir override from `fleet rc up <p>
-	// --cwd <path>`. Empty falls through to ResolveWorkingDir's
-	// meta.json / live-coord chain.
-	Cwd string
-
-	// AdoptIfFleetOwned (default: true) — when rc-state.json exists,
-	// its PID is alive, and argv matches the recorded session_prefix,
-	// adopt the running listener instead of spawning a duplicate.
-	// Idempotent re-Up semantics.
-	AdoptIfFleetOwned bool
-
-	// AdoptIfUnknown (default: false) — codex round 1: never adopt
-	// arbitrary PIDs. v0.12 does not expose this; reserved for power-
-	// users in a future release. When false, a PID that doesn't match
-	// rc-state.json (or whose state.json is missing) is REFUSED — the
-	// operator must `fleet rc reset` + `up` to reclaim ownership.
-	AdoptIfUnknown bool
-
-	// SkipSpawn (test seam) — when true, Up performs marker + state
-	// bookkeeping but does NOT exec `claude remote-control`. Unit
-	// tests set this; production callers leave it false. The injected
-	// PID is taken from InjectedPID below (0 means "use os.Getpid()
-	// as a placeholder so state.json carries a non-zero pid that
-	// IsAlive will return true for during the same test run").
-	SkipSpawn bool
-
-	// InjectedPID (test seam) overrides the recorded PID when
-	// SkipSpawn is true. 0 falls through to os.Getpid().
-	InjectedPID int
-
-	// RespawnOnly (codex P1): when true, Up MUST refuse to create a
-	// marker. It only operates on already-enabled projects — i.e.,
-	// re-spawn the listener if the recorded PID is dead, or no-op if
-	// alive. Marker absent => return OutcomeNotEnabled with no
-	// filesystem mutation. The Python coord tick uses this flag so the
-	// idempotent fleet-rc-up shell-out NEVER auto-enables RC on a
-	// project the operator hasn't opted in to.
+	// RespawnOnly is the legacy coord-tick compatibility flag. Pre-
+	// native coordinator skill copies shell out `fleet rc up <p>
+	// --respawn-only --idempotent` every 30s expecting the v0.12/v0.13
+	// listener-respawn behavior. The native model NEVER spawns a
+	// listener; Up with RespawnOnly is a pure no-op that reports a
+	// stable outcome (not_enabled when the project is opted out,
+	// already_acquired otherwise) and touches nothing on disk —
+	// keeping half-upgraded installs (old skill copy + new binary)
+	// storm-free.
 	RespawnOnly bool
-
-	// CoordID is the agent ID of the coord invoking Up. Persisted in
-	// RecordedState.OwningCoordID so self-healing can detect a dead
-	// owner across coord crash/restart. Empty is allowed (legacy
-	// callers, manual `fleet rc up` invocations) — the state record
-	// keeps the field blank and dead-owner detection is skipped for
-	// that entry. leak-rc-daemon-lifecycle PR-B.
-	CoordID string
 }
 
 // State is the snapshot Status / Inspect return. Mirrors the
@@ -124,26 +87,40 @@ type State struct {
 	OwningCoordID string `json:"owning_coord_id,omitempty"`
 }
 
-// Enabled returns true iff the per-project rc-enabled marker is
-// present on disk. THIS IS THE SINGLE SOURCE OF TRUTH for "should
-// fleet inject --remote-control / spawn listener / drive
-// /remote-control for this project". Every attach/spawn surface
-// (S1, S2, S3, I1, I2, I3) calls this helper.
+// Enabled reports whether remote control is on for project. THIS IS
+// THE SINGLE SOURCE OF TRUTH for "should fleet bake --remote-control
+// into this project's coord spawn argv". Every attach surface calls
+// this helper.
 //
-// Cheap: one stat. Best-effort: any error collapses to false.
+// Native model semantics — opt-OUT, default-on:
+//
+//	project == ""            → false (legacy / untargeted dispatch —
+//	                           no project to key an opt-out on, so
+//	                           stay conservative and skip the flag)
+//	invalid project name     → false (cannot have a marker; mirrors
+//	                           the empty-project posture)
+//	rc-disabled marker found → false (operator ran `fleet rc down`)
+//	otherwise                → true (the default)
+//
+// Cheap: one stat. Best-effort: marker stat errors collapse to
+// "no opt-out" (fail-open to the default).
 func Enabled(project string) bool {
-	return MarkerPresent(project)
+	if project == "" {
+		return false
+	}
+	if _, err := state.ProjectDir(project); err != nil {
+		return false
+	}
+	return !DisabledMarkerPresent(project)
 }
 
 // GateAttachFlag is the project-aware wrapper internal/handoffop uses
-// (and any future caller that injects --remote-control onto a claude
-// argv). When the per-project marker is absent OR the
+// (and any future caller that bakes --remote-control onto a claude
+// argv). When Enabled(project) is false (empty project, invalid name,
+// or rc-disabled opt-out marker present) OR the
 // FLEET_RC_BOOTSTRAP_DISABLED env-gate is set (defense-in-depth from
-// PR #157), GateAttachFlag returns argv unchanged. Otherwise it
-// delegates to spawn.InjectRemoteControlFlag.
-//
-// The env-gate is kept through v0.12 per A2/A3 (CI invariant test
-// must prove the marker-gate is sufficient before v0.13 retires it).
+// PR #157; keeps tests flag-free), GateAttachFlag returns argv
+// unchanged. Otherwise it delegates to spawn.InjectRemoteControlFlag.
 func GateAttachFlag(project string, argv []string, sessionName string) []string {
 	if os.Getenv("FLEET_RC_BOOTSTRAP_DISABLED") != "" {
 		return argv
@@ -199,344 +176,71 @@ func withLock(project string, fn func() (string, error)) (string, error) {
 	return fn()
 }
 
-// spawner is the seam Up uses to exec `claude remote-control`.
-// Production wires the real exec; tests inject a fake that records
-// argv and returns a synthetic PID. Returns (pid, err).
-type spawner func(workingDir string) (int, error)
-
-// defaultSpawner shells out to `claude remote-control
-// --remote-control-session-name-prefix fleet-coord` in workingDir
-// with a detached process. The Claude daemon's directory-keyed
-// registry uses workingDir for per-project isolation (codex round 2:
-// daemon prefix stays the broad `fleet-coord`).
+// Up enables remote control for project by removing the rc-disabled
+// opt-out marker. Idempotent. Native model: Up NEVER spawns a
+// standalone listener — the --remote-control flag is baked into the
+// coord's own claude argv at spawn time, so enabling takes effect on
+// the NEXT coord spawn (fresh dispatch or handoff replacement).
 //
-// Detach via Setsid so SIGHUP from the parent's tmux pane doesn't
-// cascade; redirect stdio to /dev/null so the child has no
-// controlling terminal.
-var defaultSpawner spawner = func(workingDir string) (int, error) {
-	devnull, err := os.OpenFile(os.DevNull, os.O_RDWR, 0)
-	if err != nil {
-		return 0, fmt.Errorf("rc.spawn: open devnull: %w", err)
-	}
-	defer func() { _ = devnull.Close() }()
-
-	attr := &os.ProcAttr{
-		Dir:   workingDir,
-		Files: []*os.File{devnull, devnull, devnull},
-		Sys: &syscall.SysProcAttr{
-			Setsid: true,
-		},
-	}
-	// argv shape pins what tests grep for + the pgrep sentinel.
-	// Resolve `claude` against PATH before exec — os.StartProcess
-	// does NOT search PATH on a bare name (codex review iter-1 [P1]:
-	// without LookPath, fleet rc up fails on every install where
-	// `claude` is only on PATH, not in cwd).
-	bin, err := exec.LookPath("claude")
-	if err != nil {
-		return 0, fmt.Errorf("rc.spawn: claude binary not found on PATH: %w", err)
-	}
-	argv := []string{bin, "remote-control",
-		"--remote-control-session-name-prefix", SessionPrefix}
-	proc, err := os.StartProcess(bin, argv, attr)
-	if err != nil {
-		return 0, fmt.Errorf("rc.spawn: %w", err)
-	}
-	return proc.Pid, nil
-}
-
-// activeSpawner is the package-level pointer tests swap. Production
-// uses defaultSpawner; rc_test.go sets a fake.
-var activeSpawner = defaultSpawner
-
-// SetSpawnerForTest replaces activeSpawner; returns a restore func
-// the test should defer. Exported (vs unexported var) so external
-// test packages (cmd/fleet/rc_test.go) can stub without unsafe.
-func SetSpawnerForTest(s spawner) func() {
-	prev := activeSpawner
-	activeSpawner = s
-	return func() { activeSpawner = prev }
-}
-
-// Up creates the rc-enabled marker + spawns (or adopts) the listener
-// for project. Idempotent.
+// Outcomes:
 //
-// Flow:
-//  1. Acquire per-project NB-flock (loser → contested).
-//  2. Resolve working_dir (--cwd > meta.json > live coord > fail).
-//  3. If rc-state.json exists AND PID alive AND host_id matches:
-//     adopt. Outcome=already_acquired. (Fleet-owned, idempotent.)
-//  4. Else if marker present BUT state.json absent BUT a
-//     fleet-coord-prefix listener appears alive: codex round 2
-//     duplicate-spawn refusal. Outcome=contested (operator must
-//     `fleet rc reset`).
-//  5. Else: ensure project tree, write marker, spawn listener,
-//     write state.json. Outcome=acquired.
-//
-// On (5) spawner errors: marker is left in place (operator opted in,
-// the failure is transient), state.json is written with LastError
-// populated so Status surfaces the diagnostic.
+//	acquired         — rc-disabled marker removed (was opted out)
+//	already_acquired — project was already enabled (the default)
+//	not_enabled      — RespawnOnly call on an opted-out project
+//	contested        — another rc operation holds the project lock
 func Up(project string, opts UpOpts) (string, error) {
 	if project == "" {
 		return OutcomeError, errors.New("rc.Up: empty project")
 	}
-	// Default the safe knobs.
-	if !opts.AdoptIfFleetOwned {
-		opts.AdoptIfFleetOwned = true
-	}
-
 	return withLock(project, func() (string, error) {
-		// (0) RespawnOnly gate (codex P1, Python coord tick safety):
-		// when the caller is the implicit-respawn path (Python skill
-		// shelling out every tick), Up must NEVER auto-create a marker
-		// for a project the operator hasn't explicitly enabled. If the
-		// marker is absent here, return OutcomeNotEnabled and touch
-		// nothing else.
-		if opts.RespawnOnly && !MarkerPresent(project) {
-			return OutcomeNotEnabled, nil
-		}
-
-		// codex P2: probe `claude --version` ONCE per Up and thread it to
-		// both the self-heal check and the fresh-acquire record — avoids
-		// multiple shell-outs (and the hang risk) per invocation.
-		curVer := probeClaudeVersion()
-
-		// (3) Idempotent re-Up: existing state.json + alive PID +
-		// matching host + argv matches session_prefix → return
-		// already_acquired. The argv check (codex round-3 P2)
-		// closes the PID-reuse hole: between listener exit and
-		// next Up, the kernel can recycle the PID for an unrelated
-		// process. Without the argv verify we'd claim
-		// already_acquired and the listener would silently be
-		// dead. Falling through on verify-fail respawns the
-		// listener AND emits a stderr diagnostic so the operator
-		// learns about the underlying state drift (surface, don't
-		// silo).
-		//
-		// Self-healing (leak-rc-daemon-lifecycle PR-B): even when
-		// the recorded daemon passes the PID + argv check, we now
-		// also check whether ClaudeVersion matches the current
-		// `claude --version` AND whether OwningCoordID is still
-		// alive. A version mismatch or dead owner triggers
-		// kill+respawn so superseded daemons (across upgrades) and
-		// orphaned daemons (after coord crash) self-heal on the
-		// next tick instead of living forever.
-		var healReason string // non-empty triggers respawn after spawn-side prep
-		// preResolvedCwd carries the working_dir resolved during the
-		// self-heal precheck (codex P2). When non-empty, the (5) fresh-
-		// acquire path reuses it instead of resolving AGAIN — re-resolving
-		// after killFn could fail if the source (project meta / live coord
-		// record) changed concurrently, killing the old listener with no
-		// replacement. Resolve once, before the kill, and reuse.
-		var preResolvedCwd string
-		if cur, err := ReadState(project); err == nil {
-			host, _ := os.Hostname()
-			if opts.AdoptIfFleetOwned && cur.PID > 0 && workers.IsAlive(cur.PID) && cur.HostID == host {
-				prefix := cur.SessionPrefix
-				if prefix == "" {
-					prefix = SessionPrefix
-				}
-				if verifyPIDIsListener(cur.PID, prefix, cur.WorkingDir) {
-					// PID + argv verified — now apply the self-heal
-					// checks (version + owner). Both can short-circuit
-					// to a respawn below.
-					healReason = computeHealReason(cur, curVer)
-					if healReason == "" {
-						// Healthy daemon — adopt.
-						// Ensure marker is present even if operator rm'd it
-						// while listener kept running (codex round 2: this
-						// is "re-up the marker, not the listener" semantics).
-						if !MarkerPresent(project) {
-							if _, err := state.EnsureProjectInitialized(project); err != nil {
-								return OutcomeError, err
-							}
-							if err := WriteMarker(project); err != nil {
-								return OutcomeError, err
-							}
-						}
-						// codex P2 (owner backfill on adopt): a daemon enabled
-						// via operator `fleet rc up <project>` (no --coord-id)
-						// records an EMPTY owning_coord_id. The coord tick then
-						// adopts it here via `--respawn-only --coord-id <id>`,
-						// but without this backfill the owner stays empty
-						// forever and computeHealReason keeps SKIPPING dead-
-						// owner detection — so a crashed coord's daemon never
-						// self-heals. When the caller supplies a CoordID and the
-						// record has none, stamp it in (idempotent: only when
-						// the recorded owner is empty, so we never clobber an
-						// existing owner with a different coord's tick).
-						if owner := persistableOwner(opts.CoordID); owner != "" && cur.OwningCoordID == "" {
-							cur.OwningCoordID = owner
-							if err := WriteState(cur); err != nil {
-								return OutcomeError, err
-							}
-						}
-						return OutcomeAlreadyAcquired, nil
-					}
-					// codex P2 (resolve-before-kill): we must be able to
-					// resolve the replacement working_dir BEFORE signaling
-					// the old listener. If we kill first and resolution
-					// then fails, we've taken down a working daemon and
-					// left rc-state.json pointing at a dead PID with no
-					// respawn. Resolve now; on failure, leave the daemon
-					// alive and surface the error so the next tick retries.
-					// CAPTURE the result and reuse it for (5) — re-resolving
-					// after the kill risks a concurrent source change (meta
-					// /coord record) failing the second resolve (codex P2).
-					rcwd, rerr := ResolveWorkingDir(project, opts.Cwd)
-					if rerr != nil {
-						return OutcomeError, fmt.Errorf(
-							"rc.Up: project %q self-heal (%s) aborted — cannot resolve replacement working_dir, leaving existing PID %d alive: %w",
-							project, healReason, cur.PID, rerr)
-					}
-					preResolvedCwd = rcwd
-					// codex P2 (strict cwd before self-heal kill): the argv
-					// check above degrades to argv-only when lsof is missing,
-					// and all projects share the fleet-coord prefix — so a
-					// stale PID reused by another project's HEALTHY listener
-					// could pass it. Before we SIGNAL, require a strict lsof
-					// cwd confirmation (same guard the status sweep uses). If
-					// we can't strictly confirm, abort the self-heal: leave
-					// the existing daemon alive rather than risk killing an
-					// unrelated listener. The version/owner drift will be
-					// retried next tick (or caught by gc once lsof is back).
-					if !verifyPIDCwdStrictFn(cur.PID, cur.WorkingDir) {
-						fmt.Fprintf(os.Stderr,
-							"rc.Up: project %q self-heal (%s) aborted — PID %d cwd could not be strictly verified (lsof unavailable or PID reuse); leaving it alive to avoid killing an unrelated listener\n",
-							project, healReason, cur.PID)
-						return OutcomeAlreadyAcquired, nil
-					}
-					// Self-heal: surface what changed so the operator can
-					// see why we respawned (version drift / dead owner).
-					fmt.Fprintf(os.Stderr,
-						"rc.Up: project %q self-heal — %s; killing PID %d and respawning\n",
-						project, healReason, cur.PID)
-					killFn(cur.PID)
-					// Fall through to (5) fresh acquire path. Marker is
-					// already present; (5) re-publishes it idempotently and
-					// writes a fresh state.json with current version + new
-					// CoordID, reusing preResolvedCwd (no re-resolve).
-				} else {
-					// argv/cwd mismatch — kernel PID reuse (possibly by
-					// another project's listener), external kill, or moved
-					// working_dir. Tell the operator what we observed
-					// before falling through to fresh spawn.
-					fmt.Fprintf(os.Stderr,
-						"rc.Up: project %q has recorded PID %d alive but does not match recorded session_prefix %q + working_dir %q; treating as dead and respawning (likely kernel PID reuse, cross-project reuse, or external kill)\n",
-						project, cur.PID, prefix, cur.WorkingDir)
-				}
+		if opts.RespawnOnly {
+			// Legacy coord-tick compat (see UpOpts.RespawnOnly): pure
+			// no-op, stable outcome, zero filesystem mutation. The old
+			// skill's tick loop latches quiet on not_enabled (exit 10)
+			// and treats already_acquired (exit 0) as "nothing to do".
+			if DisabledMarkerPresent(project) {
+				return OutcomeNotEnabled, nil
 			}
+			return OutcomeAlreadyAcquired, nil
 		}
-
-		// Resolve working_dir BEFORE we touch any state. The self-heal
-		// path already resolved it (and reuses that value here) so we
-		// never resolve a second time after killing the old listener
-		// (codex P2: a concurrent source change must not strand us with a
-		// dead daemon and no replacement).
-		cwd := preResolvedCwd
-		if cwd == "" {
-			var err error
-			cwd, err = ResolveWorkingDir(project, opts.Cwd)
-			if err != nil {
-				return OutcomeError, err
-			}
-		}
-
-		// (4) Duplicate-spawn refusal: marker present, state absent,
-		// but a fleet-coord listener appears alive. Conservative:
-		// operator must reset.
-		if MarkerPresent(project) {
-			if _, err := ReadState(project); errors.Is(err, ErrStateMissing) {
-				if alive, _ := detectFleetCoordListener(cwd); alive {
-					if !opts.AdoptIfUnknown {
-						return OutcomeContested, errors.New("rc.Up: marker present + rc-state.json missing + fleet-coord listener alive in working_dir; operator must `fleet rc reset` to reclaim ownership")
-					}
-				}
-			}
-		}
-
-		// (5) Fresh acquire path.
 		if _, err := state.EnsureProjectInitialized(project); err != nil {
 			return OutcomeError, err
 		}
-		if err := WriteMarker(project); err != nil {
+		if !DisabledMarkerPresent(project) {
+			return OutcomeAlreadyAcquired, nil
+		}
+		if err := RemoveDisabledMarker(project); err != nil {
 			return OutcomeError, err
 		}
-
-		host, _ := os.Hostname()
-		now := time.Now().UTC()
-
-		var pid int
-		var spawnErr error
-		if opts.SkipSpawn {
-			pid = opts.InjectedPID
-			if pid == 0 {
-				pid = os.Getpid()
-			}
-		} else {
-			pid, spawnErr = activeSpawner(cwd)
-		}
-
-		// Reuse the once-probed claude --version (codex P2) for the new
-		// state record. Empty version is acceptable (degraded probe); the
-		// next tick will detect the empty value as stale and re-probe.
-		rec := RecordedState{
-			Schema:        SchemaVersion,
-			Project:       project,
-			PID:           pid,
-			HostID:        host,
-			WorkingDir:    cwd,
-			SessionPrefix: SessionPrefix,
-			LastSpawnAt:   now,
-			ClaudeVersion: curVer,
-			OwningCoordID: persistableOwner(opts.CoordID),
-		}
-		if spawnErr != nil {
-			rec.LastError = spawnErr.Error()
-		}
-		if werr := WriteState(rec); werr != nil {
-			return OutcomeError, fmt.Errorf("rc.Up: write state: %w", werr)
-		}
-		if spawnErr != nil {
-			return OutcomeError, spawnErr
-		}
-		// leak-rc-daemon-lifecycle PR-B: the self-healing path
-		// (healReason != "") falls through here after killing the
-		// stale daemon. Map healReason → outcome so the caller can
-		// observe what happened.
-		switch healReason {
-		case healReasonStaleVersion:
-			return OutcomeRespawnedStaleVersion, nil
-		case healReasonDeadOwner:
-			return OutcomeRespawnedDeadOwner, nil
-		default:
-			return OutcomeAcquired, nil
-		}
+		return OutcomeAcquired, nil
 	})
 }
 
-// healReason* are the internal labels for Up's self-healing branch.
-// computeHealReason returns one of these (or empty for "healthy").
+// healReason* are the labels for the legacy-daemon sweep rubric
+// (SweepAllProjects / reapStaleLegacyDaemon). computeHealReason
+// returns one of these (or empty for "leave the daemon alone").
 const (
 	healReasonStaleVersion = "stale claude version"
 	healReasonDeadOwner    = "owning coord is gone"
 )
 
-// computeHealReason inspects the recorded state against the current
-// claude binary version + owner liveness. Returns one of the
-// healReason* strings, or empty when the daemon is healthy (adopt).
+// computeHealReason inspects a recorded LEGACY daemon's state against
+// the current claude binary version + owner liveness. Returns one of
+// the healReason* strings (the daemon should be reaped), or empty
+// (leave it alone — a live pre-native coord may still be paired
+// through it; it decays naturally once its owner goes away).
 //
 // Empty recorded ClaudeVersion is treated as "always stale" so legacy
-// v1 records force one heal cycle which backfills the schema.
+// v1 records get reaped on the first sweep.
 //
 // Empty OwningCoordID skips the dead-owner check (legacy or
 // manually-invoked records without a coord hint).
 //
-// Probe failures collapse to "healthy" (no respawn) — better to leak
+// Probe failures collapse to "healthy" (no reap) — better to leak
 // briefly than to kill a healthy daemon on a transient probe error.
 //
 // curVer is the current `claude --version` PROBED ONCE BY THE CALLER (codex
-// P2): SweepAllProjects iterates many projects and reapDaemonKeepMarker
+// P2): SweepAllProjects iterates many projects and reapStaleLegacyDaemon
 // re-checks under the lock — probing per call shelled out to claude N+ times
 // per `fleet status`, and a hung claude could stall status/JSON callers.
 // The caller probes once and threads the result here. curVer == "" means
@@ -569,20 +273,28 @@ func probeClaudeVersion() string {
 	return v
 }
 
-// Down kills the local PID Fleet owns + removes marker + removes
-// rc-state.json. Idempotent. Returns already_released when nothing
-// was on disk.
+// Down disables remote control for project: writes the rc-disabled
+// opt-out marker (suppresses the --remote-control flag on future
+// coord spawns) and reaps any LEGACY standalone listener Fleet still
+// owns (kills the recorded PID after strict verification, removes the
+// legacy rc-enabled marker + rc-state.json). Idempotent. Returns
+// already_released when the project was already opted out and no
+// legacy artifacts remained.
 //
-// Per design §"Service-side management" (codex round 2): we do NOT
-// invoke `claude daemon remote-control remove` — that API is for
-// the dir-registry, not for live-listener teardown. The local PID
-// kill IS the teardown. Reset (operator emergency) may optionally
-// call the registry-clean path; Down does not.
+// Note: a coord that is ALREADY running with --remote-control keeps
+// its RC session until it exits/hands off — Down can't (and doesn't
+// try to) strip a flag from a live process. The opt-out takes effect
+// on the next spawn.
+//
+// Per the v0.12 design (codex round 2): we do NOT invoke `claude
+// daemon remote-control remove` — that API is for the dir-registry,
+// not for live-listener teardown. The local PID kill IS the teardown.
 func Down(project string) (string, error) {
 	if project == "" {
 		return OutcomeError, errors.New("rc.Down: empty project")
 	}
 	return withLock(project, func() (string, error) {
+		hadDisabled := DisabledMarkerPresent(project)
 		markerHad := MarkerPresent(project)
 		cur, stateErr := ReadState(project)
 		stateHad := stateErr == nil
@@ -602,7 +314,18 @@ func Down(project string) (string, error) {
 		}
 
 		if !markerHad && !stateHad && !stateCorrupt {
-			return OutcomeAlreadyReleased, nil
+			// No legacy artifacts. The opt-out marker is the only
+			// mutation needed.
+			if hadDisabled {
+				return OutcomeAlreadyReleased, nil
+			}
+			if _, err := state.EnsureProjectInitialized(project); err != nil {
+				return OutcomeError, err
+			}
+			if err := WriteDisabledMarker(project); err != nil {
+				return OutcomeError, err
+			}
+			return OutcomeReleased, nil
 		}
 
 		// Kill local PID if state says Fleet owns one. Cross-host
@@ -652,14 +375,23 @@ func Down(project string) (string, error) {
 		if err := RemoveState(project); err != nil {
 			return OutcomeError, err
 		}
+		if _, err := state.EnsureProjectInitialized(project); err != nil {
+			return OutcomeError, err
+		}
+		if err := WriteDisabledMarker(project); err != nil {
+			return OutcomeError, err
+		}
 		return OutcomeReleased, nil
 	})
 }
 
 // Inspect returns the observed State for project. Read-only — no
 // lock acquired. Suitable for the dashboard / `fleet rc status`.
+// Enabled reflects the native opt-out gate; the listener fields are
+// LEGACY observability (populated only while a pre-native standalone
+// daemon's rc-state.json is still on disk awaiting sweep).
 func Inspect(project string) (State, error) {
-	s := State{Project: project, Enabled: MarkerPresent(project)}
+	s := State{Project: project, Enabled: Enabled(project)}
 	cur, err := ReadState(project)
 	if err == nil {
 		s.ListenerPID = cur.PID
@@ -677,9 +409,24 @@ func Inspect(project string) (State, error) {
 	return s, nil
 }
 
-// List enumerates projects with markers present. Stable order
-// (sorted by name) so JSON output is reproducible.
+// ListDisabled enumerates projects with the rc-disabled opt-out
+// marker present — i.e. the exceptions to the default-on native
+// model. Stable order (directory order) so JSON output is
+// reproducible.
+func ListDisabled() ([]string, error) {
+	return listProjectsWith(DisabledMarkerPresent)
+}
+
+// List enumerates projects with the LEGACY rc-enabled marker present.
+// Cleanup/observability surface only (Reset enumeration, tests) — the
+// native gate no longer reads this marker.
 func List() ([]string, error) {
+	return listProjectsWith(MarkerPresent)
+}
+
+// listProjectsWith walks ~/.fleet/projects/* and returns the project
+// names for which pred is true.
+func listProjectsWith(pred func(project string) bool) ([]string, error) {
 	root, err := state.Root()
 	if err != nil {
 		return nil, err
@@ -700,35 +447,39 @@ func List() ([]string, error) {
 		if name == ".locks" || strings.HasPrefix(name, ".") {
 			continue
 		}
-		if MarkerPresent(name) {
+		if pred(name) {
 			out = append(out, name)
 		}
 	}
 	return out, nil
 }
 
-// Reset removes the marker + state.json + kills the listener for
-// project (or all projects when project=="").
+// Reset cleans project's LEGACY listener state (or all projects when
+// project==""): kills any legacy daemon Fleet owns (strict PID
+// verification), removes the legacy rc-enabled marker + rc-state.json
+// (including corrupt ones — the operator-emergency case Reset exists
+// for).
 //
-// Operator emergency: when state.json is corrupt or pointing at a
-// dead PID, Reset gives a clean slate.
+// Reset NEVER touches the rc-disabled opt-out marker (/review
+// adversarial F4): the opt-out is operator INTENT, not corruptible
+// listener state, and under the default-on model `fleet rc down` is
+// the push kill-switch — an emergency command must not silently
+// re-arm RC on projects the operator disarmed. Use `fleet rc up` to
+// clear an opt-out explicitly.
 //
-// codex round-5 P2: reset-all must enumerate BOTH markered projects
-// (via List) AND markerless state files (via Glob). The latter is
-// exactly the corruption case `fleet rc reset` exists to clean.
-// Without the glob, a project that had its marker removed manually
-// but kept its rc-state.json would silently survive reset-all.
+// codex round-5 P2 (kept from v0.12): reset-all must enumerate
+// legacy-markered projects AND markerless state-only projects (Glob).
 func Reset(project string) (string, error) {
 	if project == "" {
 		seen := map[string]struct{}{}
 
-		// Markered projects (the common case).
-		if projs, err := List(); err == nil {
-			for _, p := range projs {
-				seen[p] = struct{}{}
-			}
-		} else {
+		// Legacy rc-enabled markers.
+		projs, err := List()
+		if err != nil {
 			return OutcomeError, err
+		}
+		for _, p := range projs {
+			seen[p] = struct{}{}
 		}
 
 		// Add markerless state-only projects so emergency cleanup
@@ -745,39 +496,90 @@ func Reset(project string) (string, error) {
 		}
 
 		for p := range seen {
-			if _, err := Down(p); err != nil {
+			if _, err := resetOne(p); err != nil {
 				// Continue; best-effort across all projects.
 				_ = err
 			}
 		}
 		return OutcomeReleased, nil
 	}
-	return Down(project)
+	return resetOne(project)
 }
 
-// SweepAllProjects is the cross-project reconcile hook. Enumerates
-// every rc-state.json under ~/.fleet/projects/* and reaps three
-// orphan classes:
+// resetOne is the per-project Reset body: legacy reap + legacy file
+// cleanup, with the rc-disabled opt-out marker preserved bit-for-bit
+// (present stays present, absent stays absent).
+func resetOne(project string) (string, error) {
+	if project == "" {
+		return OutcomeError, errors.New("rc.resetOne: empty project")
+	}
+	return withLock(project, func() (string, error) {
+		cur, stateErr := ReadState(project)
+		stateHad := stateErr == nil
+		stateCorrupt := stateErr != nil && !errors.Is(stateErr, ErrStateMissing)
+		if stateCorrupt {
+			fmt.Fprintf(os.Stderr,
+				"rc.Reset: project %q has malformed rc-state.json (%v); removing it as part of cleanup\n",
+				project, stateErr)
+		}
+		// Kill the legacy daemon with the same PID-reuse + cross-host
+		// defenses Down uses.
+		if stateHad && cur.PID > 0 {
+			host, _ := os.Hostname()
+			if cur.HostID == "" || cur.HostID == host {
+				if workers.IsAlive(cur.PID) {
+					prefix := cur.SessionPrefix
+					if prefix == "" {
+						prefix = SessionPrefix
+					}
+					if verifyPIDIsListener(cur.PID, prefix, cur.WorkingDir) {
+						killFn(cur.PID)
+					} else {
+						fmt.Fprintf(os.Stderr,
+							"rc.Reset: project %q recorded PID %d alive but argv/cwd does not match; skipping kill (likely PID reuse)\n",
+							project, cur.PID)
+					}
+				}
+			}
+		}
+		if err := RemoveMarker(project); err != nil {
+			return OutcomeError, err
+		}
+		if err := RemoveState(project); err != nil {
+			return OutcomeError, err
+		}
+		return OutcomeReleased, nil
+	})
+}
+
+// SweepAllProjects is the cross-project reconcile hook for LEGACY
+// standalone listener daemons (pre-native installs). Native model:
+// nothing spawns listeners anymore, so every rc-state.json on disk is
+// a decaying legacy artifact. The sweep enumerates them and reaps:
 //
-//   - Marker-absent + live PID: operator removed the marker manually
-//     but the daemon kept running. Down it.
+//   - Dead-PID records: the daemon already exited — remove the stale
+//     rc-state.json + legacy rc-enabled marker (pure file cleanup).
+//   - Legacy-marker-absent + live PID: operator opted out under the
+//     old model but the daemon kept running. Reap it.
 //   - Stale-version daemon: recorded ClaudeVersion differs from current
 //     `claude --version` (or recorded version is empty / v1 legacy).
 //     Old daemons across upgrades — the 2026-05-29 OOM root cause.
 //   - Dead-owner daemon: recorded OwningCoordID has no live agent
 //     record / dead tmux session. Coord crashed without releasing.
 //
+// A live daemon with a matching version AND a live owner is left
+// alone: a pre-native coord may still be paired through it. It decays
+// via the dead-owner class once that coord exits/hands off — no new
+// daemon ever replaces it (the v0.12 respawn tick is retired).
+//
 // Skips cross-host entries (host_id mismatch — unsafe to kill).
-// Leaves alive + version-matching + owner-alive entries untouched.
 //
 // Never kills on prefix-only evidence; state.json must claim Fleet
-// ownership (codex round 3 free-form). leak-rc-daemon-lifecycle PR-B
-// broadened from marker-absent only to the full three-class sweep
-// and wired it into fleet status via cmd/fleet/status.go.
+// ownership (codex round 3 free-form).
 //
 // codex P2 (sweep-source correctness): iterate rc-state.json directly
-// via filepath.Glob — List() filters marker-absent entries, which are
-// exactly the orphans we need to reach.
+// via filepath.Glob — marker-filtered listings miss exactly the
+// orphans we need to reach.
 func SweepAllProjects() error {
 	root, err := state.Root()
 	if err != nil {
@@ -821,7 +623,12 @@ func SweepAllProjects() error {
 			continue
 		}
 		if cur.PID <= 0 || !workers.IsAlive(cur.PID) {
-			continue // recorded PID gone — sweeper has nothing to kill.
+			// Recorded PID gone — the legacy daemon already exited.
+			// Native model: nothing will ever rewrite this record, so
+			// remove the stale rc-state.json + legacy marker (pure
+			// file cleanup; no signal sent).
+			reapDeadLegacyRecord(p, cur)
+			continue
 		}
 		// Class 1: marker absent. Operator opted out manually; daemon
 		// kept running. codex P1: this is the DESTRUCTIVE sweep path that
@@ -835,51 +642,37 @@ func SweepAllProjects() error {
 			reapMarkerlessStrict(p, cur)
 			continue
 		}
-		// Class 2/3: marker present, daemon alive — apply the same
-		// self-heal rubric Up uses. A stale version or dead owner
-		// means this daemon needs replacement.
-		//
-		// codex P1 (sweep must preserve the marker): Down() removes the
-		// project's RC marker. The coord's implicit recovery tick uses
-		// `fleet rc up --respawn-only`, which returns not_enabled when
-		// the marker is gone — so a Down here would silently DISABLE RC
-		// for an opted-in project. We reap the dead/stale daemon but
-		// KEEP the marker, exactly like Up's self-heal (killFn + fresh
-		// acquire, marker never removed). Next --respawn-only tick then
-		// respawns under the current claude + fresh coord.
-		ver := getVer() // probed lazily on the first Class 2/3 entry.
+		// Legacy marker present, daemon alive — apply the heal rubric.
+		// A stale version or dead owner means the legacy daemon is an
+		// orphan: reap it (kill + remove state + remove the legacy
+		// marker — nothing respawns under the native model, so there
+		// is no respawn expectation to preserve the marker for).
+		ver := getVer() // probed lazily on the first heal-rubric entry.
 		if reason := computeHealReason(cur, ver); reason != "" {
 			fmt.Fprintf(os.Stderr,
-				"rc.SweepAllProjects: project %q self-heal — %s; reaping PID %d (marker preserved for respawn)\n",
+				"rc.SweepAllProjects: project %q legacy daemon — %s; reaping PID %d\n",
 				p, reason, cur.PID)
-			reapDaemonKeepMarker(p, cur, ver)
+			reapStaleLegacyDaemon(p, cur, ver)
 		}
 	}
 	return nil
 }
 
-// reapDaemonKeepMarker kills the recorded local PID (with the same
-// PID-reuse defense Down uses) and removes rc-state.json, but DELIBERATELY
-// leaves the RC marker in place. This is the "reap for respawn" teardown:
-// the daemon is stale/orphaned and must die, but the project is still
-// opted in to RC, so the marker must survive for the coord's next
-// `fleet rc up --respawn-only` tick to bring a fresh listener back.
+// reapStaleLegacyDaemon kills the recorded local PID (with the same
+// PID-reuse defense Down uses) and removes rc-state.json + the legacy
+// rc-enabled marker. Native model: nothing respawns listeners, so a
+// stale/orphaned legacy daemon is pure leak — full teardown.
 //
-//	Down()                 → kill + RemoveState + RemoveMarker (opt-out)
-//	reapDaemonKeepMarker() → kill + RemoveState, marker preserved (heal)
-//
-// codex P1 (re-read under lock): SweepAllProjects reads the state snapshot
-// WITHOUT the lock, so a coord tick's `fleet rc up --respawn-only` can
-// respawn + rewrite rc-state.json between the snapshot and this call. We
-// MUST re-read under the lock and confirm (a) the PID still matches the
-// snapshot and (b) computeHealReason still flags it stale. If the state
-// changed (fresh respawn) we abort — removing the fresh state here would
-// leave marker + no-state + live listener, forcing the next respawn-only
-// tick down the contested path instead of clean adoption.
+// codex P1 (re-read under lock, kept from v0.12): SweepAllProjects
+// reads the state snapshot WITHOUT the lock; a concurrent rc
+// operation (Down/Reset on an old binary, another sweep) can rewrite
+// rc-state.json between the snapshot and this call. Re-read under the
+// lock and confirm (a) the PID still matches the snapshot and (b)
+// computeHealReason still flags it stale; abort otherwise.
 //
 // Best-effort: errors are swallowed (sweep is fire-and-forget across all
 // projects; one bad entry must not abort the rest).
-func reapDaemonKeepMarker(project string, snapshot RecordedState, curVer string) {
+func reapStaleLegacyDaemon(project string, snapshot RecordedState, curVer string) {
 	_, _ = withLock(project, func() (string, error) {
 		// Re-read under the lock. If state vanished, nothing to reap.
 		cur, err := ReadState(project)
@@ -891,13 +684,13 @@ func reapDaemonKeepMarker(project string, snapshot RecordedState, curVer string)
 		// snapshot PID, or no longer warrants a heal, leave it alone.
 		if cur.PID != snapshot.PID {
 			fmt.Fprintf(os.Stderr,
-				"rc.reapDaemonKeepMarker: project %q state changed under lock (snapshot PID %d -> current PID %d); aborting reap (likely concurrent respawn)\n",
+				"rc.reapStaleLegacyDaemon: project %q state changed under lock (snapshot PID %d -> current PID %d); aborting reap (likely concurrent respawn)\n",
 				project, snapshot.PID, cur.PID)
 			return OutcomeAlreadyAcquired, nil
 		}
 		if computeHealReason(cur, curVer) == "" {
 			fmt.Fprintf(os.Stderr,
-				"rc.reapDaemonKeepMarker: project %q no longer stale under lock (PID %d); aborting reap\n",
+				"rc.reapStaleLegacyDaemon: project %q no longer stale under lock (PID %d); aborting reap\n",
 				project, cur.PID)
 			return OutcomeAlreadyAcquired, nil
 		}
@@ -911,7 +704,7 @@ func reapDaemonKeepMarker(project string, snapshot RecordedState, curVer string)
 		// host (or an unattributed empty HostID) may be reaped here.
 		if cur.HostID != "" && cur.HostID != host {
 			fmt.Fprintf(os.Stderr,
-				"rc.reapDaemonKeepMarker: project %q rc-state.json is now owned by host %q (local %q); aborting reap (cross-host — that host's sweep will handle it)\n",
+				"rc.reapStaleLegacyDaemon: project %q rc-state.json is now owned by host %q (local %q); aborting reap (cross-host — that host's sweep will handle it)\n",
 				project, cur.HostID, host)
 			return OutcomeAlreadyAcquired, nil
 		}
@@ -933,21 +726,57 @@ func reapDaemonKeepMarker(project string, snapshot RecordedState, curVer string)
 			if !verifyPIDIsListener(cur.PID, prefix, cur.WorkingDir) ||
 				!verifyPIDCwdStrictFn(cur.PID, cur.WorkingDir) {
 				fmt.Fprintf(os.Stderr,
-					"rc.reapDaemonKeepMarker: project %q PID %d could not be strictly verified as our listener (argv/cwd unconfirmed — likely PID reuse or lsof unavailable); skipping reap to avoid killing an unrelated process\n",
+					"rc.reapStaleLegacyDaemon: project %q PID %d could not be strictly verified as our listener (argv/cwd unconfirmed — likely PID reuse or lsof unavailable); skipping reap to avoid killing an unrelated process\n",
 					project, cur.PID)
 				return OutcomeAlreadyAcquired, nil
 			}
 			killFn(cur.PID)
 		}
 		_ = RemoveState(project)
+		// Legacy rc-enabled marker is dead weight under the native
+		// model — remove it with the daemon (no respawn expectation).
+		_ = RemoveMarker(project)
 		return OutcomeReleased, nil
 	})
 }
 
-// reapMarkerlessStrict is the Class-1 (marker-absent) sweep teardown. The
+// reapDeadLegacyRecord removes a stale rc-state.json (and legacy
+// rc-enabled marker) whose recorded PID is already dead. Pure file
+// cleanup — no signal is ever sent. Native model: nothing rewrites
+// these records, so leaving them would leak one stale JSON per
+// pre-native project forever.
+//
+// Same locked re-read discipline as the other reap helpers: abort if
+// the record changed (PID differs / now alive) or moved cross-host
+// between the unlocked snapshot and the locked re-read.
+func reapDeadLegacyRecord(project string, snapshot RecordedState) {
+	_, _ = withLock(project, func() (string, error) {
+		cur, err := ReadState(project)
+		if err != nil {
+			return OutcomeAlreadyReleased, nil
+		}
+		if cur.PID != snapshot.PID {
+			return OutcomeAlreadyAcquired, nil
+		}
+		host, _ := os.Hostname()
+		if cur.HostID != "" && cur.HostID != host {
+			return OutcomeAlreadyAcquired, nil
+		}
+		if cur.PID > 0 && workers.IsAlive(cur.PID) {
+			// Came back alive under the lock (PID reuse window) —
+			// leave it for the live-daemon classes to verify.
+			return OutcomeAlreadyAcquired, nil
+		}
+		_ = RemoveState(project)
+		_ = RemoveMarker(project)
+		return OutcomeReleased, nil
+	})
+}
+
+// reapMarkerlessStrict is the legacy-marker-absent sweep teardown. The
 // operator opted out (removed the marker) but the daemon kept running, so
 // we remove BOTH the marker and the state (full opt-out, like Down) — BUT
-// with the same strict cwd confirmation reapDaemonKeepMarker uses, because
+// with the same strict cwd confirmation reapStaleLegacyDaemon uses, because
 // this path runs on every read-only `fleet status` (codex P1). If we can't
 // strictly verify the PID is our listener (lsof missing / cwd mismatch /
 // PID reuse), we skip the kill AND leave state alone — a reused PID could
@@ -994,31 +823,9 @@ func reapMarkerlessStrict(project string, snapshot RecordedState) {
 	})
 }
 
-// detectFleetCoordListener returns true iff a process whose argv
-// matches the fleet-coord listener shape is alive AND its cwd
-// matches workingDir.
-//
-// Best-effort: errors collapse to (false, err). Used only by Up's
-// duplicate-spawn refusal path; never load-bearing for adoption
-// (codex round 2: "never kill on prefix-only evidence").
-//
-// Implementation note: we shell out to pgrep via the test seam so
-// tests can stub. Production uses the OS pgrep binary.
-func detectFleetCoordListener(workingDir string) (bool, error) {
-	return detectListenerFn(workingDir)
-}
-
-// detectListenerFn is the test seam. Production uses pgrepDetect.
-// Tests override via SetDetectListenerForTest.
-var detectListenerFn = pgrepDetect
-
-// SetDetectListenerForTest swaps detectListenerFn; returns a restore
-// func the test should defer.
-func SetDetectListenerForTest(fn func(workingDir string) (bool, error)) func() {
-	prev := detectListenerFn
-	detectListenerFn = fn
-	return func() { detectListenerFn = prev }
-}
+// IsAlive re-exports workers.IsAlive for rc-package callers (Health,
+// external test packages) so they don't need a workers import.
+func IsAlive(pid int) bool { return workers.IsAlive(pid) }
 
 // verifyPIDIsListenerFn is the test seam for PID-reuse defense.
 // Production uses psArgsVerify (shells out to `ps -p <pid> -o
@@ -1224,56 +1031,6 @@ func defaultClaudeVersion() (string, error) {
 	return line, nil
 }
 
-// ownerRecordExistsFn is the test seam for the agent-record existence
-// probe used by persistableOwner. Production: agent.Load(coordID) returns
-// without state.ErrNotFound. Tests stub it.
-var ownerRecordExistsFn = defaultOwnerRecordExists
-
-func defaultOwnerRecordExists(coordID string) bool {
-	if coordID == "" {
-		return false
-	}
-	_, err := agent.Load(coordID)
-	if err == nil {
-		return true
-	}
-	// Only a definitively-missing record is "doesn't exist". A corrupt /
-	// permission-denied read is ambiguous — treat as exists so we don't
-	// drop a legitimate owner on a transient read error.
-	return !errors.Is(err, state.ErrNotFound)
-}
-
-// SetOwnerRecordExistsForTest swaps ownerRecordExistsFn; returns a restore
-// func tests defer.
-func SetOwnerRecordExistsForTest(fn func(coordID string) bool) func() {
-	prev := ownerRecordExistsFn
-	ownerRecordExistsFn = fn
-	return func() { ownerRecordExistsFn = prev }
-}
-
-// persistableOwner returns coordID only when an agent record actually
-// exists for it; otherwise "". codex P2: the coordinator's documented
-// legacy/upgrade path (loop.tick) allows a well-formed coord_id even when
-// ~/.fleet/agents/<id>.json is missing. Persisting that ID as
-// owning_coord_id would make defaultOwnerAlive classify it dead-owner on
-// the NEXT tick (record missing → reap → respawn → re-persist same ghost
-// owner), flapping the listener every tick. Persisting "" instead leaves
-// the daemon ownerless (dead-owner check is skipped for empty owners), so
-// it stays stable on the version-mismatch signal until a real record
-// appears — at which point a later adopt tick backfills the true owner.
-func persistableOwner(coordID string) string {
-	if coordID == "" {
-		return ""
-	}
-	if ownerRecordExistsFn(coordID) {
-		return coordID
-	}
-	fmt.Fprintf(os.Stderr,
-		"rc: coord-id %q has no agent record yet (legacy/upgrade path); persisting owning_coord_id as empty to avoid dead-owner flapping — a later tick will backfill once the record exists\n",
-		coordID)
-	return ""
-}
-
 // ownerAliveFn is the test seam for the owning-coord liveness probe.
 // Production: agent.Load(coordID) succeeds AND its TmuxSession is
 // alive on the current FLEET_TMUX_SOCKET. Tests stub to return true
@@ -1350,71 +1107,4 @@ func SetOwnerAliveFnForTest(fn func(coordID string) bool) func() {
 	prev := ownerAliveFn
 	ownerAliveFn = fn
 	return func() { ownerAliveFn = prev }
-}
-
-// pgrepDetect finds candidate listener PIDs via `pgrep -f
-// "claude.*remote-control"` (portable: macOS/Linux/BSD all support
-// -f matching against argv). For each candidate, it then inspects
-// argv via `ps -p <pid> -o args=` to filter on SessionPrefix, and
-// verifies cwd matches workingDir via `lsof -a -p <pid> -d cwd`.
-//
-// codex round-3 P2: the previous stub always returned false, making
-// the duplicate-spawn refusal gate dead code. codex round-4 P2:
-// the first restoration used `pgrep -a` which is Linux-only — on
-// macOS/BSD it fails and the gate degraded to false again. This
-// version uses only portable flags and per-PID `ps` for argv.
-//
-// Best-effort: missing pgrep/ps/lsof emits a one-line stderr
-// diagnostic so the operator knows the gate is degraded (surface-
-// don't-silo), then returns false. A false negative just allows a
-// fresh spawn — same outcome as no listener alive — so recovery
-// stays available via `fleet rc reset`.
-//
-// pgrep exit semantics:
-//
-//	0 → matches found
-//	1 → no matches (NOT an error — treat as "no listener")
-//	2/3 → syntax / system error (surface diagnostic)
-func pgrepDetect(workingDir string) (bool, error) {
-	if workingDir == "" {
-		return false, nil
-	}
-	out, err := exec.Command("pgrep", "-f", "claude.*remote-control").Output()
-	if err != nil {
-		if exitErr, ok := err.(*exec.ExitError); ok && exitErr.ExitCode() == 1 {
-			return false, nil // no matches
-		}
-		fmt.Fprintf(os.Stderr,
-			"rc: pgrep unavailable; duplicate-spawn refusal gate degraded (%v)\n",
-			err)
-		return false, nil
-	}
-	for _, pidStr := range strings.Fields(string(out)) {
-		pid, perr := strconv.Atoi(pidStr)
-		if perr != nil || pid <= 0 {
-			continue
-		}
-		argsOut, aerr := exec.Command("ps", "-p", strconv.Itoa(pid), "-o", "args=").Output()
-		if aerr != nil {
-			// ps refusal usually means the process exited between
-			// pgrep and ps — treat as no match for this PID.
-			continue
-		}
-		if !strings.Contains(string(argsOut), SessionPrefix) {
-			continue
-		}
-		cwdOut, lerr := exec.Command("lsof", "-a", "-p", strconv.Itoa(pid), "-d", "cwd", "-Fn").Output()
-		if lerr != nil {
-			fmt.Fprintf(os.Stderr,
-				"rc: lsof unavailable for pid %d; duplicate-spawn refusal gate degraded (%v)\n",
-				pid, lerr)
-			continue
-		}
-		for _, l := range strings.Split(string(cwdOut), "\n") {
-			if strings.HasPrefix(l, "n") && l[1:] == workingDir {
-				return true, nil
-			}
-		}
-	}
-	return false, nil
 }

@@ -54,15 +54,18 @@ func TestRender_FirstActionAppearsBeforeCompleted(t *testing.T) {
 	}
 }
 
-// TestRender_FirstActionCarriesFleetRCConnect pins the v0.12 contract:
-// the First Action body directs the operator to run `fleet rc connect
-// <project>` to re-attach mobile/web pairing. The bash bootstrap is
-// gone (DESIGN-rc-listener-lifecycle.md §"Handoff doc rewrite").
-func TestRender_FirstActionCarriesFleetRCConnect(t *testing.T) {
+// TestRender_FirstActionCarriesNativeRCStatusNote pins the native
+// contract (rc-default-native-startup): the First Action body is a
+// status note — pairing is native at coord spawn — with `fleet rc
+// status <project>` as the diagnostic and `fleet rc up <project>` as
+// the re-enable path. The bash bootstrap stays gone, and the retired
+// `fleet rc connect` instruction must not reappear.
+func TestRender_FirstActionCarriesNativeRCStatusNote(t *testing.T) {
 	d := NewManualStub("a1b2c3d4", "auth-fix", "rainier", 1, nil, time.Now().UTC())
 	got := string(Render(d))
 	for _, want := range []string{
-		"fleet rc connect rainier",
+		"--remote-control",
+		"fleet rc status rainier",
 		"fleet rc up rainier",
 	} {
 		if !strings.Contains(got, want) {
@@ -73,23 +76,11 @@ func TestRender_FirstActionCarriesFleetRCConnect(t *testing.T) {
 		"nohup claude remote-control",
 		"pgrep -f",
 		"```bash",
+		"fleet rc connect", // retired send-keys attach path
 	} {
 		if strings.Contains(got, forbidden) {
-			t.Errorf("First Action body MUST NOT contain %q (v0.12 retired bash bootstrap):\n%s", forbidden, got)
+			t.Errorf("First Action body MUST NOT contain %q:\n%s", forbidden, got)
 		}
-	}
-}
-
-// TestRender_FirstActionMentionsRemoteControlSlashCommand pins the
-// `/remote-control` reference — v0.12 keeps the in-session slash
-// command as the alternative path (codex round 2: it's the only
-// supported attach API). The body mentions it parenthetically.
-func TestRender_FirstActionMentionsRemoteControlSlashCommand(t *testing.T) {
-	d := NewManualStub("a1b2c3d4", "auth-fix", "rainier", 1, nil, time.Now().UTC())
-	got := string(Render(d))
-	want := "`/remote-control`"
-	if !strings.Contains(got, want) {
-		t.Errorf("First Action body missing %q reference:\n%s", want, got)
 	}
 }
 
@@ -119,27 +110,6 @@ func TestRender_FirstActionInstructsCoordinatorRun(t *testing.T) {
 	// it on a non-coord lineage is a safe no-op.
 	if !strings.Contains(got, "idempotent") {
 		t.Errorf("First Action body missing idempotency note for /coordinator:\n%s", got)
-	}
-}
-
-// TestRender_FirstActionCoordinatorAfterRemoteControl pins the
-// ordering invariant: the `/remote-control` slash command must appear
-// BEFORE the `/coordinator` slash command in the rendered doc. Order
-// matters because remote-control attaches the freshly-spawned chat
-// session to the operator's mobile pairing — running /coordinator
-// first means the operator misses the supervisor loop's startup
-// output (which surfaces the "lock acquired" line operators rely on
-// to confirm the handoff replaced the predecessor cleanly).
-func TestRender_FirstActionCoordinatorAfterRemoteControl(t *testing.T) {
-	d := NewManualStub("a1b2c3d4", "auth-fix", "rainier", 1, nil, time.Now().UTC())
-	got := string(Render(d))
-	rcIdx := strings.Index(got, "`/remote-control`")
-	coordIdx := strings.Index(got, "`/coordinator`")
-	if rcIdx < 0 || coordIdx < 0 {
-		t.Fatalf("missing one of the slash commands: rc=%d coord=%d", rcIdx, coordIdx)
-	}
-	if rcIdx >= coordIdx {
-		t.Errorf("/remote-control must appear before /coordinator; rc=%d coord=%d", rcIdx, coordIdx)
 	}
 }
 
@@ -291,7 +261,27 @@ func TestRender_SkillByteGolden(t *testing.T) {
 		"handoff_type: \"auto-yellow\"\n" +
 		"---\n" +
 		"\n" +
-		"## First Action (auto)\n" + FirstAction(d.Project) + "\n\n" +
+		// LITERAL FirstAction bytes — deliberately NOT FirstAction(d.Project).
+		// The Python golden (skills/fleet-guard/tests/test_handoff.py:
+		// EXPECTED_GOLDEN) pins the same literal; building the Go want from
+		// FirstAction itself would make this segment self-referential and a
+		// Go-side drift from the Python literal would never fail any test
+		// (/review specialist S3).
+		"## First Action (auto)\n" +
+		"Mobile/web pairing (Remote Control) is native: this replacement coord\n" +
+		"was spawned with `--remote-control` baked into its claude argv, so\n" +
+		"pairing carries through automatically — nothing to re-attach. If\n" +
+		"pairing looks broken, check:\n" +
+		"\n" +
+		"    fleet rc status myproj\n" +
+		"\n" +
+		"If RC was disabled for this project (`fleet rc down myproj`),\n" +
+		"re-enable it with `fleet rc up myproj` — it takes effect on the\n" +
+		"next coord spawn (`fleet handoff <coord-id>` respawns the live coord).\n" +
+		"\n" +
+		"Then run the slash command `/coordinator` (in the chat, not bash) to resume the per-project supervisor tick loop. The /coordinator skill is idempotent — running it on a coord session that already holds the NB-flock is a no-op (the flock skips when held), and on a non-coord lineage it exits cleanly with no project to supervise.\n" +
+		"\n" +
+		"Then continue with the sections below." + "\n\n" +
 		"## Completed\nWrote tests for foo\n\n" +
 		"## Key Decisions\n" + Placeholder + "\n\n" +
 		"## Files Modified\n" + Placeholder + "\n\n" +

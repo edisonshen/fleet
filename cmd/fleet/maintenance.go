@@ -20,8 +20,10 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -347,14 +349,16 @@ func runMaintenancePruneOrphanTmux(
 func newMaintenanceBootstrapRemoteControlCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "bootstrap-remote-control",
-		Short: "Survey live agents missing the --remote-control flag",
+		Short: "Survey live COORD agents missing the --remote-control flag",
 		Long: `bootstrap-remote-control walks ~/.fleet/agents/*.json and
-identifies live agents whose persisted Command lacks --remote-control.
+identifies live COORD agents (the project's coord-spawn marker
+resolves to the agent ID) whose persisted Command lacks
+--remote-control. Workers / Agent-tool subagents are out of scope —
+they never carry the flag by design (push-storm protection).
 Live = the record's tmux session is currently alive (HasSession). For
 each match, the command prints a one-line remediation suggestion
-("fleet handoff <id>" is the typical fix; the replacement spawn goes
-through the relaxed wrapper-pattern matcher and gets the flag injected
-automatically).
+("fleet handoff <id>" is the typical fix; the replacement spawn bakes
+in the native flag automatically).
 
 This is REPORT-ONLY in v1. An actual live retrofit would require
 restarting the agent's tmux session, which is the operator's call —
@@ -380,11 +384,25 @@ Exit codes:
 // listFn / hasSessionFn injection lets tests substitute fake
 // agent-store and tmux-presence views (no real tmux required).
 //
-// v0.12 (DESIGN-rc-listener-lifecycle.md §"cmd/fleet/maintenance.go:
-// 348-351 survey rewrite"): the survey now differentiates "RC not
-// enabled for project" (operator opt-out, no remediation needed)
-// from "RC enabled but agent's persisted argv lacks the flag"
-// (legacy / pre-v0.12 agent that needs a handoff to re-attach).
+// Native model (codex review iter-1 [P2]): RC rides ONLY on coord
+// spawns, and rc.Enabled is default-on — so the survey must scope to
+// COORD agents (the project's coord-spawn marker resolves to the
+// agent's ID). Workers / Agent-tool subagents are intentionally never
+// flagged: reporting them would generate false "needs remediation"
+// noise for every normal default-on project. Within coords, the
+// survey differentiates "RC disabled for project" (operator opt-out
+// via `fleet rc down` — no action) from "RC enabled (the default) but
+// persisted argv lacks the flag" (pre-native coord — handoff respawns
+// it with native RC).
+//
+// Native coords persist the CLEAN command FOREVER (the flag rides on
+// the per-spawn exec argv only), so the persisted-Command check alone
+// would flag every healthy native coord as a permanent false positive
+// (/review adversarial F8). The survey therefore ALSO probes the LIVE
+// process argv (`ps -p <pid> -o args=`, via the liveArgvHasRCFn seam):
+// a coord whose running process carries --remote-control is healthy
+// and skipped. PID<=0 / probe failure falls back to the persisted
+// check (report-only; better a rare false positive than a kill).
 func runMaintenanceBootstrapRemoteControl(
 	stdout io.Writer,
 	listFn func() ([]*agent.Record, error),
@@ -407,7 +425,22 @@ func runMaintenanceBootstrapRemoteControl(
 		if r == nil {
 			continue
 		}
+		// Coord-only scope (codex review iter-1 [P2]): workers and
+		// Agent-tool subagents never get --remote-control by design;
+		// surveying them under the default-on gate would flag every
+		// worker on every project. Same predicate as the handoff /
+		// drain inject gates: the coord-spawn marker resolves to this
+		// agent's ID.
+		if r.Project == "" || state.ReadCoordSpawnMarker(r.Project) != r.ID {
+			continue
+		}
 		if commandHasRemoteControl(r.Command) {
+			continue
+		}
+		// Live-argv probe: native coords never persist the flag, but
+		// the running claude process carries it. Healthy native coord
+		// → skip.
+		if r.PID > 0 && liveArgvHasRCFn(r.PID) {
 			continue
 		}
 		if !hasSessionFn(r.TmuxSession) {
@@ -453,25 +486,38 @@ func runMaintenanceBootstrapRemoteControl(
 		for _, m := range rcEnabledMissing {
 			_, _ = fmt.Fprintf(stdout,
 				"  %s  project=%s  task=%s  spawned=%s\n"+
-					"     remediation: fleet handoff %s   (replacement spawn auto-injects the flag)\n"+
-					"                  or: fleet rc connect %s    (drives /remote-control on the live coord)\n\n",
-				m.id, m.project, m.taskID, m.spawnedAt, m.id, m.project)
+					"     remediation: fleet handoff %s   (replacement spawn bakes in native --remote-control)\n"+
+					"                  or: type /remote-control in the agent's pane\n\n",
+				m.id, m.project, m.taskID, m.spawnedAt, m.id)
 		}
 	}
 	if len(rcDisabledSkipped) > 0 {
 		_, _ = fmt.Fprintf(stdout,
-			"%d live agent(s) without --remote-control (RC NOT enabled for project — no action needed):\n\n",
+			"%d live agent(s) without --remote-control (RC disabled for project — no action needed):\n\n",
 			len(rcDisabledSkipped))
 		for _, m := range rcDisabledSkipped {
 			_, _ = fmt.Fprintf(stdout,
 				"  %s  project=%s  task=%s  spawned=%s\n"+
-					"     status: RC opt-in absent (no `~/.fleet/projects/%s/rc-enabled` marker)\n"+
-					"     remediation (only if pairing wanted): fleet rc up %s && fleet rc connect %s\n\n",
+					"     status: RC opted out (`~/.fleet/projects/%s/rc-disabled` marker present, or no project)\n"+
+					"     remediation (only if pairing wanted): fleet rc up %s && fleet handoff %s\n\n",
 				m.id, m.project, m.taskID, m.spawnedAt,
-				m.project, m.project, m.project)
+				m.project, m.project, m.id)
 		}
 	}
 	return nil
+}
+
+// liveArgvHasRCFn probes whether the LIVE process at pid carries the
+// --remote-control flag in its argv. Production shells out to
+// `ps -p <pid> -o args=`; tests stub via the package var. Best-effort:
+// any probe failure returns false (fall back to the persisted-command
+// heuristic — the survey is report-only).
+var liveArgvHasRCFn = func(pid int) bool {
+	out, err := exec.Command("ps", "-p", strconv.Itoa(pid), "-o", "args=").Output()
+	if err != nil {
+		return false
+	}
+	return strings.Contains(string(out), "--remote-control")
 }
 
 // commandHasRemoteControl returns true iff any element of the

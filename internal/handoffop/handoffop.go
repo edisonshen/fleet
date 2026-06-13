@@ -51,24 +51,6 @@ var sessionListProbe = tmux.ListSessions
 // so tests inject deterministic fakes.
 var sessionAliveProbe = tmux.SessionAlive
 
-// writeMarkerFn is the seam for the v0.12.2 P0 drain-path RC marker
-// backfill (DESIGN-coord-spawn-atomic-gate.md). Production wires
-// rc.WriteMarker; tests stub to count invocations and exercise the
-// non-fatal-on-failure contract pinned by
-// TestDrain_CoordHandoff_MarkerWriteFailure_NonFatal.
-//
-// Mirrors cmd/fleet/dispatch.go's writeMarkerFn seam: the handoffop
-// package can't import cmd/fleet (would cycle), so each package
-// carries its own seam wired to the same rc.WriteMarker production
-// implementation.
-//
-// Closes PR #163's deferred [P2] (2): cmd/fleet/handoff.go (PR #163)
-// writes the marker before the inject for operator-triggered handoffs;
-// internal/handoffop/handoffop.go (this seam) does the same for
-// drain-path (auto-handoff + crash recovery) handoffs so pre-v0.12.1
-// coords get RC backfilled on their next handoff.
-var writeMarkerFn = rc.WriteMarker
-
 var (
 	handoffDeliveryDepsFn  = handoffdelivery.DefaultDeps
 	handoffDeliveryTimeout = 30 * time.Second
@@ -150,6 +132,25 @@ func retargetArchivedHandoffSuccessor(agentID, successorID string) error {
 		return fmt.Errorf("write archive %s: %w", agentID, err)
 	}
 	return nil
+}
+
+// coordDrainExecArgv computes the per-spawn exec argv for a COORD
+// drain replacement: routes the clean persisted Command through
+// rc.GateAttachFlag (native default-on; suppressed by the rc-disabled
+// opt-out marker or the FLEET_RC_BOOTSTRAP_DISABLED env-gate) and
+// returns nil when the rewrite is a no-op so spawn.Spawn doesn't see a
+// pointless Command/ExecCommand divergence. Workers never reach this —
+// the isCoordHandoffForAgent call-site gate is the push-storm
+// protection.
+//
+// Extracted for unit-testable coverage without driving a full
+// spawnAndRetire (which would exec the rewritten argv for real).
+func coordDrainExecArgv(project string, command []string, rcSessionName string) []string {
+	rewritten := rc.GateAttachFlag(project, command, rcSessionName)
+	if spawn.SameCommand(rewritten, command) {
+		return nil
+	}
+	return rewritten
 }
 
 // isCoordHandoffForAgent reports whether (project, agentID) identifies
@@ -677,30 +678,22 @@ func spawnAndRetire(req queue.SpawnFresh, queuePath string,
 	// operator-overridden custom --commands, InjectRemoteControlFlag
 	// returns the slice unchanged — we then pass nil as ExecCommand
 	// so spawn.Spawn doesn't see a no-op divergence.
-	// codex round-6 P1: post-v0.12 only one listener prefix exists
-	// (`fleet-coord`, started by `fleet rc up`). The legacy per-
-	// handoff `fleet-handoff-<project>` daemon went away when the
-	// S2/S3 gates replaced the embedded bash bootstrap with operator-
-	// instruction markdown. Injecting "fleet-handoff-..." into the
-	// replacement coord would point at a prefix the live listener
-	// can't see → silent pairing failure post-auto-handoff. Mirror
-	// cmd/fleet/handoff.go: use the coord session-name shape.
+	// Session names use the coord shape (`fleet-coord-<id>-<project>`)
+	// so fresh-spawn and handoff replacements are uniform on
+	// claude.ai / mobile (codex round-6 P1, historical).
 	rcSessionName := spawn.CoordRemoteControlSessionName(req.NewAgentID, oldRec.Project)
-	// v0.12 (DESIGN §"Attach-surface gates" I3): use the project-aware
-	// rc.GateAttachFlag helper. Auto-handoff drain hits this code path
-	// without going through cmd/fleet's wrapper, so the dedicated
-	// helper carries the same FLEET_RC_BOOTSTRAP_DISABLED + rc.Enabled
-	// two-layer gate (rather than re-implementing it here).
+	// Native model: use the project-aware rc.GateAttachFlag helper.
+	// Auto-handoff drain hits this code path without going through
+	// cmd/fleet's wrapper, so the dedicated helper carries the same
+	// rc-disabled opt-out + FLEET_RC_BOOTSTRAP_DISABLED two-layer gate
+	// (rather than re-implementing it here).
 	//
-	// v0.12.1 codex review iter-7 [P1]: ALSO gate on isCoordHandoff
-	// — the project-wide rc-enabled marker is now auto-written by
-	// coord-spawn (DESIGN-rc-coord-auto-marker.md), so worker handoffs
-	// resumed via fleet drain / crash recovery would silently inherit
-	// --remote-control after any coord in the same project triggered
-	// the auto-write. The strict opt-in carve-out for workers /
-	// subagents (v0.12 push-storm protection) requires gating EVERY
-	// RC inject site that runs during a handoff, not just the marker
-	// write site. Mirrors cmd/fleet/handoff.go and dispatch.go.
+	// v0.12.1 codex review iter-7 [P1] (kept): ALSO gate on
+	// isCoordHandoff — RC is default-on project-wide, so worker
+	// handoffs resumed via fleet drain / crash recovery would silently
+	// inherit --remote-control without this call-site gate. Workers /
+	// Agent-tool subagents must NEVER carry the flag (push-storm
+	// protection). Mirrors cmd/fleet/handoff.go and dispatch.go.
 	//
 	// The predicate matches the post-spawn isCoordSwap detector at
 	// line ~602 below — same fact (coord-spawn marker resolves to
@@ -741,31 +734,11 @@ func spawnAndRetire(req queue.SpawnFresh, queuePath string,
 		}
 		defer release()
 
-		// v0.12.2 P0 (DESIGN-coord-spawn-atomic-gate.md Change 6;
-		// closes PR #163 deferred [P2] (2)): backfill the rc-enabled
-		// marker for the project BEFORE the inject so a pre-v0.12.1
-		// coord whose project never had the marker written still
-		// gets RC on its drain-path replacement. Without this, the
-		// rc.Enabled(project) gate inside rc.GateAttachFlag returns
-		// false → inject no-ops → the replacement coord boots
-		// without --remote-control, breaking mobile / claude.ai
-		// pairing for the operator.
-		//
-		// Mirrors cmd/fleet/handoff.go's marker-write-before-inject
-		// pattern (PR #163 line 768). Failure is non-fatal: log a
-		// warning to stderr and continue — the inject will then
-		// no-op gracefully (the gate's other half), and the
-		// operator can recover via `fleet rc up <project>`.
-		if err := writeMarkerFn(oldRec.Project); err != nil {
-			_, _ = fmt.Fprintf(stderr,
-				"warning: rc.WriteMarker(%q) failed during drain handoff: %v "+
-					"(continuing with plain claude argv; run `fleet rc up %s` to recover)\n",
-				oldRec.Project, err, oldRec.Project)
-		}
-		rewrittenExecArgv = rc.GateAttachFlag(oldRec.Project, oldRec.Command, rcSessionName)
-		if spawn.SameCommand(rewrittenExecArgv, oldRec.Command) {
-			rewrittenExecArgv = nil
-		}
+		// Native model: no marker backfill needed — rc.Enabled is
+		// default-on; coordDrainExecArgv bakes the flag unless the
+		// operator opted the project out (rc-disabled) or the test
+		// env-gate is set.
+		rewrittenExecArgv = coordDrainExecArgv(oldRec.Project, oldRec.Command, rcSessionName)
 	}
 
 	// COORD drain handoffs resolve the repo binding via the shared

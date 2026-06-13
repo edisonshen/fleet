@@ -678,15 +678,24 @@ func TestHandoffSessionPrefix_MatchesFirstActionDaemon(t *testing.T) {
 			"internal/spawn.HandoffRemoteControlSessionName's prefix root)",
 			handoffSessionPrefix, "fleet-handoff")
 	}
-	// v0.12 FirstAction shape: operator-instruction text referencing
-	// `fleet rc connect <project>`. Per-project signal lives in the
-	// rc command, NOT in a bash bootstrap.
+	// Native FirstAction shape: status note referencing the per-project
+	// diagnostics (`fleet rc status <project>`) and the opt-out escape
+	// hatch (`fleet rc up <project>`). NO bash bootstrap, NO retired
+	// `fleet rc connect` instruction.
 	const project = "rainier"
 	body := handoff.FirstAction(project)
-	wantConnect := "fleet rc connect " + project
-	if !strings.Contains(body, wantConnect) {
-		t.Errorf("handoff.FirstAction(%q) must reference %q; got body:\n%s",
-			project, wantConnect, body)
+	for _, want := range []string{
+		"fleet rc status " + project,
+		"fleet rc up " + project,
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("handoff.FirstAction(%q) must reference %q; got body:\n%s",
+				project, want, body)
+		}
+	}
+	if strings.Contains(body, "fleet rc connect") {
+		t.Errorf("handoff.FirstAction(%q) must NOT reference the retired `fleet rc connect`; got body:\n%s",
+			project, body)
 	}
 }
 

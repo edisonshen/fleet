@@ -1,12 +1,10 @@
 package handoff
 
-// firstaction_project_test.go pins the v0.12 FirstAction contract:
-// the body is operator-instruction markdown (not bash bootstrap)
-// that directs the resuming operator to run `fleet rc connect
-// <project>` to re-attach mobile/web pairing. v0.12 retired the
-// embedded bash bootstrap per DESIGN-rc-listener-lifecycle.md
-// §"Handoff doc rewrite" — the new body must NOT contain any
-// `claude remote-control` bash exec.
+// firstaction_project_test.go pins the native-RC FirstAction contract
+// (rc-default-native-startup): the body is a status note — pairing is
+// native at coord spawn — plus the opt-out escape hatch (`fleet rc up
+// <project>`), with NO bash bootstrap and NO retired `fleet rc
+// connect` instruction. The /coordinator resume paragraph stays.
 
 import (
 	"strings"
@@ -14,24 +12,29 @@ import (
 	"time"
 )
 
-// TestFirstAction_OperatorInstructionShape asserts the new body's
-// load-bearing surface: it tells the operator to run
-// `fleet rc connect <project>` and references `fleet rc up <project>`
-// as the opt-in command.
+// TestFirstAction_OperatorInstructionShape asserts the native body's
+// load-bearing surface: pairing is native (--remote-control mention),
+// `fleet rc status <project>` is the diagnostic, `fleet rc up
+// <project>` is the re-enable path, and /coordinator resumes the
+// supervisor loop. The retired `fleet rc connect` must NOT appear.
 func TestFirstAction_OperatorInstructionShape(t *testing.T) {
 	const project = "spark"
 	got := FirstAction(project)
 
 	for _, want := range []string{
-		"fleet rc connect " + project,
+		"--remote-control",
+		"fleet rc status " + project,
 		"fleet rc up " + project,
-		"/remote-control",
 		"/coordinator",
 	} {
 		if !strings.Contains(got, want) {
 			t.Errorf("FirstAction(%q) body missing %q; got:\n%s",
 				project, want, got)
 		}
+	}
+	if strings.Contains(got, "fleet rc connect") {
+		t.Errorf("FirstAction(%q) MUST NOT reference the retired `fleet rc connect`; got:\n%s",
+			project, got)
 	}
 }
 
@@ -48,6 +51,7 @@ func TestFirstAction_NoEmbeddedBashBootstrap(t *testing.T) {
 		"pgrep -f",
 		"```bash",
 		"--remote-control-session-name-prefix",
+		"fleet rc connect", // retired send-keys attach path
 	} {
 		if strings.Contains(got, forbidden) {
 			t.Errorf("FirstAction(%q) MUST NOT contain %q (v0.12 retired the bash bootstrap; operator-instruction text only); got:\n%s",
@@ -73,7 +77,7 @@ func TestFirstAction_DistinctPerProject(t *testing.T) {
 // well-formed for legacy records.
 func TestFirstAction_EmptyProjectFallback(t *testing.T) {
 	got := FirstAction("")
-	if !strings.Contains(got, "fleet rc connect <project>") {
+	if !strings.Contains(got, "fleet rc status <project>") {
 		t.Errorf("FirstAction(\"\") should emit `<project>` placeholder; got:\n%s", got)
 	}
 }
@@ -86,7 +90,7 @@ func TestRender_FirstActionUsesDocProject(t *testing.T) {
 	d := NewManualStub("a1b2c3d4", "auth-fix", project, 1, nil, time.Now().UTC())
 	got := string(Render(d))
 
-	want := "fleet rc connect " + project
+	want := "fleet rc status " + project
 	if !strings.Contains(got, want) {
 		t.Errorf("Render(d) should embed %q from d.Project=%q; got:\n%s",
 			want, project, got)
