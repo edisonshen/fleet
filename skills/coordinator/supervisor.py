@@ -1870,8 +1870,17 @@ def _run_idle_agent_archive_pass(
         # the predicate is unambiguous and project-scoped. The literal
         # "coord-{project}" is pinned to the Go coordTaskIDPrefix by a
         # drift-guard test (internal/spawn/coord_idle_exempt_test.go).
+        # Guard `project` truthiness on Signal 1: an empty project would
+        # collapse the comparison to task_id == "coord-", wrongly exempting
+        # any worker whose task_id is literally "coord-" (a leak — the
+        # worker would never reap). The skill entrypoint already returns
+        # early on an empty project, but the sweep self-protects so a
+        # future direct caller can't reintroduce the leak. Signal 2
+        # (is_coord) needs no such guard — it's an exact bool match.
         task_id = str(rec.get("task_id", "") or "")
-        if rec.get("is_coord") is True or task_id == f"coord-{project}":
+        if rec.get("is_coord") is True or (
+            project and task_id == f"coord-{project}"
+        ):
             continue
         # Scope to this project. Every project's coord runs its own
         # sweep; a sibling project's stale agent is that coord's

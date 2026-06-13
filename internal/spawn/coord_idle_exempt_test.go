@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"strings"
 	"testing"
 
 	"github.com/edisonshen/fleet/internal/agent"
@@ -92,12 +93,31 @@ func TestCoordTaskIDPrefix_PythonDriftGuard(t *testing.T) {
 	// f"coord-{project}". We require the exact prefix literal inside an
 	// f-string interpolating {project}. Matching "coord-{project}" pins
 	// the prefix to coordTaskIDPrefix ("coord-").
+	//
+	// Match only on a CODE line, never a comment. The same literal also
+	// appears in the explanatory comment above the comparison; a plain
+	// whole-file grep would stay green if a future edit deleted the live
+	// comparison but kept the comment — defeating the very drift this
+	// test guards. So we strip Python comment lines first and require the
+	// literal to survive on actual code.
 	wantLiteral := coordTaskIDPrefix + "{project}" // "coord-{project}"
 	pat := regexp.MustCompile(`f"` + regexp.QuoteMeta(wantLiteral) + `"`)
-	if !pat.Match(src) {
+	foundOnCode := false
+	for _, line := range strings.Split(string(src), "\n") {
+		if strings.HasPrefix(strings.TrimSpace(line), "#") {
+			continue // comment line — not load-bearing
+		}
+		if pat.MatchString(line) {
+			foundOnCode = true
+			break
+		}
+	}
+	if !foundOnCode {
 		t.Errorf("supervisor.py drift: expected the idle-archive exemption "+
-			"to compare task_id against f%q (pinned to Go coordTaskIDPrefix=%q). "+
-			"If you changed the coord task_id convention on one side, change both.",
+			"to compare task_id against f%q ON A CODE LINE (pinned to Go "+
+			"coordTaskIDPrefix=%q). A match only inside a comment does not "+
+			"count. If you changed the coord task_id convention on one side, "+
+			"change both.",
 			wantLiteral, coordTaskIDPrefix)
 	}
 }

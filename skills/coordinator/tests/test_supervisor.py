@@ -1794,6 +1794,35 @@ def test_idle_agent_archive_pass_exempts_coord_explicit_field_in_isolation(
     assert path.exists(), "coord record file must remain on disk"
 
 
+def test_idle_agent_archive_pass_empty_project_does_not_exempt_coord_dash(
+    fleet_home: Path, monkeypatch,
+) -> None:
+    """Regression (adversarial F1): an empty project must NOT collapse
+    Signal 1 to task_id == "coord-" and exempt a worker whose task_id is
+    literally "coord-". Such a worker (no is_coord) must STILL reap —
+    otherwise it leaks forever. The sweep self-protects via the `project
+    and ...` guard even though the skill entrypoint already returns early
+    on an empty project."""
+    project = ""  # pathological: collapses f"coord-{project}" -> "coord-"
+    _write_agent_record(
+        fleet_home, "ffff0007",
+        project=project,
+        last_activity_ts="2026-05-11T00:00:00Z",
+        task_id="coord-",  # would match "coord-" if project guard absent
+    )
+    now_unix, calls = _exempt_setup(monkeypatch)
+
+    archived = supervisor._run_idle_agent_archive_pass(
+        project=project, home=fleet_home, fleet_bin="fleet",
+        now_unix=now_unix, log_stream=io.StringIO(),
+    )
+
+    assert archived == 1, f"empty-project worker must reap; calls: {calls}"
+    assert [c for c in calls if c[1:3] == ["rm", "ffff0007"]], (
+        f"expected `fleet rm ffff0007`, got: {calls}"
+    )
+
+
 def test_idle_agent_archive_pass_archives_worker_with_task_id(
     fleet_home: Path, monkeypatch,
 ) -> None:
