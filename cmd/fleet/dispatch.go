@@ -1520,9 +1520,18 @@ func runDispatchReconcile(stderr io.Writer, isCoordSpawn bool) {
 		// always pass -S; the bare `tmux kill-session -t <name>`
 		// hint would talk to the default server instead. Mirrors
 		// status.go's orphanCleanupHint.
-		killCmd := fmt.Sprintf("tmux kill-session -t %s", a.Target)
-		if sock := strings.TrimSpace(os.Getenv("FLEET_TMUX_SOCKET")); sock != "" {
-			killCmd = fmt.Sprintf("tmux -S %s kill-session -t %s", sock, a.Target)
+		//
+		// A classifier-supplied CleanupHint wins (codex iter-2 [P2]): a
+		// file-less orphan tmux daemon's Target is a socket PATH, so the
+		// session-kill synthesis below would emit a bogus
+		// `tmux kill-session -t /tmp/fleet-test-x.sock`; the hint carries
+		// the correct `kill <pid>`.
+		killCmd := a.CleanupHint
+		if killCmd == "" {
+			killCmd = fmt.Sprintf("tmux kill-session -t %s", a.Target)
+			if sock := strings.TrimSpace(os.Getenv("FLEET_TMUX_SOCKET")); sock != "" {
+				killCmd = fmt.Sprintf("tmux -S %s kill-session -t %s", sock, a.Target)
+			}
 		}
 		_, _ = fmt.Fprintf(stderr,
 			"warning: orphan tmux session %s has no agent record; kill manually with `%s`\n",

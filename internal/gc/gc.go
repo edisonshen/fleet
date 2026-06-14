@@ -359,6 +359,16 @@ type Deps struct {
 	// KillTmuxServer runs `tmux -S <sock> kill-server` under
 	// --apply --aggressive. Production wiring is killTmuxServerOnDisk.
 	KillTmuxServer func(socketPath string) error
+	// KillTmuxProc kills a FILE-LESS orphan tmux daemon by PID (a live
+	// `tmux -S /tmp/fleet-test-*.sock` server whose socket file is gone, so
+	// it cannot be reached by `tmux -S <path> kill-server`). expectSock is
+	// the socket path enumeration matched under the scan dir; the kill seam
+	// re-verifies the PID is STILL that exact daemon before signaling so a
+	// reused PID on a fleet-test socket OUTSIDE the scan dir is never killed
+	// (codex iter-4 [P2]). Used under --apply --aggressive for LiveTestSocket
+	// entries with ServerPID > 0. Production wiring is killTmuxProcByPID. nil
+	// leaves such daemons surfaced-only (kill seam unwired).
+	KillTmuxProc func(pid int, expectSock string) error
 
 	// Invalid-projects (KindInvalidProjects).
 	// ListProjectDirs enumerates EVERY ~/.fleet/projects/<name>/ entry
@@ -460,6 +470,13 @@ type Action struct {
 	Target string
 	Verb   Verb
 	Reason string
+	// CleanupHint, when non-empty, is the exact copy-paste command the
+	// operator should run to clean this up — overriding the consumer's
+	// default `tmux kill-session -t <Target>` synthesis. Set for file-less
+	// orphan tmux daemons (KindOrphanTmux with a socket-path Target and no
+	// session name) where the correct command is `kill <pid>`, not a
+	// session kill (codex iter-2 [P2]). Empty for the common case.
+	CleanupHint string
 }
 
 // Report carries the per-kind planned/applied actions. Stable iteration
@@ -943,9 +960,43 @@ func humanDuration(d time.Duration) string {
 // returned struct is one screenful and trivially reads as "here's the
 // real call for each hook."
 func DefaultDeps() Deps {
+	return defaultDepsScanning(gcScanDir())
+}
+
+// DefaultDepsWithScanDir is DefaultDeps with the GC socket-scan directory
+// pinned to dir instead of resolved from FLEET_GC_SCAN_DIR/`/tmp`. It exists
+// for internal/gc unit tests that must point the scan at a temp decoy WITHOUT
+// mutating process env — so the test stays parallel-safe (no t.Setenv, no
+// global-env race against sibling tests). Production code always goes through
+// DefaultDeps(), which reads the env per call (per-reconcile, not memoized).
+func DefaultDepsWithScanDir(dir string) Deps {
+	return defaultDepsScanning(dir)
+}
+
+// gcScanDir resolves the directory the socket-scan callsites walk. It is the
+// SINGLE source of the `/tmp` default — both ListSockets (KindSockets) and
+// listLiveTestSocketsOnDisk (OrphanTmux live-test-socket reaper) consult it,
+// so an unset env keeps production behavior identical to the historical
+// hardcoded `/tmp`. Read per call (DefaultDeps is invoked per reconcile), so a
+// test can scope FLEET_GC_SCAN_DIR with t.Setenv and have it picked up without
+// any memoization to bust. The `/tmp` literal lives ONLY here — the callsites
+// call gcScanDir(), never a hardcoded `/tmp` directly (grep-guarded).
+func gcScanDir() string {
+	if dir := os.Getenv("FLEET_GC_SCAN_DIR"); dir != "" {
+		return dir
+	}
+	return "/tmp"
+}
+
+// defaultDepsScanning builds the production Deps with the socket-scan
+// directory threaded into BOTH /tmp-scanning closures. A Deps.ScanDir FIELD
+// alone would be inert — reconcileSockets/reconcileLiveTestSockets invoke the
+// closures, they do not read the struct — so the dir is captured in each
+// closure here (the load-bearing wiring).
+func defaultDepsScanning(scanDir string) Deps {
 	return Deps{
 		Now:                   time.Now,
-		ListSockets:           func() ([]SocketInfo, error) { return scanSocketsDir("/tmp") },
+		ListSockets:           func() ([]SocketInfo, error) { return scanSocketsDir(scanDir) },
 		RemoveSocket:          removeSocketFile,
 		SocketLive:            socketLiveOnDisk,
 		ListAgents:            agent.List,
@@ -992,8 +1043,9 @@ func DefaultDeps() Deps {
 		RemoveDrainRun:        removeDrainRunFile,
 		ListDrainProcs:        listDrainProcsOnDisk,
 		ReloadDrainRun:        reloadDrainRunOnDisk,
-		ListLiveTestSockets:   listLiveTestSocketsOnDisk,
+		ListLiveTestSockets:   func() ([]LiveTestSocket, error) { return listLiveTestSocketsOnDisk(scanDir) },
 		KillTmuxServer:        killTmuxServerOnDisk,
+		KillTmuxProc:          killTmuxProcByPID,
 	}
 }
 

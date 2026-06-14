@@ -303,6 +303,12 @@ func isCoordRecord(r *agent.Record) bool {
 // blast radius is bounded — but the per-record hint still mentions
 // the check so the operator confirms identity before running.
 func orphanCleanupHint(a gc.Action, rec *agent.Record) string {
+	// A classifier-supplied hint wins over the per-kind default synthesis —
+	// e.g. a file-less orphan tmux daemon whose Target is a socket PATH needs
+	// `kill <pid>`, not a session kill (codex iter-2 [P2]).
+	if a.CleanupHint != "" {
+		return a.CleanupHint
+	}
 	switch a.Kind {
 	case gc.KindOrphanTmux:
 		// Codex review PR-D iter-7 [P2]: include -S $FLEET_TMUX_SOCKET
