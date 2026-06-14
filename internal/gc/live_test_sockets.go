@@ -52,6 +52,13 @@ import (
 	"time"
 )
 
+// fileLessReapHint is the copy-paste cleanup command for a file-less orphan
+// tmux daemon (socket file gone → unreachable by path). It is the kind-scoped,
+// quiescence-gated gc reaper — the only safe reap of a file-less daemon, and
+// benign to paste: the gate spares every live `go test` server and operator
+// session, so it can only kill ownerless test orphans (codex iter-15 [P2]).
+const fileLessReapHint = "fleet gc --apply --aggressive --kinds orphan-tmux"
+
 // LiveTestSocket describes one live tmux server bound to a
 // /tmp/fleet-test-*.sock. OwnerPID encodes whether the server may still
 // belong to an in-flight `go test`:
@@ -136,15 +143,18 @@ func reconcileLiveTestSockets(r *Report, opts Options, deps Deps) error {
 		// (KillTmuxProc's expectSock recheck) before signaling.
 		fileLess := s.ServerPID > 0
 		hint := fmt.Sprintf("tmux -S %s kill-server", s.SocketPath)
+		reason := fmt.Sprintf("live test-socket tmux server on %s with no live go-test owner; rerun with --apply --aggressive to kill (or `%s`)",
+			s.SocketPath, hint)
 		if fileLess {
-			hint = "fleet gc --apply --aggressive --kinds orphan-tmux"
+			hint = fileLessReapHint
+			reason = fmt.Sprintf("file-less orphan test-socket tmux daemon (pid %d) on %s with no live go-test owner; rerun with --apply --aggressive to kill (or `%s`)",
+				s.ServerPID, s.SocketPath, hint)
 		}
 		act := Action{
 			Kind:   KindOrphanTmux,
 			Target: target,
 			Verb:   VerbSurface,
-			Reason: fmt.Sprintf("live test-socket tmux server on %s with no live go-test owner; rerun with --apply --aggressive to kill (or `%s`)",
-				s.SocketPath, hint),
+			Reason: reason,
 		}
 		if fileLess {
 			// Target is a socket PATH (no session name), so the consumer's
@@ -153,7 +163,19 @@ func reconcileLiveTestSockets(r *Report, opts Options, deps Deps) error {
 			// status.go/dispatch.go, so it must be command-ONLY — no
 			// parenthesized prose (codex iter-6 [P2]: it would be a paste
 			// syntax error). The explanation lives in Reason above.
-			act.CleanupHint = "fleet gc --apply --aggressive --kinds orphan-tmux"
+			//
+			// SCOPE (codex iter-15 [P2]): the only safe reap of a file-less
+			// daemon (no socket file → unreachable by path) is the gc apply
+			// path, which is keyed by KIND not by a single target, so it reaps
+			// EVERY file-less/file-bound orphan-tmux daemon the quiescence gate
+			// classifies as ownerless. That is BENIGN: the same gate spares any
+			// live `go test` server AND any operator `fleet-coord-*`/work
+			// session (those are not go-test orphans), so a copy-paste cannot
+			// kill an in-use session. The Reason names this daemon's exact pid
+			// + socket so the operator sees what is being targeted; the command
+			// is the kind-scoped gated reaper because no narrower file-less
+			// reap exists.
+			act.CleanupHint = fileLessReapHint
 		}
 		if opts.Aggressive {
 			act.Verb = VerbWouldKill
