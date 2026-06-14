@@ -440,11 +440,68 @@ func psProcLister() ([]procInfo, error) {
 	return procs, nil
 }
 
-// orphanTestTmuxSocketRe extracts the `-S <path>` socket from a live
-// `tmux -S /tmp/fleet-test-*.sock ...` argv. Anchored to the fleet-test
-// socket namespace so it never matches the operator's default/custom
-// tmux servers (user-owns-tmux-config).
-var orphanTestTmuxSocketRe = regexp.MustCompile(`-S\s+(/[^\s]*/fleet-test-[^\s]*\.sock)`)
+// fleetTestSocketRe validates that an extracted socket path is in the
+// fleet-test namespace — the only sockets this reaper may touch
+// (user-owns-tmux-config: never the operator's default/custom servers).
+var fleetTestSocketRe = regexp.MustCompile(`^/[^\s]*/fleet-test-[^\s]*\.sock$`)
+
+// tmuxServerSocketFromArgv extracts tmux's OWN `-S <path>` server-socket
+// option from a tmux argv, returning ("", false) unless:
+//
+//   - argv[0]'s basename is `tmux`, AND
+//   - `-S <path>` appears among tmux's GLOBAL options (before the tmux
+//     command word like `new-session`), AND
+//   - <path> is in the fleet-test namespace.
+//
+// codex iter-1 [P2]: a prior regex matched any `-S /tmp/fleet-test-*.sock`
+// substring ANYWHERE in the argv — including a pane command or env value on
+// an OPERATOR-owned tmux server — and would then PID-kill that server. tmux
+// global options precede the command, so we parse positionally and STOP at
+// the first non-option token (the command), never scanning the command's
+// own args. `-Spath` (glued, no space) is also a valid tmux form.
+func tmuxServerSocketFromArgv(args string) (string, bool) {
+	fields := strings.Fields(args)
+	if len(fields) == 0 {
+		return "", false
+	}
+	exe := fields[0]
+	if i := strings.LastIndexAny(exe, "/\\"); i >= 0 {
+		exe = exe[i+1:]
+	}
+	exe = strings.TrimPrefix(exe, "(")
+	exe = strings.TrimSuffix(exe, ")")
+	if exe != "tmux" {
+		return "", false
+	}
+	for i := 1; i < len(fields); i++ {
+		tok := fields[i]
+		if !strings.HasPrefix(tok, "-") {
+			// First non-option token = the tmux command (new-session, etc.).
+			// tmux's own -S must appear before it; stop scanning so a -S in
+			// the command's args is never picked up.
+			return "", false
+		}
+		if tok == "-S" {
+			if i+1 >= len(fields) {
+				return "", false
+			}
+			sock := fields[i+1]
+			if !fleetTestSocketRe.MatchString(sock) {
+				return "", false
+			}
+			return sock, true
+		}
+		if strings.HasPrefix(tok, "-S") {
+			// Glued form `-S/path`.
+			sock := tok[2:]
+			if !fleetTestSocketRe.MatchString(sock) {
+				return "", false
+			}
+			return sock, true
+		}
+	}
+	return "", false
+}
 
 // listFileLessTestTmux finds live `tmux -S /tmp/fleet-test-*.sock` daemons
 // whose socket FILE no longer exists on disk — the file-less orphans that
@@ -465,14 +522,10 @@ func listFileLessTestTmux(ownerVerdict int) []LiveTestSocket {
 	}
 	var out []LiveTestSocket
 	for _, p := range procs {
-		if procExeBase(p.Args) != "tmux" {
+		sock, ok := tmuxServerSocketFromArgv(p.Args)
+		if !ok {
 			continue
 		}
-		m := orphanTestTmuxSocketRe.FindStringSubmatch(p.Args)
-		if m == nil {
-			continue
-		}
-		sock := m[1]
 		if _, statErr := os.Stat(sock); statErr == nil {
 			continue // socket file still present — the disk scan owns it
 		}
@@ -504,8 +557,13 @@ func killTmuxProcByPID(pid int) error {
 		return nil // pid gone (or ps failed) — nothing to kill
 	}
 	args := strings.TrimSpace(string(out))
-	if !strings.HasPrefix(args, "tmux ") || orphanTestTmuxSocketRe.FindStringSubmatch(args) == nil {
-		// PID was recycled to a non-fleet-test-tmux process; refuse to kill.
+	// Re-verify via the SAME argv0-basename + tmux-global-`-S` check used at
+	// enumeration (codex iter-1 [P2]): a plain `HasPrefix(args, "tmux ")`
+	// rejected an absolute argv0 like `/opt/homebrew/bin/tmux …` that
+	// enumeration accepted — so on such hosts the reaper would surface but
+	// never reap. Using tmuxServerSocketFromArgv keeps both ends consistent
+	// AND still refuses a recycled non-fleet-test-tmux PID.
+	if _, ok := tmuxServerSocketFromArgv(args); !ok {
 		return fmt.Errorf("killTmuxProcByPID: pid %d is no longer a fleet-test tmux daemon (recycled); refusing to kill", pid)
 	}
 	proc, ferr := os.FindProcess(pid)

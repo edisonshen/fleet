@@ -430,6 +430,50 @@ func TestAnyGoTestRunning_ListerErrorSpares(t *testing.T) {
 	}
 }
 
+// tmuxServerSocketFromArgv must extract tmux's OWN -S socket and NEVER a
+// -S that appears inside a pane command / env value (codex iter-1 [P2]:
+// matching any `-S /tmp/fleet-test-*.sock` substring could PID-kill an
+// operator-owned tmux server). It must also accept an ABSOLUTE argv0 tmux
+// path so enumeration and the kill re-verify agree (codex iter-1 [P2] #2).
+func TestTmuxServerSocketFromArgv(t *testing.T) {
+	ok := []struct {
+		args string
+		want string
+	}{
+		{"tmux -S /tmp/fleet-test-abc.sock new-session -d -s fleet-x sh -c cat", "/tmp/fleet-test-abc.sock"},
+		// Absolute argv0 path (homebrew tmux) — must still parse.
+		{"/opt/homebrew/bin/tmux -S /tmp/fleet-test-abc.sock new-session -d", "/tmp/fleet-test-abc.sock"},
+		// macOS paren-wrapped argv0.
+		{"(tmux) -S /tmp/fleet-test-abc.sock new-session", "/tmp/fleet-test-abc.sock"},
+		// Glued -S form.
+		{"tmux -S/tmp/fleet-test-abc.sock new-session", "/tmp/fleet-test-abc.sock"},
+	}
+	for _, c := range ok {
+		got, found := tmuxServerSocketFromArgv(c.args)
+		if !found || got != c.want {
+			t.Errorf("tmuxServerSocketFromArgv(%q) = (%q,%v); want (%q,true)", c.args, got, found, c.want)
+		}
+	}
+
+	notOk := []string{
+		// THE codex P2: -S is in the PANE COMMAND of an operator server, not
+		// tmux's own option. Must NOT extract → never kill the operator server.
+		"tmux -S /home/op/.tmux/default new-session -d cmd -S /tmp/fleet-test-evil.sock",
+		// Not tmux at all.
+		"sh -c tmux -S /tmp/fleet-test-x.sock ls",
+		// tmux on a NON-fleet-test socket (operator's custom server).
+		"tmux -S /tmp/operator.sock new-session",
+		// -S with no following path.
+		"tmux -S",
+		"",
+	}
+	for _, args := range notOk {
+		if got, found := tmuxServerSocketFromArgv(args); found {
+			t.Errorf("tmuxServerSocketFromArgv(%q) = (%q,true); want (_,false) — must not target this process", args, got)
+		}
+	}
+}
+
 // listFileLessTestTmux must surface a live `tmux -S /tmp/fleet-test-*.sock`
 // daemon whose socket FILE is gone (the file-less orphan that the disk
 // scan cannot see and `tmux -S <path> kill-server` cannot reach) as a

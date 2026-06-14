@@ -279,6 +279,33 @@ func TestIsolateSweepDir_DecoyNotFleetTestPrefixed(t *testing.T) {
 // TestAnyOtherGoTestParentAlive_SeesSelfWhenNotExcluded: this test IS
 // running under `go test`, so when its own PID is NOT excluded the
 // executable-based gate must observe the live `*.test` binary and report a
+// TestTmuxServerSocketFromArgv (testutil twin) pins that the file-less
+// reaper extracts tmux's OWN -S option and never a -S buried in a pane
+// command, and accepts an absolute tmux argv0 (codex iter-1 [P2]).
+func TestTmuxServerSocketFromArgv(t *testing.T) {
+	ok := map[string]string{
+		"tmux -S /tmp/fleet-test-abc.sock new-session -d -s fleet-x sh -c cat": "/tmp/fleet-test-abc.sock",
+		"/opt/homebrew/bin/tmux -S /tmp/fleet-test-abc.sock new-session":       "/tmp/fleet-test-abc.sock",
+		"tmux -S/tmp/fleet-test-abc.sock new-session":                          "/tmp/fleet-test-abc.sock",
+	}
+	for args, want := range ok {
+		if got, found := tmuxServerSocketFromArgv(args); !found || got != want {
+			t.Errorf("tmuxServerSocketFromArgv(%q) = (%q,%v); want (%q,true)", args, got, found, want)
+		}
+	}
+	notOk := []string{
+		"tmux -S /home/op/.tmux/default new-session -d cmd -S /tmp/fleet-test-evil.sock", // -S in pane cmd
+		"sh -c tmux -S /tmp/fleet-test-x.sock ls",                                        // not tmux
+		"tmux -S /tmp/operator.sock new-session",                                         // non-fleet-test sock
+		"",
+	}
+	for _, args := range notOk {
+		if got, found := tmuxServerSocketFromArgv(args); found {
+			t.Errorf("tmuxServerSocketFromArgv(%q) = (%q,true); want (_,false)", args, got)
+		}
+	}
+}
+
 // live parent. (On a sandbox where ps cannot enumerate the process table
 // the gate fails safe to true anyway — either way the assertion holds.)
 // Proves the gate fires for a live test it can see.

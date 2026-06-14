@@ -333,10 +333,51 @@ func anyOtherGoTestParentAlive(excludePIDs ...int) bool {
 	return false
 }
 
-// fileLessTestTmuxRe extracts the `-S <path>` socket from a live
-// `tmux -S /tmp/fleet-test-*.sock ...` argv. Anchored to the fleet-test
-// namespace so it never matches the operator's default/custom servers.
-var fileLessTestTmuxRe = regexp.MustCompile(`-S\s+(/[^\s]*/fleet-test-[^\s]*\.sock)`)
+// fleetTestSocketRe validates that an extracted socket path is in the
+// fleet-test namespace — the only sockets this reaper may touch.
+var fleetTestSocketRe = regexp.MustCompile(`^/[^\s]*/fleet-test-[^\s]*\.sock$`)
+
+// tmuxServerSocketFromArgv extracts tmux's OWN `-S <path>` server-socket
+// option from a tmux argv, returning ("", false) unless argv[0]'s basename
+// is `tmux`, `-S <path>` is among tmux's GLOBAL options (before the command
+// word), and <path> is in the fleet-test namespace. (testutil twin of
+// internal/gc.tmuxServerSocketFromArgv — see that doc for why anchoring to
+// tmux's own option, not any `-S` substring, prevents PID-killing an
+// operator-owned tmux server whose pane command happens to mention such a
+// path. codex iter-1 [P2].)
+func tmuxServerSocketFromArgv(args string) (string, bool) {
+	fields := strings.Fields(args)
+	if len(fields) == 0 {
+		return "", false
+	}
+	if procExeBaseFromArgs(args) != "tmux" {
+		return "", false
+	}
+	for i := 1; i < len(fields); i++ {
+		tok := fields[i]
+		if !strings.HasPrefix(tok, "-") {
+			return "", false // first non-option token = the tmux command
+		}
+		if tok == "-S" {
+			if i+1 >= len(fields) {
+				return "", false
+			}
+			sock := fields[i+1]
+			if !fleetTestSocketRe.MatchString(sock) {
+				return "", false
+			}
+			return sock, true
+		}
+		if strings.HasPrefix(tok, "-S") { // glued `-S/path`
+			sock := tok[2:]
+			if !fleetTestSocketRe.MatchString(sock) {
+				return "", false
+			}
+			return sock, true
+		}
+	}
+	return "", false
+}
 
 // reapFileLessTestTmux SIGTERMs live `tmux -S /tmp/fleet-test-*.sock`
 // daemons whose socket FILE is gone. Caller (ForceReapTestServers) has
@@ -359,14 +400,11 @@ func reapFileLessTestTmux() {
 			continue
 		}
 		rest := strings.TrimSpace(parts[1])
-		if procExeBaseFromArgs(rest) != "tmux" {
+		sock, ok := tmuxServerSocketFromArgv(rest)
+		if !ok {
 			continue
 		}
-		m := fileLessTestTmuxRe.FindStringSubmatch(rest)
-		if m == nil {
-			continue
-		}
-		if _, statErr := os.Stat(m[1]); statErr == nil {
+		if _, statErr := os.Stat(sock); statErr == nil {
 			continue // socket file present — SweepAllDir already handled it
 		}
 		if proc, ferr := os.FindProcess(pid); ferr == nil {
