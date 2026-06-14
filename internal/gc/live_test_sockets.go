@@ -581,10 +581,20 @@ func killTmuxProcByPID(pid int, expectSock string) error {
 		return fmt.Errorf("killTmuxProcByPID: invalid pid %d", pid)
 	}
 	// Re-verify identity: the PID must still be a tmux server on the SAME
-	// fleet-test socket. ps exit-1 (no such pid) → already gone → success.
+	// fleet-test socket. Distinguish "no such pid" (ps exits 1 with empty
+	// stdout → genuinely gone → success, nothing to reap) from a PROBE
+	// FAILURE (ps missing/denied/other exit → we CANNOT confirm the PID is
+	// the expected daemon, so returning nil here would let the caller report
+	// VerbKilled for a daemon that is still running — codex iter-7 [P2]).
 	out, err := exec.Command("ps", "-o", "args=", "-p", strconv.Itoa(pid)).Output()
 	if err != nil {
-		return nil // pid gone (or ps failed) — nothing to kill
+		var exitErr *exec.ExitError
+		if errors.As(err, &exitErr) && exitErr.ExitCode() == 1 && len(strings.TrimSpace(string(out))) == 0 {
+			return nil // no such pid — already gone, nothing to kill
+		}
+		// ps unavailable / denied / unexpected: cannot prove identity. Surface
+		// the failure so the action does NOT falsely report killed.
+		return fmt.Errorf("killTmuxProcByPID: identity re-verify for pid %d failed (cannot confirm it is the %s daemon; refusing to kill): %w", pid, expectSock, err)
 	}
 	args := strings.TrimSpace(string(out))
 	sock, ok := tmuxServerSocketFromArgv(args)

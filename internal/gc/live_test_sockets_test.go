@@ -607,6 +607,41 @@ func TestReconcile_LiveTestSock_FileLessUnwiredSurfaces(t *testing.T) {
 	}
 }
 
+// killTmuxProcByPID on a definitely-dead PID is a no-op success (the daemon
+// is already gone — `ps -p` exits 1 empty). It must NOT error, since the
+// caller treats nil as "reaped" and a gone daemon IS effectively reaped.
+func TestKillTmuxProcByPID_GonePidIsNoopSuccess(t *testing.T) {
+	if _, err := exec.LookPath("ps"); err != nil {
+		t.Skip("ps unavailable")
+	}
+	// Spawn a trivial process and reap it so its PID is definitively dead.
+	cmd := exec.Command("true")
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("seed true: %v", err)
+	}
+	deadPID := cmd.Process.Pid
+	if err := killTmuxProcByPID(deadPID, "/tmp/fleet-test-x.sock"); err != nil {
+		t.Errorf("killTmuxProcByPID(dead pid) = %v; want nil (gone == already reaped)", err)
+	}
+}
+
+// killTmuxProcByPID must REFUSE (error, not nil) when the live PID is not the
+// expected daemon — a recycled PID must never be killed, and the caller must
+// not report VerbKilled. We point it at our OWN test PID (alive, but not a
+// fleet-test tmux daemon on expectSock).
+func TestKillTmuxProcByPID_WrongIdentityRefuses(t *testing.T) {
+	if _, err := exec.LookPath("ps"); err != nil {
+		t.Skip("ps unavailable")
+	}
+	err := killTmuxProcByPID(os.Getpid(), "/tmp/fleet-test-x.sock")
+	if err == nil {
+		t.Fatal("killTmuxProcByPID against a non-daemon PID returned nil; must refuse (recycled-PID guard) so the action is not reported killed")
+	}
+	if !strings.Contains(err.Error(), "refusing to kill") {
+		t.Errorf("error = %q; want a 'refusing to kill' recycled-PID refusal", err)
+	}
+}
+
 // goTestOwnerVerdict must report SPARE (the unknown sentinel) whenever a
 // `go test` is alive on the host — and this test IS running under
 // `go test`, so the REAL (un-stubbed) production lister must see this
