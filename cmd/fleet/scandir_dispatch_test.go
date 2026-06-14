@@ -101,6 +101,15 @@ func TestDispatchReconcile_OrphanTmux_ScansInjectedDir_NotTmp(t *testing.T) {
 	// real DefaultDeps() reconcile (via dispatchReconcileFn, unstubbed) scans
 	// the seeded socket.
 	t.Setenv("FLEET_GC_SCAN_DIR", dir)
+	// Hermeticity (codex iter-7 [P2]): clear FLEET_TMUX_SOCKET. The full
+	// reconcile ALSO runs the orphan-agent/orphan-tmux passes, which probe via
+	// internal/tmux with `-S $FLEET_TMUX_SOCKET` when that env is set. The fake
+	// recorder would then capture `-S <that-socket>` and the "all probes under
+	// the scan dir" assertion below would fail in any dev/CI env that exports
+	// FLEET_TMUX_SOCKET — a false failure unrelated to the scan-dir wiring.
+	// Cleared, those passes target the default server (no `-S`), so
+	// socketProbes() holds only the scan-path probes we assert on.
+	t.Setenv("FLEET_TMUX_SOCKET", "")
 
 	rec := newFakeTmuxRecorder(t)
 
