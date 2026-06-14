@@ -428,6 +428,18 @@ func reapFileLessTestTmux() {
 		if _, statErr := os.Stat(sock); statErr == nil {
 			continue // socket file present — SweepAllDir already handled it
 		}
+		// Re-verify the PID is STILL the SAME tmux -S <sock> daemon
+		// IMMEDIATELY before signaling (codex iter-8 [P2]): the snapshot
+		// above can go stale — the daemon may exit and the OS reuse the PID
+		// between enumeration and Signal, so a stale snapshot could SIGTERM an
+		// unrelated process. Mirrors gc.killTmuxProcByPID's expectSock recheck.
+		out2, perr := exec.Command("ps", "-o", "args=", "-p", strconv.Itoa(pid)).Output()
+		if perr != nil {
+			continue // pid gone / probe failed — do not signal (best-effort)
+		}
+		if got, ok := tmuxServerSocketFromArgv(strings.TrimSpace(string(out2))); !ok || got != sock {
+			continue // recycled to a different process — never signal it
+		}
 		if proc, ferr := os.FindProcess(pid); ferr == nil {
 			_ = proc.Signal(syscall.SIGTERM)
 		}
@@ -489,11 +501,22 @@ func SweepAllDir(dir string) error {
 			continue
 		}
 		path := filepath.Join(dir, name)
-		// kill-server is idempotent: tmux exits non-zero when no
-		// server is running, which is fine — we only want any bound
-		// server reaped before the socket file is unlinked. Errors
-		// here are best-effort; we proceed to unlink regardless.
-		_ = exec.Command("tmux", "-S", path, "kill-server").Run()
+		// Symlink/non-socket guard (codex iter-8 [P2], mirrors
+		// gc.firstFleetSession): /tmp is world-writable, so a stale or
+		// malicious fleet-test-*.sock SYMLINK could point at the operator's
+		// default tmux socket; `tmux -S <symlink> kill-server` would then
+		// terminate the operator's real server. Lstat (no deref) + ModeSocket:
+		// only kill-server a REAL Unix domain socket. A symlink / regular file
+		// / dir in the namespace is fleet-test debris — unlink it, never
+		// kill-server through it.
+		fi, lerr := os.Lstat(path)
+		isRealSocket := lerr == nil && fi.Mode()&os.ModeSocket != 0
+		if isRealSocket {
+			// kill-server is idempotent: tmux exits non-zero when no server is
+			// running, which is fine — we only want any bound server reaped
+			// before the socket file is unlinked. Best-effort.
+			_ = exec.Command("tmux", "-S", path, "kill-server").Run()
+		}
 		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
 			if firstErr == nil {
 				firstErr = fmt.Errorf("testutil.SweepAllDir remove %s: %w", path, err)

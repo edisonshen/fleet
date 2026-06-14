@@ -183,6 +183,54 @@ func TestSweepAllDir_MissingDir_IsNoop(t *testing.T) {
 	}
 }
 
+// TestSweepAllDir_SymlinkNotFollowed (codex iter-8 [P2]): a fleet-test-*.sock
+// SYMLINK pointing at another tmux socket must NOT be `tmux -S <symlink>
+// kill-server`'d — that would terminate the symlink TARGET (potentially the
+// operator's default server). The symlink is fleet-test debris, so it is
+// unlinked, but never followed into kill-server. We point the symlink at a
+// LIVE tmux server and assert that server survives the sweep.
+func TestSweepAllDir_SymlinkNotFollowed(t *testing.T) {
+	if _, err := exec.LookPath("tmux"); err != nil {
+		t.Skip("tmux not installed")
+	}
+	// A real live tmux server on a SAFE (non-fleet-test) socket — stands in
+	// for the operator's server the malicious symlink would target.
+	victimDir, err := os.MkdirTemp("/tmp", "fleet-victim-")
+	if err != nil {
+		t.Fatalf("mkdirtemp: %v", err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(victimDir) })
+	victim := filepath.Join(victimDir, "v.sock")
+	if out, err := exec.Command("tmux", "-S", victim, "new-session", "-d", "-s", "victim", "sleep", "300").CombinedOutput(); err != nil {
+		t.Fatalf("spawn victim: %v (%s)", err, out)
+	}
+	t.Cleanup(func() { _ = exec.Command("tmux", "-S", victim, "kill-server").Run() })
+	if err := exec.Command("tmux", "-S", victim, "has-session", "-t", "victim").Run(); err != nil {
+		t.Skipf("victim server not live (host quirk): %v", err)
+	}
+
+	// The malicious symlink in the swept dir, named in the fleet-test
+	// namespace, pointing at the victim socket.
+	sweepDir := t.TempDir()
+	link := filepath.Join(sweepDir, "fleet-test-evil.sock")
+	if err := os.Symlink(victim, link); err != nil {
+		t.Fatalf("symlink: %v", err)
+	}
+
+	if err := SweepAllDir(sweepDir); err != nil {
+		t.Fatalf("SweepAllDir: %v", err)
+	}
+	// The victim server MUST survive — the sweep must not have followed the
+	// symlink into kill-server.
+	if err := exec.Command("tmux", "-S", victim, "has-session", "-t", "victim").Run(); err != nil {
+		t.Error("SweepAllDir followed a fleet-test-*.sock SYMLINK into kill-server and killed the target server; symlink guard bypassed")
+	}
+	// The symlink itself (fleet-test debris) should be unlinked.
+	if _, err := os.Lstat(link); !os.IsNotExist(err) {
+		t.Errorf("SweepAllDir left the fleet-test symlink in place; want it unlinked (lstat err=%v)", err)
+	}
+}
+
 // TestSweep_IgnoresScanDirEnv (ci-perf-pr1 socket-leak P0, 2026-06-13): Sweep
 // must NOT read FLEET_GC_SCAN_DIR. An earlier rev routed Sweep through that env
 // so every TestMain's IsolateSweepDir pointed BOTH the gc PROBE and the cleanup
