@@ -181,3 +181,71 @@ func TestSweepAllDir_MissingDir_IsNoop(t *testing.T) {
 		t.Errorf("SweepAllDir on missing dir should be a no-op; got %v", err)
 	}
 }
+
+// TestSweep_HonorsScanDirEnv (ci-perf-pr1, codex iter-3 [P1]): Sweep() reads
+// FLEET_GC_SCAN_DIR so a TestMain can redirect the sweep at a decoy instead of
+// the host /tmp. We seed a stale socket in an injected dir, point the env at
+// it, and assert Sweep() removed it — proving Sweep() walked the env dir, not
+// /tmp.
+func TestSweep_HonorsScanDirEnv(t *testing.T) {
+	dir := t.TempDir()
+	stale := filepath.Join(dir, "fleet-test-staleenv.sock")
+	if err := os.WriteFile(stale, []byte{}, 0o600); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	old := time.Now().Add(-48 * time.Hour)
+	if err := os.Chtimes(stale, old, old); err != nil {
+		t.Fatalf("chtimes: %v", err)
+	}
+	t.Setenv("FLEET_GC_SCAN_DIR", dir)
+
+	if err := Sweep(time.Hour); err != nil {
+		t.Fatalf("Sweep: %v", err)
+	}
+	if _, err := os.Stat(stale); !os.IsNotExist(err) {
+		t.Fatalf("stale socket in the env-injected dir should be reaped; stat err=%v (Sweep did not honor FLEET_GC_SCAN_DIR)", err)
+	}
+}
+
+// TestSweep_DefaultsToTmpWhenEnvUnset: with FLEET_GC_SCAN_DIR unset, sweepDir()
+// resolves /tmp — production behavior unchanged.
+func TestSweep_DefaultsToTmpWhenEnvUnset(t *testing.T) {
+	t.Setenv("FLEET_GC_SCAN_DIR", "")
+	if got := sweepDir(); got != "/tmp" {
+		t.Fatalf("sweepDir() with FLEET_GC_SCAN_DIR unset = %q; want /tmp", got)
+	}
+}
+
+// TestIsolateSweepDir_SetsDecoyAndRestores: the helper sets FLEET_GC_SCAN_DIR
+// to a fresh empty dir, and cleanup() restores the prior env value (or unsets)
+// and removes the decoy.
+func TestIsolateSweepDir_SetsDecoyAndRestores(t *testing.T) {
+	// Case 1: env previously unset -> cleanup unsets it.
+	_ = os.Unsetenv("FLEET_GC_SCAN_DIR")
+	cleanup := IsolateSweepDir()
+	decoy := os.Getenv("FLEET_GC_SCAN_DIR")
+	if decoy == "" {
+		t.Fatal("IsolateSweepDir did not set FLEET_GC_SCAN_DIR")
+	}
+	if fi, err := os.Stat(decoy); err != nil || !fi.IsDir() {
+		t.Fatalf("decoy dir %q not created: err=%v", decoy, err)
+	}
+	cleanup()
+	if _, ok := os.LookupEnv("FLEET_GC_SCAN_DIR"); ok {
+		t.Errorf("cleanup should unset FLEET_GC_SCAN_DIR when it was unset before")
+	}
+	if _, err := os.Stat(decoy); !os.IsNotExist(err) {
+		t.Errorf("cleanup should remove the decoy dir; stat err=%v", err)
+	}
+
+	// Case 2: env previously set -> cleanup restores the prior value.
+	t.Setenv("FLEET_GC_SCAN_DIR", "/some/prior")
+	cleanup2 := IsolateSweepDir()
+	if got := os.Getenv("FLEET_GC_SCAN_DIR"); got == "/some/prior" {
+		t.Fatal("IsolateSweepDir should have overridden the prior value with a decoy")
+	}
+	cleanup2()
+	if got := os.Getenv("FLEET_GC_SCAN_DIR"); got != "/some/prior" {
+		t.Errorf("cleanup should restore prior FLEET_GC_SCAN_DIR; got %q want /some/prior", got)
+	}
+}

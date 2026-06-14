@@ -49,8 +49,63 @@ import (
 // Errors are intentionally non-fatal at the call site (best-effort
 // cleanup; failing the test suite on a sweep glitch would be worse
 // than letting the CI gate catch leaks at the assertion step).
+//
+// ci-perf-pr1 (P0), codex iter-3 [P1]: Sweep honors FLEET_GC_SCAN_DIR (the
+// SAME env the internal/gc scan seam reads), defaulting to /tmp when unset.
+// Without this, every test package's TestMain (cmd/fleet, internal/spawn,
+// internal/handoffop, internal/tmux, internal/dispatch) probed EVERY leaked
+// /tmp/fleet-test-*.sock with `tmux -S <sock> list-sessions` at suite start —
+// on a dirty runner that is N tmux subprocesses BEFORE any test, the exact
+// hang this PR removes. Pointing the env at an empty decoy (see
+// IsolateSweepDir) makes the sweep a no-op. Production has no FLEET_GC_SCAN_DIR
+// set, so operator-side behavior is unchanged.
 func Sweep(maxAge time.Duration) error {
-	return SweepDir("/tmp", maxAge)
+	return SweepDir(sweepDir(), maxAge)
+}
+
+// sweepDir resolves the sweep directory from FLEET_GC_SCAN_DIR, defaulting to
+// /tmp. Mirrors internal/gc.gcScanDir so the test sweeper and the production
+// reconcile scan honor the SAME isolation env — one knob isolates both.
+func sweepDir() string {
+	if dir := os.Getenv("FLEET_GC_SCAN_DIR"); dir != "" {
+		return dir
+	}
+	return "/tmp"
+}
+
+// IsolateSweepDir points FLEET_GC_SCAN_DIR at a fresh empty decoy dir for the
+// whole test binary and returns a cleanup func that restores the prior env and
+// removes the decoy. Call it FIRST in a TestMain so the start/end Sweep calls
+// (and any FLEET_GC_SCAN_DIR-honoring reconcile the package's tests trigger)
+// scan the decoy instead of the host /tmp. There is no *testing.T in TestMain,
+// so this hand-rolls the env save/restore instead of t.Setenv.
+//
+//	func TestMain(m *testing.M) {
+//	    cleanup := testutil.IsolateSweepDir()
+//	    _ = testutil.Sweep(time.Hour)
+//	    code := m.Run()
+//	    _ = testutil.Sweep(time.Hour)
+//	    cleanup()
+//	    os.Exit(code) // cleanup() BEFORE os.Exit — os.Exit skips defers
+//	}
+func IsolateSweepDir() func() {
+	prev, had := os.LookupEnv("FLEET_GC_SCAN_DIR")
+	decoy, err := os.MkdirTemp("", "fleet-gc-sweep-decoy-")
+	if err != nil {
+		// Best-effort: if we can't make a decoy, leave the env as-is so the
+		// sweep falls back to its prior (possibly /tmp) behavior rather than
+		// panicking a TestMain. Cleanup is then a no-op.
+		return func() {}
+	}
+	_ = os.Setenv("FLEET_GC_SCAN_DIR", decoy)
+	return func() {
+		if had {
+			_ = os.Setenv("FLEET_GC_SCAN_DIR", prev)
+		} else {
+			_ = os.Unsetenv("FLEET_GC_SCAN_DIR")
+		}
+		_ = os.RemoveAll(decoy)
+	}
 }
 
 // SweepDir is Sweep with the scan directory injectable for tests.

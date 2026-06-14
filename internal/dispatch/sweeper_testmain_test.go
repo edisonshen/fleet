@@ -25,9 +25,16 @@ import (
 // internal/handoffop's SweepAll killed internal/spawn's live tmux
 // session mid-test). SweepAll/SweepAllDir remain in sweeper.go for
 // PR-D's operator-invoked `fleet gc --force-test-sockets` path.
+//
+// ci-perf-pr1 (P0): IsolateSweepDir points the sweep at an empty decoy via
+// FLEET_GC_SCAN_DIR so the start/end sweeps don't probe the host's real /tmp
+// with `tmux -S <sock> ls` (the dirty-runner hang). tmuxtest.RequireTmux still
+// reaps this package's own sockets; the decoy sweep is a no-op by design.
 func TestMain(m *testing.M) {
+	cleanup := testutil.IsolateSweepDir()
 	_ = testutil.Sweep(time.Hour)
 	code := m.Run()
 	_ = testutil.Sweep(time.Hour)
+	cleanup() // before os.Exit — os.Exit skips defers
 	os.Exit(code)
 }
