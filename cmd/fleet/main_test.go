@@ -51,6 +51,34 @@ func TestMain(m *testing.M) {
 	if err := os.Setenv("FLEET_RC_BOOTSTRAP_DISABLED", "1"); err != nil {
 		panic("TestMain: os.Setenv FLEET_RC_BOOTSTRAP_DISABLED failed: " + err.Error())
 	}
+
+	// ci-perf-pr1 (P0 CI-hang fix): point the GC socket scan at an EMPTY decoy
+	// dir for the whole cmd/fleet package so no test walks the host's real
+	// /tmp. The reconcile pass in runDispatch/runStatus scans
+	// FLEET_GC_SCAN_DIR (via gc.gcScanDir) and runs `tmux -S <sock> ls` on
+	// every fleet-test-*.sock it finds; on a host with hundreds of leaked
+	// sockets (fleet#165) that becomes N tmux subprocesses PER test and hangs
+	// the suite (24-min kill on PR #232). The decoy is empty: tmuxtest keeps
+	// its real fixture socket in /tmp (macOS ~104-byte socket-path limit) and
+	// reaps it in its own cleanup, so nothing is bound into the decoy and no
+	// per-test server-reap is needed here. Tests that need to assert against a
+	// seeded socket override this with their own per-test FLEET_GC_SCAN_DIR.
+	scanDecoy, err := os.MkdirTemp("", "fleet-gc-scan-decoy-")
+	if err != nil {
+		panic("TestMain: os.MkdirTemp for FLEET_GC_SCAN_DIR decoy failed: " + err.Error())
+	}
+	if err := os.Setenv("FLEET_GC_SCAN_DIR", scanDecoy); err != nil {
+		panic("TestMain: os.Setenv FLEET_GC_SCAN_DIR failed: " + err.Error())
+	}
+
+	// Cap the 10s pid-resolve poll to 1s for the package. The cmd/fleet
+	// dispatch tests spawn a stub that never publishes a real claude pid, so
+	// each resolve burns the full default timeout — a ~10s-per-test cluster.
+	// 1s keeps the fail-path fast without masking the default-resolve path,
+	// which maintenance_test.go re-clears via t.Setenv where it matters.
+	if err := os.Setenv("FLEET_PID_RESOLVE_S", "1"); err != nil {
+		panic("TestMain: os.Setenv FLEET_PID_RESOLVE_S failed: " + err.Error())
+	}
 	_ = testutil.Sweep(time.Hour) // start-of-run; best-effort
 	code := m.Run()
 	// End-of-run teardown: guarded sweep (freshness window +
@@ -69,5 +97,8 @@ func TestMain(m *testing.M) {
 	// source; bypassed t.Cleanup orphans (rare panic path) get reaped
 	// by the next test run's start-of-run sweep once they age past 1h.
 	_ = testutil.Sweep(time.Hour) // end-of-run; best-effort
+	// os.Exit skips defers, so reap the decoy scan dir explicitly (fleet owns
+	// the lifecycle of everything it creates — feedback_fleet_owns_its_resources).
+	_ = os.RemoveAll(scanDecoy)
 	os.Exit(code)
 }

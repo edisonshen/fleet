@@ -419,7 +419,10 @@ func TestLiveTestSockets_Integration_ListAndKill(t *testing.T) {
 		t.Skipf("tmux exited 0 but no live session on %s (host tmux quirk): %v", sock, err)
 	}
 
-	socks, err := listLiveTestSocketsOnDisk()
+	// RequireTmux keeps its socket in /tmp (macOS socket-path limit), so the
+	// integration lister must scan /tmp to see it — this is the production
+	// default path (gcScanDir() with FLEET_GC_SCAN_DIR unset).
+	socks, err := listLiveTestSocketsOnDisk("/tmp")
 	if err != nil {
 		t.Fatalf("listLiveTestSocketsOnDisk: %v", err)
 	}

@@ -140,8 +140,9 @@ func reconcileLiveTestSockets(r *Report, opts Options, deps Deps) error {
 
 // ----------------- production wiring (DefaultDeps) ------------------
 
-// listLiveTestSocketsOnDisk scans /tmp for fleet-test-*.sock files and
-// probes each for a live fleet-<id> tmux server.
+// listLiveTestSocketsOnDisk scans dir (production: gcScanDir(), default
+// `/tmp`; tests inject a decoy) for fleet-test-*.sock files and probes
+// each for a live fleet-<id> tmux server.
 //
 // Ownership is resolved ONCE per sweep via a host-wide gate, not per
 // socket: see goTestOwnerVerdict. A fleet-test socket server is reapable
@@ -153,8 +154,8 @@ func reconcileLiveTestSockets(r *Report, opts Options, deps Deps) error {
 // Best-effort: a missing tmux binary or a socket with no server simply
 // drops that entry — the classifier degrades to "no orphans found",
 // never to a spurious kill.
-func listLiveTestSocketsOnDisk() ([]LiveTestSocket, error) {
-	infos, err := scanSocketsDir("/tmp")
+func listLiveTestSocketsOnDisk(dir string) ([]LiveTestSocket, error) {
+	infos, err := scanSocketsDir(dir)
 	if err != nil {
 		return nil, err
 	}

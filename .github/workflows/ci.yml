@@ -13,6 +13,12 @@ jobs:
   # no admin update is needed when adding steps.
   build-test-lint:
     runs-on: ubuntu-latest
+    # ci-perf-pr1 (P0): hard wall-clock backstop. `go test -timeout=5m` (below)
+    # aborts a wedged test at the process level and kills any wedged tmux exec;
+    # this job-level cap is the belt to that suspenders so a hang in build/lint
+    # (outside the test process) still bounds the run instead of burning 24min
+    # of runner time as PR #232 did.
+    timeout-minutes: 6
     steps:
       - uses: actions/checkout@v4
 
@@ -76,7 +82,11 @@ jobs:
         run: touch /tmp/fleet-test-ci-sentinel
 
       - name: Test
-        run: go test -race -count=1 ./...
+        # -timeout=5m (ci-perf-pr1, P0): a single wedged test (e.g. the /tmp
+        # socket-scan grinding N tmux subprocesses) aborts at 5m at the process
+        # level — Go's timeout kills the wedged tmux execs — instead of running
+        # until the runner's own 24-min ceiling (the PR #232 hang).
+        run: go test -race -count=1 -timeout=5m ./...
 
       - name: Python tests
         run: python3 -m pytest skills/ scripts/ -q

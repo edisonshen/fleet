@@ -943,9 +943,43 @@ func humanDuration(d time.Duration) string {
 // returned struct is one screenful and trivially reads as "here's the
 // real call for each hook."
 func DefaultDeps() Deps {
+	return defaultDepsScanning(gcScanDir())
+}
+
+// DefaultDepsWithScanDir is DefaultDeps with the GC socket-scan directory
+// pinned to dir instead of resolved from FLEET_GC_SCAN_DIR/`/tmp`. It exists
+// for internal/gc unit tests that must point the scan at a temp decoy WITHOUT
+// mutating process env — so the test stays parallel-safe (no t.Setenv, no
+// global-env race against sibling tests). Production code always goes through
+// DefaultDeps(), which reads the env per call (per-reconcile, not memoized).
+func DefaultDepsWithScanDir(dir string) Deps {
+	return defaultDepsScanning(dir)
+}
+
+// gcScanDir resolves the directory the socket-scan callsites walk. It is the
+// SINGLE source of the `/tmp` default — both ListSockets (KindSockets) and
+// listLiveTestSocketsOnDisk (OrphanTmux live-test-socket reaper) consult it,
+// so an unset env keeps production behavior identical to the historical
+// hardcoded `/tmp`. Read per call (DefaultDeps is invoked per reconcile), so a
+// test can scope FLEET_GC_SCAN_DIR with t.Setenv and have it picked up without
+// any memoization to bust. The `/tmp` literal lives ONLY here — the callsites
+// call gcScanDir(), never a hardcoded `/tmp` directly (grep-guarded).
+func gcScanDir() string {
+	if dir := os.Getenv("FLEET_GC_SCAN_DIR"); dir != "" {
+		return dir
+	}
+	return "/tmp"
+}
+
+// defaultDepsScanning builds the production Deps with the socket-scan
+// directory threaded into BOTH /tmp-scanning closures. A Deps.ScanDir FIELD
+// alone would be inert — reconcileSockets/reconcileLiveTestSockets invoke the
+// closures, they do not read the struct — so the dir is captured in each
+// closure here (the load-bearing wiring).
+func defaultDepsScanning(scanDir string) Deps {
 	return Deps{
 		Now:                   time.Now,
-		ListSockets:           func() ([]SocketInfo, error) { return scanSocketsDir("/tmp") },
+		ListSockets:           func() ([]SocketInfo, error) { return scanSocketsDir(scanDir) },
 		RemoveSocket:          removeSocketFile,
 		SocketLive:            socketLiveOnDisk,
 		ListAgents:            agent.List,
@@ -992,7 +1026,7 @@ func DefaultDeps() Deps {
 		RemoveDrainRun:        removeDrainRunFile,
 		ListDrainProcs:        listDrainProcsOnDisk,
 		ReloadDrainRun:        reloadDrainRunOnDisk,
-		ListLiveTestSockets:   listLiveTestSocketsOnDisk,
+		ListLiveTestSockets:   func() ([]LiveTestSocket, error) { return listLiveTestSocketsOnDisk(scanDir) },
 		KillTmuxServer:        killTmuxServerOnDisk,
 	}
 }
