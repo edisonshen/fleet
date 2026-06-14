@@ -568,11 +568,12 @@ func TestReconcile_LiveTestSock_FileLessKilledByPID(t *testing.T) {
 	if pathKillCalled {
 		t.Error("KillTmuxServer (socket-path kill) ran for a file-less daemon; must kill by PID")
 	}
-	// The action must carry the PID-based CleanupHint so surface consumers
-	// (dispatch/status) emit `kill <pid>`, not a bogus
-	// `tmux kill-session -t /tmp/fleet-test-gone.sock` (codex iter-2 [P2]).
-	if a.CleanupHint != "kill 9931" {
-		t.Errorf("CleanupHint = %q, want %q (file-less orphan needs a PID kill hint, not a session kill)", a.CleanupHint, "kill 9931")
+	// The action must carry a SAFE CleanupHint so surface consumers
+	// (dispatch/status) point at the PID-reuse-safe `fleet gc` reap, not a
+	// bogus `tmux kill-session -t /tmp/fleet-test-gone.sock` NOR a raw
+	// `kill <pid>` that could race PID reuse (codex iter-2/5 [P2]).
+	if !strings.Contains(a.CleanupHint, "fleet gc --apply --aggressive") {
+		t.Errorf("CleanupHint = %q, want a `fleet gc --apply --aggressive` reap hint (file-less orphan: session-kill is bogus, raw kill races PID reuse)", a.CleanupHint)
 	}
 }
 

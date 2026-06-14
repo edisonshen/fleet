@@ -145,9 +145,17 @@ func reconcileLiveTestSockets(r *Report, opts Options, deps Deps) error {
 		if fileLess {
 			// File-less orphan: Target is a socket PATH (no session name to
 			// `tmux kill-session -t`), so hand consumers (dispatch/status
-			// surface hints) the correct PID-based command instead of a bogus
+			// surface hints) a SAFE command instead of a bogus
 			// `tmux kill-session -t <socket-path>` (codex iter-2 [P2]).
-			act.CleanupHint = fmt.Sprintf("kill %d", s.ServerPID)
+			//
+			// We point at `fleet gc --apply --aggressive`, NOT a raw
+			// `kill <pid>` (codex iter-5 [P2]): the PID can be reused before
+			// the operator pastes the command, and only the gc apply path
+			// re-verifies the PID is STILL the expected `tmux -S <sock>` daemon
+			// (KillTmuxProc's expectSock recheck) before signaling. A raw
+			// pasted `kill <pid>` has no such guard and could hit an unrelated
+			// process.
+			act.CleanupHint = "fleet gc --apply --aggressive --kinds orphan-tmux  (file-less daemon; PID-reuse-safe reap)"
 		}
 		if opts.Aggressive {
 			act.Verb = VerbWouldKill
