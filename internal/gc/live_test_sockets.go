@@ -157,7 +157,7 @@ func reconcileLiveTestSockets(r *Report, opts Options, deps Deps) error {
 				case fileLess:
 					if deps.KillTmuxProc == nil {
 						act.Reason = "kill seam unwired (set Deps.KillTmuxProc to apply)"
-					} else if kerr := deps.KillTmuxProc(s.ServerPID); kerr != nil {
+					} else if kerr := deps.KillTmuxProc(s.ServerPID, s.SocketPath); kerr != nil {
 						act.Reason = fmt.Sprintf("kill failed: %v", kerr)
 					} else {
 						act.Verb = VerbKilled
@@ -559,31 +559,32 @@ func listFileLessTestTmux(dir string, ownerVerdict int) []LiveTestSocket {
 }
 
 // killTmuxProcByPID terminates a file-less orphan tmux daemon by PID. It
-// re-verifies the process is a `tmux` bound to a fleet-test-*.sock BEFORE
-// signaling, so a recycled PID (the daemon exited and the OS reassigned
-// its PID to an unrelated process between enumeration and apply) is never
-// killed. SIGTERM first; the daemon has no clients to drain so it exits
-// promptly. A no-longer-existing process collapses to success (already
-// reaped).
-func killTmuxProcByPID(pid int) error {
+// re-verifies the process is STILL the SAME `tmux -S <expectSock>` daemon
+// BEFORE signaling, so a recycled PID (the daemon exited and the OS
+// reassigned its PID between enumeration and apply) is never killed.
+//
+// codex iter-4 [P2]: matching only the fleet-test-*.sock NAME pattern was
+// not enough — a reused PID could be a `tmux -S /other/dir/fleet-test-X.sock`
+// OUTSIDE the configured scan dir, escaping the namespace the enumeration
+// pass enforced. Requiring the re-verified socket to EQUAL expectSock (the
+// path enumeration matched under scanDir) closes that gap exactly.
+//
+// SIGTERM first; the daemon has no clients to drain so it exits promptly. A
+// no-longer-existing process collapses to success (already reaped).
+func killTmuxProcByPID(pid int, expectSock string) error {
 	if pid <= 0 {
 		return fmt.Errorf("killTmuxProcByPID: invalid pid %d", pid)
 	}
-	// Re-verify identity: the PID must still be a tmux server on a
+	// Re-verify identity: the PID must still be a tmux server on the SAME
 	// fleet-test socket. ps exit-1 (no such pid) → already gone → success.
 	out, err := exec.Command("ps", "-o", "args=", "-p", strconv.Itoa(pid)).Output()
 	if err != nil {
 		return nil // pid gone (or ps failed) — nothing to kill
 	}
 	args := strings.TrimSpace(string(out))
-	// Re-verify via the SAME argv0-basename + tmux-global-`-S` check used at
-	// enumeration (codex iter-1 [P2]): a plain `HasPrefix(args, "tmux ")`
-	// rejected an absolute argv0 like `/opt/homebrew/bin/tmux …` that
-	// enumeration accepted — so on such hosts the reaper would surface but
-	// never reap. Using tmuxServerSocketFromArgv keeps both ends consistent
-	// AND still refuses a recycled non-fleet-test-tmux PID.
-	if _, ok := tmuxServerSocketFromArgv(args); !ok {
-		return fmt.Errorf("killTmuxProcByPID: pid %d is no longer a fleet-test tmux daemon (recycled); refusing to kill", pid)
+	sock, ok := tmuxServerSocketFromArgv(args)
+	if !ok || sock != expectSock {
+		return fmt.Errorf("killTmuxProcByPID: pid %d is no longer the expected fleet-test tmux daemon on %s (recycled); refusing to kill", pid, expectSock)
 	}
 	proc, ferr := os.FindProcess(pid)
 	if ferr != nil {

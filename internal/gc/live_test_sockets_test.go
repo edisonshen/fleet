@@ -547,7 +547,8 @@ func TestReconcile_LiveTestSock_FileLessKilledByPID(t *testing.T) {
 			ServerPID:  9931, // file-less daemon
 		}}, nil
 	}
-	deps.KillTmuxProc = func(pid int) error { killedPID = pid; return nil }
+	var killedSock string
+	deps.KillTmuxProc = func(pid int, sock string) error { killedPID = pid; killedSock = sock; return nil }
 	deps.KillTmuxServer = func(string) error { pathKillCalled = true; return nil }
 
 	got, err := Reconcile(Options{Apply: true, Aggressive: true, Kinds: []Kind{KindOrphanTmux}}, deps)
@@ -560,6 +561,9 @@ func TestReconcile_LiveTestSock_FileLessKilledByPID(t *testing.T) {
 	}
 	if killedPID != 9931 {
 		t.Errorf("KillTmuxProc called with pid %d, want 9931", killedPID)
+	}
+	if killedSock != "/tmp/fleet-test-gone.sock" {
+		t.Errorf("KillTmuxProc called with expectSock %q, want /tmp/fleet-test-gone.sock (PID-reuse re-verify must pin the exact socket)", killedSock)
 	}
 	if pathKillCalled {
 		t.Error("KillTmuxServer (socket-path kill) ran for a file-less daemon; must kill by PID")

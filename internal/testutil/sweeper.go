@@ -237,6 +237,19 @@ func socketLive(path string) bool {
 // Best-effort: a probe failure or a `ps` we cannot read leaves the gate
 // CLOSED (spare) — an ambiguous host is treated as "a test might be
 // running", never reaped.
+//
+// DURABLE BACKSTOP (codex iter-4 [P2]): if the package that finishes LAST in
+// a parallel `go test ./...` is one without a ForceReapTestServers TestMain,
+// a file-less daemon a sibling left can survive this gated reap — and CI's
+// leak gate only checks socket FILES, not file-less daemons. That residual is
+// NOT silently tolerated: the AUTHORITATIVE reaper is `fleet gc --apply
+// --aggressive`, which (post-2026-06-13) classifies + PID-reaps file-less
+// fleet-test daemons when the host is go-test-quiescent. The coord runs
+// reconcile on every fleet command, so any escapee is reaped on the next
+// fleet invocation — this teardown hook is the FAST path, `fleet gc` is the
+// guaranteed one. (A bounded wait/retry here would risk hanging a TestMain on
+// a busy CI host; deferring to the durable tool-side reaper is the
+// fleet-owns-its-resources-correct boundary.)
 func ForceReapTestServers() error {
 	if anyOtherGoTestParentAlive(os.Getpid(), os.Getppid()) {
 		return nil // another test process is alive — spare (fail-safe)

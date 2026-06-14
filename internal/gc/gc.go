@@ -361,11 +361,14 @@ type Deps struct {
 	KillTmuxServer func(socketPath string) error
 	// KillTmuxProc kills a FILE-LESS orphan tmux daemon by PID (a live
 	// `tmux -S /tmp/fleet-test-*.sock` server whose socket file is gone, so
-	// it cannot be reached by `tmux -S <path> kill-server`). Used under
-	// --apply --aggressive for LiveTestSocket entries with ServerPID > 0.
-	// Production wiring is killTmuxProcByPID. nil leaves such daemons
-	// surfaced-only (kill seam unwired).
-	KillTmuxProc func(pid int) error
+	// it cannot be reached by `tmux -S <path> kill-server`). expectSock is
+	// the socket path enumeration matched under the scan dir; the kill seam
+	// re-verifies the PID is STILL that exact daemon before signaling so a
+	// reused PID on a fleet-test socket OUTSIDE the scan dir is never killed
+	// (codex iter-4 [P2]). Used under --apply --aggressive for LiveTestSocket
+	// entries with ServerPID > 0. Production wiring is killTmuxProcByPID. nil
+	// leaves such daemons surfaced-only (kill seam unwired).
+	KillTmuxProc func(pid int, expectSock string) error
 
 	// Invalid-projects (KindInvalidProjects).
 	// ListProjectDirs enumerates EVERY ~/.fleet/projects/<name>/ entry
