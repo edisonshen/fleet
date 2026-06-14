@@ -23,9 +23,17 @@ jobs:
     # always() cleanup/leak steps), or the job cap would fire BEFORE the
     # process-level `-timeout=5m` gets to abort a wedged test — and would skip
     # the always() cleanup, defeating the very backstop it preserves (codex
-    # iter-1 [P2]). A green run is ~9 min wall; 12 leaves headroom for the 5m
-    # test timeout to do its job while still bounding far below 24 min.
-    timeout-minutes: 12
+    # iter-1 [P2]). Observed green runs are ~9-11 min wall (max seen 10.7m), so
+    # 12 left only ~1.3 min headroom: a package hanging LATE in `go test ./...`
+    # would burn up to its 5m process-timeout ON TOP of the ~10m already spent,
+    # blowing past a 12m cap — and a GitHub job timeout CANCELS the job (it does
+    # NOT flow through the failure path), skipping the always() cleanup/leak
+    # steps this cap exists to preserve. 18 = ~11m green + the 5m worst-case
+    # test timeout + ~2m cleanup headroom, so the process-level `-timeout=5m`
+    # reliably fires first and the cleanup steps survive, still far below the
+    # 24-min runaway PR #232 hit (codex iter-12 [P2], confirmed by adversarial
+    # review against observed run durations).
+    timeout-minutes: 18
     steps:
       - uses: actions/checkout@v4
 
