@@ -49,6 +49,7 @@ import (
 	"strconv"
 	"strings"
 	"syscall"
+	"time"
 )
 
 // LiveTestSocket describes one live tmux server bound to a
@@ -588,8 +589,14 @@ func listFileLessTestTmux(dir string, ownerVerdict int) []LiveTestSocket {
 // pass enforced. Requiring the re-verified socket to EQUAL expectSock (the
 // path enumeration matched under scanDir) closes that gap exactly.
 //
-// SIGTERM first; the daemon has no clients to drain so it exits promptly. A
-// no-longer-existing process collapses to success (already reaped).
+// SIGTERM first; the daemon has no clients to drain so it exits promptly. If
+// it does NOT exit within killConfirmWindow (a wedged server that ignored
+// SIGTERM — the exact leak class this reaper exists to clear), escalate to
+// SIGKILL and confirm the PID is gone before reporting success. A daemon that
+// survives BOTH signals returns an error, so the action is surfaced (not
+// falsely reported killed — feedback_surface_dont_silo: the reaper must not
+// claim it reaped a daemon that is still alive). A no-longer-existing process
+// collapses to success (already reaped).
 func killTmuxProcByPID(pid int, expectSock string) error {
 	if pid <= 0 {
 		return fmt.Errorf("killTmuxProcByPID: invalid pid %d", pid)
@@ -619,14 +626,64 @@ func killTmuxProcByPID(pid int, expectSock string) error {
 	if ferr != nil {
 		return nil // not found
 	}
-	if serr := proc.Signal(syscall.SIGTERM); serr != nil {
-		// ESRCH (process gone) is success; anything else is a real error.
-		if errors.Is(serr, os.ErrProcessDone) || errors.Is(serr, syscall.ESRCH) {
-			return nil
-		}
-		return fmt.Errorf("kill %d: %w", pid, serr)
+	if serr := proc.Signal(syscall.SIGTERM); serr != nil && !signalIsGone(serr) {
+		return fmt.Errorf("SIGTERM %d: %w", pid, serr)
 	}
-	return nil
+	// Confirm exit, escalating to SIGKILL if the daemon ignored SIGTERM. The
+	// caller maps a nil return to VerbKilled, so the surface stays honest:
+	// success means the PID is gone, not merely signaled.
+	return confirmProcGone(proc, pid, expectSock)
+}
+
+// killConfirmWindow bounds how long killTmuxProcByPID waits for a daemon to
+// exit after SIGTERM before escalating to SIGKILL, and after SIGKILL before
+// declaring failure. tmux servers exit on SIGTERM in milliseconds; this is a
+// generous ceiling for a wedged one, kept short so a gc --apply does not stall.
+const killConfirmWindow = 2 * time.Second
+
+// signalIsGone reports whether a Signal error means the process already exited
+// (ESRCH / os.ErrProcessDone) — which is success, not failure.
+func signalIsGone(err error) bool {
+	return errors.Is(err, os.ErrProcessDone) || errors.Is(err, syscall.ESRCH)
+}
+
+// confirmProcGone polls signal-0 liveness until the PID exits, escalating to
+// SIGKILL halfway through the window if SIGTERM did not take. Returns nil once
+// the PID is confirmed gone; an error if it survives both signals (so the
+// reaper surfaces a still-alive daemon instead of lying that it killed it).
+// procAlive is a seam so a unit test can drive the escalation deterministically
+// without a real wedged process.
+var procAlive = func(pid int) bool {
+	// signal 0 probes existence without delivering a signal: nil → alive,
+	// ESRCH → gone. EPERM (alive but not ours) counts as alive.
+	if proc, err := os.FindProcess(pid); err == nil {
+		return !signalIsGone(proc.Signal(syscall.Signal(0)))
+	}
+	return false
+}
+
+func confirmProcGone(proc *os.Process, pid int, expectSock string) error {
+	deadline := time.Now().Add(killConfirmWindow)
+	escalated := false
+	for {
+		if !procAlive(pid) {
+			return nil // exited — honest VerbKilled
+		}
+		now := time.Now()
+		if now.After(deadline) {
+			return fmt.Errorf("killTmuxProcByPID: pid %d (%s daemon) survived SIGTERM+SIGKILL within %s; not reporting killed", pid, expectSock, killConfirmWindow)
+		}
+		// Escalate to SIGKILL once we are past the halfway mark and SIGTERM
+		// has not landed. SIGKILL cannot be trapped, so this clears a wedged
+		// daemon that ignored SIGTERM.
+		if !escalated && now.After(deadline.Add(-killConfirmWindow/2)) {
+			escalated = true
+			if serr := proc.Signal(syscall.SIGKILL); serr != nil && !signalIsGone(serr) {
+				return fmt.Errorf("SIGKILL %d: %w", pid, serr)
+			}
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
 }
 
 // killTmuxServerOnDisk runs `tmux -S <sock> kill-server` and best-effort

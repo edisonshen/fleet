@@ -647,6 +647,51 @@ func TestKillTmuxProcByPID_WrongIdentityRefuses(t *testing.T) {
 	}
 }
 
+// confirmProcGone returns nil once the PID is observed gone (the daemon
+// exited on SIGTERM), WITHOUT escalating to SIGKILL.
+func TestConfirmProcGone_ExitsOnSigterm(t *testing.T) {
+	// alive on the first probe, gone on the second → exited promptly.
+	calls := 0
+	prev := procAlive
+	procAlive = func(int) bool { calls++; return calls < 2 }
+	t.Cleanup(func() { procAlive = prev })
+
+	// A dead OS process so any real Signal call is a no-op ESRCH, not a
+	// stray SIGKILL to a live PID.
+	cmd := exec.Command("true")
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("seed true: %v", err)
+	}
+	proc, _ := os.FindProcess(cmd.Process.Pid)
+
+	if err := confirmProcGone(proc, cmd.Process.Pid, "/tmp/fleet-test-x.sock"); err != nil {
+		t.Errorf("confirmProcGone = %v; want nil (daemon exited on SIGTERM)", err)
+	}
+}
+
+// confirmProcGone reports an error (so the caller does NOT report VerbKilled)
+// when the daemon survives both SIGTERM and SIGKILL within the window — the
+// surface must not lie that a still-alive wedged daemon was reaped.
+func TestConfirmProcGone_SurvivesBothSignals_Errors(t *testing.T) {
+	prev := procAlive
+	procAlive = func(int) bool { return true } // never dies
+	t.Cleanup(func() { procAlive = prev })
+
+	cmd := exec.Command("true")
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("seed true: %v", err)
+	}
+	proc, _ := os.FindProcess(cmd.Process.Pid)
+
+	err := confirmProcGone(proc, cmd.Process.Pid, "/tmp/fleet-test-x.sock")
+	if err == nil {
+		t.Fatal("confirmProcGone returned nil for a daemon that survived SIGTERM+SIGKILL; must error so the action is not reported killed")
+	}
+	if !strings.Contains(err.Error(), "survived SIGTERM+SIGKILL") {
+		t.Errorf("error = %q; want a 'survived SIGTERM+SIGKILL' surface", err)
+	}
+}
+
 // goTestOwnerVerdict must report SPARE (the unknown sentinel) whenever a
 // `go test` is alive on the host — and this test IS running under
 // `go test`, so the REAL (un-stubbed) production lister must see this
