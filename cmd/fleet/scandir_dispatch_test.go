@@ -32,32 +32,27 @@ import (
 // any isolated test runs. We seed an aged real socket in /tmp, sweep the EMPTY
 // decoy (as TestMain now does), and assert the /tmp socket is never probed.
 func TestTestMainSweep_DecoyDir_DoesNotProbeTmp(t *testing.T) {
-	// A real socket sitting DIRECTLY in /tmp — the leaked debris that made the
-	// old Sweep("/tmp") grind. It must live in /tmp itself (not a subdir) for
-	// the regression to bite: SweepDir does a non-recursive ReadDir, so a
-	// subdir socket would be missed even by a /tmp sweep and prove nothing. We
-	// give it a UNIQUE name (not a fixed path) so a concurrent cmd/fleet run's
-	// fixture can't collide (codex iter-4 [P3]). os.CreateTemp reserves a
-	// unique short /tmp name; we remove the placeholder file, then bind the
-	// socket at that path (net.Listen needs the path absent + short enough for
-	// the macOS socket-path limit, which t.TempDir would blow).
+	// Fully self-contained, zero real-/tmp footprint (codex iter-6 [P2]):
+	// SweepDir walks `dir`, skips entries younger than maxAge, then runs
+	// `tmux -S <sock> list-sessions` (socketLive) on each aged fleet-test-*.sock
+	// it finds. We seed an AGED .sock REGULAR FILE inside the decoy (SweepDir
+	// matches by name + age, not os.ModeSocket — no real listener needed, and
+	// binding one in shared /tmp would let a concurrent package's /tmp scan
+	// probe a foreign socket). The fake-tmux recorder captures the probe path.
 	//
-	// We do NOT back-date its mtime (claude adversarial F1): a fresh mtime keeps
-	// any leftover (e.g. a -timeout SIGKILL skipping t.Cleanup) VISIBLE to CI's
-	// `find /tmp -name 'fleet-test-*' -newer sentinel` leak gate. The sweep
-	// under test runs on the empty decoy, so the socket's age is irrelevant to
-	// the assertion anyway — aging it would only blind the leak gate.
-	ph, err := os.CreateTemp("/tmp", "fleet-test-sweep-*.sock")
-	if err != nil {
-		t.Fatalf("createtemp /tmp: %v", err)
+	// Assertions: SweepDir probes the decoy socket (proves it scanned `dir`),
+	// and NO probe targets anything under /tmp (proves it did NOT walk /tmp —
+	// the regression that codex iter-2/3 [P1] fixed across all TestMains).
+	decoy := t.TempDir()
+	decoySock := filepath.Join(decoy, "fleet-test-decoyprobe.sock")
+	if err := os.WriteFile(decoySock, []byte{}, 0o600); err != nil {
+		t.Fatalf("seed decoy socket: %v", err)
 	}
-	tmpSock := ph.Name()
-	_ = ph.Close()
-	_ = os.Remove(tmpSock)
-	ln := listenUnix(t, tmpSock)
-	t.Cleanup(func() { _ = ln.Close(); _ = os.Remove(tmpSock) })
+	old := time.Now().Add(-48 * time.Hour)
+	if err := os.Chtimes(decoySock, old, old); err != nil {
+		t.Fatalf("chtimes: %v", err)
+	}
 
-	decoy := t.TempDir() // empty — exactly what TestMain points the sweep at
 	rec := newFakeTmuxRecorder(t)
 
 	// TestMain calls SweepDir(scanDecoy, time.Hour); mirror that exactly.
@@ -65,10 +60,21 @@ func TestTestMainSweep_DecoyDir_DoesNotProbeTmp(t *testing.T) {
 		t.Fatalf("SweepDir(decoy): %v", err)
 	}
 
-	for _, p := range rec.socketProbes() {
-		if p == tmpSock {
-			t.Fatalf("TestMain-style sweep probed the /tmp socket %s — the sweep is still scanning real /tmp (codex iter-2 [P1] regression)", tmpSock)
+	probes := rec.socketProbes()
+	if len(probes) == 0 {
+		t.Fatalf("SweepDir probed nothing — the aged decoy socket never reached the socketLive gate (sweep did not scan %s)", decoy)
+	}
+	sawDecoy := false
+	for _, p := range probes {
+		if filepath.Dir(p) == "/tmp" {
+			t.Fatalf("SweepDir probed a /tmp socket %s — the TestMain-style sweep is still scanning real /tmp (codex iter-2 [P1] regression)", p)
 		}
+		if p == decoySock {
+			sawDecoy = true
+		}
+	}
+	if !sawDecoy {
+		t.Fatalf("SweepDir did not probe the decoy socket %s; probes=%v", decoySock, probes)
 	}
 }
 
