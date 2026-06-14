@@ -404,6 +404,14 @@ func reapFileLessTestTmux() {
 		if !ok {
 			continue
 		}
+		// Constrain to realTmpDir (codex iter-3 [P2]): the file-bound
+		// SweepAllDir only touches /tmp, and the gc twin has the same
+		// filepath.Dir==scanDir guard. Without this, a developer/CI host's
+		// own live `tmux -S /home/me/fleet-test-debug.sock` daemon (socket
+		// unlinked) would be SIGTERM'd — outside Fleet's /tmp test namespace.
+		if filepath.Dir(sock) != filepath.Clean(realTmpDir) {
+			continue
+		}
 		if _, statErr := os.Stat(sock); statErr == nil {
 			continue // socket file present — SweepAllDir already handled it
 		}
