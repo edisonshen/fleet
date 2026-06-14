@@ -110,6 +110,10 @@ func TestDispatchReconcile_OrphanTmux_ScansInjectedDir_NotTmp(t *testing.T) {
 	// Cleared, those passes target the default server (no `-S`), so
 	// socketProbes() holds only the scan-path probes we assert on.
 	t.Setenv("FLEET_TMUX_SOCKET", "")
+	// Full hermeticity: isolate FLEET_HOME too so the reconcile's orphan-agent
+	// pass enumerates an empty temp agent dir instead of the operator's live
+	// ~/.fleet/agents (which would probe per-record and read host state).
+	t.Setenv("FLEET_HOME", t.TempDir())
 
 	rec := newFakeTmuxRecorder(t)
 

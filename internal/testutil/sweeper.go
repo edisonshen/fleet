@@ -205,6 +205,13 @@ func socketLive(path string) bool {
 // Sweep (with freshness + socketLive guards) is still correct for the
 // SUITE-START sweep where another concurrent `go test` may legitimately
 // own a fresh live socket; SweepAll is intentionally narrower in scope.
+//
+// NOTE (ci-perf-pr1): unlike Sweep, SweepAll does NOT honor FLEET_GC_SCAN_DIR —
+// it always force-reaps real /tmp. It currently has no callers. Do NOT wire it
+// into a TestMain in place of Sweep: it would (a) bypass the scan-dir isolation
+// this PR added and grind real /tmp, and (b) force-kill live sockets owned by
+// sibling packages still running under `go test ./...`. It exists only for an
+// operator-invoked `fleet gc --force-test-sockets` path.
 func SweepAll() error {
 	return SweepAllDir("/tmp")
 }
