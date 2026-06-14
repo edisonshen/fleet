@@ -15,10 +15,17 @@ jobs:
     runs-on: ubuntu-latest
     # ci-perf-pr1 (P0): hard wall-clock backstop. `go test -timeout=5m` (below)
     # aborts a wedged test at the process level and kills any wedged tmux exec;
-    # this job-level cap is the belt to that suspenders so a hang in build/lint
-    # (outside the test process) still bounds the run instead of burning 24min
-    # of runner time as PR #232 did.
-    timeout-minutes: 6
+    # this job-level cap is the OUTER belt to that suspenders so a hang OUTSIDE
+    # the test process (build/lint) still bounds the run instead of burning the
+    # runner's 24-min default as PR #232 did.
+    #
+    # The cap MUST exceed (setup + build + lint + the 5m test timeout + the
+    # always() cleanup/leak steps), or the job cap would fire BEFORE the
+    # process-level `-timeout=5m` gets to abort a wedged test — and would skip
+    # the always() cleanup, defeating the very backstop it preserves (codex
+    # iter-1 [P2]). A green run is ~9 min wall; 12 leaves headroom for the 5m
+    # test timeout to do its job while still bounding far below 24 min.
+    timeout-minutes: 12
     steps:
       - uses: actions/checkout@v4
 
