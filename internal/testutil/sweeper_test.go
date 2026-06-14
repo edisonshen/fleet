@@ -249,3 +249,24 @@ func TestIsolateSweepDir_SetsDecoyAndRestores(t *testing.T) {
 		t.Errorf("cleanup should restore prior FLEET_GC_SCAN_DIR; got %q want /some/prior", got)
 	}
 }
+
+// TestIsolateSweepDir_DecoyNotFleetTestPrefixed guards the PR #233 fix: the
+// EMPTY decoy must NOT carry the `fleet-test-` prefix, or a happy-path run
+// where the decoy reaps a moment after CI's leak-gate snapshot (or a
+// SIGKILL-skipped cleanup) trips the "Assert no /tmp/fleet-test-* leak" step.
+// The decoy holds no socket, so it is never the real leak that gate guards.
+func TestIsolateSweepDir_DecoyNotFleetTestPrefixed(t *testing.T) {
+	_ = os.Unsetenv("FLEET_GC_SCAN_DIR")
+	cleanup := IsolateSweepDir()
+	defer cleanup()
+	decoy := os.Getenv("FLEET_GC_SCAN_DIR")
+	if decoy == "" {
+		t.Fatal("IsolateSweepDir did not set FLEET_GC_SCAN_DIR")
+	}
+	base := filepath.Base(decoy)
+	if strings.HasPrefix(base, "fleet-test-") {
+		t.Errorf("decoy dir %q must NOT use the `fleet-test-` prefix — CI's "+
+			"/tmp/fleet-test-* leak gate would flag this empty scaffolding dir "+
+			"as a leak (PR #233)", base)
+	}
+}

@@ -90,10 +90,17 @@ func sweepDir() string {
 //	}
 func IsolateSweepDir() func() {
 	prev, had := os.LookupEnv("FLEET_GC_SCAN_DIR")
-	// Prefix `fleet-test-` so a leaked decoy (SIGKILL skipping cleanup before
-	// os.Exit) is caught by CI's top-level `/tmp/fleet-test-*` leak gate
-	// instead of accumulating silently (codex iter-5 [P2]).
-	decoy, err := os.MkdirTemp("", "fleet-test-gc-sweep-decoy-")
+	// Prefix `fleet-gcdecoy-` (NOT `fleet-test-`) on purpose: this decoy is an
+	// EMPTY scaffolding dir — it never holds a socket — so it is never a real
+	// leak. CI's leak gate matches `/tmp/fleet-test-*` to catch socket-bearing
+	// debris; an empty decoy under that glob is a guaranteed false positive that
+	// reds the "Assert no /tmp/fleet-test-* leak" step (PR #233). Keeping the
+	// prefix off `fleet-test-` makes the decoy invisible to the gate; the
+	// cleanup func below + the per-package TestMain calling it before os.Exit are
+	// what reap it. (An earlier rev used `fleet-test-` "for visibility on a
+	// SIGKILL-skipped cleanup" — but an empty dir is not the socket leak the gate
+	// guards, and on CI those decoys tripped the gate on the happy path.)
+	decoy, err := os.MkdirTemp("", "fleet-gcdecoy-sweep-")
 	if err != nil {
 		// MkdirTemp failed: we can't isolate. Rather than SILENTLY falling back
 		// to the prior (possibly /tmp) behavior — which would re-arm the very

@@ -63,11 +63,15 @@ func TestMain(m *testing.M) {
 	// reaps it in its own cleanup, so nothing is bound into the decoy and no
 	// per-test server-reap is needed here. Tests that need to assert against a
 	// seeded socket override this with their own per-test FLEET_GC_SCAN_DIR.
-	// Prefix `fleet-test-` (codex iter-5 [P2]) so that if this dir ever leaks
-	// (a SIGKILL skipping the explicit RemoveAll before os.Exit), CI's
-	// top-level `/tmp/fleet-test-*` leak gate makes it VISIBLE rather than
-	// letting empty decoy dirs accumulate silently on the runner.
-	scanDecoy, err := os.MkdirTemp("", "fleet-test-gc-scan-decoy-")
+	// Prefix `fleet-gcdecoy-` (NOT `fleet-test-`): this decoy is an EMPTY
+	// scaffolding dir — it never holds a socket — so it is never a real leak.
+	// CI's `/tmp/fleet-test-*` leak gate exists to catch socket-bearing debris;
+	// an empty decoy under that glob is a false positive that reds the
+	// "Assert no /tmp/fleet-test-* leak" step (PR #233). The explicit RemoveAll
+	// below (before os.Exit) reaps it; keeping the prefix off `fleet-test-`
+	// means even a SIGKILL-skipped cleanup leaves only an inert, unmatched dir
+	// instead of failing the gate on the happy path.
+	scanDecoy, err := os.MkdirTemp("", "fleet-gcdecoy-scan-")
 	if err != nil {
 		panic("TestMain: os.MkdirTemp for FLEET_GC_SCAN_DIR decoy failed: " + err.Error())
 	}
