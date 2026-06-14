@@ -460,21 +460,35 @@ func psProcLister() ([]procInfo, error) {
 // (user-owns-tmux-config: never the operator's default/custom servers).
 var fleetTestSocketRe = regexp.MustCompile(`^/[^\s]*/fleet-test-[^\s]*\.sock$`)
 
-// tmuxServerSocketFromArgv extracts tmux's OWN `-S <path>` server-socket
-// option from a tmux argv, returning ("", false) unless:
+// tmuxServerTitleRe matches the LINUX tmux SERVER process title. After the
+// daemon forks, Linux tmux rewrites its proctitle via setproctitle to
+// `tmux: server (<socket>)` (older builds: bare `tmux: server`). macOS tmux
+// keeps the original `tmux -S … new-session …` argv, so we parse BOTH shapes
+// (codex iter-9 [P1]: on the ubuntu-latest CI runner the server-title shape
+// is what `ps` reports, so without this the file-less reaper never sees the
+// leak class it was built to reap).
+var tmuxServerTitleRe = regexp.MustCompile(`^tmux: server \((/[^\s)]+)\)`)
+
+// tmuxServerSocketFromArgv extracts tmux's OWN server socket from a tmux
+// process's `ps args`, returning ("", false) unless the socket is in the
+// fleet-test namespace. Two shapes are recognized:
 //
-//   - argv[0]'s basename is `tmux`, AND
-//   - `-S <path>` appears among tmux's GLOBAL options (before the tmux
-//     command word like `new-session`), AND
-//   - <path> is in the fleet-test namespace.
+//   - LINUX server title: `tmux: server (<socket>)`.
+//   - macOS / client argv: argv[0] basename `tmux` AND `-S <path>` among
+//     tmux's GLOBAL options (before the command word like `new-session`).
 //
-// codex iter-1 [P2]: a prior regex matched any `-S /tmp/fleet-test-*.sock`
-// substring ANYWHERE in the argv — including a pane command or env value on
-// an OPERATOR-owned tmux server — and would then PID-kill that server. tmux
-// global options precede the command, so we parse positionally and STOP at
-// the first non-option token (the command), never scanning the command's
-// own args. `-Spath` (glued, no space) is also a valid tmux form.
+// codex iter-1 [P2]: the argv path parses positionally and STOPS at the
+// first non-option token (the command), so a `-S /tmp/fleet-test-*.sock`
+// buried in a PANE COMMAND / env value on an OPERATOR-owned server is never
+// picked up (which would PID-kill that server). `-Spath` (glued) is valid too.
 func tmuxServerSocketFromArgv(args string) (string, bool) {
+	// Linux server-title shape first (codex iter-9 [P1]).
+	if m := tmuxServerTitleRe.FindStringSubmatch(args); m != nil {
+		if fleetTestSocketRe.MatchString(m[1]) {
+			return m[1], true
+		}
+		return "", false // a server title on a non-fleet-test socket — skip
+	}
 	fields := strings.Fields(args)
 	if len(fields) == 0 {
 		return "", false

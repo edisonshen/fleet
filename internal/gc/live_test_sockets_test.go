@@ -447,6 +447,9 @@ func TestTmuxServerSocketFromArgv(t *testing.T) {
 		{"(tmux) -S /tmp/fleet-test-abc.sock new-session", "/tmp/fleet-test-abc.sock"},
 		// Glued -S form.
 		{"tmux -S/tmp/fleet-test-abc.sock new-session", "/tmp/fleet-test-abc.sock"},
+		// LINUX server proctitle (codex iter-9 [P1]) — the ubuntu CI shape.
+		{"tmux: server (/tmp/fleet-test-abc.sock)", "/tmp/fleet-test-abc.sock"},
+		{"tmux: server (/tmp/fleet-test-abc.sock) [extra]", "/tmp/fleet-test-abc.sock"},
 	}
 	for _, c := range ok {
 		got, found := tmuxServerSocketFromArgv(c.args)
@@ -463,6 +466,8 @@ func TestTmuxServerSocketFromArgv(t *testing.T) {
 		"sh -c tmux -S /tmp/fleet-test-x.sock ls",
 		// tmux on a NON-fleet-test socket (operator's custom server).
 		"tmux -S /tmp/operator.sock new-session",
+		// Linux server title on a NON-fleet-test socket (operator's server).
+		"tmux: server (/home/op/.tmux/default)",
 		// -S with no following path.
 		"tmux -S",
 		"",

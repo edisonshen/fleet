@@ -350,15 +350,26 @@ func anyOtherGoTestParentAlive(excludePIDs ...int) bool {
 // fleet-test namespace — the only sockets this reaper may touch.
 var fleetTestSocketRe = regexp.MustCompile(`^/[^\s]*/fleet-test-[^\s]*\.sock$`)
 
-// tmuxServerSocketFromArgv extracts tmux's OWN `-S <path>` server-socket
-// option from a tmux argv, returning ("", false) unless argv[0]'s basename
-// is `tmux`, `-S <path>` is among tmux's GLOBAL options (before the command
-// word), and <path> is in the fleet-test namespace. (testutil twin of
-// internal/gc.tmuxServerSocketFromArgv — see that doc for why anchoring to
-// tmux's own option, not any `-S` substring, prevents PID-killing an
-// operator-owned tmux server whose pane command happens to mention such a
-// path. codex iter-1 [P2].)
+// tmuxServerTitleRe matches the LINUX tmux SERVER proctitle
+// `tmux: server (<socket>)` (codex iter-9 [P1]: the ubuntu-latest CI runner
+// reports this shape, not the macOS `tmux -S … new-session` argv).
+var tmuxServerTitleRe = regexp.MustCompile(`^tmux: server \((/[^\s)]+)\)`)
+
+// tmuxServerSocketFromArgv extracts tmux's OWN server socket from a tmux
+// process's `ps args`, recognizing BOTH the Linux server title
+// `tmux: server (<socket>)` and the macOS/client `tmux -S <path> …` argv,
+// returning ("", false) unless the socket is in the fleet-test namespace.
+// (testutil twin of internal/gc.tmuxServerSocketFromArgv — see that doc for
+// why anchoring to tmux's own option, not any `-S` substring, prevents
+// PID-killing an operator-owned tmux server whose pane command happens to
+// mention such a path. codex iter-1 [P2], iter-9 [P1].)
 func tmuxServerSocketFromArgv(args string) (string, bool) {
+	if m := tmuxServerTitleRe.FindStringSubmatch(args); m != nil {
+		if fleetTestSocketRe.MatchString(m[1]) {
+			return m[1], true
+		}
+		return "", false
+	}
 	fields := strings.Fields(args)
 	if len(fields) == 0 {
 		return "", false

@@ -335,6 +335,8 @@ func TestTmuxServerSocketFromArgv(t *testing.T) {
 		"tmux -S /tmp/fleet-test-abc.sock new-session -d -s fleet-x sh -c cat": "/tmp/fleet-test-abc.sock",
 		"/opt/homebrew/bin/tmux -S /tmp/fleet-test-abc.sock new-session":       "/tmp/fleet-test-abc.sock",
 		"tmux -S/tmp/fleet-test-abc.sock new-session":                          "/tmp/fleet-test-abc.sock",
+		// LINUX server proctitle (codex iter-9 [P1]) — the ubuntu CI shape.
+		"tmux: server (/tmp/fleet-test-abc.sock)": "/tmp/fleet-test-abc.sock",
 	}
 	for args, want := range ok {
 		if got, found := tmuxServerSocketFromArgv(args); !found || got != want {
@@ -345,6 +347,7 @@ func TestTmuxServerSocketFromArgv(t *testing.T) {
 		"tmux -S /home/op/.tmux/default new-session -d cmd -S /tmp/fleet-test-evil.sock", // -S in pane cmd
 		"sh -c tmux -S /tmp/fleet-test-x.sock ls",                                        // not tmux
 		"tmux -S /tmp/operator.sock new-session",                                         // non-fleet-test sock
+		"tmux: server (/home/op/.tmux/default)",                                          // operator server title
 		"",
 	}
 	for _, args := range notOk {
