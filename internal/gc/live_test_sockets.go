@@ -128,12 +128,15 @@ func reconcileLiveTestSockets(r *Report, opts Options, deps Deps) error {
 			target = s.SocketPath
 		}
 		// File-less orphan daemon (ServerPID > 0): unreachable by socket
-		// path, so the surface hint + the apply path both go through PID
-		// signal instead of `tmux -S <sock> kill-server`.
+		// path. Both the surface Reason and the apply path point operators at
+		// the PID-reuse-safe `fleet gc` reap, NOT a raw kill (codex iter-5/6
+		// [P2]): a pasted PID can race reuse, and only the gc apply path
+		// re-verifies the PID is STILL the expected `tmux -S <sock>` daemon
+		// (KillTmuxProc's expectSock recheck) before signaling.
 		fileLess := s.ServerPID > 0
 		hint := fmt.Sprintf("tmux -S %s kill-server", s.SocketPath)
 		if fileLess {
-			hint = fmt.Sprintf("kill %d (file-less daemon; socket %s already unlinked)", s.ServerPID, s.SocketPath)
+			hint = "fleet gc --apply --aggressive --kinds orphan-tmux"
 		}
 		act := Action{
 			Kind:   KindOrphanTmux,
@@ -143,19 +146,13 @@ func reconcileLiveTestSockets(r *Report, opts Options, deps Deps) error {
 				s.SocketPath, hint),
 		}
 		if fileLess {
-			// File-less orphan: Target is a socket PATH (no session name to
-			// `tmux kill-session -t`), so hand consumers (dispatch/status
-			// surface hints) a SAFE command instead of a bogus
-			// `tmux kill-session -t <socket-path>` (codex iter-2 [P2]).
-			//
-			// We point at `fleet gc --apply --aggressive`, NOT a raw
-			// `kill <pid>` (codex iter-5 [P2]): the PID can be reused before
-			// the operator pastes the command, and only the gc apply path
-			// re-verifies the PID is STILL the expected `tmux -S <sock>` daemon
-			// (KillTmuxProc's expectSock recheck) before signaling. A raw
-			// pasted `kill <pid>` has no such guard and could hit an unrelated
-			// process.
-			act.CleanupHint = "fleet gc --apply --aggressive --kinds orphan-tmux  (file-less daemon; PID-reuse-safe reap)"
+			// Target is a socket PATH (no session name), so the consumer's
+			// default `tmux kill-session -t <Target>` synthesis is bogus.
+			// CleanupHint is consumed VERBATIM as a shell command by
+			// status.go/dispatch.go, so it must be command-ONLY — no
+			// parenthesized prose (codex iter-6 [P2]: it would be a paste
+			// syntax error). The explanation lives in Reason above.
+			act.CleanupHint = "fleet gc --apply --aggressive --kinds orphan-tmux"
 		}
 		if opts.Aggressive {
 			act.Verb = VerbWouldKill
