@@ -9,8 +9,6 @@ import (
 	"strings"
 	"testing"
 	"time"
-
-	"github.com/edisonshen/fleet/internal/testutil/tmuxtest"
 )
 
 // TDD suite for leak-gc-live-testsock (PR-D, DESIGN-lifecycle-leak-recurrence.md).
@@ -398,18 +396,35 @@ func TestGoTestOwnerVerdict_SparesWhileTestRunning(t *testing.T) {
 // (the unit T4 only covers the stubbed-classifier branch). The killer is
 // then exercised directly to confirm it removes the server.
 func TestLiveTestSockets_Integration_ListAndKill(t *testing.T) {
-	// codex iter-3 [P2]: use the unique /tmp/fleet-test-<hex>.sock that
-	// RequireTmux allocates (and auto-cleans), NOT a fixed global path —
-	// a hardcoded socket can collide with another concurrent run's server
-	// and get kill-server'd, the exact cross-run leak this PR exists to
-	// prevent. RequireTmux registers its own kill-server+remove cleanup.
-	sock := tmuxtest.RequireTmux(t)
-	// Spawn a real detached server on the unique socket with a fleet-<id>
-	// session name.
+	if _, err := exec.LookPath("tmux"); err != nil {
+		t.Skip("tmux not installed; skipping integration test")
+	}
+	// codex iter-6 [P1]: scan a SHORT ISOLATED /tmp subdir, not bare /tmp. The
+	// old form scanned bare /tmp, so on a dirty runner with many stale
+	// /tmp/fleet-test-*.sock files firstFleetSession would `tmux -S` probe
+	// EVERY one before filtering to this test's fixture — the exact
+	// dirty-runner grind this PR removes. We bind the test's real tmux server
+	// into our own short subdir and scan only that dir; the production /tmp
+	// default stays covered by the TestGCScanDir_DefaultIsTmp unit check.
+	//
+	// The subdir + socket name are short (ft-<8hex>/s.sock ≈ 20 chars under
+	// /tmp) so the bound socket stays well under the macOS ~104-byte limit.
+	scanDir, err := os.MkdirTemp("/tmp", "fleet-test-ltsi-")
+	if err != nil {
+		t.Fatalf("mkdirtemp /tmp: %v", err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(scanDir) })
+	// Socket name must carry the fleet-test-*.sock pattern scanSocketsDir
+	// matches; kept short so the bound path stays under the macOS limit.
+	sock := filepath.Join(scanDir, "fleet-test-s.sock")
+	// Spawn a real detached server on the isolated socket with a fleet-<id>
+	// session name. Reap the server in cleanup (RemoveAll alone leaves the
+	// daemon running on the now-deleted socket inode).
 	if out, err := exec.Command("tmux", "-S", sock, "new-session", "-d",
 		"-s", "fleet-deadbeef", "sleep", "300").CombinedOutput(); err != nil {
 		t.Fatalf("spawn tmux: %v (%s)", err, out)
 	}
+	t.Cleanup(func() { _ = exec.Command("tmux", "-S", sock, "kill-server").Run() })
 	// codex iter-1 [P2]: `tmux new-session` can print "error creating ..."
 	// yet exit 0 on some hosts, so a clean exit is NOT proof the server
 	// exists. Verify the session is actually live before asserting the
@@ -419,10 +434,7 @@ func TestLiveTestSockets_Integration_ListAndKill(t *testing.T) {
 		t.Skipf("tmux exited 0 but no live session on %s (host tmux quirk): %v", sock, err)
 	}
 
-	// RequireTmux keeps its socket in /tmp (macOS socket-path limit), so the
-	// integration lister must scan /tmp to see it — this is the production
-	// default path (gcScanDir() with FLEET_GC_SCAN_DIR unset).
-	socks, err := listLiveTestSocketsOnDisk("/tmp")
+	socks, err := listLiveTestSocketsOnDisk(scanDir)
 	if err != nil {
 		t.Fatalf("listLiveTestSocketsOnDisk: %v", err)
 	}
