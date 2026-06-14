@@ -483,17 +483,21 @@ func TestListFileLessTestTmux_SurfacesFileLessDaemon(t *testing.T) {
 	// A socket path that does NOT exist on disk (file-less daemon).
 	goneSock := filepath.Join(t.TempDir(), "fleet-test-gone.sock")
 	// Sanity: the path is genuinely absent.
+	scanDir := filepath.Dir(goneSock)
 	if _, err := os.Stat(goneSock); !os.IsNotExist(err) {
 		t.Fatalf("test setup: %s unexpectedly exists", goneSock)
 	}
 	withProcLister(t, []procInfo{
 		{PID: 4242, Args: "tmux -S " + goneSock + " new-session -d -s fleet-deadbeef sh -c cat"},
 		{PID: 7, Args: "cat"},
+		// A file-less daemon OUTSIDE the scan dir must be SKIPPED (codex
+		// iter-2 [P2]: PID kill must not escape the scan namespace).
+		{PID: 8, Args: "tmux -S /some/other/dir/fleet-test-elsewhere.sock new-session"},
 	}, nil)
 
-	got := listFileLessTestTmux(0) // 0 = host quiescent
+	got := listFileLessTestTmux(scanDir, 0) // 0 = host quiescent
 	if len(got) != 1 {
-		t.Fatalf("listFileLessTestTmux returned %d entries, want 1: %+v", len(got), got)
+		t.Fatalf("listFileLessTestTmux returned %d entries, want 1 (the out-of-scan-dir daemon must be skipped): %+v", len(got), got)
 	}
 	if got[0].ServerPID != 4242 {
 		t.Errorf("ServerPID = %d, want 4242 (file-less daemon must be killed by PID)", got[0].ServerPID)
@@ -522,7 +526,7 @@ func TestListFileLessTestTmux_SkipsFileBoundAndUnrelated(t *testing.T) {
 		{PID: 3, Args: "sh -c echo tmux -S /tmp/fleet-test-fake.sock"},           // not a tmux exe
 	}, nil)
 
-	got := listFileLessTestTmux(0)
+	got := listFileLessTestTmux(dir, 0)
 	if len(got) != 0 {
 		t.Fatalf("listFileLessTestTmux returned %d entries, want 0 (file-bound + unrelated must be skipped): %+v", len(got), got)
 	}
@@ -559,6 +563,12 @@ func TestReconcile_LiveTestSock_FileLessKilledByPID(t *testing.T) {
 	}
 	if pathKillCalled {
 		t.Error("KillTmuxServer (socket-path kill) ran for a file-less daemon; must kill by PID")
+	}
+	// The action must carry the PID-based CleanupHint so surface consumers
+	// (dispatch/status) emit `kill <pid>`, not a bogus
+	// `tmux kill-session -t /tmp/fleet-test-gone.sock` (codex iter-2 [P2]).
+	if a.CleanupHint != "kill 9931" {
+		t.Errorf("CleanupHint = %q, want %q (file-less orphan needs a PID kill hint, not a session kill)", a.CleanupHint, "kill 9931")
 	}
 }
 

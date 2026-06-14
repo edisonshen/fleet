@@ -44,6 +44,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
@@ -141,6 +142,13 @@ func reconcileLiveTestSockets(r *Report, opts Options, deps Deps) error {
 			Reason: fmt.Sprintf("live test-socket tmux server on %s with no live go-test owner; rerun with --apply --aggressive to kill (or `%s`)",
 				s.SocketPath, hint),
 		}
+		if fileLess {
+			// File-less orphan: Target is a socket PATH (no session name to
+			// `tmux kill-session -t`), so hand consumers (dispatch/status
+			// surface hints) the correct PID-based command instead of a bogus
+			// `tmux kill-session -t <socket-path>` (codex iter-2 [P2]).
+			act.CleanupHint = fmt.Sprintf("kill %d", s.ServerPID)
+		}
 		if opts.Aggressive {
 			act.Verb = VerbWouldKill
 			act.Reason = fmt.Sprintf("live test-socket tmux server on %s with no live go-test owner", s.SocketPath)
@@ -209,9 +217,11 @@ func listLiveTestSocketsOnDisk(dir string) ([]LiveTestSocket, error) {
 	}
 	// Plus the file-less orphan daemons (socket file already unlinked,
 	// daemon still alive) — unreachable by the disk scan above. Same
-	// quiescence verdict; killed by PID. This is what reaps the 399
-	// file-less daemons the 2026-06-13 host accumulated.
-	out = append(out, listFileLessTestTmux(ownerVerdict)...)
+	// quiescence verdict; killed by PID. Constrained to `dir` so the PID
+	// kill never escapes the configured scan namespace (codex iter-2 [P2]).
+	// This is what reaps the 399 file-less daemons the 2026-06-13 host
+	// accumulated.
+	out = append(out, listFileLessTestTmux(dir, ownerVerdict)...)
 	return out, nil
 }
 
@@ -513,9 +523,15 @@ func tmuxServerSocketFromArgv(args string) (string, bool) {
 //
 // Only daemons whose socket file is GONE are returned here; a daemon whose
 // .sock still exists is already covered by the disk scan, so returning it
-// here too would double-count. Best-effort: any lister error yields an
-// empty slice (the file-bound path still runs).
-func listFileLessTestTmux(ownerVerdict int) []LiveTestSocket {
+// here too would double-count.
+//
+// SCOPE (codex iter-2 [P2]): only daemons whose socket lived in `dir` (the
+// configured scan namespace — production `/tmp`, tests a decoy) are
+// returned. Without this, a `-S /home/me/fleet-test-debug.sock` server with
+// an unlinked socket would be SIGTERM'd even when the scan dir is `/tmp` or
+// a decoy — escaping the configured namespace. Best-effort: any lister
+// error yields an empty slice (the file-bound path still runs).
+func listFileLessTestTmux(dir string, ownerVerdict int) []LiveTestSocket {
 	procs, err := goTestProcLister()
 	if err != nil {
 		return nil
@@ -525,6 +541,9 @@ func listFileLessTestTmux(ownerVerdict int) []LiveTestSocket {
 		sock, ok := tmuxServerSocketFromArgv(p.Args)
 		if !ok {
 			continue
+		}
+		if filepath.Dir(sock) != filepath.Clean(dir) {
+			continue // outside the configured scan namespace — out of scope
 		}
 		if _, statErr := os.Stat(sock); statErr == nil {
 			continue // socket file still present — the disk scan owns it

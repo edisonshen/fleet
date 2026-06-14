@@ -467,6 +467,13 @@ type Action struct {
 	Target string
 	Verb   Verb
 	Reason string
+	// CleanupHint, when non-empty, is the exact copy-paste command the
+	// operator should run to clean this up — overriding the consumer's
+	// default `tmux kill-session -t <Target>` synthesis. Set for file-less
+	// orphan tmux daemons (KindOrphanTmux with a socket-path Target and no
+	// session name) where the correct command is `kill <pid>`, not a
+	// session kill (codex iter-2 [P2]). Empty for the common case.
+	CleanupHint string
 }
 
 // Report carries the per-kind planned/applied actions. Stable iteration
