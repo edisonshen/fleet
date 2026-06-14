@@ -607,19 +607,16 @@ func killTmuxProcByPID(pid int, expectSock string) error {
 	// FAILURE (ps missing/denied/other exit → we CANNOT confirm the PID is
 	// the expected daemon, so returning nil here would let the caller report
 	// VerbKilled for a daemon that is still running — codex iter-7 [P2]).
-	out, err := exec.Command("ps", "-o", "args=", "-p", strconv.Itoa(pid)).Output()
+	verdict, err := pidIsDaemon(pid, expectSock)
 	if err != nil {
-		var exitErr *exec.ExitError
-		if errors.As(err, &exitErr) && exitErr.ExitCode() == 1 && len(strings.TrimSpace(string(out))) == 0 {
-			return nil // no such pid — already gone, nothing to kill
-		}
 		// ps unavailable / denied / unexpected: cannot prove identity. Surface
 		// the failure so the action does NOT falsely report killed.
 		return fmt.Errorf("killTmuxProcByPID: identity re-verify for pid %d failed (cannot confirm it is the %s daemon; refusing to kill): %w", pid, expectSock, err)
 	}
-	args := strings.TrimSpace(string(out))
-	sock, ok := tmuxServerSocketFromArgv(args)
-	if !ok || sock != expectSock {
+	switch verdict {
+	case pidGone:
+		return nil // no such pid — already gone, nothing to kill
+	case pidMismatch:
 		return fmt.Errorf("killTmuxProcByPID: pid %d is no longer the expected fleet-test tmux daemon on %s (recycled); refusing to kill", pid, expectSock)
 	}
 	proc, ferr := os.FindProcess(pid)
@@ -647,12 +644,54 @@ func signalIsGone(err error) bool {
 	return errors.Is(err, os.ErrProcessDone) || errors.Is(err, syscall.ESRCH)
 }
 
+// pidVerdict is the result of re-verifying a PID's identity against expectSock.
+type pidVerdict int
+
+const (
+	pidIsExpected pidVerdict = iota // still the tmux -S <expectSock> daemon
+	pidGone                         // no such pid — already reaped
+	pidMismatch                     // PID alive but recycled to a different process
+)
+
+// pidIsDaemon re-verifies that pid is STILL a tmux server on expectSock via
+// `ps -o args=`. It is called both before the first signal AND before SIGKILL
+// escalation: a daemon can exit after SIGTERM and the OS reuse its PID inside
+// the confirmation window, so escalating on bare PID-existence alone would
+// SIGKILL an unrelated (possibly operator-owned) process (codex iter-11 [P2]).
+// A genuinely-gone PID (ps exit 1, empty stdout) is pidGone (success); a probe
+// failure is surfaced as an error so the caller never falsely reports killed.
+// A var seam so the escalation re-verify can be driven deterministically in
+// unit tests.
+var pidIsDaemon = func(pid int, expectSock string) (pidVerdict, error) {
+	out, err := exec.Command("ps", "-o", "args=", "-p", strconv.Itoa(pid)).Output()
+	if err != nil {
+		var exitErr *exec.ExitError
+		if errors.As(err, &exitErr) && exitErr.ExitCode() == 1 && len(strings.TrimSpace(string(out))) == 0 {
+			return pidGone, nil
+		}
+		return pidMismatch, err
+	}
+	sock, ok := tmuxServerSocketFromArgv(strings.TrimSpace(string(out)))
+	if !ok || sock != expectSock {
+		return pidMismatch, nil
+	}
+	return pidIsExpected, nil
+}
+
 // confirmProcGone polls signal-0 liveness until the PID exits, escalating to
 // SIGKILL halfway through the window if SIGTERM did not take. Returns nil once
-// the PID is confirmed gone; an error if it survives both signals (so the
-// reaper surfaces a still-alive daemon instead of lying that it killed it).
-// procAlive is a seam so a unit test can drive the escalation deterministically
-// without a real wedged process.
+// the PID is confirmed gone (OR recycled to a different process — that means
+// OUR daemon already exited); an error if our daemon survives both signals (so
+// the reaper surfaces a still-alive daemon instead of lying that it killed it).
+//
+// CRITICAL (codex iter-11 [P2]): before SIGKILL we RE-VERIFY the PID is still
+// the expectSock daemon. A daemon can exit on SIGTERM and the OS reuse its PID
+// inside this window; escalating on bare PID-existence (procAlive) alone would
+// then SIGKILL an unrelated process. An identity mismatch == our daemon is
+// gone (success), never a SIGKILL.
+//
+// procAlive / pidIsDaemon are seams so a unit test can drive the escalation
+// deterministically without a real wedged process.
 var procAlive = func(pid int) bool {
 	// signal 0 probes existence without delivering a signal: nil → alive,
 	// ESRCH → gone. EPERM (alive but not ours) counts as alive.
@@ -675,9 +714,17 @@ func confirmProcGone(proc *os.Process, pid int, expectSock string) error {
 		}
 		// Escalate to SIGKILL once we are past the halfway mark and SIGTERM
 		// has not landed. SIGKILL cannot be trapped, so this clears a wedged
-		// daemon that ignored SIGTERM.
+		// daemon that ignored SIGTERM — but ONLY after re-verifying the PID is
+		// still OUR daemon, so a recycled PID is never SIGKILL'd.
 		if !escalated && now.After(deadline.Add(-killConfirmWindow/2)) {
 			escalated = true
+			verdict, verr := pidIsDaemon(pid, expectSock)
+			if verr != nil {
+				return fmt.Errorf("killTmuxProcByPID: pre-SIGKILL re-verify for pid %d (%s) failed; refusing to escalate: %w", pid, expectSock, verr)
+			}
+			if verdict != pidIsExpected {
+				return nil // gone or recycled — our daemon already exited
+			}
 			if serr := proc.Signal(syscall.SIGKILL); serr != nil && !signalIsGone(serr) {
 				return fmt.Errorf("SIGKILL %d: %w", pid, serr)
 			}

@@ -671,11 +671,14 @@ func TestConfirmProcGone_ExitsOnSigterm(t *testing.T) {
 
 // confirmProcGone reports an error (so the caller does NOT report VerbKilled)
 // when the daemon survives both SIGTERM and SIGKILL within the window — the
-// surface must not lie that a still-alive wedged daemon was reaped.
+// surface must not lie that a still-alive wedged daemon was reaped. The
+// pre-SIGKILL identity re-verify must confirm it is STILL our daemon, so we
+// stub pidIsDaemon to keep returning pidIsExpected.
 func TestConfirmProcGone_SurvivesBothSignals_Errors(t *testing.T) {
-	prev := procAlive
-	procAlive = func(int) bool { return true } // never dies
-	t.Cleanup(func() { procAlive = prev })
+	prevAlive, prevDaemon := procAlive, pidIsDaemon
+	procAlive = func(int) bool { return true }                                        // never dies
+	pidIsDaemon = func(int, string) (pidVerdict, error) { return pidIsExpected, nil } // still ours
+	t.Cleanup(func() { procAlive = prevAlive; pidIsDaemon = prevDaemon })
 
 	cmd := exec.Command("true")
 	if err := cmd.Run(); err != nil {
@@ -689,6 +692,25 @@ func TestConfirmProcGone_SurvivesBothSignals_Errors(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "survived SIGTERM+SIGKILL") {
 		t.Errorf("error = %q; want a 'survived SIGTERM+SIGKILL' surface", err)
+	}
+}
+
+// confirmProcGone must NOT escalate to SIGKILL if the PID was recycled to a
+// different process after SIGTERM (codex iter-11 [P2]): an identity mismatch
+// at the escalation point means OUR daemon already exited, so it is success —
+// SIGKILL'ing the recycled PID would kill an unrelated process.
+func TestConfirmProcGone_RecycledPidNotSigkilled(t *testing.T) {
+	prevAlive, prevDaemon := procAlive, pidIsDaemon
+	procAlive = func(int) bool { return true } // PID number still in use (recycled)
+	// At the pre-SIGKILL re-verify, the PID is no longer our daemon.
+	pidIsDaemon = func(int, string) (pidVerdict, error) { return pidMismatch, nil }
+	t.Cleanup(func() { procAlive = prevAlive; pidIsDaemon = prevDaemon })
+
+	// FindProcess on a live PID we must never actually SIGKILL: use our own
+	// process. If the code wrongly escalated, it would SIGKILL the test runner.
+	proc, _ := os.FindProcess(os.Getpid())
+	if err := confirmProcGone(proc, os.Getpid(), "/tmp/fleet-test-x.sock"); err != nil {
+		t.Errorf("confirmProcGone = %v; want nil (recycled PID == our daemon already gone, no SIGKILL)", err)
 	}
 }
 
