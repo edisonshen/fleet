@@ -690,8 +690,9 @@ var pidIsDaemon = func(pid int, expectSock string) (pidVerdict, error) {
 // then SIGKILL an unrelated process. An identity mismatch == our daemon is
 // gone (success), never a SIGKILL.
 //
-// procAlive / pidIsDaemon are seams so a unit test can drive the escalation
-// deterministically without a real wedged process.
+// procAlive / pidIsDaemon / sigkillProc are seams so a unit test can drive the
+// escalation deterministically WITHOUT ever delivering a real signal to a PID
+// that may have been recycled mid-test (codex iter-14 [P2]).
 var procAlive = func(pid int) bool {
 	// signal 0 probes existence without delivering a signal: nil → alive,
 	// ESRCH → gone. EPERM (alive but not ours) counts as alive.
@@ -699,6 +700,13 @@ var procAlive = func(pid int) bool {
 		return !signalIsGone(proc.Signal(syscall.Signal(0)))
 	}
 	return false
+}
+
+// sigkillProc delivers SIGKILL. A var seam so the survives-both unit test can
+// assert escalation happened without firing a real SIGKILL at a (possibly
+// recycled) PID.
+var sigkillProc = func(proc *os.Process) error {
+	return proc.Signal(syscall.SIGKILL)
 }
 
 func confirmProcGone(proc *os.Process, pid int, expectSock string) error {
@@ -725,7 +733,7 @@ func confirmProcGone(proc *os.Process, pid int, expectSock string) error {
 			if verdict != pidIsExpected {
 				return nil // gone or recycled — our daemon already exited
 			}
-			if serr := proc.Signal(syscall.SIGKILL); serr != nil && !signalIsGone(serr) {
+			if serr := sigkillProc(proc); serr != nil && !signalIsGone(serr) {
 				return fmt.Errorf("SIGKILL %d: %w", pid, serr)
 			}
 		}

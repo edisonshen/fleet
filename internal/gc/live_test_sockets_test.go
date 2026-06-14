@@ -677,23 +677,25 @@ func TestConfirmProcGone_ExitsOnSigterm(t *testing.T) {
 // pre-SIGKILL identity re-verify must confirm it is STILL our daemon, so we
 // stub pidIsDaemon to keep returning pidIsExpected.
 func TestConfirmProcGone_SurvivesBothSignals_Errors(t *testing.T) {
-	prevAlive, prevDaemon := procAlive, pidIsDaemon
+	prevAlive, prevDaemon, prevKill := procAlive, pidIsDaemon, sigkillProc
 	procAlive = func(int) bool { return true }                                        // never dies
 	pidIsDaemon = func(int, string) (pidVerdict, error) { return pidIsExpected, nil } // still ours
-	t.Cleanup(func() { procAlive = prevAlive; pidIsDaemon = prevDaemon })
+	killed := false
+	// Stub the SIGKILL seam: record that escalation fired, deliver NOTHING.
+	// (codex iter-14 [P2]: a real SIGKILL to a fabricated PID could hit a
+	// recycled process — the test must never signal a live PID it does not own.)
+	sigkillProc = func(*os.Process) error { killed = true; return nil }
+	t.Cleanup(func() { procAlive = prevAlive; pidIsDaemon = prevDaemon; sigkillProc = prevKill })
 
-	cmd := exec.Command("true")
-	if err := cmd.Run(); err != nil {
-		t.Fatalf("seed true: %v", err)
-	}
-	proc, _ := os.FindProcess(cmd.Process.Pid)
-
-	err := confirmProcGone(proc, cmd.Process.Pid, "/tmp/fleet-test-x.sock")
+	err := confirmProcGone(nil, 999999, "/tmp/fleet-test-x.sock")
 	if err == nil {
 		t.Fatal("confirmProcGone returned nil for a daemon that survived SIGTERM+SIGKILL; must error so the action is not reported killed")
 	}
 	if !strings.Contains(err.Error(), "survived SIGTERM+SIGKILL") {
 		t.Errorf("error = %q; want a 'survived SIGTERM+SIGKILL' surface", err)
+	}
+	if !killed {
+		t.Error("SIGKILL escalation never fired for a SIGTERM-surviving daemon")
 	}
 }
 
@@ -702,16 +704,19 @@ func TestConfirmProcGone_SurvivesBothSignals_Errors(t *testing.T) {
 // at the escalation point means OUR daemon already exited, so it is success —
 // SIGKILL'ing the recycled PID would kill an unrelated process.
 func TestConfirmProcGone_RecycledPidNotSigkilled(t *testing.T) {
-	prevAlive, prevDaemon := procAlive, pidIsDaemon
+	prevAlive, prevDaemon, prevKill := procAlive, pidIsDaemon, sigkillProc
 	procAlive = func(int) bool { return true } // PID number still in use (recycled)
 	// At the pre-SIGKILL re-verify, the PID is no longer our daemon.
 	pidIsDaemon = func(int, string) (pidVerdict, error) { return pidMismatch, nil }
-	t.Cleanup(func() { procAlive = prevAlive; pidIsDaemon = prevDaemon })
+	// Defense-in-depth: if the logic regressed and DID try to escalate, the
+	// seam fails the test instead of SIGKILL'ing a real PID.
+	sigkillProc = func(*os.Process) error {
+		t.Error("SIGKILL fired against a recycled PID; identity recheck must short-circuit first")
+		return nil
+	}
+	t.Cleanup(func() { procAlive = prevAlive; pidIsDaemon = prevDaemon; sigkillProc = prevKill })
 
-	// FindProcess on a live PID we must never actually SIGKILL: use our own
-	// process. If the code wrongly escalated, it would SIGKILL the test runner.
-	proc, _ := os.FindProcess(os.Getpid())
-	if err := confirmProcGone(proc, os.Getpid(), "/tmp/fleet-test-x.sock"); err != nil {
+	if err := confirmProcGone(nil, 999999, "/tmp/fleet-test-x.sock"); err != nil {
 		t.Errorf("confirmProcGone = %v; want nil (recycled PID == our daemon already gone, no SIGKILL)", err)
 	}
 }
