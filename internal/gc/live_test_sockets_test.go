@@ -1,7 +1,9 @@
 package gc
 
 import (
+	"crypto/rand"
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -754,27 +756,34 @@ func TestLiveTestSockets_Integration_ListAndKill(t *testing.T) {
 	if _, err := exec.LookPath("tmux"); err != nil {
 		t.Skip("tmux not installed; skipping integration test")
 	}
-	// codex iter-6 [P1]: scan a SHORT ISOLATED /tmp subdir, not bare /tmp. The
-	// old form scanned bare /tmp, so on a dirty runner with many stale
-	// /tmp/fleet-test-*.sock files firstFleetSession would `tmux -S` probe
-	// EVERY one before filtering to this test's fixture — the exact
-	// dirty-runner grind this PR removes. We bind the test's real tmux server
-	// into our own short subdir and scan only that dir; the production /tmp
-	// default stays covered by the TestGCScanDir_DefaultIsTmp unit check.
+	// codex iter-13 [P2]: the real tmux server's socket must live at TOP-LEVEL
+	// /tmp/fleet-test-*.sock, NOT nested under a /tmp/fleet-test-ltsi-*/ subdir.
+	// If `go test -timeout=5m` SIGKILLs this test between the tmux spawn and the
+	// t.Cleanup below, the daemon leaks — and the interrupt-safe reapers
+	// (ForceReapTestServers, reapFileLessTestTmux, the CI leak gate's
+	// `/tmp/fleet-test-*.sock` glob) ONLY scan top-level /tmp. A nested socket
+	// escapes every one of them, leaking the exact orphan daemon this PR exists
+	// to kill. Top-level + a unique suffix keeps it reapable by the backstops.
 	//
-	// The subdir + socket name are short (ft-<8hex>/s.sock ≈ 20 chars under
-	// /tmp) so the bound socket stays well under the macOS ~104-byte limit.
-	scanDir, err := os.MkdirTemp("/tmp", "fleet-test-ltsi-")
-	if err != nil {
-		t.Fatalf("mkdirtemp /tmp: %v", err)
+	// We scan only this one socket's parent (/tmp) via a temp-name FILTER
+	// instead of an isolated subdir: the lister walks /tmp but we assert on our
+	// own unique socket name, and the per-test t.Cleanup + interrupt-safe
+	// reapers both cover the bound server. (iter-6's dirty-/tmp grind is a
+	// PRODUCTION concern fixed by the scan-dir seam; one integration test
+	// briefly listing /tmp is acceptable and stays reapable.)
+	//
+	// Name is short (fleet-test-ltsi-<8hex>.sock ≈ 32 chars under /tmp) so the
+	// bound socket stays well under the macOS ~104-byte limit.
+	uniq := make([]byte, 4)
+	if _, err := rand.Read(uniq); err != nil {
+		t.Fatalf("rand: %v", err)
 	}
-	t.Cleanup(func() { _ = os.RemoveAll(scanDir) })
-	// Socket name must carry the fleet-test-*.sock pattern scanSocketsDir
-	// matches; kept short so the bound path stays under the macOS limit.
-	sock := filepath.Join(scanDir, "fleet-test-s.sock")
-	// Spawn a real detached server on the isolated socket with a fleet-<id>
-	// session name. Reap the server in cleanup (RemoveAll alone leaves the
-	// daemon running on the now-deleted socket inode).
+	sock := filepath.Join("/tmp", fmt.Sprintf("fleet-test-ltsi-%x.sock", uniq))
+	scanDir := "/tmp"
+	t.Cleanup(func() { _ = os.Remove(sock) })
+	// Spawn a real detached server on the top-level socket with a fleet-<id>
+	// session name. Reap the server in cleanup (Remove alone leaves the daemon
+	// running on the now-deleted socket inode).
 	if out, err := exec.Command("tmux", "-S", sock, "new-session", "-d",
 		"-s", "fleet-deadbeef", "sleep", "300").CombinedOutput(); err != nil {
 		t.Fatalf("spawn tmux: %v (%s)", err, out)
