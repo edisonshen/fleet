@@ -90,7 +90,10 @@ func sweepDir() string {
 //	}
 func IsolateSweepDir() func() {
 	prev, had := os.LookupEnv("FLEET_GC_SCAN_DIR")
-	decoy, err := os.MkdirTemp("", "fleet-gc-sweep-decoy-")
+	// Prefix `fleet-test-` so a leaked decoy (SIGKILL skipping cleanup before
+	// os.Exit) is caught by CI's top-level `/tmp/fleet-test-*` leak gate
+	// instead of accumulating silently (codex iter-5 [P2]).
+	decoy, err := os.MkdirTemp("", "fleet-test-gc-sweep-decoy-")
 	if err != nil {
 		// MkdirTemp failed: we can't isolate. Rather than SILENTLY falling back
 		// to the prior (possibly /tmp) behavior — which would re-arm the very

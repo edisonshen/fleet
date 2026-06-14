@@ -78,7 +78,13 @@ func TestDispatchReconcile_OrphanTmux_ScansInjectedDir_NotTmp(t *testing.T) {
 	// ~104-byte socket-path limit under the long t.TempDir path. The dir is a
 	// unique subdir of /tmp, distinct from bare /tmp — the test still proves
 	// the scan is scoped to FLEET_GC_SCAN_DIR and never walks /tmp itself.
-	dir, err := os.MkdirTemp("/tmp", "fgc-")
+	//
+	// Prefix `fleet-test-` (codex iter-5 [P2]): if a -timeout=5m SIGKILL skips
+	// t.Cleanup, this dir + its socket survive. CI's leak gate / reap step
+	// matches top-level `/tmp/fleet-test-*`, so a leak-gated prefix makes the
+	// orphan VISIBLE (and reaped) instead of accumulating silently — even
+	// though the socket lives one level down, the DIR itself is now caught.
+	dir, err := os.MkdirTemp("/tmp", "fleet-test-fgc-")
 	if err != nil {
 		t.Fatalf("mkdirtemp /tmp decoy: %v", err)
 	}
