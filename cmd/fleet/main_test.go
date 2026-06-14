@@ -79,7 +79,16 @@ func TestMain(m *testing.M) {
 	if err := os.Setenv("FLEET_PID_RESOLVE_S", "1"); err != nil {
 		panic("TestMain: os.Setenv FLEET_PID_RESOLVE_S failed: " + err.Error())
 	}
-	_ = testutil.Sweep(time.Hour) // start-of-run; best-effort
+	// ci-perf-pr1 (P0), codex iter-2 [P1]: sweep the DECOY, not real /tmp.
+	// testutil.Sweep(time.Hour) hardcodes SweepDir("/tmp") and probes EVERY
+	// /tmp/fleet-test-*.sock with `tmux -S <sock> list-sessions` — on a host
+	// with hundreds of leaked sockets that is the exact N-tmux-subprocess
+	// grind this PR removes, and it runs in TestMain BEFORE any isolated test.
+	// Pointing it at the empty decoy makes the sweep a no-op (nothing to
+	// probe) so TestMain itself can't hang. Reaping real /tmp leaks is the
+	// socket-leak P0's job (`fleet gc`), out of scope here and not the test
+	// harness's to do (fleet owns its own resources, not the operator's /tmp).
+	_ = testutil.SweepDir(scanDecoy, time.Hour) // start-of-run; best-effort
 	code := m.Run()
 	// End-of-run teardown: guarded sweep (freshness window +
 	// socketLive probe). The force-mode testutil.SweepAll is
@@ -95,8 +104,14 @@ func TestMain(m *testing.M) {
 	// scripts/lint-test-isolation.sh closes the original root cause
 	// (empty-command dispatch tests forking real claude) at the
 	// source; bypassed t.Cleanup orphans (rare panic path) get reaped
-	// by the next test run's start-of-run sweep once they age past 1h.
-	_ = testutil.Sweep(time.Hour) // end-of-run; best-effort
+	// by the operator-invoked `fleet gc` (the socket-leak P0's lane).
+	//
+	// ci-perf-pr1: both sweeps now target the empty decoy, not /tmp (see the
+	// start-of-run note) — they no longer reap real /tmp debris, but cmd/fleet
+	// tests no longer CREATE any (tmuxtest reaps its own sockets via
+	// t.Cleanup), so there is nothing for this sweep to reap. Trading the
+	// /tmp grind (a hang vector) for a no-op decoy sweep is the whole point.
+	_ = testutil.SweepDir(scanDecoy, time.Hour) // end-of-run; best-effort (decoy, see start-of-run note)
 	// os.Exit skips defers, so reap the decoy scan dir explicitly (fleet owns
 	// the lifecycle of everything it creates — feedback_fleet_owns_its_resources).
 	_ = os.RemoveAll(scanDecoy)
