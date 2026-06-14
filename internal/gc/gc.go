@@ -359,6 +359,13 @@ type Deps struct {
 	// KillTmuxServer runs `tmux -S <sock> kill-server` under
 	// --apply --aggressive. Production wiring is killTmuxServerOnDisk.
 	KillTmuxServer func(socketPath string) error
+	// KillTmuxProc kills a FILE-LESS orphan tmux daemon by PID (a live
+	// `tmux -S /tmp/fleet-test-*.sock` server whose socket file is gone, so
+	// it cannot be reached by `tmux -S <path> kill-server`). Used under
+	// --apply --aggressive for LiveTestSocket entries with ServerPID > 0.
+	// Production wiring is killTmuxProcByPID. nil leaves such daemons
+	// surfaced-only (kill seam unwired).
+	KillTmuxProc func(pid int) error
 
 	// Invalid-projects (KindInvalidProjects).
 	// ListProjectDirs enumerates EVERY ~/.fleet/projects/<name>/ entry
@@ -1028,6 +1035,7 @@ func defaultDepsScanning(scanDir string) Deps {
 		ReloadDrainRun:        reloadDrainRunOnDisk,
 		ListLiveTestSockets:   func() ([]LiveTestSocket, error) { return listLiveTestSocketsOnDisk(scanDir) },
 		KillTmuxServer:        killTmuxServerOnDisk,
+		KillTmuxProc:          killTmuxProcByPID,
 	}
 }
 

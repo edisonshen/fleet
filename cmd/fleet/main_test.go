@@ -87,39 +87,23 @@ func TestMain(m *testing.M) {
 	if err := os.Setenv("FLEET_PID_RESOLVE_S", "1"); err != nil {
 		panic("TestMain: os.Setenv FLEET_PID_RESOLVE_S failed: " + err.Error())
 	}
-	// ci-perf-pr1 (P0), codex iter-2 [P1]: sweep the DECOY, not real /tmp.
-	// testutil.Sweep(time.Hour) hardcodes SweepDir("/tmp") and probes EVERY
-	// /tmp/fleet-test-*.sock with `tmux -S <sock> list-sessions` — on a host
-	// with hundreds of leaked sockets that is the exact N-tmux-subprocess
-	// grind this PR removes, and it runs in TestMain BEFORE any isolated test.
-	// Pointing it at the empty decoy makes the sweep a no-op (nothing to
-	// probe) so TestMain itself can't hang. Reaping real /tmp leaks is the
-	// socket-leak P0's job (`fleet gc`), out of scope here and not the test
-	// harness's to do (fleet owns its own resources, not the operator's /tmp).
-	_ = testutil.SweepDir(scanDecoy, time.Hour) // start-of-run; best-effort
+	// ci-perf-pr1 socket-leak P0 (2026-06-13): DECOUPLE the gc PROBE decoy
+	// (FLEET_GC_SCAN_DIR, set above — keeps the in-test reconcile off the host
+	// /tmp grind) from the cleanup SWEEP. The start-of-run sweep targets REAL
+	// /tmp (guarded: freshness + socketLive), the safety net that reaps a
+	// leaked server from a prior crashed run. An earlier rev swept the decoy
+	// instead, which DISABLED that net and let interrupted-run servers leak
+	// forever. testutil.Sweep hardcodes /tmp (never FLEET_GC_SCAN_DIR), so the
+	// probe decoy and the sweep target are now independent.
+	_ = testutil.Sweep(time.Hour) // start-of-run safety net on REAL /tmp
 	code := m.Run()
-	// End-of-run teardown: guarded sweep (freshness window +
-	// socketLive probe). The force-mode testutil.SweepAll is
-	// deliberately NOT used here: `go test ./...` runs sibling test
-	// binaries in parallel (default -p=GOMAXPROCS), all sharing the
-	// /tmp/fleet-test-*.sock namespace via tmuxtest.isolatedSocketPath.
-	// SweepAll on teardown would force-kill sockets owned by sibling
-	// packages whose tests are still running, causing a P0 CI
-	// regression (cmd/fleet finishes last in practice but the trade-
-	// off is identical across all packages). SweepAll/SweepAllDir
-	// remain in sweeper.go for PR-D's operator-invoked
-	// `fleet gc --force-test-sockets` path. The lint guard in
-	// scripts/lint-test-isolation.sh closes the original root cause
-	// (empty-command dispatch tests forking real claude) at the
-	// source; bypassed t.Cleanup orphans (rare panic path) get reaped
-	// by the operator-invoked `fleet gc` (the socket-leak P0's lane).
-	//
-	// ci-perf-pr1: both sweeps now target the empty decoy, not /tmp (see the
-	// start-of-run note) — they no longer reap real /tmp debris, but cmd/fleet
-	// tests no longer CREATE any (tmuxtest reaps its own sockets via
-	// t.Cleanup), so there is nothing for this sweep to reap. Trading the
-	// /tmp grind (a hang vector) for a no-op decoy sweep is the whole point.
-	_ = testutil.SweepDir(scanDecoy, time.Hour) // end-of-run; best-effort (decoy, see start-of-run note)
+	// End-of-run: force-reap THIS suite's leftover fleet-<id> servers on real
+	// /tmp (file-bound AND file-less), GATED on host go-test-quiescence. Under
+	// `go test ./...` sibling packages still own live servers, so the gate
+	// spares (no-op) until the test fleet is idle — the gate is what makes the
+	// teardown force-kill safe (no sibling-kill regression). This closes the
+	// bypassed-t.Cleanup leak (panic/SIGKILL skipping per-test cleanup).
+	_ = testutil.ForceReapTestServers()
 	// os.Exit skips defers, so reap the decoy scan dir explicitly (fleet owns
 	// the lifecycle of everything it creates — feedback_fleet_owns_its_resources).
 	_ = os.RemoveAll(scanDecoy)

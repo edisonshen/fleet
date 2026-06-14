@@ -5,7 +5,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -300,88 +299,278 @@ func TestKillTmuxServerOnDisk_NonSocketNoOp(t *testing.T) {
 	}
 }
 
-// pgrepCanSeeSelf reports whether pgrep can enumerate the CURRENT test
-// process by its `.test` argv. Some sandboxes (this CI/agent harness
-// included) ship a working pgrep binary that nonetheless cannot inspect
-// other processes' argv and returns "no match" for everything — there
-// the host-wide go-test gate is unobservable, so the assertions below
-// skip rather than report a false failure. On a real operator host pgrep
-// sees the live test binary and the assertions run for real.
-func pgrepCanSeeSelf(t *testing.T) bool {
+// psCanSeeSelfTestExe reports whether the REAL (un-stubbed) production
+// lister observes this running process's own `*.test` / `go test`
+// executable. Some sandboxes restrict `ps` cross-process visibility, so
+// the host-wide gate is unobservable there and dependent assertions skip
+// rather than report a false failure. On a real operator host ps sees the
+// live test binary and the assertions run for real.
+func psCanSeeSelfTestExe(t *testing.T) bool {
 	t.Helper()
-	if _, err := exec.LookPath("pgrep"); err != nil {
-		return false
-	}
-	// Match the same `.test` argv shape anyGoTestRunning uses.
-	out, err := exec.Command("pgrep", "-f", `\.test[ /]`).Output()
+	procs, err := psProcLister()
 	if err != nil {
 		return false
 	}
-	return strings.TrimSpace(string(out)) != ""
+	for _, p := range procs {
+		if isGoTestProc(p) {
+			return true
+		}
+	}
+	return false
 }
 
-// The `.test` pgrep needle must match a real `pkg.test -test.*` argv but
-// NOT unrelated processes like `pytest` / `latest` / `contest` (codex
-// iter-2 [P2] — an unescaped/over-broad `.test` regex would pin the gate
-// true forever on any host running pytest, silently defeating the
-// reaper). pgrep's cross-process visibility is unreliable in sandboxes,
-// so this validates the pattern's INTENT directly with Go's regexp over
-// representative argv strings. The needle is a BRE/ERE common-subset
-// pattern that Go's RE2 also accepts unchanged (`\.` escaped dot +
-// `[ /]` class), so this is a faithful proxy for what pgrep -f evaluates.
-func TestGoTestPgrepNeedles_TestBinarySpecificity(t *testing.T) {
-	// Find the `.test`-shaped needle from the production list.
-	var dotTest string
-	for _, n := range goTestPgrepNeedles {
-		if strings.Contains(n, `\.test`) {
-			dotTest = n
+// withProcLister swaps the package-level goTestProcLister seam for the
+// duration of one test and restores it via t.Cleanup. Pass the fake
+// process table the test wants anyGoTestRunning to see.
+func withProcLister(t *testing.T, procs []procInfo, err error) {
+	t.Helper()
+	prev := goTestProcLister
+	goTestProcLister = func() ([]procInfo, error) { return procs, err }
+	t.Cleanup(func() { goTestProcLister = prev })
+}
+
+// isGoTestProc is the load-bearing classifier behind the 2026-06-13
+// deadlock fix: the detector must match the real test PARENT by its
+// EXECUTABLE, never any process that merely references a `.test` path in
+// a later argv token (the leaked tmux server's `-e FLEET_BIN=...spawn.test`
+// is the exact false positive that pinned the gate true and spared 199
+// orphans forever).
+func TestIsGoTestProc_ExecutableOnly(t *testing.T) {
+	live := []procInfo{
+		// Compiled pkg.test binary (argv[0] basename ends `.test`).
+		{Args: "/var/.../go-build/b168/spawn.test -test.v"},
+		{Args: "/tmp/go-build/gc.test -test.run=Foo"},
+		// macOS ps may paren-wrap argv[0] for the live process — must still
+		// classify (the 2026-06-13 sibling-kill bug exposed comm truncation;
+		// argv[0] with parens is the other ps quirk to tolerate).
+		{Args: "(spawn.test) -test.v"},
+		// Full go-build temp path (the form `go test ./...` actually runs) —
+		// proves we read argv[0] not the truncated comm.
+		{Args: "/var/folders/69/xyz/T/go-build523005417/b001/handoffop.test -test.paniconexit0 -test.timeout=5m0s"},
+		// `go` driver running the `test` subcommand.
+		{Args: "go test ./..."},
+		{Args: "go -C /repo test -race ./internal/gc"}, // leading flags skipped
+	}
+	for _, p := range live {
+		if !isGoTestProc(p) {
+			t.Errorf("isGoTestProc(%+v) = false; a real go-test parent must count (else live in-flight servers get reaped)", p)
 		}
 	}
-	if dotTest == "" {
-		t.Fatal("no `\\.test` needle in goTestPgrepNeedles")
+
+	notLive := []procInfo{
+		// THE DEADLOCK: a leaked tmux server whose argv carries
+		// `-e FLEET_BIN=...spawn.test` but whose argv[0] is tmux.
+		{Args: "tmux -S /tmp/fleet-test-XX.sock new-session -d -s fleet-abc -e FLEET_BIN=/var/.../go-build/b168/spawn.test sh -c cat"},
+		// A shell child of the leaked server, same story.
+		{Args: "sh -c echo FLEET_BIN=/var/.../spawn.test; cat"},
+		// `go build` / `go vet` are NOT a test run.
+		{Args: "go build ./..."},
+		{Args: "go vet ./internal/gc"},
+		// Unrelated binaries that merely look testy.
+		{Args: "pytest -q tests/"},
+		{Args: "/usr/bin/latest --foo"},
+		{Args: "contest --run"},
+		{Args: "/opt/mytestrunner"},
+		// A process that holds a `.test` path in env but is not a test.
+		{Args: "cat"},
+		// Empty argv (defensive — no panic, not a test).
+		{Args: ""},
 	}
-	re, err := regexp.Compile(dotTest)
+	for _, p := range notLive {
+		if isGoTestProc(p) {
+			t.Errorf("isGoTestProc(%+v) = true; only the real test executable may count — this would pin the gate and silently defeat the reaper", p)
+		}
+	}
+}
+
+// anyGoTestRunning must return false when the ONLY processes referencing
+// `.test` are leaked tmux servers (their executable is tmux) — this is
+// the regression that left `fleet gc --apply --aggressive` reaping 0 of
+// 199 orphans. With the executable-based detector the host is correctly
+// classified quiescent, so the orphan is reapable.
+func TestAnyGoTestRunning_OrphansDoNotPinGate(t *testing.T) {
+	withProcLister(t, []procInfo{
+		{Args: "tmux -S /tmp/fleet-test-XX.sock new-session -d -e FLEET_BIN=/var/.../spawn.test sh -c cat"},
+		{Args: "sh -c cat"},
+		{Args: "cat"},
+	}, nil)
+	if anyGoTestRunning() {
+		t.Fatal("anyGoTestRunning() = true with only leaked tmux orphans present — the gate is still deadlocked; orphans would never be reaped")
+	}
+	if v := goTestOwnerVerdict(); v != 0 {
+		t.Errorf("goTestOwnerVerdict() = %d; want 0 (host is quiescent) so the orphan classifies reapable", v)
+	}
+}
+
+// anyGoTestRunning must return true when a REAL `*.test` / `go test`
+// parent is alive — the in-flight-test spare must survive the fix.
+func TestAnyGoTestRunning_SparesRealTestParent(t *testing.T) {
+	withProcLister(t, []procInfo{
+		{Args: "tmux -S /tmp/fleet-test-XX.sock new-session -d sh -c cat"},
+		{Args: "/var/.../go-build/b168/spawn.test -test.v"},
+	}, nil)
+	if !anyGoTestRunning() {
+		t.Fatal("anyGoTestRunning() = false with a live *.test parent — live in-flight servers would be reaped")
+	}
+	if v := goTestOwnerVerdict(); v != ownerProbeFailedPID {
+		t.Errorf("goTestOwnerVerdict() = %d while a real test runs; want spare sentinel %d", v, ownerProbeFailedPID)
+	}
+}
+
+// Fail-safe: if the process lister errors (cannot read the process
+// table), the host's quiescence is unprovable, so anyGoTestRunning
+// returns true (spare) and the verdict is the unknown sentinel.
+func TestAnyGoTestRunning_ListerErrorSpares(t *testing.T) {
+	withProcLister(t, nil, errors.New("ps exploded"))
+	if !anyGoTestRunning() {
+		t.Fatal("anyGoTestRunning() = false on lister error — must fail safe to spare")
+	}
+	if v := goTestOwnerVerdict(); v != ownerProbeFailedPID {
+		t.Errorf("goTestOwnerVerdict() = %d on probe failure; want spare sentinel %d", v, ownerProbeFailedPID)
+	}
+}
+
+// listFileLessTestTmux must surface a live `tmux -S /tmp/fleet-test-*.sock`
+// daemon whose socket FILE is gone (the file-less orphan that the disk
+// scan cannot see and `tmux -S <path> kill-server` cannot reach) as a
+// LiveTestSocket with ServerPID set — gated by the host quiescence
+// verdict. This is the classifier behind the 399-daemon reap.
+func TestListFileLessTestTmux_SurfacesFileLessDaemon(t *testing.T) {
+	// A socket path that does NOT exist on disk (file-less daemon).
+	goneSock := filepath.Join(t.TempDir(), "fleet-test-gone.sock")
+	// Sanity: the path is genuinely absent.
+	if _, err := os.Stat(goneSock); !os.IsNotExist(err) {
+		t.Fatalf("test setup: %s unexpectedly exists", goneSock)
+	}
+	withProcLister(t, []procInfo{
+		{PID: 4242, Args: "tmux -S " + goneSock + " new-session -d -s fleet-deadbeef sh -c cat"},
+		{PID: 7, Args: "cat"},
+	}, nil)
+
+	got := listFileLessTestTmux(0) // 0 = host quiescent
+	if len(got) != 1 {
+		t.Fatalf("listFileLessTestTmux returned %d entries, want 1: %+v", len(got), got)
+	}
+	if got[0].ServerPID != 4242 {
+		t.Errorf("ServerPID = %d, want 4242 (file-less daemon must be killed by PID)", got[0].ServerPID)
+	}
+	if got[0].SocketPath != goneSock {
+		t.Errorf("SocketPath = %q, want %q", got[0].SocketPath, goneSock)
+	}
+	if got[0].OwnerPID != 0 {
+		t.Errorf("OwnerPID = %d, want 0 (host quiescent → reapable)", got[0].OwnerPID)
+	}
+}
+
+// listFileLessTestTmux must SKIP a daemon whose socket file STILL exists
+// (the disk scan owns that one — returning it here would double-count) and
+// must SKIP non-tmux processes and tmux servers on non-fleet-test sockets.
+func TestListFileLessTestTmux_SkipsFileBoundAndUnrelated(t *testing.T) {
+	// A socket file that DOES exist → owned by the disk scan, skip here.
+	dir := t.TempDir()
+	presentSock := filepath.Join(dir, "fleet-test-present.sock")
+	if err := os.WriteFile(presentSock, []byte{}, 0o600); err != nil {
+		t.Fatalf("seed present sock: %v", err)
+	}
+	withProcLister(t, []procInfo{
+		{PID: 1, Args: "tmux -S " + presentSock + " new-session -d -s fleet-x sh -c cat"},
+		{PID: 2, Args: "tmux -S /tmp/some-operator.sock new-session -d -s work"}, // not fleet-test
+		{PID: 3, Args: "sh -c echo tmux -S /tmp/fleet-test-fake.sock"},           // not a tmux exe
+	}, nil)
+
+	got := listFileLessTestTmux(0)
+	if len(got) != 0 {
+		t.Fatalf("listFileLessTestTmux returned %d entries, want 0 (file-bound + unrelated must be skipped): %+v", len(got), got)
+	}
+}
+
+// reconcileLiveTestSockets must kill a file-less daemon via KillTmuxProc
+// (PID), NOT KillTmuxServer (socket path) — the daemon is unreachable by
+// path. Under --apply --aggressive with a quiescent host (OwnerPID==0).
+func TestReconcile_LiveTestSock_FileLessKilledByPID(t *testing.T) {
+	now := time.Date(2026, 6, 13, 12, 0, 0, 0, time.UTC)
+	deps := withLiveTestSocketStubs(stubDeps(now))
+	var killedPID int
+	pathKillCalled := false
+	deps.ListLiveTestSockets = func() ([]LiveTestSocket, error) {
+		return []LiveTestSocket{{
+			SocketPath: "/tmp/fleet-test-gone.sock",
+			OwnerPID:   0,
+			ServerPID:  9931, // file-less daemon
+		}}, nil
+	}
+	deps.KillTmuxProc = func(pid int) error { killedPID = pid; return nil }
+	deps.KillTmuxServer = func(string) error { pathKillCalled = true; return nil }
+
+	got, err := Reconcile(Options{Apply: true, Aggressive: true, Kinds: []Kind{KindOrphanTmux}}, deps)
 	if err != nil {
-		t.Fatalf("compile needle %q: %v", dotTest, err)
+		t.Fatalf("Reconcile: %v", err)
 	}
+	a, ok := findAction(got, KindOrphanTmux, "/tmp/fleet-test-gone.sock")
+	if !ok || a.Verb != VerbKilled {
+		t.Fatalf("verb = %q (ok=%v), want %q", a.Verb, ok, VerbKilled)
+	}
+	if killedPID != 9931 {
+		t.Errorf("KillTmuxProc called with pid %d, want 9931", killedPID)
+	}
+	if pathKillCalled {
+		t.Error("KillTmuxServer (socket-path kill) ran for a file-less daemon; must kill by PID")
+	}
+}
 
-	mustMatch := []string{
-		"/var/folders/xx/T/go-build123/b001/gc.test -test.paniconexit0 -test.v",
-		"/tmp/go-build/pkg.test -test.run=Foo",
-		"/some/dir/internal.test ", // bare binary + trailing space
-		"/a/b/c.test/d",            // path component .test followed by slash
+// A file-less daemon with KillTmuxProc unwired must surface (not falsely
+// report killed) so the operator sees it needs the seam.
+func TestReconcile_LiveTestSock_FileLessUnwiredSurfaces(t *testing.T) {
+	now := time.Date(2026, 6, 13, 12, 0, 0, 0, time.UTC)
+	deps := withLiveTestSocketStubs(stubDeps(now))
+	deps.ListLiveTestSockets = func() ([]LiveTestSocket, error) {
+		return []LiveTestSocket{{
+			SocketPath: "/tmp/fleet-test-gone.sock",
+			OwnerPID:   0,
+			ServerPID:  9931,
+		}}, nil
 	}
-	for _, argv := range mustMatch {
-		if !re.MatchString(argv) {
-			t.Errorf("needle %q failed to match a real go-test argv %q — the gate would never see a live test (reaper kills in-flight servers)", dotTest, argv)
-		}
-	}
+	deps.KillTmuxProc = nil // seam unwired
 
-	mustNotMatch := []string{
-		"pytest -q tests/",
-		"/usr/bin/latest --foo",
-		"contest --run",
-		"some.testament file", // ".test" followed by 'a', not a boundary
-		"/opt/mytestrunner",
+	got, err := Reconcile(Options{Apply: true, Aggressive: true, Kinds: []Kind{KindOrphanTmux}}, deps)
+	if err != nil {
+		t.Fatalf("Reconcile: %v", err)
 	}
-	for _, argv := range mustNotMatch {
-		if re.MatchString(argv) {
-			t.Errorf("needle %q over-matched argv %q — would pin anyGoTestRunning()==true on unrelated processes and silently defeat the reaper", dotTest, argv)
-		}
+	a, ok := findAction(got, KindOrphanTmux, "/tmp/fleet-test-gone.sock")
+	if !ok {
+		t.Fatalf("expected action for file-less daemon")
+	}
+	if a.Verb == VerbKilled {
+		t.Error("verb=killed reported despite unwired KillTmuxProc seam")
+	}
+	if !strings.Contains(a.Reason, "kill seam unwired") {
+		t.Errorf("reason should flag the unwired seam: %q", a.Reason)
 	}
 }
 
 // goTestOwnerVerdict must report SPARE (the unknown sentinel) whenever a
 // `go test` is alive on the host — and this test IS running under
-// `go test`, so the verdict is deterministically the spare sentinel.
-// This is the production-side proof of the codex iter-1 [P1] fix: the
-// host-wide quiescence gate, not lsof-on-socket, decides reapability.
+// `go test`, so the REAL (un-stubbed) production lister must see this
+// process's own `*.test` executable. This is the production-side proof
+// that the executable-based detector still observes a live test on a
+// real host (vs the stubbed unit tests above).
 func TestGoTestOwnerVerdict_SparesWhileTestRunning(t *testing.T) {
-	if !pgrepCanSeeSelf(t) {
-		t.Skip("pgrep cannot enumerate this process's argv (sandbox); host-wide gate unobservable here")
+	procs, err := psProcLister()
+	if err != nil {
+		t.Skipf("ps unavailable in this sandbox: %v", err)
+	}
+	sawSelf := false
+	for _, p := range procs {
+		if isGoTestProc(p) {
+			sawSelf = true
+			break
+		}
+	}
+	if !sawSelf {
+		t.Skip("ps cannot enumerate this process's *.test executable (sandbox); host-wide gate unobservable here")
 	}
 	if !anyGoTestRunning() {
-		t.Fatal("anyGoTestRunning() = false while running under `go test` — pgrep needle missed the test binary")
+		t.Fatal("anyGoTestRunning() = false while running under `go test` — the executable detector missed the test binary")
 	}
 	if v := goTestOwnerVerdict(); v != ownerProbeFailedPID {
 		t.Errorf("goTestOwnerVerdict() = %d while a go test runs; want spare sentinel %d (a 0 verdict would reap live test servers)", v, ownerProbeFailedPID)
@@ -455,9 +644,9 @@ func TestLiveTestSockets_Integration_ListAndKill(t *testing.T) {
 	// the host is non-quiescent and the production lister must SPARE the
 	// server (never report OwnerPID==0 mid-run). A regression to the old
 	// lsof-on-socket logic would report OwnerPID==0 here and the kill path
-	// would reap a live test server. Only assertable where pgrep can see
-	// this process (skipped in sandboxes that neuter pgrep).
-	if pgrepCanSeeSelf(t) && found.OwnerPID == 0 {
+	// would reap a live test server. Only assertable where `ps` can see
+	// this process's *.test executable (skipped in sandboxes that neuter ps).
+	if psCanSeeSelfTestExe(t) && found.OwnerPID == 0 {
 		t.Errorf("OwnerPID=0 while a go test is running — live-in-flight server would be reaped (lsof-on-socket regression); want spare sentinel %d", ownerProbeFailedPID)
 	}
 

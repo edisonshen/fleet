@@ -28,7 +28,10 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
+	"strconv"
 	"strings"
+	"syscall"
 	"time"
 )
 
@@ -50,41 +53,54 @@ import (
 // cleanup; failing the test suite on a sweep glitch would be worse
 // than letting the CI gate catch leaks at the assertion step).
 //
-// ci-perf-pr1 (P0), codex iter-3 [P1]: Sweep honors FLEET_GC_SCAN_DIR (the
-// SAME env the internal/gc scan seam reads), defaulting to /tmp when unset.
-// Without this, every test package's TestMain (cmd/fleet, internal/spawn,
-// internal/handoffop, internal/tmux, internal/dispatch) probed EVERY leaked
-// /tmp/fleet-test-*.sock with `tmux -S <sock> list-sessions` at suite start —
-// on a dirty runner that is N tmux subprocesses BEFORE any test, the exact
-// hang this PR removes. Pointing the env at an empty decoy (see
-// IsolateSweepDir) makes the sweep a no-op. Production has no FLEET_GC_SCAN_DIR
-// set, so operator-side behavior is unchanged.
+// Sweep reaps stale leaked sockets on the REAL /tmp — it deliberately does
+// NOT read FLEET_GC_SCAN_DIR.
+//
+// ci-perf-pr1 socket-leak P0 (2026-06-13): an earlier rev routed Sweep
+// through FLEET_GC_SCAN_DIR (the SAME env the in-test gc reconcile PROBE
+// reads), so every TestMain's IsolateSweepDir pointed BOTH the probe and the
+// cleanup sweep at an empty decoy — which silently DISABLED the start-of-run
+// safety-net sweep of real /tmp. Interrupted runs (panic/SIGKILL skipping
+// t.Cleanup) then leaked tmux servers forever because nothing re-swept /tmp.
+//
+// The two concerns are now DECOUPLED:
+//   - the gc reconcile PROBE (the in-test grind that walks every
+//     fleet-test-*.sock with `tmux -S <sock> ls`) stays isolated to an empty
+//     decoy via FLEET_GC_SCAN_DIR — that is the dirty-/tmp hang vector;
+//   - this cleanup SWEEP targets real /tmp again so a leaked server from a
+//     prior crashed run is reaped at the next suite start.
+//
+// Real-/tmp sweeping is SAFE despite the parallel `go test ./...` namespace:
+// SweepDir liveness-gates every kill (freshness window + socketLive probe), so
+// a fresh socket owned by a sibling package's live tmux server is spared. On a
+// clean CI runner /tmp holds no fleet-test-*.sock, so the start sweep is a
+// fast no-op.
 func Sweep(maxAge time.Duration) error {
-	return SweepDir(sweepDir(), maxAge)
+	return SweepDir(realTmpDir, maxAge)
 }
 
-// sweepDir resolves the sweep directory from FLEET_GC_SCAN_DIR, defaulting to
-// /tmp. Mirrors internal/gc.gcScanDir so the test sweeper and the production
-// reconcile scan honor the SAME isolation env — one knob isolates both.
-func sweepDir() string {
-	if dir := os.Getenv("FLEET_GC_SCAN_DIR"); dir != "" {
-		return dir
-	}
-	return "/tmp"
-}
+// realTmpDir is the host /tmp — the cleanup sweep target. A package-level
+// const (not FLEET_GC_SCAN_DIR) so the sweep can never be redirected at the
+// probe decoy again (the regression this PR fixes).
+const realTmpDir = "/tmp"
 
 // IsolateSweepDir points FLEET_GC_SCAN_DIR at a fresh empty decoy dir for the
 // whole test binary and returns a cleanup func that restores the prior env and
 // removes the decoy. Call it FIRST in a TestMain so the start/end Sweep calls
-// (and any FLEET_GC_SCAN_DIR-honoring reconcile the package's tests trigger)
 // scan the decoy instead of the host /tmp. There is no *testing.T in TestMain,
 // so this hand-rolls the env save/restore instead of t.Setenv.
 //
+// ci-perf-pr1 socket-leak P0 (2026-06-13): this isolates ONLY the in-test gc
+// reconcile PROBE (the grind that walks every fleet-test-*.sock with
+// `tmux -S <sock> ls`). It NO LONGER redirects testutil.Sweep — Sweep targets
+// real /tmp unconditionally now (see Sweep's doc for why conflating the two
+// disabled the safety-net sweep). The canonical TestMain shape is:
+//
 //	func TestMain(m *testing.M) {
-//	    cleanup := testutil.IsolateSweepDir()
-//	    _ = testutil.Sweep(time.Hour)
+//	    cleanup := testutil.IsolateSweepDir() // isolate the gc PROBE to a decoy
+//	    _ = testutil.Sweep(time.Hour)         // safety-net sweep of REAL /tmp
 //	    code := m.Run()
-//	    _ = testutil.Sweep(time.Hour)
+//	    _ = testutil.ForceReapTestServers()   // force-reap THIS suite's leftovers (gated)
 //	    cleanup()
 //	    os.Exit(code) // cleanup() BEFORE os.Exit — os.Exit skips defers
 //	}
@@ -199,6 +215,166 @@ func socketLive(path string) bool {
 	return true
 }
 
+// ForceReapTestServers is the GATED suite-teardown force-reap. It kills
+// every `fleet-<id>` tmux server this suite left on REAL /tmp —
+// file-BOUND (socket still on disk) AND file-LESS (socket already
+// unlinked, daemon alive) — but ONLY when no OTHER `go test` / `*.test`
+// process is alive anywhere on the host.
+//
+// ci-perf-pr1 socket-leak P0 (2026-06-13): even when a per-test
+// t.Cleanup is skipped on a crash (panic / SIGKILL / ^C), this end-of-run
+// reap kills the leftover servers so they never accumulate. The HOST
+// QUIESCENCE GATE is load-bearing AND it EXCLUDES THIS PROCESS: this
+// function runs from inside a TestMain, so the CURRENT `*.test` binary
+// (and its parent `go test` driver) are still alive — counting them would
+// pin the gate closed forever and the teardown reap would never fire for
+// the suite that created the leak. We exclude self + parent so the gate
+// opens for OUR OWN leftovers while a SIBLING package's still-running
+// `*.test` (under `go test ./...`, parallel) keeps the gate closed and
+// its live servers spared (the SweepAll sibling-kill regression the doc
+// below warns about).
+//
+// Best-effort: a probe failure or a `ps` we cannot read leaves the gate
+// CLOSED (spare) — an ambiguous host is treated as "a test might be
+// running", never reaped.
+func ForceReapTestServers() error {
+	if anyOtherGoTestParentAlive(os.Getpid(), os.Getppid()) {
+		return nil // another test process is alive — spare (fail-safe)
+	}
+	// File-bound: socket file present + bound server → force-kill+unlink.
+	if err := SweepAllDir(realTmpDir); err != nil {
+		return err
+	}
+	// File-less: live `tmux -S /tmp/fleet-test-*.sock` daemons whose socket
+	// file is gone — unreachable by SweepAllDir's path scan; kill by PID.
+	reapFileLessTestTmux()
+	return nil
+}
+
+// procExeBaseFromArgs returns the basename of argv[0] from a full argv
+// string. We classify on argv[0] (the executable), NOT `ps comm` — macOS
+// TRUNCATES comm for long paths (a `go test ./...` binary at
+// `/var/.../go-build.../bNNN/handoffop.test` shows comm as only
+// `/var/folders/69/`, dropping the `.test` suffix), which once made the
+// quiescence gate blind to a live sibling test and force-killed its tmux
+// session mid-run. macOS may also paren-wrap argv[0] for the live process
+// (`(spawn.test)`), so strip surrounding parens.
+func procExeBaseFromArgs(args string) string {
+	fields := strings.Fields(args)
+	if len(fields) == 0 {
+		return ""
+	}
+	exe := fields[0]
+	if i := strings.LastIndexAny(exe, "/\\"); i >= 0 {
+		exe = exe[i+1:]
+	}
+	exe = strings.TrimPrefix(exe, "(")
+	exe = strings.TrimSuffix(exe, ")")
+	return exe
+}
+
+// argvIsGoTest reports whether a full argv is a real go-test PARENT: argv[0]
+// basename ends `.test`, or argv[0] is `go` with a bare `test` subcommand
+// token. Ignores any `.test` mention OUTSIDE argv[0] (a leaked tmux server's
+// `-e FLEET_BIN=...spawn.test` must NOT count).
+func argvIsGoTest(args string) bool {
+	exe := procExeBaseFromArgs(args)
+	if strings.HasSuffix(exe, ".test") {
+		return true
+	}
+	if exe == "go" {
+		fields := strings.Fields(args)
+		for i := 1; i < len(fields); i++ {
+			if fields[i] == "test" {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// anyOtherGoTestParentAlive reports whether a real `go test` driver or
+// compiled `*.test` binary OTHER THAN excludePIDs is alive on the host. It
+// classifies on argv[0] (see procExeBaseFromArgs) — NOT the full argv — so
+// a leaked tmux server whose argv merely carries `-e FLEET_BIN=...spawn.test`
+// does NOT count. (testutil twin of internal/gc.anyGoTestRunning; duplicated
+// rather than imported to keep testutil out of gc's dependency tree —
+// gc → tmux → would cycle if tmux's TestMain imported testutil → gc.)
+// excludePIDs is the caller's own PID + PPID (the current `*.test` + its
+// `go test` driver) so the gate can open for the current suite's OWN
+// teardown. Fail-safe: any inability to read the process table returns true
+// (spare).
+func anyOtherGoTestParentAlive(excludePIDs ...int) bool {
+	excluded := make(map[int]bool, len(excludePIDs))
+	for _, p := range excludePIDs {
+		excluded[p] = true
+	}
+	out, err := exec.Command("ps", "-axo", "pid=,args=").Output()
+	if err != nil {
+		return true // cannot prove quiescence → spare
+	}
+	for _, line := range strings.Split(string(out), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		parts := strings.SplitN(line, " ", 2)
+		pid, perr := strconv.Atoi(parts[0])
+		if perr != nil || len(parts) < 2 {
+			continue
+		}
+		if excluded[pid] {
+			continue // this is our own *.test / go test driver
+		}
+		if argvIsGoTest(strings.TrimSpace(parts[1])) {
+			return true
+		}
+	}
+	return false
+}
+
+// fileLessTestTmuxRe extracts the `-S <path>` socket from a live
+// `tmux -S /tmp/fleet-test-*.sock ...` argv. Anchored to the fleet-test
+// namespace so it never matches the operator's default/custom servers.
+var fileLessTestTmuxRe = regexp.MustCompile(`-S\s+(/[^\s]*/fleet-test-[^\s]*\.sock)`)
+
+// reapFileLessTestTmux SIGTERMs live `tmux -S /tmp/fleet-test-*.sock`
+// daemons whose socket FILE is gone. Caller (ForceReapTestServers) has
+// already confirmed host quiescence, so every such daemon is an orphan.
+// Best-effort: enumeration / kill failures are swallowed (the CI leak
+// gate is the backstop).
+func reapFileLessTestTmux() {
+	out, err := exec.Command("ps", "-axo", "pid=,args=").Output()
+	if err != nil {
+		return
+	}
+	for _, line := range strings.Split(string(out), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		parts := strings.SplitN(line, " ", 2)
+		pid, perr := strconv.Atoi(parts[0])
+		if perr != nil || len(parts) < 2 {
+			continue
+		}
+		rest := strings.TrimSpace(parts[1])
+		if procExeBaseFromArgs(rest) != "tmux" {
+			continue
+		}
+		m := fileLessTestTmuxRe.FindStringSubmatch(rest)
+		if m == nil {
+			continue
+		}
+		if _, statErr := os.Stat(m[1]); statErr == nil {
+			continue // socket file present — SweepAllDir already handled it
+		}
+		if proc, ferr := os.FindProcess(pid); ferr == nil {
+			_ = proc.Signal(syscall.SIGTERM)
+		}
+	}
+}
+
 // SweepAll is the suite-teardown variant of Sweep. Reaps EVERY
 // /tmp/fleet-test-*.sock regardless of freshness AND regardless of
 // whether a tmux server is still bound. Use ONLY from TestMain
@@ -213,14 +389,17 @@ func socketLive(path string) bool {
 // SUITE-START sweep where another concurrent `go test` may legitimately
 // own a fresh live socket; SweepAll is intentionally narrower in scope.
 //
-// NOTE (ci-perf-pr1): unlike Sweep, SweepAll does NOT honor FLEET_GC_SCAN_DIR —
-// it always force-reaps real /tmp. It currently has no callers. Do NOT wire it
-// into a TestMain in place of Sweep: it would (a) bypass the scan-dir isolation
-// this PR added and grind real /tmp, and (b) force-kill live sockets owned by
-// sibling packages still running under `go test ./...`. It exists only for an
-// operator-invoked `fleet gc --force-test-sockets` path.
+// SweepAll force-reaps real /tmp (never FLEET_GC_SCAN_DIR). It is the
+// file-bound half of ForceReapTestServers' teardown reap — and is ONLY
+// safe behind that function's host-quiescence gate. Do NOT call SweepAll
+// directly from a TestMain in place of Sweep: ungated, it would (a) grind
+// real /tmp at suite START where a concurrent `go test ./...` legitimately
+// owns fresh live sockets, and (b) force-kill those sibling-package
+// sockets mid-run. The quiescence gate in ForceReapTestServers is what
+// makes the teardown force-kill safe; the surviving start-of-run safety
+// net is the guarded Sweep.
 func SweepAll() error {
-	return SweepAllDir("/tmp")
+	return SweepAllDir(realTmpDir)
 }
 
 // SweepAllDir is SweepAll with the scan directory injectable for tests.

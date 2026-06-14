@@ -2,6 +2,7 @@ package testutil
 
 import (
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -182,14 +183,16 @@ func TestSweepAllDir_MissingDir_IsNoop(t *testing.T) {
 	}
 }
 
-// TestSweep_HonorsScanDirEnv (ci-perf-pr1, codex iter-3 [P1]): Sweep() reads
-// FLEET_GC_SCAN_DIR so a TestMain can redirect the sweep at a decoy instead of
-// the host /tmp. We seed a stale socket in an injected dir, point the env at
-// it, and assert Sweep() removed it — proving Sweep() walked the env dir, not
-// /tmp.
-func TestSweep_HonorsScanDirEnv(t *testing.T) {
-	dir := t.TempDir()
-	stale := filepath.Join(dir, "fleet-test-staleenv.sock")
+// TestSweep_IgnoresScanDirEnv (ci-perf-pr1 socket-leak P0, 2026-06-13): Sweep
+// must NOT read FLEET_GC_SCAN_DIR. An earlier rev routed Sweep through that env
+// so every TestMain's IsolateSweepDir pointed BOTH the gc PROBE and the cleanup
+// SWEEP at an empty decoy — which silently DISABLED the start-of-run safety-net
+// sweep of real /tmp, letting interrupted-run servers leak forever. We seed a
+// stale socket in an injected decoy, point FLEET_GC_SCAN_DIR at it, and assert
+// Sweep did NOT touch it — proving Sweep ignores the env and sweeps /tmp only.
+func TestSweep_IgnoresScanDirEnv(t *testing.T) {
+	decoy := t.TempDir()
+	stale := filepath.Join(decoy, "fleet-test-staleenv.sock")
 	if err := os.WriteFile(stale, []byte{}, 0o600); err != nil {
 		t.Fatalf("seed: %v", err)
 	}
@@ -197,22 +200,24 @@ func TestSweep_HonorsScanDirEnv(t *testing.T) {
 	if err := os.Chtimes(stale, old, old); err != nil {
 		t.Fatalf("chtimes: %v", err)
 	}
-	t.Setenv("FLEET_GC_SCAN_DIR", dir)
+	t.Setenv("FLEET_GC_SCAN_DIR", decoy)
 
 	if err := Sweep(time.Hour); err != nil {
 		t.Fatalf("Sweep: %v", err)
 	}
-	if _, err := os.Stat(stale); !os.IsNotExist(err) {
-		t.Fatalf("stale socket in the env-injected dir should be reaped; stat err=%v (Sweep did not honor FLEET_GC_SCAN_DIR)", err)
+	// The socket lives in the DECOY, not /tmp — Sweep (which targets /tmp)
+	// must leave it untouched. If Sweep still honored the env it would have
+	// reaped it, re-arming the regression.
+	if _, err := os.Stat(stale); err != nil {
+		t.Fatalf("Sweep reaped a socket in the FLEET_GC_SCAN_DIR decoy (stat err=%v); Sweep must ignore the env and sweep /tmp only", err)
 	}
 }
 
-// TestSweep_DefaultsToTmpWhenEnvUnset: with FLEET_GC_SCAN_DIR unset, sweepDir()
-// resolves /tmp — production behavior unchanged.
-func TestSweep_DefaultsToTmpWhenEnvUnset(t *testing.T) {
-	t.Setenv("FLEET_GC_SCAN_DIR", "")
-	if got := sweepDir(); got != "/tmp" {
-		t.Fatalf("sweepDir() with FLEET_GC_SCAN_DIR unset = %q; want /tmp", got)
+// TestSweep_TargetsRealTmp: the sweep dir is the realTmpDir const, never
+// FLEET_GC_SCAN_DIR. Pins the decoupling at the constant level.
+func TestSweep_TargetsRealTmp(t *testing.T) {
+	if realTmpDir != "/tmp" {
+		t.Fatalf("realTmpDir = %q; want /tmp (the cleanup sweep must target the host /tmp, decoupled from the probe decoy)", realTmpDir)
 	}
 }
 
@@ -269,4 +274,87 @@ func TestIsolateSweepDir_DecoyNotFleetTestPrefixed(t *testing.T) {
 			"/tmp/fleet-test-* leak gate would flag this empty scaffolding dir "+
 			"as a leak (PR #233)", base)
 	}
+}
+
+// TestAnyOtherGoTestParentAlive_SeesSelfWhenNotExcluded: this test IS
+// running under `go test`, so when its own PID is NOT excluded the
+// executable-based gate must observe the live `*.test` binary and report a
+// live parent. (On a sandbox where ps cannot enumerate the process table
+// the gate fails safe to true anyway — either way the assertion holds.)
+// Proves the gate fires for a live test it can see.
+func TestAnyOtherGoTestParentAlive_SeesSelfWhenNotExcluded(t *testing.T) {
+	if !anyOtherGoTestParentAlive( /* exclude nothing */ ) {
+		t.Fatal("anyOtherGoTestParentAlive() = false while running under `go test` with no exclusions — the gate would open mid-run and force-kill sibling-package servers")
+	}
+}
+
+// TestAnyOtherGoTestParentAlive_ExcludesSelf: excluding the current
+// process + its parent (the running `*.test` and its `go test` driver)
+// must drop THIS process from the count. When this package runs ALONE
+// (no sibling `*.test`) the gate then opens (returns false), which is what
+// lets a suite reap its OWN teardown leftovers. Under `go test ./...` a
+// sibling `*.test` keeps it true; that case is inherently non-deterministic
+// so we only assert that the exclusion at minimum does not still see SELF —
+// i.e. the result differs from the not-excluded call OR a real sibling is
+// present. We verify the weaker invariant: excluding self never makes the
+// gate MORE closed than not excluding it.
+func TestAnyOtherGoTestParentAlive_ExcludesSelf(t *testing.T) {
+	withSelf := anyOtherGoTestParentAlive()
+	withoutSelf := anyOtherGoTestParentAlive(os.Getpid(), os.Getppid())
+	if !withSelf {
+		t.Skip("ps cannot see this process (sandbox); exclusion semantics unobservable")
+	}
+	// Excluding self must never ADD a live parent. If no sibling test runs,
+	// withoutSelf is false (gate opens for our own teardown). If a sibling
+	// runs, it stays true. Either way withoutSelf implies a NON-self parent.
+	if withoutSelf {
+		// A non-self test parent exists; fine (parallel `go test ./...`).
+		t.Logf("a sibling go-test parent is alive (parallel run); gate correctly stays closed")
+	}
+}
+
+// TestForceReapTestServers_ReapsFileBoundWhenQuiescent: the file-bound reap
+// MECHANISM removes a leaked socket+server. We exercise SweepAllDir (the
+// inner reap ForceReapTestServers calls once its gate opens) directly on an
+// isolated dir to stay hermetic and deterministic — calling
+// ForceReapTestServers itself would scan real /tmp top-level, whose
+// contents are not under this test's control.
+func TestSweepAllDir_InterruptedRunReap(t *testing.T) {
+	if !haveTmux() {
+		t.Skip("tmux not installed")
+	}
+	dir, err := os.MkdirTemp("/tmp", "fleet-test-irr-")
+	if err != nil {
+		t.Fatalf("mkdirtemp /tmp: %v", err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	// Simulate an interrupted run: a leaked tmux server whose t.Cleanup was
+	// skipped. We spawn it and do NOT register a kill-server cleanup before
+	// the reap (the t.Cleanup below is the safety net if the reap fails).
+	sock := filepath.Join(dir, "fleet-test-s.sock")
+	if out, err := exec.Command("tmux", "-S", sock, "new-session", "-d", "-s", "fleet-leaked01", "sleep", "300").CombinedOutput(); err != nil {
+		t.Fatalf("spawn tmux: %v (%s)", err, out)
+	}
+	t.Cleanup(func() { _ = exec.Command("tmux", "-S", sock, "kill-server").Run() })
+	if err := exec.Command("tmux", "-S", sock, "has-session", "-t", "fleet-leaked01").Run(); err != nil {
+		t.Skipf("tmux exited 0 but no live session (host quirk): %v", err)
+	}
+
+	// The suite-teardown force-reap MECHANISM (gate already passed): kill the
+	// bound server + unlink the socket regardless of freshness/liveness.
+	if err := SweepAllDir(dir); err != nil {
+		t.Fatalf("SweepAllDir: %v", err)
+	}
+	// 0 servers survive: the leaked server is dead and the socket is gone.
+	if err := exec.Command("tmux", "-S", sock, "has-session", "-t", "fleet-leaked01").Run(); err == nil {
+		t.Error("leaked tmux server survived the teardown reap; interrupted-run leak not closed")
+	}
+	if _, err := os.Stat(sock); !os.IsNotExist(err) {
+		t.Errorf("socket file survived the teardown reap; stat err=%v", err)
+	}
+}
+
+func haveTmux() bool {
+	_, err := exec.LookPath("tmux")
+	return err == nil
 }

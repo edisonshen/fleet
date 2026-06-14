@@ -44,7 +44,10 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"regexp"
+	"strconv"
 	"strings"
+	"syscall"
 )
 
 // LiveTestSocket describes one live tmux server bound to a
@@ -77,6 +80,17 @@ type LiveTestSocket struct {
 	SessionName string
 	// OwnerPID classifies ownership; see the type doc for the tri-state.
 	OwnerPID int
+	// ServerPID, when > 0, is the PID of a FILE-LESS orphan tmux daemon:
+	// a live `tmux -S /tmp/fleet-test-*.sock` server whose socket FILE has
+	// already been unlinked (the leak left by an interrupted run whose
+	// t.Cleanup removed the .sock but the kill-server never landed, or a
+	// partial sweep). Such a daemon is UNREACHABLE by socket path
+	// (`tmux -S <gone-path> kill-server` errors "No such file or
+	// directory"), so it must be killed by PID signal. ServerPID == 0
+	// means the server is reachable on SocketPath (the normal disk-scan
+	// case, killed via KillTmuxServer). The 2026-06-13 host had 399 of
+	// these file-less daemons that NO gc path could reap.
+	ServerPID int
 }
 
 // reconcileLiveTestSockets enumerates live test-socket tmux servers and
@@ -112,24 +126,43 @@ func reconcileLiveTestSockets(r *Report, opts Options, deps Deps) error {
 		if target == "" {
 			target = s.SocketPath
 		}
+		// File-less orphan daemon (ServerPID > 0): unreachable by socket
+		// path, so the surface hint + the apply path both go through PID
+		// signal instead of `tmux -S <sock> kill-server`.
+		fileLess := s.ServerPID > 0
+		hint := fmt.Sprintf("tmux -S %s kill-server", s.SocketPath)
+		if fileLess {
+			hint = fmt.Sprintf("kill %d (file-less daemon; socket %s already unlinked)", s.ServerPID, s.SocketPath)
+		}
 		act := Action{
 			Kind:   KindOrphanTmux,
 			Target: target,
 			Verb:   VerbSurface,
-			Reason: fmt.Sprintf("live test-socket tmux server on %s with no live go-test owner; rerun with --apply --aggressive to kill (or `tmux -S %s kill-server`)",
-				s.SocketPath, s.SocketPath),
+			Reason: fmt.Sprintf("live test-socket tmux server on %s with no live go-test owner; rerun with --apply --aggressive to kill (or `%s`)",
+				s.SocketPath, hint),
 		}
 		if opts.Aggressive {
 			act.Verb = VerbWouldKill
 			act.Reason = fmt.Sprintf("live test-socket tmux server on %s with no live go-test owner", s.SocketPath)
 			if opts.Apply {
-				if deps.KillTmuxServer == nil {
+				switch {
+				case fileLess:
+					if deps.KillTmuxProc == nil {
+						act.Reason = "kill seam unwired (set Deps.KillTmuxProc to apply)"
+					} else if kerr := deps.KillTmuxProc(s.ServerPID); kerr != nil {
+						act.Reason = fmt.Sprintf("kill failed: %v", kerr)
+					} else {
+						act.Verb = VerbKilled
+					}
+				case deps.KillTmuxServer == nil:
 					act.Reason = "kill seam unwired (set Deps.KillTmuxServer to apply)"
-				} else if kerr := deps.KillTmuxServer(s.SocketPath); kerr != nil {
-					// Verb stays surface; a kill failure must NOT report killed.
-					act.Reason = fmt.Sprintf("kill failed: %v", kerr)
-				} else {
-					act.Verb = VerbKilled
+				default:
+					if kerr := deps.KillTmuxServer(s.SocketPath); kerr != nil {
+						// Verb stays surface; a kill failure must NOT report killed.
+						act.Reason = fmt.Sprintf("kill failed: %v", kerr)
+					} else {
+						act.Verb = VerbKilled
+					}
 				}
 			}
 		}
@@ -174,6 +207,11 @@ func listLiveTestSocketsOnDisk(dir string) ([]LiveTestSocket, error) {
 			OwnerPID:    ownerVerdict,
 		})
 	}
+	// Plus the file-less orphan daemons (socket file already unlinked,
+	// daemon still alive) — unreachable by the disk scan above. Same
+	// quiescence verdict; killed by PID. This is what reaps the 399
+	// file-less daemons the 2026-06-13 host accumulated.
+	out = append(out, listFileLessTestTmux(ownerVerdict)...)
 	return out, nil
 }
 
@@ -258,67 +296,230 @@ func goTestOwnerVerdict() int {
 // (fail-safe).
 const ownerProbeFailedPID = -1
 
-// anyGoTestRunning reports whether at least one `go test` / test-binary
-// process is alive on the host. It probes pgrep for the canonical test
-// process shapes.
+// anyGoTestRunning reports whether at least one real `go test` driver or
+// compiled `*.test` binary is alive on the host. It classifies on the
+// process EXECUTABLE (argv[0] / `ps comm`), not the full argv.
 //
-// pgrep -f treats the needle as a regex. macOS pgrep is BSD and uses
-// BRE (basic regex): alternation `\|` and groups `(...)` are NOT
-// portable, but `\.` (escaped dot) and `[ /]` (character class) are. The
-// needles below are therefore written in the BRE/ERE common subset
-// (codex iter-2 [P2] flagged the unescaped dot; the first fix used an
-// ERE-only `(...|$)` group that silently matched nothing under BSD
-// pgrep — codex iter-3 caught the test-flakiness, this is the BRE-safe
-// form):
+// WHY EXECUTABLE-ONLY (the 2026-06-13 deadlock fix). The old form ran
+// `pgrep -f '\.test[ /]'`, and `-f` matches the WHOLE argv. A leaked
+// fleet-test tmux server's own argv is, verbatim:
 //
-//   - `go test`   — the driver while compiling + running a package's
-//     tests. The space makes it specific; no metachars to escape.
-//   - `\.test[ /]` — a compiled `pkg.test` binary. go builds these to a
-//     temp dir and execs them as `/tmp/go-build.../pkg.test -test.*`, so
-//     the argv always carries a path component ending in `.test` followed
-//     by a space (the -test.* flags) or a slash. The escaped dot + the
-//     trailing boundary class prevent the old bare `.test` regex from
-//     matching unrelated argv like `pytest`, `latest`, or `contest`
-//     (which would pin anyGoTestRunning()==true forever and silently
-//     defeat the reaper on any host running pytest).
-//   - `compile`/`link`/`vet` toolchain processes are NOT matched: they run
-//     for plain `go build` too, so matching them would spare sockets
-//     during unrelated builds. The two shapes above bracket the entire
-//     window in which a fleet-test socket can legitimately be owned.
+//	tmux -S /tmp/fleet-test-XX.sock new-session -d -s fleet-<id> ... \
+//	     -e FLEET_BIN=/var/.../go-build.../b168/spawn.test ... sh -c ...
 //
-// Fail-safe defaults:
-//   - pgrep exit 1 ("no match") for a needle → that needle found nothing.
-//   - pgrep missing (*exec.Error) → return true (unknown → spare). A host
-//     without pgrep cannot prove quiescence, so we never reap there.
-//   - any other pgrep error → return true (spare).
+// The `...spawn.test ` substring (a path ending `.test` followed by a
+// space) matched the `\.test[ /]` needle — so every orphan tmux server
+// pinned anyGoTestRunning()==true and SPARED ITSELF FOREVER. On the host
+// that left 199 orphan servers that `fleet gc --apply --aggressive`
+// reaped ZERO of, even with no real `go test` anywhere (verified). The
+// gate was deadlocked by the very debris it was meant to reap.
 //
-// goTestPgrepNeedles are the BRE/ERE-common-subset patterns fed to
-// `pgrep -f`. Exposed (package-level) so a unit test can validate the
-// patterns' INTENT against representative argv strings without depending
-// on pgrep's cross-process visibility (which some sandboxes restrict).
-var goTestPgrepNeedles = []string{"go test", `\.test[ /]`}
+// The real test PARENT is distinguishable: its EXECUTABLE is either the
+// compiled binary `pkg.test` (argv[0] basename ends `.test`) or the `go`
+// driver running the `test` subcommand (argv[0] basename == `go` AND a
+// bare `test` token in argv). A leaked tmux server's executable is `tmux`
+// — it only MENTIONS a `.test` path in a later `-e FLEET_BIN=` arg, which
+// no longer counts.
+//
+// WHY argv[0], NOT `ps comm` (the 2026-06-13 sibling-kill fix). macOS
+// `ps -o comm=` TRUNCATES a long path: a `go test ./...` binary lives at
+// `/var/folders/.../go-build.../bNNN/handoffop.test`, and `comm` reports
+// only the leading `/var/folders/69/` — the `.test` suffix is GONE. The
+// gate then failed to see a live sibling test, OPENED, and a peer
+// package's teardown force-reap killed handoffop's live tmux session
+// mid-test (full-suite flake, never reproduced package-alone). The full
+// argv (`ps args=`) carries the COMPLETE argv[0] path, so we derive the
+// executable from argv[0]'s basename and never trust the truncated comm.
+//
+// Fail-safe defaults (unchanged intent): if the process table cannot be
+// read at all, we cannot prove quiescence, so we return true (spare).
 
-func anyGoTestRunning() bool {
-	// pgrep -f matches the regex against the full argv. "-x" is NOT used
-	// because the argv carries package paths / flags after the needle.
-	for _, needle := range goTestPgrepNeedles {
-		out, err := exec.Command("pgrep", "-f", needle).Output()
-		if err != nil {
-			if exitErr, ok := err.(*exec.ExitError); ok && exitErr.ExitCode() == 1 {
-				continue // this needle matched nothing; try the next
-			}
-			// pgrep missing / unexpected failure: cannot prove quiescence.
-			var execErr *exec.Error
-			if errors.As(err, &execErr) {
+// goTestProcLister enumerates live processes as (argv) records. Seam:
+// production uses psProcLister (a `ps` shell-out); the unit test injects a
+// fake table so detection is deterministic without depending on the real
+// process table.
+var goTestProcLister = psProcLister
+
+// procInfo is one live process: Args is the FULL argv (argv[0] is the
+// executable PATH — the reliable classification source, since macOS
+// `ps comm` truncates long paths), PID is the process id (used to kill
+// file-less orphan daemons by signal).
+type procInfo struct {
+	PID  int
+	Args string
+}
+
+// procExeBase returns the basename of argv[0] from a full argv string.
+// macOS `ps` may wrap argv[0] in parens for the live process (e.g.
+// `(spawn.test)`); strip them so the suffix check sees `spawn.test`.
+func procExeBase(args string) string {
+	fields := strings.Fields(args)
+	if len(fields) == 0 {
+		return ""
+	}
+	exe := fields[0]
+	if i := strings.LastIndexAny(exe, "/\\"); i >= 0 {
+		exe = exe[i+1:]
+	}
+	exe = strings.TrimPrefix(exe, "(")
+	exe = strings.TrimSuffix(exe, ")")
+	return exe
+}
+
+// isGoTestProc reports whether p is a real go-test PARENT: a compiled
+// `*.test` binary, or the `go` driver invoking the `test` subcommand.
+// It deliberately ignores any `.test` mention OUTSIDE argv[0]
+// (e.g. a tmux server's `-e FLEET_BIN=...spawn.test`).
+func isGoTestProc(p procInfo) bool {
+	exe := procExeBase(p.Args)
+	if strings.HasSuffix(exe, ".test") {
+		return true // compiled pkg.test binary
+	}
+	if exe == "go" {
+		// `go test ...` — the driver while compiling+running a package.
+		// `go build` / `go vet` etc. must NOT count. The `test` subcommand
+		// is the only place a BARE `test` token appears in a `go` argv:
+		// build/vet/run targets are paths or import paths (`./test`,
+		// `testdata`, `internal/test`), never the standalone word `test`.
+		// Matching the bare token tolerates the rare `go -C <dir> test`
+		// form (where `test` is not argv[1]) without mis-parsing flags.
+		fields := strings.Fields(p.Args)
+		for i := 1; i < len(fields); i++ {
+			if fields[i] == "test" {
 				return true
 			}
-			return true
 		}
-		if strings.TrimSpace(string(out)) != "" {
+	}
+	return false
+}
+
+func anyGoTestRunning() bool {
+	procs, err := goTestProcLister()
+	if err != nil {
+		// Cannot enumerate processes → cannot prove quiescence → spare.
+		return true
+	}
+	for _, p := range procs {
+		if isGoTestProc(p) {
 			return true
 		}
 	}
 	return false
+}
+
+// psProcLister enumerates live processes via `ps -axo pid=,args=`. We do
+// NOT request `comm` — macOS truncates it for long paths (the 2026-06-13
+// sibling-kill bug). `args` carries the COMPLETE argv (argv[0] = the
+// executable path), which is the reliable classification source. The line
+// is `<pid> <argv...>`; pid is the leading numeric token, the rest is argv.
+func psProcLister() ([]procInfo, error) {
+	out, err := exec.Command("ps", "-axo", "pid=,args=").Output()
+	if err != nil {
+		// ps missing or failed: signal the caller to fail-safe (spare).
+		return nil, err
+	}
+	var procs []procInfo
+	for _, line := range strings.Split(string(out), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		// Split into [pid, rest-of-argv]. SplitN keeps argv intact even
+		// though it carries spaces.
+		parts := strings.SplitN(line, " ", 2)
+		pid, perr := strconv.Atoi(parts[0])
+		if perr != nil {
+			continue // malformed line (no leading numeric pid)
+		}
+		args := ""
+		if len(parts) > 1 {
+			args = strings.TrimSpace(parts[1])
+		}
+		procs = append(procs, procInfo{PID: pid, Args: args})
+	}
+	return procs, nil
+}
+
+// orphanTestTmuxSocketRe extracts the `-S <path>` socket from a live
+// `tmux -S /tmp/fleet-test-*.sock ...` argv. Anchored to the fleet-test
+// socket namespace so it never matches the operator's default/custom
+// tmux servers (user-owns-tmux-config).
+var orphanTestTmuxSocketRe = regexp.MustCompile(`-S\s+(/[^\s]*/fleet-test-[^\s]*\.sock)`)
+
+// listFileLessTestTmux finds live `tmux -S /tmp/fleet-test-*.sock` daemons
+// whose socket FILE no longer exists on disk — the file-less orphans that
+// the disk scan (listLiveTestSocketsOnDisk) cannot see and that
+// `tmux -S <path> kill-server` cannot reach. Each becomes a LiveTestSocket
+// with ServerPID set so the reaper kills it by PID signal. ownerVerdict
+// is the shared host-wide quiescence verdict (a running test spares them
+// all, identical to the file-bound path).
+//
+// Only daemons whose socket file is GONE are returned here; a daemon whose
+// .sock still exists is already covered by the disk scan, so returning it
+// here too would double-count. Best-effort: any lister error yields an
+// empty slice (the file-bound path still runs).
+func listFileLessTestTmux(ownerVerdict int) []LiveTestSocket {
+	procs, err := goTestProcLister()
+	if err != nil {
+		return nil
+	}
+	var out []LiveTestSocket
+	for _, p := range procs {
+		if procExeBase(p.Args) != "tmux" {
+			continue
+		}
+		m := orphanTestTmuxSocketRe.FindStringSubmatch(p.Args)
+		if m == nil {
+			continue
+		}
+		sock := m[1]
+		if _, statErr := os.Stat(sock); statErr == nil {
+			continue // socket file still present — the disk scan owns it
+		}
+		out = append(out, LiveTestSocket{
+			SocketPath:  sock,
+			SessionName: "", // file-less: cannot `tmux ls` to read it
+			OwnerPID:    ownerVerdict,
+			ServerPID:   p.PID,
+		})
+	}
+	return out
+}
+
+// killTmuxProcByPID terminates a file-less orphan tmux daemon by PID. It
+// re-verifies the process is a `tmux` bound to a fleet-test-*.sock BEFORE
+// signaling, so a recycled PID (the daemon exited and the OS reassigned
+// its PID to an unrelated process between enumeration and apply) is never
+// killed. SIGTERM first; the daemon has no clients to drain so it exits
+// promptly. A no-longer-existing process collapses to success (already
+// reaped).
+func killTmuxProcByPID(pid int) error {
+	if pid <= 0 {
+		return fmt.Errorf("killTmuxProcByPID: invalid pid %d", pid)
+	}
+	// Re-verify identity: the PID must still be a tmux server on a
+	// fleet-test socket. ps exit-1 (no such pid) → already gone → success.
+	out, err := exec.Command("ps", "-o", "args=", "-p", strconv.Itoa(pid)).Output()
+	if err != nil {
+		return nil // pid gone (or ps failed) — nothing to kill
+	}
+	args := strings.TrimSpace(string(out))
+	if !strings.HasPrefix(args, "tmux ") || orphanTestTmuxSocketRe.FindStringSubmatch(args) == nil {
+		// PID was recycled to a non-fleet-test-tmux process; refuse to kill.
+		return fmt.Errorf("killTmuxProcByPID: pid %d is no longer a fleet-test tmux daemon (recycled); refusing to kill", pid)
+	}
+	proc, ferr := os.FindProcess(pid)
+	if ferr != nil {
+		return nil // not found
+	}
+	if serr := proc.Signal(syscall.SIGTERM); serr != nil {
+		// ESRCH (process gone) is success; anything else is a real error.
+		if errors.Is(serr, os.ErrProcessDone) || errors.Is(serr, syscall.ESRCH) {
+			return nil
+		}
+		return fmt.Errorf("kill %d: %w", pid, serr)
+	}
+	return nil
 }
 
 // killTmuxServerOnDisk runs `tmux -S <sock> kill-server` and best-effort

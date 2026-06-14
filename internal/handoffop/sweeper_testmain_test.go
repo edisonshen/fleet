@@ -14,27 +14,27 @@ import (
 // this sweeper is the belt-and-suspenders layer for the rare panic
 // path that bypasses t.Cleanup.
 //
-// End-of-run uses testutil.Sweep (guarded: freshness window +
-// socketLive probe). The force-mode testutil.SweepAll is deliberately
-// NOT used here: `go test ./...` runs sibling test binaries in
-// parallel (default -p=GOMAXPROCS), all sharing the
-// /tmp/fleet-test-*.sock namespace via tmuxtest.isolatedSocketPath.
-// SweepAll on teardown would force-kill sockets owned by sibling
-// packages whose tests are still running, causing a P0 CI regression
-// (worker branch full-suite parallel run reproduced this:
-// internal/handoffop's SweepAll killed internal/spawn's live tmux
-// session mid-test). SweepAll/SweepAllDir remain in sweeper.go for
-// PR-D's operator-invoked `fleet gc --force-test-sockets` path.
+// ci-perf-pr1 socket-leak P0 (2026-06-13) — the two concerns are DECOUPLED:
 //
-// ci-perf-pr1 (P0): IsolateSweepDir points the sweep at an empty decoy via
-// FLEET_GC_SCAN_DIR so the start/end sweeps don't probe the host's real /tmp
-// with `tmux -S <sock> ls` (the dirty-runner hang). tmuxtest.RequireTmux still
-// reaps this package's own sockets; the decoy sweep is a no-op by design.
+//   - IsolateSweepDir isolates ONLY the in-test gc reconcile PROBE to an
+//     empty decoy via FLEET_GC_SCAN_DIR — the `tmux -S <sock> ls` grind over
+//     every /tmp/fleet-test-*.sock is the dirty-runner hang this PR removes.
+//   - testutil.Sweep at suite START targets REAL /tmp (guarded: freshness
+//     window + socketLive probe) — the safety-net that reaps a leaked server
+//     from a prior crashed run. An earlier rev routed Sweep through the decoy
+//     too, which silently disabled this net and let interrupted-run servers
+//     leak forever.
+//   - testutil.ForceReapTestServers at suite END force-reaps THIS suite's
+//     leftover fleet-<id> servers on real /tmp — file-bound AND file-less —
+//     but ONLY when the host is go-test-quiescent. Under `go test ./...`
+//     sibling packages still own live servers, so the gate spares (no-op)
+//     until the test fleet is idle; that gate (classifying on argv[0], not
+//     the macOS-truncated comm) is what makes the teardown force-kill safe.
 func TestMain(m *testing.M) {
 	cleanup := testutil.IsolateSweepDir()
 	_ = testutil.Sweep(time.Hour)
 	code := m.Run()
-	_ = testutil.Sweep(time.Hour)
+	_ = testutil.ForceReapTestServers()
 	cleanup() // before os.Exit — os.Exit skips defers
 	os.Exit(code)
 }
