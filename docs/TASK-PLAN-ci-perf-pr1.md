@@ -12,7 +12,10 @@ PR #232.
 
 - No unit test probes the host's real `/tmp` (both GC scan callsites isolated).
 - The `cmd/fleet` 10-second pid-resolve cluster drops to ~1s/test.
-- CI carries `-timeout=5m` + `timeout-minutes: 6`.
+- CI carries `-timeout=5m` + `timeout-minutes: 12` (the job cap must exceed
+  setup + build + lint + the 5m test timeout + the `always()` cleanup steps, so
+  the process-level test timeout fires first; ~9 min green run, 12 leaves
+  headroom while still bounding far below the 24-min runaway).
 - Production behavior unchanged (scan still defaults to `/tmp`).
 - Full suite green under `-race`.
 
@@ -22,7 +25,7 @@ PR #232.
 |---|------|----------|
 | 1 | Env-aware GC **scan-dir seam**, wired into **both** `/tmp` callsites | **Critical** |
 | 2 | `cmd/fleet` `TestMain` sets the decoy scan dir **+** `FLEET_PID_RESOLVE_S=1` | **Critical** |
-| 3 | CI `-timeout=5m` + `timeout-minutes: 6` | High |
+| 3 | CI `-timeout=5m` + `timeout-minutes: 12` | High |
 
 ## Dependencies
 

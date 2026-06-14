@@ -32,15 +32,21 @@ import (
 // any isolated test runs. We seed an aged real socket in /tmp, sweep the EMPTY
 // decoy (as TestMain now does), and assert the /tmp socket is never probed.
 func TestTestMainSweep_DecoyDir_DoesNotProbeTmp(t *testing.T) {
-	// A real aged socket sitting DIRECTLY in /tmp — the leaked debris that made
-	// the old Sweep("/tmp") grind. It must live in /tmp itself (not a subdir)
-	// for the regression to bite: SweepDir does a non-recursive ReadDir, so a
+	// A real socket sitting DIRECTLY in /tmp — the leaked debris that made the
+	// old Sweep("/tmp") grind. It must live in /tmp itself (not a subdir) for
+	// the regression to bite: SweepDir does a non-recursive ReadDir, so a
 	// subdir socket would be missed even by a /tmp sweep and prove nothing. We
 	// give it a UNIQUE name (not a fixed path) so a concurrent cmd/fleet run's
 	// fixture can't collide (codex iter-4 [P3]). os.CreateTemp reserves a
 	// unique short /tmp name; we remove the placeholder file, then bind the
 	// socket at that path (net.Listen needs the path absent + short enough for
 	// the macOS socket-path limit, which t.TempDir would blow).
+	//
+	// We do NOT back-date its mtime (claude adversarial F1): a fresh mtime keeps
+	// any leftover (e.g. a -timeout SIGKILL skipping t.Cleanup) VISIBLE to CI's
+	// `find /tmp -name 'fleet-test-*' -newer sentinel` leak gate. The sweep
+	// under test runs on the empty decoy, so the socket's age is irrelevant to
+	// the assertion anyway — aging it would only blind the leak gate.
 	ph, err := os.CreateTemp("/tmp", "fleet-test-sweep-*.sock")
 	if err != nil {
 		t.Fatalf("createtemp /tmp: %v", err)
@@ -50,10 +56,6 @@ func TestTestMainSweep_DecoyDir_DoesNotProbeTmp(t *testing.T) {
 	_ = os.Remove(tmpSock)
 	ln := listenUnix(t, tmpSock)
 	t.Cleanup(func() { _ = ln.Close(); _ = os.Remove(tmpSock) })
-	old := time.Now().Add(-48 * time.Hour)
-	if err := os.Chtimes(tmpSock, old, old); err != nil {
-		t.Fatalf("chtimes: %v", err)
-	}
 
 	decoy := t.TempDir() // empty — exactly what TestMain points the sweep at
 	rec := newFakeTmuxRecorder(t)

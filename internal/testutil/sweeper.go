@@ -92,9 +92,17 @@ func IsolateSweepDir() func() {
 	prev, had := os.LookupEnv("FLEET_GC_SCAN_DIR")
 	decoy, err := os.MkdirTemp("", "fleet-gc-sweep-decoy-")
 	if err != nil {
-		// Best-effort: if we can't make a decoy, leave the env as-is so the
-		// sweep falls back to its prior (possibly /tmp) behavior rather than
-		// panicking a TestMain. Cleanup is then a no-op.
+		// MkdirTemp failed: we can't isolate. Rather than SILENTLY falling back
+		// to the prior (possibly /tmp) behavior — which would re-arm the very
+		// hang this seam prevents with no trace — emit a loud stderr diagnostic
+		// (feedback_surface_dont_silo) so a CI/dev run that suddenly grinds /tmp
+		// has a breadcrumb. We still return rather than panic: a TestMain must
+		// not abort the whole package over a transient tmp failure (claude
+		// adversarial F4).
+		fmt.Fprintf(os.Stderr,
+			"testutil.IsolateSweepDir: WARNING could not create decoy scan dir (%v); "+
+				"FLEET_GC_SCAN_DIR left as-is — the test sweep may scan real /tmp and grind on leaked sockets\n",
+			err)
 		return func() {}
 	}
 	_ = os.Setenv("FLEET_GC_SCAN_DIR", decoy)

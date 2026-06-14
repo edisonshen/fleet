@@ -132,7 +132,7 @@ package (`cmd/fleet`), which both PRs target. The <3 min target is enforced by
 | Fake tmux diverges from real behavior | Parity contract runs fake AND real through the same scenarios; fake fails fast on unsupported calls; real-tmux smoke tests retained |
 | Test cull drops real coverage | Hard coverage gate (no statement-coverage drop) + per-test branch mapping + hard no-delete classes (error/recovery/cleanup paths) |
 | `t.Parallel()` introduces data races | Scope to tests with zero env/cwd/package-global mutation; prove `-race` clean; broad parallelism deferred |
-| `-timeout=5m` wedges instead of failing fast | Confirmed: Go's timeout aborts at process level and kills wedged `tmux` execs; `timeout-minutes: 6` on the job as backstop |
+| `-timeout=5m` wedges instead of failing fast | Confirmed: Go's timeout aborts at process level and kills wedged `tmux` execs; `timeout-minutes: 12` on the job as the outer backstop (must exceed setup+build+lint+5m+cleanup so the process-level timeout fires first) |
 
 ## Appendix — Implementation detail (for engineers)
 
@@ -156,7 +156,10 @@ package (`cmd/fleet`), which both PRs target. The <3 min target is enforced by
   `/tmp` due to the macOS ~104-byte socket-path limit, and reaps it in its own
   cleanup), so no per-test server-reap is added.
 - **`.github/workflows/ci.yml`** — Test step → `go test -race -count=1
-  -timeout=5m ./...`; add `timeout-minutes: 6` under `build-test-lint:`.
+  -timeout=5m ./...`; add `timeout-minutes: 12` under `build-test-lint:` (the
+  cap must exceed setup+build+lint + the 5m test timeout + the `always()`
+  cleanup, so the process-level timeout fires first instead of the job cap
+  killing the run before cleanup).
 
 ### PR-2 exact changes
 

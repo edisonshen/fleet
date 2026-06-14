@@ -46,12 +46,19 @@ func newFakeTmuxRecorder(t *testing.T) *fakeTmuxRecorder {
 	binDir := t.TempDir()
 	logPath := filepath.Join(binDir, "tmux-invocations.log")
 
-	// The script records argv (NUL-free, one line) then, for an `ls`
-	// subcommand, prints a synthetic fleet session so the caller's
-	// live-session gate matches. `fleet-deadbeef` matches fleetAgentIDPattern
+	// The script records argv ONE ARG PER LINE, prefixed by a `=INVOCATION=`
+	// record separator (claude adversarial F3): joining args with "$*" loses
+	// the boundary when a socket path contains whitespace, which would let a
+	// bogus probe path slip past the "all probes under dir" assertion. One arg
+	// per line is faithful (paths can't contain a newline). Then, for an `ls`
+	// subcommand, it prints a synthetic fleet session so the caller's
+	// live-session gate matches; `fleet-deadbeef` matches fleetAgentIDPattern
 	// (lowercase hex id) used by firstFleetSession.
 	script := "#!/bin/sh\n" +
-		"printf '%s\\n' \"$*\" >> " + shellQuote(logPath) + "\n" +
+		"printf '=INVOCATION=\\n' >> " + shellQuote(logPath) + "\n" +
+		"for a in \"$@\"; do\n" +
+		"  printf '%s\\n' \"$a\" >> " + shellQuote(logPath) + "\n" +
+		"done\n" +
 		"for a in \"$@\"; do\n" +
 		"  case \"$a\" in\n" +
 		"    ls|list-sessions) printf 'fleet-deadbeef\\n'; exit 0 ;;\n" +
@@ -67,8 +74,10 @@ func newFakeTmuxRecorder(t *testing.T) *fakeTmuxRecorder {
 	return &fakeTmuxRecorder{t: t, logPath: logPath}
 }
 
-// lines returns every recorded invocation argv line (whitespace-joined argv).
-func (r *fakeTmuxRecorder) lines() []string {
+// invocations returns the recorded `tmux` calls, each as its raw argv slice
+// (one element per arg, whitespace within an arg preserved). The on-disk log
+// is `=INVOCATION=` separators followed by one line per arg.
+func (r *fakeTmuxRecorder) invocations() [][]string {
 	b, err := os.ReadFile(r.logPath)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -76,26 +85,48 @@ func (r *fakeTmuxRecorder) lines() []string {
 		}
 		r.t.Fatalf("read fake-tmux log: %v", err)
 	}
-	var out []string
+	var out [][]string
+	var cur []string
+	started := false
 	for _, ln := range strings.Split(strings.TrimRight(string(b), "\n"), "\n") {
-		if strings.TrimSpace(ln) == "" {
+		if ln == "=INVOCATION=" {
+			if started {
+				out = append(out, cur)
+			}
+			cur = nil
+			started = true
 			continue
 		}
-		out = append(out, ln)
+		if started {
+			cur = append(cur, ln)
+		}
+	}
+	if started {
+		out = append(out, cur)
+	}
+	return out
+}
+
+// lines returns each recorded invocation as a space-joined argv string, for
+// human-readable failure messages.
+func (r *fakeTmuxRecorder) lines() []string {
+	var out []string
+	for _, args := range r.invocations() {
+		out = append(out, strings.Join(args, " "))
 	}
 	return out
 }
 
 // socketProbes returns the socket path argument from every invocation that
 // passed `-S <sock>` (the per-socket probe shape used by firstFleetSession /
-// socketLiveOnDisk). The token immediately after `-S` is the socket path.
+// socketLiveOnDisk). The arg immediately after a `-S` arg is the socket path;
+// because args are recorded one-per-line, a path with spaces stays intact.
 func (r *fakeTmuxRecorder) socketProbes() []string {
 	var out []string
-	for _, ln := range r.lines() {
-		fields := strings.Fields(ln)
-		for i := 0; i < len(fields)-1; i++ {
-			if fields[i] == "-S" {
-				out = append(out, fields[i+1])
+	for _, args := range r.invocations() {
+		for i := 0; i < len(args)-1; i++ {
+			if args[i] == "-S" {
+				out = append(out, args[i+1])
 			}
 		}
 	}
