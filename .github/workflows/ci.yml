@@ -185,60 +185,73 @@ jobs:
         # cannot be killed, the loop ends and the assert below fails loudly.
         if: always()
         run: |
-          # Process reap FIRST, UNCONDITIONALLY (codex PR-2 iter-4 [P2]): a
-          # test can leave a live `tmux: server (/tmp/fleet-test-…)` process
-          # AFTER its socket file was already unlinked — a "file-less" daemon
-          # leak (internal/testutil/sweeper.go documents this exact shape).
-          # Gating the kill behind a file-find would skip it whenever the
-          # socket is gone but the process lingers, leaving a runaway tmux on
-          # self-hosted / reused runners while /tmp looks clean. So kill any
-          # fleet-test tmux process regardless of whether a socket file exists.
+          # SCOPING (codex PR-2 iter-5 [P1]): every kill is scoped to THIS
+          # run's own sockets — files newer than /tmp/fleet-test-ci-sentinel.
+          # A blanket `pkill -f 'tmux.*/tmp/fleet-test-'` would SIGKILL a
+          # CONCURRENT Fleet job's tmux server on a shared / reused runner
+          # (sibling matrix job, another user). We kill ONLY the tmux process
+          # bound to a socket path THIS run created, so a sibling job's
+          # `/tmp/fleet-test-<other>.sock` is never touched. GitHub-hosted
+          # runners are ephemeral (one job each), but this stays correct on
+          # self-hosted / reused runners too.
           #
-          # Match ANY tmux process referencing a fleet-test socket: the Linux
-          # server proctitle `tmux: server (/tmp/fleet-test-…)` AND any client
-          # `tmux -S /tmp/fleet-test-…`. SIGKILL directly — no graceful TERM
-          # whose shutdown path re-creates the socket.
-          pat='tmux.*/tmp/fleet-test-'
-          pkill -KILL -f "$pat" 2>/dev/null || true
-          # Wait until NO fleet-test tmux process remains (bounded ~10s).
+          # For each such socket we SIGKILL the bound server directly (a -9'd
+          # process runs no shutdown code, so it cannot re-touch the socket —
+          # the Linux re-create race), wait for it to exit, settle, then rm.
+          # Match the server proctitle `tmux: server (<sock>)` AND a client
+          # `tmux -S <sock>`, anchored on the literal socket path.
+          reap_round() {
+            find /tmp -maxdepth 1 -name 'fleet-test-*' \
+              -newer /tmp/fleet-test-ci-sentinel \
+              ! -name 'fleet-test-ci-sentinel' 2>/dev/null || true
+          }
+          leaked=$(reap_round)
+          if [ -z "$leaked" ]; then
+            echo "no /tmp/fleet-test-* cleanup needed"
+            exit 0
+          fi
+          echo "reaping /tmp/fleet-test-* artifacts from this CI run:"
+          echo "$leaked"
+          # Kill the tmux process bound to EACH of this run's sockets, scoped
+          # by the literal socket path so sibling jobs are untouched.
+          for art in $leaked; do
+            # Derive the socket path: a `<sock>.sock.lock` companion maps back
+            # to its `<sock>`; a bare socket/dir is used as-is.
+            sock="${art%.lock}"
+            pkill -KILL -f "tmux.*${sock}" 2>/dev/null || true
+          done
+          # Wait until none of THIS run's sockets has a bound tmux process
+          # (bounded ~10s). Re-kill each round in case one raced startup.
           for _ in $(seq 1 100); do
-            pgrep -f "$pat" >/dev/null 2>&1 || break
-            pkill -KILL -f "$pat" 2>/dev/null || true
+            still=""
+            for art in $(reap_round); do
+              sock="${art%.lock}"
+              if pgrep -f "tmux.*${sock}" >/dev/null 2>&1; then
+                still=1
+                pkill -KILL -f "tmux.*${sock}" 2>/dev/null || true
+              fi
+            done
+            [ -z "$still" ] && break
             sleep 0.1
           done
           # Settle: let the kernel finish unlinking sockets of the killed
           # processes before we sweep, so our rm is not racing a teardown.
           sleep 1
-          # Now sweep leftover FILES. Match the SAME glob the assert below uses
-          # (`fleet-test-*`, NOT just `*.sock`): tmux 3.x writes a companion
-          # LOCK file `<socket>.sock.lock` next to each socket, and a SIGKILL'd
-          # server leaves the lock behind. The old `*.sock`-only sweep missed
-          # those `.sock.lock` files, so 22 of them tripped the assert in run
-          # 27515608918 even after every socket was reaped. Exclude the
-          # sentinel file itself.
-          leaked=$(find /tmp -maxdepth 1 -name 'fleet-test-*' \
-            -newer /tmp/fleet-test-ci-sentinel \
-            ! -name 'fleet-test-ci-sentinel' 2>/dev/null || true)
-          if [ -z "$leaked" ]; then
-            echo "no /tmp/fleet-test-* file cleanup needed (processes reaped above)"
-            exit 0
-          fi
-          echo "reaping /tmp/fleet-test-* files from this CI run:"
-          echo "$leaked"
-          # Sweep: unlink remaining sockets AND their .sock.lock companions;
-          # re-scan + re-rm a few times in case a straggler inode lingers.
+          # Sweep leftover FILES from THIS run. Match the SAME glob the assert
+          # below uses (`fleet-test-*`, NOT just `*.sock`): tmux 3.x writes a
+          # companion LOCK file `<socket>.sock.lock` and a SIGKILL'd server
+          # leaves it behind — the `*.sock`-only sweep missed those and 22 of
+          # them tripped the assert in run 27515608918.
           for _ in $(seq 1 10); do
-            remaining=$(find /tmp -maxdepth 1 -name 'fleet-test-*' \
-              -newer /tmp/fleet-test-ci-sentinel \
-              ! -name 'fleet-test-ci-sentinel' 2>/dev/null || true)
+            remaining=$(reap_round)
             [ -z "$remaining" ] && break
             # rm -rf, NOT rm -f (codex PR-2 iter-3 [P2]): a crashed/timed-out
             # test can leave a top-level DIRECTORY (e.g. os.MkdirTemp("/tmp",
             # "fleet-test-fgc-")) under the same fleet-test-* glob the assert
             # below matches. `rm -f` is a no-op on a non-empty directory, so
             # the leftover dir would survive the reap and still red the assert.
-            for sock in $remaining; do
-              rm -rf "$sock" || true
+            for art in $remaining; do
+              rm -rf "$art" || true
             done
             sleep 0.2
           done
