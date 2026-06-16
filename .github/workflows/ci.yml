@@ -205,6 +205,20 @@ jobs:
               -newer /tmp/fleet-test-ci-sentinel \
               ! -name 'fleet-test-ci-sentinel' 2>/dev/null || true
           }
+          # sock_path maps an artifact to the socket path to scope the kill on,
+          # or empty if the artifact is too short to scope safely (/review P3):
+          # `find -name 'fleet-test-*'` can in theory return a bare
+          # `/tmp/fleet-test-` (POSIX fnmatch lets `*` match the empty string).
+          # A bare prefix would make `tmux.*${sock}` match a SIBLING job's
+          # `/tmp/fleet-test-<other>.sock`, reopening the iter-5 P1. Requiring a
+          # non-empty suffix after the prefix keeps every kill scoped.
+          sock_path() {
+            s="${1%.lock}"           # `<sock>.sock.lock` → `<sock>.sock`
+            case "$s" in
+              /tmp/fleet-test-?*) printf '%s' "$s" ;;  # has a suffix → scoped
+              *) printf '' ;;                          # bare prefix → skip
+            esac
+          }
           leaked=$(reap_round)
           if [ -z "$leaked" ]; then
             echo "no /tmp/fleet-test-* cleanup needed"
@@ -215,9 +229,8 @@ jobs:
           # Kill the tmux process bound to EACH of this run's sockets, scoped
           # by the literal socket path so sibling jobs are untouched.
           for art in $leaked; do
-            # Derive the socket path: a `<sock>.sock.lock` companion maps back
-            # to its `<sock>`; a bare socket/dir is used as-is.
-            sock="${art%.lock}"
+            sock=$(sock_path "$art")
+            [ -n "$sock" ] || continue
             pkill -KILL -f "tmux.*${sock}" 2>/dev/null || true
           done
           # Wait until none of THIS run's sockets has a bound tmux process
@@ -225,7 +238,8 @@ jobs:
           for _ in $(seq 1 100); do
             still=""
             for art in $(reap_round); do
-              sock="${art%.lock}"
+              sock=$(sock_path "$art")
+              [ -n "$sock" ] || continue
               if pgrep -f "tmux.*${sock}" >/dev/null 2>&1; then
                 still=1
                 pkill -KILL -f "tmux.*${sock}" 2>/dev/null || true
