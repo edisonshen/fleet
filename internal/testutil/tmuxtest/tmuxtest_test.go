@@ -265,7 +265,9 @@ func TestServerAlive_TrueWhileProcessBound_ProbeFails(t *testing.T) {
 	}
 	cmd := &exec.Cmd{
 		Path: bin,
-		Args: []string{"tmuxtest-bound-holder (" + sock + ")", "30"},
+		// Mimic a real tmux server proctitle so the `tmux.*<sock>` pattern
+		// in tmuxProcessBound matches the way it would for a real server.
+		Args: []string{"tmux: server (" + sock + ")", "30"},
 	}
 	if err := cmd.Start(); err != nil {
 		t.Fatalf("start bound-process stub: %v", err)

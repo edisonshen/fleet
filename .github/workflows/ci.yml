@@ -223,8 +223,13 @@ jobs:
               -newer /tmp/fleet-test-ci-sentinel \
               ! -name 'fleet-test-ci-sentinel' 2>/dev/null || true)
             [ -z "$remaining" ] && break
+            # rm -rf, NOT rm -f (codex PR-2 iter-3 [P2]): a crashed/timed-out
+            # test can leave a top-level DIRECTORY (e.g. os.MkdirTemp("/tmp",
+            # "fleet-test-fgc-")) under the same fleet-test-* glob the assert
+            # below matches. `rm -f` is a no-op on a non-empty directory, so
+            # the leftover dir would survive the reap and still red the assert.
             for sock in $remaining; do
-              rm -f "$sock" || true
+              rm -rf "$sock" || true
             done
             sleep 0.2
           done

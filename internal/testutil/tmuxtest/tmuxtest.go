@@ -23,6 +23,7 @@ package tmuxtest
 
 import (
 	"bytes"
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"fmt"
@@ -252,20 +253,33 @@ func serverAlive(sock string) bool {
 // This catches the shutdown window where the control probe already fails but
 // the process has not exited and can still re-touch the socket inode.
 //
-// Best-effort: a missing pgrep or any pgrep error returns false so the
-// caller's bounded loop never hangs on a tooling gap. pgrep exits 1 when
-// there is no match (the common, healthy case) — we treat only a clean exit
-// with non-empty output as "still bound".
+// The pattern requires BOTH `tmux` AND the literal socket path in the argv
+// (/review P2): matching the socket path alone would treat ANY process whose
+// argv merely mentions the path (a shell, a logger, a sibling test's helper)
+// as a live tmux server, spinning killServerAndRemove's bounded loop to its
+// budget and falsely reporting a leak. Requiring `tmux` narrows the match to
+// actual tmux server/client processes, which is the only thing that can
+// re-create the socket inode.
+//
+// Best-effort with a short timeout (/review P3): a missing pgrep, any pgrep
+// error, or a hung pgrep returns false so the caller's bounded loop never
+// hangs on a tooling gap. pgrep exits 1 when there is no match (the common,
+// healthy case) — we treat only a clean exit with non-empty output as
+// "still bound".
 func tmuxProcessBound(sock string) bool {
 	if _, err := exec.LookPath("pgrep"); err != nil {
 		return false
 	}
-	// Anchor the match on the literal socket path so we don't match an
-	// unrelated tmux server. The path is a regex to pgrep -f; quote the
-	// metacharacters that appear in our `/tmp/fleet-test-<hex>.sock` names.
-	out, err := exec.Command("pgrep", "-f", regexp.QuoteMeta(sock)).Output()
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	// regexp.QuoteMeta the path (a regex to pgrep -f); `.*` between `tmux`
+	// and the path matches both the server proctitle `tmux: server (<sock>)`
+	// and a client `tmux -S <sock>`.
+	pat := `tmux.*` + regexp.QuoteMeta(sock)
+	out, err := exec.CommandContext(ctx, "pgrep", "-f", pat).Output()
 	if err != nil {
-		// Exit 1 (no match) or any pgrep failure → not bound (or unknown).
+		// Exit 1 (no match), timeout, or any pgrep failure → not bound
+		// (or unknown). Either way the caller falls through safely.
 		return false
 	}
 	return len(bytes.TrimSpace(out)) > 0
