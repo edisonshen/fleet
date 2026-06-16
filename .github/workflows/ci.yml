@@ -185,22 +185,15 @@ jobs:
         # cannot be killed, the loop ends and the assert below fails loudly.
         if: always()
         run: |
-          # Match the SAME glob the assert below uses (`fleet-test-*`, NOT
-          # just `*.sock`): tmux 3.x writes a companion LOCK file
-          # `<socket>.sock.lock` next to each socket, and a SIGKILL'd server
-          # leaves the lock behind. The old `*.sock`-only sweep missed those
-          # `.sock.lock` files, so 22 of them tripped the assert in run
-          # 27515608918 even after every socket was reaped. Exclude the
-          # sentinel file itself.
-          leaked=$(find /tmp -maxdepth 1 -name 'fleet-test-*' \
-            -newer /tmp/fleet-test-ci-sentinel \
-            ! -name 'fleet-test-ci-sentinel' 2>/dev/null || true)
-          if [ -z "$leaked" ]; then
-            echo "no /tmp/fleet-test-* cleanup needed"
-            exit 0
-          fi
-          echo "reaping /tmp/fleet-test-* files from this CI run:"
-          echo "$leaked"
+          # Process reap FIRST, UNCONDITIONALLY (codex PR-2 iter-4 [P2]): a
+          # test can leave a live `tmux: server (/tmp/fleet-test-…)` process
+          # AFTER its socket file was already unlinked — a "file-less" daemon
+          # leak (internal/testutil/sweeper.go documents this exact shape).
+          # Gating the kill behind a file-find would skip it whenever the
+          # socket is gone but the process lingers, leaving a runaway tmux on
+          # self-hosted / reused runners while /tmp looks clean. So kill any
+          # fleet-test tmux process regardless of whether a socket file exists.
+          #
           # Match ANY tmux process referencing a fleet-test socket: the Linux
           # server proctitle `tmux: server (/tmp/fleet-test-…)` AND any client
           # `tmux -S /tmp/fleet-test-…`. SIGKILL directly — no graceful TERM
@@ -216,6 +209,22 @@ jobs:
           # Settle: let the kernel finish unlinking sockets of the killed
           # processes before we sweep, so our rm is not racing a teardown.
           sleep 1
+          # Now sweep leftover FILES. Match the SAME glob the assert below uses
+          # (`fleet-test-*`, NOT just `*.sock`): tmux 3.x writes a companion
+          # LOCK file `<socket>.sock.lock` next to each socket, and a SIGKILL'd
+          # server leaves the lock behind. The old `*.sock`-only sweep missed
+          # those `.sock.lock` files, so 22 of them tripped the assert in run
+          # 27515608918 even after every socket was reaped. Exclude the
+          # sentinel file itself.
+          leaked=$(find /tmp -maxdepth 1 -name 'fleet-test-*' \
+            -newer /tmp/fleet-test-ci-sentinel \
+            ! -name 'fleet-test-ci-sentinel' 2>/dev/null || true)
+          if [ -z "$leaked" ]; then
+            echo "no /tmp/fleet-test-* file cleanup needed (processes reaped above)"
+            exit 0
+          fi
+          echo "reaping /tmp/fleet-test-* files from this CI run:"
+          echo "$leaked"
           # Sweep: unlink remaining sockets AND their .sock.lock companions;
           # re-scan + re-rm a few times in case a straggler inode lingers.
           for _ in $(seq 1 10); do

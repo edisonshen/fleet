@@ -5,6 +5,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -251,33 +252,38 @@ func TestServerAlive_TrueWhileProcessBound_ProbeFails(t *testing.T) {
 	}
 	// Unique socket path that is NOT bound to any tmux server, so the
 	// list-sessions probe inside serverAlive fails. The path appears in the
-	// helper process's argv so the pgrep -f process-bound check matches.
+	// helper process's REAL command line so the pgrep -f process-bound check
+	// matches.
 	sock := isolatedSocketPath(t)
 
-	// Spawn `sleep 30` but rewrite argv[0] to embed the socket path, the way
-	// a real tmux server's proctitle reads `tmux: server (<sock>)`. pgrep -f
-	// matches the full argv, so the path is visible there while the process
-	// lives. (A trailing `sleep` arg is rejected by macOS sleep, hence the
-	// argv[0] rewrite instead of an extra positional arg.)
-	bin, lookErr := exec.LookPath("sleep")
+	// Spawn `sh -c '<body>'` where the body string mimics a real tmux server
+	// proctitle (`tmux: server (<sock>)`) and then blocks. The pattern lives
+	// in the `-c` argument — a genuine argv element — so pgrep -f sees it on
+	// Linux AND Darwin/BSD. (codex PR-2 iter-4 [P2]: an Args[0]/proctitle
+	// rewrite is not reliably reflected in the BSD process table, so this
+	// uses a real command-line arg instead.)
+	bin, lookErr := exec.LookPath("sh")
 	if lookErr != nil {
-		t.Skip("sleep not installed")
+		t.Skip("sh not installed")
 	}
-	cmd := &exec.Cmd{
-		Path: bin,
-		// Mimic a real tmux server proctitle so the `tmux.*<sock>` pattern
-		// in tmuxProcessBound matches the way it would for a real server.
-		Args: []string{"tmux: server (" + sock + ")", "30"},
-	}
+	body := ": 'tmux: server (" + sock + ")'; while :; do sleep 1; done"
+	cmd := exec.Command(bin, "-c", body)
+	// New process group so we can reap the sh AND its `sleep` child together;
+	// killing only the sh would orphan the inner sleep (a leaked process).
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	if err := cmd.Start(); err != nil {
 		t.Fatalf("start bound-process stub: %v", err)
+	}
+	pgid := cmd.Process.Pid // child is its own group leader (Setpgid)
+	reap := func() {
+		_ = syscall.Kill(-pgid, syscall.SIGKILL) // whole group
+		_ = cmd.Wait()
 	}
 	killed := false
 	t.Cleanup(func() {
 		if !killed {
-			_ = cmd.Process.Kill()
+			reap()
 		}
-		_ = cmd.Wait()
 	})
 
 	// Wait until pgrep can see it (process table is async).
@@ -298,12 +304,9 @@ func TestServerAlive_TrueWhileProcessBound_ProbeFails(t *testing.T) {
 		t.Errorf("serverAlive(%s) = false while a process is bound; want true (probe-failure must NOT be treated as death)", sock)
 	}
 
-	// Kill the helper and wait for it to leave the table; serverAlive must
-	// then flip to false (nothing can re-create the inode).
-	if err := cmd.Process.Kill(); err != nil {
-		t.Fatalf("kill bound-process stub: %v", err)
-	}
-	_ = cmd.Wait()
+	// Kill the helper group and wait for it to leave the table; serverAlive
+	// must then flip to false (nothing can re-create the inode).
+	reap()
 	killed = true
 	gone := false
 	for i := 0; i < 100; i++ {
