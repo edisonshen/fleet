@@ -256,7 +256,22 @@ func alreadyCoordRunWrapped(argv []string) bool {
 		strings.Contains(strings.ToLower(filepath.Base(argv[0])), "fleet")
 }
 
+// standbyTimeoutOrDefault resolves the bound passed to `coord-run --standby`.
+//
+// FLEET_STANDBY_TIMEOUT is a TEST-ONLY seam (mirrors FLEET_PID_RESOLVE_S):
+// when set to a valid >0 duration it wins UNCONDITIONALLY, overriding even an
+// explicit caller-supplied d. This is required because the non-Spawn entry
+// points (runHandoff/runDispatch/Resume/GracefulHandoff) pass an explicit
+// StandbyTimeout: DefaultStandbyTimeout, so a d<=0-gated read could never reach
+// them. The integration test lane sets "3s" so an orphaned standby self-reaps
+// in seconds instead of looping for 10m and fork-bombing the box. Production
+// leaves it unset → pure no-op (the default stays DefaultStandbyTimeout).
 func standbyTimeoutOrDefault(d time.Duration) time.Duration {
+	if raw := strings.TrimSpace(os.Getenv("FLEET_STANDBY_TIMEOUT")); raw != "" {
+		if env, err := time.ParseDuration(raw); err == nil && env > 0 {
+			return env
+		}
+	}
 	if d <= 0 {
 		return DefaultStandbyTimeout
 	}
@@ -1058,6 +1073,12 @@ func Spawn(opts Options) (*agent.Record, error) {
 			}
 		}
 		return nil, err
+	}
+	if leaseWrapped {
+		// Authoritative fork-bomb gate (test-only read): a real standby pane is
+		// now live. Non-integration TestMains assert this stays zero, catching a
+		// standby-spawning test left in the default lane. No-op in production.
+		recordStandbyLaunch()
 	}
 	// Best-effort: pin a "Ctrl-b d to detach" hint into this session's
 	// status bar so operators see it persistently while attached.
