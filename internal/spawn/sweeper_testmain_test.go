@@ -33,10 +33,23 @@ import (
 //     until the test fleet is idle; that gate (classifying on argv[0], not
 //     the macOS-truncated comm) is what makes the teardown force-kill safe.
 func TestMain(m *testing.M) {
+	// Fork-bomb guard (PR-A): force lease-failover OFF for the whole default
+	// test lane. internal/spawn has no helper that opts out, so failover is
+	// default-ON here — every coord-spawn test would lease-wrap into a
+	// `coord-run --standby` tmux pane (10m loop) as a side effect. Forcing =0
+	// neutralizes those side-effect spawns; the genuine lease-wrap-asserting
+	// tests opt back in with t.Setenv("FLEET_LEASE_FAILOVER","1") in the
+	// integration lane. See docs/DESIGN-spawn-test-fork-bomb-root-fix.md.
+	if err := os.Setenv("FLEET_LEASE_FAILOVER", "0"); err != nil {
+		panic("TestMain: os.Setenv FLEET_LEASE_FAILOVER failed: " + err.Error())
+	}
 	cleanup := testutil.IsolateSweepDir()
 	_ = testutil.Sweep(time.Hour)
 	code := m.Run()
 	_ = testutil.ForceReapTestServers()
 	cleanup() // before os.Exit — os.Exit skips defers
-	os.Exit(code)
+	// LAST step: authoritative zero-standby-launch gate. Replaces os.Exit(code)
+	// so the reap above still runs; exits nonzero if a standby-spawning test was
+	// left in the default lane (no-op under //go:build integration).
+	assertNoStandbyLaunches(code)
 }

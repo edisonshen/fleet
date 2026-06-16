@@ -802,9 +802,13 @@ func TestSpawn_RuntimeEnvPropagated(t *testing.T) {
 	t.Setenv("FLEET_POST_READY_BUFFER_MS", "1234")
 	t.Setenv("FLEET_POST_SEND_VERIFY_MS", "456")
 	t.Setenv("FLEET_POST_SEND_RETRY_MS", "789")
+	// PR-A: FLEET_STANDBY_TIMEOUT must propagate into the pane so a nested coord
+	// spawn from inside it (drain/handoff) inherits the short test timeout
+	// instead of falling back to 10m (codex iter-3 [P1]).
+	t.Setenv("FLEET_STANDBY_TIMEOUT", "3s")
 
 	cmd := []string{"sh", "-c",
-		"echo FH=$FLEET_HOME TMS=$FLEET_TMUX_SOCKET STABLE=$FLEET_INITIAL_PROMPT_STABLE_MS MAX=$FLEET_INITIAL_PROMPT_MAX_MS DELAY=$FLEET_PROMPT_ENTER_DELAY_MS BUF=$FLEET_POST_READY_BUFFER_MS VER=$FLEET_POST_SEND_VERIFY_MS RTY=$FLEET_POST_SEND_RETRY_MS; cat"}
+		"echo FH=$FLEET_HOME TMS=$FLEET_TMUX_SOCKET STABLE=$FLEET_INITIAL_PROMPT_STABLE_MS MAX=$FLEET_INITIAL_PROMPT_MAX_MS DELAY=$FLEET_PROMPT_ENTER_DELAY_MS BUF=$FLEET_POST_READY_BUFFER_MS VER=$FLEET_POST_SEND_VERIFY_MS RTY=$FLEET_POST_SEND_RETRY_MS SBT=$FLEET_STANDBY_TIMEOUT; cat"}
 	rec, err := Spawn(Options{
 		TaskID:  "x",
 		Project: "y",
@@ -818,7 +822,7 @@ func TestSpawn_RuntimeEnvPropagated(t *testing.T) {
 	// Each marker is short enough to fit on a single tmux pane line.
 	wants := []string{
 		"STABLE=777", "MAX=8888", "DELAY=99",
-		"BUF=1234", "VER=456", "RTY=789",
+		"BUF=1234", "VER=456", "RTY=789", "SBT=3s",
 		"TMS=" + os.Getenv("FLEET_TMUX_SOCKET"),
 	}
 	if got := os.Getenv("FLEET_HOME"); got != "" {

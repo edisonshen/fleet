@@ -1,5 +1,12 @@
-//go:build linux || darwin
+//go:build integration && (linux || darwin)
 
+// PR-A fork-bomb fence: this whole file launches REAL `fleet coord-run`
+// supervisor SUBPROCESSES (build a binary, exec it), so it lives in the
+// integration lane and is excluded from the default `go test ./...` gate.
+// Each subprocess sets FLEET_STANDBY_TIMEOUT=3s so any lease-wrapped standby it
+// (or a child it spawns) starts self-reaps in seconds rather than looping 10m.
+// See docs/DESIGN-spawn-test-fork-bomb-root-fix.md.
+//
 // W11 — cross-boundary integration: a REAL `fleet coord-run` supervisor
 // holds + releases a REAL coordinator.flock for its child's lifetime.
 // This crosses the dispatch -> coord-run -> coordlock -> kernel-flock
@@ -67,6 +74,7 @@ func TestCoordRun_Lease_Integration_RealFlockHeldThenReleased(t *testing.T) {
 	cmd.Env = append(os.Environ(),
 		"FLEET_HOME="+fleetHome,
 		"FLEET_LEASE_FAILOVER=1",
+		"FLEET_STANDBY_TIMEOUT=3s", // PR-A: bound any standby to seconds, not 10m
 	)
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	if err := cmd.Start(); err != nil {
@@ -234,7 +242,8 @@ func TestCoordRun_Lease_Integration_StandDownArchivesRecord(t *testing.T) {
 	sentinel := filepath.Join(t.TempDir(), "child-ran")
 	cmd := exec.Command(bin, "coord-run", "--agent", agentID, "--project", project,
 		"--", "sh", "-c", "touch "+sentinel)
-	cmd.Env = append(os.Environ(), "FLEET_HOME="+fleetHome, "FLEET_LEASE_FAILOVER=1")
+	cmd.Env = append(os.Environ(), "FLEET_HOME="+fleetHome, "FLEET_LEASE_FAILOVER=1",
+		"FLEET_STANDBY_TIMEOUT=3s") // PR-A: bound any standby to seconds, not 10m
 	out, runErr := cmd.CombinedOutput()
 	if runErr != nil {
 		t.Fatalf("coord-run stand-down should exit 0, got %v\noutput:\n%s", runErr, out)

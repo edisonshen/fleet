@@ -527,6 +527,13 @@ func TestGracefulHandoff_PrepareOnly_NoCompletionSeams_StopsAtBarrier(t *testing
 // ---------------------------------------------------------------------------
 
 func TestGracefulSwapEligible(t *testing.T) {
+	// GracefulSwapEligible gates on leaseFailoverEnabled(). PR-A's TestMain now
+	// forces FLEET_LEASE_FAILOVER=0 package-wide (fork-bomb guard), so pin =1
+	// here to exercise the failover-ON eligibility logic. This test stubs the
+	// owner lookup and never spawns — the guard's =0 default only matters for
+	// tests that would lease-wrap a coord into a standby, which this is not.
+	// The "failover off -> not eligible" sub-case sets =0 itself, overriding this.
+	t.Setenv("FLEET_LEASE_FAILOVER", "1")
 	old := oldRecForGraceful()
 	swapOwner := func(t *testing.T, fn func(string) (coordlock.Owner, bool)) {
 		t.Helper()
