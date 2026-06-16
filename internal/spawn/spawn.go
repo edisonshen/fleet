@@ -21,7 +21,6 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
-	"testing"
 	"time"
 
 	"github.com/edisonshen/fleet/internal/agent"
@@ -259,24 +258,30 @@ func alreadyCoordRunWrapped(argv []string) bool {
 
 // standbyTimeoutOrDefault resolves the bound passed to `coord-run --standby`.
 //
-// FLEET_STANDBY_TIMEOUT is a TEST-ONLY seam (mirrors FLEET_PID_RESOLVE_S):
-// when set to a valid >0 duration it wins UNCONDITIONALLY, overriding even an
-// explicit caller-supplied d. This is required because the non-Spawn entry
-// points (runHandoff/runDispatch/Resume/GracefulHandoff) pass an explicit
-// StandbyTimeout: DefaultStandbyTimeout, so a d<=0-gated read could never reach
-// them. The integration test lane sets "3s" so an orphaned standby self-reaps
-// in seconds instead of looping for 10m and fork-bombing the box.
+// FLEET_STANDBY_TIMEOUT is a TEST-ONLY seam (same shape + caveat as the
+// existing FLEET_PID_RESOLVE_S seam, pidresolver.go): when set to a valid >0
+// duration it wins UNCONDITIONALLY, overriding even an explicit caller-supplied
+// d. Unconditional is REQUIRED for two reasons:
 //
-// The seam is read ONLY under `go test` (testing.Testing()), so a production
-// `fleet` binary is a guaranteed no-op even if the variable is still exported
-// in the shell/CI environment — `--standby-timeout` / the caller's explicit d
-// always win in production (codex [P2]). The default stays DefaultStandbyTimeout.
+//  1. The non-Spawn entry points (runHandoff/runDispatch/Resume/GracefulHandoff)
+//     pass an explicit StandbyTimeout: DefaultStandbyTimeout, so a d<=0-gated
+//     read could never reach them.
+//  2. The integration lane also execs a REAL `fleet` binary as a subprocess
+//     (cmd/fleet/coord_run_lease_integration_test.go sets FLEET_STANDBY_TIMEOUT
+//     in cmd.Env). In that child, `testing.Testing()` is false, so a
+//     test-build-only gate would NOT shrink the child's standby — leaving the
+//     exact long-lived `coord-run --standby` pane the fence exists to bound
+//     (codex iter-2 [P1]). The env read must therefore be unconditional.
+//
+// The integration lane sets "3s" so an orphaned standby self-reaps in seconds
+// instead of looping for 10m and fork-bombing the box. Production NEVER sets
+// this variable (it is fleet-internal and undocumented for users — identical to
+// FLEET_PID_RESOLVE_S), so production is a pure no-op: the default stays
+// DefaultStandbyTimeout and `--standby-timeout` / the caller's d win.
 func standbyTimeoutOrDefault(d time.Duration) time.Duration {
-	if testing.Testing() {
-		if raw := strings.TrimSpace(os.Getenv("FLEET_STANDBY_TIMEOUT")); raw != "" {
-			if env, err := time.ParseDuration(raw); err == nil && env > 0 {
-				return env
-			}
+	if raw := strings.TrimSpace(os.Getenv("FLEET_STANDBY_TIMEOUT")); raw != "" {
+		if env, err := time.ParseDuration(raw); err == nil && env > 0 {
+			return env
 		}
 	}
 	if d <= 0 {
