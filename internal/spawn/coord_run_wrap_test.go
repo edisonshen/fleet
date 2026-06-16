@@ -19,6 +19,11 @@ import (
 )
 
 func TestCoordRunWrap_Shape(t *testing.T) {
+	// PR-A: these are production argv-shape assertions on the EXACT timeout
+	// string. The CI integration step runs this lane with FLEET_STANDBY_TIMEOUT
+	// exported globally; pin it empty so the test asserts the real caller/default
+	// value, not the ambient test seam (the design's "must keep asserting" rule).
+	t.Setenv("FLEET_STANDBY_TIMEOUT", "")
 	const (
 		fleetBin = "/usr/local/bin/fleet"
 		agentID  = "deadbeef"
@@ -52,6 +57,9 @@ func TestCoordRunWrap_DoesNotMutateInput(t *testing.T) {
 }
 
 func TestCoordRunWrap_DefaultTimeout(t *testing.T) {
+	// PR-A: assert the true DefaultStandbyTimeout regardless of the lane's
+	// ambient FLEET_STANDBY_TIMEOUT (see TestCoordRunWrap_Shape).
+	t.Setenv("FLEET_STANDBY_TIMEOUT", "")
 	const (
 		fleetBin = "/usr/local/bin/fleet"
 		agentID  = "sb-deadbeef"
@@ -144,6 +152,9 @@ func TestAlreadyCoordRunWrapped(t *testing.T) {
 }
 
 func TestAugmentCoordRunWrap_AddsStandbyAndTimeout(t *testing.T) {
+	// PR-A: assert the exact passed-in timeout regardless of the lane's ambient
+	// FLEET_STANDBY_TIMEOUT (see TestCoordRunWrap_Shape).
+	t.Setenv("FLEET_STANDBY_TIMEOUT", "")
 	engine := []string{"sh", "-c", "claude"}
 	got := augmentCoordRunWrap(
 		[]string{"/usr/local/bin/fleet", "coord-run", "--agent", "a1", "--project", "p1", "--", "sh", "-c", "claude"},
@@ -160,6 +171,9 @@ func TestAugmentCoordRunWrap_AddsStandbyAndTimeout(t *testing.T) {
 }
 
 func TestAugmentCoordRunWrap_ReplacesWrongTimeout(t *testing.T) {
+	// PR-A: assert the exact replacement timeout regardless of the lane's
+	// ambient FLEET_STANDBY_TIMEOUT (see TestCoordRunWrap_Shape).
+	t.Setenv("FLEET_STANDBY_TIMEOUT", "")
 	got := augmentCoordRunWrap([]string{
 		"/usr/local/bin/fleet", "coord-run", "--agent", "a1", "--project", "p1",
 		"--standby", "--standby-timeout=5s", "--", "sh", "-c", "claude",
