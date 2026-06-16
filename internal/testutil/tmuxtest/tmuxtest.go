@@ -283,24 +283,30 @@ func serverAlive(sock string) bool {
 	return serverAliveBefore(sock, time.Now().Add(defaultProbeTimeout))
 }
 
-// serverAliveBefore is serverAlive with a hard deadline: the pgrep probe is
-// given only the time remaining to `deadline` (capped at defaultProbeTimeout),
-// so the killServerAndRemove loop's total wait stays bounded even when pgrep
-// is slow (codex PR-2 iter-7 [P2]). A deadline already in the past skips the
-// process-bound probe entirely (the loop is about to exit on its budget
-// anyway).
+// serverAliveBefore is serverAlive with a hard deadline: BOTH probes (the
+// `list-sessions` control probe and the `pgrep` process-bound probe) are
+// given only the time remaining to `deadline`, capped at defaultProbeTimeout.
+// So the killServerAndRemove loop's total wait stays bounded even when tmux's
+// control socket OR pgrep is slow (codex PR-2 iter-7 [P2]; /review iter [P2]:
+// the list-sessions probe was previously unbounded). A deadline already in the
+// past skips both probes (the loop is about to exit on its budget anyway).
 func serverAliveBefore(sock string, deadline time.Time) bool {
-	cmd := exec.Command("tmux", "-S", sock, "list-sessions")
-	cmd.Env = append(os.Environ(), "TMUX=")
-	if cmd.Run() == nil {
-		return true
-	}
 	remaining := time.Until(deadline)
 	if remaining <= 0 {
 		return false // budget spent — treat as "no longer holding the inode"
 	}
 	if remaining > defaultProbeTimeout {
 		remaining = defaultProbeTimeout
+	}
+	// Control probe under the same bound: a tmux server wedged on its control
+	// socket must not block past the budget. A timed-out/failed probe means
+	// "not answering"; we then check the process-bound signal below.
+	ctx, cancel := context.WithTimeout(context.Background(), remaining)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "tmux", "-S", sock, "list-sessions")
+	cmd.Env = append(os.Environ(), "TMUX=")
+	if cmd.Run() == nil {
+		return true
 	}
 	return tmuxProcessBound(sock, remaining)
 }
