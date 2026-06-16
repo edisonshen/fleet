@@ -21,6 +21,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"testing"
 	"time"
 
 	"github.com/edisonshen/fleet/internal/agent"
@@ -264,12 +265,18 @@ func alreadyCoordRunWrapped(argv []string) bool {
 // points (runHandoff/runDispatch/Resume/GracefulHandoff) pass an explicit
 // StandbyTimeout: DefaultStandbyTimeout, so a d<=0-gated read could never reach
 // them. The integration test lane sets "3s" so an orphaned standby self-reaps
-// in seconds instead of looping for 10m and fork-bombing the box. Production
-// leaves it unset → pure no-op (the default stays DefaultStandbyTimeout).
+// in seconds instead of looping for 10m and fork-bombing the box.
+//
+// The seam is read ONLY under `go test` (testing.Testing()), so a production
+// `fleet` binary is a guaranteed no-op even if the variable is still exported
+// in the shell/CI environment — `--standby-timeout` / the caller's explicit d
+// always win in production (codex [P2]). The default stays DefaultStandbyTimeout.
 func standbyTimeoutOrDefault(d time.Duration) time.Duration {
-	if raw := strings.TrimSpace(os.Getenv("FLEET_STANDBY_TIMEOUT")); raw != "" {
-		if env, err := time.ParseDuration(raw); err == nil && env > 0 {
-			return env
+	if testing.Testing() {
+		if raw := strings.TrimSpace(os.Getenv("FLEET_STANDBY_TIMEOUT")); raw != "" {
+			if env, err := time.ParseDuration(raw); err == nil && env > 0 {
+				return env
+			}
 		}
 	}
 	if d <= 0 {
