@@ -26,26 +26,26 @@ jobs:
     # cleanup/leak steps this cap exists to preserve (codex iter-1 [P2]).
     #
     # Process-level timeouts now in play (each step gets its OWN budget; the
-    # PR-A integration lane is split per-package, see the steps below):
+    # PR-A integration lane is `-run`-scoped per-package to the integration-only
+    # standby tests — see the steps below — so it no longer re-runs each
+    # package's full default suite):
     #   - default `go test -race ./...`     : 5m
-    #   - integration internal/spawn        : 5m
-    #   - integration cmd/fleet             : 7m
-    #   - integration internal/handoffop    : 5m
-    # Worst-case sum if every step burns its full timeout = 22m, plus the
+    #   - integration internal/spawn        : 5m  (2 scoped tests)
+    #   - integration cmd/fleet             : 5m  (9 scoped tests)
+    #   (internal/handoffop has no integration-only tests → no step)
+    # Worst-case sum if every step burns its full timeout = 15m, plus the
     # UNBUDGETED steps that sit between/after the timed lanes and the always()
     # cleanup: ~2m setup/build/lint, the two test-isolation lints + leak
     # sentinel (~1m), the Python `pytest skills/ scripts/` step (~1m), and ~2m
-    # always() cleanup/leak headroom = ~28m (codex iter-9 [P2]: the Python step
-    # was previously omitted from this sum, eating the cap margin). The cap MUST
-    # sit above that so the per-step `-timeout` reliably fires first and the
-    # cleanup steps survive — a GitHub job timeout CANCELS the job and skips
-    # always(). EXPECTED (green) run is far smaller — default lane ~3m + each
-    # integration package ~3-4m ≈ 15m wall — the caps are a backstop, not the
-    # normal run. 35 = ~28m worst-case + ~7m margin; still far below the
-    # GitHub-hosted runner's multi-hour default, so a true hang OUTSIDE a test
-    # process (e.g. a wedged lint) is still bounded instead of running away as
-    # PR #232 did.
-    timeout-minutes: 35
+    # always() cleanup/leak headroom = ~21m. The cap MUST sit above that so the
+    # per-step `-timeout` reliably fires first and the cleanup steps survive — a
+    # GitHub job timeout CANCELS the job and skips always(). EXPECTED (green) run
+    # is far smaller — default lane ~3m + each scoped integration step well under
+    # a minute ≈ 7m wall — the caps are a backstop, not the normal run. 30 =
+    # ~21m worst-case + ~9m margin; still far below the GitHub-hosted runner's
+    # multi-hour default, so a true hang OUTSIDE a test process (e.g. a wedged
+    # lint) is still bounded instead of running away as PR #232 did.
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
 
@@ -122,32 +122,42 @@ jobs:
       # HERE so they still gate — as steps inside build-test-lint (the required
       # check), NOT a separate job that branch protection wouldn't enforce.
       #
-      # WHY ONE STEP PER PACKAGE (not the old single bundled invocation): a
-      # `-tags=integration` run re-executes each package's ENTIRE default suite
-      # (the build tag only ADDS files) plus the tagged standby tests, so the
-      # three packages together cost ~8m of work on a 2-core runner. Bundling
-      # them under one `-timeout=5m` made them share a single budget, and
-      # cmd/fleet alone (~3.5m local, longer on CI) overran it — the panic seen
-      # in run 27597394005. Splitting gives EACH package its own fresh timeout,
-      # so a slow package can't starve the others and the failure is attributable
-      # to one package. Budgets (spawn 5m, cmd/fleet 7m, handoffop 5m) bound the
-      # worst case to ~17m sequential, but Go runs the suites fast in practice
-      # (~3-4m each on CI); the per-step caps are headroom, not the expected run.
+      # WHY -run SCOPED PER PACKAGE (not a bare `-tags=integration ./pkg`): the
+      # `integration` build tag only ADDS files — it does NOT subtract the default
+      # ones. So `go test -tags=integration ./cmd/fleet` recompiles the package
+      # WITH the standby tests AND re-runs the ENTIRE default suite that already
+      # ran (and passed) in the `go test -race ./...` step above — including the
+      # heavy `TestCoordIntegration_*` cases (build the real binary, install
+      # skills, drive loop.tick). That redundant re-run, not any single hang, is
+      # what blew the 5m/7m budgets (panics in runs 27597394005, 27601497061):
+      # the package is just slow on a 2-core runner. Scoping each step to `-run`
+      # the integration-ONLY test functions (those present in the integration
+      # build but absent from the default build — derived via
+      # `comm -13 <(go test -list) <(go test -tags=integration -list)`) runs each
+      # standby test exactly ONCE, in the lane that needs it, and skips the
+      # already-covered default suite. internal/handoffop has ZERO
+      # integration-only tests (its standby cases are stubbed and stay
+      # default-lane), so it needs no integration step at all.
       #
       # FLEET_STANDBY_TIMEOUT=3s caps each standby at 3s (vs the 10m production
       # default), so even an aborted run self-reaps in seconds. No -race here:
       # these tests exec real tmux-pane subprocesses (the race detector
       # instruments only in-process goroutines, and -race would roughly double
       # each lane's wall time for no added coverage of the subprocess paths this
-      # lane exists to exercise).
+      # lane exists to exercise). Keep these `-run` lists in sync with the
+      # `//go:build integration` test functions in each package; a new
+      # integration test that isn't listed here will silently NOT run in CI.
       - name: Integration lane — internal/spawn
-        run: FLEET_STANDBY_TIMEOUT=3s go test -tags=integration -count=1 -timeout=5m ./internal/spawn
+        run: >-
+          FLEET_STANDBY_TIMEOUT=3s go test -tags=integration -count=1 -timeout=5m
+          -run '^(TestSpawn_PersistsLeaseWrappedState|TestSpawn_StandbyFinalMergePreservesStampedEnginePID)$'
+          ./internal/spawn
 
       - name: Integration lane — cmd/fleet
-        run: FLEET_STANDBY_TIMEOUT=3s go test -tags=integration -count=1 -timeout=7m ./cmd/fleet
-
-      - name: Integration lane — internal/handoffop
-        run: FLEET_STANDBY_TIMEOUT=3s go test -tags=integration -count=1 -timeout=5m ./internal/handoffop
+        run: >-
+          FLEET_STANDBY_TIMEOUT=3s go test -tags=integration -count=1 -timeout=5m
+          -run '^(TestCoordLeaderCheck|TestCoordRun_Lease_Integration_RealFlockHeldThenReleased|TestCoordRun_Lease_Integration_StandDownArchivesRecord|TestDeliverHandoffResumePrompt_NoLeaseOwner_FallsBackToDirectSend|TestHandoff_GracefulRoute_SwapsViaBarrier|TestHandoff_GracefulRouteError_PreservesQueueAndOld|TestHandoff_LeaseFailoverCoordHandoffFinalizesDeliveredLockOwner|TestHandoff_LeaseFailoverCoordHandoffRefusesBeforeRetiringOld|TestRunDispatch_DeadCoordRecovery_AdvertisesLockWinner)$'
+          ./cmd/fleet
 
       - name: Python tests
         run: python3 -m pytest skills/ scripts/ -q
