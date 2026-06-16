@@ -199,6 +199,14 @@ var propagatedRuntimeEnv = []string{
 	// `fleet drain` / handoff-spawned replacement launched from inside
 	// the pane inherits the same failover state.
 	"FLEET_LEASE_FAILOVER",
+	// FLEET_STANDBY_TIMEOUT (PR-A fork-bomb fence, test-only) must reach the
+	// session so a NESTED coord spawn from inside a pane (e.g. a coord that
+	// runs `fleet drain`/handoff and lease-wraps a successor) inherits the
+	// short test timeout too. Without forwarding, the first-level standby is
+	// bounded but a nested `coord-run --standby` would fall back to the 10m
+	// default and re-open the orphan-pane window the fence closes (codex
+	// iter-3 [P1]). Production never sets it, so it stays a no-op there.
+	"FLEET_STANDBY_TIMEOUT",
 }
 
 // leaseFailoverEnabled gates whether Spawn wraps a coord in the
