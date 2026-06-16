@@ -235,6 +235,90 @@ func TestServerAlive_FalseWhenNoServer(t *testing.T) {
 	}
 }
 
+// TestServerAlive_TrueWhileProcessBound_ProbeFails regresses codex PR-2
+// iter-2 [P1]: serverAlive must report "alive" for the WHOLE window a tmux
+// process can re-create the socket inode — including the shutdown window
+// where the control probe (`tmux list-sessions`) already fails but the
+// process has not exited. We model that window with a plain process whose
+// argv contains the socket path (no tmux server, so the probe fails) and
+// assert serverAlive still returns true via the process-bound signal. Once
+// the process exits, serverAlive must flip to false so killServerAndRemove
+// can safely unlink. Without this, a probe-failure-only signal would unlink
+// under a dying server and re-leak the socket on Linux.
+func TestServerAlive_TrueWhileProcessBound_ProbeFails(t *testing.T) {
+	if _, err := exec.LookPath("pgrep"); err != nil {
+		t.Skip("pgrep not installed")
+	}
+	// Unique socket path that is NOT bound to any tmux server, so the
+	// list-sessions probe inside serverAlive fails. The path appears in the
+	// helper process's argv so the pgrep -f process-bound check matches.
+	sock := isolatedSocketPath(t)
+
+	// Spawn `sleep 30` but rewrite argv[0] to embed the socket path, the way
+	// a real tmux server's proctitle reads `tmux: server (<sock>)`. pgrep -f
+	// matches the full argv, so the path is visible there while the process
+	// lives. (A trailing `sleep` arg is rejected by macOS sleep, hence the
+	// argv[0] rewrite instead of an extra positional arg.)
+	bin, lookErr := exec.LookPath("sleep")
+	if lookErr != nil {
+		t.Skip("sleep not installed")
+	}
+	cmd := &exec.Cmd{
+		Path: bin,
+		Args: []string{"tmuxtest-bound-holder (" + sock + ")", "30"},
+	}
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("start bound-process stub: %v", err)
+	}
+	killed := false
+	t.Cleanup(func() {
+		if !killed {
+			_ = cmd.Process.Kill()
+		}
+		_ = cmd.Wait()
+	})
+
+	// Wait until pgrep can see it (process table is async).
+	bound := false
+	for i := 0; i < 100; i++ {
+		if tmuxProcessBound(sock) {
+			bound = true
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if !bound {
+		t.Fatalf("tmuxProcessBound(%s) never saw the bound helper process", sock)
+	}
+	// The control probe fails (no real tmux server) yet serverAlive must
+	// still be true because a process references the socket.
+	if !serverAlive(sock) {
+		t.Errorf("serverAlive(%s) = false while a process is bound; want true (probe-failure must NOT be treated as death)", sock)
+	}
+
+	// Kill the helper and wait for it to leave the table; serverAlive must
+	// then flip to false (nothing can re-create the inode).
+	if err := cmd.Process.Kill(); err != nil {
+		t.Fatalf("kill bound-process stub: %v", err)
+	}
+	_ = cmd.Wait()
+	killed = true
+	gone := false
+	for i := 0; i < 100; i++ {
+		if !tmuxProcessBound(sock) {
+			gone = true
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if !gone {
+		t.Fatalf("tmuxProcessBound(%s) still true after the helper exited", sock)
+	}
+	if serverAlive(sock) {
+		t.Errorf("serverAlive(%s) = true after the bound process exited; want false", sock)
+	}
+}
+
 // TestKillServerAndRemove_RetriesUntilGone pins the verified-remove loop:
 // a socket file that only disappears after a few attempts (simulating the
 // Linux server-teardown race where the inode lingers briefly) is still

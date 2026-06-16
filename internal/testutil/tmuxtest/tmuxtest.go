@@ -22,11 +22,13 @@
 package tmuxtest
 
 import (
+	"bytes"
 	"crypto/rand"
 	"encoding/hex"
 	"fmt"
 	"os"
 	"os/exec"
+	"regexp"
 	"testing"
 	"time"
 )
@@ -213,16 +215,60 @@ func killServerAndRemove(sock string) error {
 	return nil
 }
 
-// serverAlive reports whether a tmux server is currently bound to sock and
-// still answering. A successful `tmux -S <sock> list-sessions` means a live
-// server owns the socket and could re-create the inode after an unlink;
-// any failure (no server, file gone, probe error) means no server can. We
+// serverAlive reports whether a tmux server that could still re-create
+// sock's inode is bound to it. It must return true for the WHOLE window in
+// which a re-touch is possible, not just while the control socket answers.
+//
+// codex PR-2 iter-2 [P1]: a `tmux -S <sock> list-sessions` probe is NOT a
+// sufficient liveness signal on its own. During shutdown the server stops
+// answering control commands BEFORE the process exits, so the probe fails
+// while the dying process can still unlink-and-re-create the socket. If we
+// treated that probe-failure as "server dead" and unlinked, the dying
+// server would re-touch the inode after us — the exact Linux leak this code
+// exists to close. So we OR two signals:
+//
+//	answering := list-sessions succeeds   (server up, normal operation)
+//	bound     := a tmux process references this socket path   (pgrep -f)
+//
+// The server is "alive" (can still re-create the inode) while EITHER holds.
+// Only once the probe fails AND no tmux process is bound to the socket is a
+// re-touch impossible — and only then does killServerAndRemove unlink. We
 // suppress TMUX inheritance so a parent tmux session never makes the probe
 // answer about the wrong server.
+//
+// pgrep is best-effort: if it is missing or errors we fall back to the
+// probe alone (no worse than the prior behavior) rather than spin forever.
 func serverAlive(sock string) bool {
 	cmd := exec.Command("tmux", "-S", sock, "list-sessions")
 	cmd.Env = append(os.Environ(), "TMUX=")
-	return cmd.Run() == nil
+	if cmd.Run() == nil {
+		return true
+	}
+	return tmuxProcessBound(sock)
+}
+
+// tmuxProcessBound reports whether any tmux process still references sock in
+// its argv (a server `tmux: server (<sock>)` or a client `tmux -S <sock>`).
+// This catches the shutdown window where the control probe already fails but
+// the process has not exited and can still re-touch the socket inode.
+//
+// Best-effort: a missing pgrep or any pgrep error returns false so the
+// caller's bounded loop never hangs on a tooling gap. pgrep exits 1 when
+// there is no match (the common, healthy case) — we treat only a clean exit
+// with non-empty output as "still bound".
+func tmuxProcessBound(sock string) bool {
+	if _, err := exec.LookPath("pgrep"); err != nil {
+		return false
+	}
+	// Anchor the match on the literal socket path so we don't match an
+	// unrelated tmux server. The path is a regex to pgrep -f; quote the
+	// metacharacters that appear in our `/tmp/fleet-test-<hex>.sock` names.
+	out, err := exec.Command("pgrep", "-f", regexp.QuoteMeta(sock)).Output()
+	if err != nil {
+		// Exit 1 (no match) or any pgrep failure → not bound (or unknown).
+		return false
+	}
+	return len(bytes.TrimSpace(out)) > 0
 }
 
 // isolatedSocketPath returns a unique /tmp/fleet-test-<hex>.sock path.
