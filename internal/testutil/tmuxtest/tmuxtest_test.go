@@ -328,7 +328,7 @@ func TestServerAlive_TrueWhileProcessBound_ProbeFails(t *testing.T) {
 	// Wait until pgrep can see it (process table is async).
 	bound := false
 	for i := 0; i < 100; i++ {
-		if tmuxProcessBound(sock) {
+		if tmuxProcessBound(sock, time.Second) {
 			bound = true
 			break
 		}
@@ -349,7 +349,7 @@ func TestServerAlive_TrueWhileProcessBound_ProbeFails(t *testing.T) {
 	killed = true
 	gone := false
 	for i := 0; i < 100; i++ {
-		if !tmuxProcessBound(sock) {
+		if !tmuxProcessBound(sock, time.Second) {
 			gone = true
 			break
 		}

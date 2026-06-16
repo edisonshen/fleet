@@ -116,6 +116,13 @@ var (
 	socketRemoveDelay   = 50 * time.Millisecond
 )
 
+// defaultProbeTimeout caps a single `pgrep` liveness probe so a stalled
+// /proc scan can't outrun the killServerAndRemove budget (codex PR-2 iter-7
+// [P2]). The deadline-bounded loop additionally clamps each probe to the
+// time remaining, so the TOTAL Phase-1 wait stays at ~socketRemoveRetries *
+// socketRemoveDelay regardless of per-probe latency.
+const defaultProbeTimeout = time.Second
+
 // killServerAndRemove tears the per-test tmux server down and DELETES the
 // socket file, verifying the file is actually gone before returning.
 //
@@ -163,15 +170,28 @@ func killServerAndRemove(sock string) error {
 	// — so the LAST iteration's kill still gets a confirming probe. A failed
 	// probe (no server / file already gone / error) all mean "no server can
 	// recreate the inode", which is what we need.
-	serverDead := !serverAlive(sock)
+	//
+	// codex PR-2 iter-7 [P2]: the wait is bounded by a GLOBAL DEADLINE, not
+	// just the iteration count. serverAlive shells out to `pgrep` (under its
+	// own timeout); a fresh per-call timeout × socketRemoveRetries iterations
+	// could balloon the advertised ~5s budget to minutes on a runner with a
+	// stalled /proc. The deadline (retries × delay) caps the TOTAL Phase-1
+	// wall time regardless of per-probe latency: each serverAlive probe is
+	// given only the time remaining to the deadline, and the loop exits the
+	// instant the deadline passes.
+	deadline := time.Now().Add(time.Duration(socketRemoveRetries) * socketRemoveDelay)
+	serverDead := !serverAliveBefore(sock, deadline)
 	for attempt := 0; attempt < socketRemoveRetries && !serverDead; attempt++ {
+		if !time.Now().Before(deadline) {
+			break // global budget exhausted — fall through to the leak error
+		}
 		// Server still answering: re-issue kill-server (idempotent) in case
 		// the first signal raced a mid-startup server, back off, then re-probe.
 		killCmd := exec.Command("tmux", "-S", sock, "kill-server")
 		killCmd.Env = append(os.Environ(), "TMUX=")
 		_ = killCmd.Run()
 		time.Sleep(socketRemoveDelay)
-		serverDead = !serverAlive(sock)
+		serverDead = !serverAliveBefore(sock, deadline)
 	}
 
 	// codex PR2 iter-2 [P2]: if the server NEVER died within the budget (a
@@ -256,13 +276,33 @@ func killServerAndRemove(sock string) error {
 //
 // pgrep is best-effort: if it is missing or errors we fall back to the
 // probe alone (no worse than the prior behavior) rather than spin forever.
+//
+// serverAlive uses a fixed default probe timeout; the deadline-bounded
+// killServerAndRemove loop calls serverAliveBefore instead.
 func serverAlive(sock string) bool {
+	return serverAliveBefore(sock, time.Now().Add(defaultProbeTimeout))
+}
+
+// serverAliveBefore is serverAlive with a hard deadline: the pgrep probe is
+// given only the time remaining to `deadline` (capped at defaultProbeTimeout),
+// so the killServerAndRemove loop's total wait stays bounded even when pgrep
+// is slow (codex PR-2 iter-7 [P2]). A deadline already in the past skips the
+// process-bound probe entirely (the loop is about to exit on its budget
+// anyway).
+func serverAliveBefore(sock string, deadline time.Time) bool {
 	cmd := exec.Command("tmux", "-S", sock, "list-sessions")
 	cmd.Env = append(os.Environ(), "TMUX=")
 	if cmd.Run() == nil {
 		return true
 	}
-	return tmuxProcessBound(sock)
+	remaining := time.Until(deadline)
+	if remaining <= 0 {
+		return false // budget spent — treat as "no longer holding the inode"
+	}
+	if remaining > defaultProbeTimeout {
+		remaining = defaultProbeTimeout
+	}
+	return tmuxProcessBound(sock, remaining)
 }
 
 // tmuxProcessBound reports whether any tmux process still references sock in
@@ -278,16 +318,19 @@ func serverAlive(sock string) bool {
 // actual tmux server/client processes, which is the only thing that can
 // re-create the socket inode.
 //
-// Best-effort with a short timeout (/review P3): a missing pgrep, any pgrep
-// error, or a hung pgrep returns false so the caller's bounded loop never
-// hangs on a tooling gap. pgrep exits 1 when there is no match (the common,
-// healthy case) — we treat only a clean exit with non-empty output as
-// "still bound".
-func tmuxProcessBound(sock string) bool {
+// Best-effort with a caller-supplied timeout (/review P3, codex iter-7 [P2]):
+// a missing pgrep, any pgrep error, or a pgrep that outruns `timeout` returns
+// false so the caller's bounded loop never hangs on a stalled /proc scan.
+// pgrep exits 1 when there is no match (the common, healthy case) — we treat
+// only a clean exit with non-empty output as "still bound".
+func tmuxProcessBound(sock string, timeout time.Duration) bool {
 	if _, err := exec.LookPath("pgrep"); err != nil {
 		return false
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	if timeout <= 0 {
+		return false
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 	// regexp.QuoteMeta the path (a regex to pgrep -f); `.*` between `tmux`
 	// and the path matches both the server proctitle `tmux: server (<sock>)`
