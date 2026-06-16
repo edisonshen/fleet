@@ -45,6 +45,7 @@ import (
 	"os/exec"
 	"strconv"
 	"strings"
+	"testing"
 	"time"
 
 	"github.com/edisonshen/fleet/internal/agent"
@@ -622,6 +623,85 @@ func pidResolveEngineHint(engine string, oldRec *agent.Record, command []string)
 		return ""
 	}
 	return hint
+}
+
+// resolveDepsFn supplies the resolver's deps at the spawn call site. It
+// defaults to productionResolveDeps (real `tmux list-panes` + `ps`).
+//
+// The CI-perf fake-tmux backend (internal/testutil/tmuxfake) swaps this
+// for an in-process resolver: a routed unit test that installs the fake
+// has no real tmux session and no real engine process, so the production
+// resolver would exec `tmux list-panes` against a missing session, fail,
+// and burn the full FLEET_PID_RESOLVE_S budget before falling back. The
+// fake's resolver returns a synthetic live pid instantly, eliminating
+// that per-spawn floor — the lever that takes the handoff/dispatch test
+// clusters from seconds to milliseconds. Restored via t.Cleanup, so the
+// swap is test-only and never reaches a production binary.
+var resolveDepsFn = productionResolveDeps
+
+// SetFakeResolver swaps the spawn-path pid resolver for an in-process
+// stub: panePID returns a synthetic pid (the fake "engine") for any
+// session, and listProcs reports that pid as a childless leaf so the
+// resolver returns it immediately. Returns a restore func the caller
+// MUST defer / t.Cleanup-register. Exported solely for the fake-tmux
+// backend; production never calls this.
+//
+// fakePid is a fixed, obviously-synthetic value (well above any real
+// pid the test process would see) so an accidental liveness probe in a
+// routed test reads "no such process" rather than colliding with a real
+// one.
+func SetFakeResolver() func() {
+	// Refuse outside `go test`, mirroring tmux.Install's guard. Nothing in
+	// production should ever swap the pid resolver to a synthetic pid; the
+	// guard turns an accidental production call into a loud panic instead of
+	// a silently-wrong agent record (/review maintainability finding).
+	if !testing.Testing() {
+		panic("spawn.SetFakeResolver: refusing to swap the pid resolver outside go test")
+	}
+	const fakePid = 2_000_000_000 // synthetic, non-colliding
+	prev := resolveDepsFn
+	resolveDepsFn = func() resolveEnginePidDeps {
+		// Inject a fast clock + no-op sleep so the resolver returns on the
+		// FIRST poll instead of waiting out FLEET_PID_RESOLVE_S.
+		//
+		// Why this matters (codex P2): routed handoff/dispatch tests spawn
+		// CUSTOM commands (e.g. []string{"sleep","60"}). For those,
+		// pidResolveEngineHint returns "" (not the engine binary), so our
+		// fakePid leaf is only a TENTATIVE match — the resolver keeps
+		// polling to the deadline before accepting a tentative pid. With
+		// real time that re-introduces the ~1s-per-spawn floor the fake is
+		// meant to remove. A clock that reports "deadline reached" after the
+		// deadline is computed makes the resolver take the tentative match
+		// immediately, and sleep is a no-op so even an extra cycle is free.
+		//
+		// now() returns: call 1 = t0 (deadline = t0+timeout), then a value
+		// far past the deadline so the very next `now().Before(deadline)`
+		// check is false. listProcs has already run once by then, so a
+		// tentative match (if any) is returned; otherwise the pane pid
+		// fallback is returned — both instant.
+		var calls int
+		base := time.Unix(0, 0)
+		fastNow := func() time.Time {
+			calls++
+			if calls == 1 {
+				return base
+			}
+			return base.Add(24 * time.Hour)
+		}
+		return resolveEnginePidDeps{
+			panePID: func(string) (int, error) { return fakePid, nil },
+			listProcs: func() ([]procEntry, error) {
+				// fakePid as a claude-named leaf: an engine-hint spawn
+				// matches it stably (instant return); a custom-command
+				// spawn takes it as the tentative match, which the fast
+				// clock below accepts on the next deadline check.
+				return []procEntry{{PID: fakePid, PPID: 1, Args: "claude (fake)"}}, nil
+			},
+			now:   fastNow,
+			sleep: func(time.Duration) {},
+		}
+	}
+	return func() { resolveDepsFn = prev }
 }
 
 // productionResolveDeps returns the wired deps for the resolver. ps and

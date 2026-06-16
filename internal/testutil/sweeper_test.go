@@ -153,6 +153,13 @@ func TestSweepAllDir_ReapsEverythingIgnoringFreshness(t *testing.T) {
 		}
 	}
 
+	// tmux companion lock files MUST also be reaped — a stranded
+	// `fleet-test-*.sock.lock` reds the CI leak gate (run 27515608918).
+	lock1 := fresh1 + ".lock"
+	if err := os.WriteFile(lock1, []byte(""), 0o600); err != nil {
+		t.Fatalf("seed lock %s: %v", lock1, err)
+	}
+
 	// Unrelated file MUST still be spared (only fleet-test-* in scope).
 	unrelated := filepath.Join(dir, "other.sock")
 	if err := os.WriteFile(unrelated, []byte("x"), 0o600); err != nil {
@@ -167,6 +174,9 @@ func TestSweepAllDir_ReapsEverythingIgnoringFreshness(t *testing.T) {
 		if _, err := os.Stat(p); !os.IsNotExist(err) {
 			t.Errorf("fresh socket %s not reaped by SweepAllDir (stat err=%v); freshness guard MUST be bypassed in suite-teardown mode", p, err)
 		}
+	}
+	if _, err := os.Stat(lock1); !os.IsNotExist(err) {
+		t.Errorf("companion lock %s not reaped by SweepAllDir (stat err=%v)", lock1, err)
 	}
 	if _, err := os.Stat(unrelated); err != nil {
 		t.Errorf("unrelated file %s should still be kept; got stat err=%v", unrelated, err)

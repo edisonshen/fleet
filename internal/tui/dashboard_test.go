@@ -722,36 +722,46 @@ func TestSnapshot_CIRunningCountsReviewPhases(t *testing.T) {
 	}
 }
 
-func TestDeriveRepoSlug_FromGithubURL(t *testing.T) {
-	tmp := t.TempDir()
-	if err := os.WriteFile(filepath.Join(tmp, "standards.md"), []byte(
-		"---\nschema: v1\n---\n\n# Standards\n\n## Repo\n\nSee https://github.com/edisonshen/fleet for source.\n",
-	), 0o644); err != nil {
-		t.Fatal(err)
+func TestDeriveRepoSlug(t *testing.T) {
+	// Three extraction sources folded into one table: github URL in
+	// standards.md, `- repo:` bullet, and the fall-back-to-name path
+	// when standards.md is absent.
+	cases := []struct {
+		name      string
+		standards string // "" → don't write standards.md (fallback path)
+		project   string
+		want      string
+	}{
+		{
+			name:      "from github URL",
+			standards: "---\nschema: v1\n---\n\n# Standards\n\n## Repo\n\nSee https://github.com/edisonshen/fleet for source.\n",
+			project:   "fleet",
+			want:      "edisonshen/fleet",
+		},
+		{
+			name:      "from `- repo:` bullet",
+			standards: "---\nschema: v1\n---\n\n## Repo\n\n- repo: edisonshen/gstack\n",
+			project:   "gstack",
+			want:      "edisonshen/gstack",
+		},
+		{
+			name:    "fallback to name when standards.md absent",
+			project: "side-experiment",
+			want:    "side-experiment",
+		},
 	}
-	got := deriveRepoSlug(tmp, "fleet")
-	if got != "edisonshen/fleet" {
-		t.Errorf("deriveRepoSlug from github URL: got %q want edisonshen/fleet", got)
-	}
-}
-
-func TestDeriveRepoSlug_FromBullet(t *testing.T) {
-	tmp := t.TempDir()
-	if err := os.WriteFile(filepath.Join(tmp, "standards.md"), []byte(
-		"---\nschema: v1\n---\n\n## Repo\n\n- repo: edisonshen/gstack\n",
-	), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	got := deriveRepoSlug(tmp, "gstack")
-	if got != "edisonshen/gstack" {
-		t.Errorf("deriveRepoSlug from `- repo:` bullet: got %q", got)
-	}
-}
-
-func TestDeriveRepoSlug_FallbackToName(t *testing.T) {
-	got := deriveRepoSlug(t.TempDir(), "side-experiment")
-	if got != "side-experiment" {
-		t.Errorf("missing standards.md should fall back to name, got %q", got)
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			tmp := t.TempDir()
+			if c.standards != "" {
+				if err := os.WriteFile(filepath.Join(tmp, "standards.md"), []byte(c.standards), 0o644); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if got := deriveRepoSlug(tmp, c.project); got != c.want {
+				t.Errorf("deriveRepoSlug = %q, want %q", got, c.want)
+			}
+		})
 	}
 }
 

@@ -12,7 +12,7 @@ import (
 )
 
 func TestRm_LiveSession_KillsAndArchives(t *testing.T) {
-	requireTmux(t)
+	requireFakeTmux(t)
 	tmp := setupFleetHome(t)
 
 	old := seedAgent(t)
@@ -60,7 +60,7 @@ func TestRm_DeadSession_ArchivesIdempotently(t *testing.T) {
 	// after PR-B the [x] keybind is the right verb. Make sure rm
 	// handles the dead-session case cleanly (kill is a no-op, archive
 	// proceeds).
-	requireTmux(t)
+	requireFakeTmux(t)
 	tmp := setupFleetHome(t)
 
 	old := seedAgent(t)
@@ -82,7 +82,7 @@ func TestRm_DeadSession_ArchivesIdempotently(t *testing.T) {
 }
 
 func TestRm_UnknownAgent_FailsClearly(t *testing.T) {
-	requireTmux(t)
+	requireFakeTmux(t)
 	setupFleetHome(t)
 
 	out := &bytes.Buffer{}
@@ -100,7 +100,7 @@ func TestRm_RefusesWhenHandoffPending(t *testing.T) {
 	// record would orphan the recovery probe in `fleet handoff` (it
 	// would see the journal but no old record on retry). rm must
 	// refuse and tell the operator to drain first.
-	requireTmux(t)
+	requireFakeTmux(t)
 	tmp := setupFleetHome(t)
 
 	old := seedAgent(t)

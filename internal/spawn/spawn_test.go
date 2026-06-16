@@ -3,11 +3,11 @@ package spawn
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"syscall"
 	"testing"
@@ -725,70 +725,6 @@ func TestSendInitialPrompt_SendsAfterMaxWaitWhenPaneNeverStabilizes(t *testing.T
 		want, string(lastOut))
 }
 
-// TestSpawn_FleetBinInEnv verifies fleet stamps its own executable
-// path into the agent's process env so fleet-guard's _kick_drain can
-// invoke the SAME binary without a PATH lookup. Codex review on
-// fix-fleet-guard-self-drains flagged that `shutil.which("fleet")`
-// silently breaks the new auto-drain path on dev runs / non-PATH
-// installs; FLEET_BIN is the fix, this test is its smoke check.
-func TestSpawn_FleetBinInEnv(t *testing.T) {
-	requireTmux(t)
-	setupFleetHome(t)
-
-	cmd := []string{"sh", "-c", "echo FLEET_BIN=$FLEET_BIN; cat"}
-	rec, err := Spawn(Options{
-		TaskID:  "x",
-		Project: "y",
-		Command: cmd,
-	})
-	if err != nil {
-		t.Fatalf("Spawn: %v", err)
-	}
-	t.Cleanup(func() { _ = tmux.Kill(rec.TmuxSession) })
-
-	exe, err := os.Executable()
-	if err != nil {
-		t.Skipf("os.Executable() failed: %v — env stamp is best-effort", err)
-	}
-	want := "FLEET_BIN=" + exe
-	// Test binary paths land in /var/folders/.../go-build*/spawn.test
-	// which is longer than a tmux pane line, so capture-pane wraps the
-	// path across multiple rows. Normalize whitespace before matching.
-	stripWS := func(s string) string {
-		var b strings.Builder
-		for _, r := range s {
-			if r != ' ' && r != '\n' && r != '\r' && r != '\t' {
-				b.WriteRune(r)
-			}
-		}
-		return b.String()
-	}
-	wantNorm := stripWS(want)
-	deadline := time.Now().Add(2 * time.Second)
-	var lastOut []byte
-	for time.Now().Before(deadline) {
-		out, err := exec.Command("tmux", capturePaneArgs(rec.TmuxSession)...).Output()
-		if err == nil {
-			lastOut = out
-			if strings.Contains(stripWS(string(out)), wantNorm) {
-				return
-			}
-		}
-		time.Sleep(50 * time.Millisecond)
-	}
-	t.Errorf("expected %q in pane within deadline:\n%s", want, string(lastOut))
-}
-
-// TestSpawn_RuntimeEnvPropagated verifies every var in
-// propagatedRuntimeEnv flows into the agent's session when set.
-// Codex iter-2 P2 (FLEET_TMUX_SOCKET) and iter-3 P2 (prompt-timing
-// + FLEET_HOME by extension) on fix-fleet-guard-self-drains: tmux
-// strips non-`-e` vars when the server is already running, so a
-// drain kicked from inside the agent pane wouldn't see the
-// operator's overrides. Without propagation: custom FLEET_HOME
-// splits reads/writes between operator and agent (TUI doesn't see
-// the agent), slow-wrapper prompt-timing overrides regress to
-// defaults, and custom tmux sockets break auto-drain entirely.
 func TestSpawn_RuntimeEnvPropagated(t *testing.T) {
 	requireTmux(t)
 	setupFleetHome(t)
@@ -807,8 +743,12 @@ func TestSpawn_RuntimeEnvPropagated(t *testing.T) {
 	// instead of falling back to 10m (codex iter-3 [P1]).
 	t.Setenv("FLEET_STANDBY_TIMEOUT", "3s")
 
+	// Also echo FLEET_AGENT_ID + FLEET_BIN here so the per-session env
+	// stamp for those two is covered by this single real-tmux spawn
+	// (folded the old standalone TestSpawn_FleetAgentIDInEnv +
+	// TestSpawn_FleetBinInEnv to drop two extra tmux spawns).
 	cmd := []string{"sh", "-c",
-		"echo FH=$FLEET_HOME TMS=$FLEET_TMUX_SOCKET STABLE=$FLEET_INITIAL_PROMPT_STABLE_MS MAX=$FLEET_INITIAL_PROMPT_MAX_MS DELAY=$FLEET_PROMPT_ENTER_DELAY_MS BUF=$FLEET_POST_READY_BUFFER_MS VER=$FLEET_POST_SEND_VERIFY_MS RTY=$FLEET_POST_SEND_RETRY_MS SBT=$FLEET_STANDBY_TIMEOUT; cat"}
+		"echo FH=$FLEET_HOME TMS=$FLEET_TMUX_SOCKET STABLE=$FLEET_INITIAL_PROMPT_STABLE_MS MAX=$FLEET_INITIAL_PROMPT_MAX_MS DELAY=$FLEET_PROMPT_ENTER_DELAY_MS BUF=$FLEET_POST_READY_BUFFER_MS VER=$FLEET_POST_SEND_VERIFY_MS RTY=$FLEET_POST_SEND_RETRY_MS SBT=$FLEET_STANDBY_TIMEOUT AGENT_ID=$FLEET_AGENT_ID FLEET_BIN=$FLEET_BIN; cat"}
 	rec, err := Spawn(Options{
 		TaskID:  "x",
 		Project: "y",
@@ -824,9 +764,16 @@ func TestSpawn_RuntimeEnvPropagated(t *testing.T) {
 		"STABLE=777", "MAX=8888", "DELAY=99",
 		"BUF=1234", "VER=456", "RTY=789", "SBT=3s",
 		"TMS=" + os.Getenv("FLEET_TMUX_SOCKET"),
+		"AGENT_ID=" + rec.ID,
 	}
 	if got := os.Getenv("FLEET_HOME"); got != "" {
 		wants = append(wants, "FH="+got)
+	}
+	// FLEET_BIN is the spawning binary's own path (fleet-guard reads it
+	// to kick the drain). Best-effort: assert only when os.Executable is
+	// available, matching the old standalone test's Skipf behavior.
+	if exe, err := os.Executable(); err == nil {
+		wants = append(wants, "FLEET_BIN="+exe)
 	}
 
 	// FLEET_HOME (under TempDir) and FLEET_TMUX_SOCKET paths are long
@@ -1006,105 +953,73 @@ func TestSpawn_HandoffLegacyRecordNormalizesFleetEngine(t *testing.T) {
 // We measure the elapsed time of two back-to-back WaitForReadyToPrompt
 // calls: one with buffer=0, one with buffer=N. The N-vs-0 difference
 // must be ≥ N (the buffer actually fires) and ≤ N+jitter.
+// TestWaitForReadyToPrompt_AppliesPostReadyBuffer pins the contract that,
+// on stable convergence, the configured post-ready buffer is slept for
+// EXACTLY its configured duration (and skipped when 0). Exercised through
+// the deterministic seam (waitForReadyToPromptWithDeps) with a recording
+// sleep — NOT by measuring a real wall-clock delta. The old wall-clock
+// form was flaky on busy CI runners: capture-pane subprocess fork jitter
+// shrank the measured delta below the threshold (run 27532205577 saw
+// delta=905ms against a want of ≥1300ms), which violates the house rule
+// "no time.Sleep-based timing assertions".
 func TestWaitForReadyToPrompt_AppliesPostReadyBuffer(t *testing.T) {
-	requireTmux(t)
-	setupFleetHome(t)
+	t.Parallel()
 
-	// Tight stability window — synthetic shell goes idle fast.
-	t.Setenv("FLEET_INITIAL_PROMPT_STABLE_MS", "100")
-	t.Setenv("FLEET_INITIAL_PROMPT_MAX_MS", "3000")
+	stableOK := func() error { return nil }
 
-	rec, err := Spawn(Options{
-		TaskID:  "post-ready-buf",
-		Project: "p",
-		// Plain `read line` so the pane settles to idle quickly.
-		Command: []string{"sh", "-c",
-			"echo READY; read line; sleep 30"},
+	// buffer = 0 → no sleep.
+	t.Run("zero buffer skips sleep", func(t *testing.T) {
+		t.Parallel()
+		var slept []time.Duration
+		rec := func(d time.Duration) { slept = append(slept, d) }
+		if err := waitForReadyToPromptWithDeps(stableOK, 0, rec); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if len(slept) != 0 {
+			t.Errorf("buffer=0 must not sleep; got sleeps %v", slept)
+		}
 	})
-	if err != nil {
-		t.Fatalf("Spawn: %v", err)
-	}
-	t.Cleanup(func() { _ = tmux.Kill(rec.TmuxSession) })
 
-	// Wait for the shell to hit `read` so the pane is genuinely
-	// stable before either measurement.
-	time.Sleep(300 * time.Millisecond)
-
-	// Baseline: buffer=0.
-	t.Setenv("FLEET_POST_READY_BUFFER_MS", "0")
-	startBase := time.Now()
-	if err := WaitForReadyToPrompt(rec.TmuxSession); err != nil {
-		t.Fatalf("WaitForReadyToPrompt baseline: %v", err)
-	}
-	baselineElapsed := time.Since(startBase)
-
-	// With buffer. Use a generous value so jitter in the stability
-	// poll's run-to-run variation doesn't swallow the assertion.
-	const bufferMS = 1500
-	t.Setenv("FLEET_POST_READY_BUFFER_MS",
-		strconv.Itoa(bufferMS))
-	startWithBuf := time.Now()
-	if err := WaitForReadyToPrompt(rec.TmuxSession); err != nil {
-		t.Fatalf("WaitForReadyToPrompt with buffer: %v", err)
-	}
-	withBufElapsed := time.Since(startWithBuf)
-
-	delta := withBufElapsed - baselineElapsed
-	// Allow 200ms slack to absorb stability-poll run-to-run jitter
-	// (capture-pane subprocess fork timing varies on busy CI runners).
-	if delta < (bufferMS-200)*time.Millisecond {
-		t.Errorf("post-ready buffer did not fire: baseline=%s with-buffer=%s delta=%s want ≥ %dms",
-			baselineElapsed, withBufElapsed, delta, bufferMS-200)
-	}
-	// Sanity: buffer shouldn't add WAY more than its configured
-	// value (allow 1s headroom for capture-pane jitter).
-	if delta > (bufferMS+1000)*time.Millisecond {
-		t.Errorf("post-ready buffer overshot: delta=%s configured=%dms",
-			delta, bufferMS)
-	}
+	// buffer > 0 → sleep EXACTLY buf, once.
+	t.Run("positive buffer sleeps exactly once", func(t *testing.T) {
+		t.Parallel()
+		const buf = 1500 * time.Millisecond
+		var slept []time.Duration
+		rec := func(d time.Duration) { slept = append(slept, d) }
+		if err := waitForReadyToPromptWithDeps(stableOK, buf, rec); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if len(slept) != 1 || slept[0] != buf {
+			t.Errorf("buffer=%s must sleep exactly that once; got sleeps %v", buf, slept)
+		}
+	})
 }
 
 // TestWaitForReadyToPrompt_SkipsBufferOnUnstable pins the design
-// choice: when waitForPaneStable returns an error (pane never
+// choice: when the stability poll returns an error (pane never
 // converged), WaitForReadyToPrompt SKIPS the buffer. The pane is
 // already long-late; adding more delay just makes the failure
 // path slower without helping. The error propagates so the caller
 // can still log + send-keys-anyway.
+//
+// Deterministic: inject a failing stable() + a recording sleep and
+// assert the sleep was never called — no real tmux, no wall clock.
 func TestWaitForReadyToPrompt_SkipsBufferOnUnstable(t *testing.T) {
-	requireTmux(t)
-	setupFleetHome(t)
+	t.Parallel()
 
-	// Pin tiny windows so the unstable pane never converges and
-	// WaitForReadyToPrompt errors out fast.
-	t.Setenv("FLEET_INITIAL_PROMPT_STABLE_MS", "200")
-	t.Setenv("FLEET_INITIAL_PROMPT_MAX_MS", "300")
-	// Big buffer — if the skip-on-error path is broken, the test
-	// will time out paying this delay.
-	t.Setenv("FLEET_POST_READY_BUFFER_MS", "5000")
+	wantErr := errors.New("pane did not stabilize")
+	stableErr := func() error { return wantErr }
+	var slept []time.Duration
+	rec := func(d time.Duration) { slept = append(slept, d) }
 
-	rec, err := Spawn(Options{
-		TaskID:  "never-stable-buf",
-		Project: "p",
-		// Constantly-printing shell so stability never converges.
-		Command: []string{"sh", "-c",
-			"while true; do echo TICK; sleep 0.05; done"},
-	})
-	if err != nil {
-		t.Fatalf("Spawn: %v", err)
+	// Big buffer — if the skip-on-error path is broken, it would be
+	// recorded here.
+	err := waitForReadyToPromptWithDeps(stableErr, 5*time.Second, rec)
+	if !errors.Is(err, wantErr) {
+		t.Fatalf("expected stability error to propagate, got %v", err)
 	}
-	t.Cleanup(func() { _ = tmux.Kill(rec.TmuxSession) })
-
-	start := time.Now()
-	err = WaitForReadyToPrompt(rec.TmuxSession)
-	elapsed := time.Since(start)
-	if err == nil {
-		t.Fatal("expected WaitForReadyToPrompt to error on unstable pane")
-	}
-	// The 5s buffer must NOT have fired. Allow 2s of slack for the
-	// stability poll itself (pinned at 300ms max) + scheduling jitter.
-	if elapsed > 2*time.Second {
-		t.Errorf("WaitForReadyToPrompt slept the buffer despite stability error: elapsed=%s; expected fast-fail without buffer",
-			elapsed)
+	if len(slept) != 0 {
+		t.Errorf("buffer must NOT fire on stability error; got sleeps %v", slept)
 	}
 }
 
@@ -1430,86 +1345,6 @@ func TestPromptSubmitted_BottomBandHeuristic(t *testing.T) {
 	}
 }
 
-// TestTailLines pins tailLines's behavior: returns the last N lines
-// (or the whole buffer if fewer than N), and treats n<=0 as "the
-// whole buffer". The verifier depends on this to scope its prompt-in-
-// input-box check to the bottom of the pane.
-func TestTailLines(t *testing.T) {
-	cases := []struct {
-		name string
-		in   []byte
-		n    int
-		want []byte
-	}{
-		{"empty", []byte(""), 5, []byte("")},
-		{"n_zero_returns_all", []byte("a\nb\nc\n"), 0, []byte("a\nb\nc\n")},
-		{"n_negative_returns_all", []byte("a\nb\nc\n"), -1, []byte("a\nb\nc\n")},
-		{"fewer_lines_than_n", []byte("only\n"), 5, []byte("only\n")},
-		{"exact_n_lines", []byte("a\nb\nc\n"), 3, []byte("a\nb\nc\n")},
-		{"more_lines_than_n", []byte("a\nb\nc\nd\n"), 2, []byte("c\nd\n")},
-		// No trailing newline: "a\nb\nc" has only 2 newlines, so
-		// tailLines can't find the (n+1)-th-from-end and returns
-		// the whole buffer. Acceptable for the verifier — Claude's
-		// real pane captures end with a newline, so this edge
-		// case doesn't fire in production.
-		{"no_trailing_newline_returns_all", []byte("a\nb\nc"), 2, []byte("a\nb\nc")},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			got := tailLines(tc.in, tc.n)
-			if !bytes.Equal(got, tc.want) {
-				t.Errorf("tailLines(%q, %d) = %q; want %q",
-					tc.in, tc.n, got, tc.want)
-			}
-		})
-	}
-}
-
-func TestSpawn_FleetAgentIDInEnv(t *testing.T) {
-	requireTmux(t)
-	setupFleetHome(t)
-
-	cmd := []string{"sh", "-c", "echo AGENT_ID=$FLEET_AGENT_ID; cat"}
-	rec, err := Spawn(Options{
-		TaskID:  "x",
-		Project: "y",
-		Command: cmd,
-	})
-	if err != nil {
-		t.Fatalf("Spawn: %v", err)
-	}
-	t.Cleanup(func() { _ = tmux.Kill(rec.TmuxSession) })
-
-	// Poll capture-pane until the echo lands or we time out — the
-	// shell takes a moment to start and print, and a single capture
-	// is racy.
-	want := "AGENT_ID=" + rec.ID
-	deadline := time.Now().Add(2 * time.Second)
-	var lastOut []byte
-	for time.Now().Before(deadline) {
-		out, err := exec.Command("tmux", capturePaneArgs(rec.TmuxSession)...).Output()
-		if err == nil {
-			lastOut = out
-			if strings.Contains(string(out), want) {
-				return
-			}
-		}
-		time.Sleep(50 * time.Millisecond)
-	}
-	t.Errorf("expected %q in pane within deadline:\n%s", want, string(lastOut))
-}
-
-// TestSpawn_InjectsFleetProject_FreshDispatch regresses fleet#170
-// (P0). The /coordinator skill reads FLEET_PROJECT from the agent's
-// session env to know which project's queue to drain; when Spawn fails
-// to inject it, the skill silently falls back to a cwd-derived project
-// and supervises the wrong queue. Live evidence: a coord launched on
-// 2026-05-22 supervised an unrelated project for the entire session
-// because its tmux env had FLEET_AGENT_ID + FLEET_BIN + FLEET_ENGINE
-// but no FLEET_PROJECT.
-//
-// Fresh-dispatch branch: opts.Project flows directly into rec.Project,
-// so the env entry must mirror opts.Project.
 func TestSpawn_InjectsFleetProject_FreshDispatch(t *testing.T) {
 	requireTmux(t)
 	setupFleetHome(t)

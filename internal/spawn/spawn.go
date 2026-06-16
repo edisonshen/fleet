@@ -373,13 +373,37 @@ func envDuration(key string, fallback time.Duration) time.Duration {
 // just call SendPromptKeys anyway. Keys queue in tmux's pty buffer
 // and the agent consumes them once ready.
 func WaitForReadyToPrompt(session string) error {
-	if err := waitForPaneStable(session,
-		initialPromptStableWindow(),
-		initialPromptMaxWait()); err != nil {
+	return waitForReadyToPromptWithDeps(
+		func() error {
+			return waitForPaneStable(session,
+				initialPromptStableWindow(),
+				initialPromptMaxWait())
+		},
+		postReadyBuffer(),
+		time.Sleep,
+	)
+}
+
+// waitForReadyToPromptWithDeps is WaitForReadyToPrompt's testable core.
+// Seams: stable (the pane-stability poll), buf (the configured
+// post-ready buffer), sleep (the buffer wait). Tests inject a recording
+// sleep + a fake stable result so the "buffer fires only on stable
+// convergence" contract is exercised deterministically — no real tmux,
+// no wall-clock delta measurement (which was flaky on busy CI runners:
+// capture-pane jitter shrank the measured delta below the threshold).
+//
+// Contract: on stability error, SKIP the buffer (the pane is already
+// long-late). On stable convergence, sleep EXACTLY buf if buf > 0.
+func waitForReadyToPromptWithDeps(
+	stable func() error,
+	buf time.Duration,
+	sleep func(time.Duration),
+) error {
+	if err := stable(); err != nil {
 		return err
 	}
-	if buf := postReadyBuffer(); buf > 0 {
-		time.Sleep(buf)
+	if buf > 0 {
+		sleep(buf)
 	}
 	return nil
 }
@@ -1127,7 +1151,7 @@ func Spawn(opts Options) (*agent.Record, error) {
 		resolvedPid, _, resolveErr := resolveEnginePid(
 			session, disambiguator, engineHint,
 			pidResolveTimeout(),
-			productionResolveDeps(),
+			resolveDepsFn(),
 		)
 		if resolveErr != nil {
 			// Pane pid unreachable — log a warning to stderr but DO NOT

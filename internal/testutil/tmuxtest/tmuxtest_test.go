@@ -116,6 +116,33 @@ func TestKillServerAndRemove_IdempotentWhenGone(t *testing.T) {
 	}
 }
 
+// TestKillServerAndRemove_RemovesCompanionLock pins the lock-file leak fix
+// (CI run 27515608918): tmux 3.x writes a `<socket>.sock.lock` companion
+// next to the socket, and a killed server leaves it behind. The CI leak
+// gate matches `fleet-test-*` (broad), so a stranded `.sock.lock` reds the
+// run even after the socket is gone. killServerAndRemove must unlink the
+// companion lock too.
+func TestKillServerAndRemove_RemovesCompanionLock(t *testing.T) {
+	dir := t.TempDir()
+	sock := filepath.Join(dir, "fleet-test-lockcheck.sock")
+	lock := sock + ".lock"
+	if err := os.WriteFile(sock, []byte("dead"), 0o600); err != nil {
+		t.Fatalf("forge dead socket: %v", err)
+	}
+	if err := os.WriteFile(lock, []byte(""), 0o600); err != nil {
+		t.Fatalf("forge companion lock: %v", err)
+	}
+	if err := killServerAndRemove(sock); err != nil {
+		t.Fatalf("killServerAndRemove: %v", err)
+	}
+	if _, err := os.Stat(sock); !os.IsNotExist(err) {
+		t.Errorf("socket %s not removed (stat err=%v)", sock, err)
+	}
+	if _, err := os.Stat(lock); !os.IsNotExist(err) {
+		t.Errorf("companion lock %s not removed (stat err=%v)", lock, err)
+	}
+}
+
 // TestKillServerAndRemove_StopsLiveServerAndDeletesSocket pins the CI
 // failure mode: a real tmux server bound to a fleet-test socket must leave
 // no /tmp/fleet-test-*.sock file behind after helper cleanup.
@@ -146,6 +173,65 @@ func TestKillServerAndRemove_StopsLiveServerAndDeletesSocket(t *testing.T) {
 	}
 	if _, err := os.Stat(sock); !os.IsNotExist(err) {
 		t.Errorf("live tmux socket %s not removed (stat err=%v)", sock, err)
+	}
+}
+
+// TestKillServerAndRemove_ConfirmsServerDeadBeforeRemove pins the
+// ordering fix for the 230-socket Linux leak (ci-perf PR-2, 2026-06-14):
+// killServerAndRemove must drive the tmux SERVER to actual death BEFORE
+// unlinking the socket, so a dying server cannot re-create the inode after
+// we return. After the helper returns, serverAlive(sock) must be false
+// (no server can re-touch the file) AND the file must stay gone across a
+// brief settle window.
+func TestKillServerAndRemove_ConfirmsServerDeadBeforeRemove(t *testing.T) {
+	if _, err := exec.LookPath("tmux"); err != nil {
+		t.Skip("tmux not installed")
+	}
+
+	sock := isolatedSocketPath(t)
+	session := "fleet-test-deadcheck"
+	cmd := exec.Command("tmux", "-S", sock, "new-session", "-d", "-s", session, "sleep", "60")
+	cmd.Env = append(os.Environ(), "TMUX=")
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("start tmux server: %v\n%s", err, out)
+	}
+	t.Cleanup(func() {
+		c := exec.Command("tmux", "-S", sock, "kill-server")
+		c.Env = append(os.Environ(), "TMUX=")
+		_ = c.Run()
+		_ = os.Remove(sock)
+	})
+
+	if !serverAlive(sock) {
+		t.Fatalf("expected a live tmux server bound to %s before cleanup", sock)
+	}
+
+	if err := killServerAndRemove(sock); err != nil {
+		t.Fatalf("killServerAndRemove: %v", err)
+	}
+
+	// The server must be confirmed gone — nothing can re-create the inode.
+	if serverAlive(sock) {
+		t.Errorf("server still alive on %s after killServerAndRemove returned", sock)
+	}
+	// And the file must STAY gone (the old code could return on a momentary
+	// ENOENT just before the dying server's final socket touch).
+	time.Sleep(50 * time.Millisecond)
+	if _, err := os.Stat(sock); !os.IsNotExist(err) {
+		t.Errorf("socket %s reappeared after cleanup (stat err=%v) — dead-server ordering not enforced", sock, err)
+	}
+}
+
+// TestServerAlive_FalseWhenNoServer pins serverAlive's contract: an
+// absent/unbound socket path reports not-alive, so killServerAndRemove's
+// phase-1 wait exits immediately when there is no server to kill.
+func TestServerAlive_FalseWhenNoServer(t *testing.T) {
+	if _, err := exec.LookPath("tmux"); err != nil {
+		t.Skip("tmux not installed")
+	}
+	sock := isolatedSocketPath(t) // never bound
+	if serverAlive(sock) {
+		t.Errorf("serverAlive(%s) = true for an unbound socket; want false", sock)
 	}
 }
 

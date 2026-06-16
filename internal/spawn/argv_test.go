@@ -20,6 +20,7 @@ import (
 // lost remote control after a manual handoff because the persisted
 // command body diverged from the literal default by a single character.
 func TestInjectRemoteControlFlag_ShellWrapper(t *testing.T) {
+	t.Parallel()
 	cases := []struct {
 		name string
 		in   []string
@@ -97,6 +98,7 @@ func TestInjectRemoteControlFlag_ShellWrapper(t *testing.T) {
 // have wrapped a wholly different binary inside `sh -c`; silently
 // injecting --remote-control would corrupt that argv.
 func TestInjectRemoteControlFlag_NonClaudeShellWrapper(t *testing.T) {
+	t.Parallel()
 	cases := []struct {
 		name string
 		argv []string
@@ -157,6 +159,7 @@ func TestInjectRemoteControlFlag_NonClaudeShellWrapper(t *testing.T) {
 // engine adapter drops the wrapper, that adapter must own its own
 // flag-injection — the helper stays narrow.)
 func TestInjectRemoteControlFlag_DirectClaudeArgv(t *testing.T) {
+	t.Parallel()
 	in := []string{"claude", "--print", "do something"}
 	got := InjectRemoteControlFlag(in, "fleet-coord-deadbeef")
 	if len(got) != len(in) {
@@ -177,6 +180,7 @@ func TestInjectRemoteControlFlag_DirectClaudeArgv(t *testing.T) {
 // relaxed matcher must still place --remote-control adjacent to the
 // claude binary so claude's own flag parser sees it.
 func TestInjectRemoteControlFlag_PositionAfterClaudeToken(t *testing.T) {
+	t.Parallel()
 	in := []string{"sh", "-c", `claude --print --resume`}
 	got := InjectRemoteControlFlag(in, "fleet-coord-position")
 	if len(got) != 3 {
@@ -196,6 +200,7 @@ func TestInjectRemoteControlFlag_PositionAfterClaudeToken(t *testing.T) {
 // dispatch path passes opts.command which originated from cobra's flag
 // parser; mutation would corrupt later reads).
 func TestInjectRemoteControlFlag_PreservesInputSlice(t *testing.T) {
+	t.Parallel()
 	in := []string{"sh", "-c", `claude --dangerously-skip-permissions`}
 	original := make([]string, len(in))
 	copy(original, in)

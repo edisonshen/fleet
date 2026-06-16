@@ -168,43 +168,65 @@ jobs:
         # job's final state leak-free; the following assertion remains the
         # gate for any socket that cannot be reaped.
         #
-        # DRAIN TO QUIESCENCE (PR-A): the integration lane's standby tests
-        # spawn real `coord-run --standby` tmux PANES reparented to the tmux
-        # server. With FLEET_STANDBY_TIMEOUT=3s they self-exit in seconds, but
-        # a pane still WINDING DOWN when `go test` exits can RE-CREATE its
-        # socket inode AFTER a single kill-server pass — so a one-shot reap
-        # races the teardown and leaves sockets for the assert step to catch
-        # (the failure seen in run 27603440999: reap killed one set, assert
-        # found a fresh set 0.8s later). Loop kill+rm until a scan finds no
-        # `fleet-test-*.sock` newer than the sentinel (panes have fully drained
-        # past the 3s timeout) or a bounded number of rounds elapses. A short
-        # sleep between rounds lets an in-flight pane finish exiting before the
-        # next kill. Bounded so a genuinely unreapable socket still falls
-        # through to the assert gate rather than hanging the job.
+        # ci-perf PR-2 (2026-06-14): two self-defeating reap forms preceded
+        # this. (1) `tmux -S <sock> kill-server` per socket re-created the
+        # inode by invoking the tmux CLIENT against a dead socket. (2) A
+        # graceful `pkill -TERM` on the tmux SERVER triggers the server's own
+        # shutdown, and a dying tmux server RE-CREATES its socket file as it
+        # exits (Linux only) — so the reaped set and the leaked set had zero
+        # overlap; every leaked socket was freshly re-touched DURING the reap.
+        #
+        # Bulletproof form: SIGKILL the server processes outright (a -9'd
+        # process runs no shutdown code, so it cannot re-touch the socket),
+        # WAIT until pgrep confirms zero fleet-test tmux processes remain (so
+        # nothing can re-create an inode), add a short settle for the kernel
+        # to finish its own async socket teardown, THEN rm — and re-rm in a
+        # bounded loop in case a straggler inode lingers. If a process truly
+        # cannot be killed, the loop ends and the assert below fails loudly.
         if: always()
         run: |
-          for round in $(seq 1 10); do
-            leaked=$(find /tmp -maxdepth 1 -name 'fleet-test-*.sock' \
-              -newer /tmp/fleet-test-ci-sentinel 2>/dev/null || true)
-            if [ -z "$leaked" ]; then
-              if [ "$round" -eq 1 ]; then
-                echo "no /tmp/fleet-test-*.sock cleanup needed"
-              else
-                echo "drained: no fleet-test-*.sock remaining after $((round-1)) round(s)"
-              fi
-              exit 0
-            fi
-            echo "reap round $round — fleet-test-*.sock files from this CI run:"
-            echo "$leaked"
-            for sock in $leaked; do
-              if command -v tmux >/dev/null 2>&1; then
-                tmux -S "$sock" kill-server >/dev/null 2>&1 || true
-              fi
+          # Match the SAME glob the assert below uses (`fleet-test-*`, NOT
+          # just `*.sock`): tmux 3.x writes a companion LOCK file
+          # `<socket>.sock.lock` next to each socket, and a SIGKILL'd server
+          # leaves the lock behind. The old `*.sock`-only sweep missed those
+          # `.sock.lock` files, so 22 of them tripped the assert in run
+          # 27515608918 even after every socket was reaped. Exclude the
+          # sentinel file itself.
+          leaked=$(find /tmp -maxdepth 1 -name 'fleet-test-*' \
+            -newer /tmp/fleet-test-ci-sentinel \
+            ! -name 'fleet-test-ci-sentinel' 2>/dev/null || true)
+          if [ -z "$leaked" ]; then
+            echo "no /tmp/fleet-test-* cleanup needed"
+            exit 0
+          fi
+          echo "reaping /tmp/fleet-test-* files from this CI run:"
+          echo "$leaked"
+          # Match ANY tmux process referencing a fleet-test socket: the Linux
+          # server proctitle `tmux: server (/tmp/fleet-test-…)` AND any client
+          # `tmux -S /tmp/fleet-test-…`. SIGKILL directly — no graceful TERM
+          # whose shutdown path re-creates the socket.
+          pat='tmux.*/tmp/fleet-test-'
+          pkill -KILL -f "$pat" 2>/dev/null || true
+          # Wait until NO fleet-test tmux process remains (bounded ~10s).
+          for _ in $(seq 1 100); do
+            pgrep -f "$pat" >/dev/null 2>&1 || break
+            pkill -KILL -f "$pat" 2>/dev/null || true
+            sleep 0.1
+          done
+          # Settle: let the kernel finish unlinking sockets of the killed
+          # processes before we sweep, so our rm is not racing a teardown.
+          sleep 1
+          # Sweep: unlink remaining sockets AND their .sock.lock companions;
+          # re-scan + re-rm a few times in case a straggler inode lingers.
+          for _ in $(seq 1 10); do
+            remaining=$(find /tmp -maxdepth 1 -name 'fleet-test-*' \
+              -newer /tmp/fleet-test-ci-sentinel \
+              ! -name 'fleet-test-ci-sentinel' 2>/dev/null || true)
+            [ -z "$remaining" ] && break
+            for sock in $remaining; do
               rm -f "$sock" || true
             done
-            # Let any pane still winding down (3s standby timeout) finish
-            # exiting before the next scan, so we don't race its socket re-create.
-            sleep 1
+            sleep 0.2
           done
           echo "reap loop exhausted 10 rounds; remaining sockets (if any) fall through to the assert gate"
 
