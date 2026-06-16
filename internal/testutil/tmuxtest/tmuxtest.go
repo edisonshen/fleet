@@ -187,20 +187,33 @@ func killServerAndRemove(sock string) error {
 			sock, socketRemoveRetries, socketRemoveDelay)
 	}
 
-	// Phase 2: the server is gone — unlink the orphaned socket file (and its
+	// Phase 2: the server is gone — unlink the orphaned socket file AND its
 	// tmux companion lock `<sock>.lock`, which tmux 3.x writes next to the
-	// socket and a killed server leaves behind — the leak the CI gate caught
-	// in run 27515608918). Verify the socket stays gone. With no bound server
-	// nothing re-creates the inode, so this normally succeeds on the first
-	// attempt; the retry only covers a slow async unlink finishing under us.
+	// socket and a killed server leaves behind (the leak the CI gate caught
+	// in run 27515608918). Verify BOTH stay gone before reporting success.
+	//
+	// codex PR-2 iter-6 [P2]: an earlier rev returned nil as soon as the
+	// SOCKET was gone, ignoring whether the `.lock` removal actually
+	// succeeded. The broad CI leak gate matches `fleet-test-*` (lock files
+	// included), so a leaked `.lock` would red the gate even though this
+	// helper claimed a clean reap. Now both files gate the success return,
+	// and a `.lock` removal error is surfaced to the caller.
+	//
+	// With no bound server nothing re-creates the inodes, so this normally
+	// succeeds on the first attempt; the retry only covers a slow async
+	// unlink finishing under us.
+	lock := sock + ".lock"
 	var lastErr error
 	for attempt := 0; attempt < socketRemoveRetries; attempt++ {
-		removeErr := os.Remove(sock)
-		if removeErr != nil && !os.IsNotExist(removeErr) {
+		if removeErr := os.Remove(sock); removeErr != nil && !os.IsNotExist(removeErr) {
 			lastErr = removeErr
 		}
-		_ = os.Remove(sock + ".lock") // companion lock; ENOENT is fine
-		if _, statErr := os.Stat(sock); os.IsNotExist(statErr) {
+		if lockErr := os.Remove(lock); lockErr != nil && !os.IsNotExist(lockErr) {
+			lastErr = lockErr
+		}
+		_, sockStat := os.Stat(sock)
+		_, lockStat := os.Stat(lock)
+		if os.IsNotExist(sockStat) && os.IsNotExist(lockStat) {
 			return nil
 		}
 		time.Sleep(socketRemoveDelay)
@@ -208,10 +221,14 @@ func killServerAndRemove(sock string) error {
 	if lastErr != nil {
 		return lastErr
 	}
-	// File still present after the budget but every Remove reported
-	// success/ENOENT — surface a generic "still present" so the caller logs it.
+	// A file still present after the budget but every Remove reported
+	// success/ENOENT — surface a generic "still present" so the caller logs
+	// it. Name which artifact lingered for a faster diagnosis.
 	if _, statErr := os.Stat(sock); statErr == nil {
-		return os.ErrExist
+		return fmt.Errorf("tmuxtest: socket %s still present after remove budget", sock)
+	}
+	if _, statErr := os.Stat(lock); statErr == nil {
+		return fmt.Errorf("tmuxtest: companion lock %s still present after remove budget", lock)
 	}
 	return nil
 }

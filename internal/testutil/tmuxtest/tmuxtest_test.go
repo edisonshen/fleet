@@ -144,6 +144,45 @@ func TestKillServerAndRemove_RemovesCompanionLock(t *testing.T) {
 	}
 }
 
+// TestKillServerAndRemove_ErrorsWhenLockLingers regresses codex PR-2 iter-6
+// [P2]: the helper must NOT report success (nil) when the socket is gone but
+// the `.sock.lock` companion could not be removed — the broad CI leak gate
+// matches `fleet-test-*` (lock files included), so a silently-leaked lock
+// would red the gate while the helper claimed a clean reap. We make the lock
+// un-removable by holding the parent dir read-only (no unlink of children),
+// leaving only the lock present, and assert killServerAndRemove returns an
+// error naming the lingering lock.
+func TestKillServerAndRemove_ErrorsWhenLockLingers(t *testing.T) {
+	dir := t.TempDir()
+	sock := filepath.Join(dir, "fleet-test-lockstuck.sock")
+	lock := sock + ".lock"
+	// Only the lock exists (socket already gone) so the socket Remove is a
+	// no-op ENOENT and the lock is the sole blocker.
+	if err := os.WriteFile(lock, []byte(""), 0o600); err != nil {
+		t.Fatalf("forge companion lock: %v", err)
+	}
+	// Read+exec only on the dir: children cannot be unlinked, so os.Remove of
+	// the lock fails with EACCES (not ENOENT) on every retry.
+	if err := os.Chmod(dir, 0o500); err != nil {
+		t.Skipf("chmod dir: %v (likely sandbox restriction)", err)
+	}
+	t.Cleanup(func() {
+		_ = os.Chmod(dir, 0o700) // restore so t.TempDir cleanup can unlink
+	})
+	// Shrink the delay so the bounded retry loop returns fast.
+	oldDelay := socketRemoveDelay
+	socketRemoveDelay = time.Millisecond
+	t.Cleanup(func() { socketRemoveDelay = oldDelay })
+
+	err := killServerAndRemove(sock)
+	if err == nil {
+		t.Fatalf("killServerAndRemove returned nil while %s could not be removed; want an error", lock)
+	}
+	if !strings.Contains(err.Error(), ".lock") {
+		t.Errorf("error should name the lingering lock; got: %v", err)
+	}
+}
+
 // TestKillServerAndRemove_StopsLiveServerAndDeletesSocket pins the CI
 // failure mode: a real tmux server bound to a fleet-test socket must leave
 // no /tmp/fleet-test-*.sock file behind after helper cleanup.
