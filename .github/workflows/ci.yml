@@ -167,22 +167,46 @@ jobs:
         # race-enabled test binaries exit cleanly. This cleanup keeps the
         # job's final state leak-free; the following assertion remains the
         # gate for any socket that cannot be reaped.
+        #
+        # DRAIN TO QUIESCENCE (PR-A): the integration lane's standby tests
+        # spawn real `coord-run --standby` tmux PANES reparented to the tmux
+        # server. With FLEET_STANDBY_TIMEOUT=3s they self-exit in seconds, but
+        # a pane still WINDING DOWN when `go test` exits can RE-CREATE its
+        # socket inode AFTER a single kill-server pass — so a one-shot reap
+        # races the teardown and leaves sockets for the assert step to catch
+        # (the failure seen in run 27603440999: reap killed one set, assert
+        # found a fresh set 0.8s later). Loop kill+rm until a scan finds no
+        # `fleet-test-*.sock` newer than the sentinel (panes have fully drained
+        # past the 3s timeout) or a bounded number of rounds elapses. A short
+        # sleep between rounds lets an in-flight pane finish exiting before the
+        # next kill. Bounded so a genuinely unreapable socket still falls
+        # through to the assert gate rather than hanging the job.
         if: always()
         run: |
-          leaked=$(find /tmp -maxdepth 1 -name 'fleet-test-*.sock' \
-            -newer /tmp/fleet-test-ci-sentinel 2>/dev/null || true)
-          if [ -z "$leaked" ]; then
-            echo "no /tmp/fleet-test-*.sock cleanup needed"
-            exit 0
-          fi
-          echo "reaping /tmp/fleet-test-*.sock files from this CI run:"
-          echo "$leaked"
-          for sock in $leaked; do
-            if command -v tmux >/dev/null 2>&1; then
-              tmux -S "$sock" kill-server >/dev/null 2>&1 || true
+          for round in $(seq 1 10); do
+            leaked=$(find /tmp -maxdepth 1 -name 'fleet-test-*.sock' \
+              -newer /tmp/fleet-test-ci-sentinel 2>/dev/null || true)
+            if [ -z "$leaked" ]; then
+              if [ "$round" -eq 1 ]; then
+                echo "no /tmp/fleet-test-*.sock cleanup needed"
+              else
+                echo "drained: no fleet-test-*.sock remaining after $((round-1)) round(s)"
+              fi
+              exit 0
             fi
-            rm -f "$sock" || true
+            echo "reap round $round — fleet-test-*.sock files from this CI run:"
+            echo "$leaked"
+            for sock in $leaked; do
+              if command -v tmux >/dev/null 2>&1; then
+                tmux -S "$sock" kill-server >/dev/null 2>&1 || true
+              fi
+              rm -f "$sock" || true
+            done
+            # Let any pane still winding down (3s standby timeout) finish
+            # exiting before the next scan, so we don't race its socket re-create.
+            sleep 1
           done
+          echo "reap loop exhausted 10 rounds; remaining sockets (if any) fall through to the assert gate"
 
       - name: Assert no /tmp/fleet-test-* leak
         # fleet#165 PR-B gate. The test-suite Sweep (internal/testutil)
