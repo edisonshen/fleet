@@ -41,94 +41,34 @@ func TestContextBar_NoBarGlyphsRendered(t *testing.T) {
 	}
 }
 
-func TestContextBar_Empty(t *testing.T) {
-	// 0% — green zone, "0%" label.
-	got := renderContextBar(floatPtr(0))
-	if got == "" {
-		t.Fatal("0%% should still render a chip (0%% label)")
+func TestContextBar_ZonesAndLabels(t *testing.T) {
+	// Folded 8 per-point permutations into one table. Pins the integer
+	// label + threshold zone at both edges of each flip (49/50 green→amber,
+	// 69/70 amber→red) plus the 0% and 100% boundary labels. Zone gating
+	// is asserted via contextZone() because lipgloss strips ANSI in
+	// non-TTY test runs so the palette isn't substring-able.
+	cases := []struct {
+		pct   float64
+		label string
+		zone  string
+	}{
+		{0, "0%", "green"},   // low boundary, still renders a chip
+		{12, "12%", "green"}, // interior green
+		{48, "48%", "green"}, // just under the 50% flip
+		{50, "50%", "amber"}, // exact yellow threshold
+		{69, "69%", "amber"}, // just under the 70% flip
+		{70, "70%", "red"},   // exact red threshold
+		{95, "95%", "red"},   // interior red
+		{100, "100%", "red"}, // 3-digit label, high boundary
 	}
-	if !strings.Contains(got, "0%") {
-		t.Errorf("0%% chip should contain literal \"0%%\", got %q", got)
-	}
-	// Zone gating is asserted via contextZone() — lipgloss strips
-	// ANSI in non-TTY test runs so we can't substring the palette.
-	if z := contextZone(0); z != "green" {
-		t.Errorf("0%% zone want green; got %q", z)
-	}
-}
-
-func TestContextBar_Green_Low(t *testing.T) {
-	got := renderContextBar(floatPtr(12))
-	if !strings.Contains(got, "12%") {
-		t.Errorf("12%% chip should contain \"12%%\", got %q", got)
-	}
-	if z := contextZone(12); z != "green" {
-		t.Errorf("12%% zone want green; got %q", z)
-	}
-}
-
-func TestContextBar_Green_High(t *testing.T) {
-	// 48% — under yellow threshold, still green zone.
-	got := renderContextBar(floatPtr(48))
-	if !strings.Contains(got, "48%") {
-		t.Errorf("48%% chip missing label: %q", got)
-	}
-	if z := contextZone(48); z != "green" {
-		t.Errorf("48%% zone want green (still under 50); got %q", z)
-	}
-}
-
-func TestContextBar_AmberThreshold(t *testing.T) {
-	// 50% — exact yellow threshold; zone flips to amber.
-	if z := contextZone(50); z != "amber" {
-		t.Errorf("50%% zone want amber; got %q", z)
-	}
-	got := renderContextBar(floatPtr(50))
-	if !strings.Contains(got, "50%") {
-		t.Errorf("50%% chip missing label: %q", got)
-	}
-}
-
-func TestContextBar_Amber_High(t *testing.T) {
-	// 69% — last point still in amber zone before red.
-	if z := contextZone(69); z != "amber" {
-		t.Errorf("69%% zone want amber; got %q", z)
-	}
-	got := renderContextBar(floatPtr(69))
-	if !strings.Contains(got, "69%") {
-		t.Errorf("69%% chip missing label: %q", got)
-	}
-}
-
-func TestContextBar_RedThreshold(t *testing.T) {
-	// 70% — exact red threshold. Zone flips to red.
-	if z := contextZone(70); z != "red" {
-		t.Errorf("70%% zone want red; got %q", z)
-	}
-	got := renderContextBar(floatPtr(70))
-	if !strings.Contains(got, "70%") {
-		t.Errorf("70%% chip missing label: %q", got)
-	}
-}
-
-func TestContextBar_Red_High(t *testing.T) {
-	got := renderContextBar(floatPtr(95))
-	if !strings.Contains(got, "95%") {
-		t.Errorf("95%% chip missing label: %q", got)
-	}
-	if z := contextZone(95); z != "red" {
-		t.Errorf("95%% zone want red; got %q", z)
-	}
-}
-
-func TestContextBar_Full(t *testing.T) {
-	// 100% — red zone, label is "100%" (3 digits).
-	got := renderContextBar(floatPtr(100))
-	if !strings.Contains(got, "100%") {
-		t.Errorf("100%% chip missing label: %q", got)
-	}
-	if z := contextZone(100); z != "red" {
-		t.Errorf("100%% zone want red; got %q", z)
+	for _, c := range cases {
+		got := renderContextBar(floatPtr(c.pct))
+		if !strings.Contains(got, c.label) {
+			t.Errorf("%v%%: chip should contain %q, got %q", c.pct, c.label, got)
+		}
+		if z := contextZone(c.pct); z != c.zone {
+			t.Errorf("%v%% zone want %q; got %q", c.pct, c.zone, z)
+		}
 	}
 }
 
@@ -163,47 +103,32 @@ func TestHandoffTag_NilEmpty(t *testing.T) {
 	}
 }
 
-func TestHandoffTag_AutoYellow(t *testing.T) {
-	label, zone := handoffTagSpec(strPtr(handoff.TypeAutoYellow))
-	if label != "◐ HANDOFF" {
-		t.Errorf("auto-yellow label want \"◐ HANDOFF\"; got %q", label)
+func TestHandoffTag_SpecByType(t *testing.T) {
+	// Folded 4 per-type tests into one table: label + zone for each
+	// handoff type. The auto-yellow render-contains-HANDOFF check is
+	// kept inline as a representative render smoke (the others share
+	// the same renderHandoffTag path keyed off label/zone).
+	cases := []struct {
+		typ       string
+		wantLabel string
+		wantZone  string
+	}{
+		{handoff.TypeAutoYellow, "◐ HANDOFF", "amber"},
+		{handoff.TypeAutoRed, "◐ HANDOFF", "red"},
+		{handoff.TypeManual, "◐ HANDOFF", "dim"},
+		{handoff.TypePreCompact, "◐ COMPACT", "dim"},
 	}
-	if zone != "amber" {
-		t.Errorf("auto-yellow zone want amber; got %q", zone)
+	for _, c := range cases {
+		label, zone := handoffTagSpec(strPtr(c.typ))
+		if label != c.wantLabel {
+			t.Errorf("%s label want %q; got %q", c.typ, c.wantLabel, label)
+		}
+		if zone != c.wantZone {
+			t.Errorf("%s zone want %q; got %q", c.typ, c.wantZone, zone)
+		}
 	}
-	got := renderHandoffTag(strPtr(handoff.TypeAutoYellow))
-	if !strings.Contains(got, "HANDOFF") {
+	if got := renderHandoffTag(strPtr(handoff.TypeAutoYellow)); !strings.Contains(got, "HANDOFF") {
 		t.Errorf("auto-yellow render should contain HANDOFF, got %q", got)
-	}
-}
-
-func TestHandoffTag_AutoRed(t *testing.T) {
-	label, zone := handoffTagSpec(strPtr(handoff.TypeAutoRed))
-	if label != "◐ HANDOFF" {
-		t.Errorf("auto-red label want \"◐ HANDOFF\"; got %q", label)
-	}
-	if zone != "red" {
-		t.Errorf("auto-red zone want red; got %q", zone)
-	}
-}
-
-func TestHandoffTag_Manual(t *testing.T) {
-	label, zone := handoffTagSpec(strPtr(handoff.TypeManual))
-	if label != "◐ HANDOFF" {
-		t.Errorf("manual label want \"◐ HANDOFF\"; got %q", label)
-	}
-	if zone != "dim" {
-		t.Errorf("manual zone want dim; got %q", zone)
-	}
-}
-
-func TestHandoffTag_PreCompact(t *testing.T) {
-	label, zone := handoffTagSpec(strPtr(handoff.TypePreCompact))
-	if label != "◐ COMPACT" {
-		t.Errorf("precompact label want \"◐ COMPACT\"; got %q", label)
-	}
-	if zone != "dim" {
-		t.Errorf("precompact zone want dim; got %q", zone)
 	}
 }
 
@@ -303,39 +228,38 @@ func TestHotCounts_WorkerIncluded(t *testing.T) {
 
 // -- renderHotCounts shape ---------------------------------------------
 
-func TestRenderHotCounts_HiddenWhenZero(t *testing.T) {
-	if got := renderHotCounts(0, 0); got != "" {
-		t.Errorf("(0,0) → empty; got %q", got)
+func TestRenderHotCounts_Shape(t *testing.T) {
+	// Folded 4 render-shape permutations into one table: hide-at-zero,
+	// yellow-only, red-only, and both. wantSubstr asserts presence;
+	// absentSubstr asserts the other half is omitted.
+	cases := []struct {
+		name         string
+		yellow, red  int
+		want, absent string // "" → skip that check
+	}{
+		{"hidden when zero", 0, 0, "", ""},
+		{"yellow only", 3, 0, "3 yellow", "red"},
+		{"red only", 0, 2, "2 red", "yellow"},
+		{"both", 3, 2, "3 yellow", ""}, // both-present checked explicitly below
 	}
-}
-
-func TestRenderHotCounts_YellowOnly(t *testing.T) {
-	got := renderHotCounts(3, 0)
-	if !strings.Contains(got, "3 yellow") {
-		t.Errorf("3 yellow expected in output, got %q", got)
+	for _, c := range cases {
+		got := renderHotCounts(c.yellow, c.red)
+		if c.name == "hidden when zero" {
+			if got != "" {
+				t.Errorf("(0,0) → empty; got %q", got)
+			}
+			continue
+		}
+		if c.want != "" && !strings.Contains(got, c.want) {
+			t.Errorf("%s: want %q in %q", c.name, c.want, got)
+		}
+		if c.absent != "" && strings.Contains(got, c.absent) {
+			t.Errorf("%s: did not expect %q in %q", c.name, c.absent, got)
+		}
 	}
-	if strings.Contains(got, "red") {
-		t.Errorf("no red expected, got %q", got)
-	}
-}
-
-func TestRenderHotCounts_RedOnly(t *testing.T) {
-	got := renderHotCounts(0, 2)
-	if !strings.Contains(got, "2 red") {
-		t.Errorf("2 red expected in output, got %q", got)
-	}
-	if strings.Contains(got, "yellow") {
-		t.Errorf("no yellow expected, got %q", got)
-	}
-}
-
-func TestRenderHotCounts_Both(t *testing.T) {
-	got := renderHotCounts(3, 2)
-	if !strings.Contains(got, "3 yellow") {
-		t.Errorf("expected 3 yellow in %q", got)
-	}
-	if !strings.Contains(got, "2 red") {
-		t.Errorf("expected 2 red in %q", got)
+	// "both" must carry both halves.
+	if got := renderHotCounts(3, 2); !strings.Contains(got, "3 yellow") || !strings.Contains(got, "2 red") {
+		t.Errorf("both: expected 3 yellow + 2 red in %q", got)
 	}
 }
 

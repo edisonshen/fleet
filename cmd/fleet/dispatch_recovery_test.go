@@ -433,7 +433,7 @@ func TestWriteRecoveryHandoffDoc_WritesSynthDocToDisk(t *testing.T) {
 // hosts that lack it. The sleep/60 command keeps the successor alive
 // long enough to assert its record fields without racing teardown.
 func TestRunDispatch_DeadCoord_Recovers(t *testing.T) {
-	requireTmux(t)
+	requireFakeTmux(t)
 	setupFleetHome(t)
 
 	// Seed the dead coord record. pid 99999 is overwhelmingly likely
@@ -576,7 +576,7 @@ func TestRunDispatch_DeadCoord_Recovers(t *testing.T) {
 // the new /coordinator session boots fresh, throwing in-flight worker
 // state away (defeating the entire purpose of recovery).
 func TestRunDispatch_DeadCoord_SendsResumePromptToSuccessor(t *testing.T) {
-	requireTmux(t)
+	requireFakeTmux(t)
 	setupFleetHome(t)
 
 	// Capture the prompt that gets sent so we can assert ResumePrompt.
@@ -690,7 +690,7 @@ func TestRunDispatch_DeadCoord_SendsResumePromptToSuccessor(t *testing.T) {
 // stays whatever the caller passed (empty in TUI case, or operator-
 // supplied) rather than being replaced by ResumePrompt.
 func TestRunDispatch_DeadCoord_NoAutoResumeSkipsPromptSwap(t *testing.T) {
-	requireTmux(t)
+	requireFakeTmux(t)
 	setupFleetHome(t)
 
 	var capturedPrompt string
@@ -771,7 +771,7 @@ func TestRunDispatch_DeadCoord_NoAutoResumeSkipsPromptSwap(t *testing.T) {
 // prompt is still in Claude's input box and no /coordinator skill is
 // running, leaving a phantom coord on the dashboard.
 func TestRunDispatch_UnsubmittedPromptEmitsFailureMarker(t *testing.T) {
-	requireTmux(t)
+	requireFakeTmux(t)
 	setupFleetHome(t)
 
 	prev := sendInitialPrompt
@@ -815,7 +815,7 @@ func TestRunDispatch_UnsubmittedPromptEmitsFailureMarker(t *testing.T) {
 // regardless of opts.Engine, defeating the TUI's safety guard against
 // auto-spawning codex coords (which the coord skill doesn't yet support).
 func TestRunDispatch_DeadCoord_EngineClampOverridesInheritedCodex(t *testing.T) {
-	requireTmux(t)
+	requireFakeTmux(t)
 	setupFleetHome(t)
 
 	deadRec := agent.New("c0dexc0d")
@@ -1044,7 +1044,7 @@ func TestRunDispatch_DeadCoord_FreshMtimeBlocksDispatch(t *testing.T) {
 // dead.Cwd and a CORRECT meta.json repo_path and asserts the successor
 // binds the resolver's repo, never the stale dead.Cwd.
 func TestRunDispatch_DeadCoord_ResolvesRepoNotOldRecordCwd(t *testing.T) {
-	requireTmux(t)
+	requireFakeTmux(t)
 	setupFleetHome(t)
 
 	// The dead coord's recorded cwd is a WRONG/stale tree.
@@ -1113,7 +1113,7 @@ func TestRunDispatch_DeadCoord_ResolvesRepoNotOldRecordCwd(t *testing.T) {
 // no meta.json, no worktrees. It must NOT fall back to oldRecord.Cwd
 // even though the dead coord has a live recorded cwd.
 func TestRunDispatch_DeadCoord_RefusesWhenUnresolvable(t *testing.T) {
-	requireTmux(t)
+	requireFakeTmux(t)
 	setupFleetHome(t)
 
 	liveButWrongCwd := t.TempDir()
@@ -1178,7 +1178,7 @@ func TestRunDispatch_DeadCoord_RefusesWhenUnresolvable(t *testing.T) {
 // under the default. The earlier iter-7 gate of !engineExplicit
 // blocked this case unnecessarily.
 func TestRunDispatch_DeadCoord_InheritsCommandWhenEngineMatchesExplicit(t *testing.T) {
-	requireTmux(t)
+	requireFakeTmux(t)
 	setupFleetHome(t)
 
 	// Dead claude-code coord with a custom wrapper command.
@@ -1254,7 +1254,7 @@ func TestRunDispatch_DeadCoord_InheritsCommandWhenEngineMatchesExplicit(t *testi
 // language text would get typed into a session that explicitly
 // opted out — defeating the whole point of --no-auto-resume.
 func TestRunDispatch_DeadCoord_InheritsDisableAutoResume(t *testing.T) {
-	requireTmux(t)
+	requireFakeTmux(t)
 	setupFleetHome(t)
 
 	var capturedPrompt string
@@ -1382,7 +1382,7 @@ func TestRunDispatch_CoordSpawnRejectsCodexEngine(t *testing.T) {
 // restart under the default wrapper on recovery — wrong binary even
 // though task identity was preserved.
 func TestRunDispatch_DeadCoord_InheritsCommandFromOldRecord(t *testing.T) {
-	requireTmux(t)
+	requireFakeTmux(t)
 	setupFleetHome(t)
 
 	deadRec := agent.New("c0dec0de")
@@ -1462,7 +1462,7 @@ func TestRunDispatch_DeadCoord_InheritsCommandFromOldRecord(t *testing.T) {
 // The fresh-engine wrapper (already in opts.command after the wrapper-
 // swap block) is the correct argv.
 func TestRunDispatch_DeadCoord_EngineClampSkipsCommandInherit(t *testing.T) {
-	requireTmux(t)
+	requireFakeTmux(t)
 	setupFleetHome(t)
 
 	// Dead coord ran codex with a sentinel codex-wrapper command.
@@ -1547,7 +1547,7 @@ func TestRunDispatch_DeadCoord_EngineClampSkipsCommandInherit(t *testing.T) {
 // the wrapper-swap block win. Operators can re-add a custom wrapper
 // post-recovery via `fleet handoff <id> --command <wrapper>`.
 func TestRunDispatch_DeadCoord_LegacyRecordSkipsCommandInherit(t *testing.T) {
-	requireTmux(t)
+	requireFakeTmux(t)
 	setupFleetHome(t)
 
 	// Pre-v0.9 dead record: Engine field empty, custom Command that
@@ -1838,7 +1838,7 @@ func TestRunDispatch_CoordSpawn_FailsClosedOnAgentListError(t *testing.T) {
 // before returning the veto. Otherwise the winning coord boots without the
 // dead coord's in-flight worker context and orphans that state.
 func TestRunDispatch_DeadCoordRecovery_StandDownDeliversRecoveryDoc(t *testing.T) {
-	requireTmux(t)
+	requireFakeTmux(t)
 	setupFleetHome(t)
 	t.Setenv("FLEET_LEASE_FAILOVER", "1")
 

@@ -85,6 +85,38 @@ triggers="tmux.Spawn(|spawn.Spawn(|runDispatch(|runHandoff(|runHandoffDrain(|run
 # must call the canonical helpers.
 markers='tmuxtest.RequireTmux|tmuxtest.IsolateSocket|requireTmux(|isolateTmuxSocket('
 
+# ci-perf-pr2 (DESIGN-ci-3min-test-suite): the in-process fake tmux backend
+# (internal/testutil/tmuxfake) is a valid isolation mechanism for
+# IN-PROCESS triggers — InstallFake swaps the package tmux backend so
+# tmux.Spawn records in-process and NEVER reaches the operator's default
+# socket. A test that installs the fake (tmuxfake.InstallFake, or the
+# requireFakeTmux wrapper) satisfies the safety boundary FOR IN-PROCESS
+# code paths.
+#
+# CRUCIAL LIMIT (codex iter-6 [P2]): the fake only rebinds function
+# pointers in the PARENT test process. A SUBPROCESS trigger — runFleet /
+# runTick / runTickCap shells out to a child `fleet` binary where
+# testing.Testing() is false and the fake was never installed — so the
+# child can still reach the real/default tmux socket. The fake therefore
+# does NOT attest isolation for a test that hits a subprocess trigger;
+# those MUST use real-socket isolation (tmuxtest.RequireTmux /
+# FLEET_TMUX_SOCKET). fake_markers below are honored ONLY when the test
+# has no subprocess trigger.
+#
+# NOTE: unlike markers / triggers / subproc_triggers / scandir_markers,
+# fake_markers gets NO helper-chain discovery pass — requireFakeTmux is the
+# only wrapper today and is listed literally. If a second wrapper appears
+# (e.g. setupFakeSpawn that calls tmuxfake.InstallFake), add it here OR wire a
+# fake-marker discovery loop. The failure mode of forgetting is SAFE (a
+# false-positive flag, never a missed leak), which is why auto-discovery is
+# deferred per "no premature abstractions".
+fake_markers='tmuxfake.InstallFake(|requireFakeTmux('
+
+# Subprocess entry points: these fork a child `fleet` that calls tmux from
+# its own process image (the fake is parent-only). A fake marker cannot
+# isolate these — only a real socket marker can.
+subproc_triggers="runFleet(|runTickCap(|runTick("
+
 # Enumerate test files. Use git when inside a repo so vendored/untracked
 # artifacts are skipped; fall back to find otherwise.
 file_lister() {
@@ -95,13 +127,15 @@ file_lister() {
   fi
 }
 
-# Skip the canonical helper's own test file. tmuxtest_test.go exercises
-# tmuxtest.RequireTmux without calling it transitively through any of the
-# trigger entry points; it's the helper's unit test, not a regression
-# test that leaks sessions.
+# Skip the isolation helpers' own test files. tmuxtest_test.go exercises
+# tmuxtest.RequireTmux, and tmuxfake's tests drive the fake's Spawn/Kill
+# methods directly (`f.Spawn(...)`) — the fake IS the isolation, so its
+# in-process calls never reach a real socket and can't leak a session.
+# These are the helpers' unit tests, not regression tests that leak.
 skip_file() {
   case "$1" in
     internal/testutil/tmuxtest/*) return 0;;
+    internal/testutil/tmuxfake/*) return 0;;
   esac
   return 1
 }
@@ -124,20 +158,42 @@ skip_file() {
 #
 # Function body ends when brace returns to 0 having gone above 0 — i.e.,
 # we've seen the opening { for the function and matched it.
-scan_file() {
-  local f="$1"
-  awk -v file="$f" -v trigs="$triggers" -v marks="$markers" -v exempt_marker="lint-test-isolation:exempt" '
+# _scan_bodies is the shared, Go-aware per-test-function scanner. It walks
+# each `func TestXxx` body with full raw-string / interpreted-string / //
+# and /* */ comment awareness and correct brace matching, then flags a
+# function whose body has a TRIGGER but no isolation. Parameterized on the
+# trigger/marker/fake-marker/subproc/exempt lists so BOTH the tmux rule
+# (scan_file) and the scan-dir rule (scan_scandir) reuse ONE correct parser
+# (codex iter-11 [P2]: the scan-dir rule's earlier crude per-line counter
+# mishandled block comments + multiline raw strings).
+#   $1=file $2=triggers $3=markers $4=fake_markers $5=subproc_triggers
+#   $6=exempt_marker
+_scan_bodies() {
+  awk -v file="$1" -v trigs="$2" -v marks="$3" \
+      -v fake_marks="$4" -v subproc_trigs="$5" \
+      -v exempt_marker="$6" '
     function reset() {
       in_func = 0
       func_name = ""
       start_line = 0
       saw_trig = 0
       saw_iso = 0
+      saw_fake_iso = 0   # fake-backend marker present (parent-only)
+      saw_subproc = 0    # subprocess trigger present (child escapes fake)
       brace = 0
       in_raw = 0
       in_str = 0
       in_blkcmt = 0  # codex iter-18 [P2]: prevent block-comment state
                      # bleeding from a prior function into the next one.
+    }
+    # is_isolated folds the fake-marker rule: a real-socket marker always
+    # isolates; a fake marker isolates ONLY when the test has no subprocess
+    # trigger (the child binary escapes the parent-only fake — codex
+    # iter-6 [P2]).
+    function is_isolated() {
+      if (saw_iso) return 1
+      if (saw_fake_iso && !saw_subproc) return 1
+      return 0
     }
     function any_substr(haystack, needles_str,    n, arr, i) {
       # "|" separator so a needle can contain spaces (e.g., "= Spawn(").
@@ -238,12 +294,14 @@ scan_file() {
       if (body != "") {
         if (any_substr(body, trigs)) saw_trig = 1
         if (any_substr(body, marks)) saw_iso = 1
+        if (any_substr(body, fake_marks)) saw_fake_iso = 1
+        if (any_substr(body, subproc_trigs)) saw_subproc = 1
       }
       # The exempt marker `lint-test-isolation:exempt` is intentionally
       # placed in comments; check the raw line for it separately.
       if (index($0, exempt_marker) > 0) saw_iso = 1
       if (brace == 0) {
-        if (saw_trig && !saw_iso) {
+        if (saw_trig && !is_isolated()) {
           printf "%s:%d:%s\n", file, start_line, func_name
         }
         reset()
@@ -258,6 +316,8 @@ scan_file() {
       if (code_line != "") {
         if (any_substr(code_line, trigs)) saw_trig = 1
         if (any_substr(code_line, marks)) saw_iso = 1
+        if (any_substr(code_line, fake_marks)) saw_fake_iso = 1
+        if (any_substr(code_line, subproc_trigs)) saw_subproc = 1
       }
       # The exempt marker `lint-test-isolation:exempt` is intentionally
       # placed in comments; check the raw line for it separately.
@@ -266,13 +326,20 @@ scan_file() {
       # us at 1 on the declaration line; the matching close brings us
       # back to 0.)
       if (brace == 0) {
-        if (saw_trig && !saw_iso) {
+        if (saw_trig && !is_isolated()) {
           printf "%s:%d:%s\n", file, start_line, func_name
         }
         reset()
       }
     }
-  ' "$f"
+  ' "$1"
+}
+
+# scan_file = the tmux socket-isolation rule (#1/#2), using the global
+# trigger / marker / fake-marker / subproc lists + the tmux exempt marker.
+scan_file() {
+  _scan_bodies "$1" "$triggers" "$markers" "$fake_markers" \
+    "$subproc_triggers" "lint-test-isolation:exempt"
 }
 
 # Pass 1: discover helper functions (any non-Test function in *_test.go
@@ -498,6 +565,28 @@ for pass in 1 2 3; do
   done < <(file_lister)
   if [ -z "$new_triggers" ]; then break; fi
   triggers="$triggers$new_triggers"
+done
+
+# --- Subprocess-trigger chain (codex iter-7 [P2]) ---
+# A helper that wraps a subprocess entry point (runFleet / runTick /
+# runTickCap) is itself a subprocess trigger: a test calling it forks a
+# child `fleet` that escapes the parent-only fake. Track these separately
+# from the in-process trigger chain so the fake marker is NOT accepted as
+# isolation for a test that reaches a subprocess trigger THROUGH a helper.
+# Exclude markers + fake_markers so an isolating helper isn't a sink.
+for pass in 1 2 3; do
+  new_subproc=""
+  while IFS= read -r f; do
+    if skip_file "$f"; then continue; fi
+    while IFS= read -r h; do
+      [ -n "$h" ] || continue
+      if list_contains "$subproc_triggers" "$h"; then continue; fi
+      if list_contains "$new_subproc" "$h"; then continue; fi
+      new_subproc="$new_subproc|$h"
+    done < <(discover_helpers "$f" "$subproc_triggers" "$markers|$fake_markers")
+  done < <(file_lister)
+  if [ -z "$new_subproc" ]; then break; fi
+  subproc_triggers="$subproc_triggers$new_subproc"
 done
 
 violations=()
@@ -767,6 +856,201 @@ if (( ${#cmd_violations[@]} > 0 )); then
   echo "'// lint-test-isolation:command-exempt' inside the test body." >&2
   echo "" >&2
   echo "See docs/DESIGN-lifecycle-leak-recurrence.md PR-A (root cause #1)." >&2
+  exit 1
+fi
+
+# ----- Third guard: scan-dir isolation (FLEET_GC_SCAN_DIR) -----
+#
+# ci-perf-pr2 (DESIGN-ci-3min-test-suite). Postmortem 2026-06-13 (PR #232
+# 24-min CI hang, fleet#165): runDispatch / runStatus call
+# runDispatchReconcile, and reconcile's OrphanTmux pass walks the socket
+# SCAN DIR (gc.gcScanDir → FLEET_GC_SCAN_DIR, default `/tmp`) and execs
+# `tmux -S <sock> ls` on every fleet-test-*.sock it finds. On a host with
+# hundreds of leaked sockets that is N tmux subprocesses PER test — the
+# exact grind that hung CI. Rule #1/#2 above guard the tmux SOCKET seam;
+# this rule guards the orthogonal SCAN-DIR seam (a test can isolate its
+# tmux socket yet still scan the host's real /tmp).
+#
+# Triggers (reach the scan-dir walk, directly or transitively):
+#   runDispatch( · runDispatchReconcile( · gc.Reconcile( · runStatus(
+#
+# Isolation is satisfied EITHER per-function OR per-package:
+#   per-function markers (the test scopes its own scan dir):
+#     t.Setenv("FLEET_GC_SCAN_DIR"  ·  DefaultDepsWithScanDir(
+#     ·  stubDispatchReconcile(  ·  isolateScanDir(
+#   per-function exempt comment:
+#     lint-test-isolation:scandir-exempt
+#   per-PACKAGE decoy: the package's TestMain sets FLEET_GC_SCAN_DIR to a
+#     decoy dir for the whole binary (cmd/fleet does this), which isolates
+#     every test in the package at the process boundary. A file whose
+#     package carries such a TestMain is exempt wholesale — re-annotating
+#     every dispatch test would be noise.
+#
+# A test may legitimately need BOTH a tmux marker (rule #1/#2) AND a
+# scan-dir marker (this rule); they guard different seams.
+scandir_triggers="runDispatch(|runDispatchReconcile(|gc.Reconcile(|runStatus("
+scandir_markers='t.Setenv("FLEET_GC_SCAN_DIR"|DefaultDepsWithScanDir(|stubDispatchReconcile(|isolateScanDir(|lint-test-isolation:scandir-exempt'
+
+# Packages exempted wholesale because their TestMain installs a process-
+# wide FLEET_GC_SCAN_DIR decoy. Detection (codex iter-7 [P2]): the file
+# must contain `func TestMain(` AND an ACTUAL setter call —
+# `Setenv("FLEET_GC_SCAN_DIR"` (os.Setenv or t.Setenv; TestMain uses
+# os.Setenv). A bare mention in a comment / dead code no longer qualifies,
+# so a package can't claim the exemption without really scoping the scan.
+# has_real_scandir_setter: true iff the file's TestMain FUNCTION BODY
+# contains an ACTUAL (non-commented) Setenv("FLEET_GC_SCAN_DIR" call. The
+# setter MUST live inside TestMain (codex iter-9 [P2]) — a package with a
+# TestMain plus an unrelated per-test t.Setenv elsewhere is NOT package-
+# exempt, because that per-test setter only isolates ITS test. Both `//`
+# and `/* */` comments are stripped so dead-code setters don't count
+# (codex iter-7/8 [P2]).
+has_real_scandir_setter() {
+  awk '
+    function strip(line,    i,n,c,out) {
+      out=""; i=1; n=length(line)
+      while (i<=n) {
+        if (in_blk) {
+          c=substr(line,i,1)
+          if (c=="*" && i<n && substr(line,i+1,1)=="/") { in_blk=0; i+=2; continue }
+          i++; continue
+        }
+        c=substr(line,i,1)
+        if (c=="/" && i<n && substr(line,i+1,1)=="/") break
+        if (c=="/" && i<n && substr(line,i+1,1)=="*") { in_blk=1; i+=2; continue }
+        out=out c; i++
+      }
+      return out
+    }
+    BEGIN { in_main=0; depth=0; in_blk=0; found=0 }
+    {
+      code=strip($0)
+      if (!in_main) {
+        if (code ~ /func[ \t]+TestMain[ \t]*\(/) {
+          in_main=1
+          # count braces on the declaration line itself
+        } else {
+          next
+        }
+      }
+      if (in_main) {
+        if (index(code, "Setenv(\"FLEET_GC_SCAN_DIR\"") > 0) found=1
+        tmp=code; gsub(/[^{]/,"",tmp); depth+=length(tmp)
+        tmp=code; gsub(/[^}]/,"",tmp); depth-=length(tmp)
+        # TestMain body closes when depth returns to 0 after the opening {.
+        if (depth<=0 && code ~ /}/) in_main=0
+      }
+    }
+    END { exit(found ? 0 : 1) }
+  ' "$1"
+}
+
+scandir_exempt_pkgs="|"
+while IFS= read -r f; do
+  if skip_file "$f"; then continue; fi
+  if has_real_scandir_setter "$f"; then
+    pkgdir="${f%/*}"
+    case "$scandir_exempt_pkgs" in
+      *"|$pkgdir|"*) ;;
+      *) scandir_exempt_pkgs="$scandir_exempt_pkgs$pkgdir|";;
+    esac
+  fi
+done < <(file_lister)
+
+# Helper-chain discovery for scan-dir triggers (codex iter-4 [P2]). Like
+# rule #1's trigger chain, a non-test helper that itself reaches a scan-dir
+# trigger (runDispatch / runStatus / gc.Reconcile / runDispatchReconcile)
+# WITHOUT isolating the scan dir becomes a trigger too — so a test that only
+# calls that helper (e.g. seedDispatched(t)) is still required to scope
+# FLEET_GC_SCAN_DIR. Without this, a trigger hidden behind a helper slips
+# past and the /tmp-scan hang this rule guards can recur.
+#
+# Two chains, run MARKER-first (mirrors rule #1):
+#
+#  (a) scan-dir MARKER-helper chain (codex iter-10 [P2]): a helper whose
+#      BODY scopes the scan dir (t.Setenv FLEET_GC_SCAN_DIR /
+#      DefaultDepsWithScanDir / ...) becomes a scan-dir MARKER itself, so a
+#      test calling that isolating helper is NOT falsely flagged. Without
+#      this, a helper that BOTH scopes the dir AND calls runDispatch would
+#      be misclassified as a trigger (discover_helpers' exclude is name-
+#      based, not body-based).
+#
+#  (b) scan-dir TRIGGER-helper chain: a helper reaching a scan-dir trigger
+#      WITHOUT isolating becomes a trigger. Run AFTER (a) so the exclude
+#      list (scandir_markers) already contains the isolating helpers.
+#
+# Iteration cap 3, matching the tmux chains (helper graphs are shallow).
+for pass in 1 2 3; do
+  new_scandir_markers=""
+  while IFS= read -r f; do
+    if skip_file "$f"; then continue; fi
+    while IFS= read -r h; do
+      [ -n "$h" ] || continue
+      if list_contains "$scandir_markers" "$h"; then continue; fi
+      if list_contains "$new_scandir_markers" "$h"; then continue; fi
+      new_scandir_markers="$new_scandir_markers|$h"
+    done < <(discover_helpers "$f" "$scandir_markers" "")
+  done < <(file_lister)
+  if [ -z "$new_scandir_markers" ]; then break; fi
+  scandir_markers="$scandir_markers$new_scandir_markers"
+done
+
+for pass in 1 2 3; do
+  new_scandir_triggers=""
+  while IFS= read -r f; do
+    if skip_file "$f"; then continue; fi
+    while IFS= read -r h; do
+      [ -n "$h" ] || continue
+      if list_contains "$scandir_triggers" "$h"; then continue; fi
+      if list_contains "$new_scandir_triggers" "$h"; then continue; fi
+      new_scandir_triggers="$new_scandir_triggers|$h"
+    done < <(discover_helpers "$f" "$scandir_triggers" "$scandir_markers")
+  done < <(file_lister)
+  if [ -z "$new_scandir_triggers" ]; then break; fi
+  scandir_triggers="$scandir_triggers$new_scandir_triggers"
+done
+
+# scan_scandir = the scan-dir isolation rule (#3). Reuses the SAME robust
+# Go-aware parser as scan_file via _scan_bodies (codex iter-11 [P2]): the
+# earlier hand-rolled per-line counter mishandled /* */ block comments and
+# multiline raw strings. Scan-dir has no fake-marker / subprocess concepts,
+# so those lists are empty; the exempt marker is the scandir-exempt comment.
+scan_scandir() {
+  _scan_bodies "$1" "$scandir_triggers" "$scandir_markers" "" "" \
+    "lint-test-isolation:scandir-exempt"
+}
+
+scandir_violations=()
+while IFS= read -r f; do
+  if skip_file "$f"; then continue; fi
+  pkgdir="${f%/*}"
+  case "$scandir_exempt_pkgs" in
+    *"|$pkgdir|"*) continue;;  # package-wide TestMain decoy
+  esac
+  while IFS= read -r v; do
+    [ -n "$v" ] || continue
+    scandir_violations+=("$v")
+  done < <(scan_scandir "$f")
+done < <(file_lister)
+
+if (( ${#scandir_violations[@]} > 0 )); then
+  echo "test-isolation-lint: FAIL (scan-dir isolation)" >&2
+  echo "" >&2
+  echo "The following test functions reach the socket scan dir (via" >&2
+  echo "runDispatch / runDispatchReconcile / gc.Reconcile / runStatus)" >&2
+  echo "but do NOT isolate FLEET_GC_SCAN_DIR. The reconcile OrphanTmux" >&2
+  echo "pass walks that dir (default /tmp) and execs 'tmux -S <sock> ls'" >&2
+  echo "on every fleet-test-*.sock — the PR #232 24-min CI hang." >&2
+  echo "" >&2
+  printf '  %s\n' "${scandir_violations[@]}" >&2
+  echo "" >&2
+  echo "Fix (any one):" >&2
+  echo "  - t.Setenv(\"FLEET_GC_SCAN_DIR\", t.TempDir())  // scope the scan" >&2
+  echo "  - use gc.DefaultDepsWithScanDir(dir) / stubDispatchReconcile(...)" >&2
+  echo "  - give the package a TestMain that sets a FLEET_GC_SCAN_DIR decoy" >&2
+  echo "  - if the test genuinely must scan real /tmp, add the comment" >&2
+  echo "    // lint-test-isolation:scandir-exempt" >&2
+  echo "" >&2
+  echo "See docs/DESIGN-ci-3min-test-suite.md + the PR #232 postmortem." >&2
   exit 1
 fi
 

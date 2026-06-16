@@ -46,11 +46,39 @@ const (
 	MinTmuxMinor = 2
 )
 
+// Function-table seam (ci-perf-pr2). Each exported shelling op below is a
+// thin forwarder to a package-level var that defaults to the real `tmux`
+// backend (realXxx). Tests swap the table for an in-process memory fake via
+// tmuxtest.InstallFake so routed unit tests never spawn a real subprocess —
+// the lever that takes CI under 3 minutes. SessionName is pure and exempt.
+//
+//	caller ──▶ tmux.Spawn(...) ──▶ spawnFn(...) ──┬─▶ realSpawn (prod)
+//	                                              └─▶ fake.Spawn (test, swapped)
+//
+// The seam is the SOLE supported swap mechanism. The runtime sink guard in
+// realSpawn (below) remains the load-bearing safety boundary for any test
+// that DOES reach the real backend (parity/smoke tests under RequireTmux).
+var (
+	availableFn               = realAvailable
+	hasSessionFn              = realHasSession
+	sessionAliveFn            = realSessionAlive
+	spawnFn                   = realSpawn
+	attachFn                  = realAttach
+	sendKeysFn                = realSendKeys
+	capturePaneFn             = realCapturePane
+	setStatusHintFn           = realSetStatusHint
+	killFn                    = realKill
+	listSessionsFn            = realListSessions
+	listSessionsWithCreatedFn = realListSessionsWithCreated
+)
+
 // Available returns nil if `tmux` is on PATH AND its version is at
 // least MinTmuxMajor.MinTmuxMinor. Surfaces a clear error at startup
 // before any spawn attempt; on older tmux, dispatch and handoff would
 // fail at `new-session -e` with a confusing "unknown option" message.
-func Available() error {
+func Available() error { return availableFn() }
+
+func realAvailable() error {
 	cmd := exec.Command("tmux", tmuxArgs("-V")...)
 	out, err := cmd.Output()
 	if err != nil {
@@ -121,7 +149,9 @@ func parseInt(s string) (int, error) {
 // It conflates "session does not exist" with "probe failed" (binary
 // missing, socket broken). Cleanup or status paths that must NOT
 // confuse those two cases should use SessionAlive instead.
-func HasSession(session string) bool {
+func HasSession(session string) bool { return hasSessionFn(session) }
+
+func realHasSession(session string) bool {
 	cmd := exec.Command("tmux", tmuxArgs("has-session", "-t", session)...)
 	return cmd.Run() == nil
 }
@@ -148,7 +178,9 @@ func HasSession(session string) bool {
 // tmux's "can't find session" / "no server running" message.
 // Anything else with exit 1 is reported as a probe error so the
 // caller refuses to act on ambiguous state.
-func SessionAlive(session string) (bool, error) {
+func SessionAlive(session string) (bool, error) { return sessionAliveFn(session) }
+
+func realSessionAlive(session string) (bool, error) {
 	cmd := exec.Command("tmux", tmuxArgs("has-session", "-t", session)...)
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
@@ -203,6 +235,10 @@ func SessionAlive(session string) (bool, error) {
 // later client connection. Using `-e` works in both cases (fresh
 // server or existing).
 func Spawn(session, cwd string, command, extraEnv []string) error {
+	return spawnFn(session, cwd, command, extraEnv)
+}
+
+func realSpawn(session, cwd string, command, extraEnv []string) error {
 	if len(command) == 0 {
 		return errors.New("tmux.Spawn: empty command")
 	}
@@ -270,7 +306,11 @@ func Spawn(session, cwd string, command, extraEnv []string) error {
 	// stderr signals trouble — short-lived commands like `sh -c true`
 	// also leave HasSession=false, but cleanly (no stderr), and we
 	// must not flag those as failures.
-	if stderr.Len() > 0 && !HasSession(session) {
+	// realHasSession (NOT the exported HasSession): a real op must probe
+	// real tmux even when a fake backend is installed, so RealBackend()
+	// genuinely bypasses the fake (codex iter-2 [P2]). The exported
+	// wrapper forwards to hasSessionFn, which the fake swaps.
+	if stderr.Len() > 0 && !realHasSession(session) {
 		return fmt.Errorf("tmux new-session %s: exit 0 but session not created (%s)", session, stderr.String())
 	}
 	return nil
@@ -281,8 +321,10 @@ func Spawn(session, cwd string, command, extraEnv []string) error {
 //
 // Uses syscall-style exec so the user's terminal is connected directly
 // to tmux without an intermediate `fleet` process holding the session.
-func Attach(session string) error {
-	if !HasSession(session) {
+func Attach(session string) error { return attachFn(session) }
+
+func realAttach(session string) error {
+	if !realHasSession(session) { // real probe — bypass any installed fake
 		return fmt.Errorf("%w: %s", ErrNoSession, session)
 	}
 	bin, err := exec.LookPath("tmux")
@@ -307,7 +349,11 @@ func Attach(session string) error {
 // Returns ErrNoSession if the session has already exited — callers
 // in cleanup paths typically ignore this and proceed to Kill.
 func SendKeys(session string, keys ...string) error {
-	if !HasSession(session) {
+	return sendKeysFn(session, keys...)
+}
+
+func realSendKeys(session string, keys ...string) error {
+	if !realHasSession(session) { // real probe — bypass any installed fake
 		return fmt.Errorf("%w: %s", ErrNoSession, session)
 	}
 	args := append([]string{"send-keys", "-t", session}, keys...)
@@ -336,8 +382,10 @@ func SendKeys(session string, keys ...string) error {
 // roll back the new agent on ErrNoSession but only log on other
 // errors, so misclassifying transport failures would strand live
 // replacements (codex review iter-15 P1).
-func CapturePane(session string) ([]byte, error) {
-	alive, probeErr := SessionAlive(session)
+func CapturePane(session string) ([]byte, error) { return capturePaneFn(session) }
+
+func realCapturePane(session string) ([]byte, error) {
+	alive, probeErr := realSessionAlive(session) // real probe — bypass fake
 	switch {
 	case probeErr != nil:
 		return nil, fmt.Errorf("tmux capture-pane %s: probe failed: %w",
@@ -376,7 +424,9 @@ func CapturePane(session string) ([]byte, error) {
 //
 // status-right-length is bumped so a long pre-existing format string
 // plus the prepended hint fits without truncation.
-func SetStatusHint(session, hint string) error {
+func SetStatusHint(session, hint string) error { return setStatusHintFn(session, hint) }
+
+func realSetStatusHint(session, hint string) error {
 	// Read the user's current status-right (global). The format
 	// string is preserved verbatim, so #[fg=...] and #() interpolations
 	// stay intact.
@@ -410,8 +460,10 @@ func SetStatusHint(session, hint string) error {
 // live session as if it had been terminated (codex review iter-7
 // P2). Uses the tristate SessionAlive instead of HasSession so the
 // "probe failed" case no longer collapses into "already gone".
-func Kill(session string) error {
-	alive, err := SessionAlive(session)
+func Kill(session string) error { return killFn(session) }
+
+func realKill(session string) error {
+	alive, err := realSessionAlive(session) // real probe — bypass any installed fake
 	if err != nil {
 		return fmt.Errorf("tmux kill-session %s: pre-probe failed: %w", session, err)
 	}
@@ -447,7 +499,9 @@ func SessionName(agentID string) string {
 //
 // Trailing newline stripped; per-line names trimmed. Empty lines
 // (defensive — tmux shouldn't emit them) skipped.
-func ListSessions() ([]string, error) {
+func ListSessions() ([]string, error) { return listSessionsFn() }
+
+func realListSessions() ([]string, error) {
 	cmd := exec.Command("tmux", tmuxArgs("ls", "-F", "#{session_name}")...)
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
@@ -503,7 +557,9 @@ type SessionInfo struct {
 // before its agent record finishes writing (see spawn.Spawn:
 // tmux.Spawn → resolveEnginePid → rec.Write), and the sweeper must
 // not kill that legitimate window.
-func ListSessionsWithCreated() ([]SessionInfo, error) {
+func ListSessionsWithCreated() ([]SessionInfo, error) { return listSessionsWithCreatedFn() }
+
+func realListSessionsWithCreated() ([]SessionInfo, error) {
 	cmd := exec.Command("tmux", tmuxArgs("ls", "-F", "#{session_name} #{session_created}")...)
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout

@@ -48,6 +48,7 @@ func TestCoordRunWrap_Shape(t *testing.T) {
 }
 
 func TestCoordRunWrap_DoesNotMutateInput(t *testing.T) {
+	t.Parallel()
 	engine := []string{"sh", "-c", "claude"}
 	orig := append([]string(nil), engine...)
 	_ = coordRunWrap("/bin/fleet", "id1", "p1", time.Minute, engine)
@@ -87,6 +88,8 @@ func TestCoordRunWrap_DefaultTimeout(t *testing.T) {
 // env (codex PR4 [P2]) — guard the expectations by GOOS so the test passes
 // on every build target.
 func TestLeaseFailoverEnabled_Gate(t *testing.T) {
+	// NOT t.Parallel: uses t.Setenv, which panics under t.Parallel
+	// (Go forbids parallel + per-test env mutation).
 	leaseCapable := runtime.GOOS == "linux" || runtime.GOOS == "darwin"
 	cases := map[string]bool{
 		"": true, "1": true, "yes": true, "on": true, "anything": true, " 1 ": true,
@@ -104,6 +107,7 @@ func TestLeaseFailoverEnabled_Gate(t *testing.T) {
 }
 
 func TestShouldLeaseWrap(t *testing.T) {
+	t.Parallel()
 	cases := []struct {
 		name                         string
 		failoverOn, isCoord, disable bool
@@ -128,6 +132,7 @@ func TestShouldLeaseWrap(t *testing.T) {
 // W3: the idempotency guard recognizes an already-wrapped argv so a
 // re-spawn never nests coord-run inside coord-run.
 func TestAlreadyCoordRunWrapped(t *testing.T) {
+	t.Parallel()
 	yes := [][]string{
 		{"/usr/local/bin/fleet", "coord-run", "--agent", "x", "--", "sh"},
 		{"/tmp/go-build/exe/fleet.test", "coord-run", "--", "true"},
@@ -188,6 +193,7 @@ func TestAugmentCoordRunWrap_ReplacesWrongTimeout(t *testing.T) {
 }
 
 func TestShouldStandDownLeaseWrappedSpawn(t *testing.T) {
+	t.Parallel()
 	leader := func(string) bool { return true }
 
 	if shouldStandDownLeaseWrappedSpawn("rainier", 0, leader,

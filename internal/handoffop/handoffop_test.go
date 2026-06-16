@@ -18,6 +18,7 @@ import (
 	"github.com/edisonshen/fleet/internal/rc"
 	"github.com/edisonshen/fleet/internal/spawn"
 	"github.com/edisonshen/fleet/internal/state"
+	"github.com/edisonshen/fleet/internal/testutil/tmuxfake"
 	"github.com/edisonshen/fleet/internal/testutil/tmuxtest"
 	"github.com/edisonshen/fleet/internal/tmux"
 )
@@ -61,6 +62,33 @@ func requireTmux(t *testing.T) {
 	// commands where no claude descendant exists, so we'd pay the
 	// full timeout per test without this pin.
 	t.Setenv("FLEET_PID_RESOLVE_S", "1")
+}
+
+// requireFakeTmux installs the in-process fake tmux backend
+// (internal/testutil/tmuxfake) + the fast pid resolver so the test
+// exercises the real Resume/Drain code paths WITHOUT execing tmux(1) —
+// the CI-perf lever (PR-2 of DESIGN-ci-3min-test-suite). It is the fast,
+// orphan-proof substitute for requireTmux and a recognized isolation
+// marker for lint-test-isolation.sh (the fake never touches the
+// operator's default socket).
+//
+// Use requireFakeTmux for tests that only need a session abstraction
+// (Spawn / Kill / HasSession / SendKeys) and assert on Fleet's own
+// state. Use requireTmux only for tests that need REAL pane content or
+// real process semantics. The env pins mirror requireTmux so any
+// production timing path the test still touches stays fast.
+func requireFakeTmux(t *testing.T) *tmuxfake.Fake {
+	t.Helper()
+	f := tmuxfake.InstallFake(t)
+	t.Setenv("FLEET_LEASE_FAILOVER", "0")
+	t.Setenv("FLEET_INITIAL_PROMPT_STABLE_MS", "0")
+	t.Setenv("FLEET_INITIAL_PROMPT_MAX_MS", "100")
+	t.Setenv("FLEET_POST_READY_BUFFER_MS", "0")
+	t.Setenv("FLEET_POST_SEND_VERIFY_MS", "0")
+	t.Setenv("FLEET_POST_SEND_RETRY_MS", "0")
+	t.Setenv("FLEET_PROMPT_ENTER_DELAY_MS", "0")
+	t.Setenv("FLEET_PID_RESOLVE_S", "1")
+	return f
 }
 
 // spawnSeedAgent stands in for `fleet dispatch`: seeds an agent record
@@ -256,7 +284,7 @@ func writeCoordSkillQueue(t *testing.T, oldRec *agent.Record) (queue.SpawnFresh,
 // E7 (drain handoff) — a COORD drain handoff resolves the replacement's
 // Cwd via the shared resolver (meta repo), NOT the outgoing coord's Cwd.
 func TestResume_CoordDrain_ResolvesRepoNotOldCwd(t *testing.T) {
-	requireTmux(t)
+	requireFakeTmux(t)
 	setupFleetHome(t)
 	const project = "rainier"
 	correctRepo := seedCoordRepoMeta(t, project)
@@ -265,7 +293,7 @@ func TestResume_CoordDrain_ResolvesRepoNotOldCwd(t *testing.T) {
 	req, qp := writeCoordSkillQueue(t, oldRec)
 
 	out := &bytes.Buffer{}
-	if err := Resume(req, qp, 0, out, out); err != nil {
+	if err := Resume(req, qp, 1, out, out); err != nil {
 		t.Fatalf("Resume: %v\n%s", err, out.String())
 	}
 	newRec, err := agent.Load(req.NewAgentID)
@@ -282,7 +310,7 @@ func TestResume_CoordDrain_ResolvesRepoNotOldCwd(t *testing.T) {
 // E7 (drain handoff, refuse) — a COORD drain handoff REFUSES when the
 // resolver cannot bind; it does NOT fall back to oldRec.Cwd.
 func TestResume_CoordDrain_RefusesWhenUnresolvable(t *testing.T) {
-	requireTmux(t)
+	requireFakeTmux(t)
 	setupFleetHome(t)
 	const project = "ghostproj" // no meta, no worktrees → refuse
 	wrongCwd := t.TempDir()
@@ -290,7 +318,7 @@ func TestResume_CoordDrain_RefusesWhenUnresolvable(t *testing.T) {
 	req, qp := writeCoordSkillQueue(t, oldRec)
 
 	out := &bytes.Buffer{}
-	err := Resume(req, qp, 0, out, out)
+	err := Resume(req, qp, 1, out, out)
 	if err == nil {
 		t.Fatal("coord drain must REFUSE when resolver cannot bind, got nil")
 	}
@@ -306,7 +334,7 @@ func TestResume_CoordDrain_RefusesWhenUnresolvable(t *testing.T) {
 
 // E8 (drain handoff) — a WORKER drain handoff still inherits oldRec.Cwd.
 func TestResume_WorkerDrain_StillInheritsOldCwd(t *testing.T) {
-	requireTmux(t)
+	requireFakeTmux(t)
 	setupFleetHome(t)
 	// Seed meta for the project to prove the worker path ignores it.
 	otherRepo := seedCoordRepoMeta(t, "rainier")
@@ -315,7 +343,7 @@ func TestResume_WorkerDrain_StillInheritsOldCwd(t *testing.T) {
 	req, qp, _ := writeSkillQueue(t, oldRec)
 
 	out := &bytes.Buffer{}
-	if err := Resume(req, qp, 0, out, out); err != nil {
+	if err := Resume(req, qp, 1, out, out); err != nil {
 		t.Fatalf("Resume: %v\n%s", err, out.String())
 	}
 	newRec, err := agent.Load(req.NewAgentID)
@@ -334,13 +362,13 @@ func TestResume_WorkerDrain_StillInheritsOldCwd(t *testing.T) {
 // -- happy path: skill wrote queue, no replacement yet ----------------------
 
 func TestResume_SkillDrivenSpawnsAndRetires(t *testing.T) {
-	requireTmux(t)
+	requireFakeTmux(t)
 	setupFleetHome(t)
 	oldRec := spawnSeedAgent(t)
 	req, qp, _ := writeSkillQueue(t, oldRec)
 
 	out := &bytes.Buffer{}
-	if err := Resume(req, qp, 0, out, out); err != nil {
+	if err := Resume(req, qp, 1, out, out); err != nil {
 		t.Fatalf("Resume: %v\n%s", err, out.String())
 	}
 
@@ -377,7 +405,7 @@ func TestResume_SkillDrivenSpawnsAndRetires(t *testing.T) {
 // -- crash recovery: replacement already spawned ----------------------------
 
 func TestResume_AlreadySpawnedSkipsSpawnRunsTail(t *testing.T) {
-	requireTmux(t)
+	requireFakeTmux(t)
 	setupFleetHome(t)
 	oldRec := spawnSeedAgent(t)
 	req, qp, docPath := writeSkillQueue(t, oldRec)
@@ -397,7 +425,7 @@ func TestResume_AlreadySpawnedSkipsSpawnRunsTail(t *testing.T) {
 	t.Cleanup(func() { _ = tmux.Kill(newRec.TmuxSession) })
 
 	out := &bytes.Buffer{}
-	if err := Resume(req, qp, 0, out, out); err != nil {
+	if err := Resume(req, qp, 1, out, out); err != nil {
 		t.Fatalf("Resume: %v\n%s", err, out.String())
 	}
 
@@ -448,7 +476,7 @@ func TestResume_CrashRecoveryDeliversPromptToReplacement(t *testing.T) {
 	t.Cleanup(func() { _ = tmux.Kill(newRec.TmuxSession) })
 
 	out := &bytes.Buffer{}
-	if err := Resume(req, qp, 0, out, out); err != nil {
+	if err := Resume(req, qp, 1, out, out); err != nil {
 		t.Fatalf("Resume: %v\n%s", err, out.String())
 	}
 
@@ -511,7 +539,7 @@ func TestResume_DisableAutoResumeSkipsPrompt(t *testing.T) {
 	t.Cleanup(func() { _ = tmux.Kill(newRec.TmuxSession) })
 
 	out := &bytes.Buffer{}
-	if err := Resume(req, qp, 0, out, out); err != nil {
+	if err := Resume(req, qp, 1, out, out); err != nil {
 		t.Fatalf("Resume: %v\n%s", err, out.String())
 	}
 
@@ -532,7 +560,7 @@ func TestResume_DisableAutoResumeSkipsPrompt(t *testing.T) {
 // -- stale queue cleanup ----------------------------------------------------
 
 func TestResume_StaleQueueClearedWhenHandoffAlreadyComplete(t *testing.T) {
-	requireTmux(t)
+	requireFakeTmux(t)
 	setupFleetHome(t)
 	oldRec := spawnSeedAgent(t)
 	req, qp, docPath := writeSkillQueue(t, oldRec)
@@ -558,7 +586,7 @@ func TestResume_StaleQueueClearedWhenHandoffAlreadyComplete(t *testing.T) {
 	_ = tmux.Kill(oldRec.TmuxSession)
 
 	out := &bytes.Buffer{}
-	if err := Resume(req, qp, 0, out, out); err != nil {
+	if err := Resume(req, qp, 1, out, out); err != nil {
 		t.Fatalf("Resume: %v\n%s", err, out.String())
 	}
 	if !strings.Contains(out.String(), "already handed off") {
@@ -572,7 +600,7 @@ func TestResume_StaleQueueClearedWhenHandoffAlreadyComplete(t *testing.T) {
 // -- orphan refusal ---------------------------------------------------------
 
 func TestResume_RefusesWhenNewSessionAliveButRecordMissing(t *testing.T) {
-	requireTmux(t)
+	requireFakeTmux(t)
 	setupFleetHome(t)
 	oldRec := spawnSeedAgent(t)
 	req, qp, _ := writeSkillQueue(t, oldRec)
@@ -587,7 +615,7 @@ func TestResume_RefusesWhenNewSessionAliveButRecordMissing(t *testing.T) {
 	t.Cleanup(func() { _ = tmux.Kill(req.NewSession) })
 
 	out := &bytes.Buffer{}
-	err := Resume(req, qp, 0, out, out)
+	err := Resume(req, qp, 1, out, out)
 	if err == nil {
 		t.Fatal("expected refusal but got nil")
 	}
@@ -603,7 +631,7 @@ func TestResume_RefusesWhenNewSessionAliveButRecordMissing(t *testing.T) {
 // -- stale-replacement-with-dead-session → cleanup + fresh spawn ------------
 
 func TestResume_StaleReplacementWithDeadSessionRespawnsFresh(t *testing.T) {
-	requireTmux(t)
+	fake := requireFakeTmux(t)
 	setupFleetHome(t)
 	oldRec := spawnSeedAgent(t)
 	req, qp, docPath := writeSkillQueue(t, oldRec)
@@ -615,26 +643,27 @@ func TestResume_StaleReplacementWithDeadSessionRespawnsFresh(t *testing.T) {
 		OldRecord:      oldRec,
 		NewDocPath:     docPath,
 		Cwd:            oldRec.Cwd,
-		Command:        []string{"true"}, // exits instantly
+		Command:        []string{"true"}, // crashed-at-startup stand-in
 		PreAllocatedID: req.NewAgentID,
 	})
 	if err != nil {
 		t.Fatalf("plant stale: %v", err)
 	}
-	// Wait for the `true` process to exit and tmux to reap the session.
-	deadline := time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) {
-		if !tmux.HasSession(staleNew.TmuxSession) {
-			break
-		}
-		time.Sleep(50 * time.Millisecond)
+	// Make the planted session DEFINITIVELY dead. With real tmux the
+	// `true` process would exit and tmux would reap the session; the fake
+	// records an in-memory session that never exits on its own, so we kill
+	// it explicitly to model the crashed-at-startup replacement. This is
+	// deterministic (no exit-race poll / environment-quirk Skip — codex
+	// iter-3 [P2], which otherwise silently disabled this regression).
+	if err := fake.Kill(staleNew.TmuxSession); err != nil {
+		t.Fatalf("kill planted stale session: %v", err)
 	}
 	if tmux.HasSession(staleNew.TmuxSession) {
-		t.Skip("stale session refused to die; environment quirk")
+		t.Fatal("planted stale session must be dead before Resume")
 	}
 
 	out := &bytes.Buffer{}
-	if err := Resume(req, qp, 0, out, out); err != nil {
+	if err := Resume(req, qp, 1, out, out); err != nil {
 		t.Fatalf("Resume: %v\n%s", err, out.String())
 	}
 	// Resume must have spawned a fresh replacement at the SAME pre-allocated
@@ -653,7 +682,7 @@ func TestResume_StaleReplacementWithDeadSessionRespawnsFresh(t *testing.T) {
 // -- legacy record refusal --------------------------------------------------
 
 func TestResume_RefusesLegacyRecordMissingCwd(t *testing.T) {
-	requireTmux(t)
+	requireFakeTmux(t)
 	setupFleetHome(t)
 
 	// Seed an agent missing Cwd / Command — mimicking a record dispatched
@@ -678,7 +707,7 @@ func TestResume_RefusesLegacyRecordMissingCwd(t *testing.T) {
 
 	req, qp, _ := writeSkillQueue(t, rec)
 	out := &bytes.Buffer{}
-	err := Resume(req, qp, 0, out, out)
+	err := Resume(req, qp, 1, out, out)
 	if err == nil || !strings.Contains(err.Error(), "legacy record") {
 		t.Errorf("expected legacy-record refusal, got: %v", err)
 	}
@@ -696,7 +725,7 @@ func TestResume_RefusesLegacyRecordMissingCwd(t *testing.T) {
 // happy path: pre-seed marker = oldRec.ID, run Resume, marker should
 // now equal newRec.ID.
 func TestAutoHandoff_TransfersCoordMarkerWhenOldWasCoord(t *testing.T) {
-	requireTmux(t)
+	requireFakeTmux(t)
 	setupFleetHome(t)
 	oldRec := spawnSeedAgent(t)
 
@@ -711,7 +740,7 @@ func TestAutoHandoff_TransfersCoordMarkerWhenOldWasCoord(t *testing.T) {
 
 	req, qp, _ := writeSkillQueue(t, oldRec)
 	out := &bytes.Buffer{}
-	if err := Resume(req, qp, 0, out, out); err != nil {
+	if err := Resume(req, qp, 1, out, out); err != nil {
 		t.Fatalf("Resume: %v\n%s", err, out.String())
 	}
 
@@ -732,7 +761,7 @@ func TestAutoHandoff_TransfersCoordMarkerWhenOldWasCoord(t *testing.T) {
 // guard: marker points at some OTHER agent ID (not oldRec.ID); after
 // a handoff of oldRec, the marker is unchanged.
 func TestAutoHandoff_NoMarkerUpdate_WhenOldWasNotCoord(t *testing.T) {
-	requireTmux(t)
+	requireFakeTmux(t)
 	setupFleetHome(t)
 	oldRec := spawnSeedAgent(t)
 
@@ -746,7 +775,7 @@ func TestAutoHandoff_NoMarkerUpdate_WhenOldWasNotCoord(t *testing.T) {
 
 	req, qp, _ := writeSkillQueue(t, oldRec)
 	out := &bytes.Buffer{}
-	if err := Resume(req, qp, 0, out, out); err != nil {
+	if err := Resume(req, qp, 1, out, out); err != nil {
 		t.Fatalf("Resume: %v\n%s", err, out.String())
 	}
 
@@ -767,7 +796,7 @@ func TestAutoHandoff_NoMarkerUpdate_WhenOldWasNotCoord(t *testing.T) {
 // after Resume (no error, no spurious creation). Most non-coord agents
 // run with no marker at all.
 func TestAutoHandoff_NoMarkerUpdate_WhenNoMarkerExists(t *testing.T) {
-	requireTmux(t)
+	requireFakeTmux(t)
 	setupFleetHome(t)
 	oldRec := spawnSeedAgent(t)
 
@@ -775,7 +804,7 @@ func TestAutoHandoff_NoMarkerUpdate_WhenNoMarkerExists(t *testing.T) {
 	// exist; ReadCoordSpawnMarker returns "" either way.
 	req, qp, _ := writeSkillQueue(t, oldRec)
 	out := &bytes.Buffer{}
-	if err := Resume(req, qp, 0, out, out); err != nil {
+	if err := Resume(req, qp, 1, out, out); err != nil {
 		t.Fatalf("Resume: %v\n%s", err, out.String())
 	}
 
@@ -816,7 +845,7 @@ func TestAutoHandoff_NoMarkerUpdate_WhenNoMarkerExists(t *testing.T) {
 // SessionAlive tristate must surface the probe error without invoking
 // DropReplacementRecord (no kill, record file intact, queue preserved).
 func TestResume_Case3_ProbeErrorPreservesRecordAndDropsNoSession(t *testing.T) {
-	requireTmux(t)
+	requireFakeTmux(t)
 	setupFleetHome(t)
 	oldRec := spawnSeedAgent(t)
 	req, qp, docPath := writeSkillQueue(t, oldRec)
@@ -857,7 +886,7 @@ func TestResume_Case3_ProbeErrorPreservesRecordAndDropsNoSession(t *testing.T) {
 	t.Cleanup(func() { tmuxSessionAliveFn = origAlive; tmuxKillFn = origKill })
 
 	out := &bytes.Buffer{}
-	resumeErr := Resume(req, qp, 0, out, out)
+	resumeErr := Resume(req, qp, 1, out, out)
 	_ = docPath
 
 	if resumeErr == nil {
@@ -895,7 +924,7 @@ func TestResume_Case3_ProbeErrorPreservesRecordAndDropsNoSession(t *testing.T) {
 // Uses the existing fakeable seam so we don't need to race a real tmux
 // session into the "definitely-dead but record-exists" shape.
 func TestResume_Case3_DefinitiveDeadStillEntersCleanup(t *testing.T) {
-	requireTmux(t)
+	requireFakeTmux(t)
 	setupFleetHome(t)
 	oldRec := spawnSeedAgent(t)
 	req, qp, _ := writeSkillQueue(t, oldRec)
@@ -928,7 +957,7 @@ func TestResume_Case3_DefinitiveDeadStillEntersCleanup(t *testing.T) {
 	t.Cleanup(func() { tmuxSessionAliveFn = origAlive })
 
 	out := &bytes.Buffer{}
-	if err := Resume(req, qp, 0, out, out); err != nil {
+	if err := Resume(req, qp, 1, out, out); err != nil {
 		t.Fatalf("Resume: %v\n%s", err, out.String())
 	}
 
@@ -943,7 +972,7 @@ func TestResume_Case3_DefinitiveDeadStillEntersCleanup(t *testing.T) {
 	t.Cleanup(func() { _ = tmux.Kill(freshRec.TmuxSession) })
 }
 func TestResume_StaleCoordMarker_RolledBackBeforeRespawn(t *testing.T) {
-	requireTmux(t)
+	requireFakeTmux(t)
 	setupFleetHome(t)
 	oldRec := spawnSeedAgent(t)
 	req, qp, _ := writeSkillQueue(t, oldRec)
@@ -992,7 +1021,7 @@ func TestResume_StaleCoordMarker_RolledBackBeforeRespawn(t *testing.T) {
 	t.Cleanup(func() { tmuxSessionAliveFn = origAlive })
 
 	out := &bytes.Buffer{}
-	if err := Resume(req, qp, 0, out, out); err != nil {
+	if err := Resume(req, qp, 1, out, out); err != nil {
 		t.Fatalf("Resume: %v\n%s", err, out.String())
 	}
 
@@ -1046,7 +1075,7 @@ func TestResume_StaleCoordMarker_RolledBackBeforeRespawn(t *testing.T) {
 // Touching an unrelated marker would corrupt another project's coord
 // pointer. Idempotency of RollbackCoordMarkerIfPointingAt covers this.
 func TestResume_StaleCoordMarker_NonCoord_NoRollback(t *testing.T) {
-	requireTmux(t)
+	requireFakeTmux(t)
 	setupFleetHome(t)
 	oldRec := spawnSeedAgent(t)
 	req, qp, _ := writeSkillQueue(t, oldRec)
@@ -1083,7 +1112,7 @@ func TestResume_StaleCoordMarker_NonCoord_NoRollback(t *testing.T) {
 	t.Cleanup(func() { tmuxSessionAliveFn = origAlive })
 
 	out := &bytes.Buffer{}
-	if err := Resume(req, qp, 0, out, out); err != nil {
+	if err := Resume(req, qp, 1, out, out); err != nil {
 		t.Fatalf("Resume: %v\n%s", err, out.String())
 	}
 
@@ -1121,7 +1150,7 @@ func TestResume_StaleCoordMarker_NonCoord_NoRollback(t *testing.T) {
 // only legitimate coord and respawning is safe — see
 // TestResume_PreCommitStaleNewRec_OldAlive_StillRespawns below.
 func TestResume_StaleCoordMarker_OldStillAlive_RefusesRespawn(t *testing.T) {
-	requireTmux(t)
+	requireFakeTmux(t)
 	setupFleetHome(t)
 	oldRec := spawnSeedAgent(t) // OLD session alive for the duration of the test.
 	req, qp, _ := writeSkillQueue(t, oldRec)
@@ -1160,7 +1189,7 @@ func TestResume_StaleCoordMarker_OldStillAlive_RefusesRespawn(t *testing.T) {
 	t.Cleanup(func() { tmuxSessionAliveFn = origAlive })
 
 	out := &bytes.Buffer{}
-	err := Resume(req, qp, 0, out, out)
+	err := Resume(req, qp, 1, out, out)
 	if err == nil {
 		t.Fatalf("Resume must refuse when OLD coord still alive; got nil error\n%s", out.String())
 	}
@@ -1206,7 +1235,7 @@ func TestResume_StaleCoordMarker_OldStillAlive_RefusesRespawn(t *testing.T) {
 // requiring operator intervention. iter-15 narrows the predicate to
 // `marker == newRec.ID` only.
 func TestResume_PreCommitStaleNewRec_OldAlive_StillRespawns(t *testing.T) {
-	requireTmux(t)
+	requireFakeTmux(t)
 	setupFleetHome(t)
 	oldRec := spawnSeedAgent(t) // OLD session stays alive.
 	req, qp, _ := writeSkillQueue(t, oldRec)
@@ -1247,7 +1276,7 @@ func TestResume_PreCommitStaleNewRec_OldAlive_StillRespawns(t *testing.T) {
 
 	// Resume must NOT refuse — pre-commit state is safe to auto-recover.
 	out := &bytes.Buffer{}
-	if err := Resume(req, qp, 0, out, out); err != nil {
+	if err := Resume(req, qp, 1, out, out); err != nil {
 		t.Fatalf("Resume on pre-commit stale newRec must succeed; got: %v\n%s", err, out.String())
 	}
 
@@ -1403,7 +1432,7 @@ func TestCoordDrainExecArgv_CustomCommandPassesThrough(t *testing.T) {
 }
 
 func TestDrain_LeaseFailoverCoordHandoff_ResumeFallbackCompletes(t *testing.T) {
-	requireTmux(t)
+	requireFakeTmux(t)
 	t.Setenv("FLEET_LEASE_FAILOVER", "1")
 	setupFleetHome(t)
 
@@ -1453,7 +1482,7 @@ func TestDrain_LeaseFailoverCoordHandoff_ResumeFallbackCompletes(t *testing.T) {
 		return true, nil
 	}
 	out := &bytes.Buffer{}
-	if err := Resume(req, qp, 0, out, out); err != nil {
+	if err := Resume(req, qp, 1, out, out); err != nil {
 		t.Fatalf("Resume must complete the drain cold-resume fallback, got: %v\n%s", err, out.String())
 	}
 	if _, lerr := agent.Load(oldRec.ID); !errors.Is(lerr, state.ErrNotFound) {
@@ -1479,7 +1508,7 @@ func TestDrain_LeaseFailoverCoordHandoff_ResumeFallbackCompletes(t *testing.T) {
 }
 
 func TestDrain_LeaseFailoverCoordHandoff_FinalizesDeliveredLockOwner(t *testing.T) {
-	requireTmux(t)
+	requireFakeTmux(t)
 	t.Setenv("FLEET_LEASE_FAILOVER", "1")
 	setupFleetHome(t)
 
@@ -1533,7 +1562,7 @@ func TestDrain_LeaseFailoverCoordHandoff_FinalizesDeliveredLockOwner(t *testing.
 	}
 
 	out := &bytes.Buffer{}
-	if err := Resume(req, qp, 0, out, out); err != nil {
+	if err := Resume(req, qp, 1, out, out); err != nil {
 		t.Fatalf("Resume should deliver directly to the cold-spawned successor: %v\n%s", err, out.String())
 	}
 	newRec, lerr := agent.Load(req.NewAgentID)
@@ -1560,7 +1589,7 @@ func TestDrain_LeaseFailoverCoordHandoff_FinalizesDeliveredLockOwner(t *testing.
 }
 
 func TestDrain_LeaseFailoverCoordStaleQueue_UsesLockOwnerForCapApprovedCoord(t *testing.T) {
-	requireTmux(t)
+	requireFakeTmux(t)
 	t.Setenv("FLEET_LEASE_FAILOVER", "1")
 	setupFleetHome(t)
 
@@ -1694,7 +1723,7 @@ func TestDrain_LeaseFailoverCoordStaleQueue_UsesLockOwnerForCapApprovedCoord(t *
 // CurrentOwner), not the dead queued loser — so delivery proceeds to the winner
 // and the queue is consumed, instead of being stranded pending forever.
 func TestDrain_LeaseFailoverCoord_DeadLoserSession_StillDeliversToLockOwner(t *testing.T) {
-	requireTmux(t)
+	requireFakeTmux(t)
 	t.Setenv("FLEET_LEASE_FAILOVER", "1")
 	setupFleetHome(t)
 
@@ -1836,7 +1865,7 @@ func TestDrain_WorkerHandoff_NeverCarriesRemoteControl(t *testing.T) {
 
 	req, qp, _ := writeSkillQueue(t, oldRec)
 	out := &bytes.Buffer{}
-	if err := Resume(req, qp, 0, out, out); err != nil {
+	if err := Resume(req, qp, 1, out, out); err != nil {
 		t.Fatalf("Resume: %v\n%s", err, out.String())
 	}
 
@@ -1898,7 +1927,7 @@ func TestDrain_WorkerHandoff_NeverCarriesRemoteControl(t *testing.T) {
 // the queue file via queue.Delete on success while racing — defeating
 // the gate's whole purpose. Fail-fast is the correct contract.
 func TestDrainAndDispatch_ShareSameLock(t *testing.T) {
-	requireTmux(t)
+	requireFakeTmux(t)
 	setupFleetHome(t)
 	oldRec := spawnSeedAgent(t)
 
@@ -1922,7 +1951,7 @@ func TestDrainAndDispatch_ShareSameLock(t *testing.T) {
 	req, qp, _ := writeSkillQueue(t, oldRec)
 	stdout := &bytes.Buffer{}
 	stderr := &bytes.Buffer{}
-	rerr := Resume(req, qp, 0, stdout, stderr)
+	rerr := Resume(req, qp, 1, stdout, stderr)
 
 	// Resume MUST return error and the error MUST be attributable
 	// to the lock contention — that's how drainOne knows to leave
@@ -1957,7 +1986,7 @@ func TestDrainAndDispatch_ShareSameLock(t *testing.T) {
 // run Resume to completion (no outer holder), then attempt a fresh
 // coordlock.Acquire — it should succeed, proving the drain released.
 func TestDrain_LockReleasedOnReturn(t *testing.T) {
-	requireTmux(t)
+	requireFakeTmux(t)
 	setupFleetHome(t)
 	oldRec := spawnSeedAgent(t)
 
@@ -1971,7 +2000,7 @@ func TestDrain_LockReleasedOnReturn(t *testing.T) {
 	req, qp, _ := writeSkillQueue(t, oldRec)
 	stdout := &bytes.Buffer{}
 	stderr := &bytes.Buffer{}
-	if err := Resume(req, qp, 0, stdout, stderr); err != nil {
+	if err := Resume(req, qp, 1, stdout, stderr); err != nil {
 		t.Fatalf("Resume: %v\n%s", err, stderr.String())
 	}
 
@@ -2002,7 +2031,7 @@ func TestDrain_LockReleasedOnReturn(t *testing.T) {
 // Continuing past contention would consume the queue file AND race —
 // defeating the entire atomic gate.
 func TestDrain_ContentionPreservesQueueFile(t *testing.T) {
-	requireTmux(t)
+	requireFakeTmux(t)
 	setupFleetHome(t)
 	oldRec := spawnSeedAgent(t)
 
@@ -2023,7 +2052,7 @@ func TestDrain_ContentionPreservesQueueFile(t *testing.T) {
 	req, qp, _ := writeSkillQueue(t, oldRec)
 	stdout := &bytes.Buffer{}
 	stderr := &bytes.Buffer{}
-	rerr := Resume(req, qp, 0, stdout, stderr)
+	rerr := Resume(req, qp, 1, stdout, stderr)
 
 	// Drain MUST fail-fast with the lock-contention error.
 	if rerr == nil {
@@ -2118,7 +2147,7 @@ func TestDeliverResumePrompt_LeaseWrapped_NoOwner_FallsBackToDirectSend(t *testi
 // lost the lease. Before the leaseWrappedSuccessor threading, retireOldAgent
 // derived lease-wrapping from TaskID alone and direct-sent to the loser.
 func TestResume_Case3_CapApprovedCoord_DeliversToLockOwner(t *testing.T) {
-	requireTmux(t)
+	requireFakeTmux(t)
 	t.Setenv("FLEET_LEASE_FAILOVER", "1")
 	setupFleetHome(t)
 
@@ -2202,7 +2231,7 @@ func TestResume_Case3_CapApprovedCoord_DeliversToLockOwner(t *testing.T) {
 	}
 
 	out := &bytes.Buffer{}
-	if err := Resume(req, qp, 0, out, out); err != nil {
+	if err := Resume(req, qp, 1, out, out); err != nil {
 		t.Fatalf("Resume case-3 should deliver to lock owner: %v\n%s", err, out.String())
 	}
 	if sentSession != winner.TmuxSession {
@@ -2223,7 +2252,7 @@ func TestResume_Case3_CapApprovedCoord_DeliversToLockOwner(t *testing.T) {
 // not routed through DeliverToCurrentOwner — polling the lock owner here would
 // target the old/dead owner and strand recovery. CurrentOwner must NOT be polled.
 func TestDrain_CoordColdSpawn_CapApproved_DeliversDirectNotLockOwner(t *testing.T) {
-	requireTmux(t)
+	requireFakeTmux(t)
 	t.Setenv("FLEET_LEASE_FAILOVER", "1")
 	setupFleetHome(t)
 
@@ -2266,7 +2295,7 @@ func TestDrain_CoordColdSpawn_CapApproved_DeliversDirectNotLockOwner(t *testing.
 	}
 
 	out := &bytes.Buffer{}
-	if err := Resume(req, qp, 0, out, out); err != nil {
+	if err := Resume(req, qp, 1, out, out); err != nil {
 		t.Fatalf("Resume cold-spawn coord should deliver directly: %v\n%s", err, out.String())
 	}
 	newRec, lerr := agent.Load(req.NewAgentID)
@@ -2361,7 +2390,7 @@ func forbidSeparateDelivery(t *testing.T) {
 }
 
 func TestResume_Case3_GracefulRoute_SwapsViaBarrier(t *testing.T) {
-	requireTmux(t)
+	requireFakeTmux(t)
 	t.Setenv("FLEET_LEASE_FAILOVER", "1")
 	setupFleetHome(t)
 
@@ -2417,7 +2446,7 @@ func TestResume_Case3_GracefulRoute_SwapsViaBarrier(t *testing.T) {
 	}
 
 	out := &bytes.Buffer{}
-	if err := Resume(req, qp, 0, out, out); err != nil {
+	if err := Resume(req, qp, 1, out, out); err != nil {
 		t.Fatalf("Resume should complete via the graceful barrier route: %v\n%s", err, out.String())
 	}
 	if swapCalls != 1 {
@@ -2444,7 +2473,7 @@ func TestResume_Case3_GracefulRoute_SwapsViaBarrier(t *testing.T) {
 }
 
 func TestResume_Case3_GracefulRouteError_PreservesQueue(t *testing.T) {
-	requireTmux(t)
+	requireFakeTmux(t)
 	t.Setenv("FLEET_LEASE_FAILOVER", "1")
 	setupFleetHome(t)
 
@@ -2465,7 +2494,7 @@ func TestResume_Case3_GracefulRouteError_PreservesQueue(t *testing.T) {
 	}
 
 	out := &bytes.Buffer{}
-	err := Resume(req, qp, 0, out, out)
+	err := Resume(req, qp, 1, out, out)
 	if !errors.Is(err, wantErr) {
 		t.Fatalf("graceful route error not surfaced: %v", err)
 	}
@@ -2481,7 +2510,7 @@ func TestResume_Case3_GracefulRouteError_PreservesQueue(t *testing.T) {
 }
 
 func TestResume_Case3_GracefulNotEligible_BespokePathRuns(t *testing.T) {
-	requireTmux(t)
+	requireFakeTmux(t)
 	t.Setenv("FLEET_LEASE_FAILOVER", "1")
 	setupFleetHome(t)
 
@@ -2526,7 +2555,7 @@ func TestResume_Case3_GracefulNotEligible_BespokePathRuns(t *testing.T) {
 	}
 
 	out := &bytes.Buffer{}
-	if err := Resume(req, qp, 0, out, out); err != nil {
+	if err := Resume(req, qp, 1, out, out); err != nil {
 		t.Fatalf("bespoke fallback should complete: %v\n%s", err, out.String())
 	}
 	if sentSession != newRec.TmuxSession {

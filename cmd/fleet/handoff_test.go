@@ -18,6 +18,7 @@ import (
 	"github.com/edisonshen/fleet/internal/queue"
 	"github.com/edisonshen/fleet/internal/spawn"
 	"github.com/edisonshen/fleet/internal/state"
+	"github.com/edisonshen/fleet/internal/testutil/tmuxfake"
 	"github.com/edisonshen/fleet/internal/testutil/tmuxtest"
 	"github.com/edisonshen/fleet/internal/tmux"
 )
@@ -75,6 +76,38 @@ func requireTmux(t *testing.T) {
 	t.Setenv("FLEET_PID_RESOLVE_S", "1")
 }
 
+// requireFakeTmux installs the in-process fake tmux backend
+// (internal/testutil/tmuxfake) so the test exercises the real Fleet
+// spawn/handoff/drain code paths WITHOUT execing a tmux(1) subprocess —
+// the CI-perf lever (PR-2 of DESIGN-ci-3min-test-suite). It is the fast,
+// orphan-proof substitute for requireTmux: no real tmux server, no
+// `sleep 60` child, no pid-resolve floor, no leaked /tmp/fleet-test-*.sock.
+//
+// It is also a recognized isolation marker for lint-test-isolation.sh:
+// installing the fake means tmux.Spawn never reaches the operator's
+// default socket (the fake records in-process), so a test that calls
+// requireFakeTmux satisfies the same safety boundary requireTmux does.
+//
+// Use requireFakeTmux for tests that only need a session abstraction
+// (Spawn / Kill / HasSession / SendKeys / CapturePane) and assert on
+// Fleet's own state machine. Use requireTmux only for tests that need
+// REAL process semantics (real engine pid liveness, real pane content,
+// real `coord-run` supervisor). The env pins below mirror requireTmux so
+// any production timing path the test still touches stays fast.
+func requireFakeTmux(t *testing.T) *tmuxfake.Fake {
+	t.Helper()
+	f := tmuxfake.InstallFake(t)
+	t.Setenv("FLEET_LEASE_FAILOVER", "0")
+	t.Setenv("FLEET_INITIAL_PROMPT_STABLE_MS", "0")
+	t.Setenv("FLEET_INITIAL_PROMPT_MAX_MS", "100")
+	t.Setenv("FLEET_POST_READY_BUFFER_MS", "0")
+	t.Setenv("FLEET_POST_SEND_VERIFY_MS", "0")
+	t.Setenv("FLEET_POST_SEND_RETRY_MS", "0")
+	t.Setenv("FLEET_PROMPT_ENTER_DELAY_MS", "0")
+	t.Setenv("FLEET_PID_RESOLVE_S", "1")
+	return f
+}
+
 // seedAgent dispatches a long-lived agent for handoff to operate on.
 // Returns the spawned record. Caller cleans up via t.Cleanup if needed.
 func seedAgent(t *testing.T) *agent.Record {
@@ -98,14 +131,14 @@ func seedAgent(t *testing.T) *agent.Record {
 }
 
 func TestHandoff_FailsClearlyOnUnknownAgent(t *testing.T) {
-	requireTmux(t)
+	requireFakeTmux(t)
 	setupFleetHome(t)
 
 	out := &bytes.Buffer{}
 	err := runHandoff(&handoffOpts{
 		oldID:       "ghostbas",
 		command:     []string{"sleep", "60"},
-		graceMillis: 0,
+		graceMillis: 1,
 	}, out, out)
 	if err == nil {
 		t.Error("expected error for unknown agent")
@@ -113,7 +146,7 @@ func TestHandoff_FailsClearlyOnUnknownAgent(t *testing.T) {
 }
 
 func TestHandoff_HappyPath(t *testing.T) {
-	requireTmux(t)
+	requireFakeTmux(t)
 	tmp := setupFleetHome(t)
 
 	old := seedAgent(t)
@@ -123,7 +156,9 @@ func TestHandoff_HappyPath(t *testing.T) {
 	if err := runHandoff(&handoffOpts{
 		oldID:       old.ID,
 		command:     []string{"sleep", "60"},
-		graceMillis: 0, // no sleep in tests
+		graceMillis: 1, // 1ms minimal grace: the coord-swap path defaults a
+		// zero/negative GraceWindow to DefaultSwapGraceWindow (10s), so a
+		// literal 0 makes every coord-handoff test pay a real 10s sleep.
 	}, out, out); err != nil {
 		t.Fatalf("handoff: %v\n%s", err, out.String())
 	}
@@ -197,7 +232,7 @@ func TestHandoff_HappyPath(t *testing.T) {
 // live successor record must carry predecessor_id. Together these
 // are what `fleet attach <predecessor>` walks via agent.ResolveChain.
 func TestHandoff_WritesChainPointer(t *testing.T) {
-	requireTmux(t)
+	requireFakeTmux(t)
 	tmp := setupFleetHome(t)
 
 	old := seedAgent(t)
@@ -207,7 +242,7 @@ func TestHandoff_WritesChainPointer(t *testing.T) {
 	if err := runHandoff(&handoffOpts{
 		oldID:       old.ID,
 		command:     []string{"sleep", "60"},
-		graceMillis: 0,
+		graceMillis: 1,
 	}, out, out); err != nil {
 		t.Fatalf("handoff: %v\n%s", err, out.String())
 	}
@@ -258,7 +293,7 @@ func TestHandoff_WritesChainPointer(t *testing.T) {
 }
 
 func TestHandoff_ChainGrowsAcrossSequentialHandoffs(t *testing.T) {
-	requireTmux(t)
+	requireFakeTmux(t)
 	setupFleetHome(t)
 
 	// Initial dispatch.
@@ -273,7 +308,7 @@ func TestHandoff_ChainGrowsAcrossSequentialHandoffs(t *testing.T) {
 		if err := runHandoff(&handoffOpts{
 			oldID:       currentID,
 			command:     []string{"sleep", "60"},
-			graceMillis: 0,
+			graceMillis: 1,
 		}, out, out); err != nil {
 			t.Fatalf("handoff #%d: %v\n%s", i+1, err, out.String())
 		}
@@ -311,7 +346,7 @@ func TestHandoff_ConcurrentHandoffDetectedAfterArchive(t *testing.T) {
 	// from disk before lock), acquires the flock, re-loads under the
 	// lock, sees ErrNotFound, bails. This test exercises the second
 	// invocation against an already-archived record.
-	requireTmux(t)
+	requireFakeTmux(t)
 	setupFleetHome(t)
 
 	old := seedAgent(t)
@@ -322,7 +357,7 @@ func TestHandoff_ConcurrentHandoffDetectedAfterArchive(t *testing.T) {
 	if err := runHandoff(&handoffOpts{
 		oldID:       old.ID,
 		command:     []string{"sleep", "60"},
-		graceMillis: 0,
+		graceMillis: 1,
 	}, out1, out1); err != nil {
 		t.Fatalf("first handoff: %v\n%s", err, out1.String())
 	}
@@ -336,7 +371,7 @@ func TestHandoff_ConcurrentHandoffDetectedAfterArchive(t *testing.T) {
 	err := runHandoff(&handoffOpts{
 		oldID:       old.ID,
 		command:     []string{"sleep", "60"},
-		graceMillis: 0,
+		graceMillis: 1,
 	}, out2, out2)
 	if err == nil {
 		t.Fatalf("expected second handoff to fail (record archived), got success:\n%s", out2.String())
@@ -367,7 +402,7 @@ func TestHandoff_RefusesLegacyRecordMissingCwdAndCommand(t *testing.T) {
 	// JSON) MUST NOT silently fall back to os.Getwd / "claude" when
 	// no flags supplied — that would land the replacement in the
 	// wrong tree / wrong binary while reporting success.
-	requireTmux(t)
+	requireFakeTmux(t)
 	tmp := setupFleetHome(t)
 
 	// Hand-craft a legacy record JSON: no cwd, no command fields.
@@ -394,7 +429,7 @@ func TestHandoff_RefusesLegacyRecordMissingCwdAndCommand(t *testing.T) {
 	out := &bytes.Buffer{}
 	err := runHandoff(&handoffOpts{
 		oldID:       "legacyid",
-		graceMillis: 0,
+		graceMillis: 1,
 	}, out, out)
 	if err == nil {
 		t.Fatal("expected legacy handoff with no flags to refuse")
@@ -421,7 +456,7 @@ func TestHandoff_RefusesLegacyRecordMissingCwdAndCommand(t *testing.T) {
 		oldID:       "legacyid",
 		cwd:         t.TempDir(),
 		command:     []string{"sleep", "120"},
-		graceMillis: 0,
+		graceMillis: 1,
 	}, out2, out2); err != nil {
 		t.Fatalf("legacy handoff with explicit flags should succeed, got: %v\n%s", err, out2.String())
 	}
@@ -434,7 +469,7 @@ func TestHandoff_PreservesCwdAndCommandFromOldRecord(t *testing.T) {
 	// Codex iter-5 P1: handoff invoked from a different shell must
 	// place the replacement in the OUTGOING agent's cwd and run its
 	// original command, not the invoker's defaults.
-	requireTmux(t)
+	requireFakeTmux(t)
 	setupFleetHome(t)
 
 	// Seed an agent with explicit cwd + a non-default command. We
@@ -459,7 +494,7 @@ func TestHandoff_PreservesCwdAndCommandFromOldRecord(t *testing.T) {
 	out := &bytes.Buffer{}
 	if err := runHandoff(&handoffOpts{
 		oldID:       first.ID,
-		graceMillis: 0,
+		graceMillis: 1,
 	}, out, out); err != nil {
 		t.Fatalf("handoff: %v\n%s", err, out.String())
 	}
@@ -500,7 +535,7 @@ func agentSpawnForTest(t *testing.T, cwd string, command []string, project, task
 // outgoing coord here is seeded in a WRONG tree; meta pins the correct
 // repo; the replacement must land in the meta repo.
 func TestHandoff_CoordResolvesRepoNotOldCwd(t *testing.T) {
-	requireTmux(t)
+	requireFakeTmux(t)
 	root := setupFleetHome(t)
 
 	const project = "rainier"
@@ -517,7 +552,7 @@ func TestHandoff_CoordResolvesRepoNotOldCwd(t *testing.T) {
 
 	// Handoff WITHOUT --cwd → coord path must resolve via the resolver.
 	out := &bytes.Buffer{}
-	if err := runHandoff(&handoffOpts{oldID: first.ID, graceMillis: 0}, out, out); err != nil {
+	if err := runHandoff(&handoffOpts{oldID: first.ID, graceMillis: 1}, out, out); err != nil {
 		t.Fatalf("coord handoff: %v\n%s", err, out.String())
 	}
 	live := listLive(t)
@@ -535,7 +570,7 @@ func TestHandoff_CoordResolvesRepoNotOldCwd(t *testing.T) {
 // E7 (manual handoff, refuse) — a COORD handoff REFUSES when the resolver
 // cannot bind, rather than falling back to the outgoing coord's Cwd.
 func TestHandoff_CoordRefusesWhenUnresolvable(t *testing.T) {
-	requireTmux(t)
+	requireFakeTmux(t)
 	setupFleetHome(t)
 
 	const project = "ghostproj" // NO meta.json, no worktrees → refuse
@@ -549,7 +584,7 @@ func TestHandoff_CoordRefusesWhenUnresolvable(t *testing.T) {
 	t.Cleanup(func() { _ = tmux.Kill(first.TmuxSession) })
 
 	out := &bytes.Buffer{}
-	err = runHandoff(&handoffOpts{oldID: first.ID, graceMillis: 0}, out, out)
+	err = runHandoff(&handoffOpts{oldID: first.ID, graceMillis: 1}, out, out)
 	if err == nil {
 		t.Fatal("coord handoff must REFUSE when resolver cannot bind, got nil")
 	}
@@ -622,7 +657,7 @@ func TestHandoff_ShouldRefuseLeaseWrappedCoordHandoffRetire_RequiresLiveOld(t *t
 // resolver is COORD-only; workers legitimately follow their dispatch
 // tree. Guards against the coord-binding change leaking into workers.
 func TestHandoff_WorkerStillInheritsOldCwd(t *testing.T) {
-	requireTmux(t)
+	requireFakeTmux(t)
 	root := setupFleetHome(t)
 
 	const project = "rainier"
@@ -639,7 +674,7 @@ func TestHandoff_WorkerStillInheritsOldCwd(t *testing.T) {
 	t.Cleanup(func() { _ = tmux.Kill(first.TmuxSession) })
 
 	out := &bytes.Buffer{}
-	if err := runHandoff(&handoffOpts{oldID: first.ID, graceMillis: 0}, out, out); err != nil {
+	if err := runHandoff(&handoffOpts{oldID: first.ID, graceMillis: 1}, out, out); err != nil {
 		t.Fatalf("worker handoff: %v\n%s", err, out.String())
 	}
 	live := listLive(t)
@@ -657,7 +692,7 @@ func TestHandoff_WorkerStillInheritsOldCwd(t *testing.T) {
 }
 
 func TestHandoff_ResumeHandoff_CoordMarker_WritesBeforeReadinessWait(t *testing.T) {
-	requireTmux(t)
+	requireFakeTmux(t)
 	setupFleetHome(t)
 
 	old := seedAgent(t)
@@ -696,7 +731,7 @@ func TestHandoff_ResumeHandoff_CoordMarker_WritesBeforeReadinessWait(t *testing.
 	out := &bytes.Buffer{}
 	if err := runHandoff(&handoffOpts{
 		oldID:       old.ID,
-		graceMillis: 0,
+		graceMillis: 1,
 	}, out, out); err != nil {
 		t.Fatalf("runHandoff: %v\n%s", err, out.String())
 	}
@@ -728,7 +763,7 @@ func TestHandoff_ResumeHandoff_CoordMarker_WritesBeforeReadinessWait(t *testing.
 // The marker steps back to oldRec.ID, isCoordSwap fires on the retry,
 // AtomicCoordSwap commits marker → fresh replacement's ID.
 func TestHandoff_RecoveryProbe_StaleMarker_RolledBackBeforeRespawn(t *testing.T) {
-	requireTmux(t)
+	requireFakeTmux(t)
 	tmp := setupFleetHome(t)
 
 	old := seedAgent(t)
@@ -790,7 +825,7 @@ func TestHandoff_RecoveryProbe_StaleMarker_RolledBackBeforeRespawn(t *testing.T)
 		oldID:            old.ID,
 		cwd:              old.Cwd,
 		command:          []string{"sleep", "60"},
-		graceMillis:      0,
+		graceMillis:      1,
 		forceReplacement: true,
 	}, out, out); err != nil {
 		t.Fatalf("runHandoff: %v\n%s", err, out.String())
@@ -838,7 +873,7 @@ func TestHandoff_RecoveryProbe_StaleMarker_RolledBackBeforeRespawn(t *testing.T)
 // newRec.ID AND OLD's session is alive. Operator can pass
 // --force-replacement once OLD is confirmed dead.
 func TestHandoff_RecoveryProbe_OldCoordAlive_RefusesRespawn(t *testing.T) {
-	requireTmux(t)
+	requireFakeTmux(t)
 	tmp := setupFleetHome(t)
 
 	old := seedAgent(t)
@@ -890,7 +925,7 @@ func TestHandoff_RecoveryProbe_OldCoordAlive_RefusesRespawn(t *testing.T) {
 		oldID:       old.ID,
 		cwd:         old.Cwd,
 		command:     []string{"sleep", "60"},
-		graceMillis: 0,
+		graceMillis: 1,
 	}, out, out)
 	if err == nil {
 		t.Fatalf("expected handoff to refuse when OLD coord still alive; got nil\n%s", out.String())
@@ -935,7 +970,7 @@ func TestHandoff_AbortsWhenReplacementDiesAtStartup(t *testing.T) {
 		oldID:       old.ID,
 		cwd:         t.TempDir(),
 		command:     []string{"sh", "-c", "true"}, // exits immediately
-		graceMillis: 0,
+		graceMillis: 1,
 	}, out, out)
 	if err == nil {
 		t.Fatal("expected handoff to fail when replacement dies at startup")
@@ -965,7 +1000,7 @@ func TestHandoff_RecoveryRefusesDuplicateWhenSessionAlive(t *testing.T) {
 	// Codex iter-11 P1: if the replacement RECORD was hand-deleted
 	// but pending.NewSession is still alive, fresh-spawning would
 	// create a duplicate. Refuse instead.
-	requireTmux(t)
+	requireFakeTmux(t)
 	tmp := setupFleetHome(t)
 
 	old := seedAgent(t)
@@ -996,7 +1031,7 @@ func TestHandoff_RecoveryRefusesDuplicateWhenSessionAlive(t *testing.T) {
 	out := &bytes.Buffer{}
 	err := runHandoff(&handoffOpts{
 		oldID:       old.ID,
-		graceMillis: 0,
+		graceMillis: 1,
 	}, out, out)
 	if err == nil {
 		t.Fatal("expected handoff to refuse when orphan session alive")
@@ -1017,7 +1052,7 @@ func TestHandoff_RecoveryProbeAbortsOnCorruptedRecord(t *testing.T) {
 	// must NOT be treated as "old already archived" — that would
 	// silently delete the journal and exit success while the agent
 	// is still live.
-	requireTmux(t)
+	requireFakeTmux(t)
 	tmp := setupFleetHome(t)
 
 	// Seed a queue file with NewAgentID set (so the recovery probe
@@ -1040,7 +1075,7 @@ func TestHandoff_RecoveryProbeAbortsOnCorruptedRecord(t *testing.T) {
 	out := &bytes.Buffer{}
 	err := runHandoff(&handoffOpts{
 		oldID:       "corrupt1",
-		graceMillis: 0,
+		graceMillis: 1,
 	}, out, out)
 	if err == nil {
 		t.Fatal("expected handoff to abort on corrupted record, got success")
@@ -1060,7 +1095,7 @@ func TestHandoff_ResumesCrashedHandoffWithoutDoubleSpawn(t *testing.T) {
 	// 7b) and queue.Delete (step 12). A retry must NOT spawn a
 	// second replacement; it must complete kill+archive+delete via
 	// resumeHandoff.
-	requireTmux(t)
+	requireFakeTmux(t)
 	setupFleetHome(t)
 
 	old := seedAgent(t)
@@ -1094,7 +1129,7 @@ func TestHandoff_ResumesCrashedHandoffWithoutDoubleSpawn(t *testing.T) {
 	out := &bytes.Buffer{}
 	if err := runHandoff(&handoffOpts{
 		oldID:       old.ID,
-		graceMillis: 0,
+		graceMillis: 1,
 	}, out, out); err != nil {
 		t.Fatalf("resumed handoff: %v\n%s", err, out.String())
 	}
@@ -1168,7 +1203,7 @@ func TestHandoff_ResumeDeliversPromptToReplacement(t *testing.T) {
 	out := &bytes.Buffer{}
 	if err := runHandoff(&handoffOpts{
 		oldID:       old.ID,
-		graceMillis: 0,
+		graceMillis: 1,
 	}, out, out); err != nil {
 		t.Fatalf("resumed handoff: %v\n%s", err, out.String())
 	}
@@ -1200,7 +1235,7 @@ func TestHandoff_DeadSession_ArchivesWithoutSpawn(t *testing.T) {
 	// record without spawning a replacement, writing a doc, or queueing.
 	// The operator's intent is cleanup, not "continue this work" — there
 	// is no work in flight to continue.
-	requireTmux(t)
+	requireFakeTmux(t)
 	tmp := setupFleetHome(t)
 
 	old := seedAgent(t)
@@ -1215,7 +1250,7 @@ func TestHandoff_DeadSession_ArchivesWithoutSpawn(t *testing.T) {
 	out := &bytes.Buffer{}
 	if err := runHandoff(&handoffOpts{
 		oldID:       old.ID,
-		graceMillis: 0,
+		graceMillis: 1,
 	}, out, out); err != nil {
 		t.Fatalf("handoff on dead session: %v\n%s", err, out.String())
 	}
@@ -1291,7 +1326,7 @@ func TestHandoff_DeadSession_RecoveryStillWinsWhenPendingExists(t *testing.T) {
 	out := &bytes.Buffer{}
 	if err := runHandoff(&handoffOpts{
 		oldID:       old.ID,
-		graceMillis: 0,
+		graceMillis: 1,
 	}, out, out); err != nil {
 		t.Fatalf("resume handoff: %v\n%s", err, out.String())
 	}
@@ -1410,7 +1445,7 @@ func TestHandoff_ReplacementSpawnedWithRemoteControlFlag(t *testing.T) {
 	out := &bytes.Buffer{}
 	if err := runHandoff(&handoffOpts{
 		oldID:       first.ID,
-		graceMillis: 0,
+		graceMillis: 1,
 	}, out, out); err != nil {
 		t.Fatalf("handoff: %v\n%s", err, out.String())
 	}
@@ -1469,7 +1504,7 @@ func TestHandoff_ReplacementSpawnedWithRemoteControlFlag(t *testing.T) {
 }
 
 func TestHandoff_DocBodyContainsPlaceholders(t *testing.T) {
-	requireTmux(t)
+	requireFakeTmux(t)
 	setupFleetHome(t)
 
 	old := seedAgent(t)
@@ -1479,7 +1514,7 @@ func TestHandoff_DocBodyContainsPlaceholders(t *testing.T) {
 	if err := runHandoff(&handoffOpts{
 		oldID:       old.ID,
 		command:     []string{"sleep", "60"},
-		graceMillis: 0,
+		graceMillis: 1,
 	}, out, out); err != nil {
 		t.Fatalf("handoff: %v", err)
 	}
@@ -1531,7 +1566,7 @@ func TestHandoff_DocBodyContainsPlaceholders(t *testing.T) {
 // the regression. A separate task_id="coord-<project>" lineage test
 // would be necessary only if approach (b) were taken.
 func TestHandoff_CoordReplacementLineageGetsCoordinatorPrompt(t *testing.T) {
-	requireTmux(t)
+	requireFakeTmux(t)
 	setupFleetHome(t)
 
 	old := seedAgent(t)
@@ -1541,7 +1576,7 @@ func TestHandoff_CoordReplacementLineageGetsCoordinatorPrompt(t *testing.T) {
 	if err := runHandoff(&handoffOpts{
 		oldID:       old.ID,
 		command:     []string{"sleep", "60"},
-		graceMillis: 0,
+		graceMillis: 1,
 	}, out, out); err != nil {
 		t.Fatalf("handoff: %v", err)
 	}
@@ -1580,7 +1615,7 @@ func TestHandoff_CoordReplacementLineageGetsCoordinatorPrompt(t *testing.T) {
 // TestHandoff_TransfersCoordMarkerWhenOldWasCoord — happy path: marker
 // = old.ID before handoff, marker = newRec.ID after.
 func TestHandoff_TransfersCoordMarkerWhenOldWasCoord(t *testing.T) {
-	requireTmux(t)
+	requireFakeTmux(t)
 	setupFleetHome(t)
 
 	old := seedAgent(t)
@@ -1597,7 +1632,7 @@ func TestHandoff_TransfersCoordMarkerWhenOldWasCoord(t *testing.T) {
 	if err := runHandoff(&handoffOpts{
 		oldID:       old.ID,
 		command:     []string{"sleep", "60"},
-		graceMillis: 0,
+		graceMillis: 1,
 	}, out, out); err != nil {
 		t.Fatalf("handoff: %v\n%s", err, out.String())
 	}
@@ -1622,7 +1657,7 @@ func TestHandoff_TransfersCoordMarkerWhenOldWasCoord(t *testing.T) {
 // TestHandoff_NoMarkerUpdate_WhenOldWasNotCoord — marker points at an
 // unrelated agent ID; handoff of old must NOT mutate it.
 func TestHandoff_NoMarkerUpdate_WhenOldWasNotCoord(t *testing.T) {
-	requireTmux(t)
+	requireFakeTmux(t)
 	setupFleetHome(t)
 
 	old := seedAgent(t)
@@ -1640,7 +1675,7 @@ func TestHandoff_NoMarkerUpdate_WhenOldWasNotCoord(t *testing.T) {
 	if err := runHandoff(&handoffOpts{
 		oldID:       old.ID,
 		command:     []string{"sleep", "60"},
-		graceMillis: 0,
+		graceMillis: 1,
 	}, out, out); err != nil {
 		t.Fatalf("handoff: %v\n%s", err, out.String())
 	}
@@ -1659,7 +1694,7 @@ func TestHandoff_NoMarkerUpdate_WhenOldWasNotCoord(t *testing.T) {
 // TestHandoff_NoMarkerUpdate_WhenNoMarkerExists — no marker file
 // before handoff; no marker file after, no error.
 func TestHandoff_NoMarkerUpdate_WhenNoMarkerExists(t *testing.T) {
-	requireTmux(t)
+	requireFakeTmux(t)
 	setupFleetHome(t)
 
 	old := seedAgent(t)
@@ -1669,7 +1704,7 @@ func TestHandoff_NoMarkerUpdate_WhenNoMarkerExists(t *testing.T) {
 	if err := runHandoff(&handoffOpts{
 		oldID:       old.ID,
 		command:     []string{"sleep", "60"},
-		graceMillis: 0,
+		graceMillis: 1,
 	}, out, out); err != nil {
 		t.Fatalf("handoff: %v\n%s", err, out.String())
 	}
@@ -1781,7 +1816,7 @@ func forbidHandoffDeliveryOutsideBarrier(t *testing.T) {
 }
 
 func TestResumeHandoff_GracefulRoute_SwapsViaBarrier(t *testing.T) {
-	requireTmux(t)
+	requireFakeTmux(t)
 	t.Setenv("FLEET_LEASE_FAILOVER", "1")
 	root := setupFleetHome(t)
 
@@ -1869,7 +1904,7 @@ func TestResumeHandoff_GracefulRoute_SwapsViaBarrier(t *testing.T) {
 	out := &bytes.Buffer{}
 	err := runHandoff(&handoffOpts{
 		oldID:       old.ID,
-		graceMillis: 0,
+		graceMillis: 1,
 	}, out, out)
 	if err != nil {
 		t.Fatalf("resumeHandoff graceful route failed: %v\n%s", err, out.String())
@@ -1945,7 +1980,7 @@ func TestDeliverHandoffResumePrompt_RequireOwner_NoOwner_NoFallback(t *testing.T
 // PENDING — the legacy direct-send fallback would type into the coord-run
 // supervisor pane, report success, and consume the only durable inbox.
 func TestHandoff_ArchivedOldRecovery_LeaseWrapped_NoOwner_PreservesQueue(t *testing.T) {
-	requireTmux(t)
+	requireFakeTmux(t)
 	t.Setenv("FLEET_LEASE_FAILOVER", "1")
 	root := setupFleetHome(t)
 
@@ -2024,7 +2059,7 @@ func TestHandoff_ArchivedOldRecovery_LeaseWrapped_NoOwner_PreservesQueue(t *test
 	}
 
 	out := &bytes.Buffer{}
-	err = runHandoff(&handoffOpts{oldID: old.ID, graceMillis: 0}, out, out)
+	err = runHandoff(&handoffOpts{oldID: old.ID, graceMillis: 1}, out, out)
 	if err == nil || !strings.Contains(err.Error(), "delivery is still pending") {
 		t.Fatalf("archived-OLD recovery with no owner must stay pending, got %v\n%s", err, out.String())
 	}
@@ -2042,7 +2077,7 @@ func TestHandoff_ArchivedOldRecovery_LeaseWrapped_NoOwner_PreservesQueue(t *test
 // lock owner, so the still-pending doc reaches the live winner and the queue
 // is consumed.
 func TestHandoff_ArchivedOldRecovery_DeadQueuedStandby_DeliversToWinner(t *testing.T) {
-	requireTmux(t)
+	requireFakeTmux(t)
 	t.Setenv("FLEET_LEASE_FAILOVER", "1")
 	root := setupFleetHome(t)
 
@@ -2132,7 +2167,7 @@ func TestHandoff_ArchivedOldRecovery_DeadQueuedStandby_DeliversToWinner(t *testi
 	}
 
 	out := &bytes.Buffer{}
-	if err := runHandoff(&handoffOpts{oldID: old.ID, graceMillis: 0}, out, out); err != nil {
+	if err := runHandoff(&handoffOpts{oldID: old.ID, graceMillis: 1}, out, out); err != nil {
 		t.Fatalf("dead-standby recovery should deliver to the winner: %v\n%s", err, out.String())
 	}
 	if sentSession != winner.TmuxSession {

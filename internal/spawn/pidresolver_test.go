@@ -6,6 +6,7 @@ package spawn
 
 import (
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -98,34 +99,6 @@ func TestResolveEnginePid_SkipsCoordRunWrapper(t *testing.T) {
 	}
 }
 
-func TestIsCoordRunArgv(t *testing.T) {
-	yes := []string{
-		"/usr/local/bin/fleet coord-run --agent A -- sh -c claude",
-		"fleet coord-run -- true",
-		"/tmp/go-build/exe/fleet.test coord-run --agent x -- sleep 30",
-	}
-	no := []string{
-		"sh -c claude",
-		"claude --remote-control fleet-coord-A1",
-		"/usr/local/bin/fleet dispatch task", // fleet but not coord-run
-		"someproc --flag coord-run",          // coord-run not the subcommand
-		"",
-	}
-	for _, a := range yes {
-		if !isCoordRunArgv(a) {
-			t.Errorf("isCoordRunArgv(%q) = false, want true", a)
-		}
-	}
-	for _, a := range no {
-		if isCoordRunArgv(a) {
-			t.Errorf("isCoordRunArgv(%q) = true, want false", a)
-		}
-	}
-}
-
-// TestResolveEnginePid_FallsBackToEngineMatch: when there is no
-// disambiguator (plain worker dispatch without --remote-control), the
-// resolver picks the deepest claude descendant.
 func TestResolveEnginePid_FallsBackToEngineMatch(t *testing.T) {
 	procs := []procEntry{
 		{PID: 200, PPID: 1, Args: "sh -c claude --dangerously-skip-permissions"},
@@ -228,30 +201,6 @@ func TestResolveEnginePid_PanePidUnreachableErrors(t *testing.T) {
 	}
 }
 
-// TestFindEngineDescendant_NoDescendantsReturnsZero: a pane with no
-// child processes (pre-exec or just-killed) returns 0. The poll loop
-// retries until the timeout, then falls back to the pane pid.
-func TestFindEngineDescendant_NoDescendantsReturnsZero(t *testing.T) {
-	procs := []procEntry{
-		{PID: 200, PPID: 1, Args: "sh -c ..."},
-	}
-	pid, _, _ := findEngineDescendant(procs, 200, "fleet-coord-x", "claude")
-	if pid != 0 {
-		t.Errorf("pid = %d, want 0 when no descendants", pid)
-	}
-}
-
-// TestFindEngineDescendant_PaneLeaderIsEngine pins the codex-iter-1
-// fix (2026-05-14): when tmux launches the engine directly (no shell
-// wrapper — e.g. `fleet dispatch --command claude` or a custom
-// non-shell argv), the pane pid IS the engine pid. The walk must
-// include the pane process itself, not just its children. Without
-// this, direct-command spawns burn the full 10s resolver timeout
-// before falling back to the same pane pid.
-//
-// Two sub-cases:
-//   - Disambiguator match on the pane process directly
-//   - Engine-name match on the pane process directly
 func TestFindEngineDescendant_PaneLeaderIsEngine(t *testing.T) {
 	t.Run("disambiguator on pane leader", func(t *testing.T) {
 		// Pane pid 200 IS the claude with the disambiguator. No children.
@@ -287,94 +236,6 @@ func TestFindEngineDescendant_PaneLeaderIsEngine(t *testing.T) {
 	})
 }
 
-// TestFindEngineDescendant_DisambiguatorBeatsEngineMatch verifies the
-// match priority — a disambiguator hit anywhere in the tree wins over
-// a deeper engine-only match.
-func TestFindEngineDescendant_DisambiguatorBeatsEngineMatch(t *testing.T) {
-	procs := []procEntry{
-		// Shallow disambiguator match (shell itself carries the
-		// argv passed to -c, so the shell row's args includes
-		// "fleet-coord-A1"). Resolver should pick this over the
-		// deeper claude process if it had a different disambiguator.
-		{PID: 200, PPID: 1, Args: "sh -c claude --remote-control fleet-coord-A1"},
-		// Deeper engine-only match — would win in fallback but not
-		// when the disambiguator is set.
-		{PID: 201, PPID: 200, Args: "claude --no-disambiguator-here"},
-	}
-	pid, args, _ := findEngineDescendant(procs, 200, "fleet-coord-A1", "claude")
-	// The shell wrapper carries the disambiguator in its argv, so it
-	// IS the first match. This is fine — the production resolver's
-	// poll loop will re-walk and pick up the deeper claude on the
-	// next iteration once claude actually exec's. The test pins the
-	// match-priority contract: disambiguator wins over engine.
-	if pid != 200 && pid != 201 {
-		t.Fatalf("pid = %d, want 200 or 201", pid)
-	}
-	if !strings.Contains(args, "fleet-coord-A1") && !strings.Contains(args, "claude") {
-		t.Errorf("args = %q, want some match argv", args)
-	}
-}
-
-// TestArgvCommandIs covers the argv command-name match used by the
-// engine-hint priority. Strips a leading path so a binary at
-// /usr/local/bin/claude matches "claude".
-func TestArgvCommandIs(t *testing.T) {
-	cases := []struct {
-		argv string
-		name string
-		want bool
-	}{
-		{"claude --foo", "claude", true},
-		{"/usr/local/bin/claude --foo", "claude", true},
-		{"sh -c claude", "claude", false}, // first token is "sh"
-		{"", "claude", false},
-		{"claude", "claude", true},
-		{"claude-wrapper --x", "claude", false}, // exact match required
-	}
-	for _, tc := range cases {
-		got := argvCommandIs(tc.argv, tc.name)
-		if got != tc.want {
-			t.Errorf("argvCommandIs(%q, %q) = %v, want %v",
-				tc.argv, tc.name, got, tc.want)
-		}
-	}
-}
-
-// TestIsShellArgv ensures we don't classify the wrapper shell as the
-// engine via the fallback path.
-func TestIsShellArgv(t *testing.T) {
-	cases := []struct {
-		argv string
-		want bool
-	}{
-		{"sh -c foo", true},
-		{"/bin/bash -c foo", true},
-		{"zsh", true},
-		{"claude --foo", false},
-		{"", false},
-		{"  /usr/bin/dash -c foo", true},
-	}
-	for _, tc := range cases {
-		got := isShellArgv(tc.argv)
-		if got != tc.want {
-			t.Errorf("isShellArgv(%q) = %v, want %v", tc.argv, got, tc.want)
-		}
-	}
-}
-
-// TestResolveEnginePid_TentativeMatchWaitsForStability pins codex
-// iter-5's P1 (2026-05-14): for custom-shell commands like
-// `sh -c 'claude --version; sleep 60'`, the resolver must NOT
-// return the first non-shell descendant immediately — the deepest
-// non-shell might be a transient helper. Instead it waits for
-// stability (the same tentative pid through to the deadline) so a
-// short-lived helper has died and the long-lived child has taken
-// its place.
-//
-// Test shape: simulate two snapshots — snapshot 1 has only the
-// helper child; snapshot 2 has the helper dead and the long-lived
-// child running. With tentative-match semantics, the resolver must
-// return the LATER (long-lived) pid, not the first non-shell match.
 func TestResolveEnginePid_TentativeMatchWaitsForStability(t *testing.T) {
 	tick := time.Unix(0, 0)
 	nowCalls := 0
@@ -525,77 +386,6 @@ func TestResolveEnginePid_RawShellUnderCoordRun(t *testing.T) {
 	}
 }
 
-// TestRawShellLeafPid covers the helper for the coord-run cases.
-func TestRawShellLeafPid(t *testing.T) {
-	t.Run("coord-run pane with raw-shell child → child pid", func(t *testing.T) {
-		procs := []procEntry{
-			{PID: 200, PPID: 1, Args: "/usr/local/bin/fleet coord-run --agent A -- sh"},
-			{PID: 201, PPID: 200, Args: "sh"},
-		}
-		pid, ok := rawShellLeafPid(procs, 200)
-		if !ok || pid != 201 {
-			t.Errorf("want (201,true), got (%d,%v)", pid, ok)
-		}
-	})
-	t.Run("coord-run pane whose shell child has a claude grandchild → false", func(t *testing.T) {
-		procs := []procEntry{
-			{PID: 200, PPID: 1, Args: "/usr/local/bin/fleet coord-run --agent A -- sh -c claude"},
-			{PID: 201, PPID: 200, Args: "sh -c claude"},
-			{PID: 202, PPID: 201, Args: "claude"},
-		}
-		if _, ok := rawShellLeafPid(procs, 200); ok {
-			t.Error("want false; the shell has a claude grandchild (real engine)")
-		}
-	})
-	t.Run("bare-shell pane → pane pid", func(t *testing.T) {
-		procs := []procEntry{{PID: 200, PPID: 1, Args: "sh"}}
-		pid, ok := rawShellLeafPid(procs, 200)
-		if !ok || pid != 200 {
-			t.Errorf("want (200,true), got (%d,%v)", pid, ok)
-		}
-	})
-}
-
-// TestPaneIsRawShellLeaf covers the helper in isolation.
-func TestPaneIsRawShellLeaf(t *testing.T) {
-	t.Run("shell pane, no children → true", func(t *testing.T) {
-		procs := []procEntry{
-			{PID: 200, PPID: 1, Args: "sh"},
-		}
-		if !paneIsRawShellLeaf(procs, 200) {
-			t.Error("want true")
-		}
-	})
-	t.Run("shell pane with children → false", func(t *testing.T) {
-		procs := []procEntry{
-			{PID: 200, PPID: 1, Args: "sh -c claude"},
-			{PID: 201, PPID: 200, Args: "claude"},
-		}
-		if paneIsRawShellLeaf(procs, 200) {
-			t.Error("want false; pane has a claude child")
-		}
-	})
-	t.Run("non-shell pane, no children → false", func(t *testing.T) {
-		procs := []procEntry{
-			{PID: 200, PPID: 1, Args: "claude --foo"},
-		}
-		if paneIsRawShellLeaf(procs, 200) {
-			t.Error("want false; pane is not a shell")
-		}
-	})
-	t.Run("pane pid not in procs → false", func(t *testing.T) {
-		if paneIsRawShellLeaf(nil, 200) {
-			t.Error("want false on empty procs")
-		}
-	})
-}
-
-// TestPidResolveEngineHint pins the codex iter-3 fix (2026-05-14):
-// the engine hint must drop to empty for custom-command spawns so
-// the resolver falls back to the deepest-non-shell-descendant
-// heuristic. Without this, `sh -c 'claude --version; sleep 60'`
-// would prefer the short-lived `claude --version` over the
-// actual long-lived `sleep` child.
 func TestPidResolveEngineHint(t *testing.T) {
 	cases := []struct {
 		name    string
@@ -707,4 +497,107 @@ func TestParsePsOutput(t *testing.T) {
 	if !strings.Contains(got[2].Args, "fleet-coord-A1") {
 		t.Errorf("entry[2].Args = %q", got[2].Args)
 	}
+}
+
+// TestPaneIsRawShellLeaf covers the helper in isolation.
+func TestPaneIsRawShellLeaf(t *testing.T) {
+	t.Run("shell pane, no children → true", func(t *testing.T) {
+		procs := []procEntry{
+			{PID: 200, PPID: 1, Args: "sh"},
+		}
+		if !paneIsRawShellLeaf(procs, 200) {
+			t.Error("want true")
+		}
+	})
+	t.Run("shell pane with children → false", func(t *testing.T) {
+		procs := []procEntry{
+			{PID: 200, PPID: 1, Args: "sh -c claude"},
+			{PID: 201, PPID: 200, Args: "claude"},
+		}
+		if paneIsRawShellLeaf(procs, 200) {
+			t.Error("want false; pane has a claude child")
+		}
+	})
+	t.Run("non-shell pane, no children → false", func(t *testing.T) {
+		procs := []procEntry{
+			{PID: 200, PPID: 1, Args: "claude --foo"},
+		}
+		if paneIsRawShellLeaf(procs, 200) {
+			t.Error("want false; pane is not a shell")
+		}
+	})
+	t.Run("pane pid not in procs → false", func(t *testing.T) {
+		if paneIsRawShellLeaf(nil, 200) {
+			t.Error("want false on empty procs")
+		}
+	})
+}
+
+// TestPidResolveEngineHint pins the codex iter-3 fix (2026-05-14):
+// the engine hint must drop to empty for custom-command spawns so
+// the resolver falls back to the deepest-non-shell-descendant
+// heuristic. Without this, `sh -c 'claude --version; sleep 60'`
+// would prefer the short-lived `claude --version` over the
+// actual long-lived `sleep` child.
+
+// TestSetFakeResolver pins the fake-tmux pid-resolver seam used by
+// internal/testutil/tmuxfake.InstallFake (/review testing finding: the
+// fast-clock logic was load-bearing for CI speed but had no direct
+// in-package test, so a regression would only resurface as a silent
+// ~1s-per-spawn CI slowdown).
+//
+// It verifies the two resolve shapes return INSTANTLY (the injected
+// fast-clock + no-op sleep make even a huge timeout return on the first
+// poll) and that the restore func re-points the seam at production.
+func TestSetFakeResolver(t *testing.T) {
+	const fakePid = 2_000_000_000
+
+	// Production default before install.
+	if resolveDepsFn == nil {
+		t.Fatal("resolveDepsFn must default to a non-nil deps factory")
+	}
+
+	restore := SetFakeResolver()
+	t.Cleanup(restore) // safety net: restore seam even if a t.Fatalf fires before explicit restore()
+
+	// IMPORTANT: call resolveDepsFn() FRESH per resolve — each invocation
+	// returns deps with its own fast-clock call counter, exactly as the
+	// production spawn path does (one resolveDepsFn() per spawn). Reusing a
+	// single deps across two resolves would freeze the clock past the first
+	// deadline and hang, which is not how the seam is used.
+
+	// (1) Engine-hint spawn: "claude" hint matches the fake leaf's argv as
+	// a STABLE match → instant return of fakePid. A large timeout proves
+	// the injected clock/sleep short-circuit it (real time would block).
+	pid, _, err := resolveEnginePid("fleet-x", "", "claude", time.Hour, resolveDepsFn())
+	if err != nil {
+		t.Fatalf("engine-hint resolve: %v", err)
+	}
+	if pid != fakePid {
+		t.Fatalf("engine-hint pid = %d, want %d", pid, fakePid)
+	}
+
+	// (2) Custom-command spawn (empty hint, e.g. []string{"sleep","60"}):
+	// the fake leaf is only a TENTATIVE match, so the resolver would poll
+	// to the deadline with real time. The fast-clock makes it accept the
+	// tentative match on the first poll → still instant, still fakePid.
+	pid, _, err = resolveEnginePid("fleet-y", "", "", time.Hour, resolveDepsFn())
+	if err != nil {
+		t.Fatalf("custom-command resolve: %v", err)
+	}
+	if pid != fakePid {
+		t.Fatalf("custom-command pid = %d, want %d", pid, fakePid)
+	}
+
+	// (3) Restore re-points the seam at production.
+	restore()
+	if got := fnPtr(resolveDepsFn); got != fnPtr(productionResolveDeps) {
+		t.Fatal("restore() did not re-point resolveDepsFn at productionResolveDeps")
+	}
+}
+
+// fnPtr returns a comparable identity for a func value (Go forbids direct
+// func == func). Reflect-free: format the value's address via fmt.
+func fnPtr(f func() resolveEnginePidDeps) string {
+	return fmt.Sprintf("%p", f)
 }

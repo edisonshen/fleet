@@ -77,7 +77,7 @@ func writeSkillQueueFile(t *testing.T, oldRec *agent.Record) (queuePath string, 
 }
 
 func TestDrain_NoQueueFilesIsNotAnError(t *testing.T) {
-	requireTmux(t)
+	requireFakeTmux(t)
 	setupFleetHome(t)
 
 	out := &bytes.Buffer{}
@@ -90,7 +90,7 @@ func TestDrain_NoQueueFilesIsNotAnError(t *testing.T) {
 }
 
 func TestDrain_ProcessesSkillWrittenQueue(t *testing.T) {
-	requireTmux(t)
+	requireFakeTmux(t)
 	setupFleetHome(t)
 	oldRec := seedAgent(t)
 	qp, req := writeSkillQueueFile(t, oldRec)
@@ -126,7 +126,7 @@ func TestDrain_ProcessesSkillWrittenQueue(t *testing.T) {
 // Project but is not the project coord, so the coord lease says nothing about
 // it. It must drain via the LEGACY path (spawn + retire), not get stranded.
 func TestDrain_FailoverOn_WorkerHandoffUsesLegacyPath(t *testing.T) {
-	requireTmux(t)
+	requireFakeTmux(t)
 	setupFleetHome(t)
 	t.Setenv("FLEET_LEASE_FAILOVER", "1")
 	// seedAgent's TaskID is a worker task (not "coord-<project>").
@@ -153,7 +153,7 @@ func TestDrain_FailoverOn_WorkerHandoffUsesLegacyPath(t *testing.T) {
 }
 
 func TestDrain_ProcessesMultipleQueueFilesIndependently(t *testing.T) {
-	requireTmux(t)
+	requireFakeTmux(t)
 	setupFleetHome(t)
 
 	// Two independent agents, two queue files. Drain should retire both
@@ -181,7 +181,7 @@ func TestDrain_ProcessesMultipleQueueFilesIndependently(t *testing.T) {
 }
 
 func TestDrain_FailureIsolatedToOneFile(t *testing.T) {
-	requireTmux(t)
+	requireFakeTmux(t)
 	setupFleetHome(t)
 
 	// Agent A is healthy → drain should retire it.
@@ -232,7 +232,7 @@ func TestDrain_FailureIsolatedToOneFile(t *testing.T) {
 }
 
 func TestDrain_AllFailuresReturnsError(t *testing.T) {
-	requireTmux(t)
+	requireFakeTmux(t)
 	setupFleetHome(t)
 
 	// One queue file that will fail. With no successful processes, drain
@@ -333,7 +333,7 @@ func TestDrain_ResumeTimeoutFlagOverride(t *testing.T) {
 // in its own `backgrounded` bucket — still completing, retried by a later
 // drain — not claim completion.
 func TestDrain_BackgroundedResumeCountsBackgrounded(t *testing.T) {
-	requireTmux(t)
+	requireFakeTmux(t)
 	setupFleetHome(t)
 	req := bogusQueueFile(t)
 	stubDrainOne(t, func(r queue.SpawnFresh, _ string, _, timeoutMillis int, _, stderr io.Writer) error {
@@ -375,7 +375,7 @@ func TestDrain_BackgroundedResumeCountsBackgrounded(t *testing.T) {
 // failed", so the drain still exits 0 (failure isolation: the failed file is
 // left in place + logged), and the summary reports each bucket truthfully.
 func TestDrain_BackgroundedPlusFailedStillExitsZero(t *testing.T) {
-	requireTmux(t)
+	requireFakeTmux(t)
 	setupFleetHome(t)
 	slow := bogusQueueFileFor(t, "slowcord")
 	bogusQueueFileFor(t, "deadcord")
@@ -412,7 +412,7 @@ func TestDrain_BackgroundedPlusFailedStillExitsZero(t *testing.T) {
 // already-completed one. Without this retention, exit 0 + "completing in the
 // background" could silently strand a half-done handoff.
 func TestDrain_BackgroundedResumeKeepsQueueFile(t *testing.T) {
-	requireTmux(t)
+	requireFakeTmux(t)
 	setupFleetHome(t)
 	bogusQueueFile(t)
 	stubDrainOne(t, func(r queue.SpawnFresh, _ string, _, timeoutMillis int, _, _ io.Writer) error {
@@ -436,7 +436,7 @@ func TestDrain_BackgroundedResumeKeepsQueueFile(t *testing.T) {
 // Bug A, test 5 (regression guard): a GENUINE Resume error (not a timeout) is
 // still counted failed — the new sentinel must not mask real failures.
 func TestDrain_GenuineResumeErrorStillFails(t *testing.T) {
-	requireTmux(t)
+	requireFakeTmux(t)
 	setupFleetHome(t)
 	bogusQueueFile(t)
 	stubDrainOne(t, func(queue.SpawnFresh, string, int, int, io.Writer, io.Writer) error {

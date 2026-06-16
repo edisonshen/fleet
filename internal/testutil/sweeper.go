@@ -508,6 +508,18 @@ func SweepAllDir(dir string) error {
 		if !strings.HasPrefix(name, "fleet-test-") {
 			continue
 		}
+		// tmux 3.x writes a companion lock `<socket>.sock.lock` next to each
+		// socket; a killed server leaves it behind. Reap those too — the CI
+		// leak gate matches `fleet-test-*` (broad), so a stranded `.sock.lock`
+		// reds the run even after every socket is gone (run 27515608918).
+		if strings.HasSuffix(name, ".sock.lock") {
+			if err := os.Remove(filepath.Join(dir, name)); err != nil && !os.IsNotExist(err) {
+				if firstErr == nil {
+					firstErr = fmt.Errorf("testutil.SweepAllDir remove %s: %w", filepath.Join(dir, name), err)
+				}
+			}
+			continue
+		}
 		if !strings.HasSuffix(name, ".sock") {
 			continue
 		}
@@ -533,6 +545,9 @@ func SweepAllDir(dir string) error {
 				firstErr = fmt.Errorf("testutil.SweepAllDir remove %s: %w", path, err)
 			}
 		}
+		// Companion lock for THIS socket, in case the directory scan already
+		// passed its alphabetical position.
+		_ = os.Remove(path + ".lock")
 	}
 	return firstErr
 }
