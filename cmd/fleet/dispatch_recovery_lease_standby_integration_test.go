@@ -40,7 +40,8 @@ import (
 func TestRunDispatch_DeadCoordRecovery_AdvertisesLockWinner(t *testing.T) {
 	requireTmux(t)
 	setupFleetHome(t)
-	t.Setenv("FLEET_LEASE_FAILOVER", "1") // delivery branch only fires with failover on
+	t.Setenv("FLEET_LEASE_FAILOVER", "1")   // delivery branch only fires with failover on
+	t.Setenv("FLEET_STANDBY_TIMEOUT", "3s") // PR-A: self-bound the standby this dispatch spawns
 
 	// Stub the lock-owner delivery so we deterministically model "a racing
 	// standby (winnerID) won the lease" without seeding a live foreign lease +
