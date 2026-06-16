@@ -52,6 +52,17 @@ func TestMain(m *testing.M) {
 		panic("TestMain: os.Setenv FLEET_RC_BOOTSTRAP_DISABLED failed: " + err.Error())
 	}
 
+	// Fork-bomb guard (PR-A): force lease-failover OFF for the whole default
+	// test lane (shared helpers already set =0 per-test; this makes it the
+	// package default too). The genuine standby-spawning failover cases opt back
+	// in via t.Setenv("FLEET_LEASE_FAILOVER","1") in the integration lane.
+	// Subprocess tests that intend default-ON (coordinator_integration_test.go)
+	// pin =1 explicitly in their own cmd.Env rather than inherit this =0.
+	// See docs/DESIGN-spawn-test-fork-bomb-root-fix.md.
+	if err := os.Setenv("FLEET_LEASE_FAILOVER", "0"); err != nil {
+		panic("TestMain: os.Setenv FLEET_LEASE_FAILOVER failed: " + err.Error())
+	}
+
 	// ci-perf-pr1 (P0 CI-hang fix): point the GC socket scan at an EMPTY decoy
 	// dir for the whole cmd/fleet package so no test walks the host's real
 	// /tmp. The reconcile pass in runDispatch/runStatus scans
@@ -107,5 +118,7 @@ func TestMain(m *testing.M) {
 	// os.Exit skips defers, so reap the decoy scan dir explicitly (fleet owns
 	// the lifecycle of everything it creates — feedback_fleet_owns_its_resources).
 	_ = os.RemoveAll(scanDecoy)
-	os.Exit(code)
+	// LAST step: authoritative zero-standby-launch gate (no-op under
+	// //go:build integration). Replaces os.Exit(code) so the reaps above still run.
+	assertNoStandbyLaunches(code)
 }
