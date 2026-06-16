@@ -103,6 +103,23 @@ jobs:
         # until the runner's own 24-min ceiling (the PR #232 hang).
         run: go test -race -count=1 -timeout=5m ./...
 
+      - name: Integration test lane (lease-failover standby)
+        # PR-A fork-bomb fix (DESIGN-spawn-test-fork-bomb-root-fix): the genuine
+        # `coord-run --standby` spawning tests are fenced out of the default
+        # `go test ./...` lane (they fork-bomb a loaded box). They live behind
+        # //go:build integration and run HERE so they still gate — as a step
+        # inside build-test-lint (the required check), NOT a separate job that
+        # branch protection wouldn't enforce.
+        #
+        # FLEET_STANDBY_TIMEOUT=3s caps each standby at 3s (vs the 10m
+        # production default), so even an aborted run self-reaps in seconds and
+        # the lane finishes well under the -timeout=5m / 18-min job caps. No
+        # -race here: these tests exec real tmux-pane subprocesses (the race
+        # detector instruments only in-process goroutines, and -race would
+        # roughly double the lane's wall time for no added coverage of the
+        # subprocess paths this lane exists to exercise).
+        run: FLEET_STANDBY_TIMEOUT=3s go test -tags=integration -count=1 -timeout=5m ./internal/spawn ./cmd/fleet ./internal/handoffop
+
       - name: Python tests
         run: python3 -m pytest skills/ scripts/ -q
 
