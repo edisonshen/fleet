@@ -1911,6 +1911,14 @@ def _run_idle_agent_archive_pass(
         #     exists to recover) has BOTH false — yet still owns the
         #     project via the lock. Exempting the lock holder closes that
         #     gap; it mirrors the Go recovery path's authority signal.
+        #     The lock BODY is coord-exclusive by construction: the ONLY
+        #     writer is loop._try_lock(holder_id=coord_id) in the coord
+        #     skill, and it always writes the COORD'S own id. A worker
+        #     that transiently grabs the flock (register_subagent's
+        #     _take_coord_lock) does NOT write the body — so a worker id
+        #     can never appear there, and rec_id == coord_lock_holder
+        #     can only match an actual coord record. (See the
+        #     archives_worker_when_lock_held_by_coord regression test.)
         # role is NOT usable — coords carry role="executor" like workers.
         # Exact-match the project-scoped id (not startswith("coord-")) so
         # the predicate is unambiguous and project-scoped. The literal

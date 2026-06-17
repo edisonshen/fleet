@@ -1948,6 +1948,41 @@ def test_idle_agent_archive_pass_archives_worker_when_not_lock_holder(
     )
 
 
+def test_idle_agent_archive_pass_archives_worker_when_lock_held_by_coord(
+    fleet_home: Path, monkeypatch,
+) -> None:
+    """Signal 3 worker-hijack guard (codex iter-3 P1) — refutes the
+    "a worker that grabs the coordinator.lock becomes exempt" concern.
+    The lock BODY is coord-exclusive: only loop._try_lock(holder_id=
+    coord_id) writes it, always with the COORD'S id; a worker's
+    _take_coord_lock takes the flock but never writes the body. So even
+    while a worker holds the flock, the body still names the coord — and
+    an idle worker (different id from the body) MUST still archive. We
+    model exactly that: body names the coord, an idle worker with a
+    different id sits past TTL, and it reaps."""
+    project = "fleet"
+    coord_id = "c0c0c0c0"
+    _write_coord_lock(fleet_home, project, coord_id)  # body names the COORD
+    # The worker — distinct id, real task slug, no is_coord, idle past TTL.
+    _write_agent_record(
+        fleet_home, "deadbeef",
+        project=project,
+        last_activity_ts="2026-05-11T00:00:00Z",
+        task_id="worker-holding-flock-9012",
+    )
+    now_unix, calls = _exempt_setup(monkeypatch)
+
+    archived = supervisor._run_idle_agent_archive_pass(
+        project=project, home=fleet_home, fleet_bin="fleet",
+        now_unix=now_unix, log_stream=io.StringIO(),
+    )
+
+    assert archived == 1, f"idle worker must archive even mid-flock; calls: {calls}"
+    assert [c for c in calls if c[1:3] == ["rm", "deadbeef"]], (
+        f"expected `fleet rm deadbeef`, got: {calls}"
+    )
+
+
 def test_idle_agent_archive_pass_coord_exempt_respects_zero_ttl(
     fleet_home: Path, monkeypatch,
 ) -> None:
