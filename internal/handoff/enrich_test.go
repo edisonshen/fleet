@@ -358,6 +358,21 @@ func TestScanTasksMetaTolerant_IgnoresProseBullets(t *testing.T) {
 	}
 }
 
+// scanTasksMetaTolerant: a blank line WITHIN the leading field bullets
+// (hand edit / future writer) must NOT stop field reading (matches
+// handoff.py reopen behavior; codex Slice-1 P2).
+func TestScanTasksMetaTolerant_BlankLineInBulletsKeepsScanning(t *testing.T) {
+	body := "## task: a-1\n" +
+		"- status: in-review\n" +
+		"\n" + // blank line splits the field bullets
+		"- pr_url: https://x/77\n"
+	meta := scanTasksMetaTolerant([]byte(body))
+	got := meta["a-1"]
+	if got.status != "in-review" || got.prURL != "https://x/77" {
+		t.Errorf("a-1 meta: got %+v want {in-review https://x/77} (blank line must not stop field scan)", got)
+	}
+}
+
 // --- Case 2: no checkpoint, live workers on disk → Active Subagents
 // from emit-on-missing walk; Open PRs from gh. ---
 func TestEnrichManualDoc_NoCheckpointLiveWalk(t *testing.T) {

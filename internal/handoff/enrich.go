@@ -668,14 +668,14 @@ func collectOpenPRsFromTasks(pdir string) ([]OpenPR, bool) {
 func scanTasksMetaTolerant(data []byte) map[string]taskMeta {
 	out := map[string]taskMeta{}
 	var slug, status, prURL string
-	// The task FIELDS are the contiguous `- key: val` bullets that lead a
-	// task block, before the first blank line or `### ` H3. Once that
-	// leading section closes, later `- ` lines are prose (Spec/Acceptance/
-	// Notes) and must NOT be read as fields — so we latch bulletsClosed
-	// and never reopen until the next `## task:`. (This is stricter than
-	// handoff.py, which can reopen on a stray `- ` after an H3; the
-	// stricter rule avoids mis-reading a `- status:`-looking prose line.)
-	inBullets, bulletsClosed := false, false
+	// The task FIELDS are the `- key: val` bullets BEFORE the first `### `
+	// H3 (Spec/Acceptance/Notes). A blank line is only a soft pause — a
+	// hand edit or future writer may split the field bullets across one,
+	// so we do NOT latch on blank lines (matches handoff.py:_read_tasks_
+	// meta, which reopens). We DO latch permanently on `### ` so prose
+	// bullets under a body header are never mis-read as fields. (codex
+	// Slice-1 P2 — both the prose-bullet and the blank-line cases.)
+	pastFields := false
 	flush := func() {
 		if slug != "" {
 			out[slug] = taskMeta{status: status, prURL: prURL}
@@ -685,7 +685,7 @@ func scanTasksMetaTolerant(data []byte) map[string]taskMeta {
 		if strings.HasPrefix(raw, "## task: ") {
 			flush()
 			slug = strings.TrimSpace(strings.TrimPrefix(raw, "## task: "))
-			status, prURL, inBullets, bulletsClosed = "", "", false, false
+			status, prURL, pastFields = "", "", false
 			continue
 		}
 		if strings.HasPrefix(raw, "## ") {
@@ -697,22 +697,13 @@ func scanTasksMetaTolerant(data []byte) map[string]taskMeta {
 		if slug == "" {
 			continue
 		}
-		if strings.TrimSpace(raw) == "" {
-			if inBullets {
-				bulletsClosed = true // blank line ends the leading field section
-			}
-			inBullets = false
-			continue
-		}
 		if strings.HasPrefix(raw, "### ") {
-			bulletsClosed = true // H3 body section — no more task fields
-			inBullets = false
+			pastFields = true // H3 body section — no more task fields
 			continue
 		}
-		if !strings.HasPrefix(raw, "- ") || bulletsClosed {
+		if pastFields || !strings.HasPrefix(raw, "- ") {
 			continue
 		}
-		inBullets = true
 		body := raw[2:]
 		colon := strings.IndexByte(body, ':')
 		if colon < 0 {
