@@ -425,31 +425,54 @@ func TestEnrichManualDoc_TruncatedTasksMDKeepsCheckpointPRs(t *testing.T) {
 	}
 }
 
-// scanTasksMetaTolerant: a fenced markdown example containing column-0
-// `## task:` / `- pr_url:` lines must be treated as body, not structure
-// (matches internal/tasks fence handling; codex Slice-1 P2).
-func TestScanTasksMetaTolerant_IgnoresFencedHeadings(t *testing.T) {
+// scanTasksMetaTolerant: a fenced `### `-body example protects its
+// non-header prose (- pr_url: lines inside a ``` under Spec are not read
+// as fields). A column-0 `## task:` is ALWAYS a block boundary that
+// resets fence state — even mid-fence — to bound a malformed/unclosed
+// fence to its own block (review P1: an unclosed fence must NOT swallow
+// every later real task's PR). The accepted tradeoff: a CLOSED fenced
+// `## task:` example produces a benign phantom row (no WIP/inbox →
+// skipped on resume), which is far cheaper than silently dropping real
+// open-PR supervision on a partial write.
+func TestScanTasksMetaTolerant_FencedFieldBulletsNotRead(t *testing.T) {
 	body := "## task: real-1\n" +
 		"- status: in-review\n" +
 		"- pr_url: https://x/real\n" +
 		"### Spec\n" +
-		"Example of another task block:\n" +
+		"Example pr_url bullet inside a fence (must NOT override real-1):\n" +
 		"```\n" +
-		"## task: fake-2\n" +
-		"- pr_url: https://x/fake\n" +
-		"## footer-not-real\n" +
+		"- pr_url: https://x/fenced-prose\n" +
 		"```\n" +
 		"more spec prose\n"
 	meta := scanTasksMetaTolerant([]byte(body))
-	if len(meta) != 1 {
-		t.Fatalf("meta: got %d entries want 1 (fenced ## task: is not a real task); %#v", len(meta), meta)
-	}
-	if _, ok := meta["fake-2"]; ok {
-		t.Errorf("fenced 'fake-2' was parsed as a real task")
-	}
 	got := meta["real-1"]
 	if got.prURL != "https://x/real" {
-		t.Errorf("real-1 pr_url: got %q want https://x/real (not the fenced fake)", got.prURL)
+		t.Errorf("real-1 pr_url: got %q want https://x/real (fenced prose bullet must not win)", got.prURL)
+	}
+}
+
+// scanTasksMetaTolerant: an UNCLOSED fence inside one task's body must
+// NOT swallow a later real task block — the `## task:` boundary resets
+// fence state so corruption is bounded to its own block. (review P1.)
+func TestScanTasksMetaTolerant_UnclosedFenceDoesNotSwallowLaterBlocks(t *testing.T) {
+	body := "## task: first-1\n" +
+		"- status: in-review\n" +
+		"- pr_url: https://x/first\n" +
+		"### Spec\n" +
+		"```\n" + // UNCLOSED fence (no closing ```)
+		"some pasted example that forgot to close the fence\n" +
+		"## task: second-2\n" + // later REAL task — must still be parsed
+		"- status: in-review\n" +
+		"- pr_url: https://x/second\n"
+	meta := scanTasksMetaTolerant([]byte(body))
+	if _, ok := meta["second-2"]; !ok {
+		t.Fatalf("second-2 dropped by an unclosed fence in first-1's body; got %#v", meta)
+	}
+	if meta["second-2"].prURL != "https://x/second" {
+		t.Errorf("second-2 pr_url: got %q want https://x/second", meta["second-2"].prURL)
+	}
+	if meta["first-1"].prURL != "https://x/first" {
+		t.Errorf("first-1 pr_url: got %q want https://x/first", meta["first-1"].prURL)
 	}
 }
 

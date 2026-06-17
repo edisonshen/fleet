@@ -715,17 +715,18 @@ func scanTasksMetaTolerant(data []byte) map[string]taskMeta {
 		}
 	}
 	for _, raw := range strings.Split(strings.ReplaceAll(string(data), "\r\n", "\n"), "\n") {
-		if strings.HasPrefix(raw, "```") && !strings.HasPrefix(raw[3:], "`") {
-			inFence = !inFence
-			continue
-		}
-		if inFence {
-			continue // fenced body — never structural
-		}
+		// A column-0 `## task:` / `## ` header is ALWAYS a block boundary,
+		// even mid-fence: it RESETS fence state so a malformed/unclosed
+		// fence inside one task's body can corrupt at most THAT block, not
+		// every later block (matches tasks.go:readSection's per-section
+		// fence scoping). Without this reset, a single odd ``` in a Spec
+		// body — e.g. a truncated/partial write — would leave inFence=true
+		// and silently swallow every subsequent task's status/pr_url,
+		// dropping their open PRs from the handoff doc. (review P1.)
 		if strings.HasPrefix(raw, "## task: ") {
 			flush()
 			slug = strings.TrimSpace(strings.TrimPrefix(raw, "## task: "))
-			status, prURL, pastFields = "", "", false
+			status, prURL, pastFields, inFence = "", "", false, false
 			continue
 		}
 		if strings.HasPrefix(raw, "## ") {
@@ -733,6 +734,13 @@ func scanTasksMetaTolerant(data []byte) map[string]taskMeta {
 			flush()
 			slug = ""
 			break
+		}
+		if strings.HasPrefix(raw, "```") && !strings.HasPrefix(raw[3:], "`") {
+			inFence = !inFence
+			continue
+		}
+		if inFence {
+			continue // fenced body — never structural (within a block)
 		}
 		if slug == "" {
 			continue
