@@ -272,6 +272,45 @@ func TestEnrichManualDoc_TasksFallbackExcludesTerminal(t *testing.T) {
 	}
 }
 
+// --- codex Slice-1 P1: a worker with a PR open (state.json pr_url) but
+// tasks.md still in-progress is promoted to in-review in the live walk,
+// so the successor takes the shepherd-only path and does NOT re-dispatch
+// the Agent against an already-open PR. ---
+func TestCollectActiveSubagentsLive_PromotesPROpenToInReview(t *testing.T) {
+	pdir := withFleetHomeSynth(t)
+	seedCoordState(t, pdir, "myproj", map[string]string{
+		"pr-open-1111":   "idA",
+		"writing-2222":   "idB",
+		"no-status-3333": "idC",
+	})
+	// pr-open: PR opened in state.json, tasks.md still in-progress.
+	seedWorkerState(t, pdir, "myproj", "pr-open-1111", "push", "https://github.com/o/r/pull/7")
+	// writing: no PR yet, in-progress.
+	seedWorkerState(t, pdir, "myproj", "writing-2222", "tdd-green", "")
+	// no-status: PR in state.json but NO tasks.md row at all (empty status).
+	seedWorkerState(t, pdir, "myproj", "no-status-3333", "push", "https://github.com/o/r/pull/8")
+	seedTasksMD(t, pdir, "myproj", map[string]tasks.Status{
+		"pr-open-1111": tasks.StatusInProgress,
+		"writing-2222": tasks.StatusInProgress,
+		// no-status-3333 intentionally absent from tasks.md.
+	})
+
+	subs := CollectActiveSubagentsLive("myproj")
+	byTask := map[string]ActiveSubagent{}
+	for _, s := range subs {
+		byTask[s.TaskID] = s
+	}
+	if got := byTask["pr-open-1111"].Status; got != "in-review" {
+		t.Errorf("pr-open status: got %q want in-review (PR open → shepherd-only)", got)
+	}
+	if got := byTask["no-status-3333"].Status; got != "in-review" {
+		t.Errorf("no-status (PR open, empty tasks status): got %q want in-review", got)
+	}
+	if got := byTask["writing-2222"].Status; got != "in-progress" {
+		t.Errorf("writing (no PR) status: got %q want in-progress (still re-dispatch)", got)
+	}
+}
+
 // --- repoDir is forwarded to gh so `gh pr list` binds to the handed-off
 // coord's checkout regardless of the operator's CWD (codex Slice-1 P1). ---
 func TestCollectOpenPRs_PassesRepoDirToGh(t *testing.T) {

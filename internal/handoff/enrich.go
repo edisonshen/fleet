@@ -160,7 +160,9 @@ func CollectOpenPRs(repoDir string, logw func(string)) ([]OpenPR, bool) {
 // tasks.md status is overlaid per slug (readStatusBySlug); pr_url is
 // read from the worker state.json when present. Both default to "" on
 // any read failure, which the successor coord treats as the safe
-// "re-dispatch" fallback.
+// "re-dispatch" fallback. A row that carries a pr_url but a pre-PR
+// status is promoted to in-review (statusIsPrePR) so the successor
+// takes the shepherd-only branch instead of double-dispatching.
 //
 // Best-effort: a missing project tree / missing coord-state.json / empty
 // worker map returns nil (the caller leaves the _(none)_ placeholder). A
@@ -198,9 +200,36 @@ func CollectActiveSubagentsLive(project string) []ActiveSubagent {
 		if st, ok := statusBySlug[slug]; ok {
 			sub.Status = st
 		}
+		// PR-open promotion: a worker that has already opened a PR (pr_url
+		// in state.json) but whose tasks.md row is still stamped with a
+		// pre-PR/writing status (empty / todo / ready / in-progress) is in
+		// the transient window before the coord flips it to in-review.
+		// Leaving status=in-progress makes handoff_resume.py BOTH
+		// re-dispatch the Agent AND re-spawn a shepherd from ## Open PRs —
+		// duplicating work against the already-open PR. Promote to
+		// in-review so the resume path takes the shepherd-only branch.
+		// Terminal statuses (done/abandoned/blocked) are left as-is; the
+		// resume path already skips them. (codex Slice-1 P1.)
+		if sub.PRURL != "" && statusIsPrePR(sub.Status) {
+			sub.Status = string(tasks.StatusInReview)
+		}
 		out = append(out, sub)
 	}
 	return out
+}
+
+// statusIsPrePR reports whether a tasks.md status is a pre-PR / still-
+// writing state for which an already-open PR should promote the row to
+// in-review (so the successor takes the shepherd-only resume branch).
+// Empty status (legacy row / unread tasks.md) counts: a PR exists, so the
+// safe interpretation is "in review", not "re-dispatch".
+func statusIsPrePR(status string) bool {
+	switch tasks.Status(status) {
+	case "", tasks.StatusTodo, tasks.StatusReady, tasks.StatusInProgress:
+		return true
+	default:
+		return false
+	}
 }
 
 // applyCheckpointToDoc copies the lifted-verbatim sections of a parsed
