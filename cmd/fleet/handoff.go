@@ -810,8 +810,18 @@ func runHandoff(opts *handoffOpts, stdout, stderr io.Writer) error {
 	// NEVER fails a handoff. agentID = oldRec.ID drives the checkpoint
 	// generation guard; lastHandoffPath threads through nil→"".
 	// Narrative (Completed / Key Decisions) stays placeholder (Slice 2).
-	handoff.EnrichManualDoc(doc, oldRec.Project, oldRec.ID, oldRec.LastHandoffPath,
-		func(msg string) { _, _ = fmt.Fprintln(stderr, msg) })
+	//
+	// COORD ONLY: Active Subagents + Open PRs are coord-owned project
+	// state. A worker handoff has none, and enriching a worker's doc
+	// would pull the live coord's coord-state.json / open PRs into a
+	// section that must stay empty for non-coord docs — resuming the
+	// worker with unrelated project-wide state. `cwd` is the handed-off
+	// coord's repo checkout (resolved in step 4), so `gh pr list` binds
+	// to the right repo regardless of the operator's shell CWD.
+	if spawn.IsCoordSpawn(oldRec.TaskID, oldRec.Project) {
+		handoff.EnrichManualDoc(doc, oldRec.Project, oldRec.ID, cwd, oldRec.LastHandoffPath,
+			func(msg string) { _, _ = fmt.Fprintln(stderr, msg) })
+	}
 	if err := handoff.Write(doc, docPath); err != nil {
 		return fmt.Errorf("write handoff doc: %w", err)
 	}

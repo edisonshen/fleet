@@ -28,7 +28,7 @@ import (
 func fakeGH(t *testing.T, out []byte, err error) {
 	t.Helper()
 	prev := ghRunner
-	ghRunner = func(args ...string) ([]byte, error) { return out, err }
+	ghRunner = func(dir string, args ...string) ([]byte, error) { return out, err }
 	t.Cleanup(func() { ghRunner = prev })
 }
 
@@ -94,7 +94,7 @@ func TestEnrichManualDoc_FreshCheckpoint(t *testing.T) {
 	}), nil)
 
 	doc := NewManualStub("deadbeef", "coord-myproj", "myproj", 1, &lastHandoff, now)
-	EnrichManualDoc(doc, "myproj", "deadbeef", &lastHandoff, nil)
+	EnrichManualDoc(doc, "myproj", "deadbeef", "", &lastHandoff, nil)
 
 	if len(doc.ActiveSubagents) != 1 || doc.ActiveSubagents[0].TaskID != "fix-new-1234" {
 		t.Fatalf("ActiveSubagents: got %#v want one fix-new-1234 (checkpoint wins)", doc.ActiveSubagents)
@@ -121,7 +121,7 @@ func TestEnrichManualDoc_NoCheckpointLiveWalk(t *testing.T) {
 	}), nil)
 
 	doc := NewManualStub("deadbeef", "coord-myproj", "myproj", 1, nil, now)
-	EnrichManualDoc(doc, "myproj", "deadbeef", nil, nil)
+	EnrichManualDoc(doc, "myproj", "deadbeef", "", nil, nil)
 
 	if len(doc.ActiveSubagents) != 2 {
 		t.Fatalf("ActiveSubagents: got %d want 2 (live walk)", len(doc.ActiveSubagents))
@@ -150,7 +150,7 @@ func TestEnrichManualDoc_GhFailsFallsBackToPlaceholder(t *testing.T) {
 	fakeGH(t, nil, errors.New("not a git repository")) // gh exits non-zero
 
 	doc := NewManualStub("deadbeef", "coord-myproj", "myproj", 1, nil, now)
-	EnrichManualDoc(doc, "myproj", "deadbeef", nil, nil)
+	EnrichManualDoc(doc, "myproj", "deadbeef", "", nil, nil)
 
 	if len(doc.OpenPRs) != 0 {
 		t.Fatalf("OpenPRs: got %#v want empty (gh failed, no checkpoint fallback)", doc.OpenPRs)
@@ -177,7 +177,7 @@ func TestEnrichManualDoc_GhFailsFallsBackToCheckpointPRs(t *testing.T) {
 	fakeGH(t, nil, errors.New("gh down"))
 
 	doc := NewManualStub("deadbeef", "coord-myproj", "myproj", 1, &lastHandoff, now)
-	EnrichManualDoc(doc, "myproj", "deadbeef", &lastHandoff, nil)
+	EnrichManualDoc(doc, "myproj", "deadbeef", "", &lastHandoff, nil)
 
 	if len(doc.OpenPRs) != 1 || doc.OpenPRs[0].Number != 50 {
 		t.Fatalf("OpenPRs: got %#v want checkpoint fallback #50", doc.OpenPRs)
@@ -206,7 +206,7 @@ func TestEnrichManualDoc_GhFailsFallsBackToTasksMD(t *testing.T) {
 	fakeGH(t, nil, errors.New("not a git repository")) // gh fails, no checkpoint
 
 	doc := NewManualStub("deadbeef", "coord-myproj", "myproj", 1, nil, now)
-	EnrichManualDoc(doc, "myproj", "deadbeef", nil, nil)
+	EnrichManualDoc(doc, "myproj", "deadbeef", "", nil, nil)
 
 	if len(doc.OpenPRs) != 1 {
 		t.Fatalf("OpenPRs: got %#v want 1 (tasks.md fallback for the slug with a pr_url)", doc.OpenPRs)
@@ -226,6 +226,69 @@ func TestEnrichManualDoc_GhFailsFallsBackToTasksMD(t *testing.T) {
 	}
 }
 
+// --- Case 3d (codex Slice-1 P2): tasks.md fallback excludes terminal
+// (done/abandoned) tasks even when they carry a pr_url, so completed PRs
+// are not reintroduced as live shepherd watches. ---
+func TestEnrichManualDoc_TasksFallbackExcludesTerminal(t *testing.T) {
+	pdir := withFleetHomeSynth(t)
+	now := time.Now().UTC()
+	seedCoordState(t, pdir, "myproj", map[string]string{"live-1111": "deadbeef"})
+	seedWorkerState(t, pdir, "myproj", "live-1111", "push", "")
+
+	// Hand-build tasks.md with mixed statuses, all carrying a pr_url.
+	dir := filepath.Join(pdir, "myproj")
+	f := &tasks.File{Schema: 1}
+	add := func(slug string, st tasks.Status) {
+		f.Tasks = append(f.Tasks, &tasks.Task{
+			Slug: slug, Status: st, Priority: tasks.Priority("P1"),
+			PRURL: "https://github.com/o/r/pull/" + slug, Created: now, Updated: now, Spec: "x",
+		})
+	}
+	add("a-inreview", tasks.StatusInReview)
+	add("b-done", tasks.StatusDone)
+	add("c-abandoned", tasks.StatusAbandoned)
+	add("d-inprogress", tasks.StatusInProgress)
+	if err := tasks.Write(filepath.Join(dir, "tasks.md"), f); err != nil {
+		t.Fatalf("write tasks.md: %v", err)
+	}
+
+	fakeGH(t, nil, errors.New("gh down")) // force tasks.md fallback
+
+	doc := NewManualStub("deadbeef", "coord-myproj", "myproj", 1, nil, now)
+	EnrichManualDoc(doc, "myproj", "deadbeef", "", nil, nil)
+
+	got := map[string]bool{}
+	for _, pr := range doc.OpenPRs {
+		got[pr.Title] = true // Title = slug for tasks.md rows
+	}
+	if !got["a-inreview"] || !got["d-inprogress"] {
+		t.Errorf("expected in-review + in-progress PRs kept; got %#v", doc.OpenPRs)
+	}
+	if got["b-done"] || got["c-abandoned"] {
+		t.Errorf("terminal (done/abandoned) PRs must be excluded; got %#v", doc.OpenPRs)
+	}
+	if len(doc.OpenPRs) != 2 {
+		t.Errorf("OpenPRs: got %d want 2 (non-terminal only)", len(doc.OpenPRs))
+	}
+}
+
+// --- repoDir is forwarded to gh so `gh pr list` binds to the handed-off
+// coord's checkout regardless of the operator's CWD (codex Slice-1 P1). ---
+func TestCollectOpenPRs_PassesRepoDirToGh(t *testing.T) {
+	var gotDir string
+	prev := ghRunner
+	ghRunner = func(dir string, args ...string) ([]byte, error) {
+		gotDir = dir
+		return []byte("[]"), nil
+	}
+	t.Cleanup(func() { ghRunner = prev })
+
+	_, _ = CollectOpenPRs("/some/coord/repo", nil)
+	if gotDir != "/some/coord/repo" {
+		t.Errorf("gh working dir: got %q want /some/coord/repo", gotDir)
+	}
+}
+
 // --- Case 4: 3 open worker PRs → all render `- #N title — head — url`. ---
 func TestEnrichManualDoc_ThreeOpenPRsRender(t *testing.T) {
 	pdir := withFleetHomeSynth(t)
@@ -240,7 +303,7 @@ func TestEnrichManualDoc_ThreeOpenPRsRender(t *testing.T) {
 	}), nil)
 
 	doc := NewManualStub("deadbeef", "coord-myproj", "myproj", 1, nil, now)
-	EnrichManualDoc(doc, "myproj", "deadbeef", nil, nil)
+	EnrichManualDoc(doc, "myproj", "deadbeef", "", nil, nil)
 
 	body := string(Render(doc))
 	for _, want := range []string{
@@ -269,7 +332,7 @@ func TestEnrichManualDoc_EmitsOnMissingWorkerState(t *testing.T) {
 	fakeGH(t, []byte("[]"), nil) // gh returns no PRs
 
 	doc := NewManualStub("deadbeef", "coord-myproj", "myproj", 1, nil, now)
-	EnrichManualDoc(doc, "myproj", "deadbeef", nil, nil)
+	EnrichManualDoc(doc, "myproj", "deadbeef", "", nil, nil)
 
 	if len(doc.ActiveSubagents) != 2 {
 		t.Fatalf("ActiveSubagents: got %d want 2 (emit-on-missing); rows=%#v", len(doc.ActiveSubagents), doc.ActiveSubagents)
@@ -337,7 +400,7 @@ func TestEnrichManualDoc_RejectsForeignGenerationCheckpoint(t *testing.T) {
 
 	// Handing-off coord is "newcoord1", checkpoint's coord_id is "deadbeef".
 	doc := NewManualStub("newcoord1", "coord-myproj", "myproj", 1, &lastHandoff, now)
-	EnrichManualDoc(doc, "myproj", "newcoord1", &lastHandoff, nil)
+	EnrichManualDoc(doc, "myproj", "newcoord1", "", &lastHandoff, nil)
 
 	if len(doc.ActiveSubagents) != 1 || doc.ActiveSubagents[0].TaskID != "live-9999" {
 		t.Fatalf("ActiveSubagents: got %#v want live-9999 (checkpoint rejected by gen guard)", doc.ActiveSubagents)
@@ -354,7 +417,7 @@ func TestEnrichManualDoc_NoCheckpointNarrativePlaceholder(t *testing.T) {
 	fakeGH(t, []byte("[]"), nil)
 
 	doc := NewManualStub("deadbeef", "coord-myproj", "myproj", 1, nil, now)
-	EnrichManualDoc(doc, "myproj", "deadbeef", nil, nil)
+	EnrichManualDoc(doc, "myproj", "deadbeef", "", nil, nil)
 
 	if len(doc.ActiveSubagents) != 1 {
 		t.Errorf("ActiveSubagents: got %d want 1 (live walk)", len(doc.ActiveSubagents))
@@ -380,14 +443,14 @@ func TestEnrichManualDoc_RecoversFromPanic(t *testing.T) {
 
 	// Force a panic from inside the gh runner.
 	prev := ghRunner
-	ghRunner = func(args ...string) ([]byte, error) { panic("boom from gh runner") }
+	ghRunner = func(dir string, args ...string) ([]byte, error) { panic("boom from gh runner") }
 	t.Cleanup(func() { ghRunner = prev })
 
 	doc := NewManualStub("deadbeef", "coord-myproj", "myproj", 1, nil, now)
 
 	var logged []string
 	// Must NOT panic out of EnrichManualDoc.
-	EnrichManualDoc(doc, "myproj", "deadbeef", nil, func(m string) { logged = append(logged, m) })
+	EnrichManualDoc(doc, "myproj", "deadbeef", "", nil, func(m string) { logged = append(logged, m) })
 
 	// Open PRs left as placeholder; the doc still renders.
 	if len(doc.OpenPRs) != 0 {
@@ -412,21 +475,21 @@ func TestEnrichManualDoc_RecoversFromPanic(t *testing.T) {
 func TestCollectOpenPRs_EmptyAndBadJSON(t *testing.T) {
 	t.Run("empty output", func(t *testing.T) {
 		fakeGH(t, []byte(""), nil)
-		prs, ok := CollectOpenPRs(nil)
+		prs, ok := CollectOpenPRs("", nil)
 		if ok || prs != nil {
 			t.Errorf("empty gh output: got (%#v,%v) want (nil,false)", prs, ok)
 		}
 	})
 	t.Run("bad json", func(t *testing.T) {
 		fakeGH(t, []byte("not json"), nil)
-		prs, ok := CollectOpenPRs(nil)
+		prs, ok := CollectOpenPRs("", nil)
 		if ok || prs != nil {
 			t.Errorf("bad json: got (%#v,%v) want (nil,false)", prs, ok)
 		}
 	})
 	t.Run("valid", func(t *testing.T) {
 		fakeGH(t, ghJSON(t, []ghOpenPR{{Number: 5, Title: "t", HeadRefName: "worker/x", URL: "u"}}), nil)
-		prs, ok := CollectOpenPRs(nil)
+		prs, ok := CollectOpenPRs("", nil)
 		if !ok || len(prs) != 1 || prs[0].Number != 5 {
 			t.Errorf("valid: got (%#v,%v) want one #5", prs, ok)
 		}
@@ -437,7 +500,7 @@ func TestCollectOpenPRs_EmptyAndBadJSON(t *testing.T) {
 func TestEnrichManualDoc_NilDoc(t *testing.T) {
 	withFleetHomeSynth(t)
 	fakeGH(t, []byte("[]"), nil)
-	EnrichManualDoc(nil, "myproj", "deadbeef", nil, nil) // must not panic
+	EnrichManualDoc(nil, "myproj", "deadbeef", "", nil, nil) // must not panic
 }
 
 // --- Case R: refactor-parity. SynthesizeRecoveryWithLastHandoff output

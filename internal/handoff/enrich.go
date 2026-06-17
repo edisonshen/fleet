@@ -52,27 +52,37 @@ import (
 // checkpoint fallback rather than wedging the handoff.
 const ghTimeout = 10 * time.Second
 
-// ghRunner runs `gh` with the given args and a context deadline,
-// returning stdout. Production uses runGH (exec.CommandContext);
-// tests inject a fake so no real `gh` / network is touched and the
-// timeout path is exercised deterministically. The seam lives on the
-// package var so EnrichManualDoc's call site stays simple.
+// ghRunner runs `gh` in working directory dir with the given args and a
+// context deadline, returning stdout. Production uses runGH
+// (exec.CommandContext); tests inject a fake so no real `gh` / network
+// is touched and the timeout path is exercised deterministically. The
+// seam lives on the package var so EnrichManualDoc's call site stays
+// simple.
+//
+// dir binds `gh` to the handed-off coord's repo checkout: `gh pr list`
+// resolves the repo from CWD, so without this an operator running
+// `fleet handoff` from another directory would capture unrelated PRs
+// (or fail with "not a git repository"). Empty dir → inherit the
+// process CWD (legacy behavior; only happens when the caller couldn't
+// resolve a repo).
 var ghRunner = runGH
 
-// runGH is the production ghRunner: resolve `gh` on PATH, run it under a
-// ghTimeout deadline, return stdout. Errors (missing binary, non-zero
-// exit, timeout) propagate to the caller, which falls back to the
-// checkpoint Open PRs. We deliberately do NOT inspect stderr here — the
-// caller logs a single fallback line; surfacing raw `gh` stderr would
-// be noise on the common "non-git repo" path.
-func runGH(args ...string) ([]byte, error) {
+// runGH is the production ghRunner: resolve `gh` on PATH, run it in dir
+// under a ghTimeout deadline, return stdout. Errors (missing binary,
+// non-zero exit, timeout) propagate to the caller, which falls back to
+// the checkpoint / tasks.md Open PRs. We deliberately do NOT inspect
+// stderr here — the caller logs a single fallback line; surfacing raw
+// `gh` stderr would be noise on the common "non-git repo" path.
+func runGH(dir string, args ...string) ([]byte, error) {
 	bin, err := exec.LookPath("gh")
 	if err != nil {
 		return nil, fmt.Errorf("gh not on PATH: %w", err)
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), ghTimeout)
 	defer cancel()
-	out, err := exec.CommandContext(ctx, bin, args...).Output()
+	cmd := exec.CommandContext(ctx, bin, args...)
+	cmd.Dir = dir // empty → inherit process CWD
+	out, err := cmd.Output()
 	if err != nil {
 		return nil, err
 	}
@@ -100,8 +110,12 @@ type ghOpenPR struct {
 //
 // Field mapping mirrors handoff.py:_collect_open_prs exactly so the
 // auto (Python) and manual (Go) paths produce identical Open PRs rows.
-func CollectOpenPRs(logw func(string)) ([]OpenPR, bool) {
+//
+// repoDir binds `gh` to the handed-off coord's checkout (empty →
+// process CWD); see ghRunner.
+func CollectOpenPRs(repoDir string, logw func(string)) ([]OpenPR, bool) {
 	out, err := ghRunner(
+		repoDir,
 		"pr", "list",
 		"--state", "open",
 		"--search", "head:worker/",
@@ -240,6 +254,15 @@ func applyRecentDecisions(fallback string, decisions []string) string {
 // doc in place, best-effort. agentID is the handing-off coord's id (used
 // for the checkpoint generation guard). lastHandoffPath is the doc this
 // coord inherited (a *string on the agent record; nil normalizes to "").
+// repoDir is the handed-off coord's repo checkout — `gh pr list` runs
+// there so it resolves the right repo regardless of the operator's CWD
+// (empty → process CWD).
+//
+// CALLER GATE: this is for COORD handoffs only. Active Subagents +
+// Open PRs are coord-owned project state; a worker handoff has none, and
+// pulling a live coord's coord-state.json into a worker's doc would
+// resume the worker with unrelated project-wide state. The cmd/fleet
+// caller gates this call on spawn.IsCoordSpawn(taskID, project).
 //
 // Preference, matching the other producers:
 //   - checkpoint fresher than lastHandoffPath + same coord generation
@@ -247,12 +270,12 @@ func applyRecentDecisions(fallback string, decisions []string) string {
 //     PRs with a fresh `gh` query (gh is authoritative + fresher than
 //     the snapshot; on gh failure the checkpoint's Open PRs stand).
 //   - otherwise → live emit-on-missing walk for Active Subagents + fresh
-//     `gh` for Open PRs (gh failure → leave the existing placeholder).
+//     `gh` for Open PRs (gh failure → tasks.md → leave the placeholder).
 //
 // Narrative sections (Completed / Key Decisions) stay placeholder in
 // Slice 1. Any panic mid-build is recovered and swallowed — the doc
 // keeps whatever sections were already filled (placeholders at worst).
-func EnrichManualDoc(doc *Doc, project, agentID string, lastHandoffPath *string, logw func(string)) {
+func EnrichManualDoc(doc *Doc, project, agentID, repoDir string, lastHandoffPath *string, logw func(string)) {
 	// Best-effort guard: a panic anywhere in enrichment must not fail
 	// the handoff. Leave the doc with whatever it had (placeholders).
 	defer func() {
@@ -310,10 +333,10 @@ func EnrichManualDoc(doc *Doc, project, agentID string, lastHandoffPath *string,
 	//      Number=0 / title=slug row is sufficient — the URL is the only
 	//      load-bearing field. (codex Slice-1 P1.)
 	//   4. empty → _(no open PRs)_ placeholder.
-	if prs, ghOK := CollectOpenPRs(logw); ghOK {
+	if prs, ghOK := CollectOpenPRs(repoDir, logw); ghOK {
 		doc.OpenPRs = prs
 	} else if len(doc.OpenPRs) == 0 {
-		if fallback := collectOpenPRsFromTasks(pdir, project); len(fallback) > 0 {
+		if fallback := collectOpenPRsFromTasks(pdir); len(fallback) > 0 {
 			if logw != nil {
 				logw(fmt.Sprintf("enrich: gh unavailable; recovered %d Open PR(s) from tasks.md", len(fallback)))
 			}
@@ -332,9 +355,16 @@ func EnrichManualDoc(doc *Doc, project, agentID string, lastHandoffPath *string,
 // successor still re-spawns one shepherd per URL — supervision continuity
 // is preserved even though the operator-readability fields are coarse.
 //
+// Tasks in a TERMINAL state (done / abandoned) are excluded even when
+// they still carry a pr_url: those PRs are merged/closed, and
+// handoff_resume.py would otherwise reintroduce them as live shepherd
+// watches (codex Slice-1 P2). Non-terminal tasks with a pr_url
+// (in-review / in-progress / blocked / etc.) are kept — any of them may
+// have a still-open PR worth watching.
+//
 // Best-effort: any read/parse failure or empty tasks.md returns nil and
 // the caller falls through to the _(no open PRs)_ placeholder.
-func collectOpenPRsFromTasks(pdir, project string) []OpenPR {
+func collectOpenPRsFromTasks(pdir string) []OpenPR {
 	path := filepath.Join(pdir, "tasks.md")
 	if _, err := os.Stat(path); err != nil {
 		return nil
@@ -350,6 +380,9 @@ func collectOpenPRsFromTasks(pdir, project string) []OpenPR {
 	for _, t := range f.Tasks {
 		if t.PRURL == "" {
 			continue
+		}
+		if t.Status == tasks.StatusDone || t.Status == tasks.StatusAbandoned {
+			continue // terminal: PR merged/closed, no shepherd needed.
 		}
 		head := t.Branch
 		if head == "" {
