@@ -129,23 +129,13 @@ func SynthesizeRecoveryWithLastHandoff(
 	// rather than the (potentially hours-long) gap between fleet-guard's
 	// context-pct triggers.
 	if cp, ok := loadCheckpointIfFresher(pdir, agentID, lastHandoffPath); ok {
-		doc.ActiveSubagents = cp.activeSubagents
-		doc.OpenPRs = cp.openPRs
-		// Recent decisions surface in the NextSteps body as a free-form
-		// bullet list. handoff_resume.py doesn't parse them structurally
-		// — they're operator-readable context for "what was the dead
-		// coord up to". Dropping them into NextSteps keeps the existing
-		// doc shape (and parser) unchanged.
-		if len(cp.recentDecisions) > 0 {
-			var b strings.Builder
-			b.WriteString("Recent coord decisions (from checkpoint):\n")
-			for _, d := range cp.recentDecisions {
-				b.WriteString("- ")
-				b.WriteString(d)
-				b.WriteString("\n")
-			}
-			doc.NextSteps = strings.TrimRight(b.String(), "\n")
-		}
+		// Shared lift (enrich.go:applyCheckpointToDoc) — BOTH this
+		// recovery path and the manual EnrichManualDoc path apply the
+		// checkpoint identically. Behavior-preserving: it reproduces the
+		// former inline mapping verbatim (ActiveSubagents, OpenPRs,
+		// decisions→NextSteps). Slice 2 changes that one helper to add
+		// narrative, fixing manual + recovery in lockstep.
+		applyCheckpointToDoc(doc, cp)
 		return doc, nil
 	}
 

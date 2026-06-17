@@ -802,6 +802,16 @@ func runHandoff(opts *handoffOpts, stdout, stderr io.Writer) error {
 		oldRec.ID, oldRec.TaskID, oldRec.Project,
 		oldRec.HandoffNumber, oldRec.LastHandoffPath, now,
 	)
+	// Fill the machine-state sections (Active Subagents + Open PRs) from
+	// on-disk state + `gh` so the successor coord resumes immediately
+	// instead of rediscovering all in-flight work by hand. Best-effort:
+	// any failure (panic, gh down, non-git, parse error) leaves the
+	// section's placeholder and the handoff still succeeds — enrichment
+	// NEVER fails a handoff. agentID = oldRec.ID drives the checkpoint
+	// generation guard; lastHandoffPath threads through nil→"".
+	// Narrative (Completed / Key Decisions) stays placeholder (Slice 2).
+	handoff.EnrichManualDoc(doc, oldRec.Project, oldRec.ID, oldRec.LastHandoffPath,
+		func(msg string) { _, _ = fmt.Fprintln(stderr, msg) })
 	if err := handoff.Write(doc, docPath); err != nil {
 		return fmt.Errorf("write handoff doc: %w", err)
 	}
