@@ -219,6 +219,56 @@ func TestEnrichManualDoc_ReadableEmptyTasksMDDoesNotReviveCheckpointPRs(t *testi
 	}
 }
 
+// --- codex Slice-1 P2: gh down, a worker has a pr_url in state.json but
+// tasks.md has NOT been stamped → the PR is preserved in ## Open PRs
+// (derived from live worker state), so shepherding restarts. ---
+func TestEnrichManualDoc_GhDownPreservesStateJSONPRURL(t *testing.T) {
+	pdir := withFleetHomeSynth(t)
+	now := time.Now().UTC()
+	seedCoordState(t, pdir, "myproj", map[string]string{"w-1": "idA"})
+	// state.json carries the pr_url; tasks.md row is in-progress, no pr_url.
+	seedWorkerState(t, pdir, "myproj", "w-1", "push", "https://github.com/o/r/pull/61")
+	seedTasksMDWithPRAndStatus(t, pdir, "myproj", map[string][2]string{
+		"w-1": {"in-progress", ""},
+	})
+
+	fakeGH(t, nil, errors.New("gh down"))
+
+	doc := NewManualStub("deadbeef", "coord-myproj", "myproj", 1, nil, now)
+	EnrichManualDoc(doc, "myproj", "deadbeef", "", nil, nil)
+
+	if len(doc.OpenPRs) != 1 || doc.OpenPRs[0].URL != "https://github.com/o/r/pull/61" {
+		t.Fatalf("OpenPRs: got %#v want pull/61 (preserved from state.json when gh down)", doc.OpenPRs)
+	}
+}
+
+// --- codex Slice-1 P2: coord-state.json WITHOUT a worker_agent_ids key
+// (legacy / partial upgrade) is NOT authoritative → fall back to the
+// checkpoint's Active Subagents rather than clearing the section. ---
+func TestEnrichManualDoc_LegacyCoordStateFallsBackToCheckpoint(t *testing.T) {
+	pdir := withFleetHomeSynth(t)
+	now := time.Now().UTC()
+	// coord-state.json present but NO worker_agent_ids key.
+	dir := filepath.Join(pdir, "myproj")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "coord-state.json"), []byte(`{"schema":1}`), 0o644); err != nil {
+		t.Fatalf("write coord-state: %v", err)
+	}
+	cpRow := `- task="cp-worker-1234" branch="worker/cp-worker-1234" phase="push" status="in-review" pr_url="https://github.com/o/r/pull/12" agent_id="cafef00d" subagent_id=""`
+	seedCheckpoint(t, pdir, "myproj", now, []string{cpRow}, nil, nil)
+	lastHandoff := writeFakeHandoffDoc(t, pdir, "deadbeef", now.Add(-time.Hour))
+	fakeGH(t, []byte("[]"), nil)
+
+	doc := NewManualStub("deadbeef", "coord-myproj", "myproj", 1, &lastHandoff, now)
+	EnrichManualDoc(doc, "myproj", "deadbeef", "", &lastHandoff, nil)
+
+	if len(doc.ActiveSubagents) != 1 || doc.ActiveSubagents[0].TaskID != "cp-worker-1234" {
+		t.Fatalf("ActiveSubagents: got %#v want cp-worker-1234 (legacy coord-state → checkpoint fallback)", doc.ActiveSubagents)
+	}
+}
+
 // --- Case 2: no checkpoint, live workers on disk → Active Subagents
 // from emit-on-missing walk; Open PRs from gh. ---
 func TestEnrichManualDoc_NoCheckpointLiveWalk(t *testing.T) {
