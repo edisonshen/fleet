@@ -107,32 +107,61 @@ func ghJSON(t *testing.T, prs []ghOpenPR) []byte {
 	return data
 }
 
-// --- Case 1: fresh checkpoint present → Active Subagents from
-// checkpoint; Open PRs from gh. ---
-func TestEnrichManualDoc_FreshCheckpoint(t *testing.T) {
+// --- Case 1 (live-first, codex Slice-1 P1): fresh checkpoint present
+// BUT live coord-state.json is the authoritative source on a live manual
+// handoff → Active Subagents come from the LIVE walk (not the stale
+// checkpoint); Open PRs from gh. The checkpoint narrative (decisions →
+// NextSteps) is still lifted as a supplement. ---
+func TestEnrichManualDoc_LiveStateWinsOverCheckpoint(t *testing.T) {
 	pdir := withFleetHomeSynth(t)
 	now := time.Now().UTC()
 
-	// Stale on-disk state that the checkpoint should override.
-	seedCoordState(t, pdir, "myproj", map[string]string{"fix-old-0000": "obsolete"})
-	seedWorkerState(t, pdir, "myproj", "fix-old-0000", "tdd-green", "")
+	// LIVE state: the current truth — fix-live-9999 is in flight now.
+	seedCoordState(t, pdir, "myproj", map[string]string{"fix-live-9999": "livebeef"})
+	seedWorkerState(t, pdir, "myproj", "fix-live-9999", "tdd-green", "")
 
-	activeRow := `- task="fix-new-1234" branch="worker/fix-new-1234" phase="push" status="in-review" pr_url="https://github.com/o/r/pull/77" agent_id="cafef00d" subagent_id=""`
-	seedCheckpoint(t, pdir, "myproj", now, []string{activeRow}, nil, nil)
+	// Checkpoint is fresher than the last handoff but STALE vs live —
+	// it references work that has since moved on.
+	activeRow := `- task="fix-old-1234" branch="worker/fix-old-1234" phase="push" status="in-review" pr_url="https://github.com/o/r/pull/77" agent_id="cafef00d" subagent_id=""`
+	seedCheckpoint(t, pdir, "myproj", now, []string{activeRow}, nil,
+		[]string{"- dispatched fix-live-9999"})
 	lastHandoff := writeFakeHandoffDoc(t, pdir, "deadbeef", now.Add(-time.Hour))
 
 	fakeGH(t, ghJSON(t, []ghOpenPR{
-		{Number: 77, Title: "fix: new", HeadRefName: "worker/fix-new-1234", URL: "https://github.com/o/r/pull/77"},
+		{Number: 9, Title: "live", HeadRefName: "worker/fix-live-9999", URL: "https://github.com/o/r/pull/9"},
 	}), nil)
 
 	doc := NewManualStub("deadbeef", "coord-myproj", "myproj", 1, &lastHandoff, now)
 	EnrichManualDoc(doc, "myproj", "deadbeef", "", &lastHandoff, nil)
 
-	if len(doc.ActiveSubagents) != 1 || doc.ActiveSubagents[0].TaskID != "fix-new-1234" {
-		t.Fatalf("ActiveSubagents: got %#v want one fix-new-1234 (checkpoint wins)", doc.ActiveSubagents)
+	if len(doc.ActiveSubagents) != 1 || doc.ActiveSubagents[0].TaskID != "fix-live-9999" {
+		t.Fatalf("ActiveSubagents: got %#v want one fix-live-9999 (LIVE wins over checkpoint)", doc.ActiveSubagents)
 	}
-	if len(doc.OpenPRs) != 1 || doc.OpenPRs[0].Number != 77 {
-		t.Fatalf("OpenPRs: got %#v want one #77 (gh)", doc.OpenPRs)
+	if len(doc.OpenPRs) != 1 || doc.OpenPRs[0].Number != 9 {
+		t.Fatalf("OpenPRs: got %#v want one #9 (gh)", doc.OpenPRs)
+	}
+	// Narrative supplement from checkpoint still applied.
+	if !strings.Contains(doc.NextSteps, "dispatched fix-live-9999") {
+		t.Errorf("NextSteps: got %q want checkpoint decisions lifted", doc.NextSteps)
+	}
+}
+
+// --- Checkpoint-as-fallback: live walk yields nothing (coord-state
+// unreadable / empty) → fall back to the checkpoint's Active Subagents. ---
+func TestEnrichManualDoc_CheckpointFallbackWhenNoLiveState(t *testing.T) {
+	pdir := withFleetHomeSynth(t)
+	now := time.Now().UTC()
+	// No coord-state.json → live walk returns nil.
+	activeRow := `- task="cp-only-1234" branch="worker/cp-only-1234" phase="push" status="in-review" pr_url="https://github.com/o/r/pull/77" agent_id="cafef00d" subagent_id=""`
+	seedCheckpoint(t, pdir, "myproj", now, []string{activeRow}, nil, nil)
+	lastHandoff := writeFakeHandoffDoc(t, pdir, "deadbeef", now.Add(-time.Hour))
+	fakeGH(t, []byte("[]"), nil)
+
+	doc := NewManualStub("deadbeef", "coord-myproj", "myproj", 1, &lastHandoff, now)
+	EnrichManualDoc(doc, "myproj", "deadbeef", "", &lastHandoff, nil)
+
+	if len(doc.ActiveSubagents) != 1 || doc.ActiveSubagents[0].TaskID != "cp-only-1234" {
+		t.Fatalf("ActiveSubagents: got %#v want cp-only-1234 (checkpoint fallback)", doc.ActiveSubagents)
 	}
 }
 
@@ -383,6 +412,37 @@ func TestCollectOpenPRs_PassesRepoDirToGh(t *testing.T) {
 	_, _ = CollectOpenPRs("/some/coord/repo", nil)
 	if gotDir != "/some/coord/repo" {
 		t.Errorf("gh working dir: got %q want /some/coord/repo", gotDir)
+	}
+}
+
+// --- codex Slice-1 P2: gh fails AND a checkpoint snapshot HAS PRs, but
+// tasks.md carries fresher per-task pr_url → tasks.md wins over the stale
+// checkpoint snapshot (a PR opened since the last checkpoint tick is not
+// dropped). ---
+func TestEnrichManualDoc_TasksMDWinsOverCheckpointPRsOnGhFail(t *testing.T) {
+	pdir := withFleetHomeSynth(t)
+	now := time.Now().UTC()
+	seedCoordState(t, pdir, "myproj", map[string]string{"fresh-1111": "idA"})
+	seedWorkerState(t, pdir, "myproj", "fresh-1111", "push", "")
+	// Checkpoint snapshot: ONE old PR.
+	oldRow := "- #10 old — worker/old-0000 — https://github.com/o/r/pull/10"
+	seedCheckpoint(t, pdir, "myproj", now, nil, []string{oldRow}, nil)
+	// tasks.md: a DIFFERENT, fresher PR opened since the checkpoint.
+	seedTasksMDWithPR(t, pdir, "myproj", map[string]string{
+		"fresh-1111": "https://github.com/o/r/pull/55",
+	})
+	lastHandoff := writeFakeHandoffDoc(t, pdir, "deadbeef", now.Add(-time.Hour))
+
+	fakeGH(t, nil, errors.New("gh down"))
+
+	doc := NewManualStub("deadbeef", "coord-myproj", "myproj", 1, &lastHandoff, now)
+	EnrichManualDoc(doc, "myproj", "deadbeef", "", &lastHandoff, nil)
+
+	if len(doc.OpenPRs) != 1 {
+		t.Fatalf("OpenPRs: got %#v want 1 (tasks.md fresher than checkpoint)", doc.OpenPRs)
+	}
+	if doc.OpenPRs[0].URL != "https://github.com/o/r/pull/55" {
+		t.Errorf("PR URL: got %q want pull/55 (tasks.md wins over stale checkpoint #10)", doc.OpenPRs[0].URL)
 	}
 }
 

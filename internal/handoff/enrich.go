@@ -374,40 +374,62 @@ func EnrichManualDoc(doc *Doc, project, agentID, repoDir string, lastHandoffPath
 
 	cp, cpOK := loadCheckpointIfFresher(pdir, agentID, lhp)
 
+	// NARRATIVE + baseline machine state from the checkpoint via the
+	// SHARED lift (the seam Slice 2 extends to add doc.Completed). This
+	// gives the manual doc the checkpoint's recent-decisions→NextSteps
+	// (and, post-Slice-2, Completed) in lockstep with the recovery path.
+	// The machine-state fields it sets (ActiveSubagents / OpenPRs) are a
+	// stale baseline that the LIVE walk + gh OVERWRITE immediately below —
+	// live data wins for machine state on a manual (live-coord) handoff.
 	if cpOK {
-		// Checkpoint wins for Active Subagents (same preference synth
-		// uses). applyCheckpointToDoc also sets OpenPRs from the
-		// snapshot; we then prefer a fresh gh query below.
 		applyCheckpointToDoc(doc, cp)
-	} else {
-		// No fresher checkpoint → live emit-on-missing walk. Leave the
-		// section's placeholder when there are no in-flight workers.
-		if subs := CollectActiveSubagentsLive(project); len(subs) > 0 {
-			doc.ActiveSubagents = subs
-		}
 	}
 
-	// Open PRs preference, most-authoritative first:
-	//   1. `gh pr list` (fresh, authoritative) — overwrite on success.
-	//   2. checkpoint snapshot (already set by applyCheckpointToDoc when
-	//      cpOK) — stands when gh fails.
-	//   3. tasks.md pr_url per slug — when gh fails AND there's no
-	//      checkpoint snapshot. tasks.md carries the authoritative pr_url
-	//      the coord recorded, so a non-git shell / gh-auth / timeout
-	//      failure no longer drops shepherd supervision for every
-	//      in-review PR. handoff_resume.py keys the shepherd respawn off
+	// ACTIVE SUBAGENTS — LIVE-FIRST (overwrites the checkpoint baseline).
+	// `fleet handoff` runs against a (usually) live coord, so
+	// coord-state.json + tasks.md are CURRENT — fresher than a periodic
+	// checkpoint snapshot (~2.5min cadence). A worker dispatched,
+	// finished, or PR-opened since the last checkpoint tick is reflected
+	// in live state but stale in the checkpoint. Walk live state first;
+	// keep the checkpoint baseline only when the live walk yields nothing
+	// (e.g. coord-state.json unreadable). This matches the Python
+	// auto-handoff path, which always walks live state. (codex Slice-1 P1.)
+	//
+	// NOTE: live-FIRST for machine state is fresher than the design's
+	// "prefer checkpoint when fresher" wording (which targets the
+	// dead-coord recovery path); a manual handoff is the live case where
+	// coord-state.json is authoritative.
+	if subs := CollectActiveSubagentsLive(project); len(subs) > 0 {
+		doc.ActiveSubagents = subs
+	}
+
+	// OPEN PRS preference, most-authoritative (freshest) first:
+	//   1. `gh pr list` (live, authoritative) — overwrite on success.
+	//   2. tasks.md pr_url per slug — when gh fails. tasks.md is updated
+	//      live by the coord, so it is fresher than any checkpoint
+	//      snapshot; a PR opened since the last checkpoint is captured
+	//      here. Terminal (done/abandoned) rows are excluded. (codex
+	//      Slice-1 P1/P2.) handoff_resume.py keys the shepherd respawn off
 	//      the row's trailing URL (regex `\s—\s(https?://\S+)$`), so a
 	//      Number=0 / title=slug row is sufficient — the URL is the only
-	//      load-bearing field. (codex Slice-1 P1.)
+	//      load-bearing field.
+	//   3. checkpoint snapshot — when gh fails AND tasks.md yields no PRs
+	//      (e.g. tasks.md unreadable). Last-resort stale snapshot.
 	//   4. empty → _(no open PRs)_ placeholder.
-	if prs, ghOK := CollectOpenPRs(repoDir, logw); ghOK {
+	switch prs, ghOK := CollectOpenPRs(repoDir, logw); {
+	case ghOK:
 		doc.OpenPRs = prs
-	} else if len(doc.OpenPRs) == 0 {
+	default:
 		if fallback := collectOpenPRsFromTasks(pdir); len(fallback) > 0 {
 			if logw != nil {
 				logw(fmt.Sprintf("enrich: gh unavailable; recovered %d Open PR(s) from tasks.md", len(fallback)))
 			}
 			doc.OpenPRs = fallback
+		} else if cpOK && len(cp.openPRs) > 0 {
+			if logw != nil {
+				logw(fmt.Sprintf("enrich: gh + tasks.md unavailable; recovered %d Open PR(s) from checkpoint", len(cp.openPRs)))
+			}
+			doc.OpenPRs = cp.openPRs
 		}
 	}
 }
