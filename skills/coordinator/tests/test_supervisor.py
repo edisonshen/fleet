@@ -1875,6 +1875,79 @@ def test_idle_agent_archive_pass_exempts_coord_legacy_fallback(
     assert path.exists(), "legacy coord record file must remain on disk"
 
 
+def _write_coord_lock(fleet_home: Path, project: str, holder_id: str) -> Path:
+    """Seed ~/.fleet/projects/<project>/.locks/coordinator.lock with the
+    holder agent ID in its body — the authoritative "who is the coord"
+    signal the sweep reads (Signal 3). Mirrors the Go writer layout
+    (internal/projectlookup.readCoordHolder)."""
+    lock_dir = fleet_home / "projects" / project / ".locks"
+    lock_dir.mkdir(parents=True, exist_ok=True)
+    lock = lock_dir / "coordinator.lock"
+    lock.write_text(holder_id + "\n", encoding="utf-8")
+    return lock
+
+
+def test_idle_agent_archive_pass_exempts_coord_via_lock_holder(
+    fleet_home: Path, monkeypatch,
+) -> None:
+    """Signal 3 (codex iter-2 P1) — a LEGACY / manually-spawned coord whose
+    task_id is NOT "coord-<project>" and which carries NO is_coord stamp
+    (both derive from the same coord-<project> predicate, so both are false)
+    is STILL exempt when it is the project's coordinator.lock holder. Before
+    this signal such a coord — the exact lineage internal/projectlookup.
+    StaleLockBodyCoord exists to recover — would be `fleet rm`'d out from
+    under the operator after the idle TTL, re-opening the data-loss bug."""
+    project = "fleet"
+    holder = "abcd1234"
+    path = _write_agent_record(
+        fleet_home, holder,
+        project=project,
+        last_activity_ts="2026-05-11T00:00:00Z",
+        task_id="legacy-manual-coord-slug",
+        # is_coord intentionally absent — legacy coord, Signals 1+2 both false.
+    )
+    _write_coord_lock(fleet_home, project, holder)
+    now_unix, calls = _exempt_setup(monkeypatch)
+
+    archived = supervisor._run_idle_agent_archive_pass(
+        project=project, home=fleet_home, fleet_bin="fleet",
+        now_unix=now_unix, log_stream=io.StringIO(),
+    )
+
+    assert archived == 0, f"lock-holder coord must not archive; calls: {calls}"
+    assert not [c for c in calls if "rm" in c], f"no rm for coord: {calls}"
+    assert path.exists(), "lock-holder coord record file must remain on disk"
+
+
+def test_idle_agent_archive_pass_archives_worker_when_not_lock_holder(
+    fleet_home: Path, monkeypatch,
+) -> None:
+    """Signal 3 negative guard — Signal 3 must NOT over-exempt. A worker
+    with a real task slug, no is_coord, idle past TTL, whose id is NOT the
+    coordinator.lock holder still reaps. Confirms the lock-holder match is
+    exact (rec_id == holder), not a blanket "any record while a lock
+    exists" exemption that would leak every idle worker."""
+    project = "fleet"
+    _write_coord_lock(fleet_home, project, "abcd1234")  # a DIFFERENT id
+    _write_agent_record(
+        fleet_home, "dddd0099",
+        project=project,
+        last_activity_ts="2026-05-11T00:00:00Z",
+        task_id="some-worker-slug-5678",
+    )
+    now_unix, calls = _exempt_setup(monkeypatch)
+
+    archived = supervisor._run_idle_agent_archive_pass(
+        project=project, home=fleet_home, fleet_bin="fleet",
+        now_unix=now_unix, log_stream=io.StringIO(),
+    )
+
+    assert archived == 1, f"non-holder worker must archive; calls: {calls}"
+    assert [c for c in calls if c[1:3] == ["rm", "dddd0099"]], (
+        f"expected `fleet rm dddd0099`, got: {calls}"
+    )
+
+
 def test_idle_agent_archive_pass_coord_exempt_respects_zero_ttl(
     fleet_home: Path, monkeypatch,
 ) -> None:
