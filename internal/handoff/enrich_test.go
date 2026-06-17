@@ -303,6 +303,40 @@ func TestEnrichManualDoc_SchemaDriftTasksMDStillRecoversPR(t *testing.T) {
 	}
 }
 
+// --- codex Slice-1 P2: under schema drift, the live walk overlays
+// status/pr_url via the SAME tolerant scan as Open PRs, so the two
+// sections agree — a PR-open worker is promoted to in-review (shepherd-
+// only) instead of being re-dispatched while a shepherd also respawns. ---
+func TestEnrichManualDoc_SchemaDriftLiveWalkStaysConsistent(t *testing.T) {
+	pdir := withFleetHomeSynth(t)
+	now := time.Now().UTC()
+	seedCoordState(t, pdir, "myproj", map[string]string{"w-1": "idA"})
+	seedWorkerState(t, pdir, "myproj", "w-1", "push", "") // state.json has no pr_url
+	// tasks.md: future schema header (tasks.Read would refuse) + a valid
+	// block carrying status=in-progress + a pr_url.
+	dir := filepath.Join(pdir, "myproj")
+	body := "---\nschema: v99\n---\n\n## task: w-1\n- status: in-progress\n- pr_url: https://github.com/o/r/pull/42\n"
+	if err := os.WriteFile(filepath.Join(dir, "tasks.md"), []byte(body), 0o644); err != nil {
+		t.Fatalf("write tasks.md: %v", err)
+	}
+	fakeGH(t, nil, errors.New("gh down"))
+
+	doc := NewManualStub("deadbeef", "coord-myproj", "myproj", 1, nil, now)
+	EnrichManualDoc(doc, "myproj", "deadbeef", "", nil, nil)
+
+	if len(doc.ActiveSubagents) != 1 {
+		t.Fatalf("ActiveSubagents: got %d want 1", len(doc.ActiveSubagents))
+	}
+	// status recovered + promoted to in-review (PR open) — NOT re-dispatch.
+	if doc.ActiveSubagents[0].Status != "in-review" {
+		t.Errorf("status: got %q want in-review (tolerant scan recovered pr_url → promote)", doc.ActiveSubagents[0].Status)
+	}
+	// Open PRs section carries the same PR — consistent, no duplicate.
+	if len(doc.OpenPRs) != 1 || doc.OpenPRs[0].URL != "https://github.com/o/r/pull/42" {
+		t.Errorf("OpenPRs: got %#v want pull/42 (consistent with Active Subagents)", doc.OpenPRs)
+	}
+}
+
 // scanTasksMetaTolerant unit edges: prose bullets in Spec/Notes are not
 // mistaken for task fields; the footer H2 stops scanning.
 func TestScanTasksMetaTolerant_IgnoresProseBullets(t *testing.T) {

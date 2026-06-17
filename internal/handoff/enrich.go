@@ -307,23 +307,23 @@ type taskMeta struct {
 	prURL  string
 }
 
-// readTaskMetaBySlug reads tasks.md and returns {slug: {status, pr_url}}.
-// Best-effort: any missing-file / parse error returns an empty map and
-// the caller falls back to state.json + the safe "re-dispatch" default.
+// readTaskMetaBySlug reads tasks.md and returns {slug: {status, pr_url}}
+// using the SAME tolerant per-block scan as the Open PRs fallback
+// (scanTasksMetaTolerant). Using the tolerant scan here — rather than the
+// strict tasks.Read — keeps the Active Subagents overlay and the Open PRs
+// fallback CONSISTENT: a schema drift / one malformed block must not make
+// the live walk lose a slug's status+pr_url (→ re-dispatch) while the
+// Open PRs section still recovers the PR (→ shepherd), which would
+// duplicate resume work. (codex Slice-1 P2.)
+//
+// Best-effort: a missing/unreadable file returns an empty map and the
+// caller falls back to state.json + the safe "re-dispatch" default.
 func readTaskMetaBySlug(projectDir string) map[string]taskMeta {
-	out := map[string]taskMeta{}
-	path := filepath.Join(projectDir, "tasks.md")
-	if _, err := os.Stat(path); err != nil {
-		return out
-	}
-	f, err := tasks.Read(path)
+	data, err := os.ReadFile(filepath.Join(projectDir, "tasks.md"))
 	if err != nil {
-		return out
+		return map[string]taskMeta{}
 	}
-	for _, t := range f.Tasks {
-		out[t.Slug] = taskMeta{status: string(t.Status), prURL: t.PRURL}
-	}
-	return out
+	return scanTasksMetaTolerant(data)
 }
 
 // statusIsPrePR reports whether a tasks.md status is a pre-PR / still-
