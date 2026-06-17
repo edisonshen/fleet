@@ -692,12 +692,26 @@ func scanTasksMetaTolerant(data []byte) map[string]taskMeta {
 	// bullets under a body header are never mis-read as fields. (codex
 	// Slice-1 P2 — both the prose-bullet and the blank-line cases.)
 	pastFields := false
+	// Code-fence safety: a `## task:` / `## ` / `### ` / `- ` line INSIDE
+	// a ```-fenced example (e.g. a Spec block pasting markdown) is body
+	// content, never structural. internal/tasks allows these fenced
+	// headings, so we must track fences identically or we'd mis-detect a
+	// fake task / truncate the file. Toggle on a column-0 ``` marker
+	// (matches internal/tasks.isFenceMarker: exactly 3 backticks + tag).
+	inFence := false
 	flush := func() {
 		if slug != "" {
 			out[slug] = taskMeta{status: status, prURL: prURL}
 		}
 	}
 	for _, raw := range strings.Split(strings.ReplaceAll(string(data), "\r\n", "\n"), "\n") {
+		if strings.HasPrefix(raw, "```") && !strings.HasPrefix(raw[3:], "`") {
+			inFence = !inFence
+			continue
+		}
+		if inFence {
+			continue // fenced body — never structural
+		}
 		if strings.HasPrefix(raw, "## task: ") {
 			flush()
 			slug = strings.TrimSpace(strings.TrimPrefix(raw, "## task: "))

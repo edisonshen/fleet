@@ -398,6 +398,34 @@ func TestScanTasksMetaTolerant_IgnoresProseBullets(t *testing.T) {
 	}
 }
 
+// scanTasksMetaTolerant: a fenced markdown example containing column-0
+// `## task:` / `- pr_url:` lines must be treated as body, not structure
+// (matches internal/tasks fence handling; codex Slice-1 P2).
+func TestScanTasksMetaTolerant_IgnoresFencedHeadings(t *testing.T) {
+	body := "## task: real-1\n" +
+		"- status: in-review\n" +
+		"- pr_url: https://x/real\n" +
+		"### Spec\n" +
+		"Example of another task block:\n" +
+		"```\n" +
+		"## task: fake-2\n" +
+		"- pr_url: https://x/fake\n" +
+		"## footer-not-real\n" +
+		"```\n" +
+		"more spec prose\n"
+	meta := scanTasksMetaTolerant([]byte(body))
+	if len(meta) != 1 {
+		t.Fatalf("meta: got %d entries want 1 (fenced ## task: is not a real task); %#v", len(meta), meta)
+	}
+	if _, ok := meta["fake-2"]; ok {
+		t.Errorf("fenced 'fake-2' was parsed as a real task")
+	}
+	got := meta["real-1"]
+	if got.prURL != "https://x/real" {
+		t.Errorf("real-1 pr_url: got %q want https://x/real (not the fenced fake)", got.prURL)
+	}
+}
+
 // scanTasksMetaTolerant: a blank line WITHIN the leading field bullets
 // (hand edit / future writer) must NOT stop field reading (matches
 // handoff.py reopen behavior; codex Slice-1 P2).
