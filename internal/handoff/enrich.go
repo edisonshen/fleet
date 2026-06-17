@@ -640,9 +640,16 @@ func openPRsFromSubagents(subs []ActiveSubagent) []OpenPR {
 // write, or one malformed block must NOT make the whole file unreadable
 // — we still recover every well-formed `## task:` block's status/pr_url.
 // This mirrors handoff.py:_read_tasks_meta's deliberate per-block
-// tolerance. A successfully-scanned tasks.md is authoritative, including
-// when it yields zero open PRs (all merged → don't revive stale
-// checkpoint URLs). (codex Slice-1 P2.)
+// tolerance.
+//
+// AUTHORITATIVE only when the scan parsed AT LEAST ONE `## task:` block.
+// A readable file that yields ZERO blocks is ambiguous — it could be a
+// truncated / stray-`##`-header / partial write rather than a genuinely
+// empty task list — so we return ok=false and let the checkpoint
+// snapshot stand rather than wiping it to an empty PR set. (A fresh empty
+// project has no checkpoint PRs to preserve anyway.) When ≥1 block
+// parsed, the result IS authoritative, including zero open PRs (all
+// merged → don't revive stale checkpoint URLs). (codex Slice-1 P2.)
 func collectOpenPRsFromTasks(pdir string) ([]OpenPR, bool) {
 	path := filepath.Join(pdir, "tasks.md")
 	data, err := os.ReadFile(path)
@@ -650,6 +657,9 @@ func collectOpenPRsFromTasks(pdir string) ([]OpenPR, bool) {
 		return nil, false // missing / read error → ambiguous
 	}
 	meta := scanTasksMetaTolerant(data)
+	if len(meta) == 0 {
+		return nil, false // no task block parsed → ambiguous, keep checkpoint
+	}
 	slugs := make([]string, 0, len(meta))
 	for slug := range meta {
 		slugs = append(slugs, slug)

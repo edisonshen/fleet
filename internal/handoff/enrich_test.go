@@ -398,6 +398,33 @@ func TestScanTasksMetaTolerant_IgnoresProseBullets(t *testing.T) {
 	}
 }
 
+// --- codex Slice-1 P2: gh down + tasks.md present but TRUNCATED (zero
+// task blocks parsed) is ambiguous → keep the checkpoint's Open PRs
+// rather than clearing them to empty. ---
+func TestEnrichManualDoc_TruncatedTasksMDKeepsCheckpointPRs(t *testing.T) {
+	pdir := withFleetHomeSynth(t)
+	now := time.Now().UTC()
+	// coord-state present, empty workers (authoritative empty subagents).
+	seedCoordState(t, pdir, "myproj", map[string]string{})
+	// tasks.md present but truncated mid-write: a stray header, no blocks.
+	dir := filepath.Join(pdir, "myproj")
+	if err := os.WriteFile(filepath.Join(dir, "tasks.md"), []byte("---\nschema: v1\n---\n\n## ta"), 0o644); err != nil {
+		t.Fatalf("write truncated tasks.md: %v", err)
+	}
+	cpPR := "- #33 still-open — worker/cp-3333 — https://github.com/o/r/pull/33"
+	seedCheckpoint(t, pdir, "myproj", now, nil, []string{cpPR}, nil)
+	lastHandoff := writeFakeHandoffDoc(t, pdir, "deadbeef", now.Add(-time.Hour))
+
+	fakeGH(t, nil, errors.New("gh down"))
+
+	doc := NewManualStub("deadbeef", "coord-myproj", "myproj", 1, &lastHandoff, now)
+	EnrichManualDoc(doc, "myproj", "deadbeef", "", &lastHandoff, nil)
+
+	if len(doc.OpenPRs) != 1 || doc.OpenPRs[0].URL != "https://github.com/o/r/pull/33" {
+		t.Fatalf("OpenPRs: got %#v want checkpoint #33 (truncated tasks.md must not clear it)", doc.OpenPRs)
+	}
+}
+
 // scanTasksMetaTolerant: a fenced markdown example containing column-0
 // `## task:` / `- pr_url:` lines must be treated as body, not structure
 // (matches internal/tasks fence handling; codex Slice-1 P2).
