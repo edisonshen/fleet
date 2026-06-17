@@ -63,6 +63,38 @@ func seedTasksMDWithPR(t *testing.T, projectsRoot, project string, prURLBySlug m
 	}
 }
 
+// seedTasksMDWithPRAndStatus writes a tasks.md where each slug maps to
+// [status, pr_url]. Used to exercise the PR-open promotion when tasks.md
+// (not state.json) is the pr_url source.
+func seedTasksMDWithPRAndStatus(t *testing.T, projectsRoot, project string, m map[string][2]string) {
+	t.Helper()
+	dir := filepath.Join(projectsRoot, project)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatalf("mkdir %s: %v", dir, err)
+	}
+	now := time.Now().UTC().Truncate(time.Second)
+	f := &tasks.File{Schema: 1}
+	slugs := make([]string, 0, len(m))
+	for s := range m {
+		slugs = append(slugs, s)
+	}
+	sort.Strings(slugs)
+	for _, s := range slugs {
+		f.Tasks = append(f.Tasks, &tasks.Task{
+			Slug:     s,
+			Status:   tasks.Status(m[s][0]),
+			Priority: tasks.Priority("P1"),
+			PRURL:    m[s][1],
+			Created:  now,
+			Updated:  now,
+			Spec:     "enrich-test task " + s,
+		})
+	}
+	if err := tasks.Write(filepath.Join(dir, "tasks.md"), f); err != nil {
+		t.Fatalf("write tasks.md: %v", err)
+	}
+}
+
 // ghJSON marshals a slice of ghOpenPR to the JSON shape `gh pr list
 // --json number,title,headRefName,url` emits, so the parse path is
 // exercised end-to-end.
@@ -308,6 +340,32 @@ func TestCollectActiveSubagentsLive_PromotesPROpenToInReview(t *testing.T) {
 	}
 	if got := byTask["writing-2222"].Status; got != "in-progress" {
 		t.Errorf("writing (no PR) status: got %q want in-progress (still re-dispatch)", got)
+	}
+}
+
+// --- codex Slice-1 P1 (inverse direction): tasks.md has the pr_url but
+// state.json does NOT yet — promotion must still fire. pr_url is sourced
+// from EITHER store. ---
+func TestCollectActiveSubagentsLive_PromotesFromTasksMDPRURL(t *testing.T) {
+	pdir := withFleetHomeSynth(t)
+	seedCoordState(t, pdir, "myproj", map[string]string{"tonly-1111": "idA"})
+	// state.json: in-flight, NO pr_url.
+	seedWorkerState(t, pdir, "myproj", "tonly-1111", "tdd-green", "")
+	// tasks.md: in-progress but carries a pr_url (coord stamped tasks.md
+	// before state.json caught up).
+	seedTasksMDWithPRAndStatus(t, pdir, "myproj", map[string][2]string{
+		"tonly-1111": {"in-progress", "https://github.com/o/r/pull/99"},
+	})
+
+	subs := CollectActiveSubagentsLive("myproj")
+	if len(subs) != 1 {
+		t.Fatalf("subs: got %d want 1", len(subs))
+	}
+	if subs[0].Status != "in-review" {
+		t.Errorf("status: got %q want in-review (tasks.md pr_url drives promotion)", subs[0].Status)
+	}
+	if subs[0].PRURL != "https://github.com/o/r/pull/99" {
+		t.Errorf("pr_url: got %q want pull/99 (sourced from tasks.md)", subs[0].PRURL)
 	}
 }
 

@@ -180,7 +180,7 @@ func CollectActiveSubagentsLive(project string) []ActiveSubagent {
 		return nil
 	}
 
-	statusBySlug := readStatusBySlug(pdir, project)
+	metaBySlug := readTaskMetaBySlug(pdir)
 
 	slugs := make([]string, 0, len(agentIDsBySlug))
 	for slug := range agentIDsBySlug {
@@ -197,23 +197,61 @@ func CollectActiveSubagentsLive(project string) []ActiveSubagent {
 		sub.TaskID = slug
 		sub.Branch = "worker/" + slug
 		sub.AgentID = agentIDsBySlug[slug]
-		if st, ok := statusBySlug[slug]; ok {
-			sub.Status = st
+		meta := metaBySlug[slug] // zero value when slug absent from tasks.md
+		if meta.status != "" {
+			sub.Status = meta.status
+		}
+		// pr_url comes from EITHER source: tasks.md (Python's source) OR
+		// state.json (set earlier in the worker lifecycle, before the
+		// coord stamps tasks.md). Whichever is non-empty wins; tasks.md
+		// takes precedence when both are set. This handles both transient
+		// windows — PR written to state.json but not yet tasks.md, AND the
+		// reverse (tasks.md stamped before state.json) — that codex
+		// flagged. (codex Slice-1 P1, both directions.)
+		if meta.prURL != "" {
+			sub.PRURL = meta.prURL
 		}
 		// PR-open promotion: a worker that has already opened a PR (pr_url
-		// in state.json) but whose tasks.md row is still stamped with a
-		// pre-PR/writing status (empty / todo / ready / in-progress) is in
-		// the transient window before the coord flips it to in-review.
-		// Leaving status=in-progress makes handoff_resume.py BOTH
-		// re-dispatch the Agent AND re-spawn a shepherd from ## Open PRs —
-		// duplicating work against the already-open PR. Promote to
-		// in-review so the resume path takes the shepherd-only branch.
-		// Terminal statuses (done/abandoned/blocked) are left as-is; the
-		// resume path already skips them. (codex Slice-1 P1.)
+		// from either source) but whose status is still pre-PR (empty /
+		// todo / ready / in-progress) is in the transient window before
+		// the coord flips it to in-review. Leaving it makes
+		// handoff_resume.py BOTH re-dispatch the Agent AND respawn a
+		// shepherd from ## Open PRs — duplicating work against the open
+		// PR. Promote to in-review so the resume takes the shepherd-only
+		// branch. Terminal statuses (done/abandoned/blocked) are left
+		// as-is; the resume path already skips them.
 		if sub.PRURL != "" && statusIsPrePR(sub.Status) {
 			sub.Status = string(tasks.StatusInReview)
 		}
 		out = append(out, sub)
+	}
+	return out
+}
+
+// taskMeta is the per-slug (status, pr_url) pair the live walk overlays
+// from tasks.md — mirrors handoff.py:_read_tasks_meta's
+// {slug: (status, pr_url)} sourcing so the manual path matches the auto
+// path's tasks.md-as-source-of-truth for both fields.
+type taskMeta struct {
+	status string
+	prURL  string
+}
+
+// readTaskMetaBySlug reads tasks.md and returns {slug: {status, pr_url}}.
+// Best-effort: any missing-file / parse error returns an empty map and
+// the caller falls back to state.json + the safe "re-dispatch" default.
+func readTaskMetaBySlug(projectDir string) map[string]taskMeta {
+	out := map[string]taskMeta{}
+	path := filepath.Join(projectDir, "tasks.md")
+	if _, err := os.Stat(path); err != nil {
+		return out
+	}
+	f, err := tasks.Read(path)
+	if err != nil {
+		return out
+	}
+	for _, t := range f.Tasks {
+		out[t.Slug] = taskMeta{status: string(t.Status), prURL: t.PRURL}
 	}
 	return out
 }
