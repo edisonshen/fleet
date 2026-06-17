@@ -242,13 +242,20 @@ func CollectActiveSubagentsLive(project string) ([]ActiveSubagent, bool) {
 		if meta.status != "" {
 			sub.Status = meta.status
 		}
-		// pr_url comes from EITHER source: tasks.md (Python's source) OR
-		// state.json (set earlier in the worker lifecycle, before the
-		// coord stamps tasks.md). Whichever is non-empty wins; tasks.md
-		// takes precedence when both are set. This handles both transient
-		// windows — PR written to state.json but not yet tasks.md, AND the
-		// reverse (tasks.md stamped before state.json) — that codex
-		// flagged. (codex Slice-1 P1, both directions.)
+		// pr_url: a NON-EMPTY value from EITHER source means "a PR exists";
+		// trust it. tasks.md wins when both are set; otherwise state.json
+		// fills the unstamped window (PR opened before the coord stamped
+		// tasks.md). This is the common lifecycle case the feature targets.
+		//
+		// Accepted edge (codex P1, deliberately not "fixed"): on a CI-red
+		// REQUEUE, tasks.md's pr_url is cleared but state.json can briefly
+		// carry the dead PR's URL, so we'd surface a closed PR. That's the
+		// strictly less-harmful failure: a shepherd on a closed PR exits on
+		// its first poll (self-correcting), whereas making EMPTY tasks.md
+		// authoritatively clear state.json would DROP every just-opened PR
+		// in the much more common "stamped-after-state.json" window —
+		// re-dispatching duplicate work against a live PR. We optimize for
+		// the common window; the requeue race self-heals within one tick.
 		if meta.prURL != "" {
 			sub.PRURL = meta.prURL
 		}
@@ -715,32 +722,45 @@ func scanTasksMetaTolerant(data []byte) map[string]taskMeta {
 		}
 	}
 	for _, raw := range strings.Split(strings.ReplaceAll(string(data), "\r\n", "\n"), "\n") {
-		// A column-0 `## task:` / `## ` header is ALWAYS a block boundary,
-		// even mid-fence: it RESETS fence state so a malformed/unclosed
-		// fence inside one task's body can corrupt at most THAT block, not
-		// every later block (matches tasks.go:readSection's per-section
-		// fence scoping). Without this reset, a single odd ``` in a Spec
-		// body — e.g. a truncated/partial write — would leave inFence=true
-		// and silently swallow every subsequent task's status/pr_url,
-		// dropping their open PRs from the handoff doc. (review P1.)
+		// Fence handling is scoped to a task's `### `-introduced BODY
+		// (pastFields), exactly like tasks.go:readSection: fences only
+		// protect prose INSIDE a body section. While in a body fence, a
+		// `## Example` / `### Foo` / `- pr_url:` line is body, never
+		// structural (codex P2). Outside a body (the leading-field region
+		// or between blocks), `## task:` / `## ` are ALWAYS structural —
+		// and a `## task:` additionally RESETS fence state, so a
+		// malformed/unclosed fence in one block's body cannot swallow a
+		// later real task block (the Claude-adversarial P1). Net: a closed
+		// fenced heading is body; an unclosed fence is bounded to its block.
+		// `## task: ` is the task-block delimiter — ALWAYS structural and
+		// ALWAYS resets fence state, even inside a body fence. This bounds
+		// a malformed/unclosed fence to its own block so a later REAL task
+		// is never swallowed (Claude-adversarial P1). A fenced
+		// `## task: <x>` *example* is rare and yields only a benign phantom
+		// row (no WIP → skipped on resume); silently dropping a real task's
+		// open PR is the worse failure.
 		if strings.HasPrefix(raw, "## task: ") {
 			flush()
 			slug = strings.TrimSpace(strings.TrimPrefix(raw, "## task: "))
 			status, prURL, pastFields, inFence = "", "", false, false
 			continue
 		}
+		// Within a `### `-introduced body, honor fences so a CLOSED fenced
+		// generic heading (`## Example`, `### Foo`) or `- ` prose bullet is
+		// treated as prose, not structure (codex P2). Fences are only
+		// tracked in the body region — the leading-field region has none.
+		if pastFields && strings.HasPrefix(raw, "```") && !strings.HasPrefix(raw[3:], "`") {
+			inFence = !inFence
+			continue
+		}
+		if pastFields && inFence {
+			continue // inside a body fence — pure prose, skip
+		}
 		if strings.HasPrefix(raw, "## ") {
 			// Non-task H2 (footer) — flush + stop.
 			flush()
 			slug = ""
 			break
-		}
-		if strings.HasPrefix(raw, "```") && !strings.HasPrefix(raw[3:], "`") {
-			inFence = !inFence
-			continue
-		}
-		if inFence {
-			continue // fenced body — never structural (within a block)
 		}
 		if slug == "" {
 			continue

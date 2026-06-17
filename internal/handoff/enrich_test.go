@@ -451,6 +451,31 @@ func TestScanTasksMetaTolerant_FencedFieldBulletsNotRead(t *testing.T) {
 	}
 }
 
+// scanTasksMetaTolerant: a CLOSED fenced `## Example` heading inside the
+// first task's body must be treated as prose, so the SECOND real task is
+// still parsed (codex P2 — fenced heading must not be a boundary). ---
+func TestScanTasksMetaTolerant_ClosedFencedHeadingKeepsLaterBlock(t *testing.T) {
+	body := "## task: first-1\n" +
+		"- status: in-review\n" +
+		"- pr_url: https://x/first\n" +
+		"### Spec\n" +
+		"Example with a generic heading inside a fence:\n" +
+		"```md\n" +
+		"## Example\n" +
+		"### Subsection\n" +
+		"```\n" +
+		"## task: second-2\n" +
+		"- status: in-review\n" +
+		"- pr_url: https://x/second\n"
+	meta := scanTasksMetaTolerant([]byte(body))
+	if _, ok := meta["second-2"]; !ok {
+		t.Fatalf("second-2 dropped — fenced generic heading wrongly treated as a footer boundary; got %#v", meta)
+	}
+	if meta["first-1"].prURL != "https://x/first" || meta["second-2"].prURL != "https://x/second" {
+		t.Errorf("pr_urls wrong: %#v", meta)
+	}
+}
+
 // scanTasksMetaTolerant: an UNCLOSED fence inside one task's body must
 // NOT swallow a later real task block — the `## task:` boundary resets
 // fence state so corruption is bounded to its own block. (review P1.)
