@@ -165,6 +165,60 @@ func TestEnrichManualDoc_CheckpointFallbackWhenNoLiveState(t *testing.T) {
 	}
 }
 
+// --- codex Slice-1 P1: coord-state.json present with an EMPTY worker map
+// (all workers finished since the last checkpoint) is AUTHORITATIVE —
+// ## Active Subagents must be CLEARED, not filled from the stale
+// checkpoint that still lists finished workers. ---
+func TestEnrichManualDoc_EmptyLiveStateClearsStaleCheckpoint(t *testing.T) {
+	pdir := withFleetHomeSynth(t)
+	now := time.Now().UTC()
+	// coord-state.json exists but has NO workers (all done).
+	seedCoordState(t, pdir, "myproj", map[string]string{})
+	// Checkpoint still lists a (now-finished) worker.
+	staleRow := `- task="finished-1234" branch="worker/finished-1234" phase="push" status="in-review" pr_url="https://github.com/o/r/pull/77" agent_id="cafef00d" subagent_id=""`
+	seedCheckpoint(t, pdir, "myproj", now, []string{staleRow}, nil, nil)
+	lastHandoff := writeFakeHandoffDoc(t, pdir, "deadbeef", now.Add(-time.Hour))
+	fakeGH(t, []byte("[]"), nil)
+
+	doc := NewManualStub("deadbeef", "coord-myproj", "myproj", 1, &lastHandoff, now)
+	EnrichManualDoc(doc, "myproj", "deadbeef", "", &lastHandoff, nil)
+
+	if len(doc.ActiveSubagents) != 0 {
+		t.Fatalf("ActiveSubagents: got %#v want EMPTY (authoritative live state clears stale checkpoint)", doc.ActiveSubagents)
+	}
+	// Renders the _(none)_ placeholder — successor resumes no finished work.
+	if body := string(Render(doc)); !strings.Contains(body, "## Active Subagents\n"+ActiveSubagentsNonePlaceholder) {
+		t.Errorf("rendered doc should show Active Subagents placeholder; got:\n%s", body)
+	}
+}
+
+// --- codex Slice-1 P2: gh fails, tasks.md is READABLE with zero open PRs
+// (last PR merged), checkpoint still lists a stale PR → tasks.md is
+// authoritative; checkpoint PRs are NOT revived. ---
+func TestEnrichManualDoc_ReadableEmptyTasksMDDoesNotReviveCheckpointPRs(t *testing.T) {
+	pdir := withFleetHomeSynth(t)
+	now := time.Now().UTC()
+	seedCoordState(t, pdir, "myproj", map[string]string{"w-1": "idA"})
+	seedWorkerState(t, pdir, "myproj", "w-1", "push", "")
+	// tasks.md readable, but the task's PR already MERGED (done) → no open PRs.
+	seedTasksMDWithPRAndStatus(t, pdir, "myproj", map[string][2]string{
+		"w-1": {"done", "https://github.com/o/r/pull/merged"},
+	})
+	// Checkpoint still carries a stale open-PR row.
+	staleRow := "- #99 stale — worker/old-9999 — https://github.com/o/r/pull/99"
+	seedCheckpoint(t, pdir, "myproj", now, nil, []string{staleRow}, nil)
+	lastHandoff := writeFakeHandoffDoc(t, pdir, "deadbeef", now.Add(-time.Hour))
+
+	fakeGH(t, nil, errors.New("gh down"))
+
+	doc := NewManualStub("deadbeef", "coord-myproj", "myproj", 1, &lastHandoff, now)
+	EnrichManualDoc(doc, "myproj", "deadbeef", "", &lastHandoff, nil)
+
+	if len(doc.OpenPRs) != 0 {
+		t.Fatalf("OpenPRs: got %#v want EMPTY (readable tasks.md authoritative; no checkpoint revival)", doc.OpenPRs)
+	}
+}
+
 // --- Case 2: no checkpoint, live workers on disk → Active Subagents
 // from emit-on-missing walk; Open PRs from gh. ---
 func TestEnrichManualDoc_NoCheckpointLiveWalk(t *testing.T) {
@@ -356,7 +410,7 @@ func TestCollectActiveSubagentsLive_PromotesPROpenToInReview(t *testing.T) {
 		// no-status-3333 intentionally absent from tasks.md.
 	})
 
-	subs := CollectActiveSubagentsLive("myproj")
+	subs, _ := CollectActiveSubagentsLive("myproj")
 	byTask := map[string]ActiveSubagent{}
 	for _, s := range subs {
 		byTask[s.TaskID] = s
@@ -386,7 +440,7 @@ func TestCollectActiveSubagentsLive_PromotesFromTasksMDPRURL(t *testing.T) {
 		"tonly-1111": {"in-progress", "https://github.com/o/r/pull/99"},
 	})
 
-	subs := CollectActiveSubagentsLive("myproj")
+	subs, _ := CollectActiveSubagentsLive("myproj")
 	if len(subs) != 1 {
 		t.Fatalf("subs: got %d want 1", len(subs))
 	}
@@ -524,7 +578,7 @@ func TestCollectActiveSubagentsLive_DivergesFromSynthSkip(t *testing.T) {
 	seedWorkerState(t, pdir, "myproj", "present-1111", "push", "")
 
 	// Live walk emits both.
-	live := CollectActiveSubagentsLive("myproj")
+	live, _ := CollectActiveSubagentsLive("myproj")
 	if len(live) != 2 {
 		t.Fatalf("live walk: got %d want 2 (emit-on-missing)", len(live))
 	}

@@ -164,20 +164,46 @@ func CollectOpenPRs(repoDir string, logw func(string)) ([]OpenPR, bool) {
 // status is promoted to in-review (statusIsPrePR) so the successor
 // takes the shepherd-only branch instead of double-dispatching.
 //
-// Best-effort: a missing project tree / missing coord-state.json / empty
-// worker map returns nil (the caller leaves the _(none)_ placeholder). A
-// malformed project NAME (validation error from ProjectDir) also returns
-// nil — enrichment never fails the handoff.
-func CollectActiveSubagentsLive(project string) []ActiveSubagent {
+// Return contract — the bool is "live coord-state was READABLE
+// (authoritative)":
+//   - ok=true, subs=non-empty: live workers, use them.
+//   - ok=true, subs=nil: coord-state.json read fine and has NO workers
+//     (all finished, or fresh project) → AUTHORITATIVE EMPTY. The caller
+//     must CLEAR ## Active Subagents, not fall back to a stale checkpoint
+//     that still lists finished workers. (codex Slice-1 P1.)
+//   - ok=false, subs=nil: coord-state.json unreadable (malformed JSON) or
+//     a malformed project NAME → the caller may fall back to the
+//     checkpoint snapshot. Enrichment never fails the handoff either way.
+func CollectActiveSubagentsLive(project string) ([]ActiveSubagent, bool) {
 	pdir, err := state.ProjectDir(project)
 	if err != nil {
-		return nil
+		return nil, false
 	}
 	pdir = filepath.Clean(pdir)
 
-	agentIDsBySlug, err := readWorkerAgentIDs(filepath.Join(pdir, "coord-state.json"))
-	if err != nil || len(agentIDsBySlug) == 0 {
-		return nil
+	csPath := filepath.Join(pdir, "coord-state.json")
+	// MISSING coord-state.json is NOT authoritative: a live coord always
+	// writes it, so its absence means we can't observe live state (fresh
+	// project before first dispatch, or a partial setup). Treat as
+	// ok=false so the caller may fall back to the checkpoint, rather than
+	// clearing a section the checkpoint legitimately populated. A PRESENT
+	// file with an empty worker map IS authoritative (all workers
+	// finished) — see below.
+	if _, statErr := os.Stat(csPath); statErr != nil {
+		return nil, false
+	}
+
+	agentIDsBySlug, err := readWorkerAgentIDs(csPath)
+	if err != nil {
+		// Unreadable (malformed JSON) — let the caller fall back to the
+		// checkpoint.
+		return nil, false
+	}
+	if len(agentIDsBySlug) == 0 {
+		// Present + read OK + zero workers → AUTHORITATIVE EMPTY (ok=true).
+		// The coord has no in-flight work; the section must be cleared
+		// rather than reviving stale checkpoint rows. (codex Slice-1 P1.)
+		return nil, true
 	}
 
 	metaBySlug := readTaskMetaBySlug(pdir)
@@ -225,7 +251,7 @@ func CollectActiveSubagentsLive(project string) []ActiveSubagent {
 		}
 		out = append(out, sub)
 	}
-	return out
+	return out, true
 }
 
 // taskMeta is the per-slug (status, pr_url) pair the live walk overlays
@@ -399,38 +425,48 @@ func EnrichManualDoc(doc *Doc, project, agentID, repoDir string, lastHandoffPath
 	// "prefer checkpoint when fresher" wording (which targets the
 	// dead-coord recovery path); a manual handoff is the live case where
 	// coord-state.json is authoritative.
-	if subs := CollectActiveSubagentsLive(project); len(subs) > 0 {
-		doc.ActiveSubagents = subs
+	//
+	// liveOK distinguishes "coord-state read fine, zero workers"
+	// (authoritative empty → CLEAR the section) from "coord-state
+	// unreadable" (keep the checkpoint baseline). Without this, a handoff
+	// taken after all workers finished would keep stale checkpoint rows
+	// and tell the successor to resume finished work. (codex Slice-1 P1.)
+	if subs, liveOK := CollectActiveSubagentsLive(project); liveOK {
+		doc.ActiveSubagents = subs // non-empty live rows OR authoritative empty (nil)
 	}
 
 	// OPEN PRS preference, most-authoritative (freshest) first:
 	//   1. `gh pr list` (live, authoritative) — overwrite on success.
-	//   2. tasks.md pr_url per slug — when gh fails. tasks.md is updated
-	//      live by the coord, so it is fresher than any checkpoint
-	//      snapshot; a PR opened since the last checkpoint is captured
-	//      here. Terminal (done/abandoned) rows are excluded. (codex
-	//      Slice-1 P1/P2.) handoff_resume.py keys the shepherd respawn off
-	//      the row's trailing URL (regex `\s—\s(https?://\S+)$`), so a
-	//      Number=0 / title=slug row is sufficient — the URL is the only
-	//      load-bearing field.
-	//   3. checkpoint snapshot — when gh fails AND tasks.md yields no PRs
-	//      (e.g. tasks.md unreadable). Last-resort stale snapshot.
+	//   2. tasks.md — when gh fails AND tasks.md is READABLE. tasks.md is
+	//      updated live by the coord, so it is fresher than any checkpoint
+	//      snapshot; a PR opened since the last checkpoint is captured.
+	//      Terminal (done/abandoned) rows are excluded. CRUCIALLY, a
+	//      readable tasks.md with ZERO open PRs is AUTHORITATIVE — we set
+	//      OpenPRs to that empty result rather than reviving the
+	//      checkpoint, so a handoff after the last PR merged doesn't
+	//      resurrect stale shepherd URLs. (codex Slice-1 P1/P2.)
+	//      handoff_resume.py keys the respawn off the row's trailing URL
+	//      (regex `\s—\s(https?://\S+)$`); a Number=0 / title=slug row is
+	//      sufficient — the URL is the only load-bearing field.
+	//   3. checkpoint snapshot — when gh fails AND tasks.md is UNREADABLE
+	//      (the only ambiguous case). Last-resort stale snapshot; already
+	//      set into doc.OpenPRs by applyCheckpointToDoc above, so this is
+	//      the implicit no-op fall-through.
 	//   4. empty → _(no open PRs)_ placeholder.
 	switch prs, ghOK := CollectOpenPRs(repoDir, logw); {
 	case ghOK:
 		doc.OpenPRs = prs
 	default:
-		if fallback := collectOpenPRsFromTasks(pdir); len(fallback) > 0 {
+		if fallback, tasksOK := collectOpenPRsFromTasks(pdir); tasksOK {
+			// Readable tasks.md is authoritative — use its result even when
+			// empty (clears any stale checkpoint baseline).
 			if logw != nil {
-				logw(fmt.Sprintf("enrich: gh unavailable; recovered %d Open PR(s) from tasks.md", len(fallback)))
+				logw(fmt.Sprintf("enrich: gh unavailable; using %d Open PR(s) from tasks.md (authoritative)", len(fallback)))
 			}
 			doc.OpenPRs = fallback
-		} else if cpOK && len(cp.openPRs) > 0 {
-			if logw != nil {
-				logw(fmt.Sprintf("enrich: gh + tasks.md unavailable; recovered %d Open PR(s) from checkpoint", len(cp.openPRs)))
-			}
-			doc.OpenPRs = cp.openPRs
 		}
+		// else: tasks.md unreadable → keep the checkpoint baseline already
+		// set by applyCheckpointToDoc (or the placeholder if no checkpoint).
 	}
 }
 
@@ -451,16 +487,28 @@ func EnrichManualDoc(doc *Doc, project, agentID, repoDir string, lastHandoffPath
 // (in-review / in-progress / blocked / etc.) are kept — any of them may
 // have a still-open PR worth watching.
 //
-// Best-effort: any read/parse failure or empty tasks.md returns nil and
-// the caller falls through to the _(no open PRs)_ placeholder.
-func collectOpenPRsFromTasks(pdir string) []OpenPR {
+// Return contract — the bool is "tasks.md was DETERMINABLE
+// (authoritative)":
+//   - ok=true: tasks.md was read successfully (or is legitimately
+//     absent → fresh project, no tasks). The returned slice is the
+//     authoritative open-PR set, which may be empty (all PRs merged).
+//     The caller uses it verbatim and does NOT revive a stale checkpoint.
+//   - ok=false: tasks.md exists but is unreadable (parse error). The
+//     caller may fall back to the checkpoint snapshot.
+//
+// A MISSING or unreadable tasks.md is ok=false (ambiguous — let the
+// checkpoint snapshot stand if one exists). Only a tasks.md that was
+// READ SUCCESSFULLY is authoritative, including when it yields zero open
+// PRs (the case codex flagged: all PRs merged → don't revive stale
+// checkpoint URLs). (codex Slice-1 P2.)
+func collectOpenPRsFromTasks(pdir string) ([]OpenPR, bool) {
 	path := filepath.Join(pdir, "tasks.md")
 	if _, err := os.Stat(path); err != nil {
-		return nil
+		return nil, false // missing / stat error → ambiguous
 	}
 	f, err := tasks.Read(path)
 	if err != nil {
-		return nil
+		return nil, false // parse error — ambiguous, let checkpoint stand
 	}
 	// Sort by slug for deterministic doc shape (matches the live walk +
 	// synth ordering; operators benefit from stable ordering too).
@@ -484,5 +532,5 @@ func collectOpenPRsFromTasks(pdir string) []OpenPR {
 			URL:         t.PRURL,
 		})
 	}
-	return out
+	return out, true
 }
