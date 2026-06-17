@@ -269,6 +269,45 @@ func TestEnrichManualDoc_LegacyCoordStateFallsBackToCheckpoint(t *testing.T) {
 	}
 }
 
+// --- codex Slice-1 P2: gh down AND tasks.md UNREADABLE (corrupt) →
+// the checkpoint's Open PRs (which may hold in-review PRs dropped from
+// the worker map) must NOT be wiped; live subagent PRs are unioned in. ---
+func TestEnrichManualDoc_CorruptTasksMDKeepsCheckpointPRs(t *testing.T) {
+	pdir := withFleetHomeSynth(t)
+	now := time.Now().UTC()
+	seedCoordState(t, pdir, "myproj", map[string]string{"w-live": "idA"})
+	// live worker has its own PR in state.json.
+	seedWorkerState(t, pdir, "myproj", "w-live", "push", "https://github.com/o/r/pull/live")
+	// tasks.md is UNREADABLE: claims a schema version newer than this
+	// binary supports, so tasks.Read returns ErrSchemaTooNew (the
+	// deterministic "undeterminable" trigger; raw garbage parses as an
+	// empty file).
+	dir := filepath.Join(pdir, "myproj")
+	if err := os.WriteFile(filepath.Join(dir, "tasks.md"), []byte("---\nschema: v99\n---\n"), 0o644); err != nil {
+		t.Fatalf("write unreadable tasks.md: %v", err)
+	}
+	// Checkpoint carries an in-review PR dropped from the worker map.
+	cpPR := "- #88 dropped-inreview — worker/old-8888 — https://github.com/o/r/pull/88"
+	seedCheckpoint(t, pdir, "myproj", now, nil, []string{cpPR}, nil)
+	lastHandoff := writeFakeHandoffDoc(t, pdir, "deadbeef", now.Add(-time.Hour))
+
+	fakeGH(t, nil, errors.New("gh down"))
+
+	doc := NewManualStub("deadbeef", "coord-myproj", "myproj", 1, &lastHandoff, now)
+	EnrichManualDoc(doc, "myproj", "deadbeef", "", &lastHandoff, nil)
+
+	urls := map[string]bool{}
+	for _, pr := range doc.OpenPRs {
+		urls[pr.URL] = true
+	}
+	if !urls["https://github.com/o/r/pull/88"] {
+		t.Errorf("checkpoint PR #88 dropped — must be kept when tasks.md unreadable; got %#v", doc.OpenPRs)
+	}
+	if !urls["https://github.com/o/r/pull/live"] {
+		t.Errorf("live worker PR missing — must be unioned in; got %#v", doc.OpenPRs)
+	}
+}
+
 // --- Case 2: no checkpoint, live workers on disk → Active Subagents
 // from emit-on-missing walk; Open PRs from gh. ---
 func TestEnrichManualDoc_NoCheckpointLiveWalk(t *testing.T) {

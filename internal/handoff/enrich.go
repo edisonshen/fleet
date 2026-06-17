@@ -492,26 +492,41 @@ func EnrichManualDoc(doc *Doc, project, agentID, repoDir string, lastHandoffPath
 	if prs, ghOK := CollectOpenPRs(repoDir, logw); ghOK {
 		doc.OpenPRs = prs
 	} else {
-		// gh unavailable. Build the freshest local snapshot by UNIONING:
-		//   (a) tasks.md non-terminal pr_urls — covers tasks already moved
-		//       to in-review and DROPPED from coord-state.json's worker map
-		//       (the `## Open PRs` section exists precisely for these), and
-		//   (b) live Active Subagent pr_urls — covers a PR written to
-		//       state.json before tasks.md was stamped (codex Slice-1 P2).
-		// Deduped by URL. The result is AUTHORITATIVE (clears stale
-		// checkpoint PRs) when EITHER source was determinable; only when
-		// BOTH are undeterminable do we keep the checkpoint baseline.
-		tasksPRs, tasksOK := collectOpenPRsFromTasks(pdir)
+		// gh unavailable. tasks.md is the ONLY local source that covers
+		// open PRs for tasks already moved to in-review and DROPPED from
+		// coord-state.json's worker map (the `## Open PRs` section exists
+		// precisely for these). So:
+		//
+		//   tasksOK (tasks.md readable) → tasks.md + live subagent pr_urls
+		//     is the COMPLETE authoritative snapshot. Replace doc.OpenPRs
+		//     with the merge (clears stale checkpoint PRs). Subagents add
+		//     the state.json-before-tasks.md window. (codex Slice-1 P2.)
+		//
+		//   !tasksOK (tasks.md missing/corrupt) → we CANNOT see the
+		//     in-review-dropped PRs from local state; the checkpoint
+		//     snapshot may still hold them. So KEEP the checkpoint baseline
+		//     (already set by applyCheckpointToDoc) and UNION in the live
+		//     subagent pr_urls — never wipe the checkpoint. (codex Slice-1
+		//     P2.)
 		subagentPRs := openPRsFromSubagents(liveSubs)
-		if tasksOK || liveOK {
+		if tasksPRs, tasksOK := collectOpenPRsFromTasks(pdir); tasksOK {
 			merged := mergeOpenPRsByURL(tasksPRs, subagentPRs)
 			if logw != nil {
 				logw(fmt.Sprintf("enrich: gh unavailable; using %d Open PR(s) from tasks.md+live state (authoritative)", len(merged)))
 			}
 			doc.OpenPRs = merged
+		} else if len(subagentPRs) > 0 {
+			// tasks.md undeterminable → supplement (don't replace) the
+			// checkpoint baseline with live subagent PRs.
+			merged := mergeOpenPRsByURL(doc.OpenPRs, subagentPRs)
+			if logw != nil {
+				logw(fmt.Sprintf("enrich: gh + tasks.md unavailable; checkpoint baseline + %d live PR(s)", len(subagentPRs)))
+			}
+			doc.OpenPRs = merged
 		}
-		// else: neither source determinable → keep the checkpoint baseline
-		// already set by applyCheckpointToDoc (or the placeholder).
+		// else: gh + tasks.md undeterminable AND no live PRs → keep the
+		// checkpoint baseline already set by applyCheckpointToDoc (or the
+		// placeholder if no checkpoint).
 	}
 }
 
