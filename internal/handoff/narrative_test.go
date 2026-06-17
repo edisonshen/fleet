@@ -99,10 +99,11 @@ func TestCollectNextSteps_SpecTruncated(t *testing.T) {
 	)
 
 	got := CollectNextSteps(path)
-	// The rendered goal must be exactly 80 x's (first non-blank line, ≤80).
-	if !strings.Contains(got, "- [P1] longspec-1234: "+strings.Repeat("x", 80)+"\n") &&
-		!strings.HasSuffix(strings.TrimSpace(got), "- [P1] longspec-1234: "+strings.Repeat("x", 80)) {
-		t.Errorf("Spec not truncated to 80 chars, got:\n%q", got)
+	// Single task → the body is exactly one bullet. The goal must be the
+	// first Spec line truncated to 80 x's, no more.
+	want := "- [P1] longspec-1234: " + strings.Repeat("x", 80)
+	if got != want {
+		t.Errorf("Spec not truncated to 80 chars:\n got %q\nwant %q", got, want)
 	}
 	if strings.Contains(got, "second line") {
 		t.Errorf("goal must be first non-blank Spec line only, got:\n%s", got)
