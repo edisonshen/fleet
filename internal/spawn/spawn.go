@@ -1037,6 +1037,16 @@ func Spawn(opts Options) (*agent.Record, error) {
 		}
 	}
 
+	// Stamp IsCoord at this single record-build chokepoint, AFTER both
+	// branches (fresh dispatch + handoff inherit) have resolved
+	// rec.TaskID/rec.Project. is_coord is a persisted projection of
+	// isCoordSpawn — the same predicate the lease-wrap below trusts — so
+	// the idle-archive sweep's explicit exemption signal can never drift
+	// from the intrinsic task_id convention (DESIGN-coord-idle-exempt §4).
+	// Handoff successors carry the coord task_id, so isCoordSpawn stays
+	// true and the successor inherits the coord flag automatically.
+	rec.IsCoord = isCoordSpawn(rec.TaskID, rec.Project)
+
 	// Pass the canonicalized cwd (not opts.Cwd) so the tmux session
 	// actually starts in the directory we recorded on rec.Cwd.
 	// Otherwise a relative --cwd resolved to one path here could

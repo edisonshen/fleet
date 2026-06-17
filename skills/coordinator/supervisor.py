@@ -489,6 +489,37 @@ def _is_agent_id(s: str) -> bool:
     return all(c in "0123456789abcdef" for c in s)
 
 
+def _read_coord_lock_holder(home: Path, project: str) -> str:
+    """Return the agent ID written into this project's coordinator.lock
+    body, or "" if absent/malformed.
+
+    The lock lives at ``~/.fleet/projects/<project>/.locks/coordinator.lock``
+    and its first line is the holder coord's 8-hex agent ID. This is the
+    AUTHORITATIVE "who is the coord for this project" signal — it is set
+    by whoever holds the flock regardless of how the coord was spawned,
+    so it covers legacy / manually-spawned coords whose task_id is NOT
+    "coord-<project>" and whose is_coord stamp is therefore false (both
+    derive from the same coord-<project> predicate via spawn.isCoordSpawn).
+    Mirrors the Go reader internal/projectlookup.readCoordHolder and the
+    skill-side loop._read_lock_holder; we keep a self-contained reader
+    here so the leaf idle-archive sweep doesn't pull in loop's import
+    surface. flock(2) does not truncate the body on release, so a stale
+    body can name a DEAD coord — that is intentionally fine for THIS use:
+    a dead coord's record has no fresh last_activity_ts, so the sweep's
+    TTL gate already keeps it (and recovery, not idle-archive, owns the
+    dead-coord case via projectlookup.StaleLockBodyCoord)."""
+    if not project:
+        return ""
+    path = home / "projects" / project / ".locks" / "coordinator.lock"
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as fh:
+            first = fh.readline()
+    except OSError:
+        return ""
+    s = first.strip()
+    return s if _is_agent_id(s) else ""
+
+
 # ---------- structured log lines (operator-visible in tmux pane) ----------
 
 
@@ -1832,6 +1863,12 @@ def _run_idle_agent_archive_pass(
         return 0
     cutoff_unix = now_unix - (ttl_h * 3600)
 
+    # Signal 3 (authoritative): the project's coordinator.lock body names
+    # the coord's agent ID. Read once per sweep — it covers legacy /
+    # manually-spawned coords that Signals 1+2 miss (see the exemption
+    # block below). "" when no lock / malformed body.
+    coord_lock_holder = _read_coord_lock_holder(home, project)
+
     agents_dir = home / "agents"
     try:
         entries = list(agents_dir.iterdir())
@@ -1852,6 +1889,58 @@ def _run_idle_agent_archive_pass(
             # the same; nothing we should crash on.
             continue
         if not isinstance(rec, dict):
+            continue
+        # Coordinators are NEVER idle-archived (DESIGN-coord-idle-exempt
+        # §4). A coord is the long-lived owner of the project; archiving
+        # it on the same idle timer as ephemeral workers kills a healthy
+        # project the morning after a quiet day. We decide "is this a
+        # coord?" on THREE structural signals, OR-combined so no single
+        # failure mode resurrects the bug:
+        #   Signal 1 (intrinsic): task_id == "coord-<project>" — fleet's
+        #     canonical coord discriminator (Go spawn.IsCoordSpawn).
+        #     Present on every normally-spawned coord; immune to a
+        #     missed stamp.
+        #   Signal 2 (explicit): is_coord == true — stamped at spawn
+        #     from isCoordSpawn; immune to a future task-id rename.
+        #   Signal 3 (authoritative): this record IS the project's
+        #     coordinator.lock holder. Signals 1+2 BOTH derive from the
+        #     same coord-<project> predicate (spawn.isCoordSpawn stamps
+        #     is_coord exactly when task_id == coord-<project>), so a
+        #     legacy / manually-spawned coord whose task_id is something
+        #     else (the case internal/projectlookup.StaleLockBodyCoord
+        #     exists to recover) has BOTH false — yet still owns the
+        #     project via the lock. Exempting the lock holder closes that
+        #     gap; it mirrors the Go recovery path's authority signal.
+        #     The lock BODY is coord-exclusive by construction: the ONLY
+        #     writer is loop._try_lock(holder_id=coord_id) in the coord
+        #     skill, and it always writes the COORD'S own id. A worker
+        #     that transiently grabs the flock (register_subagent's
+        #     _take_coord_lock) does NOT write the body — so a worker id
+        #     can never appear there, and rec_id == coord_lock_holder
+        #     can only match an actual coord record. (See the
+        #     archives_worker_when_lock_held_by_coord regression test.)
+        # role is NOT usable — coords carry role="executor" like workers.
+        # Exact-match the project-scoped id (not startswith("coord-")) so
+        # the predicate is unambiguous and project-scoped. The literal
+        # "coord-{project}" is pinned to the Go coordTaskIDPrefix by a
+        # drift-guard test (internal/spawn/coord_idle_exempt_test.go).
+        # Guard `project` truthiness on Signal 1: an empty project would
+        # collapse the comparison to task_id == "coord-", wrongly exempting
+        # any worker whose task_id is literally "coord-" (a leak — the
+        # worker would never reap). The skill entrypoint already returns
+        # early on an empty project, but the sweep self-protects so a
+        # future direct caller can't reintroduce the leak. Signal 2
+        # (is_coord) needs no such guard — it's an exact bool match.
+        # Signal 3 needs no guard either: coord_lock_holder is "" when
+        # project is empty (or no/malformed lock), and "" never equals a
+        # valid 8-hex record id.
+        task_id = str(rec.get("task_id", "") or "")
+        rec_id = str(rec.get("id", "") or "")
+        if (
+            rec.get("is_coord") is True
+            or (project and task_id == f"coord-{project}")
+            or (coord_lock_holder and rec_id == coord_lock_holder)
+        ):
             continue
         # Scope to this project. Every project's coord runs its own
         # sweep; a sibling project's stale agent is that coord's

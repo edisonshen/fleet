@@ -1607,11 +1607,17 @@ def _write_agent_record(
     needs_input: bool = False,
     blocked: bool = False,
     engine: str = "claude-code",
+    task_id: str | None = None,
+    is_coord: bool | None = None,
 ) -> Path:
     """Seed ~/.fleet/agents/<id>.json with the minimal shape the sweep
     reads. Mirrors internal/agent.Record's json:"..." tag names verbatim
     so changing the Go schema here without updating the test is caught
-    by an assertion failure (defensive against schema drift)."""
+    by an assertion failure (defensive against schema drift).
+
+    task_id / is_coord are optional so legacy-record tests can leave the
+    field absent entirely (matching omitempty on the Go side): pass None
+    (default) to omit, or an explicit value to emit it."""
     agents_dir = fleet_home / "agents"
     agents_dir.mkdir(parents=True, exist_ok=True)
     rec = {
@@ -1623,6 +1629,10 @@ def _write_agent_record(
         "needs_input": needs_input,
         "blocked": blocked,
     }
+    if task_id is not None:
+        rec["task_id"] = task_id
+    if is_coord is not None:
+        rec["is_coord"] = is_coord
     path = agents_dir / f"{agent_id}.json"
     path.write_text(json.dumps(rec), encoding="utf-8")
     return path
@@ -1698,6 +1708,311 @@ def test_idle_agent_archive_pass_archives_stale_record(
     assert archived == 1, f"expected 1 archive, recorded calls: {calls}"
     rm_calls = [c for c in calls if c[1:3] == ["rm", "aaaa0001"]]
     assert rm_calls, f"expected `fleet rm aaaa0001`, got: {calls}"
+
+
+# ---------- coord-idle-exempt: coords are NEVER idle-archived ----------
+# DESIGN-coord-idle-exempt §4 — exempt on two structural signals,
+# OR-combined: is_coord==true (explicit) OR task_id=="coord-<project>"
+# (intrinsic, backs up a missing field on legacy records). Workers stay
+# fully reapable on the same TTL.
+
+
+def _exempt_setup(monkeypatch):
+    """Shared rig: TTL=1h, a stale heartbeat 70 min in the past, and a
+    fake `fleet rm` that records every shell so the test can assert the
+    coord was NOT rm'd. Returns (now_unix, calls)."""
+    calls: list[list[str]] = []
+
+    def fake_run(cmd, capture_output=True, text=True, timeout=None, check=False):
+        calls.append(list(cmd))
+        return subprocess.CompletedProcess(
+            args=cmd, returncode=0, stdout="", stderr="",
+        )
+
+    last_heartbeat = supervisor._parse_rfc3339("2026-05-11T00:00:00Z")
+    assert last_heartbeat is not None
+    now_unix = last_heartbeat + 70 * 60  # 70 min idle, well past TTL=1h
+
+    monkeypatch.setenv("FLEET_COORD_IDLE_TTL_H", "1")
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    return now_unix, calls
+
+
+def test_idle_agent_archive_pass_exempts_coord_explicit_field(
+    fleet_home: Path, monkeypatch,
+) -> None:
+    """Test 1 — coord NOT archived (explicit signal). A record with
+    is_coord=true, idle 70 min past TTL, must NOT be `fleet rm`'d; the
+    record file stays on disk."""
+    project = "fleet"
+    path = _write_agent_record(
+        fleet_home, "cccc0001",
+        project=project,
+        last_activity_ts="2026-05-11T00:00:00Z",
+        task_id=f"coord-{project}",
+        is_coord=True,
+    )
+    now_unix, calls = _exempt_setup(monkeypatch)
+
+    archived = supervisor._run_idle_agent_archive_pass(
+        project=project, home=fleet_home, fleet_bin="fleet",
+        now_unix=now_unix, log_stream=io.StringIO(),
+    )
+
+    assert archived == 0, f"coord must not be archived; calls: {calls}"
+    assert not [c for c in calls if "rm" in c], f"no rm for coord: {calls}"
+    assert path.exists(), "coord record file must remain on disk"
+
+
+def test_idle_agent_archive_pass_exempts_coord_explicit_field_in_isolation(
+    fleet_home: Path, monkeypatch,
+) -> None:
+    """Test 1b — Signal 2 (is_coord) exempts ALONE, with task_id pointing
+    at a NON-coord slug so Signal 1 cannot also fire. This pins the
+    explicit field's runtime guarantee — the design's "immune to a future
+    task-id rename" claim. Without it, Test 1 (which sets BOTH signals)
+    would still pass via the task_id branch even if the `is_coord is True`
+    clause were deleted, so the OR's left operand had zero isolated
+    coverage."""
+    project = "fleet"
+    path = _write_agent_record(
+        fleet_home, "cccc0005",
+        project=project,
+        last_activity_ts="2026-05-11T00:00:00Z",
+        task_id="renamed-coord-slug",  # NOT coord-<project>: Signal 1 off.
+        is_coord=True,                 # Signal 2 on, and it alone.
+    )
+    now_unix, calls = _exempt_setup(monkeypatch)
+
+    archived = supervisor._run_idle_agent_archive_pass(
+        project=project, home=fleet_home, fleet_bin="fleet",
+        now_unix=now_unix, log_stream=io.StringIO(),
+    )
+
+    assert archived == 0, f"is_coord alone must exempt; calls: {calls}"
+    assert not [c for c in calls if "rm" in c], f"no rm for coord: {calls}"
+    assert path.exists(), "coord record file must remain on disk"
+
+
+def test_idle_agent_archive_pass_empty_project_does_not_exempt_coord_dash(
+    fleet_home: Path, monkeypatch,
+) -> None:
+    """Regression (adversarial F1): an empty project must NOT collapse
+    Signal 1 to task_id == "coord-" and exempt a worker whose task_id is
+    literally "coord-". Such a worker (no is_coord) must STILL reap —
+    otherwise it leaks forever. The sweep self-protects via the `project
+    and ...` guard even though the skill entrypoint already returns early
+    on an empty project."""
+    project = ""  # pathological: collapses f"coord-{project}" -> "coord-"
+    _write_agent_record(
+        fleet_home, "ffff0007",
+        project=project,
+        last_activity_ts="2026-05-11T00:00:00Z",
+        task_id="coord-",  # would match "coord-" if project guard absent
+    )
+    now_unix, calls = _exempt_setup(monkeypatch)
+
+    archived = supervisor._run_idle_agent_archive_pass(
+        project=project, home=fleet_home, fleet_bin="fleet",
+        now_unix=now_unix, log_stream=io.StringIO(),
+    )
+
+    assert archived == 1, f"empty-project worker must reap; calls: {calls}"
+    assert [c for c in calls if c[1:3] == ["rm", "ffff0007"]], (
+        f"expected `fleet rm ffff0007`, got: {calls}"
+    )
+
+
+def test_idle_agent_archive_pass_archives_worker_with_task_id(
+    fleet_home: Path, monkeypatch,
+) -> None:
+    """Test 2 — worker IS archived (unchanged). A record with a real
+    task slug and no is_coord field, idle past TTL, still reaps."""
+    project = "fleet"
+    _write_agent_record(
+        fleet_home, "dddd0002",
+        project=project,
+        last_activity_ts="2026-05-11T00:00:00Z",
+        task_id="some-feature-slug-1234",
+    )
+    now_unix, calls = _exempt_setup(monkeypatch)
+
+    archived = supervisor._run_idle_agent_archive_pass(
+        project=project, home=fleet_home, fleet_bin="fleet",
+        now_unix=now_unix, log_stream=io.StringIO(),
+    )
+
+    assert archived == 1, f"worker must archive; calls: {calls}"
+    assert [c for c in calls if c[1:3] == ["rm", "dddd0002"]], (
+        f"expected `fleet rm dddd0002`, got: {calls}"
+    )
+
+
+def test_idle_agent_archive_pass_exempts_coord_legacy_fallback(
+    fleet_home: Path, monkeypatch,
+) -> None:
+    """Test 3 — coord NOT archived via fallback (legacy). A record with
+    task_id=="coord-<project>" but NO is_coord field (predates the stamp)
+    is still exempt — Signal 1 (the task_id convention) backs up the
+    missing explicit field."""
+    project = "fleet"
+    path = _write_agent_record(
+        fleet_home, "cccc0003",
+        project=project,
+        last_activity_ts="2026-05-11T00:00:00Z",
+        task_id=f"coord-{project}",
+        # is_coord intentionally absent (legacy record).
+    )
+    now_unix, calls = _exempt_setup(monkeypatch)
+
+    archived = supervisor._run_idle_agent_archive_pass(
+        project=project, home=fleet_home, fleet_bin="fleet",
+        now_unix=now_unix, log_stream=io.StringIO(),
+    )
+
+    assert archived == 0, f"legacy coord must not archive; calls: {calls}"
+    assert not [c for c in calls if "rm" in c], f"no rm for coord: {calls}"
+    assert path.exists(), "legacy coord record file must remain on disk"
+
+
+def _write_coord_lock(fleet_home: Path, project: str, holder_id: str) -> Path:
+    """Seed ~/.fleet/projects/<project>/.locks/coordinator.lock with the
+    holder agent ID in its body — the authoritative "who is the coord"
+    signal the sweep reads (Signal 3). Mirrors the Go writer layout
+    (internal/projectlookup.readCoordHolder)."""
+    lock_dir = fleet_home / "projects" / project / ".locks"
+    lock_dir.mkdir(parents=True, exist_ok=True)
+    lock = lock_dir / "coordinator.lock"
+    lock.write_text(holder_id + "\n", encoding="utf-8")
+    return lock
+
+
+def test_idle_agent_archive_pass_exempts_coord_via_lock_holder(
+    fleet_home: Path, monkeypatch,
+) -> None:
+    """Signal 3 (codex iter-2 P1) — a LEGACY / manually-spawned coord whose
+    task_id is NOT "coord-<project>" and which carries NO is_coord stamp
+    (both derive from the same coord-<project> predicate, so both are false)
+    is STILL exempt when it is the project's coordinator.lock holder. Before
+    this signal such a coord — the exact lineage internal/projectlookup.
+    StaleLockBodyCoord exists to recover — would be `fleet rm`'d out from
+    under the operator after the idle TTL, re-opening the data-loss bug."""
+    project = "fleet"
+    holder = "abcd1234"
+    path = _write_agent_record(
+        fleet_home, holder,
+        project=project,
+        last_activity_ts="2026-05-11T00:00:00Z",
+        task_id="legacy-manual-coord-slug",
+        # is_coord intentionally absent — legacy coord, Signals 1+2 both false.
+    )
+    _write_coord_lock(fleet_home, project, holder)
+    now_unix, calls = _exempt_setup(monkeypatch)
+
+    archived = supervisor._run_idle_agent_archive_pass(
+        project=project, home=fleet_home, fleet_bin="fleet",
+        now_unix=now_unix, log_stream=io.StringIO(),
+    )
+
+    assert archived == 0, f"lock-holder coord must not archive; calls: {calls}"
+    assert not [c for c in calls if "rm" in c], f"no rm for coord: {calls}"
+    assert path.exists(), "lock-holder coord record file must remain on disk"
+
+
+def test_idle_agent_archive_pass_archives_worker_when_not_lock_holder(
+    fleet_home: Path, monkeypatch,
+) -> None:
+    """Signal 3 negative guard — Signal 3 must NOT over-exempt. A worker
+    with a real task slug, no is_coord, idle past TTL, whose id is NOT the
+    coordinator.lock holder still reaps. Confirms the lock-holder match is
+    exact (rec_id == holder), not a blanket "any record while a lock
+    exists" exemption that would leak every idle worker."""
+    project = "fleet"
+    _write_coord_lock(fleet_home, project, "abcd1234")  # a DIFFERENT id
+    _write_agent_record(
+        fleet_home, "dddd0099",
+        project=project,
+        last_activity_ts="2026-05-11T00:00:00Z",
+        task_id="some-worker-slug-5678",
+    )
+    now_unix, calls = _exempt_setup(monkeypatch)
+
+    archived = supervisor._run_idle_agent_archive_pass(
+        project=project, home=fleet_home, fleet_bin="fleet",
+        now_unix=now_unix, log_stream=io.StringIO(),
+    )
+
+    assert archived == 1, f"non-holder worker must archive; calls: {calls}"
+    assert [c for c in calls if c[1:3] == ["rm", "dddd0099"]], (
+        f"expected `fleet rm dddd0099`, got: {calls}"
+    )
+
+
+def test_idle_agent_archive_pass_archives_worker_when_lock_held_by_coord(
+    fleet_home: Path, monkeypatch,
+) -> None:
+    """Signal 3 worker-hijack guard (codex iter-3 P1) — refutes the
+    "a worker that grabs the coordinator.lock becomes exempt" concern.
+    The lock BODY is coord-exclusive: only loop._try_lock(holder_id=
+    coord_id) writes it, always with the COORD'S id; a worker's
+    _take_coord_lock takes the flock but never writes the body. So even
+    while a worker holds the flock, the body still names the coord — and
+    an idle worker (different id from the body) MUST still archive. We
+    model exactly that: body names the coord, an idle worker with a
+    different id sits past TTL, and it reaps."""
+    project = "fleet"
+    coord_id = "c0c0c0c0"
+    _write_coord_lock(fleet_home, project, coord_id)  # body names the COORD
+    # The worker — distinct id, real task slug, no is_coord, idle past TTL.
+    _write_agent_record(
+        fleet_home, "deadbeef",
+        project=project,
+        last_activity_ts="2026-05-11T00:00:00Z",
+        task_id="worker-holding-flock-9012",
+    )
+    now_unix, calls = _exempt_setup(monkeypatch)
+
+    archived = supervisor._run_idle_agent_archive_pass(
+        project=project, home=fleet_home, fleet_bin="fleet",
+        now_unix=now_unix, log_stream=io.StringIO(),
+    )
+
+    assert archived == 1, f"idle worker must archive even mid-flock; calls: {calls}"
+    assert [c for c in calls if c[1:3] == ["rm", "deadbeef"]], (
+        f"expected `fleet rm deadbeef`, got: {calls}"
+    )
+
+
+def test_idle_agent_archive_pass_coord_exempt_respects_zero_ttl(
+    fleet_home: Path, monkeypatch,
+) -> None:
+    """Regression guard: TTL=0 still disables the whole sweep (the
+    exemption clause must not accidentally short-circuit past the
+    disable check). Coord present, but the sweep does nothing."""
+    project = "fleet"
+    _write_agent_record(
+        fleet_home, "cccc0004",
+        project=project,
+        last_activity_ts="2020-01-01T00:00:00Z",
+        task_id=f"coord-{project}",
+        is_coord=True,
+    )
+    calls: list[list[str]] = []
+
+    def fake_run(cmd, capture_output=True, text=True, timeout=None, check=False):
+        calls.append(list(cmd))
+        return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="", stderr="")
+
+    monkeypatch.setenv("FLEET_COORD_IDLE_TTL_H", "0")
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    archived = supervisor._run_idle_agent_archive_pass(
+        project=project, home=fleet_home, fleet_bin="fleet",
+        now_unix=1_000_000_000.0, log_stream=io.StringIO(),
+    )
+
+    assert archived == 0
+    assert calls == [], f"TTL=0 disables the whole sweep; got: {calls}"
 
 
 def test_idle_agent_archive_pass_disabled_by_zero_ttl(
