@@ -329,6 +329,80 @@ def test_tick_reconciles_dead_worker_with_green_ci(
     assert any("status=in-review" in c for c in set_calls)
 
 
+# ---------- Slice 2: recent_completions producer wiring ----------
+
+
+def _read_recent_completions(project_dir: Path) -> list[str]:
+    state = json.loads((project_dir / "coord-state.json").read_text(encoding="utf-8"))
+    return state.get("recent_completions", [])
+
+
+def test_tick_records_completion_on_done_transition(
+    fleet_home: Path, project_dir: Path,
+    fleet_run_recorder, dispatch_subprocess,
+) -> None:
+    """An in-review task whose PR merged reconciles to status=done — a TRUE
+    completion. The done-transition appends a line to recent_completions so
+    the next checkpoint/handoff doc's Completed section is populated."""
+    _write_tasks(project_dir, [
+        _make_task(
+            "shipit-aaaa", status="in-review", worker_pid=1,
+            pr_url="https://github.com/x/y/pull/9",
+        ),
+    ])
+    merged = loop._CIResult(all_green=True, merged=True, mergeable=True)
+    with patch.object(loop, "_pid_alive", return_value=False), \
+         patch.object(loop, "_gh_pr_checks", return_value=merged):
+        result = loop.tick(
+            "fleet", coord_id="cccccc01", cwd="/repo",
+            fleet_home=str(fleet_home),
+        )
+
+    assert result.reconciled == 1
+    completions = _read_recent_completions(project_dir)
+    assert any("shipit-aaaa" in c for c in completions), (
+        f"expected a done-transition completion for shipit-aaaa, got {completions!r}"
+    )
+
+
+def test_tick_dispatch_does_not_record_completion(
+    fleet_home: Path, project_dir: Path,
+    fleet_run_recorder, dispatch_subprocess,
+) -> None:
+    """A dispatch is a START, not a completion — it must NOT append to
+    recent_completions (recording it would tell the successor in-flight
+    work is done)."""
+    _write_tasks(project_dir, [_make_task("ready-aaaa", status="ready")])
+    dispatch_subprocess.append("abcdef01")
+
+    result = loop.tick(
+        "fleet", coord_id="cccccc01", cwd="/repo",
+        fleet_home=str(fleet_home),
+    )
+
+    assert result.dispatched == 1
+    assert _read_recent_completions(project_dir) == []
+
+
+def test_tick_worker_failed_does_not_record_completion(
+    fleet_home: Path, project_dir: Path,
+    fleet_run_recorder, dispatch_subprocess,
+) -> None:
+    """A dead worker with no PR requeues to todo — a REQUEUE, not a
+    completion. recent_completions must stay empty."""
+    _write_tasks(project_dir, [
+        _make_task("dying-aaaa", status="in-progress", worker_pid=1, pr_url=""),
+    ])
+    with patch.object(loop, "_pid_alive", return_value=False):
+        result = loop.tick(
+            "fleet", coord_id="cccccc01", cwd="/repo",
+            fleet_home=str(fleet_home),
+        )
+
+    assert result.reconciled == 1
+    assert _read_recent_completions(project_dir) == []
+
+
 # ---------- drain inbox archive sentinels ----------
 
 
