@@ -1150,6 +1150,18 @@ def _tick_locked(
         )
     except Exception as exc:  # noqa: BLE001 — watch reconcile must never wedge a tick
         result.errors.append(f"pr-watch reconcile: {exc}")
+    else:
+        # Slice 2 fix: _reconcile_pr_watches may have appended PR-merged
+        # completions to `state["recent_completions"]` inside _flip_done.
+        # The heartbeat save at line 1060 ran BEFORE this call, so those
+        # mutations are not yet on disk. Persist now so the rolling
+        # checkpoint re-load (line 1216) captures them. Fail-soft: a
+        # save error here is non-fatal (checkpoint misses this tick's
+        # completions but the buffer fills on the next merge).
+        try:
+            _save_coord_state(state_path, state)
+        except Exception as _exc_save:  # noqa: BLE001
+            result.errors.append(f"pr-watch completion flush: {_exc_save}")
     # Did the initial PR-watch pass STAGE a DISPATCH block OR RAISE an
     # operator-actionable event? If so we must NOT enter the long-running
     # supervisor (codex iter-18 [P1] / iter-28 [P2]) — it would hold the lock
@@ -1610,6 +1622,16 @@ def _run_supervisor(
                 state=cs_pw, result=result, home=home,
                 enroll_tasks=enroll_tasks if enroll_tasks is not None else f_pw.tasks,
             )
+            # Slice 2 fix: _reconcile_pr_watches mutates cs_pw["recent_completions"]
+            # inside _flip_done. The _save_coord_state above ran BEFORE the
+            # reconcile, so those mutations are not on disk yet. Persist now
+            # so the next checkpoint write captures PR-merged completions.
+            # Fail-soft: a flush error is non-fatal (completions missed this
+            # pass but the buffer fills on the next merge flip).
+            try:
+                _save_coord_state(state_path, cs_pw)
+            except Exception as _exc_flush:  # noqa: BLE001
+                result.errors.append(f"supervisor pr-watch completion flush: {_exc_flush}")
         except Exception as exc:  # noqa: BLE001 — PR-watch must never wedge the supervisor
             result.errors.append(f"supervisor pr-watch reconcile: {exc}")
         return (
