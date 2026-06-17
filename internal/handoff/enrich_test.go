@@ -337,6 +337,46 @@ func TestEnrichManualDoc_SchemaDriftLiveWalkStaysConsistent(t *testing.T) {
 	}
 }
 
+// --- codex Slice-1 P2: gh down, tasks.md readable, but coord-state.json
+// UNREADABLE (live walk failed) → tasks.md is incomplete, so the
+// checkpoint's PRs must be UNIONED in, not replaced. ---
+func TestEnrichManualDoc_TasksOKButLiveFailedUnionsCheckpoint(t *testing.T) {
+	pdir := withFleetHomeSynth(t)
+	now := time.Now().UTC()
+	dir := filepath.Join(pdir, "myproj")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	// coord-state.json is CORRUPT JSON → live walk returns ok=false.
+	if err := os.WriteFile(filepath.Join(dir, "coord-state.json"), []byte("{not valid json"), 0o644); err != nil {
+		t.Fatalf("write corrupt coord-state: %v", err)
+	}
+	// tasks.md readable, carries ONE in-review PR.
+	seedTasksMDWithPR(t, pdir, "myproj", map[string]string{
+		"t-1": "https://github.com/o/r/pull/11",
+	})
+	// Checkpoint holds a DIFFERENT PR (e.g. one tasks.md lags on).
+	cpPR := "- #22 cp-only — worker/cp-2222 — https://github.com/o/r/pull/22"
+	seedCheckpoint(t, pdir, "myproj", now, nil, []string{cpPR}, nil)
+	lastHandoff := writeFakeHandoffDoc(t, pdir, "deadbeef", now.Add(-time.Hour))
+
+	fakeGH(t, nil, errors.New("gh down"))
+
+	doc := NewManualStub("deadbeef", "coord-myproj", "myproj", 1, &lastHandoff, now)
+	EnrichManualDoc(doc, "myproj", "deadbeef", "", &lastHandoff, nil)
+
+	urls := map[string]bool{}
+	for _, pr := range doc.OpenPRs {
+		urls[pr.URL] = true
+	}
+	if !urls["https://github.com/o/r/pull/11"] {
+		t.Errorf("tasks.md PR #11 missing; got %#v", doc.OpenPRs)
+	}
+	if !urls["https://github.com/o/r/pull/22"] {
+		t.Errorf("checkpoint PR #22 dropped — must be unioned when live walk failed; got %#v", doc.OpenPRs)
+	}
+}
+
 // scanTasksMetaTolerant unit edges: prose bullets in Spec/Notes are not
 // mistaken for task fields; the footer H2 stops scanning.
 func TestScanTasksMetaTolerant_IgnoresProseBullets(t *testing.T) {

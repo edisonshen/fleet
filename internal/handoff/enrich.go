@@ -516,13 +516,29 @@ func EnrichManualDoc(doc *Doc, project, agentID, repoDir string, lastHandoffPath
 		//     subagent pr_urls — never wipe the checkpoint. (codex Slice-1
 		//     P2.)
 		subagentPRs := openPRsFromSubagents(liveSubs)
-		if tasksPRs, tasksOK := collectOpenPRsFromTasks(pdir); tasksOK {
+		tasksPRs, tasksOK := collectOpenPRsFromTasks(pdir)
+		switch {
+		case tasksOK && liveOK:
+			// BOTH local sources determinable → tasks.md + live subagents is
+			// the COMPLETE authoritative snapshot. Replace doc.OpenPRs
+			// (clears stale checkpoint PRs). (codex Slice-1 P2.)
 			merged := mergeOpenPRsByURL(tasksPRs, subagentPRs)
 			if logw != nil {
 				logw(fmt.Sprintf("enrich: gh unavailable; using %d Open PR(s) from tasks.md+live state (authoritative)", len(merged)))
 			}
 			doc.OpenPRs = merged
-		} else if len(subagentPRs) > 0 {
+		case tasksOK && !liveOK:
+			// tasks.md readable BUT the live walk failed (coord-state
+			// unreadable) → tasks.md alone is NOT complete; it can lag
+			// state.json/checkpoint on a just-opened PR. UNION tasks.md +
+			// subagents WITH the checkpoint baseline instead of replacing,
+			// so a checkpoint-only PR isn't dropped. (codex Slice-1 P2.)
+			merged := mergeOpenPRsByURL(doc.OpenPRs, mergeOpenPRsByURL(tasksPRs, subagentPRs))
+			if logw != nil {
+				logw(fmt.Sprintf("enrich: gh unavailable + live state incomplete; checkpoint ∪ tasks.md ∪ live = %d Open PR(s)", len(merged)))
+			}
+			doc.OpenPRs = merged
+		case len(subagentPRs) > 0:
 			// tasks.md undeterminable → supplement (don't replace) the
 			// checkpoint baseline with live subagent PRs.
 			merged := mergeOpenPRsByURL(doc.OpenPRs, subagentPRs)
