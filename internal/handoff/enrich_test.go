@@ -12,9 +12,14 @@ package handoff
 import (
 	"encoding/json"
 	"errors"
+	"os"
+	"path/filepath"
+	"sort"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/edisonshen/fleet/internal/tasks"
 )
 
 // fakeGH swaps ghRunner for a stub returning (out, err) and restores the
@@ -25,6 +30,37 @@ func fakeGH(t *testing.T, out []byte, err error) {
 	prev := ghRunner
 	ghRunner = func(args ...string) ([]byte, error) { return out, err }
 	t.Cleanup(func() { ghRunner = prev })
+}
+
+// seedTasksMDWithPR writes a tasks.md carrying a pr_url per slug (empty
+// pr_url = no PR). Used by the gh-failure tasks.md-fallback test.
+func seedTasksMDWithPR(t *testing.T, projectsRoot, project string, prURLBySlug map[string]string) {
+	t.Helper()
+	dir := filepath.Join(projectsRoot, project)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatalf("mkdir %s: %v", dir, err)
+	}
+	now := time.Now().UTC().Truncate(time.Second)
+	f := &tasks.File{Schema: 1}
+	slugs := make([]string, 0, len(prURLBySlug))
+	for s := range prURLBySlug {
+		slugs = append(slugs, s)
+	}
+	sort.Strings(slugs)
+	for _, s := range slugs {
+		f.Tasks = append(f.Tasks, &tasks.Task{
+			Slug:     s,
+			Status:   tasks.Status("in-review"),
+			Priority: tasks.Priority("P1"),
+			PRURL:    prURLBySlug[s],
+			Created:  now,
+			Updated:  now,
+			Spec:     "enrich-test task " + s,
+		})
+	}
+	if err := tasks.Write(filepath.Join(dir, "tasks.md"), f); err != nil {
+		t.Fatalf("write tasks.md: %v", err)
+	}
 }
 
 // ghJSON marshals a slice of ghOpenPR to the JSON shape `gh pr list
@@ -145,6 +181,48 @@ func TestEnrichManualDoc_GhFailsFallsBackToCheckpointPRs(t *testing.T) {
 
 	if len(doc.OpenPRs) != 1 || doc.OpenPRs[0].Number != 50 {
 		t.Fatalf("OpenPRs: got %#v want checkpoint fallback #50", doc.OpenPRs)
+	}
+}
+
+// --- Case 3c (codex Slice-1 P1): gh fails, NO checkpoint snapshot, but
+// tasks.md carries pr_url per slug → fall back to tasks.md so the
+// successor still re-spawns shepherds for in-review PRs (rather than
+// dropping all PR supervision). ---
+func TestEnrichManualDoc_GhFailsFallsBackToTasksMD(t *testing.T) {
+	pdir := withFleetHomeSynth(t)
+	now := time.Now().UTC()
+	seedCoordState(t, pdir, "myproj", map[string]string{
+		"fix-foo-1234": "deadbeef",
+		"fix-bar-5678": "cafef00d",
+	})
+	seedWorkerState(t, pdir, "myproj", "fix-foo-1234", "push", "")
+	seedWorkerState(t, pdir, "myproj", "fix-bar-5678", "push", "")
+	// tasks.md: foo has an open PR, bar does not.
+	seedTasksMDWithPR(t, pdir, "myproj", map[string]string{
+		"fix-foo-1234": "https://github.com/o/r/pull/42",
+		"fix-bar-5678": "",
+	})
+
+	fakeGH(t, nil, errors.New("not a git repository")) // gh fails, no checkpoint
+
+	doc := NewManualStub("deadbeef", "coord-myproj", "myproj", 1, nil, now)
+	EnrichManualDoc(doc, "myproj", "deadbeef", nil, nil)
+
+	if len(doc.OpenPRs) != 1 {
+		t.Fatalf("OpenPRs: got %#v want 1 (tasks.md fallback for the slug with a pr_url)", doc.OpenPRs)
+	}
+	pr := doc.OpenPRs[0]
+	if pr.URL != "https://github.com/o/r/pull/42" {
+		t.Errorf("PR URL: got %q want pull/42", pr.URL)
+	}
+	if pr.HeadRefName != "worker/fix-foo-1234" {
+		t.Errorf("PR head: got %q want worker/fix-foo-1234", pr.HeadRefName)
+	}
+	// The rendered row must carry a trailing URL so handoff_resume.py's
+	// shepherd-respawn regex (\s—\s(https?://\S+)$) matches it.
+	body := string(Render(doc))
+	if !strings.Contains(body, " — https://github.com/o/r/pull/42") {
+		t.Errorf("rendered Open PRs row missing trailing URL; got:\n%s", body)
 	}
 }
 

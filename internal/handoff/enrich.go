@@ -36,12 +36,14 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"sort"
 	"time"
 
 	"github.com/edisonshen/fleet/internal/state"
+	"github.com/edisonshen/fleet/internal/tasks"
 )
 
 // ghTimeout caps the `gh pr list` shell-out. Matches
@@ -295,11 +297,70 @@ func EnrichManualDoc(doc *Doc, project, agentID string, lastHandoffPath *string,
 		}
 	}
 
-	// Open PRs: gh is authoritative + fresher than any snapshot. On gh
-	// success, overwrite. On gh failure, fall back to whatever
-	// applyCheckpointToDoc set (checkpoint snapshot), else leave the
-	// existing placeholder (nil → _(no open PRs)_).
+	// Open PRs preference, most-authoritative first:
+	//   1. `gh pr list` (fresh, authoritative) — overwrite on success.
+	//   2. checkpoint snapshot (already set by applyCheckpointToDoc when
+	//      cpOK) — stands when gh fails.
+	//   3. tasks.md pr_url per slug — when gh fails AND there's no
+	//      checkpoint snapshot. tasks.md carries the authoritative pr_url
+	//      the coord recorded, so a non-git shell / gh-auth / timeout
+	//      failure no longer drops shepherd supervision for every
+	//      in-review PR. handoff_resume.py keys the shepherd respawn off
+	//      the row's trailing URL (regex `\s—\s(https?://\S+)$`), so a
+	//      Number=0 / title=slug row is sufficient — the URL is the only
+	//      load-bearing field. (codex Slice-1 P1.)
+	//   4. empty → _(no open PRs)_ placeholder.
 	if prs, ghOK := CollectOpenPRs(logw); ghOK {
 		doc.OpenPRs = prs
+	} else if len(doc.OpenPRs) == 0 {
+		if fallback := collectOpenPRsFromTasks(pdir, project); len(fallback) > 0 {
+			if logw != nil {
+				logw(fmt.Sprintf("enrich: gh unavailable; recovered %d Open PR(s) from tasks.md", len(fallback)))
+			}
+			doc.OpenPRs = fallback
+		}
 	}
+}
+
+// collectOpenPRsFromTasks reads tasks.md and returns an OpenPR per task
+// that has a non-empty pr_url, used as the degraded-path fallback when
+// `gh pr list` is unavailable and no fresher checkpoint snapshot exists.
+//
+// tasks.md does NOT carry a PR number or title, so the row is partial:
+// URL = pr_url (the load-bearing field handoff_resume.py parses), head =
+// the task's branch (or worker/<slug>), title = slug, number = 0. The
+// successor still re-spawns one shepherd per URL — supervision continuity
+// is preserved even though the operator-readability fields are coarse.
+//
+// Best-effort: any read/parse failure or empty tasks.md returns nil and
+// the caller falls through to the _(no open PRs)_ placeholder.
+func collectOpenPRsFromTasks(pdir, project string) []OpenPR {
+	path := filepath.Join(pdir, "tasks.md")
+	if _, err := os.Stat(path); err != nil {
+		return nil
+	}
+	f, err := tasks.Read(path)
+	if err != nil {
+		return nil
+	}
+	// Sort by slug for deterministic doc shape (matches the live walk +
+	// synth ordering; operators benefit from stable ordering too).
+	sort.Slice(f.Tasks, func(i, j int) bool { return f.Tasks[i].Slug < f.Tasks[j].Slug })
+	var out []OpenPR
+	for _, t := range f.Tasks {
+		if t.PRURL == "" {
+			continue
+		}
+		head := t.Branch
+		if head == "" {
+			head = "worker/" + t.Slug
+		}
+		out = append(out, OpenPR{
+			Number:      0, // unknown from tasks.md; URL is the load-bearing field.
+			Title:       t.Slug,
+			HeadRefName: head,
+			URL:         t.PRURL,
+		})
+	}
+	return out
 }
