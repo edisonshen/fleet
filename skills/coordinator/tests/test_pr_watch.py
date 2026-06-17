@@ -424,6 +424,38 @@ def test_merged_flips_all_tasks_then_prunes(tmp_path: Path) -> None:
     assert "195" not in pw.load_watches(tmp_path)["watches"]
 
 
+def test_merged_flip_records_completion(tmp_path: Path, monkeypatch) -> None:
+    """Slice 2 (handoff narrative): a PR-merged flip through the durable
+    watch is a TRUE completion — _reconcile_pr_watches records it into
+    state["recent_completions"] (via _flip_done), so the checkpoint's
+    Completed section fills. dispatch / requeue do NOT (different paths)."""
+    project_dir = tmp_path / "projects" / "p"
+    project_dir.mkdir(parents=True)
+    tasks = [_task("foo", pr_url=_pr_url(195))]
+    snaps = {195: pw.PRSnapshot(number=195, pr_state="MERGED",
+                                merged_at="2026-06-03T08:00:00Z", head_ref_oid="H")}
+    monkeypatch.setattr(loop, "_pr_watch_prober", FakeProber(snaps=snaps))
+    monkeypatch.setattr(loop, "_run_fleet", lambda *a, **k: None)
+    monkeypatch.setattr(pw, "derive_owner_repo", lambda repo_path: OWNER_REPO)
+    state: dict = {}
+
+    class _Result:
+        def __init__(self) -> None:
+            self.dispatched = 0
+            self.raised = 0
+            self.errors: list[str] = []
+            self.dispatch_instructions: list[str] = []
+
+    loop._reconcile_pr_watches(
+        tasks, project="p", project_dir=project_dir,
+        cwd="/repo", fleet_bin="fleet", state=state, result=_Result(),
+    )
+    completions = state.get("recent_completions", [])
+    assert any("foo" in c and "merged" in c for c in completions), (
+        f"expected a merged completion for foo, got {completions!r}"
+    )
+
+
 def test_merged_flip_failure_leaves_watch_unpruned(tmp_path: Path) -> None:
     """A flip failure leaves the MERGED watch un-pruned so the next tick
     re-reconciles (flip is idempotent)."""
