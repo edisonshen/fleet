@@ -40,6 +40,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/edisonshen/fleet/internal/state"
@@ -119,6 +120,12 @@ func CollectOpenPRs(repoDir string, logw func(string)) ([]OpenPR, bool) {
 		"pr", "list",
 		"--state", "open",
 		"--search", "head:worker/",
+		// gh pr list defaults to the first 30 results; a busy project can
+		// have more open worker PRs, and handoff_resume.py respawns
+		// shepherds strictly from this section — a truncated page would
+		// silently stop monitoring the overflow. Cap high enough to cover
+		// any realistic fan-out. (codex Slice-1 P2.)
+		"--limit", "500",
 		"--json", "number,title,headRefName,url",
 	)
 	if err != nil {
@@ -610,41 +617,119 @@ func openPRsFromSubagents(subs []ActiveSubagent) []OpenPR {
 //   - ok=false: tasks.md exists but is unreadable (parse error). The
 //     caller may fall back to the checkpoint snapshot.
 //
-// A MISSING or unreadable tasks.md is ok=false (ambiguous — let the
-// checkpoint snapshot stand if one exists). Only a tasks.md that was
-// READ SUCCESSFULLY is authoritative, including when it yields zero open
-// PRs (the case codex flagged: all PRs merged → don't revive stale
+// A MISSING tasks.md is ok=false (ambiguous — let the checkpoint stand).
+// A PRESENT tasks.md is parsed with a TOLERANT scan (NOT tasks.Read):
+// this fallback is the last local source for in-review PRs already
+// dropped from worker_agent_ids, so a schema-too-new binary, a partial
+// write, or one malformed block must NOT make the whole file unreadable
+// — we still recover every well-formed `## task:` block's status/pr_url.
+// This mirrors handoff.py:_read_tasks_meta's deliberate per-block
+// tolerance. A successfully-scanned tasks.md is authoritative, including
+// when it yields zero open PRs (all merged → don't revive stale
 // checkpoint URLs). (codex Slice-1 P2.)
 func collectOpenPRsFromTasks(pdir string) ([]OpenPR, bool) {
 	path := filepath.Join(pdir, "tasks.md")
-	if _, err := os.Stat(path); err != nil {
-		return nil, false // missing / stat error → ambiguous
-	}
-	f, err := tasks.Read(path)
+	data, err := os.ReadFile(path)
 	if err != nil {
-		return nil, false // parse error — ambiguous, let checkpoint stand
+		return nil, false // missing / read error → ambiguous
 	}
-	// Sort by slug for deterministic doc shape (matches the live walk +
-	// synth ordering; operators benefit from stable ordering too).
-	sort.Slice(f.Tasks, func(i, j int) bool { return f.Tasks[i].Slug < f.Tasks[j].Slug })
+	meta := scanTasksMetaTolerant(data)
+	slugs := make([]string, 0, len(meta))
+	for slug := range meta {
+		slugs = append(slugs, slug)
+	}
+	sort.Strings(slugs) // deterministic doc shape
 	var out []OpenPR
-	for _, t := range f.Tasks {
-		if t.PRURL == "" {
+	for _, slug := range slugs {
+		m := meta[slug]
+		if m.prURL == "" {
 			continue
 		}
-		if t.Status == tasks.StatusDone || t.Status == tasks.StatusAbandoned {
+		if m.status == string(tasks.StatusDone) || m.status == string(tasks.StatusAbandoned) {
 			continue // terminal: PR merged/closed, no shepherd needed.
-		}
-		head := t.Branch
-		if head == "" {
-			head = "worker/" + t.Slug
 		}
 		out = append(out, OpenPR{
 			Number:      0, // unknown from tasks.md; URL is the load-bearing field.
-			Title:       t.Slug,
-			HeadRefName: head,
-			URL:         t.PRURL,
+			Title:       slug,
+			HeadRefName: "worker/" + slug,
+			URL:         m.prURL,
 		})
 	}
 	return out, true
+}
+
+// scanTasksMetaTolerant extracts {slug: {status, pr_url}} from tasks.md
+// bytes with a hand-rolled per-block scan that survives schema drift /
+// partial writes — a port of handoff.py:_read_tasks_meta. It reads only
+// the `- status:` / `- pr_url:` bullets inside each `## task: <slug>`
+// block's leading bullet section (before the first blank line / `### `
+// header), so prose bullets in Spec/Acceptance/Notes are never mistaken
+// for task fields. Unparseable lines are skipped, never fatal.
+func scanTasksMetaTolerant(data []byte) map[string]taskMeta {
+	out := map[string]taskMeta{}
+	var slug, status, prURL string
+	// The task FIELDS are the contiguous `- key: val` bullets that lead a
+	// task block, before the first blank line or `### ` H3. Once that
+	// leading section closes, later `- ` lines are prose (Spec/Acceptance/
+	// Notes) and must NOT be read as fields — so we latch bulletsClosed
+	// and never reopen until the next `## task:`. (This is stricter than
+	// handoff.py, which can reopen on a stray `- ` after an H3; the
+	// stricter rule avoids mis-reading a `- status:`-looking prose line.)
+	inBullets, bulletsClosed := false, false
+	flush := func() {
+		if slug != "" {
+			out[slug] = taskMeta{status: status, prURL: prURL}
+		}
+	}
+	for _, raw := range strings.Split(strings.ReplaceAll(string(data), "\r\n", "\n"), "\n") {
+		if strings.HasPrefix(raw, "## task: ") {
+			flush()
+			slug = strings.TrimSpace(strings.TrimPrefix(raw, "## task: "))
+			status, prURL, inBullets, bulletsClosed = "", "", false, false
+			continue
+		}
+		if strings.HasPrefix(raw, "## ") {
+			// Non-task H2 (footer) — flush + stop.
+			flush()
+			slug = ""
+			break
+		}
+		if slug == "" {
+			continue
+		}
+		if strings.TrimSpace(raw) == "" {
+			if inBullets {
+				bulletsClosed = true // blank line ends the leading field section
+			}
+			inBullets = false
+			continue
+		}
+		if strings.HasPrefix(raw, "### ") {
+			bulletsClosed = true // H3 body section — no more task fields
+			inBullets = false
+			continue
+		}
+		if !strings.HasPrefix(raw, "- ") || bulletsClosed {
+			continue
+		}
+		inBullets = true
+		body := raw[2:]
+		colon := strings.IndexByte(body, ':')
+		if colon < 0 {
+			continue
+		}
+		key := strings.TrimSpace(body[:colon])
+		val := strings.TrimSpace(body[colon+1:])
+		if val == "null" {
+			val = ""
+		}
+		switch key {
+		case "status":
+			status = val
+		case "pr_url":
+			prURL = val
+		}
+	}
+	flush() // EOF flush
+	return out
 }

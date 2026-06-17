@@ -269,26 +269,28 @@ func TestEnrichManualDoc_LegacyCoordStateFallsBackToCheckpoint(t *testing.T) {
 	}
 }
 
-// --- codex Slice-1 P2: gh down AND tasks.md UNREADABLE (corrupt) →
-// the checkpoint's Open PRs (which may hold in-review PRs dropped from
-// the worker map) must NOT be wiped; live subagent PRs are unioned in. ---
-func TestEnrichManualDoc_CorruptTasksMDKeepsCheckpointPRs(t *testing.T) {
+// --- codex Slice-1 P2: gh down AND tasks.md has SCHEMA DRIFT (newer
+// schema header that tasks.Read would refuse) but still contains a valid
+// `## task:` block with an open PR → the tolerant scan recovers that PR
+// (a downgraded binary / schema bump must not lose in-review shepherds
+// that exist only in tasks.md). ---
+func TestEnrichManualDoc_SchemaDriftTasksMDStillRecoversPR(t *testing.T) {
 	pdir := withFleetHomeSynth(t)
 	now := time.Now().UTC()
-	seedCoordState(t, pdir, "myproj", map[string]string{"w-live": "idA"})
-	// live worker has its own PR in state.json.
-	seedWorkerState(t, pdir, "myproj", "w-live", "push", "https://github.com/o/r/pull/live")
-	// tasks.md is UNREADABLE: claims a schema version newer than this
-	// binary supports, so tasks.Read returns ErrSchemaTooNew (the
-	// deterministic "undeterminable" trigger; raw garbage parses as an
-	// empty file).
+	// A task already moved to in-review and DROPPED from the worker map —
+	// it lives only in tasks.md, not coord-state.json.
+	seedCoordState(t, pdir, "myproj", map[string]string{})
+	// tasks.md claims a future schema (tasks.Read would refuse the whole
+	// file) yet carries a well-formed task block with a pr_url.
 	dir := filepath.Join(pdir, "myproj")
-	if err := os.WriteFile(filepath.Join(dir, "tasks.md"), []byte("---\nschema: v99\n---\n"), 0o644); err != nil {
-		t.Fatalf("write unreadable tasks.md: %v", err)
+	body := "---\nschema: v99\n---\n\n" +
+		"## task: dropped-1234\n" +
+		"- status: in-review\n" +
+		"- pr_url: https://github.com/o/r/pull/88\n\n" +
+		"### Spec\n- not a field bullet\n"
+	if err := os.WriteFile(filepath.Join(dir, "tasks.md"), []byte(body), 0o644); err != nil {
+		t.Fatalf("write schema-drift tasks.md: %v", err)
 	}
-	// Checkpoint carries an in-review PR dropped from the worker map.
-	cpPR := "- #88 dropped-inreview — worker/old-8888 — https://github.com/o/r/pull/88"
-	seedCheckpoint(t, pdir, "myproj", now, nil, []string{cpPR}, nil)
 	lastHandoff := writeFakeHandoffDoc(t, pdir, "deadbeef", now.Add(-time.Hour))
 
 	fakeGH(t, nil, errors.New("gh down"))
@@ -296,15 +298,29 @@ func TestEnrichManualDoc_CorruptTasksMDKeepsCheckpointPRs(t *testing.T) {
 	doc := NewManualStub("deadbeef", "coord-myproj", "myproj", 1, &lastHandoff, now)
 	EnrichManualDoc(doc, "myproj", "deadbeef", "", &lastHandoff, nil)
 
-	urls := map[string]bool{}
-	for _, pr := range doc.OpenPRs {
-		urls[pr.URL] = true
+	if len(doc.OpenPRs) != 1 || doc.OpenPRs[0].URL != "https://github.com/o/r/pull/88" {
+		t.Fatalf("OpenPRs: got %#v want pull/88 (tolerant scan recovers despite schema drift)", doc.OpenPRs)
 	}
-	if !urls["https://github.com/o/r/pull/88"] {
-		t.Errorf("checkpoint PR #88 dropped — must be kept when tasks.md unreadable; got %#v", doc.OpenPRs)
+}
+
+// scanTasksMetaTolerant unit edges: prose bullets in Spec/Notes are not
+// mistaken for task fields; the footer H2 stops scanning.
+func TestScanTasksMetaTolerant_IgnoresProseBullets(t *testing.T) {
+	body := "## task: a-1\n" +
+		"- status: in-progress\n" +
+		"- pr_url: https://x/1\n" +
+		"### Spec\n" +
+		"- status: THIS IS PROSE not a field\n" +
+		"- pr_url: https://evil/should-not-win\n\n" +
+		"## footer\n" +
+		"- status: ignored\n"
+	meta := scanTasksMetaTolerant([]byte(body))
+	if len(meta) != 1 {
+		t.Fatalf("meta: got %d entries want 1 (footer H2 stops scan)", len(meta))
 	}
-	if !urls["https://github.com/o/r/pull/live"] {
-		t.Errorf("live worker PR missing — must be unioned in; got %#v", doc.OpenPRs)
+	got := meta["a-1"]
+	if got.status != "in-progress" || got.prURL != "https://x/1" {
+		t.Errorf("a-1 meta: got %+v want {in-progress https://x/1} (prose bullets ignored)", got)
 	}
 }
 
