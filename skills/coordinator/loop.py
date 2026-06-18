@@ -8129,21 +8129,55 @@ def _payload_has_alerts(payload: dict) -> bool:
         return False
 
 
+def _classify_dropped_stdout(exc, *, has_alerts: bool, context: str) -> int:
+    """Decide the exit code when a tick's stdout write hit `exc`, and emit
+    the matching diagnostic. Shared by the zero-dispatch emit branch and
+    `_print_json_safe` so both classify a dropped summary identically.
+
+    Returns:
+      _EXIT_BROKEN_PIPE when the drop loses something the caller must act
+        on — either operator-visible alerts (`raised`/`errors`; codex
+        [P1]/[P2]) or a non-EPIPE write FAULT (ENOSPC/EIO: the only
+        machine-readable result was lost to a fault, not a benign
+        reader-close; codex [P3]).
+      0 when the drop is a benign EPIPE on an alert-free tick (`| head`,
+        a stdout cap, an idle tick) — the actionable output already
+        flushed, so re-ticking would just spin the harness.
+    """
+    is_pipe = isinstance(exc, BrokenPipeError) or getattr(
+        exc, "errno", None) == errno.EPIPE
+    if has_alerts:
+        _warn_stderr(
+            f"coordinator: {context} could not reach a closed stdout ({exc}); "
+            f"it carried raised/errors alerts the operator did NOT receive. "
+            f"Exiting non-zero so the harness re-ticks and re-publishes."
+        )
+        return _EXIT_BROKEN_PIPE
+    if not is_pipe:
+        _warn_stderr(
+            f"coordinator: {context} could not be written (non-pipe write "
+            f"fault: {exc}); the only machine-readable result was lost to a "
+            f"write fault. Exiting non-zero so the caller does not treat "
+            f"this tick as successful."
+        )
+        return _EXIT_BROKEN_PIPE
+    _warn_stderr(
+        f"coordinator: {context} dropped to a closed stdout (broken pipe); "
+        f"it carried no alerts (no raised/errors) and the actionable output "
+        f"already flushed — exiting 0 (NOT a SIGPIPE kill, NOT a re-tick "
+        f"signal)."
+    )
+    return 0
+
+
 def _print_json_safe(payload: dict) -> int:
     """Emit the tick's JSON summary, surviving a closed stdout cleanly.
 
-    Returns 0 when the summary is purely diagnostic (no `raised`/`errors`)
-    — a broken pipe then means "the reader closed after getting everything
-    that mattered" (`| head`, a stdout cap, an idle tick), and returning
-    non-zero would spin the harness on pointless re-ticks.
-
-    Returns _EXIT_BROKEN_PIPE when the dropped summary carried alerts
-    (codex [P1]/[P2]): `raised`/`errors` are operator-visible and the
-    summary is their ONLY delivery channel, so a closed stdout that ate
-    them must force a re-tick rather than report a false-clean tick.
-
-    Either way we swallow the pipe and silence the shutdown flush so the
-    process never dies via a fatal SIGPIPE.
+    Exit code is decided by `_classify_dropped_stdout`: 0 for a benign
+    alert-free EPIPE, _EXIT_BROKEN_PIPE when the dropped summary carried
+    `raised`/`errors` alerts OR hit a non-pipe write fault. Either way we
+    swallow the error and silence the shutdown flush so the process never
+    dies via a fatal SIGPIPE.
     """
     has_alerts = _payload_has_alerts(payload)
     try:
@@ -8152,26 +8186,10 @@ def _print_json_safe(payload: dict) -> int:
         return 0
     except (BrokenPipeError, OSError) as exc:
         _silence_shutdown_flush()
-        # EPIPE = benign reader-closed; other OSError (ENOSPC/EIO) = a real
-        # write fault worth surfacing louder (review [P3]).
-        is_pipe = isinstance(exc, BrokenPipeError) or getattr(
-            exc, "errno", None) == errno.EPIPE
-        kind = "broken pipe" if is_pipe else f"non-pipe write fault: {exc}"
-        if has_alerts:
-            _warn_stderr(
-                f"coordinator: stdout closed before the tick's JSON summary "
-                f"could be written ({kind}); it carried raised/errors alerts "
-                f"that the operator did NOT receive. Exiting non-zero so the "
-                f"harness re-ticks and re-publishes the alert."
-            )
-            return _EXIT_BROKEN_PIPE
-        _warn_stderr(
-            f"coordinator: stdout closed before the tick's JSON summary "
-            f"could be written ({kind}); summary dropped but it carried no "
-            f"alerts (no raised/errors) and the actionable output already "
-            f"flushed — exiting 0 (NOT a SIGPIPE kill, NOT a re-tick signal)."
+        return _classify_dropped_stdout(
+            exc, has_alerts=has_alerts,
+            context="the tick's JSON summary",
         )
-        return 0
 
 
 def _silence_shutdown_flush() -> None:
@@ -8296,25 +8314,15 @@ def main(argv: Iterable[str] | None = None) -> int:
         pending = len(result.dispatch_instructions)
         if pending == 0:
             # No DISPATCH block was lost — the only write was the trailing
-            # flush of an empty buffer. But the tick may still carry
-            # operator-visible alerts (raised/errors) that the dropped JSON
-            # summary would have published (codex [P1]/[P2]): if so, force
-            # a re-tick; otherwise the broken pipe is benign — exit 0.
-            if result.raised or result.errors:
-                _warn_stderr(
-                    f"coordinator: stdout closed on a zero-dispatch tick "
-                    f"(broken pipe: {exc}) that carried raised/errors "
-                    f"alerts; the operator did NOT receive them. Exiting "
-                    f"non-zero so the harness re-ticks and re-publishes."
-                )
-                return _EXIT_BROKEN_PIPE
-            _warn_stderr(
-                f"coordinator: stdout closed on a zero-dispatch tick "
-                f"(broken pipe: {exc}); nothing actionable was lost (no "
-                f"blocks, no raised/errors). Exiting 0 (NOT a SIGPIPE "
-                f"kill, NOT a re-tick signal)."
+            # flush of an empty buffer. The tick may still carry alerts
+            # (raised/errors) that the dropped JSON summary would have
+            # published, and the fault may be non-EPIPE; classify exactly
+            # as the summary path does (codex [P1]/[P2]/[P3]).
+            return _classify_dropped_stdout(
+                exc,
+                has_alerts=bool(result.raised) or bool(result.errors),
+                context="a zero-dispatch tick's output",
             )
-            return 0
         # A real DISPATCH block did not reach the coord — surface it and
         # exit non-zero so the harness re-ticks. The coordinator.lock is
         # already released by tick()'s finally, so a non-zero exit here

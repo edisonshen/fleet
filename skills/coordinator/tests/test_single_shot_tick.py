@@ -20,6 +20,7 @@ Tests map 1:1 to docs/TASK-PLAN-coord-tick-single-shot.md "Tests":
 from __future__ import annotations
 
 import datetime as _dt
+import errno
 import os
 import subprocess
 import sys
@@ -499,6 +500,58 @@ def test_final_json_broken_pipe_with_errors_forces_retick(
     monkeypatch.setattr(loop.sys, "stdout", broken)
 
     assert loop.main([]) == loop._EXIT_BROKEN_PIPE
+
+
+class _ENOSPCStdout:
+    """stdout whose write raises a NON-pipe OSError (disk full)."""
+
+    def write(self, _s):
+        raise OSError(errno.ENOSPC, "No space left on device")
+
+    def flush(self):
+        raise OSError(errno.ENOSPC, "No space left on device")
+
+    def fileno(self):
+        raise OSError("no fileno")
+
+    def close(self):
+        pass
+
+
+def test_final_json_non_pipe_write_fault_forces_retick(
+    monkeypatch, capsys,
+) -> None:
+    """codex [P3]: a non-EPIPE stdout write fault (ENOSPC) on a clean
+    summary must NOT report success — the only machine-readable result
+    was lost to a fault. Exit non-zero even with no raised/errors."""
+    fake = loop.TickResult()
+    fake.dispatched = 0
+    fake.dispatch_instructions = []
+    fake.raised = 0
+    fake.errors = []
+    monkeypatch.setattr(loop, "tick", lambda *a, **kw: fake)
+    monkeypatch.setenv("FLEET_PROJECT", "fleet")
+    monkeypatch.setattr(loop.sys, "stdout", _ENOSPCStdout())
+
+    rc = loop.main([])
+
+    assert rc == loop._EXIT_BROKEN_PIPE, (
+        "a non-pipe write fault (ENOSPC) must not report success"
+    )
+
+
+def test_print_json_safe_epipe_no_alerts_exits_zero(monkeypatch) -> None:
+    """Direct unit: clean payload + EPIPE stdout -> exit 0."""
+    monkeypatch.setattr(loop.sys, "stdout", _BrokenStdout())
+    rc = loop._print_json_safe({"raised": 0, "errors": []})
+    assert rc == 0
+
+
+def test_print_json_safe_enospc_no_alerts_forces_nonzero(monkeypatch) -> None:
+    """Direct unit: clean payload + ENOSPC stdout -> non-zero (fault)."""
+    monkeypatch.setattr(loop.sys, "stdout", _ENOSPCStdout())
+    rc = loop._print_json_safe({"raised": 0, "errors": []})
+    assert rc == loop._EXIT_BROKEN_PIPE
 
 
 def test_payload_has_alerts_detects_raised_and_errors() -> None:
