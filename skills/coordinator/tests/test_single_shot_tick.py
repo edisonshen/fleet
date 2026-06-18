@@ -196,6 +196,75 @@ def test_single_shot_default_does_not_enter_supervisor(
     assert not result.skipped
 
 
+def test_single_shot_with_inflight_surfaces_diagnostic(
+    fleet_home: Path, project_dir: Path,
+    fleet_run_recorder, dispatch_subprocess, monkeypatch, capsys,
+) -> None:
+    """codex [P1]: the degraded (single-shot) cadence must be SURFACED on
+    stderr when in-flight work exists + polling was configured — not
+    silently stop monitoring. It must NOT pollute result.errors (the
+    healthy path)."""
+    monkeypatch.delenv("FLEET_COORD_IN_TURN_SUPERVISOR", raising=False)
+    monkeypatch.setenv("FLEET_COORD_POLL_INTERVAL_S", "30")
+    _write_tasks(project_dir, [
+        _make_task("live-gggg", status="in-progress", worker_pid=1),
+    ])
+    _spy_supervisor(monkeypatch)
+
+    with patch.object(loop, "_pid_alive", return_value=True):
+        result = loop.tick(
+            "fleet", coord_id="cccccc01", cwd="/repo",
+            fleet_home=str(fleet_home),
+        )
+
+    err = capsys.readouterr().err
+    assert "single-shot tick" in err
+    assert "in-flight task" in err
+    # The diagnostic is NOT a tick failure.
+    assert result.errors == []
+
+
+def test_single_shot_idle_coord_stays_quiet(
+    fleet_home: Path, project_dir: Path,
+    fleet_run_recorder, dispatch_subprocess, monkeypatch, capsys,
+) -> None:
+    """No in-flight work -> no degradation diagnostic (a truly idle coord
+    is silent)."""
+    monkeypatch.delenv("FLEET_COORD_IN_TURN_SUPERVISOR", raising=False)
+    monkeypatch.setenv("FLEET_COORD_POLL_INTERVAL_S", "30")
+    _write_tasks(project_dir, [_make_task("idle-aaaa", status="todo")])
+    _spy_supervisor(monkeypatch)
+
+    loop.tick(
+        "fleet", coord_id="cccccc01", cwd="/repo",
+        fleet_home=str(fleet_home),
+    )
+
+    assert "single-shot tick" not in capsys.readouterr().err
+
+
+def test_single_shot_no_poll_interval_stays_quiet(
+    fleet_home: Path, project_dir: Path,
+    fleet_run_recorder, dispatch_subprocess, monkeypatch, capsys,
+) -> None:
+    """Legacy single-tick callers (poll_interval<=0) never wanted the loop
+    -> no diagnostic even with in-flight work."""
+    monkeypatch.delenv("FLEET_COORD_IN_TURN_SUPERVISOR", raising=False)
+    monkeypatch.setenv("FLEET_COORD_POLL_INTERVAL_S", "0")
+    _write_tasks(project_dir, [
+        _make_task("live-hhhh", status="in-progress", worker_pid=1),
+    ])
+    _spy_supervisor(monkeypatch)
+
+    with patch.object(loop, "_pid_alive", return_value=True):
+        loop.tick(
+            "fleet", coord_id="cccccc01", cwd="/repo",
+            fleet_home=str(fleet_home),
+        )
+
+    assert "single-shot tick" not in capsys.readouterr().err
+
+
 # ===========================================================================
 # Test 2 — Lock hold bound: coordinator.lock is released before tick()
 # returns (no across-loop hold). We assert the flock fd is None after the
@@ -366,11 +435,13 @@ def test_dispatch_emit_broken_pipe_is_handled_not_signal(
     assert "broken" in err.lower() or "pipe" in err.lower()
 
 
-def test_final_json_broken_pipe_is_handled_not_signal(
+def test_final_json_broken_pipe_exits_zero_not_signal(
     monkeypatch, capsys,
 ) -> None:
     """No DISPATCH blocks -> the only write is the final JSON summary.
-    A broken pipe there must still exit cleanly (handled), never 144."""
+    A broken pipe there must exit 0 (the summary is diagnostic, not a
+    failed dispatch — codex [P2]: a non-zero here would spin the harness
+    on pointless re-ticks). Never a fatal SIGPIPE (144)."""
     fake = loop.TickResult()
     fake.dispatched = 0
     fake.dispatch_instructions = []
@@ -382,8 +453,7 @@ def test_final_json_broken_pipe_is_handled_not_signal(
 
     rc = loop.main([])
 
-    assert rc == loop._EXIT_BROKEN_PIPE
-    assert rc != 144 and rc != 141 and rc < 128
+    assert rc == 0, "broken pipe on the diagnostic JSON summary must exit 0"
     err = capsys.readouterr().err
     assert "broken" in err.lower() or "pipe" in err.lower()
 

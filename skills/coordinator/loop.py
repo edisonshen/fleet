@@ -102,6 +102,48 @@ def _in_turn_supervisor_enabled() -> bool:
     return raw in ("1", "true", "yes", "on")
 
 
+_INFLIGHT_STATUSES = ("in-progress", "in-review")
+
+
+def _maybe_warn_single_shot(*, tasks, sup_cfg, pr_watch_staged) -> None:
+    """Surface (to stderr) that the in-turn supervisor was skipped while
+    in-flight work exists — so the single-shot degradation is visible.
+
+    Stays quiet when:
+      - the operator did not configure polling (poll_interval_s <= 0):
+        legacy single-tick callers never wanted the loop;
+      - a PR-watch block was staged this tick (the legacy code ALSO skips
+        the loop in that case — main() flushes the block immediately);
+      - there is no in-flight task to shepherd (a truly idle coord).
+
+    Best-effort: never raises into the tick. The next tick (Stop hook /
+    `fleet message` wake / Slice-2 daemon pass) resumes shepherding.
+    """
+    if sup_cfg.poll_interval_s <= 0 or pr_watch_staged:
+        return
+    try:
+        inflight = [t for t in tasks if t.status in _INFLIGHT_STATUSES]
+    except Exception:  # noqa: BLE001 — never let a warn wedge a tick
+        return
+    if not inflight:
+        return
+    # Diagnostic only — written to stderr, NOT appended to result.errors:
+    # this is the EXPECTED single-shot path, not a tick failure, so it
+    # must not pollute the JSON `errors` field (which gates the operator's
+    # blocked_reason surface) on every healthy tick.
+    msg = (
+        f"coordinator: single-shot tick (FLEET_COORD_IN_TURN_SUPERVISOR "
+        f"off) — {len(inflight)} in-flight task(s) will be shepherded on "
+        f"the NEXT tick (Stop hook / `fleet message` wake / coord-run "
+        f"daemon), not by an in-turn poll loop. Set "
+        f"FLEET_COORD_IN_TURN_SUPERVISOR=1 to restore the legacy loop."
+    )
+    try:
+        sys.stderr.write(msg + "\n")
+    except (BrokenPipeError, OSError):
+        pass
+
+
 def _worktree_gc_every() -> int:
     """Resolve the worktree-GC cadence (ticks between backstop runs).
 
@@ -1416,6 +1458,21 @@ def _tick_locked(
             coord_id=coord_id,
             result=result,
             emitted_this_tick=emitted_this_tick,
+        )
+    else:
+        # Single-shot default (Slice 1): the continuous in-turn loop is
+        # OFF, so per-tick shepherding (PR-watch polling, stuck-worker
+        # recovery) only happens when a NEW tick fires — the Stop hook on
+        # the next agent turn, a `fleet message` wake, or the Slice-2
+        # daemon's mechanical pass. Surface this so the degraded cadence
+        # is visible rather than silent (feedback_surface_dont_silo) — but
+        # ONLY when there is in-flight work to shepherd AND the operator
+        # had polling configured (poll_interval>0); a truly idle coord
+        # stays quiet. codex [P1]: makes the intended tradeoff explicit.
+        _maybe_warn_single_shot(
+            tasks=f.tasks,
+            sup_cfg=sup_cfg,
+            pr_watch_staged=_pr_watch_staged_dispatch,
         )
 
     # 5.9. Rolling coord checkpoint (#187), part 2 — write the file LAST.
@@ -8035,24 +8092,29 @@ def _ensure_sigpipe_handled() -> None:
 def _print_json_safe(payload: dict) -> int:
     """Emit the tick's JSON summary, surviving a closed stdout cleanly.
 
-    Returns 0 on success, _EXIT_BROKEN_PIPE if stdout's read end is gone.
-    A broken pipe here is benign — the JSON summary is diagnostic, not the
-    load-bearing DISPATCH block — but we still close stdout so the
-    interpreter-shutdown flush can't re-raise (which historically leaked
-    out as the 144 the operator kept seeing).
+    Always returns 0. The JSON summary is DIAGNOSTIC, not load-bearing:
+    by the time we reach it, the actionable DISPATCH blocks have already
+    been flushed (their own emit path returns _EXIT_BROKEN_PIPE if THEY
+    failed). A broken pipe on the trailing summary therefore means "the
+    reader closed after getting everything that mattered" (e.g. `| head`,
+    a stdout cap, or an idle tick with zero blocks) — NOT a failed
+    dispatch. Returning non-zero here would make a fully-successful tick
+    look like a retry signal and spin the harness on pointless re-ticks
+    (codex [P2]). We swallow the pipe, silence the shutdown flush so it
+    can't re-raise (or deliver a fatal SIGPIPE), and exit 0.
     """
     try:
         print(json.dumps(payload))
         sys.stdout.flush()
-        return 0
     except (BrokenPipeError, OSError):
         _silence_shutdown_flush()
         sys.stderr.write(
             "coordinator: stdout closed before the tick's JSON summary "
-            "could be written (broken pipe); summary dropped. Exiting "
-            "non-zero so the harness re-ticks (NOT a SIGPIPE kill).\n"
+            "could be written (broken pipe); summary dropped. The tick's "
+            "actionable output (if any) already flushed — exiting 0 (NOT "
+            "a SIGPIPE kill, NOT a re-tick signal).\n"
         )
-        return _EXIT_BROKEN_PIPE
+    return 0
 
 
 def _silence_shutdown_flush() -> None:
@@ -8169,18 +8231,34 @@ def main(argv: Iterable[str] | None = None) -> int:
         # of the block buffer can't re-raise (or deliver a fatal SIGPIPE)
         # on the closed pipe.
         _silence_shutdown_flush()
+        pending = len(result.dispatch_instructions)
+        if pending == 0:
+            # No load-bearing block was lost — the only write was the
+            # trailing flush of an empty buffer. A broken pipe here is
+            # benign (codex [P2]): do NOT signal a re-tick. Exit 0.
+            sys.stderr.write(
+                f"coordinator: stdout closed on a zero-dispatch tick "
+                f"(broken pipe: {exc}); nothing actionable was lost. "
+                f"Exiting 0 (NOT a SIGPIPE kill, NOT a re-tick signal).\n"
+            )
+            return 0
+        # A real DISPATCH block did not reach the coord — surface it and
+        # exit non-zero so the harness re-ticks. The coordinator.lock is
+        # already released by tick()'s finally, so a non-zero exit here
+        # doesn't strand the lock.
         sys.stderr.write(
             f"coordinator: failed to emit DISPATCH block "
-            f"({len(result.dispatch_instructions)} pending) to a closed "
-            f"stdout (broken pipe: {exc}); the dispatch did NOT reach the "
-            f"coord. Re-run the tick with full output captured (never "
-            f"`| head`). Exiting non-zero so the harness re-ticks.\n"
+            f"({pending} pending) to a closed stdout (broken pipe: {exc}); "
+            f"the dispatch did NOT reach the coord. Re-run the tick with "
+            f"full output captured (never `| head`). Exiting non-zero so "
+            f"the harness re-ticks.\n"
         )
         return _EXIT_BROKEN_PIPE
     # Final JSON summary. A closed stdout here is benign (the summary is
-    # diagnostic, not the load-bearing DISPATCH block) — _print_json_safe
-    # returns _EXIT_BROKEN_PIPE and silences the shutdown flush so the
-    # process still exits cleanly, never via SIGPIPE.
+    # diagnostic, not the load-bearing DISPATCH block — those already
+    # flushed above) — _print_json_safe returns 0 and silences the
+    # shutdown flush so the process exits cleanly, never via SIGPIPE and
+    # never as a spurious re-tick signal.
     return _print_json_safe({
         "skipped": result.skipped,
         "reason": result.reason,
