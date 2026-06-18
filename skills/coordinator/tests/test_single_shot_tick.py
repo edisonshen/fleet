@@ -458,6 +458,56 @@ def test_final_json_broken_pipe_exits_zero_not_signal(
     assert "broken" in err.lower() or "pipe" in err.lower()
 
 
+def test_final_json_broken_pipe_with_alerts_forces_retick(
+    monkeypatch, capsys,
+) -> None:
+    """codex [P1]/[P2]: the JSON summary is the ONLY place main() publishes
+    raised/errors. If stdout closes before it writes AND the tick carried
+    alerts, the operator never sees them — so exit non-zero (re-tick), not
+    a false-clean 0. Zero dispatch blocks, but raised > 0."""
+    fake = loop.TickResult()
+    fake.dispatched = 0
+    fake.dispatch_instructions = []
+    fake.raised = 1  # an operator-visible alert (e.g. CLOSED-unmerged PR)
+    monkeypatch.setattr(loop, "tick", lambda *a, **kw: fake)
+    monkeypatch.setenv("FLEET_PROJECT", "fleet")
+
+    broken = _BrokenStdout()
+    monkeypatch.setattr(loop.sys, "stdout", broken)
+
+    rc = loop.main([])
+
+    assert rc == loop._EXIT_BROKEN_PIPE, (
+        "a dropped summary carrying raised/errors must force a re-tick"
+    )
+    err = capsys.readouterr().err
+    assert "alert" in err.lower() or "re-tick" in err.lower()
+
+
+def test_final_json_broken_pipe_with_errors_forces_retick(
+    monkeypatch, capsys,
+) -> None:
+    """Same as above but via result.errors (reconcile/auto-archive fault)."""
+    fake = loop.TickResult()
+    fake.dispatched = 0
+    fake.dispatch_instructions = []
+    fake.errors = ["reconcile: boom"]
+    monkeypatch.setattr(loop, "tick", lambda *a, **kw: fake)
+    monkeypatch.setenv("FLEET_PROJECT", "fleet")
+
+    broken = _BrokenStdout()
+    monkeypatch.setattr(loop.sys, "stdout", broken)
+
+    assert loop.main([]) == loop._EXIT_BROKEN_PIPE
+
+
+def test_payload_has_alerts_detects_raised_and_errors() -> None:
+    assert loop._payload_has_alerts({"raised": 1, "errors": []}) is True
+    assert loop._payload_has_alerts({"raised": 0, "errors": ["x"]}) is True
+    assert loop._payload_has_alerts({"raised": 0, "errors": []}) is False
+    assert loop._payload_has_alerts({}) is False
+
+
 def test_real_subprocess_piped_through_head_never_exit_144(tmp_path: Path) -> None:
     """End-to-end: run loop.py as a real subprocess with stdout piped to a
     reader that closes early (like `| head`). The process must exit with a

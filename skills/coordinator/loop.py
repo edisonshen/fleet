@@ -8113,46 +8113,65 @@ def _warn_stderr(msg: str) -> None:
         pass
 
 
+def _payload_has_alerts(payload: dict) -> bool:
+    """Does this tick's summary carry operator-visible alerts?
+
+    The JSON summary is the ONLY place main() publishes `raised` (PR-watch
+    CLOSED-unmerged / blocked-question / reconcile escalations) and
+    `errors` (auto-archive / reconcile / checkpoint faults). If stdout
+    closes before the summary writes AND the tick carried either, the
+    operator never sees the alert — so the tick must NOT look clean
+    (codex [P1]/[P2]).
+    """
+    try:
+        return bool(payload.get("raised")) or bool(payload.get("errors"))
+    except AttributeError:
+        return False
+
+
 def _print_json_safe(payload: dict) -> int:
     """Emit the tick's JSON summary, surviving a closed stdout cleanly.
 
-    Always returns 0. The JSON summary is DIAGNOSTIC, not load-bearing:
-    by the time we reach it, the actionable DISPATCH blocks have already
-    been flushed (their own emit path returns _EXIT_BROKEN_PIPE if THEY
-    failed). A broken pipe on the trailing summary therefore means "the
-    reader closed after getting everything that mattered" (e.g. `| head`,
-    a stdout cap, or an idle tick with zero blocks) — NOT a failed
-    dispatch. Returning non-zero here would make a fully-successful tick
-    look like a retry signal and spin the harness on pointless re-ticks
-    (codex [P2]). We swallow the pipe, silence the shutdown flush so it
-    can't re-raise (or deliver a fatal SIGPIPE), and exit 0.
+    Returns 0 when the summary is purely diagnostic (no `raised`/`errors`)
+    — a broken pipe then means "the reader closed after getting everything
+    that mattered" (`| head`, a stdout cap, an idle tick), and returning
+    non-zero would spin the harness on pointless re-ticks.
+
+    Returns _EXIT_BROKEN_PIPE when the dropped summary carried alerts
+    (codex [P1]/[P2]): `raised`/`errors` are operator-visible and the
+    summary is their ONLY delivery channel, so a closed stdout that ate
+    them must force a re-tick rather than report a false-clean tick.
+
+    Either way we swallow the pipe and silence the shutdown flush so the
+    process never dies via a fatal SIGPIPE.
     """
+    has_alerts = _payload_has_alerts(payload)
     try:
         print(json.dumps(payload))
         sys.stdout.flush()
+        return 0
     except (BrokenPipeError, OSError) as exc:
         _silence_shutdown_flush()
-        # A broken pipe (EPIPE) is benign — the reader closed after the
-        # actionable output. A different OSError (ENOSPC disk-full, EIO on
-        # a redirected file) is a real write fault worth surfacing louder
-        # (review [P3]) — but it's still not a re-tick signal (the summary
-        # is diagnostic), so we exit 0 either way.
+        # EPIPE = benign reader-closed; other OSError (ENOSPC/EIO) = a real
+        # write fault worth surfacing louder (review [P3]).
         is_pipe = isinstance(exc, BrokenPipeError) or getattr(
             exc, "errno", None) == errno.EPIPE
-        if is_pipe:
+        kind = "broken pipe" if is_pipe else f"non-pipe write fault: {exc}"
+        if has_alerts:
             _warn_stderr(
-                "coordinator: stdout closed before the tick's JSON summary "
-                "could be written (broken pipe); summary dropped. The "
-                "tick's actionable output (if any) already flushed — "
-                "exiting 0 (NOT a SIGPIPE kill, NOT a re-tick signal)."
+                f"coordinator: stdout closed before the tick's JSON summary "
+                f"could be written ({kind}); it carried raised/errors alerts "
+                f"that the operator did NOT receive. Exiting non-zero so the "
+                f"harness re-ticks and re-publishes the alert."
             )
-        else:
-            _warn_stderr(
-                f"coordinator: failed to write the tick's JSON summary "
-                f"(non-pipe write fault: {exc}); summary dropped. The "
-                f"tick's actionable output already flushed — exiting 0."
-            )
-    return 0
+            return _EXIT_BROKEN_PIPE
+        _warn_stderr(
+            f"coordinator: stdout closed before the tick's JSON summary "
+            f"could be written ({kind}); summary dropped but it carried no "
+            f"alerts (no raised/errors) and the actionable output already "
+            f"flushed — exiting 0 (NOT a SIGPIPE kill, NOT a re-tick signal)."
+        )
+        return 0
 
 
 def _silence_shutdown_flush() -> None:
@@ -8271,13 +8290,24 @@ def main(argv: Iterable[str] | None = None) -> int:
         _silence_shutdown_flush()
         pending = len(result.dispatch_instructions)
         if pending == 0:
-            # No load-bearing block was lost — the only write was the
-            # trailing flush of an empty buffer. A broken pipe here is
-            # benign (codex [P2]): do NOT signal a re-tick. Exit 0.
+            # No DISPATCH block was lost — the only write was the trailing
+            # flush of an empty buffer. But the tick may still carry
+            # operator-visible alerts (raised/errors) that the dropped JSON
+            # summary would have published (codex [P1]/[P2]): if so, force
+            # a re-tick; otherwise the broken pipe is benign — exit 0.
+            if result.raised or result.errors:
+                _warn_stderr(
+                    f"coordinator: stdout closed on a zero-dispatch tick "
+                    f"(broken pipe: {exc}) that carried raised/errors "
+                    f"alerts; the operator did NOT receive them. Exiting "
+                    f"non-zero so the harness re-ticks and re-publishes."
+                )
+                return _EXIT_BROKEN_PIPE
             _warn_stderr(
                 f"coordinator: stdout closed on a zero-dispatch tick "
-                f"(broken pipe: {exc}); nothing actionable was lost. "
-                f"Exiting 0 (NOT a SIGPIPE kill, NOT a re-tick signal)."
+                f"(broken pipe: {exc}); nothing actionable was lost (no "
+                f"blocks, no raised/errors). Exiting 0 (NOT a SIGPIPE "
+                f"kill, NOT a re-tick signal)."
             )
             return 0
         # A real DISPATCH block did not reach the coord — surface it and
