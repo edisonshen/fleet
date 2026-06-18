@@ -580,6 +580,15 @@ def _tick_locked(
                 full_tasks_by_slug=pre_reconcile_tasks_by_slug,
             )
             result.reconciled += 1
+            # Slice 2 (handoff narrative): a done-transition is a TRUE
+            # completion — record it in the rolling buffer the checkpoint
+            # lifts into the handoff doc's Completed section. todo (requeue)
+            # and blocked transitions are NOT completions, so gate on
+            # new_status == "done" only.
+            if action.new_status == "done":
+                dispatch_mod.record_checkpoint_completion(
+                    state, f"done {action.slug}",
+                )
             if action.raised_to_user:
                 result.raised += 1
             # Drop slug → agent_id mapping when the worker is gone (any
@@ -1141,6 +1150,18 @@ def _tick_locked(
         )
     except Exception as exc:  # noqa: BLE001 — watch reconcile must never wedge a tick
         result.errors.append(f"pr-watch reconcile: {exc}")
+    else:
+        # Slice 2 fix: _reconcile_pr_watches may have appended PR-merged
+        # completions to `state["recent_completions"]` inside _flip_done.
+        # The heartbeat save at line 1060 ran BEFORE this call, so those
+        # mutations are not yet on disk. Persist now so the rolling
+        # checkpoint re-load (line 1216) captures them. Fail-soft: a
+        # save error here is non-fatal (checkpoint misses this tick's
+        # completions but the buffer fills on the next merge).
+        try:
+            _save_coord_state(state_path, state)
+        except Exception as _exc_save:  # noqa: BLE001
+            result.errors.append(f"pr-watch completion flush: {_exc_save}")
     # Did the initial PR-watch pass STAGE a DISPATCH block OR RAISE an
     # operator-actionable event? If so we must NOT enter the long-running
     # supervisor (codex iter-18 [P1] / iter-28 [P2]) — it would hold the lock
@@ -1338,6 +1359,13 @@ def _run_supervisor(
                     home=home,
                     full_tasks_by_slug=full_map,
                 )
+                # Slice 2: done-transition is a TRUE completion (see the
+                # primary tick reconcile site). Record into the supervisor
+                # state dict `cs` so the checkpoint's Completed section fills.
+                if action.new_status == "done":
+                    dispatch_mod.record_checkpoint_completion(
+                        cs, f"done {action.slug}",
+                    )
                 if action.clear_worker:
                     # PR1 dispatch-lifecycle: release coord_prompt_inbox
                     # BEFORE forget_agent_id (same ordering rule as the
@@ -1594,6 +1622,16 @@ def _run_supervisor(
                 state=cs_pw, result=result, home=home,
                 enroll_tasks=enroll_tasks if enroll_tasks is not None else f_pw.tasks,
             )
+            # Slice 2 fix: _reconcile_pr_watches mutates cs_pw["recent_completions"]
+            # inside _flip_done. The _save_coord_state above ran BEFORE the
+            # reconcile, so those mutations are not on disk yet. Persist now
+            # so the next checkpoint write captures PR-merged completions.
+            # Fail-soft: a flush error is non-fatal (completions missed this
+            # pass but the buffer fills on the next merge flip).
+            try:
+                _save_coord_state(state_path, cs_pw)
+            except Exception as _exc_flush:  # noqa: BLE001
+                result.errors.append(f"supervisor pr-watch completion flush: {_exc_flush}")
         except Exception as exc:  # noqa: BLE001 — PR-watch must never wedge the supervisor
             result.errors.append(f"supervisor pr-watch reconcile: {exc}")
         return (
@@ -5713,6 +5751,14 @@ def _reconcile_pr_watches(
             _run_fleet([fleet_bin, "tasks", "set", "--project", project, slug, f"pr_url={pr_url}"])
         _run_fleet([fleet_bin, "tasks", "set", "--project", project, slug, "worker_pid=0"])
         _run_fleet([fleet_bin, "tasks", "set", "--project", project, slug, "status=done"])
+        # Slice 2 (handoff narrative): a PR-merged flip is a TRUE
+        # completion. Record it in the rolling buffer the checkpoint lifts
+        # into the handoff doc's Completed section. `state` is owned by the
+        # caller (_reconcile_pr_watches gets it); this closure is the only
+        # place slug+pr_url are both in scope for the merged delta.
+        dispatch_mod.record_checkpoint_completion(
+            state, f"merged {slug} {pr_url}".rstrip(),
+        )
 
     # --- PR2 auto-fix seam (DESIGN §5.1c / §6). Three injected callbacks
     # keep pr_watch shell-free: it decides WHAT to dispatch + owns the

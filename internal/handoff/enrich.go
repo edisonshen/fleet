@@ -353,45 +353,39 @@ func statusIsPrePR(status string) bool {
 // recovery-synth path and the manual EnrichManualDoc path apply the
 // checkpoint identically.
 //
-// SLICE 1 IS BEHAVIOR-PRESERVING: this reproduces synth's prior inline
-// mapping verbatim (ActiveSubagents, OpenPRs, decisions→NextSteps) — the
-// refactor-parity test (synth_test.go) pins byte-identical recovery
-// output. Slice 2 changes THIS one helper to add the narrative
-// (Completed (recent) → doc.Completed), fixing manual + recovery in
-// lockstep.
+// SLICE 2: maps the verbatim-lifted MACHINE sections (ActiveSubagents,
+// OpenPRs) plus the NARRATIVE `Completed (recent)` buffer → doc.Completed,
+// fixing manual + recovery in lockstep. `recent_decisions` is NO LONGER
+// mapped into NextSteps — that buffer has no production producer (dead),
+// and NextSteps now sources from the live tasks.md queue (CollectNextSteps).
+// recent_decisions stays in the checkpoint untouched (future home:
+// Key Decisions, deferred). Empty completions leave doc.Completed as-is
+// (Placeholder for synth / the manual stub).
 func applyCheckpointToDoc(doc *Doc, cp *checkpointDoc) {
 	doc.ActiveSubagents = cp.activeSubagents
 	doc.OpenPRs = cp.openPRs
-	// Recent decisions surface in NextSteps as a free-form bullet list.
-	// handoff_resume.py doesn't parse them structurally — they're
-	// operator-readable "what was the coord up to" context. Dropping
-	// them into NextSteps keeps the existing doc shape (and parser)
-	// unchanged. Empty buffer leaves doc.NextSteps as-is (Placeholder
-	// for synth).
-	doc.NextSteps = applyRecentDecisions(doc.NextSteps, cp.recentDecisions)
+	if body := renderCompletionBullets(cp.recentCompletions); body != "" {
+		doc.Completed = body
+	}
 }
 
-// applyRecentDecisions returns the NextSteps body for a doc given the
-// checkpoint's recent-decisions buffer: the rendered bullet list when
-// non-empty, else the passed-through fallback (the doc's existing
-// NextSteps). Split out so the formatting lives in one place and reads
-// the same in both producers.
-func applyRecentDecisions(fallback string, decisions []string) string {
-	if len(decisions) == 0 {
-		return fallback
+// renderCompletionBullets joins the checkpoint's Completed (recent) buffer
+// into a `- <line>` bullet list for the doc's `## Completed` section.
+// Returns "" for an empty buffer so the caller keeps the existing
+// placeholder (no empty-section artifact).
+func renderCompletionBullets(completions []string) string {
+	if len(completions) == 0 {
+		return ""
 	}
-	var b []byte
-	b = append(b, "Recent coord decisions (from checkpoint):\n"...)
-	for _, d := range decisions {
-		b = append(b, "- "...)
-		b = append(b, d...)
-		b = append(b, '\n')
+	var b strings.Builder
+	for i, c := range completions {
+		if i > 0 {
+			b.WriteByte('\n')
+		}
+		b.WriteString("- ")
+		b.WriteString(c)
 	}
-	// Trim the trailing newline (TrimRight on '\n').
-	for len(b) > 0 && b[len(b)-1] == '\n' {
-		b = b[:len(b)-1]
-	}
-	return string(b)
+	return b.String()
 }
 
 // EnrichManualDoc fills the machine-state sections of a manual handoff
@@ -558,6 +552,158 @@ func EnrichManualDoc(doc *Doc, project, agentID, repoDir string, lastHandoffPath
 		// checkpoint baseline already set by applyCheckpointToDoc (or the
 		// placeholder if no checkpoint).
 	}
+
+	// NARRATIVE (Slice 2): Next Steps + Open Questions come LIVE from
+	// tasks.md (always fresh, fill even when the coord died before its
+	// first checkpoint). Both never-error: parse drift / missing file →
+	// empty → keep the placeholder. Completed is set above by the
+	// checkpoint lift (applyCheckpointToDoc); Key Decisions + Files
+	// Modified stay placeholder (deferred — no durable producer).
+	tasksPath := filepath.Join(pdir, "tasks.md")
+	if ns := CollectNextSteps(tasksPath); ns != "" {
+		doc.NextSteps = ns
+	}
+	if oq := CollectOpenQuestions(tasksPath); oq != "" {
+		doc.OpenQuestions = oq
+	}
+}
+
+// readTasksTolerant wraps the strict tasks.Read so a parse error or a
+// missing file degrades to an empty task list instead of failing the
+// handoff. The collectors accept "lose the section on parse drift" rather
+// than build a second tolerant scanner (DESIGN Slice 2 (b)) — the handoff
+// must never fail on enrichment, and a malformed tasks.md is rare (atomic
+// tmp+rename means readers see a whole old-or-new file).
+func readTasksTolerant(tasksFile string) []*tasks.Task {
+	f, err := tasks.Read(tasksFile)
+	if err != nil || f == nil {
+		return nil
+	}
+	return f.Tasks
+}
+
+// priorityRank maps a tasks.Priority to a sort rank where SMALLER == more
+// urgent (P0=0 … P3=3). Unknown / empty priorities sort last (rank 4) so a
+// malformed row never jumps the queue.
+func priorityRank(p tasks.Priority) int {
+	switch p {
+	case tasks.PriorityP0:
+		return 0
+	case tasks.PriorityP1:
+		return 1
+	case tasks.PriorityP2:
+		return 2
+	case tasks.PriorityP3:
+		return 3
+	default:
+		return 4
+	}
+}
+
+// nextStepsLimit caps the Next Steps list so a huge backlog doesn't bloat
+// the handoff doc. The successor sees the top-N most-urgent queued tasks.
+const nextStepsLimit = 10
+
+// CollectNextSteps renders the `## Next Steps (prioritized)` body live from
+// tasks.md: the top-N ready/todo tasks (NOT in-progress — those appear
+// under Active Subagents / Open PRs, listing them here double-lists),
+// ordered priority-descending then by age (oldest first), each rendered
+// `- [P{n}] <slug>: <goal>` where goal = first non-blank line of Spec,
+// trimmed, ≤80 chars; an empty Spec renders the slug alone (no trailing
+// colon). Never errors: parse drift / missing file → "" (caller keeps the
+// placeholder). There is no Goal field on tasks.Task — Spec is the source.
+func CollectNextSteps(tasksFile string) string {
+	all := readTasksTolerant(tasksFile)
+	var queued []*tasks.Task
+	for _, t := range all {
+		if t.Status == tasks.StatusReady || t.Status == tasks.StatusTodo {
+			queued = append(queued, t)
+		}
+	}
+	if len(queued) == 0 {
+		return ""
+	}
+	// priority-desc (P0 first) then age (oldest Created first). Stable so
+	// equal keys keep tasks.md order.
+	sort.SliceStable(queued, func(i, j int) bool {
+		ri, rj := priorityRank(queued[i].Priority), priorityRank(queued[j].Priority)
+		if ri != rj {
+			return ri < rj
+		}
+		return queued[i].Created.Before(queued[j].Created)
+	})
+	if len(queued) > nextStepsLimit {
+		queued = queued[:nextStepsLimit]
+	}
+	var b strings.Builder
+	for i, t := range queued {
+		if i > 0 {
+			b.WriteByte('\n')
+		}
+		prio := string(t.Priority)
+		if prio == "" {
+			prio = "P?"
+		}
+		goal := specFirstLine(t.Spec)
+		if goal == "" {
+			fmt.Fprintf(&b, "- [%s] %s", prio, t.Slug)
+		} else {
+			fmt.Fprintf(&b, "- [%s] %s: %s", prio, t.Slug, goal)
+		}
+	}
+	return b.String()
+}
+
+// specFirstLine returns the first non-blank line of spec, trimmed and
+// truncated to 80 chars. Empty spec → "".
+func specFirstLine(spec string) string {
+	for _, line := range strings.Split(spec, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" {
+			continue
+		}
+		if len(trimmed) > 80 {
+			trimmed = trimmed[:80]
+		}
+		return trimmed
+	}
+	return ""
+}
+
+// CollectOpenQuestions renders the `## Open Questions` body live from
+// tasks.md: tasks where Status == "blocked" OR Parked != "" (there is no
+// `parked` status — Parked is a separate free-form field). A parked task
+// renders its Parked text; a blocked task has no structured reason in
+// tasks.md (it lives in coord sentinels) so it renders reason-less:
+// `- <slug>: blocked`. A task both blocked AND parked renders the Parked
+// text. Ordered by slug for a deterministic doc. Never errors: parse
+// drift / missing file → "" (caller keeps the placeholder).
+func CollectOpenQuestions(tasksFile string) string {
+	all := readTasksTolerant(tasksFile)
+	var picked []*tasks.Task
+	for _, t := range all {
+		if t.Status == tasks.StatusBlocked || t.Parked != "" {
+			picked = append(picked, t)
+		}
+	}
+	if len(picked) == 0 {
+		return ""
+	}
+	sort.SliceStable(picked, func(i, j int) bool {
+		return picked[i].Slug < picked[j].Slug
+	})
+	var b strings.Builder
+	for i, t := range picked {
+		if i > 0 {
+			b.WriteByte('\n')
+		}
+		reason := "blocked"
+		if t.Parked != "" {
+			reason = strings.TrimSpace(strings.ReplaceAll(t.Parked, "\n", " "))
+		}
+		fmt.Fprintf(&b, "- %s: %s", t.Slug, reason)
+	}
+	return b.String()
 }
 
 // mergeOpenPRsByURL concatenates two OpenPR slices, dropping duplicates

@@ -33,11 +33,13 @@ def _make_state(
     *,
     tick_count: int = 5,
     recent_decisions: list[str] | None = None,
+    recent_completions: list[str] | None = None,
 ) -> dict:
     """Build a coord-state.json-shaped dict for checkpoint input."""
     return {
         "tick_count": tick_count,
         "recent_decisions": list(recent_decisions or []),
+        "recent_completions": list(recent_completions or []),
     }
 
 
@@ -87,8 +89,14 @@ def test_write_emits_frontmatter_with_schema_v1(project_dir: Path):
 
 def test_write_emits_sections_in_order(project_dir: Path):
     """Body sections must appear in the documented order: Active
-    Subagents, Open PRs, Recent decisions, Drafted but unfiled tasks."""
-    state = _make_state(tick_count=5, recent_decisions=["dispatch fix-foo", "drain bar"])
+    Subagents, Open PRs, Recent decisions, Completed (recent), Drafted
+    but unfiled tasks (Slice 2 inserts Completed (recent) after Recent
+    decisions, before Drafted)."""
+    state = _make_state(
+        tick_count=5,
+        recent_decisions=["dispatch fix-foo", "drain bar"],
+        recent_completions=["done fix-foo", "merged #7 fix-bar"],
+    )
     active = [
         {
             "task": "fix-foo", "branch": "worker/fix-foo",
@@ -113,10 +121,11 @@ def test_write_emits_sections_in_order(project_dir: Path):
     idx_active = body.index("### Active Subagents")
     idx_prs = body.index("### Open PRs")
     idx_dec = body.index("### Recent decisions")
+    idx_completed = body.index("### Completed (recent)")
     idx_drafted = body.index("### Drafted but unfiled tasks")
-    assert idx_active < idx_prs < idx_dec < idx_drafted, (
+    assert idx_active < idx_prs < idx_dec < idx_completed < idx_drafted, (
         f"section order wrong: active={idx_active} prs={idx_prs} "
-        f"decisions={idx_dec} drafted={idx_drafted}"
+        f"decisions={idx_dec} completed={idx_completed} drafted={idx_drafted}"
     )
 
 
@@ -194,6 +203,7 @@ def test_write_empty_sections_render_placeholders(project_dir: Path):
     assert "_(none)_" in body, "expected _(none)_ placeholder for empty Active Subagents"
     assert "_(no open PRs)_" in body, "expected _(no open PRs)_ placeholder"
     assert "_(no recent decisions)_" in body, "expected _(no recent decisions)_ placeholder"
+    assert "_(no recent completions)_" in body, "expected _(no recent completions)_ placeholder"
     assert "_(empty — populated in Phase 2)_" in body, (
         "expected Drafted but unfiled tasks placeholder"
     )
@@ -250,6 +260,35 @@ def test_write_recent_decisions_renders_bullets(project_dir: Path):
         "- operator inbox: archive done",
     ):
         assert line in section, f"missing decision line: {line!r} in:\n{section}"
+
+
+def test_write_recent_completions_renders_bullets(project_dir: Path):
+    """Completed (recent) section emits one bullet per entry, in order,
+    between Recent decisions and Drafted but unfiled tasks."""
+    state = _make_state(
+        tick_count=5,
+        recent_completions=[
+            "done fix-foo",
+            "merged #7 fix-bar",
+        ],
+    )
+    path = dispatch.write_coord_checkpoint(
+        project_dir=project_dir,
+        coord_id="a1b2c3d4",
+        project="myproj",
+        state=state,
+        active_subagents=[],
+        open_prs=[],
+    )
+    body = Path(path).read_text(encoding="utf-8")
+    completed_idx = body.index("### Completed (recent)")
+    drafted_idx = body.index("### Drafted but unfiled tasks")
+    section = body[completed_idx:drafted_idx]
+    for line in (
+        "- done fix-foo",
+        "- merged #7 fix-bar",
+    ):
+        assert line in section, f"missing completion line: {line!r} in:\n{section}"
 
 
 def test_write_is_atomic_against_partial_writes(project_dir: Path, monkeypatch):
@@ -455,6 +494,54 @@ def test_record_decision_tolerates_corrupt_buffer():
     state = {"recent_decisions": "not-a-list"}
     dispatch.record_checkpoint_decision(state, "hello")
     assert state["recent_decisions"] == ["hello"]
+
+
+# ---------- record_checkpoint_completion (Slice 2) ----------
+
+
+def test_record_completion_appends_and_caps_state(monkeypatch):
+    """record_checkpoint_completion mutates state in place, appending the
+    line and capping to the FLEET_COORD_CHECKPOINT_DECISIONS limit — the
+    same cap that bounds recent_decisions."""
+    monkeypatch.setenv("FLEET_COORD_CHECKPOINT_DECISIONS", "3")
+    state = {"recent_completions": []}
+    dispatch.record_checkpoint_completion(state, "first")
+    dispatch.record_checkpoint_completion(state, "second")
+    dispatch.record_checkpoint_completion(state, "third")
+    dispatch.record_checkpoint_completion(state, "fourth")
+    assert state["recent_completions"] == ["second", "third", "fourth"]
+
+
+def test_record_completion_initializes_missing_list():
+    """Tolerates a state dict that has never carried a recent_completions
+    key (fresh coord first tick)."""
+    state = {}
+    dispatch.record_checkpoint_completion(state, "hello")
+    assert state["recent_completions"] == ["hello"]
+
+
+def test_record_completion_no_blank_lines():
+    """Blank / whitespace-only entries are dropped."""
+    state = {"recent_completions": []}
+    dispatch.record_checkpoint_completion(state, "")
+    dispatch.record_checkpoint_completion(state, "   ")
+    dispatch.record_checkpoint_completion(state, "\n")
+    assert state["recent_completions"] == []
+
+
+def test_record_completion_strips_newlines():
+    """Embedded newlines flatten to spaces (bullet-per-line contract)."""
+    state = {"recent_completions": []}
+    dispatch.record_checkpoint_completion(state, "line1\nline2")
+    assert state["recent_completions"] == ["line1 line2"]
+
+
+def test_record_completion_tolerates_corrupt_buffer():
+    """A non-list recent_completions (corrupt state.json) is reset to a
+    fresh list rather than crashing."""
+    state = {"recent_completions": "not-a-list"}
+    dispatch.record_checkpoint_completion(state, "hello")
+    assert state["recent_completions"] == ["hello"]
 
 
 # ---------- round-trip: frontmatter parses ----------

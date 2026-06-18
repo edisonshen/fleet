@@ -123,6 +123,23 @@ func SynthesizeRecoveryWithLastHandoff(
 	}
 	pdir = filepath.Clean(pdir)
 
+	// NARRATIVE (Slice 2): Next Steps + Open Questions come LIVE from
+	// tasks.md on EVERY recovery return path (checkpoint-lift AND the
+	// state-walk), in lockstep with the manual EnrichManualDoc path.
+	// Always fresh, fill even when the coord died before its first
+	// checkpoint. Never-error: parse drift / missing file → keep the
+	// placeholder. Applied BEFORE the checkpoint branch so the early
+	// return still carries them (applyCheckpointToDoc only sets Completed,
+	// never NextSteps/OpenQuestions). Completed comes from the checkpoint
+	// buffer (lift below); Key Decisions + Files Modified stay placeholder.
+	tasksPath := filepath.Join(pdir, "tasks.md")
+	if ns := CollectNextSteps(tasksPath); ns != "" {
+		doc.NextSteps = ns
+	}
+	if oq := CollectOpenQuestions(tasksPath); oq != "" {
+		doc.OpenQuestions = oq
+	}
+
 	// Checkpoint preference: when present + fresher than the last
 	// handoff doc, lift its body sections wholesale. The recovery window
 	// between clean handoffs is thus bounded by the checkpoint interval
@@ -131,10 +148,10 @@ func SynthesizeRecoveryWithLastHandoff(
 	if cp, ok := loadCheckpointIfFresher(pdir, agentID, lastHandoffPath); ok {
 		// Shared lift (enrich.go:applyCheckpointToDoc) — BOTH this
 		// recovery path and the manual EnrichManualDoc path apply the
-		// checkpoint identically. Behavior-preserving: it reproduces the
-		// former inline mapping verbatim (ActiveSubagents, OpenPRs,
-		// decisions→NextSteps). Slice 2 changes that one helper to add
-		// narrative, fixing manual + recovery in lockstep.
+		// checkpoint identically: ActiveSubagents + OpenPRs lifted
+		// verbatim, and the Completed (recent) buffer → doc.Completed
+		// (Slice 2). NextSteps/OpenQuestions already set above from live
+		// tasks.md, untouched here.
 		applyCheckpointToDoc(doc, cp)
 		return doc, nil
 	}
@@ -299,6 +316,10 @@ type checkpointDoc struct {
 	activeSubagents []ActiveSubagent
 	openPRs         []OpenPR
 	recentDecisions []string
+	// recentCompletions is the Slice-2 `### Completed (recent)` buffer —
+	// the rolling "what just shipped" list the shared lift maps into
+	// doc.Completed. Empty / placeholder / absent section → nil.
+	recentCompletions []string
 }
 
 // loadCheckpointIfFresher reads `<pdir>/coord-checkpoint.md` and returns
@@ -450,6 +471,12 @@ func parseCheckpoint(data []byte) (*checkpointDoc, bool) {
 	if raw, ok := sections["Recent decisions"]; ok {
 		cp.recentDecisions = parseCheckpointDecisions(raw)
 	}
+	// Slice 2: forward-tolerant — an older checkpoint writer simply omits
+	// this section, so an absent key leaves recentCompletions nil (→
+	// doc.Completed placeholder). No schema bump needed.
+	if raw, ok := sections["Completed (recent)"]; ok {
+		cp.recentCompletions = parseCheckpointCompletions(raw)
+	}
 	return cp, true
 }
 
@@ -581,6 +608,26 @@ func parseCheckpointOpenPRs(body string) []OpenPR {
 // Recent decisions section. Empty / placeholder bodies return nil.
 func parseCheckpointDecisions(body string) []string {
 	if strings.TrimSpace(body) == "_(no recent decisions)_" {
+		return nil
+	}
+	var out []string
+	for _, line := range strings.Split(body, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if !strings.HasPrefix(trimmed, "- ") {
+			continue
+		}
+		out = append(out, strings.TrimPrefix(trimmed, "- "))
+	}
+	return out
+}
+
+// parseCheckpointCompletions extracts the `- <text>` bullets from the
+// Completed (recent) section. Empty / placeholder bodies return nil
+// (short-circuit on the byte-identical placeholder dispatch.py emits, so
+// an empty buffer round-trips to nil rather than a literal-bullet artifact
+// — exactly as parseCheckpointDecisions does).
+func parseCheckpointCompletions(body string) []string {
+	if strings.TrimSpace(body) == "_(no recent completions)_" {
 		return nil
 	}
 	var out []string

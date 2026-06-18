@@ -28,6 +28,7 @@ import pytest
 import dispatch
 import loop
 import parse
+import pr_watch as pw
 import supervisor
 
 
@@ -327,6 +328,175 @@ def test_tick_reconciles_dead_worker_with_green_ci(
     assert result.raised == 1
     set_calls = [c for c in fleet_run_recorder if c[1:3] == ["tasks", "set"]]
     assert any("status=in-review" in c for c in set_calls)
+
+
+# ---------- Slice 2: recent_completions producer wiring ----------
+
+
+def _read_recent_completions(project_dir: Path) -> list[str]:
+    state = json.loads((project_dir / "coord-state.json").read_text(encoding="utf-8"))
+    return state.get("recent_completions", [])
+
+
+def test_tick_records_completion_on_done_transition(
+    fleet_home: Path, project_dir: Path,
+    fleet_run_recorder, dispatch_subprocess,
+) -> None:
+    """An in-review task whose PR merged reconciles to status=done — a TRUE
+    completion. The done-transition appends a line to recent_completions so
+    the next checkpoint/handoff doc's Completed section is populated."""
+    _write_tasks(project_dir, [
+        _make_task(
+            "shipit-aaaa", status="in-review", worker_pid=1,
+            pr_url="https://github.com/x/y/pull/9",
+        ),
+    ])
+    merged = loop._CIResult(all_green=True, merged=True, mergeable=True)
+    with patch.object(loop, "_pid_alive", return_value=False), \
+         patch.object(loop, "_gh_pr_checks", return_value=merged):
+        result = loop.tick(
+            "fleet", coord_id="cccccc01", cwd="/repo",
+            fleet_home=str(fleet_home),
+        )
+
+    assert result.reconciled == 1
+    completions = _read_recent_completions(project_dir)
+    assert any("shipit-aaaa" in c for c in completions), (
+        f"expected a done-transition completion for shipit-aaaa, got {completions!r}"
+    )
+
+
+def test_tick_dispatch_does_not_record_completion(
+    fleet_home: Path, project_dir: Path,
+    fleet_run_recorder, dispatch_subprocess,
+) -> None:
+    """A dispatch is a START, not a completion — it must NOT append to
+    recent_completions (recording it would tell the successor in-flight
+    work is done)."""
+    _write_tasks(project_dir, [_make_task("ready-aaaa", status="ready")])
+    dispatch_subprocess.append("abcdef01")
+
+    result = loop.tick(
+        "fleet", coord_id="cccccc01", cwd="/repo",
+        fleet_home=str(fleet_home),
+    )
+
+    assert result.dispatched == 1
+    assert _read_recent_completions(project_dir) == []
+
+
+def test_tick_worker_failed_does_not_record_completion(
+    fleet_home: Path, project_dir: Path,
+    fleet_run_recorder, dispatch_subprocess,
+) -> None:
+    """A dead worker with no PR requeues to todo — a REQUEUE, not a
+    completion. recent_completions must stay empty."""
+    _write_tasks(project_dir, [
+        _make_task("dying-aaaa", status="in-progress", worker_pid=1, pr_url=""),
+    ])
+    with patch.object(loop, "_pid_alive", return_value=False):
+        result = loop.tick(
+            "fleet", coord_id="cccccc01", cwd="/repo",
+            fleet_home=str(fleet_home),
+        )
+
+    assert result.reconciled == 1
+    assert _read_recent_completions(project_dir) == []
+
+
+def test_tick_pr_watch_merged_completion_persisted_to_disk(
+    fleet_home: Path, project_dir: Path,
+    fleet_run_recorder, dispatch_subprocess,
+) -> None:
+    """Regression test for Slice-2 fix: _reconcile_pr_watches mutates
+    state["recent_completions"] inside _flip_done, but the heartbeat
+    _save_coord_state ran BEFORE that call. Without the explicit flush
+    added after _reconcile_pr_watches, PR-merged completions were never
+    written to coord-state.json — making the Completed section of every
+    handoff doc silently empty for PR-merged transitions.
+
+    This test verifies that after a tick that triggers a PR-merged flip
+    through the DURABLE pr-watch path, the completion is on DISK (not
+    just in memory)."""
+    # Enroll a task that already has a pr_url — the durable watch path
+    # picks it up and probes for MERGED state.
+    _write_tasks(project_dir, [
+        _make_task(
+            "watch-aaaa", status="in-review", worker_pid=0,
+            pr_url="https://github.com/x/y/pull/195",
+        ),
+    ])
+    # Seed a pr-watches.json so the watch is already enrolled (skips the
+    # enroll-only first tick and goes straight to probe).
+    watches_doc = {
+        "schema": 1,
+        "watches": {
+            "195": {
+                "state": "OPEN",
+                "pr_number": 195,
+                "pr_url": "https://github.com/x/y/pull/195",
+                "slug": "watch-aaaa",
+                "base_ref": "main",
+                "head_ref_oid": "H",
+                "enrolled_at": "2026-06-01T00:00:00Z",
+                "tick_enrolled": 1,
+                "last_probed_tick": 0,
+                "probe_error_count": 0,
+                "orphaned": False,
+            },
+        },
+    }
+    pw.save_watches(project_dir, watches_doc)
+
+    # FakeProber returns MERGED for PR #195.
+    merged_snap = pw.PRSnapshot(
+        number=195, pr_state="MERGED",
+        merged_at="2026-06-03T08:00:00Z", head_ref_oid="H",
+    )
+    with patch.object(loop, "_pr_watch_prober", pw.GhGitProber.__new__(pw.GhGitProber)):
+        pass  # just to confirm the attribute exists
+
+    # Patch derive_owner_repo so pr_watch doesn't shell out.
+    with patch.object(pw, "derive_owner_repo", return_value="x/y"), \
+         patch.object(loop, "_pr_watch_prober",
+                      _FakePrWatchProber({195: merged_snap})):
+        loop.tick(
+            "fleet", coord_id="cccccc01", cwd="/repo",
+            fleet_home=str(fleet_home),
+        )
+
+    # The completion must be on DISK, not just in memory — reading from
+    # coord-state.json directly.
+    completions = _read_recent_completions(project_dir)
+    assert any("watch-aaaa" in c or "195" in c for c in completions), (
+        f"PR-merged completion not persisted to disk: {completions!r} "
+        "— the post-_reconcile_pr_watches flush is missing"
+    )
+
+
+class _FakePrWatchProber:
+    """Minimal fake prober for test_tick integration tests. Mirrors the
+    interface of FakeProber in test_pr_watch.py but lives here to avoid
+    a cross-test-module import that would couple test layouts."""
+
+    def __init__(self, snaps: dict) -> None:
+        self.snaps = snaps
+
+    def probe_repo(self, repo_path, owner_repo, base_ref, pr_numbers, head_oids):
+        result = pw.RepoProbe(
+            fresh_base_sha="BASE",
+            fresh_base_shas={},
+            fetch_ok=True,
+            fetch_error="",
+        )
+        for n in pr_numbers:
+            if n in self.snaps:
+                result.snapshots[n] = self.snaps[n]
+                result.head_present.add(n)
+        return result
+
+    def is_ancestor(self, repo_path, ancestor_sha, descendant_sha) -> bool:
+        return False
 
 
 # ---------- drain inbox archive sentinels ----------

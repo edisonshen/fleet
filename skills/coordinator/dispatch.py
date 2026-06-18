@@ -1539,6 +1539,10 @@ _CHECKPOINT_DEFAULT_DECISIONS = 10
 _CHECKPOINT_ACTIVE_PLACEHOLDER = "_(none)_"
 _CHECKPOINT_OPEN_PRS_PLACEHOLDER = "_(no open PRs)_"
 _CHECKPOINT_DECISIONS_PLACEHOLDER = "_(no recent decisions)_"
+# Slice 2: byte-identical to synth.go's parseCheckpointCompletions
+# short-circuit constant so an empty Completed (recent) buffer round-trips
+# to nil (not a literal-bullet artifact). Mirrors the decisions placeholder.
+_CHECKPOINT_COMPLETIONS_PLACEHOLDER = "_(no recent completions)_"
 _CHECKPOINT_DRAFTED_PLACEHOLDER = "_(empty — populated in Phase 2)_"
 
 
@@ -1621,6 +1625,35 @@ def record_checkpoint_decision(state: dict, line: str) -> None:
     state["recent_decisions"] = raw
 
 
+def record_checkpoint_completion(state: dict, line: str) -> None:
+    """Append `line` to state["recent_completions"], capped to the
+    FLEET_COORD_CHECKPOINT_DECISIONS limit (shared cap). Mutates `state`
+    in place.
+
+    Clone of record_checkpoint_decision: same cap / flatten / tolerance
+    discipline. Unlike the decisions buffer (which has no production
+    caller and renders dead), THIS buffer is wired in loop.py to two TRUE
+    completion deltas — the reconcile done-transition and the PR-merged
+    flip. dispatch / worker_failed are deliberately EXCLUDED: a start or
+    a requeue is not a completion (it would tell the successor that
+    in-flight/failed work is done). See DESIGN-handoff-manual-doc-
+    enrichment.md Slice 2 (a).
+    """
+    if line is None:
+        return
+    flat = str(line).replace("\r", "\n").replace("\n", " ").strip()
+    if not flat:
+        return
+    cap = resolve_checkpoint_decisions()
+    raw = state.get("recent_completions")
+    if not isinstance(raw, list):
+        raw = []
+    raw.append(flat)
+    if cap > 0 and len(raw) > cap:
+        raw = raw[-cap:]
+    state["recent_completions"] = raw
+
+
 def write_coord_checkpoint(
     *,
     project_dir,
@@ -1635,8 +1668,9 @@ def write_coord_checkpoint(
 
     Returns the absolute path written (project_dir/coord-checkpoint.md).
 
-    state: the coord-state.json dict. tick_count + recent_decisions are
-        read out for the frontmatter + Recent decisions section.
+    state: the coord-state.json dict. tick_count + recent_decisions +
+        recent_completions are read out for the frontmatter + the Recent
+        decisions / Completed (recent) sections.
     active_subagents: list of dicts with keys task, branch, phase,
         status, pr_url, agent_id, subagent_id. Rendered with the same
         7-field key="value" shape as handoff.go's renderActiveSubagents
@@ -1671,6 +1705,12 @@ def write_coord_checkpoint(
     else:
         decisions = []
 
+    raw_completions = state.get("recent_completions")
+    if isinstance(raw_completions, list):
+        completions = [str(c) for c in raw_completions if isinstance(c, str) and c.strip()]
+    else:
+        completions = []
+
     body = _render_checkpoint(
         coord_id=coord_id,
         project=project,
@@ -1679,6 +1719,7 @@ def write_coord_checkpoint(
         active_subagents=active_subagents,
         open_prs=open_prs,
         decisions=decisions,
+        completions=completions,
     )
 
     fd, tmp = tempfile.mkstemp(prefix="coord-checkpoint.md.tmp.", dir=target_dir)
@@ -1706,6 +1747,7 @@ def _render_checkpoint(
     active_subagents: list[dict],
     open_prs: list[dict],
     decisions: list[str],
+    completions: list[str],
 ) -> str:
     parts: list[str] = []
     parts.append("---\n")
@@ -1726,6 +1768,13 @@ def _render_checkpoint(
 
     parts.append("### Recent decisions\n")
     parts.append(_render_checkpoint_decisions(decisions))
+    parts.append("\n\n")
+
+    # Slice 2: Completed (recent) sits AFTER Recent decisions and BEFORE
+    # Drafted but unfiled tasks (test_write_emits_sections_in_order pins
+    # the order; synth.go lifts this section → doc.Completed).
+    parts.append("### Completed (recent)\n")
+    parts.append(_render_checkpoint_completions(completions))
     parts.append("\n\n")
 
     parts.append("### Drafted but unfiled tasks\n")
@@ -1772,6 +1821,12 @@ def _render_checkpoint_decisions(decisions: list[str]) -> str:
     if not decisions:
         return _CHECKPOINT_DECISIONS_PLACEHOLDER
     return "\n".join(f"- {d}" for d in decisions)
+
+
+def _render_checkpoint_completions(completions: list[str]) -> str:
+    if not completions:
+        return _CHECKPOINT_COMPLETIONS_PLACEHOLDER
+    return "\n".join(f"- {c}" for c in completions)
 
 
 def _checkpoint_q(v) -> str:
