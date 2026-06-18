@@ -518,6 +518,64 @@ def _shquote(s: str) -> str:
     return shlex.quote(s)
 
 
+class _BrokenStream:
+    """A stream whose write/flush always raise BrokenPipeError. Used to
+    simulate BOTH stdout and stderr being closed."""
+
+    def write(self, _s):
+        raise BrokenPipeError(32, "Broken pipe")
+
+    def flush(self):
+        raise BrokenPipeError(32, "Broken pipe")
+
+    def fileno(self):
+        raise OSError("no fileno")
+
+    def close(self):
+        pass
+
+
+def test_self_exit_kill_runs_even_with_stdout_and_stderr_closed(
+    monkeypatch,
+) -> None:
+    """codex [P2]: in the duplicate-coord self-exit path, a closed stderr
+    (in addition to a closed stdout) must NOT abort main() before the
+    load-bearing _kill_own_session_fn runs — otherwise the duplicate
+    coordinator stays alive. The kill must fire regardless."""
+    fake = loop.TickResult()
+    fake.self_exit = True
+    fake.skipped = True
+    fake.reason = "duplicate coord"
+    monkeypatch.setattr(loop, "tick", lambda *a, **kw: fake)
+    monkeypatch.setenv("FLEET_PROJECT", "fleet")
+    monkeypatch.setenv("FLEET_AGENT_ID", "dead00id")
+
+    killed = {"n": 0}
+
+    def _fake_kill(coord_id):
+        killed["n"] += 1
+        return True
+
+    monkeypatch.setattr(loop, "_kill_own_session_fn", _fake_kill)
+    # BOTH streams closed.
+    monkeypatch.setattr(loop.sys, "stdout", _BrokenStream())
+    monkeypatch.setattr(loop.sys, "stderr", _BrokenStream())
+
+    rc = loop.main([])
+
+    assert killed["n"] == 1, (
+        "self-exit kill must run even when stdout AND stderr are closed"
+    )
+    assert rc == 0
+
+
+def test_warn_stderr_tolerates_closed_stderr(monkeypatch) -> None:
+    """_warn_stderr must swallow a closed stderr (never raise)."""
+    monkeypatch.setattr(loop.sys, "stderr", _BrokenStream())
+    # Must not raise.
+    loop._warn_stderr("anything")
+
+
 # ===========================================================================
 # Test 6 — DISPATCH still emitted under single-shot: a ready task under cap
 # still produces exactly one DISPATCH block + the registration path intact.

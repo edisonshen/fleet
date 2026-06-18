@@ -8096,6 +8096,23 @@ def _ensure_sigpipe_handled() -> None:
         pass
 
 
+def _warn_stderr(msg: str) -> None:
+    """Write a diagnostic to stderr, tolerating a CLOSED stderr.
+
+    codex [P2]: the SIGPIPE handlers write their diagnostic to stderr on
+    the failure path. If the caller closed BOTH stdout and stderr (e.g.
+    redirecting both to one capped pipe), an unguarded stderr write would
+    raise BrokenPipeError and propagate — aborting main() before a
+    load-bearing action (the self-exit `_kill_own_session_fn`) could run,
+    leaving a duplicate coordinator alive. Swallow a closed stderr so the
+    caller always reaches its post-write logic.
+    """
+    try:
+        sys.stderr.write(msg if msg.endswith("\n") else msg + "\n")
+    except (BrokenPipeError, OSError):
+        pass
+
+
 def _print_json_safe(payload: dict) -> int:
     """Emit the tick's JSON summary, surviving a closed stdout cleanly.
 
@@ -8123,17 +8140,17 @@ def _print_json_safe(payload: dict) -> int:
         is_pipe = isinstance(exc, BrokenPipeError) or getattr(
             exc, "errno", None) == errno.EPIPE
         if is_pipe:
-            sys.stderr.write(
+            _warn_stderr(
                 "coordinator: stdout closed before the tick's JSON summary "
                 "could be written (broken pipe); summary dropped. The "
                 "tick's actionable output (if any) already flushed — "
-                "exiting 0 (NOT a SIGPIPE kill, NOT a re-tick signal).\n"
+                "exiting 0 (NOT a SIGPIPE kill, NOT a re-tick signal)."
             )
         else:
-            sys.stderr.write(
+            _warn_stderr(
                 f"coordinator: failed to write the tick's JSON summary "
                 f"(non-pipe write fault: {exc}); summary dropped. The "
-                f"tick's actionable output already flushed — exiting 0.\n"
+                f"tick's actionable output already flushed — exiting 0."
             )
     return 0
 
@@ -8216,13 +8233,13 @@ def main(argv: Iterable[str] | None = None) -> int:
             "errors": result.errors,
         })
         if coord_id and not _kill_own_session_fn(coord_id):
-            sys.stderr.write(
+            _warn_stderr(
                 f"coordinator: self-exit requested for duplicate coord "
                 f"{coord_id} but `tmux kill-session -t "
                 f"{supervisor_mod.session_name_for_agent(coord_id)}` did "
                 f"not succeed; this session may persist. Run `fleet gc` "
                 f"or kill the duplicate manually after confirming the "
-                f"holder is the live coord.\n"
+                f"holder is the live coord."
             )
         return 0
     # Issue #84 Phase A: emit DISPATCH blocks BEFORE the JSON summary
@@ -8257,10 +8274,10 @@ def main(argv: Iterable[str] | None = None) -> int:
             # No load-bearing block was lost — the only write was the
             # trailing flush of an empty buffer. A broken pipe here is
             # benign (codex [P2]): do NOT signal a re-tick. Exit 0.
-            sys.stderr.write(
+            _warn_stderr(
                 f"coordinator: stdout closed on a zero-dispatch tick "
                 f"(broken pipe: {exc}); nothing actionable was lost. "
-                f"Exiting 0 (NOT a SIGPIPE kill, NOT a re-tick signal).\n"
+                f"Exiting 0 (NOT a SIGPIPE kill, NOT a re-tick signal)."
             )
             return 0
         # A real DISPATCH block did not reach the coord — surface it and
@@ -8270,12 +8287,12 @@ def main(argv: Iterable[str] | None = None) -> int:
         # `pending` blocks made it before the pipe closed (the failure may
         # have been block k of N), so say "up to" rather than imply an
         # exact lost-count (review [P2]).
-        sys.stderr.write(
+        _warn_stderr(
             f"coordinator: failed to emit DISPATCH block (up to {pending} "
             f"of this tick's blocks may not have reached the coord) to a "
             f"closed stdout (broken pipe: {exc}). Re-run the tick with full "
             f"output captured (never `| head`). Exiting non-zero so the "
-            f"harness re-ticks.\n"
+            f"harness re-ticks."
         )
         return _EXIT_BROKEN_PIPE
     # Final JSON summary. A closed stdout here is benign (the summary is
