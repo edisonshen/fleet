@@ -8113,14 +8113,28 @@ def _print_json_safe(payload: dict) -> int:
     try:
         print(json.dumps(payload))
         sys.stdout.flush()
-    except (BrokenPipeError, OSError):
+    except (BrokenPipeError, OSError) as exc:
         _silence_shutdown_flush()
-        sys.stderr.write(
-            "coordinator: stdout closed before the tick's JSON summary "
-            "could be written (broken pipe); summary dropped. The tick's "
-            "actionable output (if any) already flushed — exiting 0 (NOT "
-            "a SIGPIPE kill, NOT a re-tick signal).\n"
-        )
+        # A broken pipe (EPIPE) is benign — the reader closed after the
+        # actionable output. A different OSError (ENOSPC disk-full, EIO on
+        # a redirected file) is a real write fault worth surfacing louder
+        # (review [P3]) — but it's still not a re-tick signal (the summary
+        # is diagnostic), so we exit 0 either way.
+        is_pipe = isinstance(exc, BrokenPipeError) or getattr(
+            exc, "errno", None) == errno.EPIPE
+        if is_pipe:
+            sys.stderr.write(
+                "coordinator: stdout closed before the tick's JSON summary "
+                "could be written (broken pipe); summary dropped. The "
+                "tick's actionable output (if any) already flushed — "
+                "exiting 0 (NOT a SIGPIPE kill, NOT a re-tick signal).\n"
+            )
+        else:
+            sys.stderr.write(
+                f"coordinator: failed to write the tick's JSON summary "
+                f"(non-pipe write fault: {exc}); summary dropped. The "
+                f"tick's actionable output already flushed — exiting 0.\n"
+            )
     return 0
 
 
@@ -8252,13 +8266,16 @@ def main(argv: Iterable[str] | None = None) -> int:
         # A real DISPATCH block did not reach the coord — surface it and
         # exit non-zero so the harness re-ticks. The coordinator.lock is
         # already released by tick()'s finally, so a non-zero exit here
-        # doesn't strand the lock.
+        # doesn't strand the lock. We can't know exactly how many of the
+        # `pending` blocks made it before the pipe closed (the failure may
+        # have been block k of N), so say "up to" rather than imply an
+        # exact lost-count (review [P2]).
         sys.stderr.write(
-            f"coordinator: failed to emit DISPATCH block "
-            f"({pending} pending) to a closed stdout (broken pipe: {exc}); "
-            f"the dispatch did NOT reach the coord. Re-run the tick with "
-            f"full output captured (never `| head`). Exiting non-zero so "
-            f"the harness re-ticks.\n"
+            f"coordinator: failed to emit DISPATCH block (up to {pending} "
+            f"of this tick's blocks may not have reached the coord) to a "
+            f"closed stdout (broken pipe: {exc}). Re-run the tick with full "
+            f"output captured (never `| head`). Exiting non-zero so the "
+            f"harness re-ticks.\n"
         )
         return _EXIT_BROKEN_PIPE
     # Final JSON summary. A closed stdout here is benign (the summary is
