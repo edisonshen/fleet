@@ -105,7 +105,7 @@ def _in_turn_supervisor_enabled() -> bool:
 _INFLIGHT_STATUSES = ("in-progress", "in-review")
 
 
-def _maybe_warn_single_shot(*, tasks, sup_cfg, pr_watch_staged) -> None:
+def _maybe_warn_single_shot(*, tasks_path, sup_cfg, pr_watch_staged) -> None:
     """Surface (to stderr) that the in-turn supervisor was skipped while
     in-flight work exists — so the single-shot degradation is visible.
 
@@ -116,13 +116,20 @@ def _maybe_warn_single_shot(*, tasks, sup_cfg, pr_watch_staged) -> None:
         the loop in that case — main() flushes the block immediately);
       - there is no in-flight task to shepherd (a truly idle coord).
 
+    Re-reads tasks.md fresh (codex [P3]): the in-memory `f.tasks` at the
+    gate is PRE-dispatch (re-read before §5), so a task dispatched this
+    tick is still `ready` there and reconcile mutations went through the
+    CLI to disk. Reading the current on-disk state gives the true
+    post-dispatch / post-reconcile in-flight view this breadcrumb needs.
+
     Best-effort: never raises into the tick. The next tick (Stop hook /
     `fleet message` wake / Slice-2 daemon pass) resumes shepherding.
     """
     if sup_cfg.poll_interval_s <= 0 or pr_watch_staged:
         return
     try:
-        inflight = [t for t in tasks if t.status in _INFLIGHT_STATUSES]
+        current = parse.read(str(tasks_path))
+        inflight = [t for t in current.tasks if t.status in _INFLIGHT_STATUSES]
     except Exception:  # noqa: BLE001 — never let a warn wedge a tick
         return
     if not inflight:
@@ -1470,7 +1477,7 @@ def _tick_locked(
         # had polling configured (poll_interval>0); a truly idle coord
         # stays quiet. codex [P1]: makes the intended tradeoff explicit.
         _maybe_warn_single_shot(
-            tasks=f.tasks,
+            tasks_path=tasks_path,
             sup_cfg=sup_cfg,
             pr_watch_staged=_pr_watch_staged_dispatch,
         )
