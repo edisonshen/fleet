@@ -79,6 +79,29 @@ _ARCHIVE_SCAN_CAP = 200
 _WORKTREE_GC_EVERY_DEFAULT = 20
 
 
+def _in_turn_supervisor_enabled() -> bool:
+    """Is the in-turn supervisor poll loop opt-in for THIS tick?
+
+    P0 stopgap (Slice 1 of DESIGN-coord-supervisor-in-daemon): the agent
+    tick is SINGLE-SHOT by default. Historically every tick entered
+    `_run_supervisor` — a 30-min in-turn poll loop that held
+    `coordinator.lock` and froze the agent's foreground turn; a closed
+    stdout in that window SIGPIPE-killed the process (exit 144). The
+    daemon (Slice 2) owns the continuous loop; the agent tick reverts to
+    its one-shot shape.
+
+    Default OFF. Set FLEET_COORD_IN_TURN_SUPERVISOR to a truthy value
+    (1/true/yes/on, case-insensitive) to restore the old in-turn loop as
+    a debugging escape hatch.
+
+    PROJECT-AGNOSTIC by construction — env-only, never gated on the
+    project name. Every coordinator (projects-fleet, projects-rainier,
+    all) inherits the single-shot default identically.
+    """
+    raw = os.environ.get("FLEET_COORD_IN_TURN_SUPERVISOR", "").strip().lower()
+    return raw in ("1", "true", "yes", "on")
+
+
 def _worktree_gc_every() -> int:
     """Resolve the worktree-GC cadence (ticks between backstop runs).
 
@@ -1362,13 +1385,24 @@ def _tick_locked(
         result.errors.append(f"worktree-gc: {exc}")
 
     # 6. Supervisor loop (issue #79). After the initial reconcile + drain
-    # + dispatch pass we keep the lock and watch in-flight workers. Cheap
-    # mtime polling drives event-based reconciliation; a sparse stuck-
-    # check pass catches workers that died silently. The legacy
-    # single-tick behavior is preserved when poll_interval=0 (or no
-    # in-flight tasks) — the supervisor returns immediately.
+    # + dispatch pass the legacy behavior kept the lock and watched
+    # in-flight workers via a 30-min in-turn poll loop. That froze the
+    # agent's foreground turn and SIGPIPE-killed the process (exit 144)
+    # whenever stdout closed mid-loop.
+    #
+    # P0 stopgap (Slice 1 of DESIGN-coord-supervisor-in-daemon): the agent
+    # tick is now SINGLE-SHOT by default. `_in_turn_supervisor_enabled()`
+    # gates the loop OFF unless FLEET_COORD_IN_TURN_SUPERVISOR is set —
+    # project-agnostic, no project-name branch. The daemon (Slice 2) owns
+    # the continuous loop out-of-turn. When the gate is on we still respect
+    # the legacy guards (poll_interval=0 / no in-flight tasks / a staged
+    # PR-watch block returns immediately).
     sup_cfg = supervisor_mod.SupervisorConfig.from_env()
-    if sup_cfg.poll_interval_s > 0 and not _pr_watch_staged_dispatch:
+    if (
+        _in_turn_supervisor_enabled()
+        and sup_cfg.poll_interval_s > 0
+        and not _pr_watch_staged_dispatch
+    ):
         _run_supervisor(
             cfg=sup_cfg,
             project=project,
@@ -7966,6 +8000,83 @@ def _kill_own_tmux_session(coord_id: str) -> bool:
 _kill_own_session_fn = _kill_own_tmux_session
 
 
+# Exit code returned when stdout is a broken pipe while emitting a tick's
+# output. NOT 144 (128+SIGPIPE): the broken pipe is HANDLED, never a
+# fatal signal. The harness/operator sees a clean nonzero and re-ticks.
+_EXIT_BROKEN_PIPE = 2
+
+
+def _ensure_sigpipe_handled() -> None:
+    """Defensively keep SIGPIPE handled (not fatal) for this process.
+
+    CPython sets SIGPIPE to SIG_IGN at startup so a write to a closed
+    pipe raises BrokenPipeError instead of killing the process with the
+    signal (exit 144). But a parent/child that ran `signal(SIGPIPE,
+    SIG_DFL)` (common in shell pipelines and some tmux send-key setups)
+    can leak the default disposition into this process — and then the
+    very first write to a closed stdout delivers a FATAL SIGPIPE before
+    any `try/except BrokenPipeError` can run. This tick is routinely
+    piped (`| head`, harness truncation), so we restore SIG_IGN
+    explicitly at entry. Best-effort: platforms without SIGPIPE (Windows)
+    or a restricted env just skip it.
+    """
+    try:
+        import signal
+
+        if hasattr(signal, "SIGPIPE"):
+            signal.signal(signal.SIGPIPE, signal.SIG_IGN)
+    except (ValueError, OSError, AttributeError):
+        # ValueError: not the main thread. OSError/AttributeError: no
+        # SIGPIPE on this platform. Either way the default Python
+        # disposition (SIG_IGN) already covers the common case.
+        pass
+
+
+def _print_json_safe(payload: dict) -> int:
+    """Emit the tick's JSON summary, surviving a closed stdout cleanly.
+
+    Returns 0 on success, _EXIT_BROKEN_PIPE if stdout's read end is gone.
+    A broken pipe here is benign — the JSON summary is diagnostic, not the
+    load-bearing DISPATCH block — but we still close stdout so the
+    interpreter-shutdown flush can't re-raise (which historically leaked
+    out as the 144 the operator kept seeing).
+    """
+    try:
+        print(json.dumps(payload))
+        sys.stdout.flush()
+        return 0
+    except (BrokenPipeError, OSError):
+        _silence_shutdown_flush()
+        sys.stderr.write(
+            "coordinator: stdout closed before the tick's JSON summary "
+            "could be written (broken pipe); summary dropped. Exiting "
+            "non-zero so the harness re-ticks (NOT a SIGPIPE kill).\n"
+        )
+        return _EXIT_BROKEN_PIPE
+
+
+def _silence_shutdown_flush() -> None:
+    """Redirect stdout to /dev/null so CPython's at-exit flush of the
+    block buffer can't deliver a second BrokenPipeError (or a fatal
+    SIGPIPE if the disposition was reset) on a closed pipe.
+
+    Closing sys.stdout outright works but trips a noisy "Exception
+    ignored in: <_io.TextIOWrapper>" on shutdown; pointing the fd at the
+    bit bucket drains the buffer silently.
+    """
+    try:
+        devnull = open(os.devnull, "w")  # noqa: SIM115 — lives until exit
+        os.dup2(devnull.fileno(), sys.stdout.fileno())
+    except (OSError, ValueError, AttributeError):
+        # dup2 unavailable (no real fd behind sys.stdout, e.g. a test
+        # double or an io redirect). Detach the Python-level stream so the
+        # at-exit flush is a no-op even without an OS-level redirect.
+        try:
+            sys.stdout = open(os.devnull, "w")  # noqa: SIM115
+        except OSError:
+            pass
+
+
 def main(argv: Iterable[str] | None = None) -> int:
     """Skill entry point. Reads project from FLEET_PROJECT env or argv.
 
@@ -7977,12 +8088,21 @@ def main(argv: Iterable[str] | None = None) -> int:
     harness re-ticks, because a swallowed broken pipe would silently drop
     the dispatch instead of delivering it to the coord.
     """
+    # SIGPIPE hardening (loop-supervisor-sigpipe-5263 / Slice 1): keep a
+    # closed stdout a HANDLED BrokenPipeError, never a fatal SIGPIPE
+    # (exit 144). This tick is routinely piped (`| head`, harness
+    # truncation). Restore SIG_IGN at entry in case a parent leaked
+    # SIG_DFL into us.
+    _ensure_sigpipe_handled()
     argv = list(argv) if argv is not None else []
     project = os.environ.get("FLEET_PROJECT", "")
     if argv:
         project = argv[0]
     if not project:
-        print("coordinator: no project set (FLEET_PROJECT or argv[0])")
+        try:
+            print("coordinator: no project set (FLEET_PROJECT or argv[0])")
+        except (BrokenPipeError, OSError):
+            _silence_shutdown_flush()
         return 0
     result = tick(project)
     # coord-self-exit-when-it-6014: a duplicate coord (a different live
@@ -7999,7 +8119,9 @@ def main(argv: Iterable[str] | None = None) -> int:
     # acquired (lock-busy branch), so there is nothing to release.
     if result.self_exit:
         coord_id = os.environ.get("FLEET_AGENT_ID", "")
-        print(json.dumps({
+        # Guard the JSON print: a closed stdout must NOT skip the kill
+        # below (the load-bearing self-exit action) nor SIGPIPE-kill us.
+        _print_json_safe({
             "skipped": result.skipped,
             "reason": result.reason,
             "self_exit": True,
@@ -8009,8 +8131,7 @@ def main(argv: Iterable[str] | None = None) -> int:
             "dispatched": result.dispatched,
             "raised": result.raised,
             "errors": result.errors,
-        }))
-        sys.stdout.flush()
+        })
         if coord_id and not _kill_own_session_fn(coord_id):
             sys.stderr.write(
                 f"coordinator: self-exit requested for duplicate coord "
@@ -8044,11 +8165,10 @@ def main(argv: Iterable[str] | None = None) -> int:
             print(file=sys.stdout)
         sys.stdout.flush()
     except (BrokenPipeError, OSError) as exc:
-        # Avoid a second BrokenPipeError on interpreter shutdown flush.
-        try:
-            sys.stdout.close()
-        except OSError:
-            pass
+        # Redirect stdout to /dev/null so the interpreter-shutdown flush
+        # of the block buffer can't re-raise (or deliver a fatal SIGPIPE)
+        # on the closed pipe.
+        _silence_shutdown_flush()
         sys.stderr.write(
             f"coordinator: failed to emit DISPATCH block "
             f"({len(result.dispatch_instructions)} pending) to a closed "
@@ -8056,8 +8176,12 @@ def main(argv: Iterable[str] | None = None) -> int:
             f"coord. Re-run the tick with full output captured (never "
             f"`| head`). Exiting non-zero so the harness re-ticks.\n"
         )
-        return 2
-    print(json.dumps({
+        return _EXIT_BROKEN_PIPE
+    # Final JSON summary. A closed stdout here is benign (the summary is
+    # diagnostic, not the load-bearing DISPATCH block) — _print_json_safe
+    # returns _EXIT_BROKEN_PIPE and silences the shutdown flush so the
+    # process still exits cleanly, never via SIGPIPE.
+    return _print_json_safe({
         "skipped": result.skipped,
         "reason": result.reason,
         "parsed": result.parsed_tasks,
@@ -8066,8 +8190,7 @@ def main(argv: Iterable[str] | None = None) -> int:
         "dispatched": result.dispatched,
         "raised": result.raised,
         "errors": result.errors,
-    }))
-    return 0
+    })
 
 
 if __name__ == "__main__":

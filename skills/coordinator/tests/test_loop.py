@@ -4563,7 +4563,10 @@ def test_tick_checkpoint_written_after_supervisor(
     """
     monkeypatch.setenv("FLEET_COORD_CHECKPOINT_EVERY", "1")
     # conftest pins poll_interval=0 (supervisor off); enable it so the
-    # _run_supervisor branch runs and our patched mutation fires.
+    # _run_supervisor branch runs and our patched mutation fires. The
+    # in-turn supervisor is opt-in (Slice-1 single-shot default), so set
+    # FLEET_COORD_IN_TURN_SUPERVISOR=1 too.
+    monkeypatch.setenv("FLEET_COORD_IN_TURN_SUPERVISOR", "1")
     monkeypatch.setenv("FLEET_COORD_POLL_INTERVAL_S", "5")
     # Pre-supervisor disk state: nothing active.
     _write_tasks(project_dir, [_make_task("idle-hhhh", status="ready")])
@@ -4668,6 +4671,8 @@ def test_supervisor_heartbeat_writes_rolling_checkpoint(
     patch run_supervisor to invoke the write_state hook it was handed, and
     assert the hook published a checkpoint reflecting the live worker."""
     monkeypatch.setenv("FLEET_COORD_CHECKPOINT_EVERY", "1")
+    # In-turn supervisor is opt-in (Slice-1 single-shot default).
+    monkeypatch.setenv("FLEET_COORD_IN_TURN_SUPERVISOR", "1")
     monkeypatch.setenv("FLEET_COORD_POLL_INTERVAL_S", "5")
     # A live in-flight worker so _run_supervisor proceeds to the inner
     # supervisor loop (it returns early when nothing is in-flight). A
