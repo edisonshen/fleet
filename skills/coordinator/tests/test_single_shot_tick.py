@@ -591,11 +591,15 @@ def test_self_exit_kill_runs_even_with_stdout_and_stderr_closed(
     """codex [P2]: in the duplicate-coord self-exit path, a closed stderr
     (in addition to a closed stdout) must NOT abort main() before the
     load-bearing _kill_own_session_fn runs — otherwise the duplicate
-    coordinator stays alive. The kill must fire regardless."""
+    coordinator stays alive. The kill must fire regardless. And because a
+    self-exit summary carries `errors` (the demotion reason), a dropped
+    summary must propagate _EXIT_BROKEN_PIPE so the harness re-ticks and
+    re-publishes — not a silent 0."""
     fake = loop.TickResult()
     fake.self_exit = True
     fake.skipped = True
     fake.reason = "duplicate coord"
+    fake.errors = ["another live coord holds coordinator.lock"]
     monkeypatch.setattr(loop, "tick", lambda *a, **kw: fake)
     monkeypatch.setenv("FLEET_PROJECT", "fleet")
     monkeypatch.setenv("FLEET_AGENT_ID", "dead00id")
@@ -616,6 +620,32 @@ def test_self_exit_kill_runs_even_with_stdout_and_stderr_closed(
     assert killed["n"] == 1, (
         "self-exit kill must run even when stdout AND stderr are closed"
     )
+    # Dropped self-exit summary carried errors -> force re-tick (codex P2).
+    assert rc == loop._EXIT_BROKEN_PIPE
+
+
+def test_self_exit_clean_summary_exits_zero_and_kills(monkeypatch) -> None:
+    """A self-exit with NO errors and a writable stdout exits 0 and kills.
+    (Guards against over-eagerly returning non-zero when the alert WAS
+    delivered.)"""
+    fake = loop.TickResult()
+    fake.self_exit = True
+    fake.skipped = True
+    fake.reason = "duplicate coord"
+    fake.errors = []
+    monkeypatch.setattr(loop, "tick", lambda *a, **kw: fake)
+    monkeypatch.setenv("FLEET_PROJECT", "fleet")
+    monkeypatch.setenv("FLEET_AGENT_ID", "dead00id")
+
+    killed = {"n": 0}
+    monkeypatch.setattr(
+        loop, "_kill_own_session_fn",
+        lambda cid: killed.__setitem__("n", killed["n"] + 1) or True,
+    )
+
+    rc = loop.main([])
+
+    assert killed["n"] == 1
     assert rc == 0
 
 

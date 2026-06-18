@@ -8240,7 +8240,12 @@ def main(argv: Iterable[str] | None = None) -> int:
         coord_id = os.environ.get("FLEET_AGENT_ID", "")
         # Guard the JSON print: a closed stdout must NOT skip the kill
         # below (the load-bearing self-exit action) nor SIGPIPE-kill us.
-        _print_json_safe({
+        # A self-exit summary ALWAYS carries `errors` (the duplicate-coord
+        # reason), so if stdout is closed _print_json_safe returns
+        # _EXIT_BROKEN_PIPE — propagate it (codex [P2]) so the harness
+        # re-ticks and re-publishes the dropped self-demotion alert,
+        # instead of the coord disappearing with a silent exit 0.
+        rc = _print_json_safe({
             "skipped": result.skipped,
             "reason": result.reason,
             "self_exit": True,
@@ -8260,7 +8265,7 @@ def main(argv: Iterable[str] | None = None) -> int:
                 f"or kill the duplicate manually after confirming the "
                 f"holder is the live coord."
             )
-        return 0
+        return rc
     # Issue #84 Phase A: emit DISPATCH blocks BEFORE the JSON summary
     # so the coord agent (Claude) sees them as parseable plain text in
     # the tick output. Each block tells Claude to invoke the Agent
