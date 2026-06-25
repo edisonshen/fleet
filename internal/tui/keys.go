@@ -210,6 +210,22 @@ type coordSpawnDoneMsg struct {
 	agentID     string
 	session     string
 	err         error
+	// attachedExisting is true when dispatch vetoed the spawn (exit 75 —
+	// a healthy leader already holds the lease) AND the callback re-
+	// resolved that live leader on disk. The Update handler then attaches
+	// to the existing coord (pendingAttach + tea.Quit) WITHOUT writing the
+	// coord-spawn marker — the TUI did not spawn this coord, so stamping
+	// the marker would corrupt [a] dedup semantics (codex round-2 P1). A
+	// distinct field (not reusing the spawn-success shape) keeps the
+	// "attached a live coord" outcome from threading through the marker-
+	// writing default branch in model.go.
+	attachedExisting bool
+	// recoverable, when set on a no-error message, carries a non-fatal
+	// flash (isErr=false): the spawn was vetoed (exit 75) but the live
+	// leader's record was not yet visible on disk. The operator is told
+	// to press [a] again — never an error banner, never a respawn. Mirrors
+	// handleCoordSpawnVeto's "wait-and-retry, never exit 70" contract.
+	recoverable string
 	// promptDelivered is true when dispatch's stdout did NOT contain
 	// the dispatchPromptFailedMarker — i.e. SendInitialPrompt
 	// succeeded and /coordinator was actually typed into the pane.
@@ -219,6 +235,15 @@ type coordSpawnDoneMsg struct {
 	// the marker file). Codex iter-5 P2.
 	promptDelivered bool
 }
+
+// tuiCoordVetoExitCode is the exit code `fleet dispatch --coord-spawn`
+// returns when a healthy coord already holds the project's lease (EX_
+// TEMPFAIL): the spawn stood down and the caller must ATTACH the live
+// leader, not surface an error. Duplicated here because the tui package
+// cannot import the `main` package — mirrors cmd/fleet/attach.go's
+// dispatchVetoExitCode and cmd/fleet/dispatch.go's vetoExitCode, both 75.
+// Keep all three in sync.
+const tuiCoordVetoExitCode = 75
 
 // fleetBinary is resolved once at startup via os.Executable() so the
 // TUI invokes ITSELF for sub-commands rather than depending on the
@@ -2218,6 +2243,49 @@ func (m Model) startCoordSpawn(projectName, cwd string) tea.Cmd {
 	args = append(args, "--engine", "claude-code")
 	return runFleetCmd(args, func(out string, err error) tea.Msg {
 		if err != nil {
+			// Exit 75 (EX_TEMPFAIL) is NOT a failure: a healthy coord
+			// already holds the project's lease and the spawn stood
+			// down. This is the "attach the live one" signal — the
+			// operator's [a] must land them in the existing coord, never
+			// a fatal banner ("fleet attach never exits"). Mirror the CLI
+			// veto path (cmd/fleet/attach.go handleCoordSpawnVeto): re-
+			// read records FROM DISK here in the callback goroutine (the
+			// Update handler only sees the cached m.records, which can
+			// false-negative a winner already on disk) and resolve the
+			// leader with the markerless projectlookup pair. Do NOT use
+			// findExistingCoordForProject — it is marker-gated by design
+			// and would drop a live coord started outside the TUI.
+			var ee *exec.ExitError
+			if errors.As(err, &ee) && ee.ExitCode() == tuiCoordVetoExitCode {
+				records, _, lerr := agent.ListStrict()
+				if lerr == nil {
+					if rec, ok := projectlookup.FindLiveCoord(records, projectName); ok {
+						return coordSpawnDoneMsg{
+							projectName:      projectName,
+							agentID:          rec.ID,
+							session:          rec.TmuxSession,
+							attachedExisting: true,
+						}
+					}
+					if rec, ok := projectlookup.FindCoordByLockBody(records, projectName); ok {
+						return coordSpawnDoneMsg{
+							projectName:      projectName,
+							agentID:          rec.ID,
+							session:          rec.TmuxSession,
+							attachedExisting: true,
+						}
+					}
+				}
+				// Lease held but the live record isn't on disk yet (the
+				// winner is mid-boot). Do NOT swallow and do NOT respawn —
+				// emit a recoverable flash telling the operator to retry.
+				return coordSpawnDoneMsg{
+					projectName: projectName,
+					recoverable: fmt.Sprintf(
+						"coord lease for %s is held by a live leader, but its record is not visible yet — press [a] again in a moment",
+						projectName),
+				}
+			}
 			return coordSpawnDoneMsg{
 				projectName: projectName,
 				err:         fmt.Errorf("dispatch: %w\n%s", err, out),

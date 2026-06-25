@@ -939,6 +939,32 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.projectAddCoordSpawn != nil {
 			delete(m.projectAddCoordSpawn, msg.projectName)
 		}
+		// Exit-75 attach-the-live-leader path (project-row [a] on a
+		// project whose coord already holds the lease). The callback
+		// already re-resolved the live coord from disk, so we ONLY
+		// attach here — and crucially we do NOT call
+		// writeCoordSpawnMarkerFn (codex round-2 P1): the TUI did not
+		// spawn this coord, so stamping the coord-spawn marker would
+		// falsely promote a leader the TUI never booted and corrupt
+		// future [a] dedup. The in-flight gate is already cleared above.
+		if msg.attachedExisting {
+			m.flash = &flashMsg{
+				text: fmt.Sprintf(
+					"attached to live coord %s for %s",
+					msg.agentID, msg.projectName),
+			}
+			m.pendingAttach = msg.session
+			return m, tea.Quit
+		}
+		// Exit-75 but the live leader's record isn't on disk yet — a
+		// recoverable, non-fatal flash (never a banner, never a
+		// respawn). Mirrors handleCoordSpawnVeto's wait-and-retry
+		// contract: the operator presses [a] again once the winner
+		// publishes its record.
+		if msg.recoverable != "" {
+			m.flash = &flashMsg{text: msg.recoverable}
+			return m, loadAgentsCmd()
+		}
 		// Issues #60, #63: project-row [a] auto-spawn result. err non-nil
 		// covers init failures, dispatch failures, and agent-ID parse
 		// failures; surface as a flash so the operator can decide
