@@ -261,6 +261,18 @@ func coordVetoRetryFlash(project string) string {
 		project)
 }
 
+// summarizeBadIDs renders ListStrict's corrupt-record IDs for a flash,
+// capped so a directory full of unparseable JSON (the project has a
+// history of thousands of leaked ~/.fleet files) can't blow out the TUI
+// render with a multi-KB line. Shows the first few, then "(and N more)".
+func summarizeBadIDs(badIDs []string) string {
+	const cap = 3
+	if len(badIDs) <= cap {
+		return strings.Join(badIDs, ", ")
+	}
+	return fmt.Sprintf("%s, (and %d more)", strings.Join(badIDs[:cap], ", "), len(badIDs)-cap)
+}
+
 // fleetBinary is resolved once at startup via os.Executable() so the
 // TUI invokes ITSELF for sub-commands rather than depending on the
 // PATH-resolved `fleet`. Critical for dev runs (`go run`, install
@@ -2317,7 +2329,7 @@ func (m Model) startCoordSpawn(projectName, cwd string) tea.Cmd {
 						projectName: projectName,
 						recoverable: fmt.Sprintf(
 							"coord lease for %s is held, but %d agent record(s) are corrupt (%s) — the live leader may be among them; fix ~/.fleet/agents/<id>.json, then press [a] again",
-							projectName, len(badIDs), strings.Join(badIDs, ", ")),
+							projectName, len(badIDs), summarizeBadIDs(badIDs)),
 					}
 				default:
 					return coordSpawnDoneMsg{

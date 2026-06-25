@@ -164,7 +164,13 @@ func TestVeto_MarkerBackedLiveLeader_Attaches(t *testing.T) {
 	// attach; stub it so the resolved session reads reachable+alive
 	// (true, nil) without real tmux.
 	(&stubSessionProbe{}).install(t)
-	stubFleetCmdInvokesCallback(t, "spawn vetoed\n", exitErr(t, tuiCoordVetoExitCode))
+	markerWrites := stubMarkerWrite(t)
+	// Seed the LITERAL 75 (not the tuiCoordVetoExitCode symbol) so this
+	// test pins the cross-PROCESS contract: dispatch.go returns the
+	// literal 75, and if the TUI's const ever drifts the classification
+	// silently stops recognizing real vetoes. Self-consistent
+	// symbol-vs-symbol tests would mask that drift.
+	stubFleetCmdInvokesCallback(t, "spawn vetoed\n", exitErr(t, 75))
 
 	msg, mm := driveSpawn(t, projectRowModelForVeto("demo"))
 	if !msg.attachedExisting {
@@ -175,6 +181,20 @@ func TestVeto_MarkerBackedLiveLeader_Attaches(t *testing.T) {
 	}
 	if mm.flash == nil || mm.flash.isErr {
 		t.Fatalf("expected informational (non-err) flash; got %+v", mm.flash)
+	}
+	if *markerWrites != 0 {
+		t.Errorf("attach-existing must not write the coord-spawn marker; got %d writes", *markerWrites)
+	}
+}
+
+// TestVetoExitCode_MatchesDispatchContract pins the cross-process exit
+// code: the TUI classifies on tuiCoordVetoExitCode but `fleet dispatch`
+// returns the literal 75 (dispatch.go vetoExitCode, attach.go
+// dispatchVetoExitCode). A drift here silently breaks veto recognition,
+// so guard the literal directly (maintainability review P2).
+func TestVetoExitCode_MatchesDispatchContract(t *testing.T) {
+	if tuiCoordVetoExitCode != 75 {
+		t.Fatalf("tuiCoordVetoExitCode = %d; want 75 (EX_TEMPFAIL — must match dispatch.go vetoExitCode / attach.go dispatchVetoExitCode)", tuiCoordVetoExitCode)
 	}
 }
 
@@ -232,6 +252,7 @@ func TestVeto_LockBodyOnlyLiveLeader_Attaches(t *testing.T) {
 	seedDiskCoord(t, "1c00d001", "demo", "manual-spawn")
 	seedLockBody(t, "demo", "1c00d001")
 	(&stubSessionProbe{}).install(t)
+	markerWrites := stubMarkerWrite(t)
 	stubFleetCmdInvokesCallback(t, "spawn vetoed\n", exitErr(t, tuiCoordVetoExitCode))
 
 	msg, mm := driveSpawn(t, projectRowModelForVeto("demo"))
@@ -243,6 +264,9 @@ func TestVeto_LockBodyOnlyLiveLeader_Attaches(t *testing.T) {
 	}
 	if mm.flash == nil || mm.flash.isErr {
 		t.Fatalf("expected informational flash; got %+v", mm.flash)
+	}
+	if *markerWrites != 0 {
+		t.Errorf("attach-existing must not write the coord-spawn marker; got %d writes", *markerWrites)
 	}
 }
 
@@ -350,6 +374,23 @@ func TestVeto_ListStrictError_RecoverableNamesFault(t *testing.T) {
 	}
 	if mm.pendingAttach != "" {
 		t.Errorf("pendingAttach = %q; want empty", mm.pendingAttach)
+	}
+}
+
+// TestSummarizeBadIDs_CapsLongLists — the corrupt-record flash must not
+// blow out the TUI render when ~/.fleet/agents has many unparseable
+// files (the project has a leaked-file history). Cap at 3 + "(and N
+// more)" (review P3).
+func TestSummarizeBadIDs_CapsLongLists(t *testing.T) {
+	if got := summarizeBadIDs([]string{"a", "b"}); got != "a, b" {
+		t.Errorf("short list = %q; want \"a, b\"", got)
+	}
+	if got := summarizeBadIDs([]string{"a", "b", "c"}); got != "a, b, c" {
+		t.Errorf("exactly-cap list = %q; want \"a, b, c\"", got)
+	}
+	got := summarizeBadIDs([]string{"a", "b", "c", "d", "e"})
+	if !strings.Contains(got, "a, b, c") || !strings.Contains(got, "(and 2 more)") {
+		t.Errorf("over-cap list = %q; want first 3 + \"(and 2 more)\"", got)
 	}
 }
 
