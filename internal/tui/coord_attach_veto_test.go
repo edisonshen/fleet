@@ -270,6 +270,41 @@ func TestVeto_LockBodyOnlyLiveLeader_Attaches(t *testing.T) {
 	}
 }
 
+// TestVeto_MultipleLiveCoords_LockHolderWins — codex iter-8 [P1]: during
+// a handoff/rotation window two live coord-<project> records exist. The
+// veto fired against the lock HOLDER, so the attach must target the lock
+// body's coord, not whichever live coord-<project> record happens to be
+// first in directory order. Resolving FindCoordByLockBody before
+// FindLiveCoord guarantees the authoritative leader wins.
+func TestVeto_MultipleLiveCoords_LockHolderWins(t *testing.T) {
+	withFleetHome(t)
+	seedProjectMeta(t, "demo", t.TempDir())
+	// Both coords alive. "0fd00002" sorts before "1eade001" in the
+	// agents/ dir, so FindLiveCoord (directory order) would pick it — but
+	// the lock body names "1eade001" as the leader.
+	restorePL := projectlookup.SetTestStubs(
+		func(s string) bool { return s == "fleet-0fd00002" || s == "fleet-1eade001" },
+		func(s string) (bool, error) {
+			return s == "fleet-0fd00002" || s == "fleet-1eade001", nil
+		},
+		nil,
+	)
+	t.Cleanup(restorePL)
+	seedDiskCoord(t, "0fd00002", "demo", coordTaskID("demo")) // outgoing, sorts first
+	seedDiskCoord(t, "1eade001", "demo", coordTaskID("demo")) // leader (lock holder)
+	seedLockBody(t, "demo", "1eade001")
+	(&stubSessionProbe{}).install(t)
+	stubFleetCmdInvokesCallback(t, "spawn vetoed\n", exitErr(t, tuiCoordVetoExitCode))
+
+	msg, mm := driveSpawn(t, projectRowModelForVeto("demo"))
+	if !msg.attachedExisting {
+		t.Fatalf("multi-coord veto must still attach; got %+v", msg)
+	}
+	if mm.pendingAttach != "fleet-1eade001" {
+		t.Errorf("pendingAttach = %q; want fleet-1eade001 (lock holder must win over directory-first live coord fleet-0fd00002)", mm.pendingAttach)
+	}
+}
+
 // TestVeto_NoLiveRecord_RecoverableFlash — exit 75 but NO live record on
 // disk (winner mid-boot). Must emit a recoverable non-err flash, leave
 // pendingAttach empty, and NOT respawn (no banner).
@@ -363,8 +398,14 @@ func TestVeto_ListStrictError_RecoverableNamesFault(t *testing.T) {
 	if msg.recoverable == "" {
 		t.Fatal("ListStrict failure must emit a recoverable flash")
 	}
-	if !strings.Contains(msg.recoverable, "reading agent records failed") {
-		t.Errorf("recoverable flash must name the read fault; got %q", msg.recoverable)
+	// Must LEAD with the actionable retry/socket guidance (codex iter-8
+	// P2 — never let the disk diagnostic suppress it) and APPEND the read
+	// fault as a note (don't silo).
+	if !strings.Contains(msg.recoverable, "FLEET_TMUX_SOCKET") {
+		t.Errorf("recoverable flash must lead with retry/socket guidance; got %q", msg.recoverable)
+	}
+	if !strings.Contains(msg.recoverable, "reading ~/.fleet/agents failed") {
+		t.Errorf("recoverable flash must name the read fault as a note; got %q", msg.recoverable)
 	}
 	if msg.attachedExisting {
 		t.Error("ListStrict failure must not attach")
@@ -423,8 +464,11 @@ func TestVeto_CorruptRecord_RecoverableNamesBadID(t *testing.T) {
 	if msg.attachedExisting {
 		t.Error("corrupt record (no resolvable live coord) must not attach")
 	}
+	if !strings.Contains(msg.recoverable, "FLEET_TMUX_SOCKET") {
+		t.Errorf("recoverable flash must lead with retry/socket guidance, not be hijacked by the corrupt-record note (codex iter-8 P2); got %q", msg.recoverable)
+	}
 	if !strings.Contains(msg.recoverable, "corrupt") || !strings.Contains(msg.recoverable, "badc0de1") {
-		t.Errorf("recoverable flash must name the corrupt record id; got %q", msg.recoverable)
+		t.Errorf("recoverable flash must name the corrupt record id as a note; got %q", msg.recoverable)
 	}
 	if mm.flash == nil || mm.flash.isErr {
 		t.Fatalf("expected recoverable (non-err) flash; got %+v", mm.flash)

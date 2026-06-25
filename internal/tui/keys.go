@@ -2286,14 +2286,16 @@ func (m Model) startCoordSpawn(projectName, cwd string) tea.Cmd {
 			var ee *exec.ExitError
 			if errors.As(err, &ee) && ee.ExitCode() == tuiCoordVetoExitCode {
 				records, badIDs, lerr := agent.ListStrict()
-				if rec, ok := projectlookup.FindLiveCoord(records, projectName); ok {
-					return coordSpawnDoneMsg{
-						projectName:      projectName,
-						agentID:          rec.ID,
-						session:          rec.TmuxSession,
-						attachedExisting: true,
-					}
-				}
+				// Lock-holder FIRST (codex iter-8 P1). The veto fired because
+				// a coord holds coordinator.lock — that lock body is the
+				// AUTHORITATIVE leader (a lease-holding coord wrote its ID via
+				// LOCK_EX). FindLiveCoord just returns the first alive
+				// coord-<project> record in directory order, which during a
+				// handoff/rotation window (two live coords briefly) can be the
+				// OUTGOING coord, not the leader the operator was vetoed
+				// against. So resolve the lock holder first, then fall back to
+				// FindLiveCoord for legacy/manual coords whose lock body is
+				// empty/stale. Both are the markerless pair the plan mandates.
 				if rec, ok := projectlookup.FindCoordByLockBody(records, projectName); ok {
 					return coordSpawnDoneMsg{
 						projectName:      projectName,
@@ -2302,40 +2304,37 @@ func (m Model) startCoordSpawn(projectName, cwd string) tea.Cmd {
 						attachedExisting: true,
 					}
 				}
+				if rec, ok := projectlookup.FindLiveCoord(records, projectName); ok {
+					return coordSpawnDoneMsg{
+						projectName:      projectName,
+						agentID:          rec.ID,
+						session:          rec.TmuxSession,
+						attachedExisting: true,
+					}
+				}
 				// Lease held but no live record resolved from THIS process.
-				// Every unresolved branch is RECOVERABLE (non-error) — exit
-				// 75 already told us a live coord exists, so a fatal banner
-				// here would dead-end an operator who just needs to retry or
-				// fix their environment (codex iter-5 P2; same retryable
-				// treatment cmd/fleet/attach.go's handleCoordSpawnVeto
-				// gives). But the flash must NAME the actual blocker rather
-				// than a generic "not visible yet" (surface, don't silo):
-				//   - read failure: ~/.fleet/agents unreadable / not a dir;
-				//   - corrupt records: an unparseable agent JSON that may BE
-				//     the leader (ListStrict's badIDs) — retries re-hit 75
-				//     forever until the operator fixes the file;
-				//   - otherwise: a coord on a different tmux socket OR the
-				//     winner still booting (coordVetoRetryFlash).
+				// RECOVERABLE (non-error) — exit 75 already told us a live
+				// coord exists, so a fatal banner here would dead-end an
+				// operator who just needs to retry or fix their environment
+				// (codex iter-5 P2; same retryable treatment
+				// cmd/fleet/attach.go's handleCoordSpawnVeto gives). ALWAYS
+				// LEAD with the actionable retry/socket guidance
+				// (coordVetoRetryFlash) — never let a disk diagnostic SUPPRESS
+				// it (codex iter-8 P2: badIDs is global across all projects,
+				// so an unrelated project's corrupt file must not hijack the
+				// message and send the operator chasing irrelevant records).
+				// Append the disk diagnostic only as a secondary note so the
+				// real fault is still surfaced (don't silo).
+				flash := coordVetoRetryFlash(projectName)
 				switch {
 				case lerr != nil:
-					return coordSpawnDoneMsg{
-						projectName: projectName,
-						recoverable: fmt.Sprintf(
-							"coord lease for %s is held, but reading agent records failed: %v — fix ~/.fleet/agents, then press [a] again",
-							projectName, lerr),
-					}
+					flash += fmt.Sprintf(" — note: reading ~/.fleet/agents failed (%v), which may be hiding the leader", lerr)
 				case len(badIDs) > 0:
-					return coordSpawnDoneMsg{
-						projectName: projectName,
-						recoverable: fmt.Sprintf(
-							"coord lease for %s is held, but %d agent record(s) are corrupt (%s) — the live leader may be among them; fix ~/.fleet/agents/<id>.json, then press [a] again",
-							projectName, len(badIDs), summarizeBadIDs(badIDs)),
-					}
-				default:
-					return coordSpawnDoneMsg{
-						projectName: projectName,
-						recoverable: coordVetoRetryFlash(projectName),
-					}
+					flash += fmt.Sprintf(" — note: %d corrupt agent record(s) present (%s); the leader may be among them if retries keep failing", len(badIDs), summarizeBadIDs(badIDs))
+				}
+				return coordSpawnDoneMsg{
+					projectName: projectName,
+					recoverable: flash,
 				}
 			}
 			return coordSpawnDoneMsg{
