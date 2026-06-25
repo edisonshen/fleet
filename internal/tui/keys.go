@@ -2258,22 +2258,33 @@ func (m Model) startCoordSpawn(projectName, cwd string) tea.Cmd {
 			var ee *exec.ExitError
 			if errors.As(err, &ee) && ee.ExitCode() == tuiCoordVetoExitCode {
 				records, _, lerr := agent.ListStrict()
-				if lerr == nil {
-					if rec, ok := projectlookup.FindLiveCoord(records, projectName); ok {
-						return coordSpawnDoneMsg{
-							projectName:      projectName,
-							agentID:          rec.ID,
-							session:          rec.TmuxSession,
-							attachedExisting: true,
-						}
+				if lerr != nil {
+					// A disk read failure (permissions, I/O) is NOT a
+					// "winner mid-boot" race — masking it as a recoverable
+					// "press [a] again" flash would loop the operator
+					// forever while hiding the real fault (surface, don't
+					// silo). Surface it as an actionable error banner.
+					return coordSpawnDoneMsg{
+						projectName: projectName,
+						err: fmt.Errorf(
+							"coord lease for %s is held, but reading agent records failed: %w",
+							projectName, lerr),
 					}
-					if rec, ok := projectlookup.FindCoordByLockBody(records, projectName); ok {
-						return coordSpawnDoneMsg{
-							projectName:      projectName,
-							agentID:          rec.ID,
-							session:          rec.TmuxSession,
-							attachedExisting: true,
-						}
+				}
+				if rec, ok := projectlookup.FindLiveCoord(records, projectName); ok {
+					return coordSpawnDoneMsg{
+						projectName:      projectName,
+						agentID:          rec.ID,
+						session:          rec.TmuxSession,
+						attachedExisting: true,
+					}
+				}
+				if rec, ok := projectlookup.FindCoordByLockBody(records, projectName); ok {
+					return coordSpawnDoneMsg{
+						projectName:      projectName,
+						agentID:          rec.ID,
+						session:          rec.TmuxSession,
+						attachedExisting: true,
 					}
 				}
 				// Lease held but the live record isn't on disk yet (the

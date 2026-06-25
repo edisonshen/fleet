@@ -21,6 +21,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	tea "github.com/charmbracelet/bubbletea"
@@ -159,6 +160,9 @@ func TestVeto_MarkerBackedLiveLeader_Attaches(t *testing.T) {
 	)
 	t.Cleanup(restorePL)
 	seedDiskCoord(t, "livecord", "demo", coordTaskID("demo"))
+	// Stub the tui-level liveness probe (model.go re-probes before
+	// attach) so the resolved session reads alive without real tmux.
+	stubAliveSessions(t, map[string]bool{"fleet-livecord": true})
 	stubFleetCmdInvokesCallback(t, "spawn vetoed\n", exitErr(t, tuiCoordVetoExitCode))
 
 	msg, mm := driveSpawn(t, projectRowModelForVeto("demo"))
@@ -193,6 +197,7 @@ func TestVeto_MarkerlessLiveLeader_Attaches(t *testing.T) {
 	// so the marker-gated resolver would have bailed. The record is still
 	// tagged coord-<project> so the markerless FindLiveCoord matches.
 	seedDiskCoord(t, "nomarker", "demo", coordTaskID("demo"))
+	stubAliveSessions(t, map[string]bool{"fleet-nomarker": true})
 	markerWrites := stubMarkerWrite(t)
 	stubFleetCmdInvokesCallback(t, "spawn vetoed\n", exitErr(t, tuiCoordVetoExitCode))
 
@@ -225,6 +230,7 @@ func TestVeto_LockBodyOnlyLiveLeader_Attaches(t *testing.T) {
 	// the lock body knows about this coord (manual/legacy spawn shape).
 	seedDiskCoord(t, "1c00d001", "demo", "manual-spawn")
 	seedLockBody(t, "demo", "1c00d001")
+	stubAliveSessions(t, map[string]bool{"fleet-1c00d001": true})
 	stubFleetCmdInvokesCallback(t, "spawn vetoed\n", exitErr(t, tuiCoordVetoExitCode))
 
 	msg, mm := driveSpawn(t, projectRowModelForVeto("demo"))
@@ -292,5 +298,91 @@ func TestVeto_NonVetoExit_PreservesBanner(t *testing.T) {
 	}
 	if mm.pendingAttach != "" {
 		t.Errorf("pendingAttach = %q; want empty on genuine failure", mm.pendingAttach)
+	}
+}
+
+// TestVeto_ListStrictError_SurfacesBanner — codex round-4 [P2]: a disk
+// read failure during the post-veto re-resolve (e.g. ~/.fleet/agents is
+// unreadable) must NOT be masked as a recoverable "press [a] again"
+// flash (which loops forever while hiding the fault). It surfaces as an
+// actionable error banner. We force ListStrict to fail by replacing
+// FLEET_HOME/agents with a regular FILE so os.ReadDir returns ENOTDIR.
+func TestVeto_ListStrictError_SurfacesBanner(t *testing.T) {
+	withFleetHome(t)
+	seedProjectMeta(t, "demo", t.TempDir())
+	root, err := state.Root()
+	if err != nil {
+		t.Fatal(err)
+	}
+	// agents must be a FILE, not a dir → os.ReadDir errors (not
+	// IsNotExist), so agent.ListStrict returns a real error.
+	if werr := os.WriteFile(filepath.Join(root, "agents"), []byte("x"), 0o644); werr != nil {
+		t.Fatal(werr)
+	}
+	stubFleetCmdInvokesCallback(t, "spawn vetoed\n", exitErr(t, tuiCoordVetoExitCode))
+
+	msg, mm := driveSpawn(t, projectRowModelForVeto("demo"))
+	if msg.err == nil {
+		t.Fatal("ListStrict failure must surface as err, not a recoverable flash")
+	}
+	if msg.recoverable != "" {
+		t.Errorf("ListStrict failure must NOT emit a recoverable flash; got %q", msg.recoverable)
+	}
+	if msg.attachedExisting {
+		t.Error("ListStrict failure must not attach")
+	}
+	if mm.flash == nil || !mm.flash.isErr {
+		t.Fatalf("expected error flash on disk read failure; got %+v", mm.flash)
+	}
+	if mm.pendingAttach != "" {
+		t.Errorf("pendingAttach = %q; want empty", mm.pendingAttach)
+	}
+}
+
+// TestVeto_LeaderDiesBeforeAttach_RecoverableNoQuit — codex round-4
+// [P2]: the callback resolves a live leader, but it dies in the window
+// before Update handles the message. The model.go re-probe must catch
+// the now-dead session and emit a recoverable retry flash WITHOUT
+// quitting into a dead tmux attach (the raw "no sessions" UX this
+// handler exists to avoid). pendingAttach stays empty; no tea.Quit.
+func TestVeto_LeaderDiesBeforeAttach_RecoverableNoQuit(t *testing.T) {
+	withFleetHome(t)
+	seedProjectMeta(t, "demo", t.TempDir())
+	// projectlookup probe (callback-side) sees the leader alive so the
+	// callback resolves it...
+	restorePL := projectlookup.SetTestStubs(
+		func(s string) bool { return s == "fleet-dyingcrd" },
+		func(s string) (bool, error) { return s == "fleet-dyingcrd", nil },
+		nil,
+	)
+	t.Cleanup(restorePL)
+	seedDiskCoord(t, "dyingcrd", "demo", coordTaskID("demo"))
+	// ...but the tui-level re-probe in model.go sees it DEAD (the race:
+	// it died between resolution and Update).
+	stubAliveSessions(t, map[string]bool{"fleet-dyingcrd": false})
+	stubFleetCmdInvokesCallback(t, "spawn vetoed\n", exitErr(t, tuiCoordVetoExitCode))
+
+	m := projectRowModelForVeto("demo")
+	_, cmd := m.Update(keyMsg("a"))
+	if cmd == nil {
+		t.Fatal("[a] should produce a spawn cmd")
+	}
+	msg := cmd().(coordSpawnDoneMsg)
+	if !msg.attachedExisting {
+		t.Fatalf("callback should still resolve attachedExisting=true; got %+v", msg)
+	}
+	updated, attachCmd := m.Update(msg)
+	mm := updated.(Model)
+	if mm.pendingAttach != "" {
+		t.Errorf("dead-session race: pendingAttach must stay empty; got %q", mm.pendingAttach)
+	}
+	if attachCmd == nil {
+		t.Error("expected a loadAgentsCmd refresh, got nil (no quit)")
+	}
+	if mm.flash == nil {
+		t.Fatal("expected a recoverable retry flash")
+	}
+	if !strings.Contains(mm.flash.text, "again") {
+		t.Errorf("flash should tell operator to retry; got %q", mm.flash.text)
 	}
 }
