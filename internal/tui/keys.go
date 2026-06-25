@@ -2273,20 +2273,7 @@ func (m Model) startCoordSpawn(projectName, cwd string) tea.Cmd {
 			// and would drop a live coord started outside the TUI.
 			var ee *exec.ExitError
 			if errors.As(err, &ee) && ee.ExitCode() == tuiCoordVetoExitCode {
-				records, _, lerr := agent.ListStrict()
-				if lerr != nil {
-					// A disk read failure (permissions, I/O) is NOT a
-					// "winner mid-boot" race — masking it as a recoverable
-					// "press [a] again" flash would loop the operator
-					// forever while hiding the real fault (surface, don't
-					// silo). Surface it as an actionable error banner.
-					return coordSpawnDoneMsg{
-						projectName: projectName,
-						err: fmt.Errorf(
-							"coord lease for %s is held, but reading agent records failed: %w",
-							projectName, lerr),
-					}
-				}
+				records, badIDs, lerr := agent.ListStrict()
 				if rec, ok := projectlookup.FindLiveCoord(records, projectName); ok {
 					return coordSpawnDoneMsg{
 						projectName:      projectName,
@@ -2304,17 +2291,39 @@ func (m Model) startCoordSpawn(projectName, cwd string) tea.Cmd {
 					}
 				}
 				// Lease held but no live record resolved from THIS process.
-				// Two causes, mirroring cmd/fleet/attach.go's
-				// handleCoordSpawnVeto wait-retry message: (1) the live
-				// coord is on a DIFFERENT tmux socket, so the operator must
-				// fix FLEET_TMUX_SOCKET (retries alone never succeed), or
-				// (2) the winning coord is still booting and its record
-				// isn't on disk yet (press [a] again). Naming only cause 2
-				// would loop the cross-socket operator forever (surface,
-				// don't silo). Do NOT swallow, do NOT respawn.
-				return coordSpawnDoneMsg{
-					projectName: projectName,
-					recoverable: coordVetoRetryFlash(projectName),
+				// Every unresolved branch is RECOVERABLE (non-error) — exit
+				// 75 already told us a live coord exists, so a fatal banner
+				// here would dead-end an operator who just needs to retry or
+				// fix their environment (codex iter-5 P2; same retryable
+				// treatment cmd/fleet/attach.go's handleCoordSpawnVeto
+				// gives). But the flash must NAME the actual blocker rather
+				// than a generic "not visible yet" (surface, don't silo):
+				//   - read failure: ~/.fleet/agents unreadable / not a dir;
+				//   - corrupt records: an unparseable agent JSON that may BE
+				//     the leader (ListStrict's badIDs) — retries re-hit 75
+				//     forever until the operator fixes the file;
+				//   - otherwise: a coord on a different tmux socket OR the
+				//     winner still booting (coordVetoRetryFlash).
+				switch {
+				case lerr != nil:
+					return coordSpawnDoneMsg{
+						projectName: projectName,
+						recoverable: fmt.Sprintf(
+							"coord lease for %s is held, but reading agent records failed: %v — fix ~/.fleet/agents, then press [a] again",
+							projectName, lerr),
+					}
+				case len(badIDs) > 0:
+					return coordSpawnDoneMsg{
+						projectName: projectName,
+						recoverable: fmt.Sprintf(
+							"coord lease for %s is held, but %d agent record(s) are corrupt (%s) — the live leader may be among them; fix ~/.fleet/agents/<id>.json, then press [a] again",
+							projectName, len(badIDs), strings.Join(badIDs, ", ")),
+					}
+				default:
+					return coordSpawnDoneMsg{
+						projectName: projectName,
+						recoverable: coordVetoRetryFlash(projectName),
+					}
 				}
 			}
 			return coordSpawnDoneMsg{

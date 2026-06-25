@@ -311,13 +311,14 @@ func TestVeto_NonVetoExit_PreservesBanner(t *testing.T) {
 	}
 }
 
-// TestVeto_ListStrictError_SurfacesBanner — codex round-4 [P2]: a disk
-// read failure during the post-veto re-resolve (e.g. ~/.fleet/agents is
-// unreadable) must NOT be masked as a recoverable "press [a] again"
-// flash (which loops forever while hiding the fault). It surfaces as an
-// actionable error banner. We force ListStrict to fail by replacing
-// FLEET_HOME/agents with a regular FILE so os.ReadDir returns ENOTDIR.
-func TestVeto_ListStrictError_SurfacesBanner(t *testing.T) {
+// TestVeto_ListStrictError_RecoverableNamesFault — codex iter-1 + iter-5
+// [P2]: a disk read failure during the post-veto re-resolve (e.g.
+// ~/.fleet/agents unreadable / not a dir) must be RECOVERABLE (exit 75
+// already proved a live coord exists, so a fatal banner would dead-end
+// the operator) yet NAME the real fault (not a generic "not visible
+// yet"). We force ListStrict to fail by replacing FLEET_HOME/agents with
+// a regular FILE so os.ReadDir returns ENOTDIR.
+func TestVeto_ListStrictError_RecoverableNamesFault(t *testing.T) {
 	withFleetHome(t)
 	seedProjectMeta(t, "demo", t.TempDir())
 	root, err := state.Root()
@@ -332,17 +333,60 @@ func TestVeto_ListStrictError_SurfacesBanner(t *testing.T) {
 	stubFleetCmdInvokesCallback(t, "spawn vetoed\n", exitErr(t, tuiCoordVetoExitCode))
 
 	msg, mm := driveSpawn(t, projectRowModelForVeto("demo"))
-	if msg.err == nil {
-		t.Fatal("ListStrict failure must surface as err, not a recoverable flash")
+	if msg.err != nil {
+		t.Fatalf("ListStrict failure must NOT be a fatal banner (dead-end); got err=%v", msg.err)
 	}
-	if msg.recoverable != "" {
-		t.Errorf("ListStrict failure must NOT emit a recoverable flash; got %q", msg.recoverable)
+	if msg.recoverable == "" {
+		t.Fatal("ListStrict failure must emit a recoverable flash")
+	}
+	if !strings.Contains(msg.recoverable, "reading agent records failed") {
+		t.Errorf("recoverable flash must name the read fault; got %q", msg.recoverable)
 	}
 	if msg.attachedExisting {
 		t.Error("ListStrict failure must not attach")
 	}
-	if mm.flash == nil || !mm.flash.isErr {
-		t.Fatalf("expected error flash on disk read failure; got %+v", mm.flash)
+	if mm.flash == nil || mm.flash.isErr {
+		t.Fatalf("expected recoverable (non-err) flash on disk read failure; got %+v", mm.flash)
+	}
+	if mm.pendingAttach != "" {
+		t.Errorf("pendingAttach = %q; want empty", mm.pendingAttach)
+	}
+}
+
+// TestVeto_CorruptRecord_RecoverableNamesBadID — codex iter-5 [P2]: when
+// ListStrict returns badIDs (unparseable agent JSON) and neither
+// resolver matched, the live leader may BE one of the corrupt records —
+// every retry re-hits exit 75 forever. The recoverable flash must name
+// the corrupt record so the operator knows to fix ~/.fleet/agents/<id>.json
+// rather than mash [a].
+func TestVeto_CorruptRecord_RecoverableNamesBadID(t *testing.T) {
+	withFleetHome(t)
+	seedProjectMeta(t, "demo", t.TempDir())
+	// Write a corrupt agent record so ListStrict reports it in badIDs.
+	dir, err := state.AgentDir()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if mkerr := os.MkdirAll(dir, 0o755); mkerr != nil {
+		t.Fatal(mkerr)
+	}
+	if werr := os.WriteFile(filepath.Join(dir, "badc0de1.json"), []byte("{not valid json"), 0o644); werr != nil {
+		t.Fatal(werr)
+	}
+	stubFleetCmdInvokesCallback(t, "spawn vetoed\n", exitErr(t, tuiCoordVetoExitCode))
+
+	msg, mm := driveSpawn(t, projectRowModelForVeto("demo"))
+	if msg.err != nil {
+		t.Fatalf("corrupt record must not be a fatal banner; got err=%v", msg.err)
+	}
+	if msg.attachedExisting {
+		t.Error("corrupt record (no resolvable live coord) must not attach")
+	}
+	if !strings.Contains(msg.recoverable, "corrupt") || !strings.Contains(msg.recoverable, "badc0de1") {
+		t.Errorf("recoverable flash must name the corrupt record id; got %q", msg.recoverable)
+	}
+	if mm.flash == nil || mm.flash.isErr {
+		t.Fatalf("expected recoverable (non-err) flash; got %+v", mm.flash)
 	}
 	if mm.pendingAttach != "" {
 		t.Errorf("pendingAttach = %q; want empty", mm.pendingAttach)
