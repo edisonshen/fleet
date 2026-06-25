@@ -2287,13 +2287,19 @@ func (m Model) startCoordSpawn(projectName, cwd string) tea.Cmd {
 						attachedExisting: true,
 					}
 				}
-				// Lease held but the live record isn't on disk yet (the
-				// winner is mid-boot). Do NOT swallow and do NOT respawn —
-				// emit a recoverable flash telling the operator to retry.
+				// Lease held but no live record resolved from THIS process.
+				// Two causes, mirroring cmd/fleet/attach.go's
+				// handleCoordSpawnVeto wait-retry message: (1) the live
+				// coord is on a DIFFERENT tmux socket, so the operator must
+				// fix FLEET_TMUX_SOCKET (retries alone never succeed), or
+				// (2) the winning coord is still booting and its record
+				// isn't on disk yet (press [a] again). Naming only cause 2
+				// would loop the cross-socket operator forever (surface,
+				// don't silo). Do NOT swallow, do NOT respawn.
 				return coordSpawnDoneMsg{
 					projectName: projectName,
 					recoverable: fmt.Sprintf(
-						"coord lease for %s is held by a live leader, but its record is not visible yet — press [a] again in a moment",
+						"coord lease for %s is held by a live leader not visible from this TUI — likely (1) a coord on a different tmux socket (check FLEET_TMUX_SOCKET / `fleet status`) or (2) the winner is still booting (press [a] again in a moment)",
 						projectName),
 				}
 			}

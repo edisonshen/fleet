@@ -270,6 +270,15 @@ func TestVeto_NoLiveRecord_RecoverableFlash(t *testing.T) {
 	if msg.recoverable == "" {
 		t.Error("expected a recoverable flash message on unresolved veto")
 	}
+	// Must name BOTH causes (cross-socket + winner-booting), mirroring
+	// handleCoordSpawnVeto — naming only "press [a] again" loops a
+	// cross-socket operator forever (codex round-5 P2).
+	if !strings.Contains(msg.recoverable, "FLEET_TMUX_SOCKET") {
+		t.Errorf("unresolved-veto flash must surface the cross-socket next step; got %q", msg.recoverable)
+	}
+	if !strings.Contains(msg.recoverable, "[a] again") {
+		t.Errorf("unresolved-veto flash must keep the winner-booting retry hint; got %q", msg.recoverable)
+	}
 	if mm.pendingAttach != "" {
 		t.Errorf("pendingAttach = %q; want empty (no respawn, no attach)", mm.pendingAttach)
 	}
