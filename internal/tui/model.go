@@ -962,6 +962,17 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			// definitively dead (died/rotated in the race) or unreachable
 			// (wrong socket) — routes to the recoverable both-causes flash
 			// (cross-socket guidance + retry hint), never a dead-end quit.
+			//
+			// Deliberate tradeoff (codex iter-3 P1 vs iter-4 P2): on an
+			// AMBIGUOUS probe error we refuse the attach. A transient tmux
+			// hiccup over a genuinely-live coord therefore shows the retry
+			// flash instead of attaching — but that is RECOVERABLE (press
+			// [a] again; the next probe succeeds). The opposite choice
+			// (attach on probe error) dead-ends the wrong-socket operator
+			// into a failed tmux attach AFTER the TUI has already quit,
+			// which is NOT recoverable from here. The operator's hard rule
+			// — "fleet attach never dead-ends" — breaks the tie toward the
+			// recoverable side, so we accept the rare extra retry.
 			alive, probeErr := sessionProbeFn(msg.session)
 			if msg.session == "" || probeErr != nil || !alive {
 				m.flash = &flashMsg{text: coordVetoRetryFlash(msg.projectName)}
