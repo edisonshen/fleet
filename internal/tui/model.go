@@ -948,22 +948,23 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// falsely promote a leader the TUI never booted and corrupt
 		// future [a] dedup. The in-flight gate is already cleared above.
 		if msg.attachedExisting {
-			// Re-probe before quitting into tmux attach. The callback
-			// resolved a live leader, but it can die in the window
-			// between resolution and here; without this check the TUI
-			// would quit and Run() would attach to a dead session,
-			// regressing to the raw "no sessions" UX (same guard the
-			// spawn-success path below uses). On a definitively-dead
-			// session, surface a recoverable retry flash instead of
-			// quitting — never a dead-end. sessionProbeOrAliveFn returns
-			// true on a transport error so a flaky socket doesn't block
-			// a real attach.
-			if msg.session != "" && !sessionProbeOrAliveFn(msg.session) {
-				m.flash = &flashMsg{
-					text: fmt.Sprintf(
-						"coord %s for %s went away before attach — press [a] again",
-						msg.agentID, msg.projectName),
-				}
+			// DEFINITIVE re-probe before quitting into tmux attach. The
+			// callback resolved the leader via FindLiveCoord /
+			// FindCoordByLockBody, which treat a tmux PROBE ERROR as
+			// "alive" (a transient hiccup must not drop a live claim). But
+			// a wrong FLEET_TMUX_SOCKET is a PERSISTENT probe error: the
+			// session is real yet unreachable from this process. If we
+			// trusted the error-tolerant probe and quit, Run() would
+			// tmux-attach to an unreachable session and dead-end the
+			// operator on tmux's raw error (codex iter-3 P1). So commit to
+			// the attach ONLY when sessionProbeFn confirms the session is
+			// reachable AND alive (err==nil && alive). Any other outcome —
+			// definitively dead (died/rotated in the race) or unreachable
+			// (wrong socket) — routes to the recoverable both-causes flash
+			// (cross-socket guidance + retry hint), never a dead-end quit.
+			alive, probeErr := sessionProbeFn(msg.session)
+			if msg.session == "" || probeErr != nil || !alive {
+				m.flash = &flashMsg{text: coordVetoRetryFlash(msg.projectName)}
 				return m, loadAgentsCmd()
 			}
 			m.flash = &flashMsg{

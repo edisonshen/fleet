@@ -245,6 +245,22 @@ type coordSpawnDoneMsg struct {
 // Keep all three in sync.
 const tuiCoordVetoExitCode = 75
 
+// coordVetoRetryFlash is the recoverable (non-error) flash shown when a
+// coord-spawn was vetoed (exit 75 — a live leader holds the lease) but
+// the TUI could not resolve+reach that leader to attach. It names BOTH
+// causes the operator can act on, mirroring cmd/fleet/attach.go's
+// handleCoordSpawnVeto: (1) the live coord is on a different tmux socket
+// (retries never resolve it until FLEET_TMUX_SOCKET is fixed), or (2)
+// the winning coord is still booting / just rotated (a retry succeeds).
+// Naming only cause 2 would loop a cross-socket operator forever
+// (surface, don't silo). Shared by the keys.go unresolved-veto branch
+// and the model.go re-probe-failed branch so the guidance is identical.
+func coordVetoRetryFlash(project string) string {
+	return fmt.Sprintf(
+		"coord lease for %s is held by a live leader not reachable from this TUI — likely (1) a coord on a different tmux socket (check FLEET_TMUX_SOCKET / `fleet status`) or (2) the winner is still booting / just rotated (press [a] again in a moment)",
+		project)
+}
+
 // fleetBinary is resolved once at startup via os.Executable() so the
 // TUI invokes ITSELF for sub-commands rather than depending on the
 // PATH-resolved `fleet`. Critical for dev runs (`go run`, install
@@ -2298,9 +2314,7 @@ func (m Model) startCoordSpawn(projectName, cwd string) tea.Cmd {
 				// don't silo). Do NOT swallow, do NOT respawn.
 				return coordSpawnDoneMsg{
 					projectName: projectName,
-					recoverable: fmt.Sprintf(
-						"coord lease for %s is held by a live leader not visible from this TUI — likely (1) a coord on a different tmux socket (check FLEET_TMUX_SOCKET / `fleet status`) or (2) the winner is still booting (press [a] again in a moment)",
-						projectName),
+					recoverable: coordVetoRetryFlash(projectName),
 				}
 			}
 			return coordSpawnDoneMsg{

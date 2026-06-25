@@ -160,9 +160,10 @@ func TestVeto_MarkerBackedLiveLeader_Attaches(t *testing.T) {
 	)
 	t.Cleanup(restorePL)
 	seedDiskCoord(t, "livecord", "demo", coordTaskID("demo"))
-	// Stub the tui-level liveness probe (model.go re-probes before
-	// attach) so the resolved session reads alive without real tmux.
-	stubAliveSessions(t, map[string]bool{"fleet-livecord": true})
+	// model.go now does a DEFINITIVE re-probe via sessionProbeFn before
+	// attach; stub it so the resolved session reads reachable+alive
+	// (true, nil) without real tmux.
+	(&stubSessionProbe{}).install(t)
 	stubFleetCmdInvokesCallback(t, "spawn vetoed\n", exitErr(t, tuiCoordVetoExitCode))
 
 	msg, mm := driveSpawn(t, projectRowModelForVeto("demo"))
@@ -197,7 +198,7 @@ func TestVeto_MarkerlessLiveLeader_Attaches(t *testing.T) {
 	// so the marker-gated resolver would have bailed. The record is still
 	// tagged coord-<project> so the markerless FindLiveCoord matches.
 	seedDiskCoord(t, "nomarker", "demo", coordTaskID("demo"))
-	stubAliveSessions(t, map[string]bool{"fleet-nomarker": true})
+	(&stubSessionProbe{}).install(t)
 	markerWrites := stubMarkerWrite(t)
 	stubFleetCmdInvokesCallback(t, "spawn vetoed\n", exitErr(t, tuiCoordVetoExitCode))
 
@@ -230,7 +231,7 @@ func TestVeto_LockBodyOnlyLiveLeader_Attaches(t *testing.T) {
 	// the lock body knows about this coord (manual/legacy spawn shape).
 	seedDiskCoord(t, "1c00d001", "demo", "manual-spawn")
 	seedLockBody(t, "demo", "1c00d001")
-	stubAliveSessions(t, map[string]bool{"fleet-1c00d001": true})
+	(&stubSessionProbe{}).install(t)
 	stubFleetCmdInvokesCallback(t, "spawn vetoed\n", exitErr(t, tuiCoordVetoExitCode))
 
 	msg, mm := driveSpawn(t, projectRowModelForVeto("demo"))
@@ -366,9 +367,10 @@ func TestVeto_LeaderDiesBeforeAttach_RecoverableNoQuit(t *testing.T) {
 	)
 	t.Cleanup(restorePL)
 	seedDiskCoord(t, "dyingcrd", "demo", coordTaskID("demo"))
-	// ...but the tui-level re-probe in model.go sees it DEAD (the race:
-	// it died between resolution and Update).
-	stubAliveSessions(t, map[string]bool{"fleet-dyingcrd": false})
+	// ...but the tui-level DEFINITIVE re-probe in model.go sees it DEAD
+	// (alive=false, no err — the race: it died between resolution and
+	// Update).
+	(&stubSessionProbe{dead: map[string]bool{"fleet-dyingcrd": true}}).install(t)
 	stubFleetCmdInvokesCallback(t, "spawn vetoed\n", exitErr(t, tuiCoordVetoExitCode))
 
 	m := projectRowModelForVeto("demo")
@@ -393,5 +395,63 @@ func TestVeto_LeaderDiesBeforeAttach_RecoverableNoQuit(t *testing.T) {
 	}
 	if !strings.Contains(mm.flash.text, "again") {
 		t.Errorf("flash should tell operator to retry; got %q", mm.flash.text)
+	}
+}
+
+// TestVeto_CrossSocketLeader_RecoverableNotDeadAttach — codex iter-3
+// [P1]: the live coord is on a DIFFERENT tmux socket (wrong
+// FLEET_TMUX_SOCKET). FindLiveCoord still matches because the
+// projectlookup probe treats a tmux transport ERROR as "alive" (don't
+// drop a live claim on a hiccup), so the callback returns
+// attachedExisting=true. But the model.go DEFINITIVE re-probe
+// (sessionProbeFn) returns a transport error for the unreachable
+// session — so the TUI must NOT quit into a doomed tmux attach. Instead
+// it surfaces the cross-socket guidance (FLEET_TMUX_SOCKET) and stays in
+// the TUI. This is the exact dead-end the never-exit rule forbids.
+func TestVeto_CrossSocketLeader_RecoverableNotDeadAttach(t *testing.T) {
+	withFleetHome(t)
+	seedProjectMeta(t, "demo", t.TempDir())
+	// Callback-side projectlookup probe: alive=false but probe ERRORS →
+	// projectlookup's sessionAliveOrProbe treats the error as alive, so
+	// FindLiveCoord resolves the cross-socket coord.
+	restorePL := projectlookup.SetTestStubs(
+		func(s string) bool { return false },
+		func(s string) (bool, error) {
+			if s == "fleet-xsocket01" {
+				return false, errors.New("no server on this socket")
+			}
+			return false, nil
+		},
+		nil,
+	)
+	t.Cleanup(restorePL)
+	seedDiskCoord(t, "xsocket01", "demo", coordTaskID("demo"))
+	// tui-level DEFINITIVE re-probe ERRORS for the unreachable session
+	// (wrong socket) → model.go must route to the cross-socket flash.
+	(&stubSessionProbe{errSessions: map[string]bool{"fleet-xsocket01": true}}).install(t)
+	stubFleetCmdInvokesCallback(t, "spawn vetoed\n", exitErr(t, tuiCoordVetoExitCode))
+
+	m := projectRowModelForVeto("demo")
+	_, cmd := m.Update(keyMsg("a"))
+	if cmd == nil {
+		t.Fatal("[a] should produce a spawn cmd")
+	}
+	msg := cmd().(coordSpawnDoneMsg)
+	if !msg.attachedExisting {
+		t.Fatalf("callback should resolve attachedExisting=true via probe-error-as-alive; got %+v", msg)
+	}
+	updated, attachCmd := m.Update(msg)
+	mm := updated.(Model)
+	if mm.pendingAttach != "" {
+		t.Errorf("cross-socket: must NOT quit into a doomed attach; pendingAttach=%q want empty", mm.pendingAttach)
+	}
+	if attachCmd == nil {
+		t.Error("expected loadAgentsCmd refresh (stay in TUI), got nil")
+	}
+	if mm.flash == nil || mm.flash.isErr {
+		t.Fatalf("expected recoverable non-err flash; got %+v", mm.flash)
+	}
+	if !strings.Contains(mm.flash.text, "FLEET_TMUX_SOCKET") {
+		t.Errorf("cross-socket flash must surface the FLEET_TMUX_SOCKET next step; got %q", mm.flash.text)
 	}
 }
