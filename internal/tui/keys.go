@@ -2286,10 +2286,16 @@ func (m Model) startCoordSpawn(projectName, cwd string) tea.Cmd {
 			var ee *exec.ExitError
 			if errors.As(err, &ee) && ee.ExitCode() == tuiCoordVetoExitCode {
 				records, badIDs, lerr := agent.ListStrict()
-				// FindLiveCoord FIRST, FindCoordByLockBody as fallback — the
-				// exact order cmd/fleet/attach.go's handleCoordSpawnVeto uses,
-				// which the plan mandates mirroring. The lock body is NOT
-				// authoritative during a handoff/rotation window:
+				// FindLiveCoord FIRST, FindCoordByLockBody as fallback. This
+				// is the order used by BOTH (a) cmd/fleet/attach.go's
+				// handleCoordSpawnVeto (the exact path the plan mandates
+				// mirroring, attach.go FindLiveCoord→FindCoordByLockBody) AND
+				// (b) the TUI's own existing [a] resolution — Path 1 and Path
+				// 2/2.5 resolve the live coord (findExistingCoordForProject)
+				// first and consult the lock body only as a fallback. So this
+				// veto path stays consistent with the rest of the codebase,
+				// not divergent. The lock body is NOT authoritative during a
+				// handoff/rotation window:
 				// skills/coordinator/loop.py:_try_lock writes the body only
 				// after LOCK_EX and the body is explicitly allowed to stay
 				// stale, so a still-live PREDECESSOR can linger in
