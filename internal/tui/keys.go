@@ -2286,17 +2286,21 @@ func (m Model) startCoordSpawn(projectName, cwd string) tea.Cmd {
 			var ee *exec.ExitError
 			if errors.As(err, &ee) && ee.ExitCode() == tuiCoordVetoExitCode {
 				records, badIDs, lerr := agent.ListStrict()
-				// Lock-holder FIRST (codex iter-8 P1). The veto fired because
-				// a coord holds coordinator.lock — that lock body is the
-				// AUTHORITATIVE leader (a lease-holding coord wrote its ID via
-				// LOCK_EX). FindLiveCoord just returns the first alive
-				// coord-<project> record in directory order, which during a
-				// handoff/rotation window (two live coords briefly) can be the
-				// OUTGOING coord, not the leader the operator was vetoed
-				// against. So resolve the lock holder first, then fall back to
-				// FindLiveCoord for legacy/manual coords whose lock body is
-				// empty/stale. Both are the markerless pair the plan mandates.
-				if rec, ok := projectlookup.FindCoordByLockBody(records, projectName); ok {
+				// FindLiveCoord FIRST, FindCoordByLockBody as fallback — the
+				// exact order cmd/fleet/attach.go's handleCoordSpawnVeto uses,
+				// which the plan mandates mirroring. The lock body is NOT
+				// authoritative during a handoff/rotation window:
+				// skills/coordinator/loop.py:_try_lock writes the body only
+				// after LOCK_EX and the body is explicitly allowed to stay
+				// stale, so a still-live PREDECESSOR can linger in
+				// coordinator.lock while a newer coord is the one that
+				// actually vetoed. Trusting the lock body first would
+				// deterministically attach the operator to that stale
+				// predecessor (codex iter-9). FindLiveCoord (a live
+				// coord-<project> record) is the better primary signal; the
+				// lock body resolves only legacy/manual coords FindLiveCoord
+				// can't see (no coord-<project> task_id tag).
+				if rec, ok := projectlookup.FindLiveCoord(records, projectName); ok {
 					return coordSpawnDoneMsg{
 						projectName:      projectName,
 						agentID:          rec.ID,
@@ -2304,7 +2308,7 @@ func (m Model) startCoordSpawn(projectName, cwd string) tea.Cmd {
 						attachedExisting: true,
 					}
 				}
-				if rec, ok := projectlookup.FindLiveCoord(records, projectName); ok {
+				if rec, ok := projectlookup.FindCoordByLockBody(records, projectName); ok {
 					return coordSpawnDoneMsg{
 						projectName:      projectName,
 						agentID:          rec.ID,

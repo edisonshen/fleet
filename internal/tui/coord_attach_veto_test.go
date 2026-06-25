@@ -270,38 +270,40 @@ func TestVeto_LockBodyOnlyLiveLeader_Attaches(t *testing.T) {
 	}
 }
 
-// TestVeto_MultipleLiveCoords_LockHolderWins — codex iter-8 [P1]: during
-// a handoff/rotation window two live coord-<project> records exist. The
-// veto fired against the lock HOLDER, so the attach must target the lock
-// body's coord, not whichever live coord-<project> record happens to be
-// first in directory order. Resolving FindCoordByLockBody before
-// FindLiveCoord guarantees the authoritative leader wins.
-func TestVeto_MultipleLiveCoords_LockHolderWins(t *testing.T) {
+// TestVeto_LiveCoordPreferredOverStaleLockBody — codex iter-9 [P2]: the
+// coordinator.lock body is NOT authoritative during a rotation window —
+// loop.py writes it under LOCK_EX but it is allowed to stay stale, so a
+// live PREDECESSOR can linger there. The attach must prefer the live
+// coord-<project> record (FindLiveCoord) over whatever the lock body
+// says, mirroring the CLI veto path. Here the lock body points at a
+// different (stale) id; FindLiveCoord's live coord must win.
+func TestVeto_LiveCoordPreferredOverStaleLockBody(t *testing.T) {
 	withFleetHome(t)
 	seedProjectMeta(t, "demo", t.TempDir())
-	// Both coords alive. "0fd00002" sorts before "1eade001" in the
-	// agents/ dir, so FindLiveCoord (directory order) would pick it — but
-	// the lock body names "1eade001" as the leader.
 	restorePL := projectlookup.SetTestStubs(
-		func(s string) bool { return s == "fleet-0fd00002" || s == "fleet-1eade001" },
+		func(s string) bool { return s == "fleet-1eade001" || s == "fleet-deadbeef" },
 		func(s string) (bool, error) {
-			return s == "fleet-0fd00002" || s == "fleet-1eade001", nil
+			return s == "fleet-1eade001" || s == "fleet-deadbeef", nil
 		},
 		nil,
 	)
 	t.Cleanup(restorePL)
-	seedDiskCoord(t, "0fd00002", "demo", coordTaskID("demo")) // outgoing, sorts first
-	seedDiskCoord(t, "1eade001", "demo", coordTaskID("demo")) // leader (lock holder)
-	seedLockBody(t, "demo", "1eade001")
+	// 1eade001 is the live coord-<project> record (FindLiveCoord target).
+	seedDiskCoord(t, "1eade001", "demo", coordTaskID("demo"))
+	// deadbeef is only known via the (stale) lock body — NOT a
+	// coord-<project> record, so FindLiveCoord never sees it. Lock-body-
+	// first would wrongly attach it; FindLiveCoord-first must win.
+	seedDiskCoord(t, "deadbeef", "demo", "stale-predecessor")
+	seedLockBody(t, "demo", "deadbeef")
 	(&stubSessionProbe{}).install(t)
 	stubFleetCmdInvokesCallback(t, "spawn vetoed\n", exitErr(t, tuiCoordVetoExitCode))
 
 	msg, mm := driveSpawn(t, projectRowModelForVeto("demo"))
 	if !msg.attachedExisting {
-		t.Fatalf("multi-coord veto must still attach; got %+v", msg)
+		t.Fatalf("veto must still attach; got %+v", msg)
 	}
 	if mm.pendingAttach != "fleet-1eade001" {
-		t.Errorf("pendingAttach = %q; want fleet-1eade001 (lock holder must win over directory-first live coord fleet-0fd00002)", mm.pendingAttach)
+		t.Errorf("pendingAttach = %q; want fleet-1eade001 (live coord must win over stale lock-body holder fleet-deadbeef)", mm.pendingAttach)
 	}
 }
 
