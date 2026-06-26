@@ -939,6 +939,62 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.projectAddCoordSpawn != nil {
 			delete(m.projectAddCoordSpawn, msg.projectName)
 		}
+		// Exit-75 attach-the-live-leader path (project-row [a] on a
+		// project whose coord already holds the lease). The callback
+		// already re-resolved the live coord from disk, so we ONLY
+		// attach here — and crucially we do NOT call
+		// writeCoordSpawnMarkerFn (codex round-2 P1): the TUI did not
+		// spawn this coord, so stamping the coord-spawn marker would
+		// falsely promote a leader the TUI never booted and corrupt
+		// future [a] dedup. The in-flight gate is already cleared above.
+		if msg.attachedExisting {
+			// DEFINITIVE re-probe before quitting into tmux attach. The
+			// callback resolved the leader via FindLiveCoord /
+			// FindCoordByLockBody, which treat a tmux PROBE ERROR as
+			// "alive" (a transient hiccup must not drop a live claim). But
+			// a wrong FLEET_TMUX_SOCKET is a PERSISTENT probe error: the
+			// session is real yet unreachable from this process. If we
+			// trusted the error-tolerant probe and quit, Run() would
+			// tmux-attach to an unreachable session and dead-end the
+			// operator on tmux's raw error (codex iter-3 P1). So commit to
+			// the attach ONLY when sessionProbeFn confirms the session is
+			// reachable AND alive (err==nil && alive). Any other outcome —
+			// definitively dead (died/rotated in the race) or unreachable
+			// (wrong socket) — routes to the recoverable both-causes flash
+			// (cross-socket guidance + retry hint), never a dead-end quit.
+			//
+			// Deliberate tradeoff (codex iter-3 P1 vs iter-4 P2): on an
+			// AMBIGUOUS probe error we refuse the attach. A transient tmux
+			// hiccup over a genuinely-live coord therefore shows the retry
+			// flash instead of attaching — but that is RECOVERABLE (press
+			// [a] again; the next probe succeeds). The opposite choice
+			// (attach on probe error) dead-ends the wrong-socket operator
+			// into a failed tmux attach AFTER the TUI has already quit,
+			// which is NOT recoverable from here. The operator's hard rule
+			// — "fleet attach never dead-ends" — breaks the tie toward the
+			// recoverable side, so we accept the rare extra retry.
+			alive, probeErr := sessionProbeFn(msg.session)
+			if msg.session == "" || probeErr != nil || !alive {
+				m.flash = &flashMsg{text: coordVetoRetryFlash(msg.projectName)}
+				return m, loadAgentsCmd()
+			}
+			m.flash = &flashMsg{
+				text: fmt.Sprintf(
+					"attached to live coord %s for %s",
+					msg.agentID, msg.projectName),
+			}
+			m.pendingAttach = msg.session
+			return m, tea.Quit
+		}
+		// Exit-75 but the live leader's record isn't on disk yet — a
+		// recoverable, non-fatal flash (never a banner, never a
+		// respawn). Mirrors handleCoordSpawnVeto's wait-and-retry
+		// contract: the operator presses [a] again once the winner
+		// publishes its record.
+		if msg.recoverable != "" {
+			m.flash = &flashMsg{text: msg.recoverable}
+			return m, loadAgentsCmd()
+		}
 		// Issues #60, #63: project-row [a] auto-spawn result. err non-nil
 		// covers init failures, dispatch failures, and agent-ID parse
 		// failures; surface as a flash so the operator can decide

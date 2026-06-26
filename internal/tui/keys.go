@@ -210,6 +210,22 @@ type coordSpawnDoneMsg struct {
 	agentID     string
 	session     string
 	err         error
+	// attachedExisting is true when dispatch vetoed the spawn (exit 75 —
+	// a healthy leader already holds the lease) AND the callback re-
+	// resolved that live leader on disk. The Update handler then attaches
+	// to the existing coord (pendingAttach + tea.Quit) WITHOUT writing the
+	// coord-spawn marker — the TUI did not spawn this coord, so stamping
+	// the marker would corrupt [a] dedup semantics (codex round-2 P1). A
+	// distinct field (not reusing the spawn-success shape) keeps the
+	// "attached a live coord" outcome from threading through the marker-
+	// writing default branch in model.go.
+	attachedExisting bool
+	// recoverable, when set on a no-error message, carries a non-fatal
+	// flash (isErr=false): the spawn was vetoed (exit 75) but the live
+	// leader's record was not yet visible on disk. The operator is told
+	// to press [a] again — never an error banner, never a respawn. Mirrors
+	// handleCoordSpawnVeto's "wait-and-retry, never exit 70" contract.
+	recoverable string
 	// promptDelivered is true when dispatch's stdout did NOT contain
 	// the dispatchPromptFailedMarker — i.e. SendInitialPrompt
 	// succeeded and /coordinator was actually typed into the pane.
@@ -218,6 +234,43 @@ type coordSpawnDoneMsg struct {
 	// started; the TUI must not promote it to the project's coord via
 	// the marker file). Codex iter-5 P2.
 	promptDelivered bool
+}
+
+// tuiCoordVetoExitCode is the exit code `fleet dispatch --coord-spawn`
+// returns when a healthy coord already holds the project's lease (EX_
+// TEMPFAIL): the spawn stood down and the caller must ATTACH the live
+// leader, not surface an error. Duplicated here because the tui package
+// cannot import the `main` package — mirrors cmd/fleet/attach.go's
+// dispatchVetoExitCode and cmd/fleet/dispatch.go's vetoExitCode, both 75.
+// Keep all three in sync.
+const tuiCoordVetoExitCode = 75
+
+// coordVetoRetryFlash is the recoverable (non-error) flash shown when a
+// coord-spawn was vetoed (exit 75 — a live leader holds the lease) but
+// the TUI could not resolve+reach that leader to attach. It names BOTH
+// causes the operator can act on, mirroring cmd/fleet/attach.go's
+// handleCoordSpawnVeto: (1) the live coord is on a different tmux socket
+// (retries never resolve it until FLEET_TMUX_SOCKET is fixed), or (2)
+// the winning coord is still booting / just rotated (a retry succeeds).
+// Naming only cause 2 would loop a cross-socket operator forever
+// (surface, don't silo). Shared by the keys.go unresolved-veto branch
+// and the model.go re-probe-failed branch so the guidance is identical.
+func coordVetoRetryFlash(project string) string {
+	return fmt.Sprintf(
+		"coord lease for %s is held by a live leader not reachable from this TUI — likely (1) a coord on a different tmux socket (check FLEET_TMUX_SOCKET / `fleet status`) or (2) the winner is still booting / just rotated (press [a] again in a moment)",
+		project)
+}
+
+// summarizeBadIDs renders ListStrict's corrupt-record IDs for a flash,
+// capped so a directory full of unparseable JSON (the project has a
+// history of thousands of leaked ~/.fleet files) can't blow out the TUI
+// render with a multi-KB line. Shows the first few, then "(and N more)".
+func summarizeBadIDs(badIDs []string) string {
+	const cap = 3
+	if len(badIDs) <= cap {
+		return strings.Join(badIDs, ", ")
+	}
+	return fmt.Sprintf("%s, (and %d more)", strings.Join(badIDs[:cap], ", "), len(badIDs)-cap)
 }
 
 // fleetBinary is resolved once at startup via os.Executable() so the
@@ -2218,6 +2271,82 @@ func (m Model) startCoordSpawn(projectName, cwd string) tea.Cmd {
 	args = append(args, "--engine", "claude-code")
 	return runFleetCmd(args, func(out string, err error) tea.Msg {
 		if err != nil {
+			// Exit 75 (EX_TEMPFAIL) is NOT a failure: a healthy coord
+			// already holds the project's lease and the spawn stood
+			// down. This is the "attach the live one" signal — the
+			// operator's [a] must land them in the existing coord, never
+			// a fatal banner ("fleet attach never exits"). Mirror the CLI
+			// veto path (cmd/fleet/attach.go handleCoordSpawnVeto): re-
+			// read records FROM DISK here in the callback goroutine (the
+			// Update handler only sees the cached m.records, which can
+			// false-negative a winner already on disk) and resolve the
+			// leader with the markerless projectlookup pair. Do NOT use
+			// findExistingCoordForProject — it is marker-gated by design
+			// and would drop a live coord started outside the TUI.
+			var ee *exec.ExitError
+			if errors.As(err, &ee) && ee.ExitCode() == tuiCoordVetoExitCode {
+				records, badIDs, lerr := agent.ListStrict()
+				// FindLiveCoord FIRST, FindCoordByLockBody as fallback. This
+				// is the order used by BOTH (a) cmd/fleet/attach.go's
+				// handleCoordSpawnVeto (the exact path the plan mandates
+				// mirroring, attach.go FindLiveCoord→FindCoordByLockBody) AND
+				// (b) the TUI's own existing [a] resolution — Path 1 and Path
+				// 2/2.5 resolve the live coord (findExistingCoordForProject)
+				// first and consult the lock body only as a fallback. So this
+				// veto path stays consistent with the rest of the codebase,
+				// not divergent. The lock body is NOT authoritative during a
+				// handoff/rotation window:
+				// skills/coordinator/loop.py:_try_lock writes the body only
+				// after LOCK_EX and the body is explicitly allowed to stay
+				// stale, so a still-live PREDECESSOR can linger in
+				// coordinator.lock while a newer coord is the one that
+				// actually vetoed. Trusting the lock body first would
+				// deterministically attach the operator to that stale
+				// predecessor (codex iter-9). FindLiveCoord (a live
+				// coord-<project> record) is the better primary signal; the
+				// lock body resolves only legacy/manual coords FindLiveCoord
+				// can't see (no coord-<project> task_id tag).
+				if rec, ok := projectlookup.FindLiveCoord(records, projectName); ok {
+					return coordSpawnDoneMsg{
+						projectName:      projectName,
+						agentID:          rec.ID,
+						session:          rec.TmuxSession,
+						attachedExisting: true,
+					}
+				}
+				if rec, ok := projectlookup.FindCoordByLockBody(records, projectName); ok {
+					return coordSpawnDoneMsg{
+						projectName:      projectName,
+						agentID:          rec.ID,
+						session:          rec.TmuxSession,
+						attachedExisting: true,
+					}
+				}
+				// Lease held but no live record resolved from THIS process.
+				// RECOVERABLE (non-error) — exit 75 already told us a live
+				// coord exists, so a fatal banner here would dead-end an
+				// operator who just needs to retry or fix their environment
+				// (codex iter-5 P2; same retryable treatment
+				// cmd/fleet/attach.go's handleCoordSpawnVeto gives). ALWAYS
+				// LEAD with the actionable retry/socket guidance
+				// (coordVetoRetryFlash) — never let a disk diagnostic SUPPRESS
+				// it (codex iter-8 P2: badIDs is global across all projects,
+				// so an unrelated project's corrupt file must not hijack the
+				// message and send the operator chasing irrelevant records).
+				// Append the disk diagnostic only as a secondary note so the
+				// real fault is still surfaced (don't silo).
+				flash := coordVetoRetryFlash(projectName)
+				switch {
+				case lerr != nil:
+					flash += fmt.Sprintf(" — note: reading ~/.fleet/agents failed (%v), which may be hiding the leader", lerr)
+				case len(badIDs) > 0:
+					flash += fmt.Sprintf(" — note: %d corrupt agent record(s) present (%s); the leader may be among them if retries keep failing", len(badIDs), summarizeBadIDs(badIDs))
+				}
+				return coordSpawnDoneMsg{
+					projectName: projectName,
+					recoverable: flash,
+				}
+			}
 			return coordSpawnDoneMsg{
 				projectName: projectName,
 				err:         fmt.Errorf("dispatch: %w\n%s", err, out),
