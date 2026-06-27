@@ -1583,3 +1583,43 @@ func TestUpdateStateGenEmitsFleetlog(t *testing.T) {
 		t.Errorf("UpdateStateGen: no state.transition fleetlog event for slug-fl2; lines: %v", lines)
 	}
 }
+
+// TestUpdateStateNoPhaseChangeOmitsFleetlog verifies that a metadata-only
+// UpdateState call (e.g. `fleet workers update --review-*` which bumps
+// review counters without changing Phase) does NOT emit a state.transition
+// event. A bogus "review-done -> review-done" log line would mislead
+// agents reconstructing worker lifecycle from the debug log.
+func TestUpdateStateNoPhaseChangeOmitsFleetlog(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("FLEET_HOME", tmp)
+	t.Setenv("XDG_STATE_HOME", "")
+	logDir := fleetlog.Dir()
+
+	// Seed initial state at review-done.
+	if err := WriteState("proj", "slug-fl3", &State{
+		Slug: "slug-fl3", Project: "proj", Phase: PhaseReviewDone,
+		ReviewClaudeStatus: ReviewStatusPassed,
+		ReviewCodexStatus:  ReviewStatusPassed,
+	}); err != nil {
+		t.Fatalf("WriteState: %v", err)
+	}
+	// Metadata-only update — phase stays review-done.
+	if err := UpdateState("proj", "slug-fl3", func(s *State) {
+		s.ReviewClaudeRounds = 2 // bump counter; Phase unchanged
+	}); err != nil {
+		t.Fatalf("UpdateState no-phase-change: %v", err)
+	}
+	lines := readFleetlogLines(t, logDir)
+	var bogus int
+	for _, m := range lines {
+		if m["type"] == "state.transition" && m["slug"] == "slug-fl3" {
+			d, _ := m["data"].(map[string]any)
+			if d["from"] == d["to"] {
+				bogus++
+			}
+		}
+	}
+	if bogus > 0 {
+		t.Errorf("UpdateState no-phase-change: emitted %d bogus state.transition(s) with from==to", bogus)
+	}
+}

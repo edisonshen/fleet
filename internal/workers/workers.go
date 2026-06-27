@@ -319,9 +319,12 @@ func WriteState(project, slug string, s *State) error {
 	if werr := writeStateLocked(project, slug, s); werr != nil {
 		return werr
 	}
-	// fleetlog: record the phase transition. Fire-and-forget; a logging
-	// failure must never fail the state write.
-	if s != nil {
+	// fleetlog: record the phase transition only when the phase actually
+	// changed. Some callers (e.g. `fleet workers update --review-*`) mutate
+	// review metadata without bumping Phase — emitting "review-done ->
+	// review-done" would produce bogus transition lines that mislead log
+	// consumers trying to reconstruct the worker lifecycle.
+	if s != nil && from != s.Phase {
 		fleetlog.Log(fleetlog.CompWorker, "state.transition", "info", fleetlog.Fields{
 			Proj: project,
 			Slug: slug,
@@ -431,15 +434,17 @@ func UpdateState(project, slug string, mutate func(*State)) error {
 		if werr := writeStateLocked(project, slug, cur); werr != nil {
 			return werr
 		}
-		// fleetlog: record the phase transition. Fire-and-forget; a logging
-		// failure must never fail the state write.
-		fleetlog.Log(fleetlog.CompWorker, "state.transition", "info", fleetlog.Fields{
-			Proj: project,
-			Slug: slug,
-			Gen:  cur.DispatchGeneration,
-			Msg:  fmt.Sprintf("worker %s phase %s -> %s", slug, from, cur.Phase),
-			Data: map[string]any{"from": string(from), "to": string(cur.Phase)},
-		})
+		// fleetlog: only log when the phase actually changed (avoid bogus
+		// "review-done -> review-done" entries for metadata-only updates).
+		if from != cur.Phase {
+			fleetlog.Log(fleetlog.CompWorker, "state.transition", "info", fleetlog.Fields{
+				Proj: project,
+				Slug: slug,
+				Gen:  cur.DispatchGeneration,
+				Msg:  fmt.Sprintf("worker %s phase %s -> %s", slug, from, cur.Phase),
+				Data: map[string]any{"from": string(from), "to": string(cur.Phase)},
+			})
+		}
 		return nil
 	})
 }
@@ -523,15 +528,17 @@ func UpdateStateGen(project, slug string, n, taskGen int, mutate func(*State)) e
 		if werr := writeStateLocked(project, slug, cur); werr != nil {
 			return werr
 		}
-		// fleetlog: record the phase transition. Fire-and-forget; a logging
-		// failure must never fail the state write.
-		fleetlog.Log(fleetlog.CompWorker, "state.transition", "info", fleetlog.Fields{
-			Proj: project,
-			Slug: slug,
-			Gen:  cur.DispatchGeneration,
-			Msg:  fmt.Sprintf("worker %s phase %s -> %s", slug, from, cur.Phase),
-			Data: map[string]any{"from": string(from), "to": string(cur.Phase)},
-		})
+		// fleetlog: only log when the phase actually changed (avoid bogus
+		// "review-done -> review-done" entries for metadata-only updates).
+		if from != cur.Phase {
+			fleetlog.Log(fleetlog.CompWorker, "state.transition", "info", fleetlog.Fields{
+				Proj: project,
+				Slug: slug,
+				Gen:  cur.DispatchGeneration,
+				Msg:  fmt.Sprintf("worker %s phase %s -> %s", slug, from, cur.Phase),
+				Data: map[string]any{"from": string(from), "to": string(cur.Phase)},
+			})
+		}
 		return nil
 	})
 }
