@@ -57,8 +57,32 @@ func TestFleetlogLifecycle(t *testing.T) {
 	const slug = "lifecycle-task"
 
 	// --- Trigger 1: a real Python coord tick (coord.tick x2 + dispatch.worker)
+	//
+	// The tick's dispatch path execs the real `fleet` binary
+	// (acquire_coord_prompt_inbox -> `fleet claims ...`), so the driver
+	// needs `fleet` on PATH. A dev box usually has a stale operator-
+	// installed fleet on PATH (why this passed locally); CI has none,
+	// so the dispatch failed and the driver exited 3 (dispatched=0).
+	// Build the binary from THIS checkout and prepend its dir to the
+	// driver's PATH — hermetic in CI and on a dev box (uses the
+	// just-built bytes, not whatever fleet the operator happens to have).
+	fleetBin := buildFleetBinary(t)
+	binDir := filepath.Dir(fleetBin)
 	cmd := exec.Command(python, driver, skillDir, home, home, project, slug)
-	cmd.Env = append(os.Environ(), "FLEET_HOME="+home, "PYTHONDONTWRITEBYTECODE=1")
+	// Rebuild env with PATH prepended. A duplicate PATH= entry appended
+	// after os.Environ() would NOT win (glibc getenv takes the first
+	// match), so filter the inherited PATH out before setting ours.
+	newPath := binDir + string(os.PathListSeparator) + os.Getenv("PATH")
+	env := os.Environ()
+	filtered := env[:0]
+	for _, kv := range env {
+		if strings.HasPrefix(kv, "PATH=") {
+			continue
+		}
+		filtered = append(filtered, kv)
+	}
+	filtered = append(filtered, "FLEET_HOME="+home, "PYTHONDONTWRITEBYTECODE=1", "PATH="+newPath)
+	cmd.Env = filtered
 	if out, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("coord tick driver failed: %v\n%s", err, out)
 	}
