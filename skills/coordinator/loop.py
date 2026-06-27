@@ -428,6 +428,11 @@ def tick(
         result.skipped = True
         result.reason = reason_code
         result.raised += 1
+        # fleetlog: record the skipped tick so log consumers see repo-resolve
+        # refusals rather than an unexplained gap.
+        _flog(_FLOG_COORD, "coord.tick", "info", proj=project, agent=coord_id,
+              msg=f"coord tick skipped: {reason_code} for {project}",
+              data={"skipped": True, "reason": reason_code})
         try:
             fcntl.flock(lock_fd, fcntl.LOCK_UN)
         finally:

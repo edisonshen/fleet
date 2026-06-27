@@ -1348,15 +1348,18 @@ func Spawn(opts Options) (*agent.Record, error) {
 	// iter-1 P1 / iter-2 P2.
 	//
 	// fleetlog: record the spawn. Fire-and-forget; never fails the spawn.
-	// Task-worker spawns use comp=worker + event=worker.start so consumers
-	// filtering comp=worker see the start event alongside later
-	// state.transition records. Coordinator spawns use comp=coord +
-	// event=coord.start to keep the coord lifecycle stream separate.
-	spawnComp, spawnEvt := fleetlog.CompWorker, "worker.start"
+	// comp=cli for all spawns because this code runs in the CLI process
+	// (fleet dispatch/handoff/drain), not in the new agent session. The
+	// design invariant is that comp+pid identifies the EMITTING process;
+	// the event type (worker.start / coord.start) carries the semantic
+	// identity of what was spawned. Coord spawns additionally use the
+	// coord event type so log consumers can distinguish coord vs task-worker
+	// lifecycle events even within the CLI component stream.
+	spawnEvt := "worker.start"
 	if rec.IsCoord {
-		spawnComp, spawnEvt = fleetlog.CompCoord, "coord.start"
+		spawnEvt = "coord.start"
 	}
-	fleetlog.Log(spawnComp, spawnEvt, "info", fleetlog.Fields{
+	fleetlog.Log(fleetlog.CompCLI, spawnEvt, "info", fleetlog.Fields{
 		Proj:  rec.Project,
 		Agent: rec.ID,
 		Slug:  rec.TaskID,
