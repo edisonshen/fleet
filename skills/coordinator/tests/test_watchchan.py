@@ -149,7 +149,10 @@ def test_read_heartbeat_and_list(tmp_path):
     assert wc.list_pending(tmp_path) == []
 
 
-# A corrupt/partial JSON file is skipped by the drain, never crashes it.
+# A missing channel directory yields empty pending, never crashes the drain.
+# (read_message deliberately RAISES on corrupt/newer-schema bytes so the caller
+# can quarantine — see test_read_message_refuses_newer_schema; the listing pass
+# itself only needs to survive an absent dir.)
 def test_list_pending_tolerates_missing_dir(tmp_path):
     # directory never created -> empty pending, no error.
     assert wc.list_pending(tmp_path / "nope") == []
