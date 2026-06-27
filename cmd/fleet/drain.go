@@ -83,7 +83,7 @@ down when a healthy leader holds the lease, verifies the handoff-complete
 barrier before a graceful kill, and escalates a slow/hung handoff to the
 safety-net takeover after --resume-timeout-ms instead of blocking.`,
 		RunE: func(c *cobra.Command, _ []string) error {
-			finish := fleetlog.CLIStart("drain")
+			finish := fleetlog.CLIStart(fleetlog.Fields{}, "drain")
 			err := runDrain(c.OutOrStdout(), c.ErrOrStderr(), graceMillis, resumeTimeoutMilli)
 			finish(err)
 			return err

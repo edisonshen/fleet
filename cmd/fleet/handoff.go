@@ -96,7 +96,7 @@ outgoing record and increments handoff_number by 1.`,
 				return fmt.Errorf("--no-auto-resume and --auto-resume are mutually exclusive")
 			}
 			opts.autoResumeFlagWasSet = noChanged || yesChanged
-			finish := fleetlog.CLIStart("handoff", opts.oldID)
+			finish := fleetlog.CLIStart(fleetlog.Fields{}, "handoff", opts.oldID)
 			err := runHandoff(opts, cmd.OutOrStdout(), cmd.ErrOrStderr())
 			finish(err)
 			return err

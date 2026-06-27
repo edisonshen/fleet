@@ -325,6 +325,10 @@ func WriteState(project, slug string, s *State) error {
 		fleetlog.Log(fleetlog.CompWorker, "state.transition", "info", fleetlog.Fields{
 			Proj: project,
 			Slug: slug,
+			// Gen threads the dispatch generation so log consumers can
+			// distinguish transitions from different redispatch attempts
+			// of the same slug (crash recovery, stale-worker reissue, etc.).
+			Gen:  s.DispatchGeneration,
 			Msg:  fmt.Sprintf("worker %s phase %s -> %s", slug, from, s.Phase),
 			Data: map[string]any{"from": string(from), "to": string(s.Phase)},
 		})
@@ -432,6 +436,7 @@ func UpdateState(project, slug string, mutate func(*State)) error {
 		fleetlog.Log(fleetlog.CompWorker, "state.transition", "info", fleetlog.Fields{
 			Proj: project,
 			Slug: slug,
+			Gen:  cur.DispatchGeneration,
 			Msg:  fmt.Sprintf("worker %s phase %s -> %s", slug, from, cur.Phase),
 			Data: map[string]any{"from": string(from), "to": string(cur.Phase)},
 		})
@@ -523,6 +528,7 @@ func UpdateStateGen(project, slug string, n, taskGen int, mutate func(*State)) e
 		fleetlog.Log(fleetlog.CompWorker, "state.transition", "info", fleetlog.Fields{
 			Proj: project,
 			Slug: slug,
+			Gen:  cur.DispatchGeneration,
 			Msg:  fmt.Sprintf("worker %s phase %s -> %s", slug, from, cur.Phase),
 			Data: map[string]any{"from": string(from), "to": string(cur.Phase)},
 		})

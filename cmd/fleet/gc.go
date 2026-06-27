@@ -123,7 +123,7 @@ Exit codes:
   1  — sweep failed before any classifier ran (CLI parse / dep wiring)`,
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			finish := fleetlog.CLIStart("gc")
+			finish := fleetlog.CLIStart(fleetlog.Fields{}, "gc")
 			err := runGC(cmd.OutOrStdout(), cmd.ErrOrStderr(), f)
 			finish(err)
 			return err

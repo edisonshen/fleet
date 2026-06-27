@@ -104,6 +104,47 @@ def test_tick_throttles_prune_when_marker_fresh(home, monkeypatch):
     assert stale.exists()  # throttle skipped the scan; stale survives
 
 
+def test_tick_lock_busy_emits_fleetlog(home, monkeypatch):
+    """T2b: a lock-busy early-return emits a coord.tick event so the debug
+    log has a record of the skipped tick (not just a gap)."""
+    import fcntl
+    import os
+    import fleetlog
+    import importlib
+    importlib.reload(fleetlog)
+
+    project = "fleet"
+    pdir = home / "projects" / project
+    pdir.mkdir(parents=True, exist_ok=True)
+    (pdir / ".locks").mkdir(exist_ok=True)
+
+    # Hold the coordinator lock from a separate fd to force lock-busy.
+    lock_path = pdir / ".locks" / "coordinator.lock"
+    lock_path.touch()
+    holder_fd = os.open(str(lock_path), os.O_RDWR)
+    fcntl.flock(holder_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    try:
+        result = loop.tick(project, coord_id="some-coord", cwd=str(pdir),
+                           fleet_home=str(home))
+        assert result.skipped
+        assert result.reason in ("lock-busy", "duplicate-coord-self-exit")
+
+        # The fleetlog must have a coord.tick event with skipped=True.
+        log_dir = Path(fleetlog.dir())
+        events = []
+        for f in sorted(log_dir.glob("*.jsonl")):
+            for ln in f.read_text().splitlines():
+                if ln:
+                    events.append(json.loads(ln))
+        skipped = [e for e in events
+                   if e.get("type") == "coord.tick"
+                   and e.get("data", {}).get("skipped")]
+        assert skipped, f"no skipped coord.tick fleetlog event; events: {events}"
+    finally:
+        fcntl.flock(holder_fd, fcntl.LOCK_UN)
+        os.close(holder_fd)
+
+
 def test_tick_survives_logging_failure(home, monkeypatch):
     """T2: a raising fleetlog.log must NOT propagate — the tick still
     completes and dispatches (logging is fire-and-forget)."""

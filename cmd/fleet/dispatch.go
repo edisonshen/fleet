@@ -194,7 +194,7 @@ the record. A full project manifest model lands later (see docs/DESIGN.md
 			opts.engineExplicit = root.PersistentFlags().Changed("engine") ||
 				root.PersistentFlags().Changed("codex") ||
 				root.PersistentFlags().Changed("claude")
-			finish := fleetlog.CLIStart("dispatch", opts.taskID)
+			finish := fleetlog.CLIStart(fleetlog.Fields{Proj: opts.project}, "dispatch", opts.taskID)
 			err := runDispatch(opts, cmd.OutOrStdout())
 			finish(err)
 			return err

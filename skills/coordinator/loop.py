@@ -322,6 +322,10 @@ def tick(
         result.skipped = True
         result.self_exit = True
         result.reason = "lease-fenced-self-exit"
+        # fleetlog: record the early-exit so log consumers see the gap.
+        _flog(_FLOG_COORD, "coord.tick", "info", proj=project, agent=coord_id,
+              msg=f"coord tick skipped: lease-fenced-self-exit for {project}",
+              data={"skipped": True, "reason": "lease-fenced-self-exit"})
         return result
 
     # 1. NB-flock coordinator.lock (PLAN §6 lock acquisition).
@@ -363,6 +367,10 @@ def tick(
             # why this session is going away and how to confirm.
             sys.stderr.write(diag + "\n")
             result.errors.append(diag)
+        # fleetlog: record the skipped tick so log consumers see the gap.
+        _flog(_FLOG_COORD, "coord.tick", "info", proj=project, agent=coord_id,
+              msg=f"coord tick skipped: {result.reason} for {project}",
+              data={"skipped": True, "reason": result.reason})
         return result
     # 1.5. Resolve the coord's repo binding — single shared binder.
     #
@@ -474,6 +482,11 @@ def tick(
         result.skipped = True
         result.self_exit = True
         result.reason = "lease-fenced-self-exit"
+        # fleetlog: record the early-exit so log consumers see the gap.
+        _flog(_FLOG_COORD, "coord.tick", "info", proj=project, agent=coord_id,
+              msg=f"coord tick skipped: lease-fenced-self-exit (post-lock) for {project}",
+              data={"skipped": True, "reason": "lease-fenced-self-exit",
+                    "phase": "post-lock"})
         try:
             fcntl.flock(lock_fd, fcntl.LOCK_UN)
         finally:

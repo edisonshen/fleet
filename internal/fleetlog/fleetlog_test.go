@@ -339,10 +339,10 @@ func TestDirHonorsXDGStateHome(t *testing.T) {
 }
 
 // CLIStart emits cli.start then cli.finish(rc) with argv carrying the
-// command name.
+// command name, and threads the Proj correlation key through both events.
 func TestCLIStartFinish(t *testing.T) {
 	dir := setupLogHome(t)
-	finish := CLIStart("drain")
+	finish := CLIStart(Fields{Proj: "proj-a"}, "drain")
 	finish(nil)
 	lines := readLines(t, dir)
 	if len(lines) != 2 {
@@ -359,6 +359,13 @@ func TestCLIStartFinish(t *testing.T) {
 	}
 	if start == nil || fin == nil {
 		t.Fatalf("missing cli.start/cli.finish: %v", lines)
+	}
+	// Both events must carry the proj correlation key.
+	if start["proj"] != "proj-a" {
+		t.Errorf("cli.start proj want proj-a, got %v", start["proj"])
+	}
+	if fin["proj"] != "proj-a" {
+		t.Errorf("cli.finish proj want proj-a, got %v", fin["proj"])
 	}
 	sd, _ := start["data"].(map[string]any)
 	argv, _ := sd["argv"].([]any)
@@ -379,7 +386,7 @@ func TestCLIStartFinish(t *testing.T) {
 // (e.g. 64 for usage errors, 70 for system errors).
 func TestCLIStartFinishTypedRC(t *testing.T) {
 	dir := setupLogHome(t)
-	finish := CLIStart("attach", "proj")
+	finish := CLIStart(Fields{}, "attach", "tok")
 	err := fmt.Errorf("usage error: bad arg")
 	finish(err, 64) // explicit typed exit code
 	lines := readLines(t, dir)

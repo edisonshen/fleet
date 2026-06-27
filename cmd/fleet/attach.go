@@ -75,7 +75,7 @@ Exit codes:
 			// runAttachFailover, so cli.finish never runs on success (by
 			// design). finish(err) below fires only on the error-return
 			// path. Hence cli.start is the only attach event on success.
-			finish := fleetlog.CLIStart("attach", args[0])
+			finish := fleetlog.CLIStart(fleetlog.Fields{}, "attach", args[0])
 			err := runAttachFailover(args[0], opts)
 			// Pass the typed exit code so cli.finish records the real rc
 			// (64 for usage errors, 70/127 for system errors) rather than
