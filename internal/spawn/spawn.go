@@ -24,6 +24,7 @@ import (
 	"time"
 
 	"github.com/edisonshen/fleet/internal/agent"
+	"github.com/edisonshen/fleet/internal/fleetlog"
 	"github.com/edisonshen/fleet/internal/handoff"
 	"github.com/edisonshen/fleet/internal/state"
 	"github.com/edisonshen/fleet/internal/tmux"
@@ -1344,5 +1345,14 @@ func Spawn(opts Options) (*agent.Record, error) {
 	// branch — which goes through retireOldAgent directly without
 	// re-spawning — still delivers the prompt. See codex review
 	// iter-1 P1 / iter-2 P2.
+	//
+	// fleetlog: record the spawn. Fire-and-forget; never fails the spawn.
+	fleetlog.Log(fleetlog.CompCLI, "worker.start", "info", fleetlog.Fields{
+		Proj:  rec.Project,
+		Agent: rec.ID,
+		Slug:  rec.TaskID,
+		Msg:   fmt.Sprintf("spawned agent %s for task %q in %s", rec.ID, rec.TaskID, session),
+		Data:  map[string]any{"session": session, "engine": rec.Engine, "pid": rec.PID},
+	})
 	return rec, nil
 }

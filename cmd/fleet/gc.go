@@ -22,6 +22,7 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"github.com/edisonshen/fleet/internal/fleetlog"
 	"github.com/edisonshen/fleet/internal/gc"
 	"github.com/edisonshen/fleet/internal/state"
 )
@@ -122,7 +123,10 @@ Exit codes:
   1  — sweep failed before any classifier ran (CLI parse / dep wiring)`,
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			return runGC(cmd.OutOrStdout(), cmd.ErrOrStderr(), f)
+			finish := fleetlog.CLIStart("gc")
+			err := runGC(cmd.OutOrStdout(), cmd.ErrOrStderr(), f)
+			finish(err)
+			return err
 		},
 	}
 	cmd.Flags().BoolVar(&f.apply, "apply", false, "actually mutate (default: dry-run)")

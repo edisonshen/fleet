@@ -34,6 +34,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/edisonshen/fleet/internal/fleetlog"
 	"github.com/edisonshen/fleet/internal/projects"
 	"github.com/edisonshen/fleet/internal/state"
 )
@@ -310,7 +311,25 @@ func WriteState(project, slug string, s *State) error {
 		return err
 	}
 	defer release()
-	return writeStateLocked(project, slug, s)
+	// Read the prior phase (best-effort) so the log records from->to.
+	var from Phase
+	if prev, perr := ReadState(project, slug); perr == nil && prev != nil {
+		from = prev.Phase
+	}
+	if werr := writeStateLocked(project, slug, s); werr != nil {
+		return werr
+	}
+	// fleetlog: record the phase transition. Fire-and-forget; a logging
+	// failure must never fail the state write.
+	if s != nil {
+		fleetlog.Log(fleetlog.CompWorker, "state.transition", "info", fleetlog.Fields{
+			Proj: project,
+			Slug: slug,
+			Msg:  fmt.Sprintf("worker %s phase %s -> %s", slug, from, s.Phase),
+			Data: map[string]any{"from": string(from), "to": string(s.Phase)},
+		})
+	}
+	return nil
 }
 
 // writeStateLocked is the body of WriteState without lock acquisition.

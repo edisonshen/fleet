@@ -42,6 +42,10 @@ from typing import Iterable
 import conflict
 import coord_config
 import dispatch as dispatch_mod
+try:
+    import fleetlog as fleetlog_mod
+except Exception:  # pragma: no cover - logging is best-effort; never block import
+    fleetlog_mod = None
 import parse
 import pr_watch as pr_watch_mod
 import reaper as reaper_mod
@@ -177,6 +181,18 @@ class TickResult:
     raised: int = 0
     errors: list[str] = field(default_factory=list)
     dispatch_instructions: list[str] = field(default_factory=list)
+
+
+def _flog(comp, evt, lvl="info", **fields):
+    """Best-effort fleetlog emit. Swallows every error (and a missing
+    module) so a logging failure can never break a tick. Returns the event
+    id (for caused_by chaining) or ""."""
+    if fleetlog_mod is None:
+        return ""
+    try:
+        return fleetlog_mod.log(comp, evt, lvl, **fields)
+    except Exception:
+        return ""
 
 
 def tick(
@@ -461,12 +477,33 @@ def tick(
         finally:
             os.close(lock_fd)
         return result
+    # fleetlog: bracket the mutating phase with coord.tick start/end and
+    # run the once/day retention prune. All best-effort (fire-and-forget):
+    # a logging or prune failure must never affect the tick result.
+    _flog(fleetlog_mod.COMP_COORD if fleetlog_mod else "coord",
+          "coord.tick", "info", proj=project, agent=coord_id,
+          msg=f"coord tick start for {project}", data={"cap": cap})
+    if fleetlog_mod is not None:
+        try:
+            fleetlog_mod.maybe_prune_daily()
+        except Exception:
+            pass
     try:
         return _tick_locked(
             result, project, project_dir, coord_id, cwd, cap,
             home, fleet_bin, now_unix,
         )
     finally:
+        _flog(fleetlog_mod.COMP_COORD if fleetlog_mod else "coord",
+              "coord.tick", "info", proj=project, agent=coord_id,
+              msg=f"coord tick end for {project}",
+              data={
+                  "dispatched": result.dispatched,
+                  "reconciled": result.reconciled,
+                  "drained": result.drained,
+                  "raised": result.raised,
+                  "errors": len(result.errors),
+              })
         try:
             fcntl.flock(lock_fd, fcntl.LOCK_UN)
         finally:
@@ -7570,6 +7607,13 @@ def _apply_dispatch(action: _DispatchAction, project: str, fleet_bin: str) -> No
     _run_fleet(starting_update)
     _run_fleet([fleet_bin, "tasks", "set", "--project", project, action.slug, f"worker_pid={os.getpid()}"])
     _run_fleet([fleet_bin, "tasks", "note", "--project", project, action.slug, f"dispatched as agent {action.agent_id}"])
+    # fleetlog: record the worker dispatch (fire-and-forget). The full
+    # mutation chain above has landed, so the task is durably in-progress.
+    _flog(fleetlog_mod.COMP_COORD if fleetlog_mod else "coord",
+          "dispatch.worker", "info", proj=project, slug=action.slug,
+          agent=action.agent_id, dispatch_id=action.agent_id,
+          msg=f"dispatched worker {action.slug} as agent {action.agent_id}",
+          data={"branch": action.branch, "worktree": action.worktree})
 
 
 def _apply_dispatch_handoff(

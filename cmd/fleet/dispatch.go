@@ -14,6 +14,7 @@ import (
 	"github.com/edisonshen/fleet/internal/coordlock"
 	"github.com/edisonshen/fleet/internal/coordrepo"
 	"github.com/edisonshen/fleet/internal/enginecfg"
+	"github.com/edisonshen/fleet/internal/fleetlog"
 	"github.com/edisonshen/fleet/internal/gc"
 	"github.com/edisonshen/fleet/internal/handoff"
 	"github.com/edisonshen/fleet/internal/handoffdelivery"
@@ -193,7 +194,10 @@ the record. A full project manifest model lands later (see docs/DESIGN.md
 			opts.engineExplicit = root.PersistentFlags().Changed("engine") ||
 				root.PersistentFlags().Changed("codex") ||
 				root.PersistentFlags().Changed("claude")
-			return runDispatch(opts, cmd.OutOrStdout())
+			finish := fleetlog.CLIStart("dispatch", opts.taskID)
+			err := runDispatch(opts, cmd.OutOrStdout())
+			finish(err)
+			return err
 		},
 	}
 	cmd.Flags().StringVar(&opts.project, "project", "default",
