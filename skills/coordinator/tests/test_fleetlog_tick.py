@@ -31,6 +31,20 @@ def _write_one_ready_task(project_dir: Path, slug: str = "tick-prune-task") -> N
                 parse.File(schema=parse.SCHEMA_VERSION, tasks=[task], footer=""))
 
 
+def _stub_acquire(monkeypatch, home: Path, agent_id: str) -> None:
+    """Stub dispatch.acquire_coord_prompt_inbox — it execs the real `fleet`
+    binary (`fleet claims ...`), which CI has no copy of on PATH. Without
+    this stub the tick's dispatch fails with "fleet binary not found" and
+    dispatched=0. _apply_dispatch still emits the dispatch.worker fleetlog
+    event afterward via the separately-stubbed loop._run_fleet, so the
+    tick's fleetlog behavior stays under test. Mirrors test_chokepoint's
+    acquire stub and the conftest shell-out seam stubs."""
+    monkeypatch.setattr(
+        "dispatch.acquire_coord_prompt_inbox",
+        lambda *a, **k: str(home / "inbox" / f"{agent_id}.md"),
+    )
+
+
 @pytest.fixture
 def home(tmp_path, monkeypatch):
     h = tmp_path / "fleet"
@@ -52,6 +66,7 @@ def test_tick_emits_coord_events_and_dispatch(home, monkeypatch):
     _write_one_ready_task(pdir)
     monkeypatch.setattr("dispatch.mint_agent_id", lambda: "abcdef01")
     monkeypatch.setattr(loop, "_run_fleet", lambda cmd, timeout_s=30.0: None)
+    _stub_acquire(monkeypatch, home, "abcdef01")
 
     result = loop.tick(project, coord_id="", cwd=str(pdir), fleet_home=str(home))
     assert result.dispatched == 1
@@ -71,6 +86,7 @@ def test_tick_prunes_stale_log_when_no_marker(home, monkeypatch):
     _write_one_ready_task(home / "projects" / project)
     monkeypatch.setattr("dispatch.mint_agent_id", lambda: "abcdef02")
     monkeypatch.setattr(loop, "_run_fleet", lambda cmd, timeout_s=30.0: None)
+    _stub_acquire(monkeypatch, home, "abcdef02")
 
     logdir = home / "logs"
     stale = logdir / "fleet-2000-01-01-coord-1-1.jsonl"
@@ -90,6 +106,7 @@ def test_tick_throttles_prune_when_marker_fresh(home, monkeypatch):
     _write_one_ready_task(home / "projects" / project)
     monkeypatch.setattr("dispatch.mint_agent_id", lambda: "abcdef03")
     monkeypatch.setattr(loop, "_run_fleet", lambda cmd, timeout_s=30.0: None)
+    _stub_acquire(monkeypatch, home, "abcdef03")
 
     logdir = home / "logs"
     stale = logdir / "fleet-2000-01-01-coord-1-1.jsonl"
@@ -153,6 +170,7 @@ def test_tick_survives_logging_failure(home, monkeypatch):
     _write_one_ready_task(pdir)
     monkeypatch.setattr("dispatch.mint_agent_id", lambda: "abcdef04")
     monkeypatch.setattr(loop, "_run_fleet", lambda cmd, timeout_s=30.0: None)
+    _stub_acquire(monkeypatch, home, "abcdef04")
 
     def _boom(*a, **k):
         raise RuntimeError("emit failed")
