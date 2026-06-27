@@ -104,6 +104,30 @@ var nowNanos = func() int64 { return time.Now().UnixNano() }
 // the filename unique across ALL producers.
 var seqCounter atomic.Uint64
 
+// fsyncDir is the package seam for directory-durability fsync (open the dir
+// read-only + Sync, so a dentry change — a newly-created watch-msgs/ or an
+// unlinked heartbeat — survives a crash/reboot). state.WriteAtomic already
+// fsyncs an event/heartbeat file's IMMEDIATE parent on rename, but two dentry
+// mutations it does NOT cover need this seam: (1) the lazy first-time creation
+// of watch-msgs/ inside the project dir, and (2) heartbeat unlinks (a
+// non-durable delete can resurrect a stale heartbeat, making a dead worker
+// look live to the Slice 3 stuck-timer). Best-effort like state.fsyncParent:
+// a failure is logged, never propagated, because the data mutation itself has
+// already taken observable effect. Overridable in tests to assert the call
+// without spying on syscalls.
+var fsyncDir = func(dir string) error {
+	d, err := os.Open(dir)
+	if err != nil {
+		return err
+	}
+	syncErr := d.Sync()
+	closeErr := d.Close()
+	if syncErr != nil {
+		return syncErr
+	}
+	return closeErr
+}
+
 // WatcherID returns a process-unique watcher id by appending this process's
 // pid to base (e.g. "<agent_id>" -> "<agent_id>-<pid>"). The pid is
 // load-bearing: it is what keeps two watcher PROCESSES from emitting the
@@ -152,6 +176,24 @@ func eventFilename(unixNanos int64, watcherID string, seq uint64) string {
 	return fmt.Sprintf("%019d-%s-%020d.json", unixNanos, watcherID, seq)
 }
 
+// ensureDir creates watch-msgs/ on demand and, ONLY when it actually creates
+// it, fsyncs the parent (project) dir so the new directory's dentry survives a
+// crash — otherwise the first message (and the whole dir) can vanish on a
+// reboot, breaking the crash-safe guarantee. The already-exists fast path
+// skips the fsync (the dentry was made durable by whoever first created it).
+func (c *Channel) ensureDir() error {
+	if _, err := os.Stat(c.dir); err == nil {
+		return nil
+	}
+	if err := os.MkdirAll(c.dir, 0o755); err != nil {
+		return fmt.Errorf("watchchan: mkdir %s: %w", c.dir, err)
+	}
+	if perr := fsyncDir(filepath.Dir(c.dir)); perr != nil {
+		c.logf("created %s but parent-dir fsync failed: %v", c.dir, perr)
+	}
+	return nil
+}
+
 // AppendEvent publishes msg as a new unique-name event file and returns its
 // absolute path. msg.WatcherID must be process-unique (use WatcherID). The
 // channel fills v/ts and assigns the filename nanos+seq. After writing it
@@ -167,8 +209,8 @@ func (c *Channel) AppendEvent(msg Message) (string, error) {
 		return "", fmt.Errorf("watchchan: AppendEvent requires Kind")
 	}
 	stamp(&msg)
-	if err := os.MkdirAll(c.dir, 0o755); err != nil {
-		return "", fmt.Errorf("watchchan: mkdir %s: %w", c.dir, err)
+	if err := c.ensureDir(); err != nil {
+		return "", err
 	}
 	data, err := marshal(msg)
 	if err != nil {
@@ -203,8 +245,8 @@ func (c *Channel) WriteHeartbeat(workerID string, msg Message) (string, error) {
 	}
 	msg.Kind = KindHeartbeat
 	stamp(&msg)
-	if err := os.MkdirAll(c.dir, 0o755); err != nil {
-		return "", fmt.Errorf("watchchan: mkdir %s: %w", c.dir, err)
+	if err := c.ensureDir(); err != nil {
+		return "", err
 	}
 	data, err := marshal(msg)
 	if err != nil {
@@ -223,8 +265,16 @@ func (c *Channel) WriteHeartbeat(workerID string, msg Message) (string, error) {
 // no-op.
 func (c *Channel) RemoveHeartbeat(workerID string) error {
 	path := filepath.Join(c.dir, heartbeatName(workerID))
-	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+	if err := os.Remove(path); err != nil {
+		if os.IsNotExist(err) {
+			return nil // already gone — nothing to make durable
+		}
 		return fmt.Errorf("watchchan: remove heartbeat %s: %w", path, err)
+	}
+	// Make the unlink durable: a non-fsynced delete can resurrect the stale
+	// heartbeat after a crash, making a dead worker look live to Slice 3.
+	if perr := fsyncDir(c.dir); perr != nil {
+		c.logf("removed heartbeat %s but dir fsync failed: %v", path, perr)
 	}
 	return nil
 }
@@ -258,6 +308,13 @@ func (c *Channel) ReapOrphanHeartbeats(live map[string]bool) ([]string, error) {
 			return reaped, fmt.Errorf("watchchan: reap %s: %w", p, err)
 		}
 		reaped = append(reaped, p)
+	}
+	// One dir fsync makes the batch of unlinks durable (same liveness-truth
+	// reasoning as RemoveHeartbeat). Skip it when nothing was reaped.
+	if len(reaped) > 0 {
+		if perr := fsyncDir(c.dir); perr != nil {
+			c.logf("reaped %d orphan heartbeats but dir fsync failed: %v", len(reaped), perr)
+		}
 	}
 	return reaped, nil
 }

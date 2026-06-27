@@ -385,7 +385,100 @@ func TestGoldenFixtureParses(t *testing.T) {
 	}
 }
 
+// Test 12 (regression) — lazy watch-msgs/ creation fsyncs the project dir so
+// the new dentry survives a crash; an append onto an already-existing dir does
+// NOT re-fsync the project dir.
+func TestEnsureDir_FsyncsProjectDirOnCreateOnly(t *testing.T) {
+	projectDir := t.TempDir()
+	c := New(projectDir)
+	var synced []string
+	restore := fsyncDir
+	fsyncDir = func(dir string) error { synced = append(synced, dir); return nil }
+	defer func() { fsyncDir = restore }()
+
+	if _, err := c.AppendEvent(Message{Kind: KindWorkerDelta, WatcherID: WatcherID("w"), Key: "a"}); err != nil {
+		t.Fatal(err)
+	}
+	if !contains(synced, projectDir) {
+		t.Fatalf("project dir %q not fsynced on watch-msgs create; synced=%v", projectDir, synced)
+	}
+	before := len(synced)
+	if _, err := c.AppendEvent(Message{Kind: KindWorkerDelta, WatcherID: WatcherID("w"), Key: "b"}); err != nil {
+		t.Fatal(err)
+	}
+	if contains(synced[before:], projectDir) {
+		t.Fatalf("project dir re-fsynced on existing-dir append: %v", synced[before:])
+	}
+}
+
+// Test 13 (regression) — heartbeat unlink is made durable (dir fsync); a no-op
+// remove of a missing heartbeat does not fsync.
+func TestRemoveHeartbeat_FsyncsDir(t *testing.T) {
+	c, msgsDir := newChan(t)
+	if _, err := c.WriteHeartbeat("w1", Message{Key: "hb"}); err != nil {
+		t.Fatal(err)
+	}
+	var synced []string
+	restore := fsyncDir
+	fsyncDir = func(dir string) error { synced = append(synced, dir); return nil }
+	defer func() { fsyncDir = restore }()
+
+	if err := c.RemoveHeartbeat("w1"); err != nil {
+		t.Fatal(err)
+	}
+	if !contains(synced, msgsDir) {
+		t.Fatalf("watch-msgs dir not fsynced after heartbeat remove: %v", synced)
+	}
+	synced = nil
+	if err := c.RemoveHeartbeat("ghost"); err != nil {
+		t.Fatal(err)
+	}
+	if len(synced) != 0 {
+		t.Fatalf("no-op remove must not fsync: %v", synced)
+	}
+}
+
+// Test 14 (regression) — orphan reap fsyncs the dir once when it removes
+// anything, and not at all when nothing was reaped.
+func TestReapOrphanHeartbeats_FsyncsDirWhenReaped(t *testing.T) {
+	c, msgsDir := newChan(t)
+	if _, err := c.WriteHeartbeat("dead", Message{Key: "hb"}); err != nil {
+		t.Fatal(err)
+	}
+	var synced []string
+	restore := fsyncDir
+	fsyncDir = func(dir string) error { synced = append(synced, dir); return nil }
+	defer func() { fsyncDir = restore }()
+
+	reaped, err := c.ReapOrphanHeartbeats(map[string]bool{}) // nothing live
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(reaped) != 1 {
+		t.Fatalf("want 1 reaped, got %d", len(reaped))
+	}
+	if !contains(synced, msgsDir) {
+		t.Fatalf("dir not fsynced after reap: %v", synced)
+	}
+	synced = nil
+	if _, err := c.ReapOrphanHeartbeats(map[string]bool{"dead": true}); err != nil {
+		t.Fatal(err)
+	}
+	if len(synced) != 0 {
+		t.Fatalf("empty reap must not fsync: %v", synced)
+	}
+}
+
 // --- test helpers ---
+
+func contains(ss []string, s string) bool {
+	for _, x := range ss {
+		if x == s {
+			return true
+		}
+	}
+	return false
+}
 
 func heartbeatFiles(t *testing.T, dir string) []string {
 	t.Helper()
