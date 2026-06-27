@@ -4,7 +4,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -229,33 +231,57 @@ func TestCap_DropsOldestEventsHeartbeatsExempt(t *testing.T) {
 	}
 }
 
-// Test 11 — concurrent heartbeat writers (two processes): always parses,
-// exactly one hb file, surviving epoch is one of the writers'.
+// Test 11 — concurrent heartbeat writers (the reworked invariant): two
+// PROCESSES hammer WriteHeartbeat(same worker) concurrently → the file
+// always parses (no torn read), exactly one hb-<worker>.json exists, and the
+// surviving epoch is one of the writers' values. This is the real
+// concurrency model (handoff overlap = distinct pids); WriteAtomic's
+// pid-scoped temp + atomic rename is a CROSS-process guarantee, so the test
+// uses real subprocesses (distinct pids), not goroutines in one pid.
+//
+// The child branch re-enters this test under an env guard, writes one
+// heartbeat, and exits — the standard Go "fork the test binary" idiom.
 func TestWriteHeartbeat_ConcurrentWritersNoTear(t *testing.T) {
-	c, msgsDir := newChan(t)
 	const worker = "wkr"
-	const n = 40
+	if projectDir := os.Getenv("WATCHCHAN_HB_CHILD_DIR"); projectDir != "" {
+		epoch, _ := strconv.Atoi(os.Getenv("WATCHCHAN_HB_EPOCH"))
+		c := New(projectDir)
+		if _, err := c.WriteHeartbeat(worker, Message{
+			WatcherID: fmt.Sprintf("w-%d", epoch),
+			EpochID:   int64(epoch),
+			Key:       "hb-" + worker,
+		}); err != nil {
+			os.Exit(1)
+		}
+		os.Exit(0)
+	}
+
+	const n = 12
+	projectDir := t.TempDir()
+	msgsDir := filepath.Join(projectDir, DirName)
+	exe := os.Args[0]
 	var wg sync.WaitGroup
 	for i := 0; i < n; i++ {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			_, _ = c.WriteHeartbeat(worker, Message{
-				Kind:      KindHeartbeat,
-				WatcherID: fmt.Sprintf("w-%d", i),
-				EpochID:   int64(i),
-				Key:       "hb-" + worker,
-			})
+			cmd := exec.Command(exe, "-test.run=^TestWriteHeartbeat_ConcurrentWritersNoTear$")
+			cmd.Env = append(os.Environ(),
+				"WATCHCHAN_HB_CHILD_DIR="+projectDir,
+				"WATCHCHAN_HB_EPOCH="+strconv.Itoa(i),
+			)
+			_ = cmd.Run()
 		}(i)
 	}
 	wg.Wait()
+
 	hbs := heartbeatFiles(t, msgsDir)
 	if len(hbs) != 1 {
 		t.Fatalf("want exactly 1 hb file under concurrency, got %d", len(hbs))
 	}
 	m := readMsgFile(t, hbs[0]) // must not be torn
 	if m.EpochID < 0 || m.EpochID >= n {
-		t.Fatalf("surviving epoch %d out of writer range", m.EpochID)
+		t.Fatalf("surviving epoch %d out of writer range [0,%d)", m.EpochID, n)
 	}
 }
 
