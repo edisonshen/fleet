@@ -175,6 +175,7 @@ func postSendRetryDelay() time.Duration {
 //   - FLEET_TEST_PROBE is test-only.
 var propagatedRuntimeEnv = []string{
 	"FLEET_HOME",                     // queue/handoffs/agents root
+	"XDG_STATE_HOME",                 // fleetlog dir: $XDG_STATE_HOME/fleet/logs when set
 	"FLEET_TMUX_SOCKET",              // alt-server isolation
 	"FLEET_INITIAL_PROMPT_STABLE_MS", // prompt-timing for slow wrappers
 	"FLEET_INITIAL_PROMPT_MAX_MS",

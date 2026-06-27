@@ -2,6 +2,7 @@ package fleetlog
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -370,5 +371,29 @@ func TestCLIStartFinish(t *testing.T) {
 	}
 	if fin["caused_by"] != start["id"] {
 		t.Errorf("cli.finish.caused_by %v must equal cli.start.id %v", fin["caused_by"], start["id"])
+	}
+}
+
+// TestCLIStartFinishTypedRC verifies that an explicit rc argument overrides
+// the default err→1 mapping, so cli.finish records the real typed exit code
+// (e.g. 64 for usage errors, 70 for system errors).
+func TestCLIStartFinishTypedRC(t *testing.T) {
+	dir := setupLogHome(t)
+	finish := CLIStart("attach", "proj")
+	err := fmt.Errorf("usage error: bad arg")
+	finish(err, 64) // explicit typed exit code
+	lines := readLines(t, dir)
+	var fin map[string]any
+	for _, m := range lines {
+		if m["type"] == "cli.finish" {
+			fin = m
+		}
+	}
+	if fin == nil {
+		t.Fatalf("no cli.finish in: %v", lines)
+	}
+	fd, _ := fin["data"].(map[string]any)
+	if rc, _ := fd["rc"].(float64); int(rc) != 64 {
+		t.Errorf("cli.finish rc want 64 (typed usage-error), got %v", fd["rc"])
 	}
 }

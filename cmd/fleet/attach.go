@@ -77,7 +77,10 @@ Exit codes:
 			// path. Hence cli.start is the only attach event on success.
 			finish := fleetlog.CLIStart("attach", args[0])
 			err := runAttachFailover(args[0], opts)
-			finish(err)
+			// Pass the typed exit code so cli.finish records the real rc
+			// (64 for usage errors, 70/127 for system errors) rather than
+			// collapsing every failure to rc=1.
+			finish(err, ExitCodeFor(err))
 			if err != nil {
 				// Map typed errors (UsageError + SystemError) to cobra's
 				// silent-error path so cobra doesn't print its generic
