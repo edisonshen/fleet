@@ -136,12 +136,20 @@ func New(projectDir string) *Channel {
 // Dir returns the absolute watch-msgs directory path.
 func (c *Channel) Dir() string { return c.dir }
 
-// eventFilename builds the unique event filename. unix_nanos is zero-padded
-// to 19 digits so lexicographic sort == time order (int64 nanos stays 19
-// digits until year 2262), and the (unix_nanos, watcher_id, seq) triple is
-// what guarantees no clobber across producers.
+// eventFilename builds the unique event filename. BOTH numeric fields are
+// fixed-width zero-padded so lexicographic sort == (time, seq) order:
+//   - unix_nanos to 19 digits (int64 nanos stays 19 digits until year 2262);
+//   - seq to 20 digits (uint64 max, 18446744073709551615, is 20 digits).
+//
+// The seq pad is load-bearing: within one same-nanos burst the names tie on
+// nanos+watcher_id and break on seq, and an UNpadded seq would sort
+// "...-10.json" before "...-2.json" — replaying/dropping same-timestamp
+// events out of append order, since both the Python drainer (list_pending)
+// and the Go cap use filename sort as the ordering key. The
+// (unix_nanos, watcher_id, seq) triple is what guarantees no clobber across
+// producers.
 func eventFilename(unixNanos int64, watcherID string, seq uint64) string {
-	return fmt.Sprintf("%019d-%s-%d.json", unixNanos, watcherID, seq)
+	return fmt.Sprintf("%019d-%s-%020d.json", unixNanos, watcherID, seq)
 }
 
 // AppendEvent publishes msg as a new unique-name event file and returns its

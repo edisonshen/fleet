@@ -109,13 +109,28 @@ def heartbeat_path(project_dir, worker_id: str) -> Path:
 
 def read_heartbeat(project_dir, worker_id: str) -> Optional[dict]:
     """Return the latest heartbeat dict for a worker, or None if none/
-    unreadable. Heartbeats are latest-state files — read, never mark_done."""
+    unreadable. Heartbeats are latest-state files — read, never mark_done.
+
+    Refuses a `v` newer than SCHEMA_VERSION (SchemaTooNewError), same as
+    read_message: in a mixed-version rollout an older coord must surface the
+    upgrade requirement, NOT silently consume an incompatible heartbeat and
+    skew the liveness/stuck-worker decisions built on it. Raising (rather than
+    returning None) is deliberate — a None would read as 'worker dead' and
+    could trip false stuck-worker recovery."""
     p = heartbeat_path(project_dir, worker_id)
     try:
         with open(p, "r", encoding="utf-8") as fh:
-            return json.load(fh)
+            hb = json.load(fh)
     except (FileNotFoundError, json.JSONDecodeError):
         return None
+    if isinstance(hb, dict):
+        v = hb.get("v")
+        if isinstance(v, int) and v > SCHEMA_VERSION:
+            raise SchemaTooNewError(
+                f"watchchan: {p} heartbeat schema v={v} newer than supported "
+                f"{SCHEMA_VERSION} (upgrade fleet)"
+            )
+    return hb
 
 
 def list_heartbeats(project_dir) -> list[Path]:

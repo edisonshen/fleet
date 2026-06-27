@@ -149,6 +149,18 @@ def test_read_heartbeat_and_list(tmp_path):
     assert wc.list_pending(tmp_path) == []
 
 
+# read_heartbeat refuses a newer schema v (same discipline as read_message):
+# an old coord must surface the upgrade need, not consume an incompatible
+# heartbeat and skew liveness decisions. A None would read as "worker dead".
+def test_read_heartbeat_refuses_newer_schema(tmp_path):
+    msgs = wc.watch_msgs_dir(tmp_path)
+    _write_event(msgs, "hb-future.json",
+                 _event_msg(kind="liveness_heartbeat", key="hb-future",
+                            v=wc.SCHEMA_VERSION + 1))
+    with pytest.raises(wc.SchemaTooNewError):
+        wc.read_heartbeat(tmp_path, "future")
+
+
 # A missing channel directory yields empty pending, never crashes the drain.
 # (read_message deliberately RAISES on corrupt/newer-schema bytes so the caller
 # can quarantine — see test_read_message_refuses_newer_schema; the listing pass

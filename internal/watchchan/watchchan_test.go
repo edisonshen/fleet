@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -110,6 +111,44 @@ func TestAppendEvent_SameNanosDistinctSeq(t *testing.T) {
 	}
 	if cnt != 2 {
 		t.Fatalf("want 2 files for same-nanos distinct-seq, got %d", cnt)
+	}
+}
+
+// Test 2b (regression) — same-nanos burst of >9 events must sort in append
+// (seq) order. An UNpadded seq sorts "...-10.json" before "...-2.json", which
+// would replay/drop same-timestamp events out of order since both the Python
+// drainer and the Go cap key on filename sort. Zero-padding seq fixes it.
+func TestAppendEvent_SameNanosBurstSortsInSeqOrder(t *testing.T) {
+	c, msgsDir := newChan(t)
+	restore := nowNanos
+	nowNanos = func() int64 { return 1700000000000000000 }
+	defer func() { nowNanos = restore }()
+
+	const n = 14 // straddles the 1->2 digit boundary that broke naive %d
+	appendOrder := make([]string, n)
+	for i := 0; i < n; i++ {
+		p, err := c.AppendEvent(Message{Kind: KindWorkerDelta, WatcherID: WatcherID("w"), Key: fmt.Sprintf("e%d", i)})
+		if err != nil {
+			t.Fatalf("append %d: %v", i, err)
+		}
+		appendOrder[i] = filepath.Base(p)
+	}
+
+	// names on disk, lexicographically sorted == the channel's ordering key.
+	got := eventFilesIn(t, msgsDir)
+	sorted := make([]string, len(got))
+	for i, p := range got {
+		sorted[i] = filepath.Base(p)
+	}
+	sort.Strings(sorted)
+
+	if len(sorted) != n {
+		t.Fatalf("want %d files, got %d", n, len(sorted))
+	}
+	for i := range appendOrder {
+		if sorted[i] != appendOrder[i] {
+			t.Fatalf("sort order != append order at %d: sorted=%v append=%v", i, sorted, appendOrder)
+		}
 	}
 }
 
