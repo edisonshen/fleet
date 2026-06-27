@@ -113,10 +113,16 @@ def _cap_data(data):
     out = {}
     for k, v in data.items():
         if isinstance(v, str):
-            # Python str slicing is by characters (Unicode), so no UTF-8
-            # boundary issue — this correctly truncates at a character boundary.
-            if len(v) > _DATA_CAP:
-                out[k] = v[:_DATA_CAP] + _ELISION
+            # Cap by UTF-8 byte length, not character count, to match the Go
+            # emitter's `len(s)` byte check. A CJK or emoji string whose
+            # character count is ≤ 2048 but whose UTF-8 encoding exceeds 2048
+            # bytes must still be truncated for cross-language line-size parity.
+            enc = v.encode("utf-8")
+            if len(enc) > _DATA_CAP:
+                # Slice at the byte boundary and decode with 'ignore' to drop
+                # the partial multi-byte character at the cut point, preserving
+                # valid UTF-8 in the output.
+                out[k] = enc[:_DATA_CAP].decode("utf-8", errors="ignore") + _ELISION
             else:
                 out[k] = v
         else:

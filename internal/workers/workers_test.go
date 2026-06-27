@@ -1,16 +1,19 @@
 package workers
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/edisonshen/fleet/internal/fleetlog"
 	"github.com/edisonshen/fleet/internal/projects"
 	"github.com/edisonshen/fleet/internal/state"
 )
@@ -1487,4 +1490,96 @@ func TestUpdateStateGen_CAS(t *testing.T) {
 			t.Errorf("repair started_at %v older than prior %v", got.StartedAt, oldStarted)
 		}
 	})
+}
+
+// readFleetlogLines scans all *.jsonl in dir and returns parsed JSON lines.
+func readFleetlogLines(t *testing.T, dir string) []map[string]any {
+	t.Helper()
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatalf("read fleetlog dir %s: %v", dir, err)
+	}
+	var out []map[string]any
+	for _, e := range entries {
+		if !strings.HasSuffix(e.Name(), ".jsonl") {
+			continue
+		}
+		raw, err := os.ReadFile(filepath.Join(dir, e.Name()))
+		if err != nil {
+			t.Fatalf("read %s: %v", e.Name(), err)
+		}
+		for _, ln := range strings.Split(strings.TrimRight(string(raw), "\n"), "\n") {
+			if ln == "" {
+				continue
+			}
+			var m map[string]any
+			if err := json.Unmarshal([]byte(ln), &m); err != nil {
+				t.Fatalf("invalid JSON in %s: %q: %v", e.Name(), ln, err)
+			}
+			out = append(out, m)
+		}
+	}
+	return out
+}
+
+// TestUpdateStateEmitsFleetlog verifies that UpdateState emits a
+// state.transition fleetlog event on every phase change. This is the P1 fix:
+// the real `fleet workers update` code path uses UpdateState/UpdateStateGen,
+// not WriteState, so agents reading the debug log need transitions from those
+// paths to reconstruct the full worker lifecycle.
+func TestUpdateStateEmitsFleetlog(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("FLEET_HOME", tmp)
+	t.Setenv("XDG_STATE_HOME", "")
+	logDir := fleetlog.Dir()
+
+	if err := UpdateState("proj", "slug-fl1", func(s *State) {
+		s.Phase = PhaseBranch
+	}); err != nil {
+		t.Fatalf("UpdateState: %v", err)
+	}
+	lines := readFleetlogLines(t, logDir)
+	var found bool
+	for _, m := range lines {
+		if m["type"] == "state.transition" && m["slug"] == "slug-fl1" {
+			found = true
+			data, _ := m["data"].(map[string]any)
+			if data["to"] != string(PhaseBranch) {
+				t.Errorf("state.transition data.to want %q got %v", PhaseBranch, data["to"])
+			}
+		}
+	}
+	if !found {
+		t.Errorf("UpdateState: no state.transition fleetlog event for slug-fl1; lines: %v", lines)
+	}
+}
+
+// TestUpdateStateGenEmitsFleetlog verifies that UpdateStateGen (the CAS writer
+// used by `fleet workers update --dispatch-generation`) also emits
+// state.transition events.
+func TestUpdateStateGenEmitsFleetlog(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("FLEET_HOME", tmp)
+	t.Setenv("XDG_STATE_HOME", "")
+	logDir := fleetlog.Dir()
+
+	if err := UpdateStateGen("proj", "slug-fl2", 1, 1, func(s *State) {
+		s.Phase = PhaseTDDGreen
+	}); err != nil {
+		t.Fatalf("UpdateStateGen: %v", err)
+	}
+	lines := readFleetlogLines(t, logDir)
+	var found bool
+	for _, m := range lines {
+		if m["type"] == "state.transition" && m["slug"] == "slug-fl2" {
+			found = true
+			data, _ := m["data"].(map[string]any)
+			if data["to"] != string(PhaseTDDGreen) {
+				t.Errorf("state.transition data.to want %q got %v", PhaseTDDGreen, data["to"])
+			}
+		}
+	}
+	if !found {
+		t.Errorf("UpdateStateGen: no state.transition fleetlog event for slug-fl2; lines: %v", lines)
+	}
 }

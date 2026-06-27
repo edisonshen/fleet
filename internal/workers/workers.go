@@ -422,8 +422,20 @@ func UpdateState(project, slug string, mutate func(*State)) error {
 		if err != nil {
 			return err
 		}
+		from := cur.Phase // capture before mutate so the log records from->to
 		mutate(cur)
-		return writeStateLocked(project, slug, cur)
+		if werr := writeStateLocked(project, slug, cur); werr != nil {
+			return werr
+		}
+		// fleetlog: record the phase transition. Fire-and-forget; a logging
+		// failure must never fail the state write.
+		fleetlog.Log(fleetlog.CompWorker, "state.transition", "info", fleetlog.Fields{
+			Proj: project,
+			Slug: slug,
+			Msg:  fmt.Sprintf("worker %s phase %s -> %s", slug, from, cur.Phase),
+			Data: map[string]any{"from": string(from), "to": string(cur.Phase)},
+		})
+		return nil
 	})
 }
 
@@ -501,8 +513,20 @@ func UpdateStateGen(project, slug string, n, taskGen int, mutate func(*State)) e
 		// rejected, the < / absent case was replaced fresh). The stamp is
 		// a consistency reassertion.
 		cur.DispatchGeneration = taskGen
+		from := cur.Phase // capture before mutate so the log records from->to
 		mutate(cur)
-		return writeStateLocked(project, slug, cur)
+		if werr := writeStateLocked(project, slug, cur); werr != nil {
+			return werr
+		}
+		// fleetlog: record the phase transition. Fire-and-forget; a logging
+		// failure must never fail the state write.
+		fleetlog.Log(fleetlog.CompWorker, "state.transition", "info", fleetlog.Fields{
+			Proj: project,
+			Slug: slug,
+			Msg:  fmt.Sprintf("worker %s phase %s -> %s", slug, from, cur.Phase),
+			Data: map[string]any{"from": string(from), "to": string(cur.Phase)},
+		})
+		return nil
 	})
 }
 

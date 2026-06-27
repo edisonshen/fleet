@@ -92,6 +92,22 @@ def test_data_cap_and_raw_values(flog):
     assert m["data"]["tok"] == tok
 
 
+def test_data_cap_string_utf8_bytes(flog):
+    """String cap uses UTF-8 byte length, not character count. A CJK string
+    with ≤ 2048 characters but > 2048 UTF-8 bytes must be truncated."""
+    d = Path(flog.dir())
+    # Each CJK character is 3 bytes; 700 chars = 2100 bytes > _DATA_CAP.
+    cjk_str = "中" * 700  # 700 chars × 3 bytes = 2100 UTF-8 bytes
+    assert len(cjk_str) < flog._DATA_CAP  # character count below cap
+    assert len(cjk_str.encode("utf-8")) > flog._DATA_CAP  # but bytes exceed cap
+    flog.log(flog.COMP_COORD, "decision", "info",
+             data={"cjk": cjk_str})
+    _, m = _read_lines(d)[0]
+    got = m["data"]["cjk"]
+    assert got.endswith(flog._ELISION), f"missing elision marker: {got!r}"
+    assert len(got.encode("utf-8")) <= flog._DATA_CAP + len(flog._ELISION.encode("utf-8"))
+
+
 def test_data_cap_non_string(flog):
     """Non-string values (lists, dicts) whose JSON representation exceeds
     _DATA_CAP are replaced with a '<capped: N bytes>' hint."""
