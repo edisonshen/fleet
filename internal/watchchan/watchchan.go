@@ -158,10 +158,7 @@ func (c *Channel) AppendEvent(msg Message) (string, error) {
 	if msg.Kind == "" {
 		return "", fmt.Errorf("watchchan: AppendEvent requires Kind")
 	}
-	msg.V = SchemaVersion
-	if msg.TS == "" {
-		msg.TS = time.Now().UTC().Format(time.RFC3339)
-	}
+	stamp(&msg)
 	if err := os.MkdirAll(c.dir, 0o755); err != nil {
 		return "", fmt.Errorf("watchchan: mkdir %s: %w", c.dir, err)
 	}
@@ -197,10 +194,7 @@ func (c *Channel) WriteHeartbeat(workerID string, msg Message) (string, error) {
 		return "", fmt.Errorf("watchchan: WriteHeartbeat requires workerID")
 	}
 	msg.Kind = KindHeartbeat
-	msg.V = SchemaVersion
-	if msg.TS == "" {
-		msg.TS = time.Now().UTC().Format(time.RFC3339)
-	}
+	stamp(&msg)
 	if err := os.MkdirAll(c.dir, 0o755); err != nil {
 		return "", fmt.Errorf("watchchan: mkdir %s: %w", c.dir, err)
 	}
@@ -324,6 +318,16 @@ func workerFromHeartbeat(name string) (string, bool) {
 		return "", false
 	}
 	return strings.TrimSuffix(strings.TrimPrefix(name, HeartbeatPrefix), ".json"), true
+}
+
+// stamp fills the wire fields the channel owns: the schema version (always
+// the current one — the writer never emits an old shape) and a default
+// UTC-ISO ts when the caller left it empty.
+func stamp(msg *Message) {
+	msg.V = SchemaVersion
+	if msg.TS == "" {
+		msg.TS = time.Now().UTC().Format(time.RFC3339)
+	}
 }
 
 func marshal(msg Message) ([]byte, error) {
