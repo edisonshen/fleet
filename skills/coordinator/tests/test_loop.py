@@ -4481,11 +4481,15 @@ def test_tick_checkpoint_schema_matches_synth_fixture(
 ) -> None:
     """Integration: the checkpoint a real tick writes is byte-shaped like
     the seedCheckpoint fixture in internal/handoff/synth_test.go so
-    synth.go lifts the rows verbatim. Pins the section headers + the
-    placeholders for an empty (no in-progress) lane.
+    synth.go lifts the rows verbatim. Pins the section headers (incl. the
+    Slice-2 `Completed (recent)` section) + the empty-lane placeholders.
     """
     monkeypatch.setenv("FLEET_COORD_CHECKPOINT_EVERY", "1")
-    # No in-progress tasks → every section should render its placeholder.
+    # A `ready` task gets dispatched this tick → it records a decision
+    # ("dispatched worker …") but is NOT a completion (a dispatch is a
+    # start, never a done). So Recent decisions carries the dispatch line
+    # while Completed (recent) stays at its placeholder (Slice 2/3 producer
+    # wiring).
     _write_tasks(project_dir, [_make_task("idle-dddd", status="ready")])
 
     loop.tick(
@@ -4498,11 +4502,15 @@ def test_tick_checkpoint_schema_matches_synth_fixture(
     assert "### Active Subagents\n" in body
     assert "### Open PRs\n" in body
     assert "### Recent decisions\n" in body
+    assert "### Completed (recent)\n" in body
     assert "### Drafted but unfiled tasks\n" in body
     # Placeholders are byte-identical with synth.go's literals.
     assert "_(none)_" in body
     assert "_(no open PRs)_" in body
-    assert "_(no recent decisions)_" in body
+    # A dispatch is recorded as a decision (producer is wired, not dead)…
+    assert "dispatched worker idle-dddd" in body
+    # …but a dispatch is NOT a true completion.
+    assert "_(no recent completions)_" in body
 
 
 def test_tick_checkpoint_write_failure_does_not_wedge_tick(
