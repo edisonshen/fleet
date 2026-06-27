@@ -328,6 +328,19 @@ def tick(
               data={"skipped": True, "reason": "lease-fenced-self-exit"})
         return result
 
+    # Run the once/day retention prune BEFORE taking the coordinator lock.
+    # Holding the lock during a readdir + many os.remove() calls would block
+    # every other fleet process that needs coordinator.lock for the duration
+    # of the scan (worst-case: NFS-mounted home, or a large accumulated backlog).
+    # The prune is idempotent and lock-independent: two concurrent prunes are
+    # safe (os.remove is a no-op on a missing file; the marker is updated by
+    # both). Best-effort: any exception is swallowed.
+    if fleetlog_mod is not None:
+        try:
+            fleetlog_mod.maybe_prune_daily()
+        except Exception:
+            pass
+
     # 1. NB-flock coordinator.lock (PLAN §6 lock acquisition).
     project_dir = home / "projects" / project
     locks_dir = project_dir / ".locks"
@@ -497,17 +510,11 @@ def tick(
         finally:
             os.close(lock_fd)
         return result
-    # fleetlog: bracket the mutating phase with coord.tick start/end and
-    # run the once/day retention prune. All best-effort (fire-and-forget):
-    # a logging or prune failure must never affect the tick result.
+    # fleetlog: bracket the mutating phase with coord.tick start/end.
+    # Best-effort: a logging failure must never affect the tick result.
     _flog(_FLOG_COORD,
           "coord.tick", "info", proj=project, agent=coord_id,
           msg=f"coord tick start for {project}", data={"cap": cap})
-    if fleetlog_mod is not None:
-        try:
-            fleetlog_mod.maybe_prune_daily()
-        except Exception:
-            pass
     try:
         return _tick_locked(
             result, project, project_dir, coord_id, cwd, cap,

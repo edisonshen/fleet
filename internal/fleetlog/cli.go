@@ -34,11 +34,16 @@ func CLIStart(f Fields, argv ...string) func(err error, rc ...int) {
 		name = argv[0]
 	}
 	f.Msg = "cli " + name + " start"
-	if f.Data == nil {
-		f.Data = map[string]any{"argv": argv}
-	} else {
-		f.Data["argv"] = argv
+	// Build a fresh data map rather than mutating the caller's Fields.Data.
+	// If the caller passes a pre-populated Data, mutating it in-place
+	// would inject an unexpected "argv" key into the caller's own map —
+	// a silent spooky-action-at-a-distance bug.
+	startData := make(map[string]any, len(f.Data)+1)
+	for k, v := range f.Data {
+		startData[k] = v
 	}
+	startData["argv"] = argv
+	f.Data = startData
 	id := Log(CompCLI, "cli.start", "info", f)
 	return func(err error, rc ...int) {
 		code := 0

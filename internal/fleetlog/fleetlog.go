@@ -140,9 +140,12 @@ func Dir() string {
 	}
 	root, err := state.Root()
 	if err != nil {
-		// Last-resort: a relative dir keeps logging best-effort rather
-		// than panicking when even the home dir can't be resolved.
-		return "logs"
+		// Last-resort: write under the OS temp dir rather than a relative
+		// "logs" path. A relative path would land inside whatever the
+		// process's cwd happens to be (e.g. a git repo), dirtying the
+		// working tree with JSONL files. os.TempDir() is always absolute
+		// and survives even a missing $HOME.
+		return filepath.Join(os.TempDir(), "fleet-logs")
 	}
 	return filepath.Join(root, "logs")
 }

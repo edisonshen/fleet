@@ -117,6 +117,9 @@ func TestLogWritesEnvelopeToOwnFile(t *testing.T) {
 // T2 (Go): logging into an unwritable dir returns no error and never
 // panics — the caller is unaffected.
 func TestLogBestEffortUnwritableDir(t *testing.T) {
+	if os.Getuid() == 0 {
+		t.Skip("root bypasses file-mode permission checks; chmod 0500 has no effect")
+	}
 	dir := setupLogHome(t)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		t.Fatalf("mkdir: %v", err)
@@ -402,5 +405,34 @@ func TestCLIStartFinishTypedRC(t *testing.T) {
 	fd, _ := fin["data"].(map[string]any)
 	if rc, _ := fd["rc"].(float64); int(rc) != 64 {
 		t.Errorf("cli.finish rc want 64 (typed usage-error), got %v", fd["rc"])
+	}
+}
+
+// TestDirFallbackAbsolute verifies that Dir() returns an absolute path even
+// when state.Root() fails (both FLEET_HOME and HOME are unset). A relative
+// path like "logs" would land inside whatever the process cwd is — polluting
+// a git repo with JSONL files on any system where FLEET_HOME is unset.
+func TestDirFallbackAbsolute(t *testing.T) {
+	t.Setenv("FLEET_HOME", "")
+	t.Setenv("XDG_STATE_HOME", "")
+	t.Setenv("HOME", "")
+	got := Dir()
+	if !filepath.IsAbs(got) {
+		t.Errorf("Dir() returned relative path %q — must be absolute when FLEET_HOME and HOME are unset", got)
+	}
+}
+
+// TestCLIStartDoesNotMutateCallerData verifies that CLIStart does not
+// inject "argv" into the caller's own Fields.Data map. A caller that passes
+// a pre-populated Data map must not see unexpected keys after CLIStart returns.
+func TestCLIStartDoesNotMutateCallerData(t *testing.T) {
+	setupLogHome(t)
+	callerData := map[string]any{"correlation": "abc123"}
+	_ = CLIStart(Fields{Data: callerData}, "dispatch", "task-1")
+	if _, mutated := callerData["argv"]; mutated {
+		t.Errorf("CLIStart injected 'argv' into caller's Fields.Data map — must copy, not mutate")
+	}
+	if callerData["correlation"] != "abc123" {
+		t.Errorf("CLIStart modified existing key in caller's Fields.Data map")
 	}
 }
