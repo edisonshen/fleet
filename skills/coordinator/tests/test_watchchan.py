@@ -99,6 +99,23 @@ def test_apply_before_delete_replay(tmp_path):
     wc.mark_done(again[0])
 
 
+# mark_done is a DURABLE commit point: it fsyncs the parent dir after the
+# unlink so a drained event can't resurrect after a crash. A no-op delete of a
+# missing file skips the fsync.
+def test_mark_done_fsyncs_parent_dir(tmp_path, monkeypatch):
+    msgs = wc.watch_msgs_dir(tmp_path)
+    p = _write_event(msgs, "1700000000000000001-w-0.json", _event_msg())
+    synced = []
+    monkeypatch.setattr(wc, "_fsync_dir", lambda d: synced.append(Path(d)))
+
+    wc.mark_done(p)
+    assert msgs in synced, synced
+    # second call: file already gone -> no unlink, no fsync.
+    synced.clear()
+    wc.mark_done(p)
+    assert synced == []
+
+
 # Test 10 (Python half) — versioned wire + pr_event round-trip via the shared
 # golden fixture: every field reads back and the lease key reconstructs.
 def test_golden_pr_event_round_trip(tmp_path):

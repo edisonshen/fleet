@@ -88,15 +88,41 @@ def read_message(path) -> dict:
     return msg
 
 
+def _fsync_dir(directory) -> None:
+    """Best-effort fsync of a directory so a just-completed unlink is durable
+    across a crash. On POSIX an unlink is NOT crash-durable until its parent
+    directory is fsynced; without this a "drained" event file can reappear
+    after a reboot and be processed twice. Mirrors the Go writer's fsyncDir.
+    Errors are swallowed: the unlink already took observable effect, and some
+    platforms/filesystems refuse a directory fsync."""
+    try:
+        fd = os.open(str(directory), os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(fd)
+    except OSError:
+        pass
+    finally:
+        os.close(fd)
+
+
 def mark_done(path) -> None:
     """Delete a drained EVENT file — the apply-before-delete COMMIT POINT.
     The caller applies the mutation first, THEN calls mark_done; a crash in
     between replays the message on recovery. Missing file is a no-op
-    (idempotent)."""
+    (idempotent).
+
+    The unlink is made durable (parent-dir fsync) so this is a REAL commit
+    point: without it, applying a worker_delta/pr_event, calling mark_done,
+    then crashing could resurrect the file on reboot and double-apply the
+    action. A missing file skips the fsync (nothing was committed here)."""
+    path = Path(path)
     try:
         os.remove(path)
     except FileNotFoundError:
-        pass
+        return
+    _fsync_dir(path.parent)
 
 
 # --- heartbeats: latest-state, read separately, never drained as events ---

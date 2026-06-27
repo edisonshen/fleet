@@ -359,13 +359,25 @@ func (c *Channel) enforceCap() {
 	}
 	// names sort lexicographically == oldest-first (nanos-prefixed).
 	drop := events[:len(events)-c.cap]
+	dropped := 0
 	for _, name := range drop {
 		p := filepath.Join(c.dir, name)
-		if err := os.Remove(p); err != nil && !os.IsNotExist(err) {
-			c.logf("cap %d exceeded but failed to drop %s: %v", c.cap, name, err)
+		if err := os.Remove(p); err != nil {
+			if !os.IsNotExist(err) {
+				c.logf("cap %d exceeded but failed to drop %s: %v", c.cap, name, err)
+			}
 			continue
 		}
+		dropped++
 		c.logf("cap %d exceeded, dropped oldest event %s", c.cap, name)
+	}
+	// Make the evictions durable: a non-fsynced unlink can resurrect a
+	// "dropped" event after a crash, undoing the backpressure and replaying
+	// stale notifications — same reasoning as the heartbeat delete paths.
+	if dropped > 0 {
+		if perr := fsyncDir(c.dir); perr != nil {
+			c.logf("dropped %d capped events but dir fsync failed: %v", dropped, perr)
+		}
 	}
 }
 

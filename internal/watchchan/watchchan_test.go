@@ -411,6 +411,42 @@ func TestEnsureDir_FsyncsProjectDirOnCreateOnly(t *testing.T) {
 	}
 }
 
+// Test 15 (regression) — cap eviction fsyncs the dir once after dropping so a
+// "dropped" event can't resurrect after a crash; no drop => no fsync.
+func TestCap_FsyncsDirAfterDrop(t *testing.T) {
+	dir := t.TempDir()
+	c := New(dir)
+	c.cap = 3
+	c.logf = func(string, ...any) {}
+	msgsDir := filepath.Join(dir, DirName)
+
+	// prime the dir (its creation fsync happens before we start counting).
+	if _, err := c.AppendEvent(Message{Kind: KindWorkerDelta, WatcherID: WatcherID("w"), Key: "p"}); err != nil {
+		t.Fatal(err)
+	}
+	var synced []string
+	restore := fsyncDir
+	fsyncDir = func(d string) error { synced = append(synced, d); return nil }
+	defer func() { fsyncDir = restore }()
+
+	// under cap so far (1 <= 3): appending up to the cap drops nothing.
+	for i := 0; i < 2; i++ {
+		if _, err := c.AppendEvent(Message{Kind: KindWorkerDelta, WatcherID: WatcherID("w"), Key: fmt.Sprintf("u%d", i)}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if contains(synced, msgsDir) {
+		t.Fatalf("no eviction yet but dir was fsynced: %v", synced)
+	}
+	// push over the cap: now the oldest is evicted and the dir is fsynced.
+	if _, err := c.AppendEvent(Message{Kind: KindWorkerDelta, WatcherID: WatcherID("w"), Key: "over"}); err != nil {
+		t.Fatal(err)
+	}
+	if !contains(synced, msgsDir) {
+		t.Fatalf("cap eviction did not fsync watch-msgs dir: %v", synced)
+	}
+}
+
 // Test 12b (regression) — when the project dir ITSELF does not exist yet
 // (state.ProjectDir is path-only), the first write creates both <project>/ and
 // watch-msgs/; the parent of EVERY created level must be fsynced so neither
