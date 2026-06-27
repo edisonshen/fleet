@@ -112,10 +112,25 @@ def _cap_data(data):
         return None
     out = {}
     for k, v in data.items():
-        if isinstance(v, str) and len(v) > _DATA_CAP:
-            out[k] = v[:_DATA_CAP] + _ELISION
+        if isinstance(v, str):
+            # Python str slicing is by characters (Unicode), so no UTF-8
+            # boundary issue — this correctly truncates at a character boundary.
+            if len(v) > _DATA_CAP:
+                out[k] = v[:_DATA_CAP] + _ELISION
+            else:
+                out[k] = v
         else:
-            out[k] = v
+            # Non-string values (lists, dicts, ints…): check JSON size.
+            # If small, keep the typed value; if large, store a size hint
+            # so the cap is visible and the line size stays bounded.
+            try:
+                b = json.dumps(v, separators=(",", ":"), ensure_ascii=False)
+                if len(b.encode("utf-8")) > _DATA_CAP:
+                    out[k] = f"<capped: {len(b.encode('utf-8'))} bytes>"
+                else:
+                    out[k] = v
+            except (TypeError, ValueError):
+                out[k] = v
     return out
 
 

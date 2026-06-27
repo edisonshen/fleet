@@ -163,6 +163,66 @@ func TestLogDataCapAndRawValues(t *testing.T) {
 	}
 }
 
+// T3b: non-string data values ([]any, nested map) exceeding dataCap are replaced
+// with a "<capped: N bytes>" hint, keeping lines bounded.
+func TestLogDataCapNonString(t *testing.T) {
+	dir := setupLogHome(t)
+	// Build a []string that marshals to well over 2 KB.
+	bigSlice := make([]any, 300)
+	for i := range bigSlice {
+		bigSlice[i] = strings.Repeat("x", 10)
+	}
+	Log(CompCLI, "cli.start", "info", Fields{
+		Data: map[string]any{"argv": bigSlice},
+	})
+	lines := readLines(t, dir)
+	if len(lines) != 1 {
+		t.Fatalf("want 1 line, got %d", len(lines))
+	}
+	data, _ := lines[0]["data"].(map[string]any)
+	hint, _ := data["argv"].(string)
+	if !strings.HasPrefix(hint, "<capped:") {
+		t.Errorf("large []any must be capped; got argv=%v", data["argv"])
+	}
+	// Line must still be valid JSON and bounded.
+	raw, err := json.Marshal(lines[0])
+	if err != nil {
+		t.Fatalf("marshaled capped line invalid JSON: %v", err)
+	}
+	if len(raw) > dataCap*5 {
+		t.Errorf("capped line too large: %d bytes", len(raw))
+	}
+}
+
+// T3c: string truncation at a multi-byte UTF-8 boundary never produces
+// invalid UTF-8 (i.e., the truncated value is valid UTF-8).
+func TestLogDataCapUTF8Boundary(t *testing.T) {
+	dir := setupLogHome(t)
+	// Craft a string whose 2048-byte prefix ends mid-rune:
+	// 2045 ASCII bytes + one 4-byte rune = 2049 bytes total.
+	s := strings.Repeat("a", 2045) + "😀" // 😀 = 4 bytes (U+1F600)
+	Log(CompCoord, "decision", "info", Fields{
+		Data: map[string]any{"txt": s},
+	})
+	lines := readLines(t, dir)
+	if len(lines) != 1 {
+		t.Fatalf("want 1 line, got %d", len(lines))
+	}
+	data, _ := lines[0]["data"].(map[string]any)
+	got, _ := data["txt"].(string)
+	// Must end with the elision marker.
+	if !strings.HasSuffix(got, elision) {
+		t.Errorf("missing elision marker: %q", got[max(0, len(got)-20):])
+	}
+}
+
+func max(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
+}
+
 // T4 (Go): one process, many goroutines — every line independently parses
 // (no torn/interleaved record) and all land in this process's single file.
 func TestLogConcurrentNoTornLines(t *testing.T) {

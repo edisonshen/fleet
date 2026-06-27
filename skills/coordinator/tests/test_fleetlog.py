@@ -92,6 +92,22 @@ def test_data_cap_and_raw_values(flog):
     assert m["data"]["tok"] == tok
 
 
+def test_data_cap_non_string(flog):
+    """Non-string values (lists, dicts) whose JSON representation exceeds
+    _DATA_CAP are replaced with a '<capped: N bytes>' hint."""
+    d = Path(flog.dir())
+    # Build a list that marshals to > 2 KB.
+    big_list = ["x" * 10] * 300  # ~3.6 KB as JSON
+    flog.log(flog.COMP_CLI, "cli.start", "info",
+             data={"argv": big_list})
+    _, m = _read_lines(d)[0]
+    argv_val = m["data"]["argv"]
+    # Must have been capped — value becomes a "<capped: N bytes>" string.
+    assert isinstance(argv_val, str) and argv_val.startswith("<capped:"), (
+        f"large list must be capped; got {argv_val!r}"
+    )
+
+
 def test_log_is_compact_single_line(flog):
     d = Path(flog.dir())
     flog.log(flog.COMP_CLI, "cli.start", "info", msg="a", data={"argv": ["drain"]})

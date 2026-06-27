@@ -29,6 +29,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -36,6 +37,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode/utf8"
 
 	"github.com/edisonshen/fleet/internal/state"
 )
@@ -220,13 +222,40 @@ func capData(d map[string]any) map[string]any {
 	}
 	out := make(map[string]any, len(d))
 	for k, v := range d {
-		if s, ok := v.(string); ok && len(s) > dataCap {
-			out[k] = s[:dataCap] + elision
-		} else {
-			out[k] = v
+		switch s := v.(type) {
+		case string:
+			if len(s) > dataCap {
+				out[k] = truncateUTF8(s, dataCap) + elision
+			} else {
+				out[k] = s
+			}
+		default:
+			// Non-string values (slices, maps, ints…): marshal to JSON to
+			// bound the wire size. If the representation is small, keep the
+			// original typed value (better for consumers). If it's large, store
+			// a human-readable size hint so the cap is visible in the log line.
+			b, err := json.Marshal(v)
+			if err == nil && len(b) > dataCap {
+				out[k] = fmt.Sprintf("<capped: %d bytes>", len(b))
+			} else {
+				out[k] = v
+			}
 		}
 	}
 	return out
+}
+
+// truncateUTF8 returns s[:maxBytes] truncated to the last valid UTF-8
+// rune boundary so the result is always valid UTF-8. maxBytes must be > 0.
+func truncateUTF8(s string, maxBytes int) string {
+	if len(s) <= maxBytes {
+		return s
+	}
+	cut := maxBytes
+	for cut > 0 && !utf8.ValidString(s[:cut]) {
+		cut--
+	}
+	return s[:cut]
 }
 
 var fileRe = regexp.MustCompile(`^fleet-(\d{4}-\d{2}-\d{2})-.+\.jsonl$`)
