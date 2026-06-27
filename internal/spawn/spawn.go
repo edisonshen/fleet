@@ -1348,9 +1348,11 @@ func Spawn(opts Options) (*agent.Record, error) {
 	// iter-1 P1 / iter-2 P2.
 	//
 	// fleetlog: record the spawn. Fire-and-forget; never fails the spawn.
-	// Coordinator spawns use comp=coord + event=coord.start so log consumers
-	// can distinguish coord lifecycle from task-worker lifecycle.
-	spawnComp, spawnEvt := fleetlog.CompCLI, "worker.start"
+	// Task-worker spawns use comp=worker + event=worker.start so consumers
+	// filtering comp=worker see the start event alongside later
+	// state.transition records. Coordinator spawns use comp=coord +
+	// event=coord.start to keep the coord lifecycle stream separate.
+	spawnComp, spawnEvt := fleetlog.CompWorker, "worker.start"
 	if rec.IsCoord {
 		spawnComp, spawnEvt = fleetlog.CompCoord, "coord.start"
 	}

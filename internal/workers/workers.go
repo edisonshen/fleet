@@ -425,7 +425,7 @@ func UpdateState(project, slug string, mutate func(*State)) error {
 		return fmt.Errorf("%w: nil mutate fn", ErrInvalidState)
 	}
 	return withUpdateLock(project, slug, func() error {
-		cur, err := loadOrBootstrapForUpdate(project, slug)
+		cur, bootstrapped, err := loadOrBootstrapForUpdate(project, slug)
 		if err != nil {
 			return err
 		}
@@ -434,9 +434,10 @@ func UpdateState(project, slug string, mutate func(*State)) error {
 		if werr := writeStateLocked(project, slug, cur); werr != nil {
 			return werr
 		}
-		// fleetlog: only log when the phase actually changed (avoid bogus
-		// "review-done -> review-done" entries for metadata-only updates).
-		if from != cur.Phase {
+		// fleetlog: log on actual phase change OR on first bootstrap (when
+		// from == to == starting, the bootstrap itself is the first lifecycle
+		// event and must appear in the debug log).
+		if bootstrapped || from != cur.Phase {
 			fleetlog.Log(fleetlog.CompWorker, "state.transition", "info", fleetlog.Fields{
 				Proj: project,
 				Slug: slug,
@@ -508,7 +509,8 @@ func UpdateStateGen(project, slug string, n, taskGen int, mutate func(*State)) e
 				ErrStaleGeneration, n, cur.DispatchGeneration, slug,
 			)
 		}
-		if cur == nil || cur.DispatchGeneration < taskGen {
+		bootstrapped := cur == nil || cur.DispatchGeneration < taskGen
+		if bootstrapped {
 			// Absent, OR a prior-generation file the current attempt is
 			// repairing. Either way: brand-new state, never a merge of
 			// the stale object's fields.
@@ -528,9 +530,10 @@ func UpdateStateGen(project, slug string, n, taskGen int, mutate func(*State)) e
 		if werr := writeStateLocked(project, slug, cur); werr != nil {
 			return werr
 		}
-		// fleetlog: only log when the phase actually changed (avoid bogus
-		// "review-done -> review-done" entries for metadata-only updates).
-		if from != cur.Phase {
+		// fleetlog: log on actual phase change OR on first bootstrap (when
+		// from == to == starting, the bootstrap itself is the first lifecycle
+		// event and must appear in the debug log).
+		if bootstrapped || from != cur.Phase {
 			fleetlog.Log(fleetlog.CompWorker, "state.transition", "info", fleetlog.Fields{
 				Proj: project,
 				Slug: slug,
@@ -573,20 +576,23 @@ func withUpdateLock(project, slug string, fn func() error) error {
 // loadOrBootstrapForUpdate reads the current state or returns a minimal
 // bootstrapped one (the non-CAS path; UpdateStateGen owns its own
 // generation-aware bootstrap). Caller must hold the worker lock.
-func loadOrBootstrapForUpdate(project, slug string) (*State, error) {
+// Returns (state, bootstrapped, err); bootstrapped is true when the file
+// was absent — the first lifecycle event must be logged even when the
+// initial phase doesn't change.
+func loadOrBootstrapForUpdate(project, slug string) (*State, bool, error) {
 	cur, err := ReadState(project, slug)
 	if err != nil && !errors.Is(err, ErrNotFound) {
-		return nil, err
+		return nil, false, err
 	}
 	if cur == nil {
-		cur = &State{
+		return &State{
 			Slug:      slug,
 			Project:   project,
 			Phase:     PhaseStarting,
 			StartedAt: time.Now().UTC(),
-		}
+		}, true, nil // bootstrapped=true: first write for this slug
 	}
-	return cur, nil
+	return cur, false, nil
 }
 
 // acquireWorkerLock returns an exclusive flock on the per-worker lock
