@@ -411,6 +411,33 @@ func TestEnsureDir_FsyncsProjectDirOnCreateOnly(t *testing.T) {
 	}
 }
 
+// Test 12b (regression) — when the project dir ITSELF does not exist yet
+// (state.ProjectDir is path-only), the first write creates both <project>/ and
+// watch-msgs/; the parent of EVERY created level must be fsynced so neither
+// dentry is lost on a crash. Fsyncing only watch-msgs/'s parent would leave
+// the <project>/ dentry non-durable.
+func TestEnsureDir_FsyncsAllCreatedLevels(t *testing.T) {
+	base := t.TempDir()
+	projectDir := filepath.Join(base, "proj-x") // does NOT exist yet
+	c := New(projectDir)
+	var synced []string
+	restore := fsyncDir
+	fsyncDir = func(dir string) error { synced = append(synced, dir); return nil }
+	defer func() { fsyncDir = restore }()
+
+	if _, err := c.AppendEvent(Message{Kind: KindWorkerDelta, WatcherID: WatcherID("w"), Key: "a"}); err != nil {
+		t.Fatal(err)
+	}
+	// parent of watch-msgs/ (== projectDir) AND parent of projectDir (== base)
+	// must both be fsynced.
+	if !contains(synced, projectDir) {
+		t.Fatalf("projectDir %q (parent of watch-msgs) not fsynced; synced=%v", projectDir, synced)
+	}
+	if !contains(synced, base) {
+		t.Fatalf("base %q (parent of newly-created projectDir) not fsynced; synced=%v", base, synced)
+	}
+}
+
 // Test 13 (regression) — heartbeat unlink is made durable (dir fsync); a no-op
 // remove of a missing heartbeat does not fsync.
 func TestRemoveHeartbeat_FsyncsDir(t *testing.T) {

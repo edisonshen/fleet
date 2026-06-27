@@ -177,19 +177,46 @@ func eventFilename(unixNanos int64, watcherID string, seq uint64) string {
 }
 
 // ensureDir creates watch-msgs/ on demand and, ONLY when it actually creates
-// it, fsyncs the parent (project) dir so the new directory's dentry survives a
-// crash — otherwise the first message (and the whole dir) can vanish on a
-// reboot, breaking the crash-safe guarantee. The already-exists fast path
-// skips the fsync (the dentry was made durable by whoever first created it).
+// directories, fsyncs the PARENT of every level it created so each new dentry
+// survives a crash — otherwise the first message (and the whole dir) can
+// vanish on a reboot, breaking the crash-safe guarantee. MkdirAll can create a
+// MULTI-level chain: state.ProjectDir is path-only (does NOT create
+// <project>/), so the first write may make both <project>/ and watch-msgs/.
+// Fsyncing only watch-msgs/'s immediate parent would leave the <project>/
+// dentry in ~/.fleet/projects/ non-durable, so we fsync the parent of each
+// newly-created level (deduped). The already-exists fast path skips all of
+// this (the dentries were made durable by whoever first created them).
 func (c *Channel) ensureDir() error {
 	if _, err := os.Stat(c.dir); err == nil {
 		return nil
 	}
+	// Collect the ancestor dirs that don't exist yet (deepest-first), stopping
+	// at the first existing ancestor — exactly the set MkdirAll will create.
+	var created []string
+	for d := c.dir; ; {
+		if _, err := os.Stat(d); err == nil {
+			break
+		}
+		created = append(created, d)
+		parent := filepath.Dir(d)
+		if parent == d { // filesystem root — stop
+			break
+		}
+		d = parent
+	}
 	if err := os.MkdirAll(c.dir, 0o755); err != nil {
 		return fmt.Errorf("watchchan: mkdir %s: %w", c.dir, err)
 	}
-	if perr := fsyncDir(filepath.Dir(c.dir)); perr != nil {
-		c.logf("created %s but parent-dir fsync failed: %v", c.dir, perr)
+	synced := make(map[string]bool, len(created))
+	for _, d := range created {
+		parent := filepath.Dir(d)
+		if synced[parent] {
+			continue
+		}
+		synced[parent] = true
+		if perr := fsyncDir(parent); perr != nil {
+			c.logf("created %s but fsync of parent %s failed: %v", c.dir, parent, perr)
+		}
 	}
 	return nil
 }
