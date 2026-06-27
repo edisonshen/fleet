@@ -46,6 +46,8 @@ try:
     import fleetlog as fleetlog_mod
 except Exception:  # pragma: no cover - logging is best-effort; never block import
     fleetlog_mod = None
+# Resolved once at import so every _flog callsite avoids the repeated ternary.
+_FLOG_COORD = fleetlog_mod.COMP_COORD if fleetlog_mod is not None else "coord"
 import parse
 import pr_watch as pr_watch_mod
 import reaper as reaper_mod
@@ -480,7 +482,7 @@ def tick(
     # fleetlog: bracket the mutating phase with coord.tick start/end and
     # run the once/day retention prune. All best-effort (fire-and-forget):
     # a logging or prune failure must never affect the tick result.
-    _flog(fleetlog_mod.COMP_COORD if fleetlog_mod else "coord",
+    _flog(_FLOG_COORD,
           "coord.tick", "info", proj=project, agent=coord_id,
           msg=f"coord tick start for {project}", data={"cap": cap})
     if fleetlog_mod is not None:
@@ -494,7 +496,7 @@ def tick(
             home, fleet_bin, now_unix,
         )
     finally:
-        _flog(fleetlog_mod.COMP_COORD if fleetlog_mod else "coord",
+        _flog(_FLOG_COORD,
               "coord.tick", "info", proj=project, agent=coord_id,
               msg=f"coord tick end for {project}",
               data={
@@ -7609,7 +7611,7 @@ def _apply_dispatch(action: _DispatchAction, project: str, fleet_bin: str) -> No
     _run_fleet([fleet_bin, "tasks", "note", "--project", project, action.slug, f"dispatched as agent {action.agent_id}"])
     # fleetlog: record the worker dispatch (fire-and-forget). The full
     # mutation chain above has landed, so the task is durably in-progress.
-    _flog(fleetlog_mod.COMP_COORD if fleetlog_mod else "coord",
+    _flog(_FLOG_COORD,
           "dispatch.worker", "info", proj=project, slug=action.slug,
           agent=action.agent_id, dispatch_id=action.agent_id,
           msg=f"dispatched worker {action.slug} as agent {action.agent_id}",

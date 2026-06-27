@@ -252,7 +252,7 @@ documented, not hand-waved.
   `handoffs/`, …); relocating all of it would be wrong, and the doc only wants
   logs under XDG. `MkdirAll` defensively; **swallow all errors** — logging must
   never fail a command (best-effort).
-- File handle is opened once per process and reused (re-open on date rollover).
+- File handle is opened per `Log()` call (`os.O_WRONLY|os.O_APPEND|os.O_CREATE`), one line is written, and the fd is closed immediately. Open-per-call; no cached handle. The filename is computed from `nowFn()` on each call so date rollover is handled implicitly (the next Log after midnight writes to the new-day file).
 
 ### Emitter — Python (`skills/coordinator/fleetlog.py`)
 
