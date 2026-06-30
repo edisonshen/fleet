@@ -521,6 +521,15 @@ def tick(
             home, fleet_bin, now_unix,
         )
     finally:
+        # Release the coordinator lock FIRST, then emit the end event.
+        # _flog only swallows Exception (not BaseException), and its file I/O
+        # could block on a stalled FS — both would otherwise delay or skip the
+        # unlock and leak the lock for the process lifetime. Logging is
+        # best-effort, so it runs last, outside the lock.
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        finally:
+            os.close(lock_fd)
         _flog(_FLOG_COORD,
               "coord.tick", "info", proj=project, agent=coord_id,
               msg=f"coord tick end for {project}",
@@ -531,10 +540,6 @@ def tick(
                   "raised": result.raised,
                   "errors": len(result.errors),
               })
-        try:
-            fcntl.flock(lock_fd, fcntl.LOCK_UN)
-        finally:
-            os.close(lock_fd)
 
 
 # ----------------------------------------------------------------------

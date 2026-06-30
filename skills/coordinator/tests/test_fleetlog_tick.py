@@ -181,3 +181,43 @@ def test_tick_survives_logging_failure(home, monkeypatch):
     result = loop.tick(project, coord_id="", cwd=str(pdir), fleet_home=str(home))
     assert result.dispatched == 1
     assert not result.skipped
+
+
+def test_tick_releases_lock_when_end_event_raises_base_exception(home, monkeypatch):
+    """Regression: the coordinator lock must be released even if the
+    'coord tick end' fleetlog emit raises a BaseException (KeyboardInterrupt /
+    SystemExit) — _flog only swallows Exception, so a BaseException propagates.
+    The unlock must run BEFORE the end emit; otherwise the lock leaks for the
+    process lifetime and wedges every competing coord with lock-busy."""
+    import fcntl
+    import os
+
+    project = "fleet"
+    pdir = home / "projects" / project
+    _write_one_ready_task(pdir)
+    monkeypatch.setattr("dispatch.mint_agent_id", lambda: "abcdef05")
+    monkeypatch.setattr(loop, "_run_fleet", lambda cmd, timeout_s=30.0: None)
+    _stub_acquire(monkeypatch, home, "abcdef05")
+
+    real_log = loop.fleetlog_mod.log
+
+    def _raise_on_end(comp, evt, lvl="info", **fields):
+        if "coord tick end" in (fields.get("msg") or ""):
+            raise KeyboardInterrupt("simulated signal during end emit")
+        return real_log(comp, evt, lvl, **fields)
+
+    monkeypatch.setattr(loop.fleetlog_mod, "log", _raise_on_end)
+
+    with pytest.raises(KeyboardInterrupt):
+        loop.tick(project, coord_id="", cwd=str(pdir), fleet_home=str(home))
+
+    # Lock must be free: a fresh non-blocking exclusive flock acquires it.
+    # flock on a distinct open-file-description contends even within the same
+    # process, so a leaked-but-still-held lock_fd would make this raise.
+    lock_path = pdir / ".locks" / "coordinator.lock"
+    fd = os.open(str(lock_path), os.O_RDWR)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        fcntl.flock(fd, fcntl.LOCK_UN)
+    finally:
+        os.close(fd)
