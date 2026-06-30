@@ -8342,11 +8342,12 @@ def main(argv: Iterable[str] | None = None) -> int:
             f"harness re-ticks."
         )
         return _EXIT_BROKEN_PIPE
-    # Final JSON summary. A closed stdout here is benign (the summary is
-    # diagnostic, not the load-bearing DISPATCH block — those already
-    # flushed above) — _print_json_safe returns 0 and silences the
-    # shutdown flush so the process exits cleanly, never via SIGPIPE and
-    # never as a spurious re-tick signal.
+    # Final JSON summary. A closed stdout here is usually benign (the
+    # summary is diagnostic, not the load-bearing DISPATCH block — those
+    # already flushed above) — _print_json_safe silences the shutdown
+    # flush, never via SIGPIPE. It returns 0 for a benign alert-free EPIPE,
+    # or _EXIT_BROKEN_PIPE=2 when the dropped summary carried raised/errors
+    # (path 3 in the main() docstring) so the harness re-ticks.
     return _print_json_safe({
         "skipped": result.skipped,
         "reason": result.reason,
