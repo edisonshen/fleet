@@ -6,6 +6,72 @@ follows [SemVer](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.14.0] - 2026-06-30
+
+The coordinator tick goes single-shot. By default each tick now does
+one pass — reconcile, drain, dispatch, hand off — and exits, with the
+old in-turn poll loop available behind `FLEET_COORD_IN_TURN_SUPERVISOR=1`
+as a rollback hatch; the path is SIGPIPE-hardened so a closed stdout
+never wedges a tick or leaks its lock. Local debug observability lands:
+`fleetlog` writes per-process agent/LLM JSONL under `~/.fleet/logs`
+(OTel-inspired schema, closed event vocabulary, 3-day prune) with
+explicit emit calls wired through the coord tick, workers, spawn, and
+the key CLIs. Handoff docs become genuinely useful — the manual and
+recovery docs are now filled end to end: machine state (active
+subagents, open PRs), the narrative sections (Completed, Next Steps,
+Open Questions), and Key Decisions + Files Modified, all produced from
+live coordinator state. Remote control becomes native and default-on
+(the standalone listener and send-keys injection are retired in favor
+of `claude --remote-control` baked into the spawn argv), an
+append-safe watcher→coord message channel (`watchchan`) is added, and
+graceful handoff gains a real completion phase. CI hardening continues:
+the test hang is killed, the suite is fenced and de-heavied to run in
+under three minutes, and the lease-failover fork-bomb is fixed.
+
+### Added
+
+- Single-shot coordinator tick by default: one reconcile/drain/dispatch/
+  handoff pass per tick, SIGPIPE-hardened, with
+  `FLEET_COORD_IN_TURN_SUPERVISOR=1` as the in-turn-loop rollback hatch
+  (#238).
+- `fleetlog` local debug logs: an append-only library plus
+  `skills/coordinator/fleetlog.py`, writing per-process agent/LLM JSONL
+  to `~/.fleet/logs` with an OTel-inspired schema and closed event
+  vocabulary, emitted at coord-tick / worker / spawn / key-CLI sites,
+  with a 3-day `fleet gc` prune (#241).
+- Native, default-on remote control: `--remote-control` baked into the
+  coord spawn argv with an opt-out marker, retiring the standalone
+  listener and send-keys injection (#230).
+- Append-safe watcher→coord message channel (`watchchan`) (#240).
+- Handoff doc enrichment — machine state (active subagents, open PRs)
+  (#236), the Completed / Next Steps / Open Questions narrative (#237),
+  and Key Decisions + Files Modified producers (#242).
+- `GracefulHandoff` completion phase converging the live-coord paths
+  (#231).
+
+### Changed
+
+- Warm-standby spawn collapse (#225) and handoff delivery routed to the
+  lock owner (#226).
+- Drain counts a timed-out resume as backgrounded and defaults to 120s
+  (#227).
+- TUI project-row `[a]` attaches the live coord on dispatch exit 75
+  instead of dead-ending (#239).
+- Task-plan review SOP: dispatched dual review before promote
+  documented in the coordinator skill (#229).
+
+### Fixed
+
+- `fleet-guard` flags rather than silos an unknown model — defaults to
+  the 1M context window, adds the Fable 5 table, and emits loud
+  no-usage diagnostics (#228).
+- Coordinator records are exempted from the idle-TTL archive sweep
+  (#232).
+- CI test hang killed and runtime capped (#233); the suite is moved
+  in-process with a fake tmux and `cmd/fleet` de-heavied to land CI
+  under three minutes (#234); lease-failover coord-spawn tests are
+  fenced out of the default lane to fix the fork-bomb (#235).
+
 ## [0.13.0] - 2026-06-08
 
 Handoff durability gets a real lease. A three-file coordinator lease
