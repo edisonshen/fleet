@@ -141,9 +141,11 @@ func TestEnrichManualDoc_LiveStateWinsOverCheckpoint(t *testing.T) {
 	if len(doc.OpenPRs) != 1 || doc.OpenPRs[0].Number != 9 {
 		t.Fatalf("OpenPRs: got %#v want one #9 (gh)", doc.OpenPRs)
 	}
-	// Slice 2: checkpoint decisions are NO LONGER lifted into NextSteps
-	// (dead mapping removed). No live ready/todo tasks.md here → NextSteps
-	// stays placeholder.
+	// Slice 3: checkpoint decisions now land in Key Decisions (not the
+	// deleted decisions->NextSteps mapping).
+	if !strings.Contains(doc.KeyDecisions, "dispatched fix-live-9999") {
+		t.Errorf("KeyDecisions: got %q want checkpoint decisions lifted", doc.KeyDecisions)
+	}
 	if strings.Contains(doc.NextSteps, "dispatched fix-live-9999") {
 		t.Errorf("NextSteps must not carry checkpoint decisions: %q", doc.NextSteps)
 	}
@@ -1014,14 +1016,12 @@ func TestEnrichManualDoc_NilDoc(t *testing.T) {
 	EnrichManualDoc(nil, "myproj", "deadbeef", "", nil, nil) // must not panic
 }
 
-// --- Case R: checkpoint-lift behavior under Slice 2. The shared
-// applyCheckpointToDoc lifts ActiveSubagents + OpenPRs verbatim; the dead
-// recent_decisions→NextSteps mapping is GONE (NextSteps now sources from
-// the live tasks.md queue — absent here, so it stays placeholder). Recent
-// decisions stay in the checkpoint untouched but no longer surface in the
-// doc. Completed comes from the Completed (recent) buffer (absent in this
-// seed → placeholder). ---
-func TestSynthesizeRecovery_CheckpointLift_NoDecisionsToNextSteps(t *testing.T) {
+// --- Case R: checkpoint-lift mapping (Slice 2/3). The shared
+// applyCheckpointToDoc now maps the checkpoint's recent_decisions →
+// doc.KeyDecisions (NOT the deleted decisions→NextSteps mis-mapping). No
+// recent_completions seeded here → Completed stays placeholder; no
+// tasks.md → NextSteps / OpenQuestions stay placeholder. ---
+func TestSynthesizeRecovery_RefactorParity_CheckpointLift(t *testing.T) {
 	pdir := withFleetHomeSynth(t)
 	now := time.Date(2026, 6, 16, 12, 0, 0, 0, time.UTC)
 
@@ -1038,13 +1038,15 @@ func TestSynthesizeRecovery_CheckpointLift_NoDecisionsToNextSteps(t *testing.T) 
 		t.Fatalf("SynthesizeRecoveryWithLastHandoff: %v", err)
 	}
 
-	// recent_decisions no longer map into NextSteps; no live tasks.md →
-	// NextSteps stays placeholder.
-	if doc.NextSteps != Placeholder {
-		t.Errorf("NextSteps: got %q want placeholder (decisions mapping removed, no live queue)", doc.NextSteps)
+	// recent_decisions now land in Key Decisions, rendered as a plain
+	// `- <line>` bullet list (no header).
+	wantKeyDecisions := "- dispatched fix-new-1234\n- promoted bar to ready"
+	if doc.KeyDecisions != wantKeyDecisions {
+		t.Errorf("KeyDecisions drift:\n got %q\nwant %q", doc.KeyDecisions, wantKeyDecisions)
 	}
-	if strings.Contains(doc.NextSteps, "dispatched fix-new-1234") {
-		t.Errorf("NextSteps must NOT carry checkpoint decisions: %q", doc.NextSteps)
+	// NextSteps no longer carries decisions; no tasks.md → placeholder.
+	if doc.NextSteps != Placeholder {
+		t.Errorf("NextSteps: got %q want placeholder (decisions→KeyDecisions now)", doc.NextSteps)
 	}
 	if len(doc.ActiveSubagents) != 1 || doc.ActiveSubagents[0].TaskID != "fix-new-1234" {
 		t.Errorf("ActiveSubagents drift: %#v", doc.ActiveSubagents)
@@ -1052,19 +1054,15 @@ func TestSynthesizeRecovery_CheckpointLift_NoDecisionsToNextSteps(t *testing.T) 
 	if len(doc.OpenPRs) != 1 || doc.OpenPRs[0].Number != 77 {
 		t.Errorf("OpenPRs drift: %#v", doc.OpenPRs)
 	}
-	// Completed (no Completed (recent) section in this seed) + Key
-	// Decisions + Open Questions stay placeholder.
-	if doc.Completed != Placeholder || doc.KeyDecisions != Placeholder || doc.OpenQuestions != Placeholder {
-		t.Errorf("narrative drift: Completed=%q KeyDecisions=%q OpenQuestions=%q",
-			doc.Completed, doc.KeyDecisions, doc.OpenQuestions)
+	// No recent_completions seeded -> Completed stays placeholder.
+	if doc.Completed != Placeholder {
+		t.Errorf("Completed: got %q want placeholder (no completions buffer)", doc.Completed)
 	}
 }
 
-// renderCompletionBullets formatting: empty buffer → "" (caller keeps the
-// placeholder); non-empty renders the exact `- <line>` bullet shape that
-// applyCheckpointToDoc lifts into doc.Completed. Replaces the deleted
-// TestApplyRecentDecisions_Format (the dead decisions→NextSteps mapping
-// is gone; NextSteps now sources from the live tasks.md queue).
+// renderCompletionBullets formatting: empty buffer -> "" (caller keeps
+// the placeholder); non-empty renders the exact `- <line>` bullet shape
+// applyCheckpointToDoc lifts into doc.Completed / doc.KeyDecisions.
 func TestRenderCompletionBullets_Format(t *testing.T) {
 	if got := renderCompletionBullets(nil); got != "" {
 		t.Errorf("empty completions: got %q want empty", got)

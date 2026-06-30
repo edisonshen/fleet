@@ -473,6 +473,84 @@ def tick(
             os.close(lock_fd)
 
 
+# ----------------------------------------------------------------------
+# Key Decisions producer (DESIGN-handoff-doc-slice3-decisions-files). The
+# recent_decisions capped rolling buffer in coord-state.json feeds the
+# successor's handoff doc Key Decisions section: every applied dispatch/
+# reconcile/sentinel action records the "why".
+#
+# Recording is a SHARED SEAM, not threaded into the `_apply_*` signatures
+# (a missed caller silently drops decisions): every loop that applies an
+# action calls `_record_decision(<state dict it owns>, action)` right after
+# a successful apply. The enclosing loop already persists that dict
+# (`_save_coord_state`), so the buffer rides along to the next checkpoint
+# write. Best-effort — a decision-log failure must never wedge a tick.
+# (Completed / recent_completions is the Slice 2 buffer, wired separately.)
+# ----------------------------------------------------------------------
+
+
+def _decision_line(action) -> str:
+    """Map a tick action to a one-line, past-tense decision string for the
+    recent_decisions buffer, or "" for actions that are not
+    operator-meaningful decisions (a failed/no-op dispatch, a `new_task`
+    sentinel, a status-less reconcile). Never raises."""
+    try:
+        slug = getattr(action, "slug", "") or ""
+        if isinstance(action, _DispatchAction):
+            if getattr(action, "error", ""):
+                return ""
+            phase = getattr(action, "handoff_phase", "") or ""
+            if phase == "review-pending":
+                return f"dispatched reviewer for {slug}"
+            if phase == "review-done":
+                return f"dispatched finisher for {slug}"
+            if getattr(action, "dispatch_instruction", "") or getattr(action, "agent_id", ""):
+                gen = getattr(action, "dispatch_generation", 0) or 0
+                return f"dispatched worker {slug} (gen {gen})"
+            return ""
+        if isinstance(action, _ReconcileAction):
+            # A reconcile can BOTH move the task AND raise to the operator
+            # (e.g. recovering a shipped PR sets new_status="in-review" and
+            # raises). Capture the status transition first so Key Decisions
+            # records WHERE the task went, then append the raise — never drop
+            # the transition just because the action also alerted.
+            new_status = getattr(action, "new_status", None)
+            raised = getattr(action, "raised_to_user", False)
+            txt = (getattr(action, "raise_text", "") or "").strip()
+            if new_status and raised:
+                line = f"reconciled {slug} → {new_status}, raised hand"
+                return line + (f" — {txt}" if txt else "")
+            if raised:
+                return f"raised hand: {slug}" + (f" — {txt}" if txt else "")
+            if new_status:
+                return f"reconciled {slug} → {new_status}"
+            return ""
+        if isinstance(action, _SentinelAction):
+            kind = getattr(action, "kind", "") or ""
+            if kind == "task_done_pr":
+                return f"worker {slug} finished → in-review"
+            if kind == "worker_failed":
+                return f"requeued worker-failed task {slug}"
+            if kind == "blocked_question":
+                return f"parked task {slug}: blocked question"
+            return ""  # new_task is not a decision
+    except Exception:  # noqa: BLE001 — classification must never raise
+        return ""
+    return ""
+
+
+def _record_decision(state: dict, action) -> None:
+    """Shared seam: record a decision line for `action` into the
+    recent_decisions checkpoint buffer (in-memory; the enclosing loop
+    persists `state`). Best-effort — never raises."""
+    try:
+        line = _decision_line(action)
+        if line:
+            dispatch_mod.record_checkpoint_decision(state, line)
+    except Exception:  # noqa: BLE001 — a decision-log fault must not wedge a tick
+        pass
+
+
 def _tick_locked(
     result: TickResult,
     project: str,
@@ -589,6 +667,10 @@ def _tick_locked(
                 dispatch_mod.record_checkpoint_completion(
                     state, f"done {action.slug}",
                 )
+            # Slice 3 (Key Decisions): record the decision for this applied
+            # reconcile into recent_decisions (the "why"). `state` is the
+            # primary tick dict, persisted at the heartbeat below.
+            _record_decision(state, action)
             if action.raised_to_user:
                 result.raised += 1
             # Drop slug → agent_id mapping when the worker is gone (any
@@ -741,6 +823,10 @@ def _tick_locked(
             if sentinel_outcome == SENTINEL_SKIPPED_STALE:
                 continue
             result.drained += 1
+            # Checkpoint narrative (Slice 2/3): an APPLIED sentinel is a
+            # decision (drain event). NOT a completion — task_done_pr →
+            # in-review, worker_failed → requeue; neither is a true done.
+            _record_decision(state, action)
             if action.raised_to_user:
                 result.raised += 1
             # Worker is leaving the in-flight set on TASK_DONE_PR
@@ -947,6 +1033,9 @@ def _tick_locked(
                 if action.agent_id:
                     emitted_this_tick.add(action.agent_id)
                 result.dispatched += 1
+                # Checkpoint narrative (Slice 3): reviewer/finisher
+                # dispatch is a decision.
+                _record_decision(state, action)
         except Exception as exc:
             result.errors.append(f"handoff apply {action.slug}: {exc}")
     dispatched = _dispatch_ready(
@@ -1013,6 +1102,9 @@ def _tick_locked(
                 if action.agent_id:
                     emitted_this_tick.add(action.agent_id)
                 result.dispatched += 1
+                # Checkpoint narrative (Slice 3): a genuine dispatch (a
+                # block was emitted) is a decision — never a completion.
+                _record_decision(state, action)
         except Exception as exc:
             result.errors.append(f"dispatch {action.slug}: {exc}")
 
@@ -1152,8 +1244,9 @@ def _tick_locked(
         result.errors.append(f"pr-watch reconcile: {exc}")
     else:
         # Slice 2 fix: _reconcile_pr_watches may have appended PR-merged
-        # completions to `state["recent_completions"]` inside _flip_done.
-        # The heartbeat save at line 1060 ran BEFORE this call, so those
+        # completions to `state["recent_completions"]` (and, Slice 3, a
+        # decision to `state["recent_decisions"]`) inside _flip_done. The
+        # heartbeat save at line 1060 ran BEFORE this call, so those
         # mutations are not yet on disk. Persist now so the rolling
         # checkpoint re-load (line 1216) captures them. Fail-soft: a
         # save error here is non-fatal (checkpoint misses this tick's
@@ -1366,6 +1459,10 @@ def _run_supervisor(
                     dispatch_mod.record_checkpoint_completion(
                         cs, f"done {action.slug}",
                     )
+                # Slice 3 (Key Decisions): record into `cs` —
+                # _save_coord_state(state_path, cs) at the end of this loop
+                # persists it for the post-supervisor checkpoint write.
+                _record_decision(cs, action)
                 if action.clear_worker:
                     # PR1 dispatch-lifecycle: release coord_prompt_inbox
                     # BEFORE forget_agent_id (same ordering rule as the
@@ -1491,6 +1588,9 @@ def _run_supervisor(
                     result.dispatch_instructions.append(action.dispatch_instruction)
                     if action.agent_id:
                         emitted_this_tick.add(action.agent_id)
+                # Checkpoint narrative (Slice 3): record into `cs`
+                # (persisted by _save_coord_state at this loop's end).
+                _record_decision(cs, action)
             except Exception as exc:  # noqa: BLE001
                 result.errors.append(
                     f"supervisor handoff apply {action.slug}: {exc}"
@@ -1544,6 +1644,9 @@ def _run_supervisor(
                     result.dispatch_instructions.append(action.dispatch_instruction)
                     if action.agent_id:
                         emitted_this_tick.add(action.agent_id)
+                # Checkpoint narrative (Slice 3): supervisor-dispatched
+                # worker is a decision; record into `cs`.
+                _record_decision(cs, action)
             except Exception as exc:  # noqa: BLE001
                 result.errors.append(f"supervisor dispatch {action.slug}: {exc}")
         _save_coord_state(state_path, cs)
@@ -1856,6 +1959,10 @@ def _run_supervisor(
                 # stale sentinel never becomes current.
                 if sentinel_outcome == SENTINEL_SKIPPED_STALE:
                     continue
+                # Checkpoint narrative (Slice 2/3): an APPLIED deferred
+                # sentinel is a decision; record into `cs` (the caller
+                # persists it via _save_coord_state).
+                _record_decision(cs, action)
                 # Codex iter-23 [P2]: same blocked_question carve-out
                 # as the non-replay drain — blocked workers stay alive,
                 # so we must preserve the agent_id mapping. Only the
@@ -2030,6 +2137,11 @@ def _run_supervisor(
                 # no re-defer (a stale sentinel never becomes current).
                 if sentinel_outcome == SENTINEL_SKIPPED_STALE:
                     continue
+                # Checkpoint narrative (Slice 2/3): a fresh-drain sentinel
+                # (the COMMON supervisor path — merge→done flip /
+                # worker-failed park) is a decision. Record into `cs`
+                # (persisted by _save_coord_state at this loop's end).
+                _record_decision(cs, action)
                 # Codex iter-22 [P1]: blocked workers stay ALIVE so
                 # the operator can answer the BLOCKED_QUESTION. We
                 # must NOT forget the agent_id mapping in that case —
@@ -5759,6 +5871,13 @@ def _reconcile_pr_watches(
         dispatch_mod.record_checkpoint_completion(
             state, f"merged {slug} {pr_url}".rstrip(),
         )
+        # Slice 3 (Key Decisions): the same PR-merged flip is also a
+        # decision (→ Key Decisions). Inline (not via _record_decision) —
+        # this closure has slug+pr_url, not an action object. Best-effort.
+        try:
+            dispatch_mod.record_checkpoint_decision(state, f"merged PR → task {slug} done")
+        except Exception:  # noqa: BLE001
+            pass
 
     # --- PR2 auto-fix seam (DESIGN §5.1c / §6). Three injected callbacks
     # keep pr_watch shell-free: it decides WHAT to dispatch + owns the

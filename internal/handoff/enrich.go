@@ -353,26 +353,29 @@ func statusIsPrePR(status string) bool {
 // recovery-synth path and the manual EnrichManualDoc path apply the
 // checkpoint identically.
 //
-// SLICE 2: maps the verbatim-lifted MACHINE sections (ActiveSubagents,
-// OpenPRs) plus the NARRATIVE `Completed (recent)` buffer → doc.Completed,
-// fixing manual + recovery in lockstep. `recent_decisions` is NO LONGER
-// mapped into NextSteps — that buffer has no production producer (dead),
-// and NextSteps now sources from the live tasks.md queue (CollectNextSteps).
-// recent_decisions stays in the checkpoint untouched (future home:
-// Key Decisions, deferred). Empty completions leave doc.Completed as-is
-// (Placeholder for synth / the manual stub).
+// SLICE 2 maps the verbatim-lifted MACHINE sections (ActiveSubagents,
+// OpenPRs) plus the NARRATIVE `Completed (recent)` buffer -> doc.Completed.
+// SLICE 3 adds the `recent_decisions` buffer -> doc.KeyDecisions (the
+// buffer's correct home; it finally has a producer wired in loop.py).
+// Each empty buffer leaves the doc's existing section text (Placeholder
+// for synth / the manual stub). NextSteps + Open Questions are NOT touched
+// here -- they come live from tasks.md via CollectNextSteps /
+// CollectOpenQuestions, so a checkpoint lift must not overwrite them.
 func applyCheckpointToDoc(doc *Doc, cp *checkpointDoc) {
 	doc.ActiveSubagents = cp.activeSubagents
 	doc.OpenPRs = cp.openPRs
 	if body := renderCompletionBullets(cp.recentCompletions); body != "" {
 		doc.Completed = body
 	}
+	if body := renderCompletionBullets(cp.recentDecisions); body != "" {
+		doc.KeyDecisions = body
+	}
 }
 
-// renderCompletionBullets joins the checkpoint's Completed (recent) buffer
-// into a `- <line>` bullet list for the doc's `## Completed` section.
-// Returns "" for an empty buffer so the caller keeps the existing
-// placeholder (no empty-section artifact).
+// renderCompletionBullets joins a checkpoint buffer (recent_completions
+// -> Completed, or recent_decisions -> Key Decisions) into a `- <line>`
+// bullet list. Returns "" for an empty buffer so the caller keeps the
+// existing placeholder (no empty-section artifact).
 func renderCompletionBullets(completions []string) string {
 	if len(completions) == 0 {
 		return ""
@@ -565,6 +568,13 @@ func EnrichManualDoc(doc *Doc, project, agentID, repoDir string, lastHandoffPath
 	}
 	if oq := CollectOpenQuestions(tasksPath); oq != "" {
 		doc.OpenQuestions = oq
+	}
+	// Files Modified (Slice 3) is MANUAL-path only: repoDir is the
+	// handed-off coord's checkout, already resolved by the caller (do NOT
+	// re-resolve). Best-effort -- non-git / empty -> keep the placeholder.
+	// synth.go stays placeholder there (subprocess-free; Open PRs precedent).
+	if fm := CollectFilesModified(repoDir); fm != "" {
+		doc.FilesModified = fm
 	}
 }
 
