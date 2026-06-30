@@ -183,37 +183,14 @@ def test_tick_survives_logging_failure(home, monkeypatch):
     assert not result.skipped
 
 
-def test_tick_releases_lock_when_end_event_raises_base_exception(home, monkeypatch):
-    """Regression: the coordinator lock must be released even if the
-    'coord tick end' fleetlog emit raises a BaseException (KeyboardInterrupt /
-    SystemExit) — _flog only swallows Exception, so a BaseException propagates.
-    The unlock must run BEFORE the end emit; otherwise the lock leaks for the
-    process lifetime and wedges every competing coord with lock-busy."""
+def _assert_coord_lock_free(pdir: Path) -> None:
+    """A fresh non-blocking exclusive flock must acquire coordinator.lock.
+    flock on a distinct open-file-description contends even within the same
+    process, so a leaked-but-still-held lock_fd makes LOCK_NB raise
+    BlockingIOError. Used by every 'lock released on BaseException' test."""
     import fcntl
     import os
 
-    project = "fleet"
-    pdir = home / "projects" / project
-    _write_one_ready_task(pdir)
-    monkeypatch.setattr("dispatch.mint_agent_id", lambda: "abcdef05")
-    monkeypatch.setattr(loop, "_run_fleet", lambda cmd, timeout_s=30.0: None)
-    _stub_acquire(monkeypatch, home, "abcdef05")
-
-    real_log = loop.fleetlog_mod.log
-
-    def _raise_on_end(comp, evt, lvl="info", **fields):
-        if "coord tick end" in (fields.get("msg") or ""):
-            raise KeyboardInterrupt("simulated signal during end emit")
-        return real_log(comp, evt, lvl, **fields)
-
-    monkeypatch.setattr(loop.fleetlog_mod, "log", _raise_on_end)
-
-    with pytest.raises(KeyboardInterrupt):
-        loop.tick(project, coord_id="", cwd=str(pdir), fleet_home=str(home))
-
-    # Lock must be free: a fresh non-blocking exclusive flock acquires it.
-    # flock on a distinct open-file-description contends even within the same
-    # process, so a leaked-but-still-held lock_fd would make this raise.
     lock_path = pdir / ".locks" / "coordinator.lock"
     fd = os.open(str(lock_path), os.O_RDWR)
     try:
@@ -221,3 +198,99 @@ def test_tick_releases_lock_when_end_event_raises_base_exception(home, monkeypat
         fcntl.flock(fd, fcntl.LOCK_UN)
     finally:
         os.close(fd)
+
+
+def _raise_on_msg(real_log, needle: str):
+    """Wrap fleetlog.log so an emit whose msg contains `needle` raises a
+    BaseException (KeyboardInterrupt) — _flog only swallows Exception, so it
+    propagates and exercises the lock-release-before-emit ordering."""
+
+    def _wrapped(comp, evt, lvl="info", **fields):
+        if needle in (fields.get("msg") or ""):
+            raise KeyboardInterrupt(f"simulated signal during {needle!r} emit")
+        return real_log(comp, evt, lvl, **fields)
+
+    return _wrapped
+
+
+def test_tick_releases_lock_when_end_event_raises_base_exception(home, monkeypatch):
+    """Regression: the coordinator lock must be released even if the
+    'coord tick end' fleetlog emit raises a BaseException (KeyboardInterrupt /
+    SystemExit) — _flog only swallows Exception, so a BaseException propagates.
+    The unlock must run BEFORE the end emit; otherwise the lock leaks for the
+    process lifetime and wedges every competing coord with lock-busy."""
+    project = "fleet"
+    pdir = home / "projects" / project
+    _write_one_ready_task(pdir)
+    monkeypatch.setattr("dispatch.mint_agent_id", lambda: "abcdef05")
+    monkeypatch.setattr(loop, "_run_fleet", lambda cmd, timeout_s=30.0: None)
+    _stub_acquire(monkeypatch, home, "abcdef05")
+
+    monkeypatch.setattr(loop.fleetlog_mod, "log",
+                        _raise_on_msg(loop.fleetlog_mod.log, "coord tick end"))
+
+    with pytest.raises(KeyboardInterrupt):
+        loop.tick(project, coord_id="", cwd=str(pdir), fleet_home=str(home))
+
+    _assert_coord_lock_free(pdir)
+
+
+def test_tick_releases_lock_when_start_event_raises_base_exception(home, monkeypatch):
+    """Regression: the 'coord tick start' emit runs while the lock is held; a
+    BaseException there must still release the lock (start emit lives inside
+    the try whose finally unlocks)."""
+    project = "fleet"
+    pdir = home / "projects" / project
+    _write_one_ready_task(pdir)
+
+    monkeypatch.setattr(loop.fleetlog_mod, "log",
+                        _raise_on_msg(loop.fleetlog_mod.log, "coord tick start"))
+
+    with pytest.raises(KeyboardInterrupt):
+        loop.tick(project, coord_id="", cwd=str(pdir), fleet_home=str(home))
+
+    _assert_coord_lock_free(pdir)
+
+
+def test_tick_releases_lock_when_refuse_stale_event_raises_base_exception(home, monkeypatch):
+    """Regression: _refuse_stale (repo-resolve refusal) emits while holding the
+    lock; a BaseException there must still release it (unlock runs first)."""
+    project = "fleet"
+    pdir = home / "projects" / project
+    pdir.mkdir(parents=True, exist_ok=True)
+    # Make the repo binder refuse so tick takes the _refuse_stale path.
+    monkeypatch.setattr(
+        loop, "_resolve_repo_fn",
+        lambda project, *, home, fleet_bin="fleet", cwd=None: (None, "binder refused"),
+    )
+    monkeypatch.setattr(loop.fleetlog_mod, "log",
+                        _raise_on_msg(loop.fleetlog_mod.log, "repo-unresolved"))
+
+    with pytest.raises(KeyboardInterrupt):
+        loop.tick(project, coord_id="", cwd=str(pdir), fleet_home=str(home))
+
+    _assert_coord_lock_free(pdir)
+
+
+def test_tick_releases_lock_when_postlock_fence_event_raises_base_exception(home, monkeypatch):
+    """Regression: the post-lock lease-fence emit runs while holding the lock;
+    a BaseException there must still release it (unlock runs first). The
+    pre-lock proof passes, the post-lock re-fence returns 'fenced'."""
+    project = "fleet"
+    pdir = home / "projects" / project
+    pdir.mkdir(parents=True, exist_ok=True)
+
+    calls = {"n": 0}
+
+    def _fence_second(project, *, home, fleet_bin="fleet"):
+        calls["n"] += 1
+        return "owner" if calls["n"] == 1 else "fenced"
+
+    monkeypatch.setattr(loop, "_lease_check_fn", _fence_second)
+    monkeypatch.setattr(loop.fleetlog_mod, "log",
+                        _raise_on_msg(loop.fleetlog_mod.log, "post-lock"))
+
+    with pytest.raises(KeyboardInterrupt):
+        loop.tick(project, coord_id="", cwd=str(pdir), fleet_home=str(home))
+
+    _assert_coord_lock_free(pdir)

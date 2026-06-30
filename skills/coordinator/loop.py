@@ -441,15 +441,17 @@ def tick(
         result.skipped = True
         result.reason = reason_code
         result.raised += 1
-        # fleetlog: record the skipped tick so log consumers see repo-resolve
-        # refusals rather than an unexplained gap.
-        _flog(_FLOG_COORD, "coord.tick", "info", proj=project, agent=coord_id,
-              msg=f"coord tick skipped: {reason_code} for {project}",
-              data={"skipped": True, "reason": reason_code})
         try:
             fcntl.flock(lock_fd, fcntl.LOCK_UN)
         finally:
             os.close(lock_fd)
+        # fleetlog: record the skipped tick AFTER releasing the lock so a
+        # BaseException / stalled-FS write in the emit cannot leak the lock
+        # (logging is best-effort). Consumers still see the repo-resolve
+        # refusal rather than an unexplained gap.
+        _flog(_FLOG_COORD, "coord.tick", "info", proj=project, agent=coord_id,
+              msg=f"coord tick skipped: {reason_code} for {project}",
+              data={"skipped": True, "reason": reason_code})
         return result
 
     # The resolver runs AFTER the coordinator lock is acquired but BEFORE
@@ -500,22 +502,27 @@ def tick(
         result.skipped = True
         result.self_exit = True
         result.reason = "lease-fenced-self-exit"
-        # fleetlog: record the early-exit so log consumers see the gap.
-        _flog(_FLOG_COORD, "coord.tick", "info", proj=project, agent=coord_id,
-              msg=f"coord tick skipped: lease-fenced-self-exit (post-lock) for {project}",
-              data={"skipped": True, "reason": "lease-fenced-self-exit",
-                    "phase": "post-lock"})
         try:
             fcntl.flock(lock_fd, fcntl.LOCK_UN)
         finally:
             os.close(lock_fd)
+        # fleetlog: record the early-exit AFTER releasing the lock (see
+        # _refuse_stale rationale) so a BaseException in the emit cannot leak
+        # the lock; consumers still see the post-lock fence rather than a gap.
+        _flog(_FLOG_COORD, "coord.tick", "info", proj=project, agent=coord_id,
+              msg=f"coord tick skipped: lease-fenced-self-exit (post-lock) for {project}",
+              data={"skipped": True, "reason": "lease-fenced-self-exit",
+                    "phase": "post-lock"})
         return result
     # fleetlog: bracket the mutating phase with coord.tick start/end.
     # Best-effort: a logging failure must never affect the tick result.
-    _flog(_FLOG_COORD,
-          "coord.tick", "info", proj=project, agent=coord_id,
-          msg=f"coord tick start for {project}", data={"cap": cap})
+    # The start emit lives INSIDE the try so the finally still releases the
+    # lock if _flog raises a BaseException (KeyboardInterrupt/SystemExit) — a
+    # bare emit before the try would leak the lock on that path.
     try:
+        _flog(_FLOG_COORD,
+              "coord.tick", "info", proj=project, agent=coord_id,
+              msg=f"coord tick start for {project}", data={"cap": cap})
         return _tick_locked(
             result, project, project_dir, coord_id, cwd, cap,
             home, fleet_bin, now_unix,
