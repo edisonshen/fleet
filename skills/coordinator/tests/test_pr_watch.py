@@ -2685,7 +2685,9 @@ def test_raise_only_event_skips_supervisor_e2e(
     monkeypatch.setattr(loop.dispatch_mod, "acquire_coord_prompt_inbox",
                         _fake_acquire_factory(it_home))
     # force the supervisor "enabled" so the skip-on-raise gate is what
-    # prevents entry (not poll_interval_s<=0).
+    # prevents entry (not poll_interval_s<=0 and not the Slice-1
+    # single-shot default — opt that back in for this test).
+    monkeypatch.setenv("FLEET_COORD_IN_TURN_SUPERVISOR", "1")
     monkeypatch.setenv("FLEET_COORD_POLL_INTERVAL_S", "30")
     sup_called = {"n": 0}
     orig_sup = loop._run_supervisor

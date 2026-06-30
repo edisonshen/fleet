@@ -209,6 +209,16 @@ var propagatedRuntimeEnv = []string{
 	// default and re-open the orphan-pane window the fence closes (codex
 	// iter-3 [P1]). Production never sets it, so it stays a no-op there.
 	"FLEET_STANDBY_TIMEOUT",
+	// FLEET_COORD_IN_TURN_SUPERVISOR is the rollback/debug escape hatch for
+	// the single-shot agent tick (DESIGN-coord-supervisor-in-daemon Slice 1).
+	// The coord tick (loop.py) reads it from os.environ to decide whether to
+	// run the legacy in-turn supervisor poll loop; default OFF (single-shot).
+	// It MUST reach the spawned coord's tmux session, or `FLEET_COORD_IN_TURN_
+	// SUPERVISOR=1 fleet dispatch --coord-spawn ...` (and handoff/drain
+	// replacement spawns) would still run single-shot and the documented
+	// recover-to-legacy path would silently no-op (codex [P1]). Unset in
+	// production → no-op, so spawned coords stay single-shot by default.
+	"FLEET_COORD_IN_TURN_SUPERVISOR",
 }
 
 // leaseFailoverEnabled gates whether Spawn wraps a coord in the

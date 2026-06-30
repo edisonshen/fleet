@@ -79,6 +79,78 @@ _ARCHIVE_SCAN_CAP = 200
 _WORKTREE_GC_EVERY_DEFAULT = 20
 
 
+def _in_turn_supervisor_enabled() -> bool:
+    """Is the in-turn supervisor poll loop opt-in for THIS tick?
+
+    P0 stopgap (Slice 1 of DESIGN-coord-supervisor-in-daemon): the agent
+    tick is SINGLE-SHOT by default. Historically every tick entered
+    `_run_supervisor` — a 30-min in-turn poll loop that held
+    `coordinator.lock` and froze the agent's foreground turn; a closed
+    stdout in that window SIGPIPE-killed the process (exit 144). The
+    daemon (Slice 2) owns the continuous loop; the agent tick reverts to
+    its one-shot shape.
+
+    Default OFF. Set FLEET_COORD_IN_TURN_SUPERVISOR to a truthy value
+    (1/true/yes/on, case-insensitive) to restore the old in-turn loop as
+    a debugging escape hatch.
+
+    PROJECT-AGNOSTIC by construction — env-only, never gated on the
+    project name. Every coordinator (projects-fleet, projects-rainier,
+    all) inherits the single-shot default identically.
+    """
+    raw = os.environ.get("FLEET_COORD_IN_TURN_SUPERVISOR", "").strip().lower()
+    return raw in ("1", "true", "yes", "on")
+
+
+_INFLIGHT_STATUSES = ("in-progress", "in-review")
+
+
+def _maybe_warn_single_shot(*, tasks_path, sup_cfg, pr_watch_staged) -> None:
+    """Surface (to stderr) that the in-turn supervisor was skipped while
+    in-flight work exists — so the single-shot degradation is visible.
+
+    Stays quiet when:
+      - the operator did not configure polling (poll_interval_s <= 0):
+        legacy single-tick callers never wanted the loop;
+      - a PR-watch block was staged this tick (the legacy code ALSO skips
+        the loop in that case — main() flushes the block immediately);
+      - there is no in-flight task to shepherd (a truly idle coord).
+
+    Re-reads tasks.md fresh (codex [P3]): the in-memory `f.tasks` at the
+    gate is PRE-dispatch (re-read before §5), so a task dispatched this
+    tick is still `ready` there and reconcile mutations went through the
+    CLI to disk. Reading the current on-disk state gives the true
+    post-dispatch / post-reconcile in-flight view this breadcrumb needs.
+
+    Best-effort: never raises into the tick. The next tick (Stop hook /
+    `fleet message` wake / Slice-2 daemon pass) resumes shepherding.
+    """
+    if sup_cfg.poll_interval_s <= 0 or pr_watch_staged:
+        return
+    try:
+        current = parse.read(str(tasks_path))
+        inflight = [t for t in current.tasks if t.status in _INFLIGHT_STATUSES]
+    except Exception:  # noqa: BLE001 — never let a warn wedge a tick
+        return
+    if not inflight:
+        return
+    # Diagnostic only — written to stderr, NOT appended to result.errors:
+    # this is the EXPECTED single-shot path, not a tick failure, so it
+    # must not pollute the JSON `errors` field (which gates the operator's
+    # blocked_reason surface) on every healthy tick.
+    msg = (
+        f"coordinator: single-shot tick (FLEET_COORD_IN_TURN_SUPERVISOR "
+        f"off) — {len(inflight)} in-flight task(s) will be shepherded on "
+        f"the NEXT tick (Stop hook / `fleet message` wake / coord-run "
+        f"daemon), not by an in-turn poll loop. Set "
+        f"FLEET_COORD_IN_TURN_SUPERVISOR=1 to restore the legacy loop."
+    )
+    try:
+        sys.stderr.write(msg + "\n")
+    except (BrokenPipeError, OSError):
+        pass
+
+
 def _worktree_gc_every() -> int:
     """Resolve the worktree-GC cadence (ticks between backstop runs).
 
@@ -1362,13 +1434,24 @@ def _tick_locked(
         result.errors.append(f"worktree-gc: {exc}")
 
     # 6. Supervisor loop (issue #79). After the initial reconcile + drain
-    # + dispatch pass we keep the lock and watch in-flight workers. Cheap
-    # mtime polling drives event-based reconciliation; a sparse stuck-
-    # check pass catches workers that died silently. The legacy
-    # single-tick behavior is preserved when poll_interval=0 (or no
-    # in-flight tasks) — the supervisor returns immediately.
+    # + dispatch pass the legacy behavior kept the lock and watched
+    # in-flight workers via a 30-min in-turn poll loop. That froze the
+    # agent's foreground turn and SIGPIPE-killed the process (exit 144)
+    # whenever stdout closed mid-loop.
+    #
+    # P0 stopgap (Slice 1 of DESIGN-coord-supervisor-in-daemon): the agent
+    # tick is now SINGLE-SHOT by default. `_in_turn_supervisor_enabled()`
+    # gates the loop OFF unless FLEET_COORD_IN_TURN_SUPERVISOR is set —
+    # project-agnostic, no project-name branch. The daemon (Slice 2) owns
+    # the continuous loop out-of-turn. When the gate is on we still respect
+    # the legacy guards (poll_interval=0 / no in-flight tasks / a staged
+    # PR-watch block returns immediately).
     sup_cfg = supervisor_mod.SupervisorConfig.from_env()
-    if sup_cfg.poll_interval_s > 0 and not _pr_watch_staged_dispatch:
+    if (
+        _in_turn_supervisor_enabled()
+        and sup_cfg.poll_interval_s > 0
+        and not _pr_watch_staged_dispatch
+    ):
         _run_supervisor(
             cfg=sup_cfg,
             project=project,
@@ -1382,6 +1465,21 @@ def _tick_locked(
             coord_id=coord_id,
             result=result,
             emitted_this_tick=emitted_this_tick,
+        )
+    else:
+        # Single-shot default (Slice 1): the continuous in-turn loop is
+        # OFF, so per-tick shepherding (PR-watch polling, stuck-worker
+        # recovery) only happens when a NEW tick fires — the Stop hook on
+        # the next agent turn, a `fleet message` wake, or the Slice-2
+        # daemon's mechanical pass. Surface this so the degraded cadence
+        # is visible rather than silent (feedback_surface_dont_silo) — but
+        # ONLY when there is in-flight work to shepherd AND the operator
+        # had polling configured (poll_interval>0); a truly idle coord
+        # stays quiet. codex [P1]: makes the intended tradeoff explicit.
+        _maybe_warn_single_shot(
+            tasks_path=tasks_path,
+            sup_cfg=sup_cfg,
+            pr_watch_staged=_pr_watch_staged_dispatch,
         )
 
     # 5.9. Rolling coord checkpoint (#187), part 2 — write the file LAST.
@@ -7966,23 +8064,186 @@ def _kill_own_tmux_session(coord_id: str) -> bool:
 _kill_own_session_fn = _kill_own_tmux_session
 
 
+# Exit code returned when stdout is a broken pipe while emitting a tick's
+# output. NOT 144 (128+SIGPIPE): the broken pipe is HANDLED, never a
+# fatal signal. The harness/operator sees a clean nonzero and re-ticks.
+_EXIT_BROKEN_PIPE = 2
+
+
+def _ensure_sigpipe_handled() -> None:
+    """Defensively keep SIGPIPE handled (not fatal) for this process.
+
+    CPython sets SIGPIPE to SIG_IGN at startup so a write to a closed
+    pipe raises BrokenPipeError instead of killing the process with the
+    signal (exit 144). But a parent/child that ran `signal(SIGPIPE,
+    SIG_DFL)` (common in shell pipelines and some tmux send-key setups)
+    can leak the default disposition into this process — and then the
+    very first write to a closed stdout delivers a FATAL SIGPIPE before
+    any `try/except BrokenPipeError` can run. This tick is routinely
+    piped (`| head`, harness truncation), so we restore SIG_IGN
+    explicitly at entry. Best-effort: platforms without SIGPIPE (Windows)
+    or a restricted env just skip it.
+    """
+    try:
+        import signal
+
+        if hasattr(signal, "SIGPIPE"):
+            signal.signal(signal.SIGPIPE, signal.SIG_IGN)
+    except (ValueError, OSError, AttributeError):
+        # ValueError: not the main thread. OSError/AttributeError: no
+        # SIGPIPE on this platform. Either way the default Python
+        # disposition (SIG_IGN) already covers the common case.
+        pass
+
+
+def _warn_stderr(msg: str) -> None:
+    """Write a diagnostic to stderr, tolerating a CLOSED stderr.
+
+    codex [P2]: the SIGPIPE handlers write their diagnostic to stderr on
+    the failure path. If the caller closed BOTH stdout and stderr (e.g.
+    redirecting both to one capped pipe), an unguarded stderr write would
+    raise BrokenPipeError and propagate — aborting main() before a
+    load-bearing action (the self-exit `_kill_own_session_fn`) could run,
+    leaving a duplicate coordinator alive. Swallow a closed stderr so the
+    caller always reaches its post-write logic.
+    """
+    try:
+        sys.stderr.write(msg if msg.endswith("\n") else msg + "\n")
+    except (BrokenPipeError, OSError):
+        pass
+
+
+def _payload_has_alerts(payload: dict) -> bool:
+    """Does this tick's summary carry operator-visible alerts?
+
+    The JSON summary is the ONLY place main() publishes `raised` (PR-watch
+    CLOSED-unmerged / blocked-question / reconcile escalations) and
+    `errors` (auto-archive / reconcile / checkpoint faults). If stdout
+    closes before the summary writes AND the tick carried either, the
+    operator never sees the alert — so the tick must NOT look clean
+    (codex [P1]/[P2]).
+    """
+    try:
+        return bool(payload.get("raised")) or bool(payload.get("errors"))
+    except AttributeError:
+        return False
+
+
+def _classify_dropped_stdout(exc, *, has_alerts: bool, context: str) -> int:
+    """Decide the exit code when a tick's stdout write hit `exc`, and emit
+    the matching diagnostic. Shared by the zero-dispatch emit branch and
+    `_print_json_safe` so both classify a dropped summary identically.
+
+    Returns:
+      _EXIT_BROKEN_PIPE when the drop loses something the caller must act
+        on — either operator-visible alerts (`raised`/`errors`; codex
+        [P1]/[P2]) or a non-EPIPE write FAULT (ENOSPC/EIO: the only
+        machine-readable result was lost to a fault, not a benign
+        reader-close; codex [P3]).
+      0 when the drop is a benign EPIPE on an alert-free tick (`| head`,
+        a stdout cap, an idle tick) — the actionable output already
+        flushed, so re-ticking would just spin the harness.
+    """
+    is_pipe = isinstance(exc, BrokenPipeError) or getattr(
+        exc, "errno", None) == errno.EPIPE
+    if has_alerts:
+        _warn_stderr(
+            f"coordinator: {context} could not reach a closed stdout ({exc}); "
+            f"it carried raised/errors alerts the operator did NOT receive. "
+            f"Exiting non-zero so the harness re-ticks and re-publishes."
+        )
+        return _EXIT_BROKEN_PIPE
+    if not is_pipe:
+        _warn_stderr(
+            f"coordinator: {context} could not be written (non-pipe write "
+            f"fault: {exc}); the only machine-readable result was lost to a "
+            f"write fault. Exiting non-zero so the caller does not treat "
+            f"this tick as successful."
+        )
+        return _EXIT_BROKEN_PIPE
+    _warn_stderr(
+        f"coordinator: {context} dropped to a closed stdout (broken pipe); "
+        f"it carried no alerts (no raised/errors) and the actionable output "
+        f"already flushed — exiting 0 (NOT a SIGPIPE kill, NOT a re-tick "
+        f"signal)."
+    )
+    return 0
+
+
+def _print_json_safe(payload: dict) -> int:
+    """Emit the tick's JSON summary, surviving a closed stdout cleanly.
+
+    Exit code is decided by `_classify_dropped_stdout`: 0 for a benign
+    alert-free EPIPE, _EXIT_BROKEN_PIPE when the dropped summary carried
+    `raised`/`errors` alerts OR hit a non-pipe write fault. Either way we
+    swallow the error and silence the shutdown flush so the process never
+    dies via a fatal SIGPIPE.
+    """
+    has_alerts = _payload_has_alerts(payload)
+    try:
+        print(json.dumps(payload))
+        sys.stdout.flush()
+        return 0
+    except (BrokenPipeError, OSError) as exc:
+        _silence_shutdown_flush()
+        return _classify_dropped_stdout(
+            exc, has_alerts=has_alerts,
+            context="the tick's JSON summary",
+        )
+
+
+def _silence_shutdown_flush() -> None:
+    """Redirect stdout to /dev/null so CPython's at-exit flush of the
+    block buffer can't deliver a second BrokenPipeError (or a fatal
+    SIGPIPE if the disposition was reset) on a closed pipe.
+
+    Closing sys.stdout outright works but trips a noisy "Exception
+    ignored in: <_io.TextIOWrapper>" on shutdown; pointing the fd at the
+    bit bucket drains the buffer silently.
+    """
+    try:
+        devnull = open(os.devnull, "w")  # noqa: SIM115 — lives until exit
+        os.dup2(devnull.fileno(), sys.stdout.fileno())
+    except (OSError, ValueError, AttributeError):
+        # dup2 unavailable (no real fd behind sys.stdout, e.g. a test
+        # double or an io redirect). Detach the Python-level stream so the
+        # at-exit flush is a no-op even without an OS-level redirect.
+        try:
+            sys.stdout = open(os.devnull, "w")  # noqa: SIM115
+        except OSError:
+            pass
+
+
 def main(argv: Iterable[str] | None = None) -> int:
     """Skill entry point. Reads project from FLEET_PROJECT env or argv.
 
     Exits 0 on the normal path — failures are recorded in the result and
     surfaced to the operator via the agent's blocked_reason; the hook
     itself must not block the agent's turn (matches fleet-guard
-    discipline). The ONE exception (loop-supervisor-sigpipe-5263) is a
-    broken stdout while emitting the DISPATCH block: that returns 2 so the
-    harness re-ticks, because a swallowed broken pipe would silently drop
-    the dispatch instead of delivering it to the coord.
+    discipline). The exceptions (loop-supervisor-sigpipe-5263) all return
+    _EXIT_BROKEN_PIPE=2 so the harness re-ticks, because a swallowed
+    broken stdout would silently drop operator-visible output. Three
+    distinct paths exit non-zero: (1) a broken stdout while emitting the
+    DISPATCH block; (2) the self-exit summary write faulting while it
+    carried raised/errors; (3) a zero-dispatch tick's summary write
+    faulting on an alert-bearing payload or a non-pipe (e.g. ENOSPC)
+    fault. Each re-ticks so the dropped output is re-published.
     """
+    # SIGPIPE hardening (loop-supervisor-sigpipe-5263 / Slice 1): keep a
+    # closed stdout a HANDLED BrokenPipeError, never a fatal SIGPIPE
+    # (exit 144). This tick is routinely piped (`| head`, harness
+    # truncation). Restore SIG_IGN at entry in case a parent leaked
+    # SIG_DFL into us.
+    _ensure_sigpipe_handled()
     argv = list(argv) if argv is not None else []
     project = os.environ.get("FLEET_PROJECT", "")
     if argv:
         project = argv[0]
     if not project:
-        print("coordinator: no project set (FLEET_PROJECT or argv[0])")
+        try:
+            print("coordinator: no project set (FLEET_PROJECT or argv[0])")
+        except (BrokenPipeError, OSError):
+            _silence_shutdown_flush()
         return 0
     result = tick(project)
     # coord-self-exit-when-it-6014: a duplicate coord (a different live
@@ -7999,7 +8260,14 @@ def main(argv: Iterable[str] | None = None) -> int:
     # acquired (lock-busy branch), so there is nothing to release.
     if result.self_exit:
         coord_id = os.environ.get("FLEET_AGENT_ID", "")
-        print(json.dumps({
+        # Guard the JSON print: a closed stdout must NOT skip the kill
+        # below (the load-bearing self-exit action) nor SIGPIPE-kill us.
+        # A self-exit summary ALWAYS carries `errors` (the duplicate-coord
+        # reason), so if stdout is closed _print_json_safe returns
+        # _EXIT_BROKEN_PIPE — propagate it (codex [P2]) so the harness
+        # re-ticks and re-publishes the dropped self-demotion alert,
+        # instead of the coord disappearing with a silent exit 0.
+        rc = _print_json_safe({
             "skipped": result.skipped,
             "reason": result.reason,
             "self_exit": True,
@@ -8009,18 +8277,17 @@ def main(argv: Iterable[str] | None = None) -> int:
             "dispatched": result.dispatched,
             "raised": result.raised,
             "errors": result.errors,
-        }))
-        sys.stdout.flush()
+        })
         if coord_id and not _kill_own_session_fn(coord_id):
-            sys.stderr.write(
+            _warn_stderr(
                 f"coordinator: self-exit requested for duplicate coord "
                 f"{coord_id} but `tmux kill-session -t "
                 f"{supervisor_mod.session_name_for_agent(coord_id)}` did "
                 f"not succeed; this session may persist. Run `fleet gc` "
                 f"or kill the duplicate manually after confirming the "
-                f"holder is the live coord.\n"
+                f"holder is the live coord."
             )
-        return 0
+        return rc
     # Issue #84 Phase A: emit DISPATCH blocks BEFORE the JSON summary
     # so the coord agent (Claude) sees them as parseable plain text in
     # the tick output. Each block tells Claude to invoke the Agent
@@ -8044,20 +8311,44 @@ def main(argv: Iterable[str] | None = None) -> int:
             print(file=sys.stdout)
         sys.stdout.flush()
     except (BrokenPipeError, OSError) as exc:
-        # Avoid a second BrokenPipeError on interpreter shutdown flush.
-        try:
-            sys.stdout.close()
-        except OSError:
-            pass
-        sys.stderr.write(
-            f"coordinator: failed to emit DISPATCH block "
-            f"({len(result.dispatch_instructions)} pending) to a closed "
-            f"stdout (broken pipe: {exc}); the dispatch did NOT reach the "
-            f"coord. Re-run the tick with full output captured (never "
-            f"`| head`). Exiting non-zero so the harness re-ticks.\n"
+        # Redirect stdout to /dev/null so the interpreter-shutdown flush
+        # of the block buffer can't re-raise (or deliver a fatal SIGPIPE)
+        # on the closed pipe.
+        _silence_shutdown_flush()
+        pending = len(result.dispatch_instructions)
+        if pending == 0:
+            # No DISPATCH block was lost — the only write was the trailing
+            # flush of an empty buffer. The tick may still carry alerts
+            # (raised/errors) that the dropped JSON summary would have
+            # published, and the fault may be non-EPIPE; classify exactly
+            # as the summary path does (codex [P1]/[P2]/[P3]).
+            return _classify_dropped_stdout(
+                exc,
+                has_alerts=bool(result.raised) or bool(result.errors),
+                context="a zero-dispatch tick's output",
+            )
+        # A real DISPATCH block did not reach the coord — surface it and
+        # exit non-zero so the harness re-ticks. The coordinator.lock is
+        # already released by tick()'s finally, so a non-zero exit here
+        # doesn't strand the lock. We can't know exactly how many of the
+        # `pending` blocks made it before the pipe closed (the failure may
+        # have been block k of N), so say "up to" rather than imply an
+        # exact lost-count (review [P2]).
+        _warn_stderr(
+            f"coordinator: failed to emit DISPATCH block (up to {pending} "
+            f"of this tick's blocks may not have reached the coord) to a "
+            f"closed stdout (broken pipe: {exc}). Re-run the tick with full "
+            f"output captured (never `| head`). Exiting non-zero so the "
+            f"harness re-ticks."
         )
-        return 2
-    print(json.dumps({
+        return _EXIT_BROKEN_PIPE
+    # Final JSON summary. A closed stdout here is usually benign (the
+    # summary is diagnostic, not the load-bearing DISPATCH block — those
+    # already flushed above) — _print_json_safe silences the shutdown
+    # flush, never via SIGPIPE. It returns 0 for a benign alert-free EPIPE,
+    # or _EXIT_BROKEN_PIPE=2 when the dropped summary carried raised/errors
+    # (path 3 in the main() docstring) so the harness re-ticks.
+    return _print_json_safe({
         "skipped": result.skipped,
         "reason": result.reason,
         "parsed": result.parsed_tasks,
@@ -8066,8 +8357,7 @@ def main(argv: Iterable[str] | None = None) -> int:
         "dispatched": result.dispatched,
         "raised": result.raised,
         "errors": result.errors,
-    }))
-    return 0
+    })
 
 
 if __name__ == "__main__":

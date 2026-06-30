@@ -742,13 +742,17 @@ func TestSpawn_RuntimeEnvPropagated(t *testing.T) {
 	// spawn from inside it (drain/handoff) inherits the short test timeout
 	// instead of falling back to 10m (codex iter-3 [P1]).
 	t.Setenv("FLEET_STANDBY_TIMEOUT", "3s")
+	// Single-shot rollback escape hatch must reach the spawned coord's pane,
+	// or `FLEET_COORD_IN_TURN_SUPERVISOR=1 fleet dispatch ...` silently runs
+	// single-shot anyway (codex [P1], DESIGN-coord-supervisor-in-daemon S1).
+	t.Setenv("FLEET_COORD_IN_TURN_SUPERVISOR", "1")
 
 	// Also echo FLEET_AGENT_ID + FLEET_BIN here so the per-session env
 	// stamp for those two is covered by this single real-tmux spawn
 	// (folded the old standalone TestSpawn_FleetAgentIDInEnv +
 	// TestSpawn_FleetBinInEnv to drop two extra tmux spawns).
 	cmd := []string{"sh", "-c",
-		"echo FH=$FLEET_HOME TMS=$FLEET_TMUX_SOCKET STABLE=$FLEET_INITIAL_PROMPT_STABLE_MS MAX=$FLEET_INITIAL_PROMPT_MAX_MS DELAY=$FLEET_PROMPT_ENTER_DELAY_MS BUF=$FLEET_POST_READY_BUFFER_MS VER=$FLEET_POST_SEND_VERIFY_MS RTY=$FLEET_POST_SEND_RETRY_MS SBT=$FLEET_STANDBY_TIMEOUT AGENT_ID=$FLEET_AGENT_ID FLEET_BIN=$FLEET_BIN; cat"}
+		"echo FH=$FLEET_HOME TMS=$FLEET_TMUX_SOCKET STABLE=$FLEET_INITIAL_PROMPT_STABLE_MS MAX=$FLEET_INITIAL_PROMPT_MAX_MS DELAY=$FLEET_PROMPT_ENTER_DELAY_MS BUF=$FLEET_POST_READY_BUFFER_MS VER=$FLEET_POST_SEND_VERIFY_MS RTY=$FLEET_POST_SEND_RETRY_MS SBT=$FLEET_STANDBY_TIMEOUT ITS=$FLEET_COORD_IN_TURN_SUPERVISOR AGENT_ID=$FLEET_AGENT_ID FLEET_BIN=$FLEET_BIN; cat"}
 	rec, err := Spawn(Options{
 		TaskID:  "x",
 		Project: "y",
@@ -762,7 +766,7 @@ func TestSpawn_RuntimeEnvPropagated(t *testing.T) {
 	// Each marker is short enough to fit on a single tmux pane line.
 	wants := []string{
 		"STABLE=777", "MAX=8888", "DELAY=99",
-		"BUF=1234", "VER=456", "RTY=789", "SBT=3s",
+		"BUF=1234", "VER=456", "RTY=789", "SBT=3s", "ITS=1",
 		"TMS=" + os.Getenv("FLEET_TMUX_SOCKET"),
 		"AGENT_ID=" + rec.ID,
 	}
