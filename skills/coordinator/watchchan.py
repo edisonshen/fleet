@@ -17,7 +17,9 @@ pre-serialization plumbing.
 Drain contract (apply-before-delete):
 
     for path in list_pending(project_dir):
-        msg = read_message(path)     # refuses a newer schema v
+        msg = read_message(path)     # None if cap-evicted mid-drain; else refuses newer v
+        if msg is None:              # file vanished between list and read -> skip
+            continue
         apply(msg)                   # <-- COMMIT POINT is AFTER this
         mark_done(path)              # a crash before here replays the msg
 
@@ -72,11 +74,26 @@ def list_pending(project_dir) -> list[Path]:
     return [d / n for n in events]
 
 
-def read_message(path) -> dict:
-    """Parse one message file. Refuses a `v` newer than SCHEMA_VERSION
-    (SchemaTooNewError) rather than mis-parsing — mirrors
-    queue.ReadSpawnFresh / pr_watch SCHEMA_VERSION discipline."""
-    with open(path, "r", encoding="utf-8") as fh:
+def read_message(path) -> Optional[dict]:
+    """Parse one message file, or return None if it vanished between
+    list_pending and this read.
+
+    The vanish case is a benign race against the writer's OWN cap eviction:
+    list_pending returns oldest-first and the Go writer's enforceCap drops
+    oldest-first, so a watcher appending an over-cap event can unlink the very
+    file the drainer is about to open. That is backpressure, not corruption —
+    the message was intentionally evicted, so the caller skips it (mirrors
+    mark_done's FileNotFoundError no-op). None is returned for THAT case only.
+
+    Still refuses a `v` newer than SCHEMA_VERSION (SchemaTooNewError) and still
+    RAISES on corrupt/non-object bytes (JSONDecodeError/ValueError) rather than
+    mis-parsing — those are quarantine cases, distinct from the benign vanish
+    race. Mirrors queue.ReadSpawnFresh / pr_watch SCHEMA_VERSION discipline."""
+    try:
+        fh = open(path, "r", encoding="utf-8")
+    except FileNotFoundError:
+        return None
+    with fh:
         msg = json.load(fh)
     if not isinstance(msg, dict):
         raise ValueError(f"watchchan: {path} is not a JSON object")

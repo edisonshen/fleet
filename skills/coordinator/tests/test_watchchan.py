@@ -178,6 +178,25 @@ def test_read_heartbeat_refuses_newer_schema(tmp_path):
         wc.read_heartbeat(tmp_path, "future")
 
 
+# read_message returns None (not a crash) when the event file vanished between
+# list_pending and the read. This is the benign cap-eviction race: list_pending
+# yields oldest-first and the Go writer's enforceCap drops oldest-first, so a
+# concurrent over-cap append can unlink the very file the drainer is about to
+# open. A None means "skip", distinct from the RAISE-to-quarantine corrupt path.
+def test_read_message_none_when_file_vanished(tmp_path):
+    msgs = wc.watch_msgs_dir(tmp_path)
+    p = _write_event(msgs, "1700000000000000001-w-0.json", _event_msg(key="evicted"))
+    # simulate enforceCap unlinking the oldest event mid-drain, after list_pending
+    # already returned its path.
+    os.remove(p)
+    assert wc.read_message(p) is None
+    # contrast: corrupt bytes still RAISE (quarantine path, not the vanish race).
+    bad = _write_event(msgs, "1700000000000000002-w-1.json", {})
+    bad.write_text("{not json", encoding="utf-8")
+    with pytest.raises(json.JSONDecodeError):
+        wc.read_message(bad)
+
+
 # A missing channel directory yields empty pending, never crashes the drain.
 # (read_message deliberately RAISES on corrupt/newer-schema bytes so the caller
 # can quarantine — see test_read_message_refuses_newer_schema; the listing pass
