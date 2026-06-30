@@ -81,6 +81,49 @@ def test_tick_emits_coord_events_and_dispatch(home, monkeypatch):
     assert "dispatch.worker" in types
 
 
+def test_tick_emits_coord_events_under_single_shot_poll(home, monkeypatch):
+    """Rebase-integration guard (PR #238 single-shot × #241 fleetlog).
+
+    The default test path runs poll_interval=0 (the legacy "callers never
+    wanted the loop" case). This pins the NEW single-shot path: poll IS
+    configured (>0) but the in-turn supervisor is gated OFF by default
+    (FLEET_COORD_IN_TURN_SUPERVISOR unset). The coord.tick start/end and
+    dispatch.worker emits must still fire from the single-shot mainline —
+    NOT from the now-gated _run_supervisor branch. If a future refactor
+    moved an emit inside that branch, this test fails while the poll=0
+    test stays green. Also asserts the supervisor was never entered."""
+    project = "fleet"
+    pdir = home / "projects" / project
+    _write_one_ready_task(pdir)
+    monkeypatch.setenv("FLEET_COORD_POLL_INTERVAL_S", "30")
+    monkeypatch.delenv("FLEET_COORD_IN_TURN_SUPERVISOR", raising=False)
+    monkeypatch.setattr("dispatch.mint_agent_id", lambda: "abcdef09")
+    monkeypatch.setattr(loop, "_run_fleet", lambda cmd, timeout_s=30.0: None)
+    _stub_acquire(monkeypatch, home, "abcdef09")
+
+    sup_seen = {"n": 0}
+    real_sup = loop._run_supervisor
+
+    def _spy(**kwargs):
+        sup_seen["n"] += 1
+        return real_sup(**kwargs)
+
+    monkeypatch.setattr(loop, "_run_supervisor", _spy)
+
+    result = loop.tick(project, coord_id="", cwd=str(pdir), fleet_home=str(home))
+    assert result.dispatched == 1
+    assert sup_seen["n"] == 0  # single-shot default: supervisor not entered
+
+    logdir = home / "logs"
+    types = []
+    for f in logdir.glob("*.jsonl"):
+        for ln in f.read_text().splitlines():
+            if ln:
+                types.append(json.loads(ln)["type"])
+    assert types.count("coord.tick") == 2  # start + end fire on the single-shot path
+    assert "dispatch.worker" in types
+
+
 def test_tick_prunes_stale_log_when_no_marker(home, monkeypatch):
     project = "fleet"
     _write_one_ready_task(home / "projects" / project)

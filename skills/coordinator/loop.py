@@ -8220,10 +8220,14 @@ def main(argv: Iterable[str] | None = None) -> int:
     Exits 0 on the normal path — failures are recorded in the result and
     surfaced to the operator via the agent's blocked_reason; the hook
     itself must not block the agent's turn (matches fleet-guard
-    discipline). The ONE exception (loop-supervisor-sigpipe-5263) is a
-    broken stdout while emitting the DISPATCH block: that returns 2 so the
-    harness re-ticks, because a swallowed broken pipe would silently drop
-    the dispatch instead of delivering it to the coord.
+    discipline). The exceptions (loop-supervisor-sigpipe-5263) all return
+    _EXIT_BROKEN_PIPE=2 so the harness re-ticks, because a swallowed
+    broken stdout would silently drop operator-visible output. Three
+    distinct paths exit non-zero: (1) a broken stdout while emitting the
+    DISPATCH block; (2) the self-exit summary write faulting while it
+    carried raised/errors; (3) a zero-dispatch tick's summary write
+    faulting on an alert-bearing payload or a non-pipe (e.g. ENOSPC)
+    fault. Each re-ticks so the dropped output is re-published.
     """
     # SIGPIPE hardening (loop-supervisor-sigpipe-5263 / Slice 1): keep a
     # closed stdout a HANDLED BrokenPipeError, never a fatal SIGPIPE

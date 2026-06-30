@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import datetime as _dt
 import errno
+import json
 import os
 import subprocess
 import sys
@@ -32,6 +33,18 @@ import pytest
 import dispatch
 import loop
 import parse
+
+
+def _read_recent_decisions(project_dir: Path) -> list[str]:
+    """Read the recent_decisions buffer the heartbeat persisted to
+    coord-state.json. Empty list if the file or key is absent."""
+    p = project_dir / "coord-state.json"
+    if not p.exists():
+        return []
+    try:
+        return list(json.loads(p.read_text()).get("recent_decisions") or [])
+    except (ValueError, OSError):
+        return []
 
 
 # ---------- local fixtures (mirror test_loop.py, kept self-contained) ----------
@@ -741,6 +754,13 @@ def test_dispatch_block_emitted_under_single_shot(
     assert (fleet_home / "inbox" / "abcdef01.md").exists()
     set_calls = [c for c in fleet_run_recorder if c[1:3] == ["tasks", "set"]]
     assert any("status=in-progress" in c for c in set_calls)
+    # Rebase-integration guard (PR #238 single-shot × #242 decision seam):
+    # the dispatch _record_decision call sits ABOVE the supervisor gate, so
+    # it must fire on the single-shot path. If a future refactor moved it
+    # inside the gated _run_supervisor branch the checkpoint narrative would
+    # go silent here. Pin it.
+    decisions = _read_recent_decisions(project_dir)
+    assert any("ready-eeee" in d for d in decisions), decisions
 
 
 # ===========================================================================
@@ -771,3 +791,43 @@ def test_reconcile_runs_under_single_shot(
     set_calls = [c for c in fleet_run_recorder if c[1:3] == ["tasks", "set"]]
     assert any("status=todo" in c for c in set_calls)
     assert any("worker_pid=0" in c for c in set_calls)
+    # Decision seam (PR #242) fires for the reconcile on the single-shot
+    # path, not just the gated supervisor path.
+    decisions = _read_recent_decisions(project_dir)
+    assert any("dying-ffff" in d for d in decisions), decisions
+
+
+# ===========================================================================
+# Test 8 — _maybe_warn_single_shot swallows a tasks.md read fault: the
+# single-shot breadcrumb re-reads tasks.md fresh (codex [P3]); if that read
+# raises (e.g. tasks.md deleted mid-tick) the warning must be swallowed,
+# never propagated. Exercises the `except Exception: return` guard the
+# noqa: BLE001 comment documents. Unit-tests the helper directly so the
+# fault is isolated to the breadcrumb's re-read, not the main tick read.
+# ===========================================================================
+
+
+class _Cfg:
+    """Minimal stub: only poll_interval_s is read by the breadcrumb."""
+    def __init__(self, poll_interval_s: int) -> None:
+        self.poll_interval_s = poll_interval_s
+
+
+def test_warn_single_shot_swallows_read_fault(
+    project_dir: Path, monkeypatch,
+) -> None:
+    # An in-flight task on disk so the gate would proceed to the fragile
+    # parse.read() it must guard (poll configured, no pr-watch staged).
+    _write_tasks(project_dir, [
+        _make_task("inflight-gggg", status="in-progress", worker_pid=1),
+    ])
+    monkeypatch.setattr(
+        loop.parse, "read",
+        lambda *a, **k: (_ for _ in ()).throw(OSError("tasks.md vanished")),
+    )
+    # Must return None without raising despite the read fault.
+    assert loop._maybe_warn_single_shot(
+        tasks_path=project_dir / "tasks.md",
+        sup_cfg=_Cfg(30),
+        pr_watch_staged=False,
+    ) is None
