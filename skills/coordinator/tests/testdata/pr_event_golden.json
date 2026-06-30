@@ -1,0 +1,14 @@
+{
+  "v": 1,
+  "kind": "pr_event",
+  "watcher_id": "agent7f3a-48211",
+  "epoch_id": 12,
+  "key": "pr-239-deadbeefcafe-BEHIND",
+  "payload": {
+    "head_sha": "deadbeefcafe",
+    "base_sha": "0ddba11feed5",
+    "event": "BEHIND",
+    "detail_key": "rebase"
+  },
+  "ts": "2026-06-26T18:04:00Z"
+}
