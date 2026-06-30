@@ -17,6 +17,7 @@ import (
 
 	"github.com/edisonshen/fleet/internal/agent"
 	"github.com/edisonshen/fleet/internal/coordrepo"
+	"github.com/edisonshen/fleet/internal/fleetlog"
 	"github.com/edisonshen/fleet/internal/projectlookup"
 	"github.com/edisonshen/fleet/internal/state"
 	"github.com/edisonshen/fleet/internal/tmux"
@@ -70,7 +71,16 @@ Exit codes:
 				IsTty:       isStdinTty(),
 				CwdBasename: gitToplevelBasename(),
 			}
+			// A successful attach execve-replaces this process inside
+			// runAttachFailover, so cli.finish never runs on success (by
+			// design). finish(err) below fires only on the error-return
+			// path. Hence cli.start is the only attach event on success.
+			finish := fleetlog.CLIStart(fleetlog.Fields{}, "attach", args[0])
 			err := runAttachFailover(args[0], opts)
+			// Pass the typed exit code so cli.finish records the real rc
+			// (64 for usage errors, 70/127 for system errors) rather than
+			// collapsing every failure to rc=1.
+			finish(err, ExitCodeFor(err))
 			if err != nil {
 				// Map typed errors (UsageError + SystemError) to cobra's
 				// silent-error path so cobra doesn't print its generic

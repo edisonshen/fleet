@@ -42,6 +42,12 @@ from typing import Iterable
 import conflict
 import coord_config
 import dispatch as dispatch_mod
+try:
+    import fleetlog as fleetlog_mod
+except Exception:  # pragma: no cover - logging is best-effort; never block import
+    fleetlog_mod = None
+# Resolved once at import so every _flog callsite avoids the repeated ternary.
+_FLOG_COORD = fleetlog_mod.COMP_COORD if fleetlog_mod is not None else "coord"
 import parse
 import pr_watch as pr_watch_mod
 import reaper as reaper_mod
@@ -179,6 +185,18 @@ class TickResult:
     dispatch_instructions: list[str] = field(default_factory=list)
 
 
+def _flog(comp, evt, lvl="info", **fields):
+    """Best-effort fleetlog emit. Swallows every error (and a missing
+    module) so a logging failure can never break a tick. Returns the event
+    id (for caused_by chaining) or ""."""
+    if fleetlog_mod is None:
+        return ""
+    try:
+        return fleetlog_mod.log(comp, evt, lvl, **fields)
+    except Exception:
+        return ""
+
+
 def tick(
     project: str,
     *,
@@ -304,7 +322,24 @@ def tick(
         result.skipped = True
         result.self_exit = True
         result.reason = "lease-fenced-self-exit"
+        # fleetlog: record the early-exit so log consumers see the gap.
+        _flog(_FLOG_COORD, "coord.tick", "info", proj=project, agent=coord_id,
+              msg=f"coord tick skipped: lease-fenced-self-exit for {project}",
+              data={"skipped": True, "reason": "lease-fenced-self-exit"})
         return result
+
+    # Run the once/day retention prune BEFORE taking the coordinator lock.
+    # Holding the lock during a readdir + many os.remove() calls would block
+    # every other fleet process that needs coordinator.lock for the duration
+    # of the scan (worst-case: NFS-mounted home, or a large accumulated backlog).
+    # The prune is idempotent and lock-independent: two concurrent prunes are
+    # safe (os.remove is a no-op on a missing file; the marker is updated by
+    # both). Best-effort: any exception is swallowed.
+    if fleetlog_mod is not None:
+        try:
+            fleetlog_mod.maybe_prune_daily()
+        except Exception:
+            pass
 
     # 1. NB-flock coordinator.lock (PLAN §6 lock acquisition).
     project_dir = home / "projects" / project
@@ -345,6 +380,10 @@ def tick(
             # why this session is going away and how to confirm.
             sys.stderr.write(diag + "\n")
             result.errors.append(diag)
+        # fleetlog: record the skipped tick so log consumers see the gap.
+        _flog(_FLOG_COORD, "coord.tick", "info", proj=project, agent=coord_id,
+              msg=f"coord tick skipped: {result.reason} for {project}",
+              data={"skipped": True, "reason": result.reason})
         return result
     # 1.5. Resolve the coord's repo binding — single shared binder.
     #
@@ -406,6 +445,13 @@ def tick(
             fcntl.flock(lock_fd, fcntl.LOCK_UN)
         finally:
             os.close(lock_fd)
+        # fleetlog: record the skipped tick AFTER releasing the lock so a
+        # BaseException / stalled-FS write in the emit cannot leak the lock
+        # (logging is best-effort). Consumers still see the repo-resolve
+        # refusal rather than an unexplained gap.
+        _flog(_FLOG_COORD, "coord.tick", "info", proj=project, agent=coord_id,
+              msg=f"coord tick skipped: {reason_code} for {project}",
+              data={"skipped": True, "reason": reason_code})
         return result
 
     # The resolver runs AFTER the coordinator lock is acquired but BEFORE
@@ -460,17 +506,47 @@ def tick(
             fcntl.flock(lock_fd, fcntl.LOCK_UN)
         finally:
             os.close(lock_fd)
+        # fleetlog: record the early-exit AFTER releasing the lock (see
+        # _refuse_stale rationale) so a BaseException in the emit cannot leak
+        # the lock; consumers still see the post-lock fence rather than a gap.
+        _flog(_FLOG_COORD, "coord.tick", "info", proj=project, agent=coord_id,
+              msg=f"coord tick skipped: lease-fenced-self-exit (post-lock) for {project}",
+              data={"skipped": True, "reason": "lease-fenced-self-exit",
+                    "phase": "post-lock"})
         return result
+    # fleetlog: bracket the mutating phase with coord.tick start/end.
+    # Best-effort: a logging failure must never affect the tick result.
+    # The start emit lives INSIDE the try so the finally still releases the
+    # lock if _flog raises a BaseException (KeyboardInterrupt/SystemExit) — a
+    # bare emit before the try would leak the lock on that path.
     try:
+        _flog(_FLOG_COORD,
+              "coord.tick", "info", proj=project, agent=coord_id,
+              msg=f"coord tick start for {project}", data={"cap": cap})
         return _tick_locked(
             result, project, project_dir, coord_id, cwd, cap,
             home, fleet_bin, now_unix,
         )
     finally:
+        # Release the coordinator lock FIRST, then emit the end event.
+        # _flog only swallows Exception (not BaseException), and its file I/O
+        # could block on a stalled FS — both would otherwise delay or skip the
+        # unlock and leak the lock for the process lifetime. Logging is
+        # best-effort, so it runs last, outside the lock.
         try:
             fcntl.flock(lock_fd, fcntl.LOCK_UN)
         finally:
             os.close(lock_fd)
+        _flog(_FLOG_COORD,
+              "coord.tick", "info", proj=project, agent=coord_id,
+              msg=f"coord tick end for {project}",
+              data={
+                  "dispatched": result.dispatched,
+                  "reconciled": result.reconciled,
+                  "drained": result.drained,
+                  "raised": result.raised,
+                  "errors": len(result.errors),
+              })
 
 
 # ----------------------------------------------------------------------
@@ -7570,6 +7646,13 @@ def _apply_dispatch(action: _DispatchAction, project: str, fleet_bin: str) -> No
     _run_fleet(starting_update)
     _run_fleet([fleet_bin, "tasks", "set", "--project", project, action.slug, f"worker_pid={os.getpid()}"])
     _run_fleet([fleet_bin, "tasks", "note", "--project", project, action.slug, f"dispatched as agent {action.agent_id}"])
+    # fleetlog: record the worker dispatch (fire-and-forget). The full
+    # mutation chain above has landed, so the task is durably in-progress.
+    _flog(_FLOG_COORD,
+          "dispatch.worker", "info", proj=project, slug=action.slug,
+          agent=action.agent_id, dispatch_id=action.agent_id,
+          msg=f"dispatched worker {action.slug} as agent {action.agent_id}",
+          data={"branch": action.branch, "worktree": action.worktree})
 
 
 def _apply_dispatch_handoff(

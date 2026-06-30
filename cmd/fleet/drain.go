@@ -7,6 +7,7 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"github.com/edisonshen/fleet/internal/fleetlog"
 	"github.com/edisonshen/fleet/internal/handoffop"
 	"github.com/edisonshen/fleet/internal/queue"
 	"github.com/edisonshen/fleet/internal/spawn"
@@ -82,7 +83,10 @@ down when a healthy leader holds the lease, verifies the handoff-complete
 barrier before a graceful kill, and escalates a slow/hung handoff to the
 safety-net takeover after --resume-timeout-ms instead of blocking.`,
 		RunE: func(c *cobra.Command, _ []string) error {
-			return runDrain(c.OutOrStdout(), c.ErrOrStderr(), graceMillis, resumeTimeoutMilli)
+			finish := fleetlog.CLIStart(fleetlog.Fields{}, "drain")
+			err := runDrain(c.OutOrStdout(), c.ErrOrStderr(), graceMillis, resumeTimeoutMilli)
+			finish(err)
+			return err
 		},
 	}
 	cmd.Flags().IntVar(&graceMillis, "grace-ms", handoffop.DefaultGraceMillis,

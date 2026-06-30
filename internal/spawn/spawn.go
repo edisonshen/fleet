@@ -24,6 +24,7 @@ import (
 	"time"
 
 	"github.com/edisonshen/fleet/internal/agent"
+	"github.com/edisonshen/fleet/internal/fleetlog"
 	"github.com/edisonshen/fleet/internal/handoff"
 	"github.com/edisonshen/fleet/internal/state"
 	"github.com/edisonshen/fleet/internal/tmux"
@@ -174,6 +175,7 @@ func postSendRetryDelay() time.Duration {
 //   - FLEET_TEST_PROBE is test-only.
 var propagatedRuntimeEnv = []string{
 	"FLEET_HOME",                     // queue/handoffs/agents root
+	"XDG_STATE_HOME",                 // fleetlog dir: $XDG_STATE_HOME/fleet/logs when set
 	"FLEET_TMUX_SOCKET",              // alt-server isolation
 	"FLEET_INITIAL_PROMPT_STABLE_MS", // prompt-timing for slow wrappers
 	"FLEET_INITIAL_PROMPT_MAX_MS",
@@ -1344,5 +1346,25 @@ func Spawn(opts Options) (*agent.Record, error) {
 	// branch — which goes through retireOldAgent directly without
 	// re-spawning — still delivers the prompt. See codex review
 	// iter-1 P1 / iter-2 P2.
+	//
+	// fleetlog: record the spawn. Fire-and-forget; never fails the spawn.
+	// comp=cli for all spawns because this code runs in the CLI process
+	// (fleet dispatch/handoff/drain), not in the new agent session. The
+	// design invariant is that comp+pid identifies the EMITTING process;
+	// the event type (worker.start / coord.start) carries the semantic
+	// identity of what was spawned. Coord spawns additionally use the
+	// coord event type so log consumers can distinguish coord vs task-worker
+	// lifecycle events even within the CLI component stream.
+	spawnEvt := "worker.start"
+	if rec.IsCoord {
+		spawnEvt = "coord.start"
+	}
+	fleetlog.Log(fleetlog.CompCLI, spawnEvt, "info", fleetlog.Fields{
+		Proj:  rec.Project,
+		Agent: rec.ID,
+		Slug:  rec.TaskID,
+		Msg:   fmt.Sprintf("spawned agent %s for task %q in %s", rec.ID, rec.TaskID, session),
+		Data:  map[string]any{"session": session, "engine": rec.Engine, "pid": rec.PID},
+	})
 	return rec, nil
 }

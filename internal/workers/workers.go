@@ -34,6 +34,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/edisonshen/fleet/internal/fleetlog"
 	"github.com/edisonshen/fleet/internal/projects"
 	"github.com/edisonshen/fleet/internal/state"
 )
@@ -310,7 +311,32 @@ func WriteState(project, slug string, s *State) error {
 		return err
 	}
 	defer release()
-	return writeStateLocked(project, slug, s)
+	// Read the prior phase (best-effort) so the log records from->to.
+	var from Phase
+	if prev, perr := ReadState(project, slug); perr == nil && prev != nil {
+		from = prev.Phase
+	}
+	if werr := writeStateLocked(project, slug, s); werr != nil {
+		return werr
+	}
+	// fleetlog: record the phase transition only when the phase actually
+	// changed. Some callers (e.g. `fleet workers update --review-*`) mutate
+	// review metadata without bumping Phase — emitting "review-done ->
+	// review-done" would produce bogus transition lines that mislead log
+	// consumers trying to reconstruct the worker lifecycle.
+	if s != nil && from != s.Phase {
+		fleetlog.Log(fleetlog.CompWorker, "state.transition", "info", fleetlog.Fields{
+			Proj: project,
+			Slug: slug,
+			// Gen threads the dispatch generation so log consumers can
+			// distinguish transitions from different redispatch attempts
+			// of the same slug (crash recovery, stale-worker reissue, etc.).
+			Gen:  s.DispatchGeneration,
+			Msg:  fmt.Sprintf("worker %s phase %s -> %s", slug, from, s.Phase),
+			Data: map[string]any{"from": string(from), "to": string(s.Phase)},
+		})
+	}
+	return nil
 }
 
 // writeStateLocked is the body of WriteState without lock acquisition.
@@ -399,12 +425,28 @@ func UpdateState(project, slug string, mutate func(*State)) error {
 		return fmt.Errorf("%w: nil mutate fn", ErrInvalidState)
 	}
 	return withUpdateLock(project, slug, func() error {
-		cur, err := loadOrBootstrapForUpdate(project, slug)
+		cur, bootstrapped, err := loadOrBootstrapForUpdate(project, slug)
 		if err != nil {
 			return err
 		}
+		from := cur.Phase // capture before mutate so the log records from->to
 		mutate(cur)
-		return writeStateLocked(project, slug, cur)
+		if werr := writeStateLocked(project, slug, cur); werr != nil {
+			return werr
+		}
+		// fleetlog: log on actual phase change OR on first bootstrap (when
+		// from == to == starting, the bootstrap itself is the first lifecycle
+		// event and must appear in the debug log).
+		if bootstrapped || from != cur.Phase {
+			fleetlog.Log(fleetlog.CompWorker, "state.transition", "info", fleetlog.Fields{
+				Proj: project,
+				Slug: slug,
+				Gen:  cur.DispatchGeneration,
+				Msg:  fmt.Sprintf("worker %s phase %s -> %s", slug, from, cur.Phase),
+				Data: map[string]any{"from": string(from), "to": string(cur.Phase)},
+			})
+		}
+		return nil
 	})
 }
 
@@ -467,7 +509,8 @@ func UpdateStateGen(project, slug string, n, taskGen int, mutate func(*State)) e
 				ErrStaleGeneration, n, cur.DispatchGeneration, slug,
 			)
 		}
-		if cur == nil || cur.DispatchGeneration < taskGen {
+		bootstrapped := cur == nil || cur.DispatchGeneration < taskGen
+		if bootstrapped {
 			// Absent, OR a prior-generation file the current attempt is
 			// repairing. Either way: brand-new state, never a merge of
 			// the stale object's fields.
@@ -482,8 +525,24 @@ func UpdateStateGen(project, slug string, n, taskGen int, mutate func(*State)) e
 		// rejected, the < / absent case was replaced fresh). The stamp is
 		// a consistency reassertion.
 		cur.DispatchGeneration = taskGen
+		from := cur.Phase // capture before mutate so the log records from->to
 		mutate(cur)
-		return writeStateLocked(project, slug, cur)
+		if werr := writeStateLocked(project, slug, cur); werr != nil {
+			return werr
+		}
+		// fleetlog: log on actual phase change OR on first bootstrap (when
+		// from == to == starting, the bootstrap itself is the first lifecycle
+		// event and must appear in the debug log).
+		if bootstrapped || from != cur.Phase {
+			fleetlog.Log(fleetlog.CompWorker, "state.transition", "info", fleetlog.Fields{
+				Proj: project,
+				Slug: slug,
+				Gen:  cur.DispatchGeneration,
+				Msg:  fmt.Sprintf("worker %s phase %s -> %s", slug, from, cur.Phase),
+				Data: map[string]any{"from": string(from), "to": string(cur.Phase)},
+			})
+		}
+		return nil
 	})
 }
 
@@ -517,20 +576,23 @@ func withUpdateLock(project, slug string, fn func() error) error {
 // loadOrBootstrapForUpdate reads the current state or returns a minimal
 // bootstrapped one (the non-CAS path; UpdateStateGen owns its own
 // generation-aware bootstrap). Caller must hold the worker lock.
-func loadOrBootstrapForUpdate(project, slug string) (*State, error) {
+// Returns (state, bootstrapped, err); bootstrapped is true when the file
+// was absent — the first lifecycle event must be logged even when the
+// initial phase doesn't change.
+func loadOrBootstrapForUpdate(project, slug string) (*State, bool, error) {
 	cur, err := ReadState(project, slug)
 	if err != nil && !errors.Is(err, ErrNotFound) {
-		return nil, err
+		return nil, false, err
 	}
 	if cur == nil {
-		cur = &State{
+		return &State{
 			Slug:      slug,
 			Project:   project,
 			Phase:     PhaseStarting,
 			StartedAt: time.Now().UTC(),
-		}
+		}, true, nil // bootstrapped=true: first write for this slug
 	}
-	return cur, nil
+	return cur, false, nil
 }
 
 // acquireWorkerLock returns an exclusive flock on the per-worker lock

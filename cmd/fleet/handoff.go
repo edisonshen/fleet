@@ -12,6 +12,7 @@ import (
 
 	"github.com/edisonshen/fleet/internal/agent"
 	"github.com/edisonshen/fleet/internal/coordrepo"
+	"github.com/edisonshen/fleet/internal/fleetlog"
 	"github.com/edisonshen/fleet/internal/handoff"
 	"github.com/edisonshen/fleet/internal/handoffdelivery"
 	"github.com/edisonshen/fleet/internal/handoffop"
@@ -95,7 +96,10 @@ outgoing record and increments handoff_number by 1.`,
 				return fmt.Errorf("--no-auto-resume and --auto-resume are mutually exclusive")
 			}
 			opts.autoResumeFlagWasSet = noChanged || yesChanged
-			return runHandoff(opts, cmd.OutOrStdout(), cmd.ErrOrStderr())
+			finish := fleetlog.CLIStart(fleetlog.Fields{}, "handoff", opts.oldID)
+			err := runHandoff(opts, cmd.OutOrStdout(), cmd.ErrOrStderr())
+			finish(err)
+			return err
 		},
 	}
 	cmd.Flags().StringVar(&opts.cwd, "cwd", "",
