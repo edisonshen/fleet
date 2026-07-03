@@ -233,6 +233,36 @@ func TestCheckpointDecision_RejectsBlank(t *testing.T) {
 	}
 }
 
+// recent_decisions caps to the newest checkpointDefaultDecisions (10):
+// writing more than the cap sequentially drops the oldest and keeps the
+// newest N in order. Covers the overflow-trim branch the concurrent test
+// (writers < cap) never exercises.
+func TestCheckpointDecision_CapsToNewest(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("FLEET_HOME", home)
+	if _, err := state.Bootstrap(); err != nil {
+		t.Fatalf("Bootstrap: %v", err)
+	}
+	const n = checkpointDefaultDecisions + 2 // 12 > cap 10
+	for i := 0; i < n; i++ {
+		if err := runCheckpoint(t, "decision", "--project", "myproj",
+			fmt.Sprintf("decision-%02d", i)); err != nil {
+			t.Fatalf("decision %d: %v", i, err)
+		}
+	}
+	raw, ok := readCoordState(t, home, "myproj")["recent_decisions"].([]any)
+	if !ok || len(raw) != checkpointDefaultDecisions {
+		t.Fatalf("expected cap %d, got %#v", checkpointDefaultDecisions, raw)
+	}
+	// Oldest two (00, 01) dropped; newest (11) at the tail, in order.
+	if raw[0] != "decision-02" {
+		t.Errorf("oldest not trimmed: head=%v want decision-02", raw[0])
+	}
+	if raw[len(raw)-1] != fmt.Sprintf("decision-%02d", n-1) {
+		t.Errorf("newest not at tail: %v", raw[len(raw)-1])
+	}
+}
+
 // Test 12 — concurrent checkpoint writers serialize on coordinator.lock:
 // every distinct decision survives (no lost update / no corruption).
 func TestCheckpoint_ConcurrentWritersSerialize(t *testing.T) {
