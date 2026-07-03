@@ -109,7 +109,7 @@ func SynthesizeRecoveryWithLastHandoff(
 		Timestamp:     ts.UTC(),
 		Completed:     Placeholder,
 		KeyDecisions:  Placeholder,
-		FilesModified: Placeholder,
+		SessionDocs:   Placeholder,
 		OpenQuestions: Placeholder,
 		NextSteps:     Placeholder,
 	}
@@ -131,13 +131,30 @@ func SynthesizeRecoveryWithLastHandoff(
 	// placeholder. Applied BEFORE the checkpoint branch so the early
 	// return still carries them (applyCheckpointToDoc only sets Completed,
 	// never NextSteps/OpenQuestions). Completed comes from the checkpoint
-	// buffer (lift below); Key Decisions + Files Modified stay placeholder.
+	// buffer (lift below); Key Decisions is set live below.
 	tasksPath := filepath.Join(pdir, "tasks.md")
 	if ns := CollectNextSteps(tasksPath); ns != "" {
 		doc.NextSteps = ns
 	}
 	if oq := CollectOpenQuestions(tasksPath); oq != "" {
 		doc.OpenQuestions = oq
+	}
+
+	// Docs (this session) + Key Decisions come LIVE from
+	// coord-state.json (session_docs / recent_decisions) — the SAME source
+	// the manual EnrichManualDoc path reads, both pure FS so synth stays
+	// subprocess-free. Set before the checkpoint branch so EVERY return path
+	// (empty-project early return, checkpoint lift, state walk) carries them.
+	// KeyDecisions is re-applied AFTER any checkpoint lift so the live buffer
+	// WINS over the tick-published checkpoint value (an agent decision logged
+	// after the last tick — the no-tick-before-handoff gap).
+	csPath := filepath.Join(pdir, "coord-state.json")
+	if sd := CollectSessionDocs(csPath); sd != "" {
+		doc.SessionDocs = sd
+	}
+	liveDecisions := renderCompletionBullets(CollectRecentDecisionsLive(csPath))
+	if liveDecisions != "" {
+		doc.KeyDecisions = liveDecisions
 	}
 
 	// Checkpoint preference: when present + fresher than the last
@@ -149,10 +166,13 @@ func SynthesizeRecoveryWithLastHandoff(
 		// Shared lift (enrich.go:applyCheckpointToDoc) — BOTH this
 		// recovery path and the manual EnrichManualDoc path apply the
 		// checkpoint identically: ActiveSubagents + OpenPRs lifted
-		// verbatim, and the Completed (recent) buffer → doc.Completed
-		// (Slice 2). NextSteps/OpenQuestions already set above from live
-		// tasks.md, untouched here.
+		// verbatim, and the Completed (recent) buffer → doc.Completed.
+		// NextSteps/OpenQuestions/SessionDocs already set above; Key
+		// Decisions is re-applied live below so it wins over the checkpoint.
 		applyCheckpointToDoc(doc, cp)
+		if liveDecisions != "" {
+			doc.KeyDecisions = liveDecisions
+		}
 		return doc, nil
 	}
 

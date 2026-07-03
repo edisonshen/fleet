@@ -1532,7 +1532,7 @@ func TestHandoff_DocBodyContainsPlaceholders(t *testing.T) {
 	for _, want := range []string{
 		"## Completed",
 		"## Key Decisions",
-		"## Files Modified",
+		"## Docs (this session)",
 		"## Open Questions",
 		"## Next Steps (prioritized)",
 		"_(operator-triggered handoff",

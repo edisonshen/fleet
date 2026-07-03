@@ -1,64 +1,123 @@
 package handoff
 
-// collect.go — Slice 3 Files Modified collector for the manual handoff
-// doc. The coordinator's real file footprint is the plan docs it authored
-// (docs/DESIGN-*.md, TASK-PLAN-*.md, and their gitignored *.html renders),
-// read LIVE from the project repo's git working tree at handoff time — no
-// synchronous prompt to a possibly-dead agent, no buffer to feed.
+// collect.go — session-scoped collectors for the manual + recovery handoff
+// docs. Both read LIVE from ~/.fleet/projects/<p>/coord-state.json (written
+// by `fleet checkpoint` while the coord is alive), NOT from a synchronous
+// prompt to a possibly-dead agent:
 //
-//	section          source                          path
-//	-------          ------                          ----
-//	Files Modified   git status --ignored=matching   CollectFilesModified (manual ONLY)
+//	section              source                              reader
+//	-------              ------                              ------
+//	Docs (this session)  coord-state.json:session_docs       CollectSessionDocs
+//	Key Decisions        coord-state.json:recent_decisions   CollectRecentDecisionsLive
+//	                     (live-preferred over the checkpoint)
 //
 // (Next Steps + Open Questions come from tasks.md via CollectNextSteps /
-// CollectOpenQuestions in enrich.go; Completed + Key Decisions come from the
-// rolling checkpoint buffers via applyCheckpointToDoc — not from here.)
+// CollectOpenQuestions in enrich.go; Completed comes from the rolling
+// checkpoint buffer via applyCheckpointToDoc.)
 //
-// The collector is best-effort: a non-git repo, a dead `git`, an empty
-// repoDir, or empty output returns "" so the caller leaves the section's
-// existing placeholder. Enrichment NEVER fails a handoff.
+// Both collectors are best-effort: a missing / malformed coord-state.json, an
+// empty path, or an absent/empty key returns the zero value so the caller
+// keeps the section's existing placeholder. Enrichment NEVER fails a handoff.
+//
+// The retired predecessor `CollectFilesModified` shelled out to `git status`
+// and dumped EVERY untracked doc under docs/ (every past coord's litter);
+// `CollectSessionDocs` shows only the plan docs THIS coord recorded.
 
 import (
-	"context"
+	"encoding/json"
 	"fmt"
-	"os/exec"
+	"os"
 	"strings"
-	"time"
 )
 
 // sessionDocsMax caps how many "Docs (this session)" rows render in a
 // handoff doc so a long-lived coord that authored a large number of plan
 // docs can't bloat the section. Its own constant, INDEPENDENT of the
 // recent_decisions env cap (resolve_checkpoint_decisions, default 10) —
-// the two buffers cap separately (design: coord-state schema).
+// the two buffers cap separately (design: coord-state schema). The writer
+// (`fleet checkpoint doc`) caps at the same value; this reader-side cap is
+// belt-and-suspenders against a hand-edited coord-state.json.
 const sessionDocsMax = 20
 
-// sessionDoc is one entry of coord-state.json:session_docs — a plan doc
-// the coordinator authored or is actively implementing this session. The
-// Go CLI (`fleet checkpoint doc`) is the only writer; the handoff
-// collector below is the reader.
+// sessionDoc is one entry of coord-state.json:session_docs — a plan doc the
+// coordinator authored or is actively implementing this session. The Go CLI
+// (`fleet checkpoint doc`) is the only writer; the collector below is the
+// reader.
 type sessionDoc struct {
 	Path string `json:"path"`
 	Role string `json:"role"`
 	TS   string `json:"ts"`
 }
 
+// coordStateForCollect is the subset of coord-state.json the collectors read.
+// A pointer-typed session_docs would over-fit; a plain slice + a []string
+// suffice, and unknown keys are ignored by encoding/json.
+type coordStateForCollect struct {
+	SessionDocs     []sessionDoc `json:"session_docs"`
+	RecentDecisions []string     `json:"recent_decisions"`
+}
+
+// readCoordStateForCollect loads the collector's view of coord-state.json.
+// Empty path, missing file, or malformed JSON → zero-value struct (both
+// collectors then render their placeholder). Never errors.
+func readCoordStateForCollect(coordStatePath string) coordStateForCollect {
+	var cs coordStateForCollect
+	if strings.TrimSpace(coordStatePath) == "" {
+		return cs
+	}
+	data, err := os.ReadFile(coordStatePath)
+	if err != nil {
+		return cs
+	}
+	// Ignore unmarshal errors: a malformed / partially-written file degrades
+	// to the placeholder, never fails the handoff. (Atomic tmp+rename means a
+	// reader normally sees a whole old-or-new file; genuine corruption still
+	// degrades gracefully.)
+	_ = json.Unmarshal(data, &cs)
+	return cs
+}
+
 // CollectSessionDocs renders the `## Docs (this session)` body from
-// coord-state.json:session_docs — the plan docs THIS coordinator authored
-// or is implementing, recorded live via `fleet checkpoint doc`. Each entry
-// renders `- <role>: <path>`; the newest sessionDocsMax are shown with a
-// `- … and N more` tail when the list overflows.
+// coord-state.json:session_docs — the plan docs THIS coordinator authored or
+// is implementing, recorded live via `fleet checkpoint doc`. Each entry
+// renders `- <role>: <path>`; the NEWEST sessionDocsMax are shown with a
+// `- … and N more` tail counting the older overflow.
 //
-// This replaces the retired CollectFilesModified whole-repo git dump: the
-// old collector rendered EVERY untracked doc under docs/ (every past
-// coord's litter), while this shows only what the live coord touched.
-//
-// Never errors: a missing / malformed coord-state.json, an empty
+// Never errors: missing / malformed coord-state.json, an empty
 // coordStatePath, or an absent/empty session_docs key returns "" so the
-// caller keeps the section's placeholder. Enrichment NEVER fails a handoff.
+// caller keeps the section's placeholder.
 func CollectSessionDocs(coordStatePath string) string {
-	// TODO(tdd-green): implement.
-	return ""
+	docs := readCoordStateForCollect(coordStatePath).SessionDocs
+	// Drop malformed entries (a hand-edited row missing path/role).
+	valid := docs[:0]
+	for _, d := range docs {
+		if strings.TrimSpace(d.Path) == "" || strings.TrimSpace(d.Role) == "" {
+			continue
+		}
+		valid = append(valid, d)
+	}
+	if len(valid) == 0 {
+		return ""
+	}
+	total := len(valid)
+	hidden := 0
+	if total > sessionDocsMax {
+		// Keep the NEWEST sessionDocsMax (append order is chronological, so
+		// the tail is newest); count the older head as overflow.
+		hidden = total - sessionDocsMax
+		valid = valid[hidden:]
+	}
+	var b strings.Builder
+	for i, d := range valid {
+		if i > 0 {
+			b.WriteByte('\n')
+		}
+		fmt.Fprintf(&b, "- %s: %s", d.Role, d.Path)
+	}
+	if hidden > 0 {
+		fmt.Fprintf(&b, "\n- … and %d more", hidden)
+	}
+	return b.String()
 }
 
 // CollectRecentDecisionsLive reads coord-state.json:recent_decisions LIVE
@@ -68,116 +127,20 @@ func CollectSessionDocs(coordStatePath string) string {
 // rationale logged out-of-band (no tick between the log and the handoff)
 // still reaches Key Decisions — the motivating no-tick case.
 //
-// Never errors: a missing / malformed coord-state.json, an empty
-// coordStatePath, or an absent/empty recent_decisions key returns nil so
-// the caller keeps whatever the checkpoint lift already set.
+// Never errors: missing / malformed coord-state.json, an empty
+// coordStatePath, or an absent/empty recent_decisions key returns nil so the
+// caller keeps whatever the checkpoint lift already set.
 func CollectRecentDecisionsLive(coordStatePath string) []string {
-	// TODO(tdd-green): implement.
-	return nil
-}
-
-// gitTimeout caps the `git status` shell-out, mirroring ghTimeout.
-const gitTimeout = 10 * time.Second
-
-// filesModifiedMax caps how many entries render under Files Modified so a
-// large untracked subtree under docs/ (e.g. a scratch dir) can't dump
-// thousands of bullet lines into the handoff doc. Mirrors the Python
-// recent_decisions cap discipline; the successor re-reads the working tree
-// anyway, so this section is operator-readable triage context.
-const filesModifiedMax = 50
-
-// gitRunner runs `git` in dir with args under a gitTimeout deadline,
-// returning stdout. Production uses runGit; tests inject a fake so the
-// non-git / failure paths are exercised deterministically.
-var gitRunner = runGit
-
-func runGit(dir string, args ...string) ([]byte, error) {
-	bin, err := exec.LookPath("git")
-	if err != nil {
-		return nil, fmt.Errorf("git not on PATH: %w", err)
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), gitTimeout)
-	defer cancel()
-	cmd := exec.CommandContext(ctx, bin, args...)
-	cmd.Dir = dir
-	out, err := cmd.Output()
-	if err != nil {
-		return nil, err
-	}
-	return out, nil
-}
-
-// CollectFilesModified renders the coordinator's plan-doc footprint: the
-// uncommitted/ignored entries under docs/ in repoDir, via `git -C
-// <repoDir> status --porcelain --untracked-files=all --ignored=matching --
-// docs/`. This pulls in tracked DESIGN-*.md / TASK-PLAN-*.md changes,
-// freshly-authored (untracked) plan docs listed INDIVIDUALLY (not
-// collapsed to a bare `docs/`), AND the gitignored docs/*.html companions
-// (--ignored=matching includes ignored files matching the pathspec).
-//
-// Each `XY <path>` porcelain line renders `- <path> (<XY>)`, capped at
-// filesModifiedMax entries with a `- … and N more` tail so a large untracked
-// docs/ subtree can't bloat the doc. Never errors: a non-git repo, a `git`
-// failure, an empty repoDir, or empty output returns "" and the caller keeps
-// the placeholder.
-//
-// MANUAL PATH ONLY — synth.go is contractually subprocess-free, so it
-// leaves Files Modified at its placeholder (the Open PRs precedent).
-func CollectFilesModified(repoDir string) string {
-	if strings.TrimSpace(repoDir) == "" {
-		return ""
-	}
-	out, err := gitRunner(
-		repoDir,
-		"-C", repoDir,
-		// core.quotePath=false: emit UTF-8 paths literally instead of
-		// C-quoting non-ASCII bytes (a `docs/café.md` would otherwise render
-		// as `"docs/caf\303\251.md"` gibberish in the handoff doc).
-		"-c", "core.quotePath=false",
-		"status", "--porcelain",
-		// List untracked files INDIVIDUALLY. Without this, git collapses a
-		// fully-untracked docs/ directory to a single `?? docs/` entry — and
-		// a freshly-authored plan doc in an otherwise-clean docs/ is exactly
-		// that case, so the successor would see `docs/` instead of the file.
-		"--untracked-files=all",
-		// Include the gitignored docs/*.html render companions.
-		"--ignored=matching",
-		"--", "docs/",
-	)
-	if err != nil || len(out) == 0 {
-		return ""
-	}
-	var b strings.Builder
-	rendered := 0
-	total := 0
-	for _, raw := range strings.Split(strings.ReplaceAll(string(out), "\r\n", "\n"), "\n") {
-		line := strings.TrimRight(raw, "\n")
-		if len(line) < 4 {
-			// porcelain v1: "XY path" — 2 status chars + space + path.
+	raw := readCoordStateForCollect(coordStatePath).RecentDecisions
+	out := make([]string, 0, len(raw))
+	for _, d := range raw {
+		if strings.TrimSpace(d) == "" {
 			continue
 		}
-		code := strings.TrimSpace(line[:2])
-		path := strings.TrimSpace(line[3:])
-		if path == "" {
-			continue
-		}
-		total++
-		if rendered >= filesModifiedMax {
-			// Keep counting so the tail line reports the true overflow.
-			continue
-		}
-		// Renamed entries render `orig -> new`; keep the whole tail.
-		if rendered > 0 {
-			b.WriteByte('\n')
-		}
-		rendered++
-		fmt.Fprintf(&b, "- %s (%s)", path, code)
+		out = append(out, d)
 	}
-	if rendered == 0 {
-		return ""
+	if len(out) == 0 {
+		return nil
 	}
-	if total > rendered {
-		fmt.Fprintf(&b, "\n- … and %d more", total-rendered)
-	}
-	return b.String()
+	return out
 }

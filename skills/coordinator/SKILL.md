@@ -88,6 +88,11 @@ Before splitting tasks, save the approved implementation plan.
   reviewer sees it immediately.
 - Contents: summary, design decisions, task split, test plan, assumptions, and
   approval timestamp.
+- Record: after the save, run
+  `fleet checkpoint doc --role authored docs/DESIGN-<kebab-topic>.md` so the
+  doc lands in coord-state.json:session_docs and renders in this coord's
+  handoff under "Docs (this session)". Best-effort: a failed call only omits
+  the doc from the handoff; it never blocks the step.
 
 ### Step 3 — SPLIT
 
@@ -123,6 +128,9 @@ Before any task is promoted to ready, save its worker-ready task plan doc.
 - Worker visibility: before promotion, either embed the task plan in Spec or
   append its path to Spec/Acceptance, for example:
   `fleet tasks note --project <project> <slug> --section spec "Task plan: docs/TASK-PLAN-<slug>.md"`.
+- Record: after the save, run
+  `fleet checkpoint doc --role authored docs/TASK-PLAN-<slug>.md` ("Docs
+  (this session)" in the handoff).
 - Promotion: run `fleet tasks promote <slug>` only after the doc exists and is
   linked or embedded in worker-visible task text.
 
@@ -194,6 +202,28 @@ Rules:
   the worker state validator.
 - v0.2 default parallelism is 1. Higher parallelism uses worktrees and conflict
   checks.
+- Record: when dispatching a worker for a task, run
+  `fleet checkpoint doc --role implementing docs/TASK-PLAN-<slug>.md` so the
+  handoff's "Docs (this session)" shows what this coord is actively
+  implementing (dedupe by path — the role flips from `authored` to
+  `implementing`).
+
+### Decision log
+
+On every **material** call, log one rationale line — always with the *why*:
+
+```bash
+fleet checkpoint decision "<what> — <why>"
+# e.g. fleet checkpoint decision "Stopped rebase of PR #224 — superseded PR for an operator-paused task"
+```
+
+Material = a fix/defer choice, a design fork resolved, a re-prioritisation, a
+PR-shepherding action. It appends to the same capped
+coord-state.json:recent_decisions buffer the tick auto-producer feeds, so the
+handoff's "Key Decisions" carries agent rationale alongside the mechanical
+events — even on a manual handoff before the next tick (the handoff reads the
+buffer live). Routine mechanical steps (a dispatch, a poll) are NOT material;
+the auto-producer already records those.
 
 ### Step 7 — PR-TRACK
 

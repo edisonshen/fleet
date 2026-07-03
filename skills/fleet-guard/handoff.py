@@ -903,7 +903,7 @@ def _render_doc(*, agent_id: str, task_id: str, project: str,
     out.append(f"## First Action (auto)\n{first_action(project)}\n\n")
     out.append(f"## Completed\n{completed}\n\n")
     out.append(f"## Key Decisions\n{PLACEHOLDER}\n\n")
-    out.append(f"## Files Modified\n{PLACEHOLDER}\n\n")
+    out.append(f"## Docs (this session)\n{PLACEHOLDER}\n\n")
     out.append(f"## Open Questions\n{PLACEHOLDER}\n\n")
     out.append(f"## Next Steps (prioritized)\n{PLACEHOLDER}\n\n")
     out.append(

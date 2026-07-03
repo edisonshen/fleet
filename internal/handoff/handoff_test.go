@@ -29,7 +29,7 @@ func TestRender_HasAllSections(t *testing.T) {
 		"## First Action (auto)",
 		"## Completed",
 		"## Key Decisions",
-		"## Files Modified",
+		"## Docs (this session)",
 		"## Open Questions",
 		"## Next Steps (prioritized)",
 		"## Active Subagents",
@@ -161,7 +161,7 @@ func TestRender_ContextPctRendersAsNumber(t *testing.T) {
 		Timestamp:           time.Now().UTC(),
 		Completed:           "x",
 		KeyDecisions:        "x",
-		FilesModified:       "x",
+		SessionDocs:         "x",
 		OpenQuestions:       "x",
 		NextSteps:           "x",
 	}
@@ -246,7 +246,7 @@ func TestRender_SkillByteGolden(t *testing.T) {
 		Timestamp:           time.Date(2026, 4, 28, 12, 34, 56, 0, time.UTC),
 		Completed:           "Wrote tests for foo",
 		KeyDecisions:        Placeholder,
-		FilesModified:       Placeholder,
+		SessionDocs:         Placeholder,
 		OpenQuestions:       Placeholder,
 		NextSteps:           Placeholder,
 	}
@@ -284,7 +284,7 @@ func TestRender_SkillByteGolden(t *testing.T) {
 		"Then continue with the sections below." + "\n\n" +
 		"## Completed\nWrote tests for foo\n\n" +
 		"## Key Decisions\n" + Placeholder + "\n\n" +
-		"## Files Modified\n" + Placeholder + "\n\n" +
+		"## Docs (this session)\n" + Placeholder + "\n\n" +
 		"## Open Questions\n" + Placeholder + "\n\n" +
 		"## Next Steps (prioritized)\n" + Placeholder + "\n\n" +
 		"## Active Subagents\n" + ActiveSubagentsNonePlaceholder + "\n\n" +
