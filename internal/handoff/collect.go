@@ -26,6 +26,56 @@ import (
 	"time"
 )
 
+// sessionDocsMax caps how many "Docs (this session)" rows render in a
+// handoff doc so a long-lived coord that authored a large number of plan
+// docs can't bloat the section. Its own constant, INDEPENDENT of the
+// recent_decisions env cap (resolve_checkpoint_decisions, default 10) —
+// the two buffers cap separately (design: coord-state schema).
+const sessionDocsMax = 20
+
+// sessionDoc is one entry of coord-state.json:session_docs — a plan doc
+// the coordinator authored or is actively implementing this session. The
+// Go CLI (`fleet checkpoint doc`) is the only writer; the handoff
+// collector below is the reader.
+type sessionDoc struct {
+	Path string `json:"path"`
+	Role string `json:"role"`
+	TS   string `json:"ts"`
+}
+
+// CollectSessionDocs renders the `## Docs (this session)` body from
+// coord-state.json:session_docs — the plan docs THIS coordinator authored
+// or is implementing, recorded live via `fleet checkpoint doc`. Each entry
+// renders `- <role>: <path>`; the newest sessionDocsMax are shown with a
+// `- … and N more` tail when the list overflows.
+//
+// This replaces the retired CollectFilesModified whole-repo git dump: the
+// old collector rendered EVERY untracked doc under docs/ (every past
+// coord's litter), while this shows only what the live coord touched.
+//
+// Never errors: a missing / malformed coord-state.json, an empty
+// coordStatePath, or an absent/empty session_docs key returns "" so the
+// caller keeps the section's placeholder. Enrichment NEVER fails a handoff.
+func CollectSessionDocs(coordStatePath string) string {
+	// TODO(tdd-green): implement.
+	return ""
+}
+
+// CollectRecentDecisionsLive reads coord-state.json:recent_decisions LIVE
+// (the same buffer the tick auto-producer AND `fleet checkpoint decision`
+// both feed) and returns it as an ordered slice. The handoff paths prefer
+// this over the tick-published coord-checkpoint.md value so an agent
+// rationale logged out-of-band (no tick between the log and the handoff)
+// still reaches Key Decisions — the motivating no-tick case.
+//
+// Never errors: a missing / malformed coord-state.json, an empty
+// coordStatePath, or an absent/empty recent_decisions key returns nil so
+// the caller keeps whatever the checkpoint lift already set.
+func CollectRecentDecisionsLive(coordStatePath string) []string {
+	// TODO(tdd-green): implement.
+	return nil
+}
+
 // gitTimeout caps the `git status` shell-out, mirroring ghTimeout.
 const gitTimeout = 10 * time.Second
 

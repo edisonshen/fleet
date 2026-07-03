@@ -1,0 +1,212 @@
+package handoff
+
+// sessiondocs_test.go — CollectSessionDocs + CollectRecentDecisionsLive
+// (curated-handoff-context). The former replaces the retired git-dump
+// CollectFilesModified; the latter closes the no-tick-before-handoff gap
+// so an agent rationale logged via `fleet checkpoint decision` reaches
+// Key Decisions even when no tick published a fresh coord-checkpoint.md.
+
+import (
+	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+)
+
+// writeCoordStateJSON writes a coord-state.json with the given raw body
+// under <dir> and returns its path.
+func writeCoordStateJSON(t *testing.T, dir, body string) string {
+	t.Helper()
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatalf("mkdir %s: %v", dir, err)
+	}
+	path := filepath.Join(dir, "coord-state.json")
+	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+		t.Fatalf("write coord-state.json: %v", err)
+	}
+	return path
+}
+
+// ---------- CollectSessionDocs ----------
+
+// Test 1 — role-tagged rows, never a git dump.
+func TestCollectSessionDocs_RendersRoleTaggedRows(t *testing.T) {
+	cs := writeCoordStateJSON(t, t.TempDir(), `{"session_docs":[
+		{"path":"docs/DESIGN-a.md","role":"authored","ts":"2026-07-02T00:00:00Z"},
+		{"path":"docs/DESIGN-b.md","role":"authored","ts":"2026-07-02T00:01:00Z"},
+		{"path":"docs/TASK-PLAN-c.md","role":"implementing","ts":"2026-07-02T00:02:00Z"}
+	]}`)
+	got := CollectSessionDocs(cs)
+	for _, want := range []string{
+		"- authored: docs/DESIGN-a.md",
+		"- authored: docs/DESIGN-b.md",
+		"- implementing: docs/TASK-PLAN-c.md",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("missing %q in:\n%s", want, got)
+		}
+	}
+	if strings.Count(got, "\n") != 2 { // 3 rows → 2 newlines
+		t.Errorf("expected exactly 3 rows, got:\n%s", got)
+	}
+}
+
+// Test 3 + Test 5 — empty / missing / malformed / empty-path all → "".
+func TestCollectSessionDocs_EmptyMissingMalformedYieldPlaceholder(t *testing.T) {
+	dir := t.TempDir()
+	cases := map[string]string{
+		"empty list":  `{"session_docs":[]}`,
+		"no key":      `{"tick_count":3}`,
+		"null key":    `{"session_docs":null}`,
+		"malformed":   `{not valid json`,
+		"wrong shape": `{"session_docs":"oops"}`,
+	}
+	for name, body := range cases {
+		cs := writeCoordStateJSON(t, dir, body)
+		if got := CollectSessionDocs(cs); got != "" {
+			t.Errorf("%s: got %q want empty", name, got)
+		}
+	}
+	// Missing file.
+	if got := CollectSessionDocs(filepath.Join(dir, "nope.json")); got != "" {
+		t.Errorf("missing file: got %q want empty", got)
+	}
+	// Empty path (no shell-out / read).
+	if got := CollectSessionDocs(""); got != "" {
+		t.Errorf("empty path: got %q want empty", got)
+	}
+}
+
+// Test 4 — cap at sessionDocsMax: newest N shown + "… and M more" tail.
+func TestCollectSessionDocs_CapsAtSessionDocsMax(t *testing.T) {
+	const extra = 5
+	n := sessionDocsMax + extra
+	var b strings.Builder
+	b.WriteString(`{"session_docs":[`)
+	for i := 0; i < n; i++ {
+		if i > 0 {
+			b.WriteByte(',')
+		}
+		fmt.Fprintf(&b, `{"path":"docs/f%03d.md","role":"authored","ts":"2026-07-02T00:00:00Z"}`, i)
+	}
+	b.WriteString(`]}`)
+	cs := writeCoordStateJSON(t, t.TempDir(), b.String())
+
+	got := CollectSessionDocs(cs)
+	lines := strings.Split(got, "\n")
+	// sessionDocsMax rows + 1 overflow tail line.
+	if len(lines) != sessionDocsMax+1 {
+		t.Fatalf("line count: got %d want %d\n%s", len(lines), sessionDocsMax+1, got)
+	}
+	wantTail := fmt.Sprintf("- … and %d more", extra)
+	if lines[len(lines)-1] != wantTail {
+		t.Errorf("overflow tail: got %q want %q", lines[len(lines)-1], wantTail)
+	}
+	// Newest shown, oldest dropped.
+	if !strings.Contains(got, fmt.Sprintf("docs/f%03d.md", n-1)) {
+		t.Errorf("newest doc missing from capped output:\n%s", got)
+	}
+	if strings.Contains(got, "docs/f000.md") {
+		t.Errorf("oldest doc should be dropped by the cap:\n%s", got)
+	}
+}
+
+// ---------- CollectRecentDecisionsLive ----------
+
+func TestCollectRecentDecisionsLive_ReadsBuffer(t *testing.T) {
+	cs := writeCoordStateJSON(t, t.TempDir(),
+		`{"recent_decisions":["auto: merged PR → task x done","agent: stopped rebase of PR #224 — superseded"]}`)
+	got := CollectRecentDecisionsLive(cs)
+	if len(got) != 2 {
+		t.Fatalf("got %d entries want 2: %v", len(got), got)
+	}
+	if got[0] != "auto: merged PR → task x done" ||
+		got[1] != "agent: stopped rebase of PR #224 — superseded" {
+		t.Errorf("entries mismatch: %v", got)
+	}
+}
+
+func TestCollectRecentDecisionsLive_MissingMalformedEmptyYieldNil(t *testing.T) {
+	dir := t.TempDir()
+	cases := map[string]string{
+		"empty list": `{"recent_decisions":[]}`,
+		"no key":     `{"tick_count":1}`,
+		"null":       `{"recent_decisions":null}`,
+		"malformed":  `{bad`,
+	}
+	for name, body := range cases {
+		cs := writeCoordStateJSON(t, dir, body)
+		if got := CollectRecentDecisionsLive(cs); got != nil {
+			t.Errorf("%s: got %v want nil", name, got)
+		}
+	}
+	if got := CollectRecentDecisionsLive(filepath.Join(dir, "nope.json")); got != nil {
+		t.Errorf("missing file: got %v want nil", got)
+	}
+	if got := CollectRecentDecisionsLive(""); got != nil {
+		t.Errorf("empty path: got %v want nil", got)
+	}
+}
+
+// Test 7b — the motivating no-tick case: `fleet checkpoint decision`
+// writes coord-state.json:recent_decisions out-of-band, and a manual
+// handoff BEFORE the next tick must read it LIVE (not the stale
+// coord-checkpoint.md) so Key Decisions carries the agent's rationale.
+func TestEnrichManualDoc_LiveRecentDecisions_NoTick(t *testing.T) {
+	pdir := withFleetHomeSynth(t)
+	now := time.Now().UTC()
+	// coord-state.json: no workers, but a freshly-logged agent decision
+	// and NO coord-checkpoint.md at all (the no-tick window).
+	writeCoordStateJSON(t, filepath.Join(pdir, "myproj"),
+		`{"worker_agent_ids":{},"recent_decisions":["stopped rebase of PR #224 — superseded PR for a paused task"]}`)
+	fakeGH(t, []byte("[]"), nil)
+
+	doc := NewManualStub("deadbeef", "coord-myproj", "myproj", 1, nil, now)
+	EnrichManualDoc(doc, "myproj", "deadbeef", "", nil, nil)
+
+	if !strings.Contains(doc.KeyDecisions, "stopped rebase of PR #224 — superseded PR for a paused task") {
+		t.Errorf("live recent_decisions not lifted into Key Decisions: %q", doc.KeyDecisions)
+	}
+}
+
+// Live coord-state recent_decisions must WIN over a stale checkpoint's
+// Recent decisions (the checkpoint predates the just-logged agent line).
+func TestEnrichManualDoc_LiveRecentDecisions_OverridesStaleCheckpoint(t *testing.T) {
+	pdir := withFleetHomeSynth(t)
+	now := time.Now().UTC()
+	// Checkpoint (coord_id deadbeef) carries an OLD decision; coord-state
+	// carries a NEWER agent decision logged after the checkpoint tick.
+	seedCheckpointFull(t, pdir, "myproj", now, nil,
+		[]string{"- old checkpoint decision"}, nil)
+	writeCoordStateJSON(t, filepath.Join(pdir, "myproj"),
+		`{"worker_agent_ids":{},"recent_decisions":["fresh agent decision — logged after the tick"]}`)
+	fakeGH(t, []byte("[]"), nil)
+
+	doc := NewManualStub("deadbeef", "coord-myproj", "myproj", 1, nil, now)
+	EnrichManualDoc(doc, "myproj", "deadbeef", "", nil, nil)
+
+	if !strings.Contains(doc.KeyDecisions, "fresh agent decision — logged after the tick") {
+		t.Errorf("live decision must win over checkpoint: %q", doc.KeyDecisions)
+	}
+	if strings.Contains(doc.KeyDecisions, "old checkpoint decision") {
+		t.Errorf("stale checkpoint decision must be overridden by live: %q", doc.KeyDecisions)
+	}
+}
+
+// Recovery synth must ALSO prefer the live coord-state recent_decisions.
+func TestSynthesizeRecovery_LiveRecentDecisions(t *testing.T) {
+	pdir := withFleetHomeSynth(t)
+	now := time.Now().UTC()
+	writeCoordStateJSON(t, filepath.Join(pdir, "myproj"),
+		`{"worker_agent_ids":{},"recent_decisions":["recovery live decision — from coord-state"]}`)
+
+	doc, err := SynthesizeRecoveryWithLastHandoff("deadbeef", "myproj", "", now)
+	if err != nil {
+		t.Fatalf("SynthesizeRecoveryWithLastHandoff: %v", err)
+	}
+	if !strings.Contains(doc.KeyDecisions, "recovery live decision — from coord-state") {
+		t.Errorf("synth did not lift live recent_decisions: %q", doc.KeyDecisions)
+	}
+}
