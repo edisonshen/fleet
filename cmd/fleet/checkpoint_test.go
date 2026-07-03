@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 
@@ -160,6 +161,37 @@ func TestCheckpointDoc_RejectsBadRole(t *testing.T) {
 	}
 	if err := runCheckpoint(t, "doc", "--project", "myproj", "--role", "bogus", "docs/x.md"); err == nil {
 		t.Fatalf("expected error on bad --role")
+	}
+}
+
+// A doc path carrying embedded CR/LF is flattened to spaces before it is
+// stored, so it can't forge a fake `## Section` header when the handoff
+// renderer emits `- <role>: <path>` verbatim. Mirrors the decision-text
+// flatten; regression for the section-injection vector.
+func TestCheckpointDoc_FlattensNewlinesInPath(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("FLEET_HOME", home)
+	if _, err := state.Bootstrap(); err != nil {
+		t.Fatalf("Bootstrap: %v", err)
+	}
+	// A path attempting to inject a forged header + a CR variant.
+	inject := "docs/x.md\n## INJECTED HEADER\r- forged: docs/evil.md"
+	if err := runCheckpoint(t, "doc", "--project", "myproj", "--role", "authored", inject); err != nil {
+		t.Fatalf("checkpoint doc: %v", err)
+	}
+	docs := sessionDocsOf(t, readCoordState(t, home, "myproj"))
+	if len(docs) != 1 {
+		t.Fatalf("expected 1 entry, got %d: %#v", len(docs), docs)
+	}
+	got, _ := docs[0]["path"].(string)
+	if strings.ContainsAny(got, "\r\n") {
+		t.Errorf("stored path retains CR/LF (header-injection vector): %q", got)
+	}
+	// The '##' bytes survive but no longer start a line, so the renderer's
+	// `- <role>: <path>` stays a single bullet — no forged section.
+	want := "docs/x.md ## INJECTED HEADER - forged: docs/evil.md"
+	if got != want {
+		t.Errorf("flattened path: got %q want %q", got, want)
 	}
 }
 

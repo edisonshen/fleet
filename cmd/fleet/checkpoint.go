@@ -111,7 +111,15 @@ func runCheckpointDoc(project, role, path string) error {
 	default:
 		return fmt.Errorf("--role must be authored or implementing, got %q", role)
 	}
-	path = strings.TrimSpace(path)
+	// Flatten CR/LF to spaces BEFORE trimming. A doc path is rendered
+	// verbatim into the handoff doc as `- <role>: <path>`; an embedded
+	// newline would forge a fake `## Section` header (or duplicate a real
+	// one) inside a document the successor coord reads as trusted
+	// instructions. Mirrors runCheckpointDecision's identical flatten of the
+	// decision text — Render concatenates fixed `## H\n%s\n\n` blocks with no
+	// per-section fencing, so sanitizing at the writer is the load-bearing
+	// guard.
+	path = strings.TrimSpace(strings.ReplaceAll(strings.ReplaceAll(path, "\r", " "), "\n", " "))
 	if path == "" {
 		return errors.New("doc path must be non-empty")
 	}
