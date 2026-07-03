@@ -195,6 +195,56 @@ func TestCheckpointDoc_FlattensNewlinesInPath(t *testing.T) {
 	}
 }
 
+// Generation stamping: a coord-session write (FLEET_AGENT_ID set) stamps
+// the session_docs entry with coord_id and flips recent_decisions_owner;
+// an operator-shell write (env unset) leaves both unstamped so the reader-
+// side guard treats them as legacy (unfiltered).
+func TestCheckpoint_StampsCoordGeneration(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("FLEET_HOME", home)
+	if _, err := state.Bootstrap(); err != nil {
+		t.Fatalf("Bootstrap: %v", err)
+	}
+
+	// Coord-session writes.
+	t.Setenv("FLEET_AGENT_ID", "cafe0123")
+	if err := runCheckpoint(t, "doc", "--project", "myproj", "--role", "authored", "docs/D.md"); err != nil {
+		t.Fatalf("doc: %v", err)
+	}
+	if err := runCheckpoint(t, "decision", "--project", "myproj", "why — because"); err != nil {
+		t.Fatalf("decision: %v", err)
+	}
+	m := readCoordState(t, home, "myproj")
+	docs := sessionDocsOf(t, m)
+	if len(docs) != 1 || docs[0]["coord_id"] != "cafe0123" {
+		t.Errorf("session_docs entry not stamped: %#v", docs)
+	}
+	if m["recent_decisions_owner"] != "cafe0123" {
+		t.Errorf("recent_decisions_owner not stamped: %#v", m["recent_decisions_owner"])
+	}
+
+	// Operator-shell writes: no stamp on the new entry; prior owner stamp
+	// left intact (never erase attribution).
+	t.Setenv("FLEET_AGENT_ID", "")
+	if err := runCheckpoint(t, "doc", "--project", "myproj", "--role", "authored", "docs/OP.md"); err != nil {
+		t.Fatalf("operator doc: %v", err)
+	}
+	if err := runCheckpoint(t, "decision", "--project", "myproj", "operator line"); err != nil {
+		t.Fatalf("operator decision: %v", err)
+	}
+	m = readCoordState(t, home, "myproj")
+	for _, d := range sessionDocsOf(t, m) {
+		if d["path"] == "docs/OP.md" {
+			if _, stamped := d["coord_id"]; stamped {
+				t.Errorf("operator-shell entry must be unstamped: %#v", d)
+			}
+		}
+	}
+	if m["recent_decisions_owner"] != "cafe0123" {
+		t.Errorf("operator-shell write must not erase the owner stamp: %#v", m["recent_decisions_owner"])
+	}
+}
+
 // Test 7 — `fleet checkpoint decision` appends to recent_decisions.
 func TestCheckpointDecision_AppendsBuffer(t *testing.T) {
 	home := t.TempDir()

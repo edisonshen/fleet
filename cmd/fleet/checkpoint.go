@@ -135,11 +135,21 @@ func runCheckpointDoc(project, role, path string) error {
 			}
 			kept = append(kept, e)
 		}
-		kept = append(kept, map[string]any{
+		entry := map[string]any{
 			"path": path,
 			"role": role,
 			"ts":   time.Now().UTC().Format(time.RFC3339),
-		})
+		}
+		// Generation stamp: coord-state.json survives coord succession, so
+		// the reader (CollectSessionDocs) filters entries stamped by a
+		// DIFFERENT coord — the same guard loadCheckpointIfFresher applies
+		// to the checkpoint. An empty FLEET_AGENT_ID (operator shell) leaves
+		// the entry unstamped → unfiltered, mirroring the checkpoint guard's
+		// empty-coord_id handling.
+		if id := os.Getenv("FLEET_AGENT_ID"); id != "" {
+			entry["coord_id"] = id
+		}
+		kept = append(kept, entry)
 		if len(kept) > checkpointSessionDocsMax {
 			kept = kept[len(kept)-checkpointSessionDocsMax:]
 		}
@@ -168,6 +178,20 @@ func runCheckpointDecision(project, text string) error {
 			out[i] = s
 		}
 		cs["recent_decisions"] = out
+		// Generation stamp for the LIVE read. recent_decisions is a plain-
+		// strings buffer shared with the Python tick producer (per-entry
+		// stamping would break the coord-checkpoint.md round-trip), so the
+		// stamp is a top-level sibling key: the last CLI writer's coord
+		// generation. CollectRecentDecisionsLive suppresses the live
+		// override when this stamp belongs to a different coord — the
+		// checkpoint fallback then applies its own coord_id guard. The tick
+		// preserves unknown keys through load-mutate-save, so the stamp
+		// rides through heartbeats untouched. Empty FLEET_AGENT_ID
+		// (operator shell) leaves any prior stamp in place rather than
+		// erasing attribution.
+		if id := os.Getenv("FLEET_AGENT_ID"); id != "" {
+			cs["recent_decisions_owner"] = id
+		}
 	})
 }
 

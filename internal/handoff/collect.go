@@ -42,19 +42,38 @@ const sessionDocsMax = 20
 // sessionDoc is one entry of coord-state.json:session_docs — a plan doc the
 // coordinator authored or is actively implementing this session. The Go CLI
 // (`fleet checkpoint doc`) is the only writer; the collector below is the
-// reader.
+// reader. CoordID stamps the writing coord's generation (FLEET_AGENT_ID at
+// write time; empty for an operator-shell write) so the reader can apply
+// the SAME generation guard loadCheckpointIfFresher applies to the
+// checkpoint — coord-state.json survives coord succession, and without the
+// stamp a successor's "Docs (this session)" would attribute a predecessor's
+// docs to itself.
 type sessionDoc struct {
-	Path string `json:"path"`
-	Role string `json:"role"`
-	TS   string `json:"ts"`
+	Path    string `json:"path"`
+	Role    string `json:"role"`
+	TS      string `json:"ts"`
+	CoordID string `json:"coord_id,omitempty"`
 }
 
 // coordStateForCollect is the subset of coord-state.json the collectors read.
 // A pointer-typed session_docs would over-fit; a plain slice + a []string
 // suffice, and unknown keys are ignored by encoding/json.
+// RecentDecisionsOwner is the generation stamp `fleet checkpoint decision`
+// maintains for the shared recent_decisions buffer (per-entry stamping would
+// break the plain-strings checkpoint round-trip the tick producer shares).
 type coordStateForCollect struct {
-	SessionDocs     []sessionDoc `json:"session_docs"`
-	RecentDecisions []string     `json:"recent_decisions"`
+	SessionDocs          []sessionDoc `json:"session_docs"`
+	RecentDecisions      []string     `json:"recent_decisions"`
+	RecentDecisionsOwner string       `json:"recent_decisions_owner"`
+}
+
+// foreignGeneration reports whether a stamped owner belongs to a DIFFERENT
+// coord generation than the agent whose handoff doc is being built. Empty
+// stamp (legacy entry / operator-shell write) or empty agentID (caller
+// without generation context) can't be attributed, so it is NOT foreign —
+// the exact semantics of loadCheckpointIfFresher's coord_id guard.
+func foreignGeneration(stamp, agentID string) bool {
+	return stamp != "" && agentID != "" && stamp != agentID
 }
 
 // readCoordStateForCollect loads the collector's view of coord-state.json.
@@ -83,15 +102,28 @@ func readCoordStateForCollect(coordStatePath string) coordStateForCollect {
 // renders `- <role>: <path>`; the NEWEST sessionDocsMax are shown with a
 // `- … and N more` tail counting the older overflow.
 //
+// agentID is the coord whose handoff doc is being built. coord-state.json
+// survives coord succession (the tick preserves session_docs across
+// generations), so entries stamped with a DIFFERENT coord_id are a
+// predecessor's (or, on a recovery misclassification, a live sibling's) —
+// they are filtered out, mirroring loadCheckpointIfFresher's generation
+// guard. Unstamped entries (legacy / operator-shell writes) and an empty
+// agentID pass through, same as the checkpoint guard's empty-coord_id
+// handling.
+//
 // Never errors: missing / malformed coord-state.json, an empty
 // coordStatePath, or an absent/empty session_docs key returns "" so the
 // caller keeps the section's placeholder.
-func CollectSessionDocs(coordStatePath string) string {
+func CollectSessionDocs(coordStatePath, agentID string) string {
 	docs := readCoordStateForCollect(coordStatePath).SessionDocs
-	// Drop malformed entries (a hand-edited row missing path/role).
+	// Drop malformed entries (a hand-edited row missing path/role) and
+	// foreign-generation entries (another coord's session).
 	valid := docs[:0]
 	for _, d := range docs {
 		if strings.TrimSpace(d.Path) == "" || strings.TrimSpace(d.Role) == "" {
+			continue
+		}
+		if foreignGeneration(d.CoordID, agentID) {
 			continue
 		}
 		valid = append(valid, d)
@@ -127,11 +159,25 @@ func CollectSessionDocs(coordStatePath string) string {
 // rationale logged out-of-band (no tick between the log and the handoff)
 // still reaches Key Decisions — the motivating no-tick case.
 //
+// agentID gates the live override by generation: `fleet checkpoint
+// decision` stamps coord-state.json:recent_decisions_owner with the writing
+// coord's FLEET_AGENT_ID, and a stamp from a DIFFERENT coord means the live
+// buffer's agent lines belong to another generation (predecessor leftovers
+// after succession, or a live sibling during a recovery misclassification).
+// In that case return nil — the caller falls back to the checkpoint value,
+// which loadCheckpointIfFresher already generation-guards. An empty stamp
+// (tick-only buffer, no CLI write yet) or empty agentID passes: that is the
+// pre-existing tick-producer exposure, unchanged.
+//
 // Never errors: missing / malformed coord-state.json, an empty
 // coordStatePath, or an absent/empty recent_decisions key returns nil so the
 // caller keeps whatever the checkpoint lift already set.
-func CollectRecentDecisionsLive(coordStatePath string) []string {
-	raw := readCoordStateForCollect(coordStatePath).RecentDecisions
+func CollectRecentDecisionsLive(coordStatePath, agentID string) []string {
+	cs := readCoordStateForCollect(coordStatePath)
+	if foreignGeneration(cs.RecentDecisionsOwner, agentID) {
+		return nil
+	}
+	raw := cs.RecentDecisions
 	out := make([]string, 0, len(raw))
 	for _, d := range raw {
 		if strings.TrimSpace(d) == "" {

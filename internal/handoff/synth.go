@@ -149,10 +149,10 @@ func SynthesizeRecoveryWithLastHandoff(
 	// WINS over the tick-published checkpoint value (an agent decision logged
 	// after the last tick — the no-tick-before-handoff gap).
 	csPath := filepath.Join(pdir, "coord-state.json")
-	if sd := CollectSessionDocs(csPath); sd != "" {
+	if sd := CollectSessionDocs(csPath, agentID); sd != "" {
 		doc.SessionDocs = sd
 	}
-	liveDecisions := renderCompletionBullets(CollectRecentDecisionsLive(csPath))
+	liveDecisions := renderCompletionBullets(CollectRecentDecisionsLive(csPath, agentID))
 	if liveDecisions != "" {
 		doc.KeyDecisions = liveDecisions
 	}

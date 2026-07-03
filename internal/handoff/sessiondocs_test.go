@@ -38,7 +38,7 @@ func TestCollectSessionDocs_RendersRoleTaggedRows(t *testing.T) {
 		{"path":"docs/DESIGN-b.md","role":"authored","ts":"2026-07-02T00:01:00Z"},
 		{"path":"docs/TASK-PLAN-c.md","role":"implementing","ts":"2026-07-02T00:02:00Z"}
 	]}`)
-	got := CollectSessionDocs(cs)
+	got := CollectSessionDocs(cs, "")
 	for _, want := range []string{
 		"- authored: docs/DESIGN-a.md",
 		"- authored: docs/DESIGN-b.md",
@@ -65,16 +65,16 @@ func TestCollectSessionDocs_EmptyMissingMalformedYieldPlaceholder(t *testing.T) 
 	}
 	for name, body := range cases {
 		cs := writeCoordStateJSON(t, dir, body)
-		if got := CollectSessionDocs(cs); got != "" {
+		if got := CollectSessionDocs(cs, ""); got != "" {
 			t.Errorf("%s: got %q want empty", name, got)
 		}
 	}
 	// Missing file.
-	if got := CollectSessionDocs(filepath.Join(dir, "nope.json")); got != "" {
+	if got := CollectSessionDocs(filepath.Join(dir, "nope.json"), ""); got != "" {
 		t.Errorf("missing file: got %q want empty", got)
 	}
 	// Empty path (no shell-out / read).
-	if got := CollectSessionDocs(""); got != "" {
+	if got := CollectSessionDocs("", ""); got != "" {
 		t.Errorf("empty path: got %q want empty", got)
 	}
 }
@@ -94,7 +94,7 @@ func TestCollectSessionDocs_CapsAtSessionDocsMax(t *testing.T) {
 	b.WriteString(`]}`)
 	cs := writeCoordStateJSON(t, t.TempDir(), b.String())
 
-	got := CollectSessionDocs(cs)
+	got := CollectSessionDocs(cs, "")
 	lines := strings.Split(got, "\n")
 	// sessionDocsMax rows + 1 overflow tail line.
 	if len(lines) != sessionDocsMax+1 {
@@ -118,7 +118,7 @@ func TestCollectSessionDocs_CapsAtSessionDocsMax(t *testing.T) {
 func TestCollectRecentDecisionsLive_ReadsBuffer(t *testing.T) {
 	cs := writeCoordStateJSON(t, t.TempDir(),
 		`{"recent_decisions":["auto: merged PR → task x done","agent: stopped rebase of PR #224 — superseded"]}`)
-	got := CollectRecentDecisionsLive(cs)
+	got := CollectRecentDecisionsLive(cs, "")
 	if len(got) != 2 {
 		t.Fatalf("got %d entries want 2: %v", len(got), got)
 	}
@@ -138,14 +138,14 @@ func TestCollectRecentDecisionsLive_MissingMalformedEmptyYieldNil(t *testing.T) 
 	}
 	for name, body := range cases {
 		cs := writeCoordStateJSON(t, dir, body)
-		if got := CollectRecentDecisionsLive(cs); got != nil {
+		if got := CollectRecentDecisionsLive(cs, ""); got != nil {
 			t.Errorf("%s: got %v want nil", name, got)
 		}
 	}
-	if got := CollectRecentDecisionsLive(filepath.Join(dir, "nope.json")); got != nil {
+	if got := CollectRecentDecisionsLive(filepath.Join(dir, "nope.json"), ""); got != nil {
 		t.Errorf("missing file: got %v want nil", got)
 	}
-	if got := CollectRecentDecisionsLive(""); got != nil {
+	if got := CollectRecentDecisionsLive("", ""); got != nil {
 		t.Errorf("empty path: got %v want nil", got)
 	}
 }
@@ -192,6 +192,93 @@ func TestEnrichManualDoc_LiveRecentDecisions_OverridesStaleCheckpoint(t *testing
 	}
 	if strings.Contains(doc.KeyDecisions, "old checkpoint decision") {
 		t.Errorf("stale checkpoint decision must be overridden by live: %q", doc.KeyDecisions)
+	}
+}
+
+// ---------- generation scoping (coord-state survives succession) ----------
+
+// session_docs entries stamped with a DIFFERENT coord_id are a
+// predecessor's — the reader filters them so a successor's "Docs (this
+// session)" never attributes another generation's docs to itself.
+// Unstamped (legacy / operator-shell) entries pass, and an empty agentID
+// disables filtering — the exact semantics of loadCheckpointIfFresher's
+// coord_id guard.
+func TestCollectSessionDocs_FiltersForeignGeneration(t *testing.T) {
+	cs := writeCoordStateJSON(t, t.TempDir(), `{"session_docs":[
+		{"path":"docs/DESIGN-old.md","role":"authored","ts":"2026-07-01T00:00:00Z","coord_id":"aaaa1111"},
+		{"path":"docs/DESIGN-mine.md","role":"authored","ts":"2026-07-02T00:00:00Z","coord_id":"bbbb2222"},
+		{"path":"docs/DESIGN-legacy.md","role":"implementing","ts":"2026-07-02T00:01:00Z"}
+	]}`)
+	// Reader is coord bbbb2222: the aaaa1111 entry is foreign, the
+	// unstamped legacy entry passes.
+	got := CollectSessionDocs(cs, "bbbb2222")
+	if strings.Contains(got, "docs/DESIGN-old.md") {
+		t.Errorf("foreign-generation doc leaked into session docs: %q", got)
+	}
+	if !strings.Contains(got, "- authored: docs/DESIGN-mine.md") {
+		t.Errorf("own-generation doc missing: %q", got)
+	}
+	if !strings.Contains(got, "- implementing: docs/DESIGN-legacy.md") {
+		t.Errorf("unstamped legacy doc must pass the guard: %q", got)
+	}
+	// Empty agentID (no generation context) → no filtering.
+	all := CollectSessionDocs(cs, "")
+	for _, want := range []string{"docs/DESIGN-old.md", "docs/DESIGN-mine.md", "docs/DESIGN-legacy.md"} {
+		if !strings.Contains(all, want) {
+			t.Errorf("empty agentID must disable the filter; missing %q in %q", want, all)
+		}
+	}
+	// A third coord: both stamped rows are foreign; only the unstamped
+	// legacy row survives.
+	third := CollectSessionDocs(cs, "cccc3333")
+	if third != "- implementing: docs/DESIGN-legacy.md" {
+		t.Errorf("third generation should see only the legacy row, got %q", third)
+	}
+}
+
+// A recent_decisions_owner stamp from a DIFFERENT coord suppresses the
+// live override entirely (return nil) — the caller then falls back to the
+// checkpoint value, which loadCheckpointIfFresher generation-guards. Own /
+// unstamped / empty-agentID all pass.
+func TestCollectRecentDecisionsLive_ForeignOwnerSuppressed(t *testing.T) {
+	dir := t.TempDir()
+	cs := writeCoordStateJSON(t, dir,
+		`{"recent_decisions":["their decision — not mine"],"recent_decisions_owner":"aaaa1111"}`)
+	if got := CollectRecentDecisionsLive(cs, "bbbb2222"); got != nil {
+		t.Errorf("foreign-owner live buffer must be suppressed, got %v", got)
+	}
+	// Own stamp passes.
+	if got := CollectRecentDecisionsLive(cs, "aaaa1111"); len(got) != 1 {
+		t.Errorf("own-generation live buffer must pass: %v", got)
+	}
+	// Empty agentID (no generation context) passes.
+	if got := CollectRecentDecisionsLive(cs, ""); len(got) != 1 {
+		t.Errorf("empty agentID must disable the owner guard: %v", got)
+	}
+	// Unstamped buffer (tick-only writes) passes for any reader.
+	cs2 := writeCoordStateJSON(t, dir, `{"recent_decisions":["tick decision"]}`)
+	if got := CollectRecentDecisionsLive(cs2, "bbbb2222"); len(got) != 1 {
+		t.Errorf("unstamped buffer must pass the owner guard: %v", got)
+	}
+}
+
+// End-to-end: a successor coord's manual handoff must NOT lift a
+// predecessor-owned live decisions buffer into ITS Key Decisions.
+func TestEnrichManualDoc_ForeignOwnerDecisions_NotLifted(t *testing.T) {
+	pdir := withFleetHomeSynth(t)
+	now := time.Now().UTC()
+	writeCoordStateJSON(t, filepath.Join(pdir, "myproj"),
+		`{"worker_agent_ids":{},"recent_decisions":["predecessor rationale"],"recent_decisions_owner":"aaaa1111"}`)
+	fakeGH(t, []byte("[]"), nil)
+
+	doc := NewManualStub("deadbeef", "coord-myproj", "myproj", 1, nil, now)
+	EnrichManualDoc(doc, "myproj", "deadbeef", "", nil, nil)
+
+	if strings.Contains(doc.KeyDecisions, "predecessor rationale") {
+		t.Errorf("foreign-owned live decisions leaked into successor's Key Decisions: %q", doc.KeyDecisions)
+	}
+	if doc.KeyDecisions != Placeholder {
+		t.Errorf("expected placeholder (no own decisions), got %q", doc.KeyDecisions)
 	}
 }
 

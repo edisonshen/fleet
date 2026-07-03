@@ -469,7 +469,7 @@ func EnrichManualDoc(doc *Doc, project, agentID, repoDir string, lastHandoffPath
 	// mirrors the CollectActiveSubagentsLive live-overwrite pattern and
 	// closes the "manual handoff before the next tick → blank Key Decisions"
 	// gap. Empty live buffer → keep the checkpoint value (or placeholder).
-	if body := renderCompletionBullets(CollectRecentDecisionsLive(filepath.Join(pdir, "coord-state.json"))); body != "" {
+	if body := renderCompletionBullets(CollectRecentDecisionsLive(filepath.Join(pdir, "coord-state.json"), agentID)); body != "" {
 		doc.KeyDecisions = body
 	}
 
@@ -588,7 +588,7 @@ func EnrichManualDoc(doc *Doc, project, agentID, repoDir string, lastHandoffPath
 	// coord's untracked docs). Same live coord-state source as the decisions
 	// buffer above; best-effort → empty keeps the placeholder. synth.go reads
 	// the same source, so recovery now fills this section too.
-	if sd := CollectSessionDocs(filepath.Join(pdir, "coord-state.json")); sd != "" {
+	if sd := CollectSessionDocs(filepath.Join(pdir, "coord-state.json"), agentID); sd != "" {
 		doc.SessionDocs = sd
 	}
 }
