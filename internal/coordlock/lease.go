@@ -830,6 +830,14 @@ func (l *Lease) heartbeatOnce() (bool, error) {
 	})
 }
 
+// reacquireOwnExpired re-acquires the caller's own expired lease in place at
+// the SAME epoch (DESIGN-coord-lease-false-fence-prevention piece 1).
+// TDD-red stub: implemented in the green commit.
+func (l *Lease) reacquireOwnExpired(prev epochRecord) error {
+	_ = prev
+	return fmt.Errorf("coordlock: reacquireOwnExpired not implemented")
+}
+
 // Release stops the heartbeat, DEMOTES the epoch record to `released`, then
 // closes the flock fd (the kernel also releases the flock on process
 // death). Demoting the record before dropping the flock is what makes any

@@ -1,0 +1,187 @@
+//go:build linux || darwin
+
+package main
+
+// Integration coverage for DESIGN-coord-lease-false-fence-prevention piece 1
+// (task lease-fence-no-rival-rea-5a90, plan test 8): a coordinator whose
+// supervisor's lease renewal STALLED (expired `active` record, no rival)
+// must keep serving — `fleet lease-check` re-acquires the lease in place at
+// the SAME epoch and exits 0, and a real loop.tick() proceeds without any
+// lease-fenced skip. Before this fix the same setup exited 3 and the tick
+// self-killed the coord's tmux session, stranding the project coordless
+// (rainier, 2x in 9h on 2026-07-03/04).
+
+import (
+	"encoding/json"
+	"errors"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"testing"
+
+	"github.com/edisonshen/fleet/internal/coordlock"
+	"github.com/edisonshen/fleet/internal/state"
+)
+
+// epochJSON mirrors coordlock's on-disk epoch record for test-side
+// inspection/mutation. Owner/Candidate stay raw so a rewrite preserves the
+// exact identity bytes; the int64 fields avoid a float64 round-trip that
+// would corrupt ~1e18 monotonic stamps.
+type epochJSON struct {
+	Epoch         int64           `json:"epoch"`
+	State         string          `json:"state"`
+	Owner         json.RawMessage `json:"owner"`
+	Candidate     json.RawMessage `json:"candidate,omitempty"`
+	Host          string          `json:"host"`
+	BootID        string          `json:"boot_id"`
+	RenewedAtMono int64           `json:"renewed_at_mono"`
+	RenewedAtWall int64           `json:"renewed_at_wall"`
+}
+
+func epochPathFor(t *testing.T, fleetHome, project string) string {
+	t.Helper()
+	return filepath.Join(fleetHome, "projects", project, ".locks", "coordinator.epoch")
+}
+
+func readEpochJSON(t *testing.T, path string) epochJSON {
+	t.Helper()
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read epoch: %v", err)
+	}
+	var rec epochJSON
+	if err := json.Unmarshal(b, &rec); err != nil {
+		t.Fatalf("unmarshal epoch: %v", err)
+	}
+	return rec
+}
+
+// staleifyEpoch rewinds renewed_at_mono by 60s (2x the 30s TTL) so the
+// record reads as a stalled renewal, and returns the stale stamp for
+// later "was it refreshed" comparisons.
+func staleifyEpoch(t *testing.T, path string) int64 {
+	t.Helper()
+	rec := readEpochJSON(t, path)
+	rec.RenewedAtMono -= 60 * int64(1e9)
+	b, err := json.Marshal(rec)
+	if err != nil {
+		t.Fatalf("marshal epoch: %v", err)
+	}
+	if err := os.WriteFile(path, b, 0o644); err != nil {
+		t.Fatalf("write stale epoch: %v", err)
+	}
+	return rec.RenewedAtMono
+}
+
+// Plan test 8a: `fleet lease-check` against our OWN expired active lease
+// (no rival) exits 0 and re-acquires in place — same epoch, refreshed
+// renewed_at, state active, owner unchanged.
+func TestLeaseCheck_StalledRenewalReacquiresSameEpoch(t *testing.T) {
+	bin := buildFleetBinary(t)
+	const project = "stall-reacquire"
+	fleetHome := t.TempDir()
+	t.Setenv("FLEET_HOME", fleetHome)
+	t.Setenv("FLEET_LEASE_FAILOVER", "1")
+	if _, err := state.Bootstrap(); err != nil {
+		t.Fatalf("bootstrap: %v", err)
+	}
+	if _, err := state.EnsureProjectInitialized(project); err != nil {
+		t.Fatalf("ensure project: %v", err)
+	}
+
+	// The TEST process is the "supervisor": it owns the lease, and it is an
+	// ancestor of the lease-check subprocess below.
+	lease, acquired, err := coordlock.AcquireLease(project, "stall-sup")
+	if err != nil || !acquired || lease == nil {
+		t.Fatalf("pre-acquire lease failed (acquired=%v err=%v)", acquired, err)
+	}
+	t.Cleanup(lease.Release)
+
+	epochPath := epochPathFor(t, fleetHome, project)
+	before := readEpochJSON(t, epochPath)
+	staleMono := staleifyEpoch(t, epochPath)
+
+	// The supervisor's renewal has "stalled" (no heartbeat started). A
+	// lease-check for the owner pid must RE-ACQUIRE, not fence (exit 3 was
+	// the pre-fix behavior).
+	cmd := exec.Command(bin, "lease-check", "--project", project,
+		"--pid", strconv.Itoa(os.Getpid()))
+	cmd.Env = append(os.Environ(),
+		"FLEET_HOME="+fleetHome,
+		"FLEET_LEASE_FAILOVER=1",
+	)
+	out, runErr := cmd.CombinedOutput()
+	if runErr != nil {
+		var exitErr *exec.ExitError
+		if errors.As(runErr, &exitErr) {
+			t.Fatalf("lease-check must exit 0 (re-acquire in place), got exit %d\noutput:\n%s",
+				exitErr.ExitCode(), out)
+		}
+		t.Fatalf("lease-check: %v\noutput:\n%s", runErr, out)
+	}
+
+	after := readEpochJSON(t, epochPath)
+	if after.Epoch != before.Epoch {
+		t.Errorf("re-acquire must keep the SAME epoch: got %d want %d", after.Epoch, before.Epoch)
+	}
+	if after.State != "active" {
+		t.Errorf("state = %q, want active", after.State)
+	}
+	if after.RenewedAtMono <= staleMono {
+		t.Errorf("renewed_at_mono must be refreshed past the stale stamp: got %d stale %d",
+			after.RenewedAtMono, staleMono)
+	}
+	if string(after.Owner) != string(before.Owner) {
+		t.Errorf("owner identity must be byte-identical: got %s want %s", after.Owner, before.Owner)
+	}
+}
+
+// Plan test 8b: a REAL loop.tick() against a stalled-renewal lease keeps
+// serving — no lease-fenced skip, no self-exit — and the tick's own
+// lease-check leaves a refreshed same-epoch active record behind.
+func TestCoordIntegration_StalledLeaseTickReacquiresAndProceeds(t *testing.T) {
+	env := setupCoordIntegration(t, "stall-tick")
+	env.plantCoord(t)
+	initGitRepo(t, env.repoCwd)
+	env.bindRepo(t)
+
+	t.Setenv("FLEET_LEASE_FAILOVER", "1")
+	lease, acquired, err := coordlock.AcquireLease(env.project, "stall-tick-sup")
+	if err != nil || !acquired || lease == nil {
+		t.Fatalf("pre-acquire lease failed (acquired=%v err=%v)", acquired, err)
+	}
+	t.Cleanup(lease.Release)
+
+	epochPath := epochPathFor(t, env.fleetHome, env.project)
+	before := readEpochJSON(t, epochPath)
+	staleMono := staleifyEpoch(t, epochPath)
+
+	out := env.runTick(t)
+
+	if strings.Contains(out, "lease-fenced") {
+		t.Fatalf("a stalled-renewal tick with no rival must NOT fence: %s", out)
+	}
+	var res struct {
+		Skipped bool   `json:"skipped"`
+		Reason  string `json:"reason"`
+	}
+	if err := json.Unmarshal([]byte(out), &res); err != nil {
+		t.Fatalf("parse tick result: %v\nout=%s", err, out)
+	}
+	if res.Skipped {
+		t.Fatalf("tick must proceed after in-place re-acquire, got skipped reason=%q", res.Reason)
+	}
+
+	after := readEpochJSON(t, epochPath)
+	if after.Epoch != before.Epoch {
+		t.Errorf("re-acquire must keep the SAME epoch: got %d want %d", after.Epoch, before.Epoch)
+	}
+	if after.State != "active" {
+		t.Errorf("state = %q, want active", after.State)
+	}
+	if after.RenewedAtMono <= staleMono {
+		t.Errorf("renewed_at_mono must be refreshed: got %d stale %d", after.RenewedAtMono, staleMono)
+	}
+}
