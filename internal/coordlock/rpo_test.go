@@ -1531,3 +1531,38 @@ func TestHeartbeatAdoptsReacquiredBumpedEpoch(t *testing.T) {
 		t.Fatalf("a rival's higher-epoch record must demote, got ok=%v err=%v", ok, err)
 	}
 }
+
+// codex iter-3 [P1]: the NON-ANCESTOR branch must fence a STALE takeover
+// whose candidate is still ALIVE — a hung candidate can resume its takeover
+// and kill phase, so treating its record as "no live lease" would open a
+// zombie-write window for the old coord's non-descendant child. Shared
+// ownExpiredRival predicate; a dead candidate still proceeds (abandoned).
+func TestLeaseCheckByAncestor_NonAncestorStaleLiveCandidateFences(t *testing.T) {
+	setupHome(t)
+	const project = "rainier"
+	clk := &fakeClock{}
+	live := newFakeLiveness()
+	live.set(800, 6000)                                  // hung-but-ALIVE candidate
+	cfg := leaseCheckCfg(clk, live, map[int]int{700: 1}) // caller not under owner
+	writeEpochRaw(t, project, epochRecord{
+		Epoch: 5, State: stateFencing,
+		Owner:     identity{Pid: 500, PidStart: 9001, AgentID: "old", Project: project},
+		Candidate: identity{Pid: 800, PidStart: 6000, AgentID: "cand", Project: project},
+		BootID:    "test-boot-1", RenewedAtMono: clk.now(),
+	})
+	clk.advance(cfg.ttl + 1) // record stale, candidate still lives
+
+	err := leaseCheckByAncestorWithCfg(project, 700, cfg)
+	if !errors.Is(err, ErrNotLeaseOwner) {
+		t.Fatalf("stale fencing with a LIVE candidate must fence a non-ancestor, got %v", err)
+	}
+	if !strings.Contains(err.Error(), "takeover-fenced") {
+		t.Fatalf("want takeover-fenced tag, got %v", err)
+	}
+
+	// Candidate dies -> abandoned takeover -> non-ancestor proceeds again.
+	live.kill(800)
+	if err := leaseCheckByAncestorWithCfg(project, 700, cfg); err != nil {
+		t.Fatalf("abandoned (dead-candidate) stale fencing must proceed, got %v", err)
+	}
+}

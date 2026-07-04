@@ -549,8 +549,9 @@ func (l *Lease) transientResumable(rec epochRecord) bool {
 // hung past TTL is STILL a rival — transientResumable calls the record stale
 // on gap>TTL alone, but a live candidate can resume and run its kill phase,
 // so only a fencing record with a DEAD candidate is re-acquirable. Shared by
-// the lease-check probe and reacquireOwnExpired's CAS re-read so the two
-// predicates can never drift.
+// the lease-check probe (BOTH branches: own-ancestor re-acquire gate and the
+// non-ancestor takeover fence) and reacquireOwnExpired's CAS re-read so the
+// rival predicates can never drift.
 func (l *Lease) ownExpiredRival(rec epochRecord) bool {
 	return rec.State == stateFencing &&
 		(!l.transientResumable(rec) || l.pidAlive(rec.Candidate))

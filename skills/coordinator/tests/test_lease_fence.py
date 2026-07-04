@@ -351,3 +351,57 @@ def test_prove_helper_unknown_flag_retry_fence_maps_fenced(
     monkeypatch.setattr(loop.subprocess, "run", _skewed)
     got = loop._prove_parent_lease_ownership("fleet", home=fleet_home, fleet_bin="fleet")
     assert got == "fenced"
+
+
+def test_prove_helper_skew_old_active_fence_fails_open(
+    fleet_home: Path, monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """codex iter-3 [P1]: the degraded (old-binary) retry fencing our OWN
+    expired ACTIVE lease (frozen message, rival-free by construction) must
+    fail OPEN ("unknown") — honoring it would idle the coord until the
+    binary upgrade. Any other exit-3 stays fenced."""
+    monkeypatch.setenv("FLEET_LEASE_FAILOVER", "1")
+    old_msg = (
+        "lease-check: REFUSE: coordlock: caller is not under the active "
+        "lease owner (fenced/stale coord) — refuse mutation: our lease is "
+        "no longer active (state=active, possibly self-expired)"
+    )
+
+    def _skewed(cmd, **k):
+        if "--reacquire" in cmd:
+            return _fake_completed(1, "Error: unknown flag: --reacquire")
+        return _fake_completed(3, old_msg)
+
+    monkeypatch.setattr(loop.subprocess, "run", _skewed)
+    got = loop._prove_parent_lease_ownership("fleet", home=fleet_home, fleet_bin="fleet")
+    assert got == "unknown", "old-binary own-expired-ACTIVE fence must fail open"
+    assert "predates --reacquire" in capsys.readouterr().err
+
+    # state=fencing in the old message = possible rival -> stays fenced.
+    fencing_msg = old_msg.replace("state=active", "state=fencing")
+
+    def _skewed2(cmd, **k):
+        if "--reacquire" in cmd:
+            return _fake_completed(1, "Error: unknown flag: --reacquire")
+        return _fake_completed(3, fencing_msg)
+
+    monkeypatch.setattr(loop.subprocess, "run", _skewed2)
+    got = loop._prove_parent_lease_ownership("fleet", home=fleet_home, fleet_bin="fleet")
+    assert got == "fenced", "a possibly-rival old fence must stay fenced"
+
+
+def test_prove_helper_new_binary_exit3_not_treated_as_skew(
+    fleet_home: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A NEW binary's exit-3 (no degrade) maps to fenced even if the message
+    mentions state=active — the fail-open shim applies ONLY after the
+    unknown-flag downgrade."""
+    monkeypatch.setenv("FLEET_LEASE_FAILOVER", "1")
+    monkeypatch.setattr(
+        loop.subprocess, "run",
+        lambda *a, **k: _fake_completed(
+            3, "REFUSE: own-expired-readonly-fenced: state=active possibly self-expired"),
+    )
+    got = loop._prove_parent_lease_ownership("fleet", home=fleet_home, fleet_bin="fleet")
+    assert got == "fenced"

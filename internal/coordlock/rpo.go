@@ -828,9 +828,14 @@ func leaseCheckByAncestorWithCfg(project string, startPid int, cfg leaseConfig) 
 		return fmt.Errorf("%w: %s: active lease owner pid=%d is not an ancestor of pid=%d",
 			ErrNotLeaseOwner, fenceTagDifferentOwner, rec.Owner.Pid, startPid)
 	}
-	if rec.State == stateFencing && !l.transientResumable(rec) {
-		// A fresh, live, in-budget takeover is acquiring -> a new leader is
-		// coming; the non-descendant caller must self-demote.
+	if l.ownExpiredRival(rec) {
+		// A live takeover is acquiring (fresh in-budget record, OR a stale
+		// record whose candidate pid is STILL ALIVE — a hung candidate can
+		// resume and finish its kill phase; codex iter-3 [P1]) -> a new
+		// leader is coming; the non-descendant caller must self-demote.
+		// Shared predicate with the own-ancestor branch so the two can
+		// never drift: only a fencing record with a DEAD candidate reads
+		// as "no live lease in play".
 		return fmt.Errorf("%w: %s: a takeover is in progress (state=fencing) for project %q; pid=%d must self-demote",
 			ErrNotLeaseOwner, fenceTagTakeover, rec.Owner.Project, startPid)
 	}

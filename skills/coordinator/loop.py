@@ -3050,6 +3050,7 @@ def _prove_parent_lease_ownership(
     # diagnostics) stays read-only — a check must never keep a wedged
     # coord's lease fresh as a side effect (codex iter-2 [P1]).
     argv = [bin_path, "lease-check", "--project", project, "--reacquire"]
+    degraded = False
     for attempt in (0, 1):
         try:
             proc = subprocess.run(
@@ -3077,8 +3078,31 @@ def _prove_parent_lease_ownership(
                 # semantics, no renewal) instead of failing open/closed on
                 # a version skew.
                 argv = argv[:-1]
+                degraded = True
                 continue
         break
+    if degraded and proc.returncode == _LEASE_CHECK_NOT_OWNER_EXIT:
+        # codex iter-3 [P1]: the OLD binary fences our OWN expired ACTIVE
+        # lease (its pre-reacquire own-ancestor branch; frozen message
+        # "our lease is no longer active (state=active, possibly
+        # self-expired)"). state=active on the own-ancestor branch means NO
+        # rival (any takeover flips the record to fencing first), i.e. the
+        # exact false-fence this design fixes — and with the kill route
+        # deleted, honoring it would skip EVERY tick until the binary is
+        # upgraded (a permanently idle coord holding coordinator.lock).
+        # Fail OPEN loudly instead: proceed un-renewed, exactly pre-lease
+        # behavior. Any other exit-3 (rival takeover, different owner,
+        # released) still fences.
+        skew_detail = proc.stderr or proc.stdout or ""
+        if "possibly self-expired" in skew_detail and "state=active" in skew_detail:
+            sys.stderr.write(
+                f"[coord] lease-check for {project!r}: installed fleet binary "
+                f"predates --reacquire and fenced our own expired ACTIVE "
+                f"(rival-free) lease; proceeding WITHOUT renewal. Upgrade the "
+                f"fleet binary and run `fleet skills status` to clear this "
+                f"skew.\n"
+            )
+            return "unknown"
     if proc.returncode == 0:
         return "owner"
     if proc.returncode == _LEASE_CHECK_NOT_OWNER_EXIT:
