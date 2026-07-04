@@ -533,6 +533,19 @@ func (l *Lease) transientResumable(rec epochRecord) bool {
 	return !l.pidAlive(rec.Candidate)
 }
 
+// ownExpiredRival reports whether an own-ancestor record shows a LIVE rival
+// takeover on the own-lease-expired branch: state==fencing AND (the record
+// is fresh/in-budget, OR its candidate pid is still alive). A live candidate
+// hung past TTL is STILL a rival — transientResumable calls the record stale
+// on gap>TTL alone, but a live candidate can resume and run its kill phase,
+// so only a fencing record with a DEAD candidate is re-acquirable. Shared by
+// the lease-check probe and reacquireOwnExpired's CAS re-read so the two
+// predicates can never drift.
+func (l *Lease) ownExpiredRival(rec epochRecord) bool {
+	return rec.State == stateFencing &&
+		(!l.transientResumable(rec) || l.pidAlive(rec.Candidate))
+}
+
 // holderHealthy reports whether the recorded holder is a healthy active
 // leader: state==active AND same boot AND within TTL (monotonic) AND
 // pid+pid_start alive. Any failing clause => stealable.
@@ -881,7 +894,7 @@ func (l *Lease) reacquireOwnExpired(prev epochRecord) error {
 			verdict = fmt.Errorf("%w: %s: our lease was released during re-acquire (state=%s); never resurrect",
 				ErrNotLeaseOwner, fenceTagOwnReleased, cur.State)
 			return false, nil
-		case cur.State == stateFencing && (!l.transientResumable(cur) || l.pidAlive(cur.Candidate)):
+		case l.ownExpiredRival(cur):
 			verdict = fmt.Errorf("%w: %s: a takeover rival appeared during re-acquire (candidate pid=%d)",
 				ErrNotLeaseOwner, fenceTagOwnExpiredRival, cur.Candidate.Pid)
 			return false, nil

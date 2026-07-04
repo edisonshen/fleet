@@ -752,7 +752,7 @@ func leaseCheckByAncestorWithCfg(project string, startPid int, cfg leaseConfig) 
 		case rec.State == stateReleased || rec.State == stateFencedNotAcquired:
 			return fmt.Errorf("%w: %s: our lease was deliberately released/escalated (state=%s); never resurrect",
 				ErrNotLeaseOwner, fenceTagOwnReleased, rec.State)
-		case rec.State == stateFencing && (!l.transientResumable(rec) || l.pidAlive(rec.Candidate)):
+		case l.ownExpiredRival(rec):
 			return fmt.Errorf("%w: %s: a takeover rival exists for our expired lease (state=fencing, candidate pid=%d)",
 				ErrNotLeaseOwner, fenceTagOwnExpiredRival, rec.Candidate.Pid)
 		case rec.State == stateActive || rec.State == stateFencing:
