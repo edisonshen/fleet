@@ -381,23 +381,33 @@ def tick(
     # wedge a healthy coord — the coordinator.lock + project-ownership guard
     # remain the defense for those. (A coordinator.lock acquire FAILURE is
     # still never read as "my parent holds it" — that is step 1's job.)
+    # KILL ROUTE DELETED (DESIGN-coord-lease-false-fence-prevention piece 1):
+    # a fence verdict only ever SKIPS the tick — it never tears down the
+    # session. Split-brain safety was always enforced by the fence gating
+    # tick mutations, not by the kill; the kill is what turned FALSE fences
+    # (a stalled supervisor renewal with no rival) into production coord
+    # deaths (rainier, 2x in 9h). The Go lease-check now re-acquires a
+    # rival-free expired lease in place, so a genuine fence here means a
+    # rival exists (or a transient) — either way the right move is: skip,
+    # log loudly, stay alive, re-check next tick. Session teardown of a
+    # genuinely superseded coord belongs to handoff/drain/gc, never here.
     proof = _lease_check_fn(project, home=home, fleet_bin=fleet_bin)
     if proof == "fenced":
         msg = (
             f"[coord] lease fenced: agent {coord_id or '?'} for project "
-            f"{project!r} is no longer under the active coordinator lease "
-            f"owner — a successor took over. Self-demoting (this tick wrote "
-            f"nothing). Run `fleet doctor` if no successor is serving."
+            f"{project!r} is not under the active coordinator lease owner. "
+            f"Skipping this tick (no mutation); the session STAYS ALIVE and "
+            f"re-checks on the next tick. Run `fleet doctor` if this "
+            f"repeats with no successor serving."
         )
         sys.stderr.write(msg + "\n")
         result.errors.append(msg)
         result.skipped = True
-        result.self_exit = True
-        result.reason = "lease-fenced-self-exit"
-        # fleetlog: record the early-exit so log consumers see the gap.
+        result.reason = "lease-fenced"
+        # fleetlog: record the skipped tick so log consumers see the gap.
         _flog(_FLOG_COORD, "coord.tick", "info", proj=project, agent=coord_id,
-              msg=f"coord tick skipped: lease-fenced-self-exit for {project}",
-              data={"skipped": True, "reason": "lease-fenced-self-exit"})
+              msg=f"coord tick skipped: lease-fenced for {project}",
+              data={"skipped": True, "reason": "lease-fenced"})
         return result
 
     # Run the once/day retention prune BEFORE taking the coordinator lock.
@@ -564,26 +574,27 @@ def tick(
     # window from the whole tick to just the lock/resolve steps. A fence now
     # aborts WITHOUT entering the mutation phase; the coord self-demotes.
     if _lease_check_fn(project, home=home, fleet_bin=fleet_bin) == "fenced":
+        # Same kill-route deletion as the step-0.5 fence: skip + stay alive.
         msg = (
             f"[coord] lease fenced after lock acquire: agent {coord_id or '?'} "
-            f"for {project!r} lost the lease before mutating; self-demoting "
-            f"(tick wrote nothing). Run `fleet doctor` if no successor serves."
+            f"for {project!r} lost the lease before mutating. Skipping this "
+            f"tick (wrote nothing); the session STAYS ALIVE and re-checks "
+            f"next tick. Run `fleet doctor` if this repeats."
         )
         sys.stderr.write(msg + "\n")
         result.errors.append(msg)
         result.skipped = True
-        result.self_exit = True
-        result.reason = "lease-fenced-self-exit"
+        result.reason = "lease-fenced"
         try:
             fcntl.flock(lock_fd, fcntl.LOCK_UN)
         finally:
             os.close(lock_fd)
-        # fleetlog: record the early-exit AFTER releasing the lock (see
+        # fleetlog: record the skipped tick AFTER releasing the lock (see
         # _refuse_stale rationale) so a BaseException in the emit cannot leak
         # the lock; consumers still see the post-lock fence rather than a gap.
         _flog(_FLOG_COORD, "coord.tick", "info", proj=project, agent=coord_id,
-              msg=f"coord tick skipped: lease-fenced-self-exit (post-lock) for {project}",
-              data={"skipped": True, "reason": "lease-fenced-self-exit",
+              msg=f"coord tick skipped: lease-fenced (post-lock) for {project}",
+              data={"skipped": True, "reason": "lease-fenced",
                     "phase": "post-lock"})
         return result
     # fleetlog: bracket the mutating phase with coord.tick start/end.

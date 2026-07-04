@@ -830,12 +830,91 @@ func (l *Lease) heartbeatOnce() (bool, error) {
 	})
 }
 
-// reacquireOwnExpired re-acquires the caller's own expired lease in place at
-// the SAME epoch (DESIGN-coord-lease-false-fence-prevention piece 1).
-// TDD-red stub: implemented in the green commit.
+// reacquireOwnExpired re-acquires the caller's own expired lease IN PLACE at
+// the SAME epoch (DESIGN-coord-lease-false-fence-prevention piece 1). It is
+// the lease-check side's answer to a rival-free stall: prev is the probe
+// snapshot leaseCheckByAncestorWithCfg read (owner == the caller's ancestor,
+// state expired `active` or stale `fencing` with a dead candidate).
+//
+// The write is the heartbeatOnce CAS shape — state→active, refresh
+// renewed_at_mono/_wall, owner unchanged, epoch UNCHANGED — under
+// coordinator.epoch.lock via writeEpochLocked. No epoch bump: the incumbent
+// supervisor's heartbeat goroutine self-demotes permanently on an epoch it
+// doesn't recognize (heartbeatOnce), so bumping would convert a transient
+// renewal stall into a guaranteed loss of the in-process heartbeat. No
+// takeOver() machinery: there is no rival to kill and the flock never left
+// the supervisor. Split-brain safety without the bump: a racing candidate's
+// takeOver re-checks holderHealthy inside its own epoch-locked fence closure,
+// which sees this write; both writers serialize on coordinator.epoch.lock.
+//
+// CAS precondition, pinned: under the lock, re-read and require owner + epoch
+// unchanged since the probe AND the record still one of the two re-acquirable
+// shapes. On a failed precondition, branch on WHAT the re-read shows:
+//
+//	fresh `active`, same owner+epoch -> our OWN heartbeat recovered in the
+//	    probe->CAS window -> no write, no fence: proceed (nil).
+//	anything else (rival bumped/flipped it) -> no write: fence verdict for
+//	    what the record now shows. Never a bare-proceed on an expired
+//	    record, never a retry loop (a wrong fence costs one skipped tick).
+//
+// Returns nil => the tick may proceed (re-acquired, or found healthy).
 func (l *Lease) reacquireOwnExpired(prev epochRecord) error {
-	_ = prev
-	return fmt.Errorf("coordlock: reacquireOwnExpired not implemented")
+	var verdict error // nil => proceed; set => the fence verdict to return
+	_, err := l.withEpochLock(func() (bool, error) {
+		cur, rerr := readEpoch(l.paths.epoch)
+		if rerr != nil {
+			return false, rerr
+		}
+		if cur.Epoch != prev.Epoch || !cur.Owner.equal(prev.Owner) {
+			// A rival advanced the lease in the probe->CAS window.
+			verdict = fmt.Errorf("%w: %s: lease moved during re-acquire (epoch %d -> %d, state=%s)",
+				ErrNotLeaseOwner, fenceTagOwnExpiredRival, prev.Epoch, cur.Epoch, cur.State)
+			return false, nil
+		}
+		switch {
+		case cur.State == stateActive && cur.BootID == l.boot &&
+			l.cfg.nowMono()-cur.RenewedAtMono <= int64(l.cfg.ttl):
+			// Our own heartbeat recovered mid-window: the lease is healthy
+			// again. Do not write, do not fence — proceed.
+			return false, nil
+		case cur.State == stateReleased || cur.State == stateFencedNotAcquired:
+			verdict = fmt.Errorf("%w: %s: our lease was released during re-acquire (state=%s); never resurrect",
+				ErrNotLeaseOwner, fenceTagOwnReleased, cur.State)
+			return false, nil
+		case cur.State == stateFencing && (!l.transientResumable(cur) || l.pidAlive(cur.Candidate)):
+			verdict = fmt.Errorf("%w: %s: a takeover rival appeared during re-acquire (candidate pid=%d)",
+				ErrNotLeaseOwner, fenceTagOwnExpiredRival, cur.Candidate.Pid)
+			return false, nil
+		case cur.State != stateActive && cur.State != stateFencing:
+			verdict = fmt.Errorf("%w: %s: unrecognized lease state %q during re-acquire",
+				ErrNotLeaseOwner, fenceTagOwnExpiredRival, cur.State)
+			return false, nil
+		}
+		// Still a re-acquirable shape: same-identity, same-epoch refresh.
+		// Candidate is cleared (the stale-fencing sub-case's dead candidate
+		// must not linger as a phantom rival). Host is PRESERVED: this
+		// process's Lease has host unset (lease-check builds it bare), so
+		// the heartbeatOnce shape's `cur.Host = l.host` would blank it.
+		// BootID re-stamps to OUR boot so the fresh mono stamp is
+		// comparable (a cross-boot expired record re-acquires here too).
+		cur.State = stateActive
+		cur.Candidate = identity{}
+		cur.BootID = l.boot
+		cur.RenewedAtMono = l.cfg.nowMono()
+		cur.RenewedAtWall = time.Now().UnixNano()
+		return true, l.writeEpochLocked(cur)
+	})
+	switch {
+	case errors.Is(err, errSerializerBusy):
+		// A writer held coordinator.epoch.lock for the whole budget — very
+		// likely a rival mid-write. NEVER bare-proceed on an expired record:
+		// fence this tick and re-check next tick.
+		return fmt.Errorf("%w: %s: epoch serializer busy during re-acquire (a writer is mid-flight); skipping this tick",
+			ErrNotLeaseOwner, fenceTagOwnExpiredRival)
+	case err != nil:
+		return fmt.Errorf("coordlock.LeaseCheck: re-acquire own expired lease: %w", err)
+	}
+	return verdict
 }
 
 // Release stops the heartbeat, DEMOTES the epoch record to `released`, then
