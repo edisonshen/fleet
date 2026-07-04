@@ -185,3 +185,108 @@ func TestCoordIntegration_StalledLeaseTickReacquiresAndProceeds(t *testing.T) {
 		t.Errorf("renewed_at_mono must be refreshed: got %d stale %d", after.RenewedAtMono, staleMono)
 	}
 }
+
+// forgeLiveRival rewrites the epoch record as an in-progress takeover:
+// state=fencing with a LIVE candidate. The candidate identity is copied
+// byte-for-byte from Owner (this test process), so pid+pid_start are
+// genuinely alive — ownExpiredRival must read it as a rival.
+func forgeLiveRival(t *testing.T, path string) {
+	t.Helper()
+	rec := readEpochJSON(t, path)
+	rec.State = "fencing"
+	rec.Candidate = rec.Owner
+	b, err := json.Marshal(rec)
+	if err != nil {
+		t.Fatalf("marshal epoch: %v", err)
+	}
+	if err := os.WriteFile(path, b, 0o644); err != nil {
+		t.Fatalf("write rival epoch: %v", err)
+	}
+}
+
+// Reviewer iter-2 (testing specialist), split-brain half of the change:
+// a fencing record with a LIVE candidate must STILL make `fleet
+// lease-check` exit 3 (own-expired-rival-fenced) through the real binary
+// — the no-rival re-acquire must not have opened a bare-proceed hole.
+func TestLeaseCheck_LiveRivalStillFencesExit3(t *testing.T) {
+	bin := buildFleetBinary(t)
+	const project = "rival-fence"
+	fleetHome := t.TempDir()
+	t.Setenv("FLEET_HOME", fleetHome)
+	t.Setenv("FLEET_LEASE_FAILOVER", "1")
+	if _, err := state.Bootstrap(); err != nil {
+		t.Fatalf("bootstrap: %v", err)
+	}
+	if _, err := state.EnsureProjectInitialized(project); err != nil {
+		t.Fatalf("ensure project: %v", err)
+	}
+	lease, acquired, err := coordlock.AcquireLease(project, "rival-sup")
+	if err != nil || !acquired || lease == nil {
+		t.Fatalf("pre-acquire lease failed (acquired=%v err=%v)", acquired, err)
+	}
+	t.Cleanup(lease.Release)
+
+	epochPath := epochPathFor(t, fleetHome, project)
+	forgeLiveRival(t, epochPath)
+
+	cmd := exec.Command(bin, "lease-check", "--project", project,
+		"--pid", strconv.Itoa(os.Getpid()))
+	cmd.Env = append(os.Environ(),
+		"FLEET_HOME="+fleetHome,
+		"FLEET_LEASE_FAILOVER=1",
+	)
+	out, runErr := cmd.CombinedOutput()
+	var exitErr *exec.ExitError
+	if !errors.As(runErr, &exitErr) {
+		t.Fatalf("lease-check with a live rival must exit non-zero, got err=%v\noutput:\n%s", runErr, out)
+	}
+	if exitErr.ExitCode() != 3 {
+		t.Fatalf("lease-check with a live rival must exit 3, got %d\noutput:\n%s",
+			exitErr.ExitCode(), out)
+	}
+	if !strings.Contains(string(out), "own-expired-rival-fenced") {
+		t.Errorf("refusal must carry the own-expired-rival-fenced tag, got:\n%s", out)
+	}
+	if after := readEpochJSON(t, epochPath); after.State != "fencing" {
+		t.Errorf("a fence verdict must not write; state = %q, want fencing", after.State)
+	}
+}
+
+// Reviewer iter-2 (testing specialist): the same live-rival record through
+// a REAL loop.tick() — the tick skips with reason "lease-fenced" (no
+// mutation) and does NOT request session teardown (kill route deleted).
+func TestCoordIntegration_LiveRivalTickSkipsAndStaysAlive(t *testing.T) {
+	env := setupCoordIntegration(t, "rival-tick")
+	env.plantCoord(t)
+	initGitRepo(t, env.repoCwd)
+	env.bindRepo(t)
+
+	t.Setenv("FLEET_LEASE_FAILOVER", "1")
+	lease, acquired, err := coordlock.AcquireLease(env.project, "rival-tick-sup")
+	if err != nil || !acquired || lease == nil {
+		t.Fatalf("pre-acquire lease failed (acquired=%v err=%v)", acquired, err)
+	}
+	t.Cleanup(lease.Release)
+
+	epochPath := epochPathFor(t, env.fleetHome, env.project)
+	forgeLiveRival(t, epochPath)
+
+	out := env.runTick(t)
+
+	var res struct {
+		Skipped bool   `json:"skipped"`
+		Reason  string `json:"reason"`
+	}
+	if err := json.Unmarshal([]byte(out), &res); err != nil {
+		t.Fatalf("parse tick result: %v\nout=%s", err, out)
+	}
+	if !res.Skipped {
+		t.Fatalf("a live-rival tick must skip, got %s", out)
+	}
+	if res.Reason != "lease-fenced" {
+		t.Fatalf("reason = %q, want lease-fenced (skip, stay alive)", res.Reason)
+	}
+	if after := readEpochJSON(t, epochPath); after.State != "fencing" {
+		t.Errorf("the fenced tick must not write; state = %q, want fencing", after.State)
+	}
+}

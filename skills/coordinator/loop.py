@@ -3016,8 +3016,11 @@ def _prove_parent_lease_ownership(
 
       "owner"   — proven owner, OR failover disabled (no lease in play).
                   The tick may mutate.
-      "fenced"  — the Go check returned exit 3: definitively NOT the owner
-                  (a successor took over). The tick MUST abort + self-demote.
+      "fenced"  — the Go check returned exit 3: NOT under the active owner
+                  (a rival takeover is live, or ownership could not be
+                  proven). The tick MUST skip (no mutation) but the session
+                  STAYS ALIVE and re-checks next tick — the fence never
+                  kills (kill route deleted).
       "unknown" — the binary is missing / errored / timed out. Surfaced to
                   stderr but treated as non-fatal: a legacy install or a
                   transient fault must not wedge a healthy coord (the
