@@ -413,9 +413,12 @@ func renderCompletionBullets(completions []string) string {
 //   - otherwise → live emit-on-missing walk for Active Subagents + fresh
 //     `gh` for Open PRs (gh failure → tasks.md → leave the placeholder).
 //
-// Narrative sections (Completed / Key Decisions) stay placeholder in
-// Slice 1. Any panic mid-build is recovered and swallowed — the doc
-// keeps whatever sections were already filled (placeholders at worst).
+// Narrative sections are filled from durable state: Completed from the
+// checkpoint lift, Key Decisions live-preferred from
+// coord-state.json:recent_decisions, Docs (this session) from
+// coord-state.json:session_docs. Any panic mid-build is recovered and
+// swallowed — the doc keeps whatever sections were already filled
+// (placeholders at worst).
 func EnrichManualDoc(doc *Doc, project, agentID, repoDir string, lastHandoffPath *string, logw func(string)) {
 	// Best-effort guard: a panic anywhere in enrichment must not fail
 	// the handoff. Leave the doc with whatever it had (placeholders).
@@ -457,6 +460,17 @@ func EnrichManualDoc(doc *Doc, project, agentID, repoDir string, lastHandoffPath
 	// live data wins for machine state on a manual (live-coord) handoff.
 	if cpOK {
 		applyCheckpointToDoc(doc, cp)
+	}
+
+	// KEY DECISIONS — LIVE-PREFERRED. `fleet checkpoint decision` writes
+	// coord-state.json:recent_decisions out-of-band (no tick), so the
+	// tick-published checkpoint the lift above used can lag a just-logged
+	// agent rationale. Read the buffer LIVE and let it WIN when present —
+	// mirrors the CollectActiveSubagentsLive live-overwrite pattern and
+	// closes the "manual handoff before the next tick → blank Key Decisions"
+	// gap. Empty live buffer → keep the checkpoint value (or placeholder).
+	if body := renderCompletionBullets(CollectRecentDecisionsLive(filepath.Join(pdir, "coord-state.json"), agentID)); body != "" {
+		doc.KeyDecisions = body
 	}
 
 	// ACTIVE SUBAGENTS — LIVE-FIRST (overwrites the checkpoint baseline).
@@ -556,12 +570,11 @@ func EnrichManualDoc(doc *Doc, project, agentID, repoDir string, lastHandoffPath
 		// placeholder if no checkpoint).
 	}
 
-	// NARRATIVE (Slice 2): Next Steps + Open Questions come LIVE from
-	// tasks.md (always fresh, fill even when the coord died before its
-	// first checkpoint). Both never-error: parse drift / missing file →
-	// empty → keep the placeholder. Completed is set above by the
-	// checkpoint lift (applyCheckpointToDoc); Key Decisions + Files
-	// Modified stay placeholder (deferred — no durable producer).
+	// NARRATIVE: Next Steps + Open Questions come LIVE from tasks.md (always
+	// fresh, fill even when the coord died before its first checkpoint). Both
+	// never-error: parse drift / missing file → empty → keep the placeholder.
+	// Completed is set above by the checkpoint lift (applyCheckpointToDoc);
+	// Key Decisions is set live above.
 	tasksPath := filepath.Join(pdir, "tasks.md")
 	if ns := CollectNextSteps(tasksPath); ns != "" {
 		doc.NextSteps = ns
@@ -569,12 +582,14 @@ func EnrichManualDoc(doc *Doc, project, agentID, repoDir string, lastHandoffPath
 	if oq := CollectOpenQuestions(tasksPath); oq != "" {
 		doc.OpenQuestions = oq
 	}
-	// Files Modified (Slice 3) is MANUAL-path only: repoDir is the
-	// handed-off coord's checkout, already resolved by the caller (do NOT
-	// re-resolve). Best-effort -- non-git / empty -> keep the placeholder.
-	// synth.go stays placeholder there (subprocess-free; Open PRs precedent).
-	if fm := CollectFilesModified(repoDir); fm != "" {
-		doc.FilesModified = fm
+	// Docs (this session): the plan docs THIS coord recorded via
+	// `fleet checkpoint doc`, read from coord-state.json:session_docs (NOT a
+	// git shell-out — the retired CollectFilesModified dumped every past
+	// coord's untracked docs). Same live coord-state source as the decisions
+	// buffer above; best-effort → empty keeps the placeholder. synth.go reads
+	// the same source, so recovery now fills this section too.
+	if sd := CollectSessionDocs(filepath.Join(pdir, "coord-state.json"), agentID); sd != "" {
+		doc.SessionDocs = sd
 	}
 }
 

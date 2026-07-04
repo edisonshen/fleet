@@ -72,11 +72,13 @@ agent inheriting the same task/project, sends "/exit" to the outgoing
 tmux session, waits a grace period, then kills the old session and
 archives its record.
 
-Week 4a (operator-triggered): the doc body is a stub with placeholders
-in all five sections — the agent never received a HANDOFF REQUESTED
-injection so we can't fill its view of the work. Once the old session
-is killed, fleet auto-types a "Read your handoff doc at <path> and
-continue" prompt into the new session so the replacement starts
+For a coord handoff the doc body is enriched from durable on-disk
+state (coord-state.json, coord-checkpoint.md, tasks.md, gh): Completed,
+Key Decisions, Docs (this session), Open Questions, Next Steps, Active
+Subagents, and Open PRs all fill without a round-trip to the (possibly
+dead) agent; sections with no data keep their placeholder. Once the old
+session is killed, fleet auto-types a "Read your handoff doc at <path>
+and continue" prompt into the new session so the replacement starts
 working without operator intervention; ` + "`fleet attach`" + ` shows
 the result.
 
@@ -806,14 +808,16 @@ func runHandoff(opts *handoffOpts, stdout, stderr io.Writer) error {
 		oldRec.ID, oldRec.TaskID, oldRec.Project,
 		oldRec.HandoffNumber, oldRec.LastHandoffPath, now,
 	)
-	// Fill the machine-state sections (Active Subagents + Open PRs) from
-	// on-disk state + `gh` so the successor coord resumes immediately
-	// instead of rediscovering all in-flight work by hand. Best-effort:
-	// any failure (panic, gh down, non-git, parse error) leaves the
-	// section's placeholder and the handoff still succeeds — enrichment
-	// NEVER fails a handoff. agentID = oldRec.ID drives the checkpoint
-	// generation guard; lastHandoffPath threads through nil→"".
-	// Narrative (Completed / Key Decisions) stays placeholder (Slice 2).
+	// Fill the doc from durable on-disk state so the successor coord
+	// resumes immediately instead of rediscovering all in-flight work by
+	// hand: Active Subagents + Open PRs (coord-state.json + `gh`),
+	// Completed (checkpoint buffer), Key Decisions + Docs (this session)
+	// (live coord-state.json recent_decisions / session_docs), Next Steps
+	// + Open Questions (tasks.md). Best-effort: any failure (panic, gh
+	// down, parse error) leaves the section's placeholder and the handoff
+	// still succeeds — enrichment NEVER fails a handoff. agentID =
+	// oldRec.ID drives the checkpoint generation guard; lastHandoffPath
+	// threads through nil→"".
 	//
 	// COORD ONLY: Active Subagents + Open PRs are coord-owned project
 	// state. A worker handoff has none, and enriching a worker's doc

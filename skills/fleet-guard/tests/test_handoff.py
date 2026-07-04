@@ -199,7 +199,7 @@ EXPECTED_GOLDEN = (
     b"## Key Decisions\n"
     b"_(operator-triggered handoff \xe2\x80\x94 fill in before resuming)_\n"
     b"\n"
-    b"## Files Modified\n"
+    b"## Docs (this session)\n"
     b"_(operator-triggered handoff \xe2\x80\x94 fill in before resuming)_\n"
     b"\n"
     b"## Open Questions\n"

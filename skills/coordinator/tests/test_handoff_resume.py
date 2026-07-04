@@ -115,7 +115,7 @@ def _seed_handoff(
         "## First Action (auto)\nfoo\n\n"
         "## Completed\nx\n\n"
         "## Key Decisions\nx\n\n"
-        "## Files Modified\nx\n\n"
+        "## Docs (this session)\nx\n\n"
         "## Open Questions\nx\n\n"
         "## Next Steps (prioritized)\nx\n\n"
         f"## Active Subagents\n{body_subagents}\n\n"

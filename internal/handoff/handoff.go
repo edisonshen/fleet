@@ -5,12 +5,14 @@
 // frontmatter with chain fields (agent_id, task_id, project,
 // previous_handoff, handoff_number, timestamp, handoff_type,
 // context_pct_at_handoff) followed by five sections (Completed, Key
-// Decisions, Files Modified, Open Questions, Next Steps).
+// Decisions, Docs (this session), Open Questions, Next Steps).
 //
-// Week 4a writes operator-triggered stubs via NewManualStub — the
-// agent never got a HANDOFF REQUESTED injection, so the body sections
-// are placeholders the operator (or fresh agent) fills in. Week 4b/c
-// will build Docs with real bodies from skill-side context.
+// NewManualStub writes operator-triggered stubs — the agent never got a
+// HANDOFF REQUESTED injection, so the body sections start as placeholders.
+// The enrich (manual) and synth (recovery) paths then fill them from durable
+// on-disk state: Completed + Key Decisions from the coord checkpoint /
+// coord-state buffers, Docs (this session) from coord-state.json:session_docs,
+// Next Steps + Open Questions live from tasks.md.
 package handoff
 
 import (
@@ -83,7 +85,7 @@ type Doc struct {
 
 	Completed       string
 	KeyDecisions    string
-	FilesModified   string
+	SessionDocs     string
 	OpenQuestions   string
 	NextSteps       string
 	ActiveSubagents []ActiveSubagent
@@ -181,7 +183,7 @@ func NewManualStub(agentID, taskID, project string, number int, prev *string, ts
 		Timestamp:     ts.UTC(),
 		Completed:     Placeholder,
 		KeyDecisions:  Placeholder,
-		FilesModified: Placeholder,
+		SessionDocs:   Placeholder,
 		OpenQuestions: Placeholder,
 		NextSteps:     Placeholder,
 	}
@@ -255,7 +257,7 @@ func FirstAction(project string) string {
 //  1. ## First Action (auto)        — fixed FirstAction string
 //  2. ## Completed                  — Doc.Completed
 //  3. ## Key Decisions              — Doc.KeyDecisions
-//  4. ## Files Modified             — Doc.FilesModified
+//  4. ## Docs (this session)        — Doc.SessionDocs
 //  5. ## Open Questions             — Doc.OpenQuestions
 //  6. ## Next Steps (prioritized)   — Doc.NextSteps
 //  7. ## Active Subagents           — Doc.ActiveSubagents (issue #93 Phase B2)
@@ -288,7 +290,7 @@ func Render(d *Doc) []byte {
 	fmt.Fprintf(&b, "## First Action (auto)\n%s\n\n", FirstAction(d.Project))
 	fmt.Fprintf(&b, "## Completed\n%s\n\n", d.Completed)
 	fmt.Fprintf(&b, "## Key Decisions\n%s\n\n", d.KeyDecisions)
-	fmt.Fprintf(&b, "## Files Modified\n%s\n\n", d.FilesModified)
+	fmt.Fprintf(&b, "## Docs (this session)\n%s\n\n", d.SessionDocs)
 	fmt.Fprintf(&b, "## Open Questions\n%s\n\n", d.OpenQuestions)
 	fmt.Fprintf(&b, "## Next Steps (prioritized)\n%s\n\n", d.NextSteps)
 	fmt.Fprintf(&b, "## Active Subagents\n%s\n\n", renderActiveSubagents(d.ActiveSubagents))

@@ -1631,10 +1631,12 @@ def record_checkpoint_completion(state: dict, line: str) -> None:
     in place.
 
     Clone of record_checkpoint_decision: same cap / flatten / tolerance
-    discipline. Unlike the decisions buffer (which has no production
-    caller and renders dead), THIS buffer is wired in loop.py to two TRUE
-    completion deltas — the reconcile done-transition and the PR-merged
-    flip. dispatch / worker_failed are deliberately EXCLUDED: a start or
+    discipline. Both buffers render in the handoff doc: recent_decisions
+    → "Key Decisions" (fed by loop.py's tick auto-producer AND the agent's
+    out-of-band `fleet checkpoint decision`; the Go CLI is a second
+    writer), recent_completions → "Completed". THIS buffer is wired in
+    loop.py to two TRUE completion deltas — the reconcile done-transition
+    and the PR-merged flip. dispatch / worker_failed are EXCLUDED: a start or
     a requeue is not a completion (it would tell the successor that
     in-flight/failed work is done). See DESIGN-handoff-manual-doc-
     enrichment.md Slice 2 (a).

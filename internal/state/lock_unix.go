@@ -184,6 +184,26 @@ func LockAgent(id string) (func(), error) {
 	return acquireFlock(AgentLockPath, id, agentLockTimeout)
 }
 
+// LockCoordinatorTimeout takes an exclusive flock on
+// ~/.fleet/projects/<project>/.locks/coordinator.lock — the SAME
+// cross-process lock the coordinator skill's tick() and register_subagent.py
+// take around every coord-state.json mutation. `fleet checkpoint`
+// (session_docs / recent_decisions RMW) takes it so a provenance write can't
+// race a concurrent tick heartbeat and lose a sibling key.
+//
+// A non-positive timeout means "single LOCK_NB attempt" (fail-fast). The
+// checkpoint CLI passes a short bounded timeout so a coord mid-tick (holding
+// the lock for its whole pass) surfaces as a timeout the agent can retry,
+// rather than blocking its turn. On timeout the error wraps ErrLockTimeout
+// and names the stale holder PID stamped in the lock body.
+func LockCoordinatorTimeout(project string, timeout time.Duration) (func(), error) {
+	path, err := CoordinatorLockPath(project)
+	if err != nil {
+		return nil, err
+	}
+	return acquireBoundedAt(path, timeout)
+}
+
 // acquireFlock is the shared body for the per-scope lock helpers.
 // Takes a path-builder function so each helper can resolve its own
 // canonical lock path while sharing the open + Flock + close-on-release
