@@ -572,7 +572,8 @@ def tick(
     # Go GuardWithLease boundary, so re-proving ownership here — after the lock
     # is held, immediately before _tick_locked — narrows the zombie-write
     # window from the whole tick to just the lock/resolve steps. A fence now
-    # aborts WITHOUT entering the mutation phase; the coord self-demotes.
+    # aborts WITHOUT entering the mutation phase; the coord skips the tick
+    # and stays alive (kill route deleted — it re-checks next tick).
     if _lease_check_fn(project, home=home, fleet_bin=fleet_bin) == "fenced":
         # Same kill-route deletion as the step-0.5 fence: skip + stay alive.
         msg = (

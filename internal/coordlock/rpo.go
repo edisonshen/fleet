@@ -660,8 +660,10 @@ const (
 //	  └─ a record exists; walk startPid's ancestors:
 //	        ├─ an ancestor IS the recorded owner (pid+pid_start match)
 //	        │     ├─ record active AND NOT self-expired -> PROCEED (live leader)
-//	        │     └─ else (fencing / released / expired) -> FENCE: our own
-//	        │        lease was taken / lapsed -> self-demote.
+//	        │     ├─ released / rival takeover -> FENCE (a verdict that only
+//	        │     │  SKIPS the tick; loop.py re-checks next tick — no kill).
+//	        │     └─ expired with NO rival -> RE-ACQUIRE in place at the
+//	        │        SAME epoch and PROCEED (see the own-expired branch).
 //	        └─ NO ancestor is the recorded owner
 //	              ├─ a DIFFERENT owner is healthy+active -> FENCE (a live
 //	              │  successor holds the lease; we are the zombie).
