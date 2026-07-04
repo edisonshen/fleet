@@ -1333,3 +1333,77 @@ func TestLeaseCheckByAncestor_CrossBootExpiredReacquires(t *testing.T) {
 		t.Errorf("owner must be unchanged, got %+v", rec.Owner)
 	}
 }
+
+// Reviewer iter-3 (adversarial F5): the recorded owner DIES in the
+// probe->CAS window. The re-acquire must NOT publish a fresh `active`
+// record for a corpse (holderHealthy readers + the STONITH live-leader
+// gate would report a dead leader for up to TTL) — fence, no write.
+func TestLeaseCheckByAncestor_ReacquireOwnerDiedMidCASFences(t *testing.T) {
+	setupHome(t)
+	const project = "rainier"
+	clk := &fakeClock{}
+	live := newFakeLiveness()
+	owner := identity{Pid: 500, PidStart: 9001, AgentID: "coord", Project: project}
+	live.set(owner.Pid, owner.PidStart)
+	cfg := leaseCheckCfg(clk, live, map[int]int{510: 500, 500: 1})
+	paths, err := resolvePaths(project)
+	if err != nil {
+		t.Fatalf("resolvePaths: %v", err)
+	}
+	l := &Lease{cfg: cfg, paths: paths, boot: cfg.boot()}
+
+	prev := epochRecord{ // probe snapshot: expired active, owner alive
+		Epoch: 4, State: stateActive, Owner: owner,
+		BootID: "test-boot-1", RenewedAtMono: clk.now(),
+	}
+	clk.advance(cfg.ttl + 1)
+	stale := prev
+	writeEpochRaw(t, project, stale)
+	live.kill(owner.Pid) // supervisor dies between probe and CAS
+
+	verr := l.reacquireOwnExpired(prev)
+	if !errors.Is(verr, ErrNotLeaseOwner) {
+		t.Fatalf("a dead owner must never be resurrected fresh-active, got %v", verr)
+	}
+	if !strings.Contains(verr.Error(), "own-expired-rival-fenced") {
+		t.Fatalf("want conservative own-expired-rival-fenced tag, got %v", verr)
+	}
+	if got := readEpochFor(t, project); got != stale {
+		t.Fatalf("no write may land for a dead owner, got %+v", got)
+	}
+}
+
+// Reviewer iter-3 (adversarial F6): a malformed fencing record with a ZERO
+// candidate is NOT a rival (no provable takeover), and that verdict must
+// come from the pidAlive clause — never from the self-equal short-circuit
+// accidentally matching the lease-check probe's zero self identity.
+func TestOwnExpiredRival_ZeroCandidateIsNotARival(t *testing.T) {
+	setupHome(t)
+	clk := &fakeClock{}
+	live := newFakeLiveness()
+	cfg := leaseCheckCfg(clk, live, map[int]int{})
+	paths, err := resolvePaths("rainier")
+	if err != nil {
+		t.Fatalf("resolvePaths: %v", err)
+	}
+	// Zero self — exactly the shape leaseCheckByAncestorWithCfg builds.
+	l := &Lease{cfg: cfg, paths: paths, boot: cfg.boot()}
+	rec := epochRecord{
+		Epoch: 5, State: stateFencing, // fresh, in budget, candidate zero
+		Owner:  identity{Pid: 500, PidStart: 9001, AgentID: "coord", Project: "rainier"},
+		BootID: "test-boot-1", RenewedAtMono: clk.now(),
+	}
+	if l.ownExpiredRival(rec) {
+		t.Fatal("a zero-candidate fencing record has no provable rival; must be re-acquirable")
+	}
+	// And the guarded short-circuit must still fire for a REAL self match:
+	// a candidate retrying its own fresh takeover reads it as resumable.
+	cand := identity{Pid: 800, PidStart: 6000, AgentID: "cand", Project: "rainier"}
+	live.set(cand.Pid, cand.PidStart)
+	lc := &Lease{cfg: cfg, paths: paths, self: cand, boot: cfg.boot()}
+	own := rec
+	own.Candidate = cand
+	if !lc.transientResumable(own) {
+		t.Fatal("a candidate's own fresh fencing record must stay resumable (self short-circuit)")
+	}
+}

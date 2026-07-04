@@ -519,8 +519,12 @@ func (l *Lease) transientResumable(rec epochRecord) bool {
 	// is the retry after a serializer-busy release in casFencingToActive
 	// (we released the flock + are retrying our own takeover). Without this
 	// a candidate would stand down on its own fresh record (live candidate
-	// = self) and leave NO active leader until TTL.
-	if rec.Candidate.equal(l.self) {
+	// = self) and leave NO active leader until TTL. Guarded on a REAL self:
+	// the lease-check probe builds its Lease with a zero self identity, and
+	// a zero Candidate (malformed record) must not silently match it — the
+	// zero-candidate case falls through to the pidAlive clause below, which
+	// reads Pid<=0 as dead (same verdict, honest path).
+	if l.self.Pid > 0 && rec.Candidate.equal(l.self) {
 		return true
 	}
 	if rec.BootID != l.boot {
@@ -901,6 +905,16 @@ func (l *Lease) reacquireOwnExpired(prev epochRecord) error {
 		case cur.State != stateActive && cur.State != stateFencing:
 			verdict = fmt.Errorf("%w: %s: unrecognized lease state %q during re-acquire",
 				ErrNotLeaseOwner, fenceTagOwnExpiredRival, cur.State)
+			return false, nil
+		case !l.pidAlive(cur.Owner):
+			// The owner supervisor died in the probe->CAS window. Publishing
+			// a fresh `active` record for a corpse would make holderHealthy
+			// readers (LeaderPresent, the STONITH never-shoot-the-live-leader
+			// gate) report a dead leader for up to TTL. Fence: skip this
+			// tick; the next probe sees ancestorIsOwner=false and routes to
+			// the takeover path.
+			verdict = fmt.Errorf("%w: %s: recorded owner pid=%d died during re-acquire; not resurrecting a dead owner's lease",
+				ErrNotLeaseOwner, fenceTagOwnExpiredRival, cur.Owner.Pid)
 			return false, nil
 		}
 		// Still a re-acquirable shape: same-identity, same-epoch refresh.
