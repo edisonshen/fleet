@@ -1407,3 +1407,68 @@ func TestOwnExpiredRival_ZeroCandidateIsNotARival(t *testing.T) {
 		t.Fatal("a candidate's own fresh fencing record must stay resumable (self short-circuit)")
 	}
 }
+
+// codex iter-1 [P1]: after the STALE-FENCING re-acquire (dead candidate,
+// epoch already bumped E->E+1 by the candidate's fence), the incumbent
+// supervisor's next heartbeat must ADOPT the bumped epoch and keep
+// renewing — not self-demote onto tick-time CPR. Rollback protection
+// stays: a lower epoch or a foreign owner still demotes.
+func TestHeartbeatAdoptsReacquiredBumpedEpoch(t *testing.T) {
+	setupHome(t)
+	const project = "rainier"
+	clk := &fakeClock{}
+	live := newFakeLiveness()
+	owner := identity{Pid: 500, PidStart: 9001, AgentID: "coord", Project: project}
+	live.set(owner.Pid, owner.PidStart)
+	cfg := leaseCheckCfg(clk, live, map[int]int{510: 500, 500: 1})
+	// Candidate 800 fenced to epoch 5, then died; record went stale.
+	writeEpochRaw(t, project, epochRecord{
+		Epoch: 5, State: stateFencing, Owner: owner,
+		Candidate: identity{Pid: 800, PidStart: 6000, AgentID: "cand", Project: project},
+		BootID:    "test-boot-1", RenewedAtMono: clk.now(),
+	})
+	clk.advance(cfg.ttl + 1)
+	if err := leaseCheckByAncestorWithCfg(project, 510, cfg); err != nil {
+		t.Fatalf("stale-fencing re-acquire failed: %v", err)
+	}
+	paths, err := resolvePaths(project)
+	if err != nil {
+		t.Fatalf("resolvePaths: %v", err)
+	}
+	// The incumbent supervisor still believes epoch 4 (pre-fence).
+	sup := &Lease{cfg: cfg, paths: paths, self: owner, host: "sup-host", boot: cfg.boot(), epoch: 4}
+	clk.advance(1)
+	ok, err := sup.heartbeatOnce()
+	if err != nil {
+		t.Fatalf("heartbeatOnce after bumped-epoch re-acquire: %v", err)
+	}
+	if !ok {
+		t.Fatal("heartbeat must ADOPT the re-acquired bumped epoch, not self-demote")
+	}
+	if sup.epoch != 5 {
+		t.Errorf("in-memory epoch must resync to the record, got %d want 5", sup.epoch)
+	}
+	if rec := readEpochFor(t, project); rec.RenewedAtMono != clk.now() || rec.Epoch != 5 {
+		t.Errorf("adopted beat must renew at epoch 5: got renewed=%d epoch=%d", rec.RenewedAtMono, rec.Epoch)
+	}
+
+	// Rollback protection intact: a LOWER on-disk epoch must still demote.
+	writeEpochRaw(t, project, epochRecord{
+		Epoch: 3, State: stateActive, Owner: owner,
+		BootID: "test-boot-1", RenewedAtMono: clk.now(),
+	})
+	if ok, err := sup.heartbeatOnce(); err != nil || ok {
+		t.Fatalf("a lower epoch must demote (never roll forward onto it), got ok=%v err=%v", ok, err)
+	}
+
+	// Foreign-owner protection intact: a completed rival takeover (active,
+	// RIVAL owner, higher epoch) must still demote.
+	writeEpochRaw(t, project, epochRecord{
+		Epoch: 9, State: stateActive,
+		Owner:  identity{Pid: 800, PidStart: 6000, AgentID: "cand", Project: project},
+		BootID: "test-boot-1", RenewedAtMono: clk.now(),
+	})
+	if ok, err := sup.heartbeatOnce(); err != nil || ok {
+		t.Fatalf("a rival's higher-epoch record must demote, got ok=%v err=%v", ok, err)
+	}
+}

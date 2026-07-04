@@ -834,9 +834,27 @@ func (l *Lease) heartbeatOnce() (bool, error) {
 		if err != nil {
 			return false, err
 		}
-		// Write ONLY if still exactly ours.
-		if cur.State != stateActive || cur.Epoch != l.epoch || !cur.Owner.equal(l.self) {
+		// Write ONLY if still ours.
+		if cur.State != stateActive || !cur.Owner.equal(l.self) {
 			return false, nil // fenced / not ours -> self-demote, do NOT write
+		}
+		switch {
+		case cur.Epoch == l.epoch:
+			// Normal renew.
+		case cur.Epoch > l.epoch && cur.BootID == l.boot:
+			// ADOPT the higher epoch (codex iter-1 [P1]): an in-place
+			// re-acquire (reacquireOwnExpired, stale-fencing sub-case)
+			// republished OUR lease at the dead candidate's bumped epoch.
+			// That is the ONLY writer that produces active+our-owner at a
+			// higher epoch — a completed rival takeover writes the RIVAL's
+			// owner identity, and an in-progress one is state=fencing (both
+			// demote above/below). Demoting here would strand the
+			// re-acquired lease on tick-time CPR renewals and hand a
+			// healthy coord to the next takeover. Rollback protection is
+			// untouched: a LOWER epoch still demotes.
+			l.epoch = cur.Epoch
+		default:
+			return false, nil // epoch rolled back / moved unrecognizably
 		}
 		// Update ONLY renewed_at; never the epoch, never from cached state.
 		cur.RenewedAtMono = l.cfg.nowMono()
