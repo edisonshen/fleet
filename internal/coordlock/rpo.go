@@ -638,10 +638,11 @@ var ErrNotLeaseOwner = errors.New(
 // ever SKIPS a tick — no fence path kills a session (kill route deleted).
 // The no-rival re-acquire path is a non-error and carries no tag.
 const (
-	fenceTagOwnExpiredRival = "own-expired-rival-fenced"
-	fenceTagOwnReleased     = "own-released-fenced"
-	fenceTagDifferentOwner  = "different-owner-fenced"
-	fenceTagTakeover        = "takeover-fenced"
+	fenceTagOwnExpiredRival    = "own-expired-rival-fenced"
+	fenceTagOwnExpiredReadOnly = "own-expired-readonly-fenced"
+	fenceTagOwnReleased        = "own-released-fenced"
+	fenceTagDifferentOwner     = "different-owner-fenced"
+	fenceTagTakeover           = "takeover-fenced"
 )
 
 // LeaseCheckByAncestor decides whether the calling process (startPid,
@@ -673,8 +674,27 @@ const (
 //	                    spawned after the old coord retired).
 //
 // The walk is bounded so an unexpected ppid cycle / deep tree can't spin.
+//
+// LeaseCheckByAncestor is READ-ONLY: an own-expired no-rival lease FENCES
+// (own-expired-readonly-fenced) instead of renewing. Non-tick callers
+// (fleet-guard's per-turn producer fence, diagnostics) must never renew the
+// lease as a side effect of a check — a wedged coord whose claude engine
+// still produces turns would otherwise keep its lease fresh forever and
+// block a standby takeover (codex iter-2 [P1]). The coordinator tick uses
+// LeaseCheckByAncestorReacquire.
 func LeaseCheckByAncestor(project string, startPid int) error {
 	return leaseCheckByAncestorWithCfg(project, startPid, defaultLeaseConfig())
+}
+
+// LeaseCheckByAncestorReacquire is the coordinator tick's opt-in variant
+// (DESIGN-coord-lease-false-fence-prevention piece 1): identical proof, but
+// an own-expired lease with NO rival is RE-ACQUIRED in place at the same
+// epoch (zero downtime) instead of fenced. Only the tick may take this
+// path — it is the coord's liveness signal, so renewing here is truthful.
+func LeaseCheckByAncestorReacquire(project string, startPid int) error {
+	cfg := defaultLeaseConfig()
+	cfg.reacquire = true
+	return leaseCheckByAncestorWithCfg(project, startPid, cfg)
 }
 
 // leaseCheckByAncestorWithCfg is the seam-injected core so tests drive a
@@ -744,9 +764,18 @@ func leaseCheckByAncestorWithCfg(project string, startPid int, cfg leaseConfig) 
 		//	  ├─ fencing, fresh OR live candidate -> FENCE own-expired-rival-
 		//	  │    fenced (a live candidate hung past TTL can still resume
 		//	  │     its takeover + kill phase — still a rival)
-		//	  └─ expired active / stale fencing with DEAD candidate
-		//	       -> RE-ACQUIRE in place, SAME epoch (zero downtime); the
-		//	          verdict is nil and the tick proceeds.
+		//	  ├─ record from a PREVIOUS boot -> FENCE (pid_start is only
+		//	  │    comparable within a boot, so the ancestor match above is
+		//	  │    unprovable — a recycled pid could coincidentally match;
+		//	  │    codex iter-2 [P2]. Await a real takeover.)
+		//	  ├─ read-only probe (no cfg.reacquire) -> FENCE own-expired-
+		//	  │    readonly-fenced. Only the coord tick's opt-in path may
+		//	  │    renew (codex iter-2 [P1]): fleet-guard's per-turn producer
+		//	  │    fence must never keep a wedged coord's lease fresh and
+		//	  │    block a standby takeover.
+		//	  └─ expired active / stale fencing with DEAD candidate, same
+		//	       boot, reacquire path -> RE-ACQUIRE in place, SAME epoch
+		//	       (zero downtime); the verdict is nil and the tick proceeds.
 		//
 		// Every fence verdict here only SKIPS the tick — loop.py no longer
 		// kills the session on a fence; it re-checks on the next tick.
@@ -757,15 +786,26 @@ func leaseCheckByAncestorWithCfg(project string, startPid int, cfg leaseConfig) 
 		case l.ownExpiredRival(rec):
 			return fmt.Errorf("%w: %s: a takeover rival exists for our expired lease (state=fencing, candidate pid=%d)",
 				ErrNotLeaseOwner, fenceTagOwnExpiredRival, rec.Candidate.Pid)
-		case rec.State == stateActive || rec.State == stateFencing:
-			// No rival: pure renewal stall (expired active) or an abandoned
-			// takeover (stale fencing, dead candidate). Re-acquire in place.
-			return l.reacquireOwnExpired(rec)
-		default:
+		case rec.State != stateActive && rec.State != stateFencing:
 			// Unrecognized state string: fence conservatively (skip one
 			// tick, re-check next) rather than guess at a write.
 			return fmt.Errorf("%w: %s: unrecognized lease state %q for our expired lease",
 				ErrNotLeaseOwner, fenceTagOwnExpiredRival, rec.State)
+		case rec.BootID != l.boot:
+			// Cross-boot record: the pid+pid_start ancestor match is not a
+			// valid ownership proof across boots — never re-acquire it.
+			return fmt.Errorf("%w: %s: lease record is from a previous boot (%q); pid identity unprovable across boots — awaiting takeover",
+				ErrNotLeaseOwner, fenceTagOwnExpiredRival, rec.BootID)
+		case !cfg.reacquire:
+			// Read-only probe (fleet-guard producer fence, diagnostics):
+			// report the expiry without renewing. The coord tick re-acquires
+			// on its next `lease-check --reacquire`; this caller just skips.
+			return fmt.Errorf("%w: %s: our lease is expired (state=%s) and this is a read-only probe; not renewing",
+				ErrNotLeaseOwner, fenceTagOwnExpiredReadOnly, rec.State)
+		default:
+			// No rival: pure renewal stall (expired active) or an abandoned
+			// takeover (stale fencing, dead candidate). Re-acquire in place.
+			return l.reacquireOwnExpired(rec)
 		}
 	}
 

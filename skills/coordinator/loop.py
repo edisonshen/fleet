@@ -3044,24 +3044,41 @@ def _prove_parent_lease_ownership(
         bin_path = os.environ.get("FLEET_BIN", "") or "fleet"
     env = dict(os.environ)
     env["FLEET_HOME"] = str(home)
-    try:
-        proc = subprocess.run(
-            [bin_path, "lease-check", "--project", project],
-            capture_output=True, text=True,
-            timeout=_LEASE_CHECK_TIMEOUT_S, check=False, env=env,
-        )
-    except subprocess.TimeoutExpired:
-        sys.stderr.write(
-            f"[coord] lease-check for {project!r} timed out "
-            f"(>{_LEASE_CHECK_TIMEOUT_S}s); proceeding without the proof\n"
-        )
-        return "unknown"
-    except OSError:
-        # OSError covers FileNotFoundError (no `fleet` on PATH) AND a
-        # non-executable / permission-denied FLEET_BIN (codex PR4 [P2]).
-        # Lease-check unavailable -> inconclusive; don't wedge the tick (the
-        # coordinator.lock + #171 guard remain the defense).
-        return "unknown"
+    # --reacquire: the TICK is the coord's liveness signal, so it may renew
+    # an own expired no-rival lease in place (the false-fence fix). Every
+    # other lease-check caller (fleet-guard's per-turn producer fence,
+    # diagnostics) stays read-only — a check must never keep a wedged
+    # coord's lease fresh as a side effect (codex iter-2 [P1]).
+    argv = [bin_path, "lease-check", "--project", project, "--reacquire"]
+    for attempt in (0, 1):
+        try:
+            proc = subprocess.run(
+                argv,
+                capture_output=True, text=True,
+                timeout=_LEASE_CHECK_TIMEOUT_S, check=False, env=env,
+            )
+        except subprocess.TimeoutExpired:
+            sys.stderr.write(
+                f"[coord] lease-check for {project!r} timed out "
+                f"(>{_LEASE_CHECK_TIMEOUT_S}s); proceeding without the proof\n"
+            )
+            return "unknown"
+        except OSError:
+            # OSError covers FileNotFoundError (no `fleet` on PATH) AND a
+            # non-executable / permission-denied FLEET_BIN (codex PR4 [P2]).
+            # Lease-check unavailable -> inconclusive; don't wedge the tick
+            # (the coordinator.lock + #171 guard remain the defense).
+            return "unknown"
+        if attempt == 0 and proc.returncode not in (0, _LEASE_CHECK_NOT_OWNER_EXIT):
+            skew = (proc.stderr or proc.stdout or "").lower()
+            if "unknown flag" in skew:
+                # Mid-vintage binary: has `lease-check` but predates
+                # --reacquire. Degrade to the READ-ONLY check (same fence
+                # semantics, no renewal) instead of failing open/closed on
+                # a version skew.
+                argv = argv[:-1]
+                continue
+        break
     if proc.returncode == 0:
         return "owner"
     if proc.returncode == _LEASE_CHECK_NOT_OWNER_EXIT:

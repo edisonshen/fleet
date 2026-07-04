@@ -145,6 +145,12 @@ type leaseConfig struct {
 	// getppid chain. nil in defaultLeaseConfig falls back to the real
 	// ppidOf at the call site; tests inject a fake tree.
 	ppid func(pid int) (int, bool)
+	// reacquire gates the own-expired-no-rival IN-PLACE RENEWAL in
+	// leaseCheckByAncestorWithCfg (codex iter-2 [P1]). False (the default)
+	// keeps the check read-only — only LeaseCheckByAncestorReacquire (the
+	// coordinator tick's `lease-check --reacquire`) sets it. A check must
+	// never renew the lease as a side effect for non-tick callers.
+	reacquire bool
 	// boot returns the current boot id. Production: bootID.
 	boot func() string
 	// killStub fences-then-kills the old holder. PR1 shipped a no-op
@@ -924,6 +930,14 @@ func (l *Lease) reacquireOwnExpired(prev epochRecord) error {
 			verdict = fmt.Errorf("%w: %s: unrecognized lease state %q during re-acquire",
 				ErrNotLeaseOwner, fenceTagOwnExpiredRival, cur.State)
 			return false, nil
+		case cur.BootID != l.boot:
+			// Cross-boot record (mirror of the probe's gate, codex iter-2
+			// [P2]): pid_start is only comparable within a boot, so the
+			// ownership proof does not hold — never re-stamp a previous
+			// boot's record as ours.
+			verdict = fmt.Errorf("%w: %s: lease record is from a previous boot (%q); not re-acquirable",
+				ErrNotLeaseOwner, fenceTagOwnExpiredRival, cur.BootID)
+			return false, nil
 		case !l.pidAlive(cur.Owner):
 			// The owner supervisor died in the probe->CAS window. Publishing
 			// a fresh `active` record for a corpse would make holderHealthy
@@ -940,8 +954,8 @@ func (l *Lease) reacquireOwnExpired(prev epochRecord) error {
 		// must not linger as a phantom rival). Host is PRESERVED: this
 		// process's Lease has host unset (lease-check builds it bare), so
 		// the heartbeatOnce shape's `cur.Host = l.host` would blank it.
-		// BootID re-stamps to OUR boot so the fresh mono stamp is
-		// comparable (a cross-boot expired record re-acquires here too).
+		// BootID re-stamp is a same-boot no-op (cross-boot records fenced
+		// above); kept so the written record is always complete.
 		cur.State = stateActive
 		cur.Candidate = identity{}
 		cur.BootID = l.boot

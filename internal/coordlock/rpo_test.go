@@ -604,6 +604,9 @@ func leaseCheckCfg(clk *fakeClock, live *fakeLiveness, tree map[int]int) leaseCo
 		p, ok := tree[pid]
 		return p, ok
 	}
+	// The reacquire (tick) variant is the default under test — the suite's
+	// re-acquire coverage drives it. Read-only probe tests flip it off.
+	cfg.reacquire = true
 	return cfg
 }
 
@@ -1297,11 +1300,12 @@ func TestLeaseCheckByAncestor_UnrecognizedStateFencesConservatively(t *testing.T
 	}
 }
 
-// Reviewer iter-2 (testing specialist): a CROSS-BOOT expired own record
-// (BootID from a previous boot — its mono stamp is meaningless) with no
-// rival re-acquires in place, re-stamping BootID to the current boot so
-// the fresh mono stamp is comparable. Same epoch, host preserved.
-func TestLeaseCheckByAncestor_CrossBootExpiredReacquires(t *testing.T) {
+// codex iter-2 [P2]: a CROSS-BOOT own record must NEVER be re-acquired —
+// pid_start values are only comparable within a boot, so the ancestor
+// match is not a valid ownership proof for a previous boot's record (a
+// recycled pid could coincidentally match). Fence, no write, both at the
+// probe and at the CAS re-read.
+func TestLeaseCheckByAncestor_CrossBootExpiredFences(t *testing.T) {
 	setupHome(t)
 	const project = "rainier"
 	clk := &fakeClock{}
@@ -1309,28 +1313,83 @@ func TestLeaseCheckByAncestor_CrossBootExpiredReacquires(t *testing.T) {
 	owner := identity{Pid: 500, PidStart: 9001, AgentID: "coord", Project: project}
 	live.set(owner.Pid, owner.PidStart)
 	cfg := leaseCheckCfg(clk, live, map[int]int{510: 500, 500: 1})
-	writeEpochRaw(t, project, epochRecord{
+	crossBoot := epochRecord{
 		Epoch: 4, State: stateActive, Owner: owner, Host: "old-host",
 		BootID: "prev-boot", RenewedAtMono: clk.now(), // fresh stamp, WRONG boot
+	}
+	writeEpochRaw(t, project, crossBoot)
+	err := leaseCheckByAncestorWithCfg(project, 510, cfg)
+	if !errors.Is(err, ErrNotLeaseOwner) {
+		t.Fatalf("a cross-boot record must fence (pid identity unprovable), got %v", err)
+	}
+	if !strings.Contains(err.Error(), "own-expired-rival-fenced") {
+		t.Fatalf("want conservative own-expired-rival-fenced tag, got %v", err)
+	}
+	if got := readEpochFor(t, project); got != crossBoot {
+		t.Fatalf("cross-boot fence must not write, got %+v", got)
+	}
+
+	// CAS mirror: prev same-boot at probe, record flips to cross-boot in
+	// the window (defensive) -> fence, no write.
+	paths, perr := resolvePaths(project)
+	if perr != nil {
+		t.Fatalf("resolvePaths: %v", perr)
+	}
+	l := &Lease{cfg: cfg, paths: paths, boot: cfg.boot()}
+	prev := epochRecord{
+		Epoch: 4, State: stateActive, Owner: owner,
+		BootID: "test-boot-1", RenewedAtMono: clk.now(),
+	}
+	clk.advance(cfg.ttl + 1)
+	writeEpochRaw(t, project, crossBoot)
+	if err := l.reacquireOwnExpired(prev); !errors.Is(err, ErrNotLeaseOwner) {
+		t.Fatalf("cross-boot mid-CAS must fence, got %v", err)
+	}
+	if got := readEpochFor(t, project); got != crossBoot {
+		t.Fatalf("cross-boot mid-CAS must not write, got %+v", got)
+	}
+}
+
+// codex iter-2 [P1]: the READ-ONLY probe (no cfg.reacquire — every caller
+// except the coord tick, e.g. fleet-guard's per-turn producer fence) must
+// FENCE an own expired no-rival lease WITHOUT renewing it. A check that
+// renews as a side effect would let a wedged coord's still-talking claude
+// engine keep the lease fresh forever and block a standby takeover.
+func TestLeaseCheckByAncestor_ReadOnlyProbeNeverRenews(t *testing.T) {
+	setupHome(t)
+	const project = "rainier"
+	clk := &fakeClock{}
+	live := newFakeLiveness()
+	owner := identity{Pid: 500, PidStart: 9001, AgentID: "coord", Project: project}
+	live.set(owner.Pid, owner.PidStart)
+	cfg := leaseCheckCfg(clk, live, map[int]int{510: 500, 500: 1})
+	cfg.reacquire = false // the read-only default every non-tick caller gets
+	stale := epochRecord{
+		Epoch: 4, State: stateActive, Owner: owner,
+		BootID: "test-boot-1", RenewedAtMono: clk.now(),
+	}
+	writeEpochRaw(t, project, stale)
+	clk.advance(cfg.ttl + 1)
+
+	err := leaseCheckByAncestorWithCfg(project, 510, cfg)
+	if !errors.Is(err, ErrNotLeaseOwner) {
+		t.Fatalf("read-only probe of an own expired lease must fence, got %v", err)
+	}
+	if !strings.Contains(err.Error(), "own-expired-readonly-fenced") {
+		t.Fatalf("want own-expired-readonly-fenced tag, got %v", err)
+	}
+	if got := readEpochFor(t, project); got != stale {
+		t.Fatalf("read-only probe must not write, got %+v", got)
+	}
+
+	// A fresh healthy own lease still passes read-only (no regression for
+	// fleet-guard's producer fence on a healthy coord).
+	writeEpochRaw(t, project, epochRecord{
+		Epoch: 4, State: stateActive, Owner: owner,
+		BootID: "test-boot-1", RenewedAtMono: clk.now(),
 	})
 	if err := leaseCheckByAncestorWithCfg(project, 510, cfg); err != nil {
-		t.Fatalf("cross-boot expired active record with no rival must re-acquire, got %v", err)
-	}
-	rec := readEpochFor(t, project)
-	if rec.Epoch != 4 {
-		t.Errorf("re-acquire must keep the SAME epoch, got %d", rec.Epoch)
-	}
-	if rec.State != stateActive {
-		t.Errorf("state = %q, want active", rec.State)
-	}
-	if rec.BootID != "test-boot-1" {
-		t.Errorf("BootID must re-stamp to the CURRENT boot, got %q", rec.BootID)
-	}
-	if rec.Host != "old-host" {
-		t.Errorf("Host must be preserved, got %q", rec.Host)
-	}
-	if !rec.Owner.equal(owner) {
-		t.Errorf("owner must be unchanged, got %+v", rec.Owner)
+		t.Fatalf("read-only probe of a healthy own lease must pass, got %v", err)
 	}
 }
 

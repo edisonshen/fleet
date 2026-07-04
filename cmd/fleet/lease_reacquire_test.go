@@ -103,11 +103,30 @@ func TestLeaseCheck_StalledRenewalReacquiresSameEpoch(t *testing.T) {
 	before := readEpochJSON(t, epochPath)
 	staleMono := staleifyEpoch(t, epochPath)
 
-	// The supervisor's renewal has "stalled" (no heartbeat started). A
-	// lease-check for the owner pid must RE-ACQUIRE, not fence (exit 3 was
-	// the pre-fix behavior).
-	cmd := exec.Command(bin, "lease-check", "--project", project,
+	// Read-only default first (codex iter-2 [P1]): WITHOUT --reacquire the
+	// check must fence (exit 3) and leave the stale record untouched — only
+	// the tick's opt-in path may renew.
+	roCmd := exec.Command(bin, "lease-check", "--project", project,
 		"--pid", strconv.Itoa(os.Getpid()))
+	roCmd.Env = append(os.Environ(),
+		"FLEET_HOME="+fleetHome,
+		"FLEET_LEASE_FAILOVER=1",
+	)
+	roOut, roErr := roCmd.CombinedOutput()
+	var roExit *exec.ExitError
+	if !errors.As(roErr, &roExit) || roExit.ExitCode() != 3 {
+		t.Fatalf("read-only lease-check on a stalled lease must exit 3, got err=%v\noutput:\n%s", roErr, roOut)
+	}
+	if got := readEpochJSON(t, epochPath); got.RenewedAtMono != staleMono {
+		t.Fatalf("read-only lease-check must not renew, renewed_at=%d want stale %d",
+			got.RenewedAtMono, staleMono)
+	}
+
+	// The supervisor's renewal has "stalled" (no heartbeat started). A
+	// lease-check --reacquire for the owner pid must RE-ACQUIRE, not fence
+	// (exit 3 was the pre-fix behavior).
+	cmd := exec.Command(bin, "lease-check", "--project", project,
+		"--pid", strconv.Itoa(os.Getpid()), "--reacquire")
 	cmd.Env = append(os.Environ(),
 		"FLEET_HOME="+fleetHome,
 		"FLEET_LEASE_FAILOVER=1",

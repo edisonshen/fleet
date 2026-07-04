@@ -9,7 +9,7 @@ import (
 // runLeaseCheck's --project is required.
 func TestLeaseCheck_ProjectRequired(t *testing.T) {
 	var out, errb bytes.Buffer
-	if err := runLeaseCheck("", 0, &out, &errb); err == nil {
+	if err := runLeaseCheck("", 0, false, &out, &errb); err == nil {
 		t.Fatal("missing --project must error")
 	}
 }
@@ -19,7 +19,7 @@ func TestLeaseCheck_ProjectRequired(t *testing.T) {
 func TestLeaseCheck_FailoverDisabledNoOp(t *testing.T) {
 	t.Setenv("FLEET_LEASE_FAILOVER", "0")
 	var out, errb bytes.Buffer
-	if err := runLeaseCheck("rainier", 4242, &out, &errb); err != nil {
+	if err := runLeaseCheck("rainier", 4242, true, &out, &errb); err != nil {
 		t.Fatalf("disabled failover must be a no-op success, got %v", err)
 	}
 	if !strings.Contains(out.String(), "failover disabled") {

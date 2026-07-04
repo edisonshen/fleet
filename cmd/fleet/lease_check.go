@@ -36,21 +36,27 @@ const leaseCheckNotOwnerExit = 3
 func newLeaseCheckCmd() *cobra.Command {
 	var project string
 	var pid int
+	var reacquire bool
 	cmd := &cobra.Command{
 		Use:   "lease-check --project <project>",
 		Short: "Prove the caller descends from the active coordinator lease owner",
 		Long: "Exit 0 if the calling process tree descends from the live active " +
 			"coordinator lease owner for --project; exit 3 if it does not " +
 			"(fenced/stale coord); exit 1 on usage/internal error. With " +
-			"FLEET_LEASE_FAILOVER=0 the check is a no-op success.",
+			"FLEET_LEASE_FAILOVER=0 the check is a no-op success. " +
+			"--reacquire (coordinator tick only) renews an own expired lease " +
+			"in place when no rival takeover exists; without it the check is " +
+			"strictly read-only.",
 		SilenceUsage:  true,
 		SilenceErrors: true,
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			return runLeaseCheck(project, pid, cmd.OutOrStdout(), cmd.ErrOrStderr())
+			return runLeaseCheck(project, pid, reacquire, cmd.OutOrStdout(), cmd.ErrOrStderr())
 		},
 	}
 	cmd.Flags().StringVar(&project, "project", "", "project whose lease to check (required)")
 	cmd.Flags().IntVar(&pid, "pid", 0, "process to prove ownership for (default: this process's parent)")
+	cmd.Flags().BoolVar(&reacquire, "reacquire", false,
+		"renew an own expired no-rival lease in place (coordinator tick only; default read-only)")
 	return cmd
 }
 
@@ -58,7 +64,7 @@ func newLeaseCheckCmd() *cobra.Command {
 // usage faults (cobra maps to exit 1); for the definitive "not owner"
 // outcome it calls os.Exit(leaseCheckNotOwnerExit) directly so the skill
 // gets a distinct, scriptable signal.
-func runLeaseCheck(project string, pid int, stdout, stderr io.Writer) error {
+func runLeaseCheck(project string, pid int, reacquire bool, stdout, stderr io.Writer) error {
 	if project == "" {
 		return fmt.Errorf("lease-check: --project is required")
 	}
@@ -75,7 +81,7 @@ func runLeaseCheck(project string, pid int, stdout, stderr io.Writer) error {
 	if target == 0 {
 		target = os.Getppid()
 	}
-	outcome, err := leaseCheckOwnership(project, target)
+	outcome, err := leaseCheckOwnership(project, target, reacquire)
 	switch outcome {
 	case leaseCheckOK:
 		_, _ = fmt.Fprintf(stdout, "lease-check: ok (pid=%d under active lease owner for %q)\n", target, project)

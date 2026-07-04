@@ -290,3 +290,64 @@ def test_prove_helper_binary_missing_is_unknown(
         "fleet", home=fleet_home, fleet_bin="fleet",
     )
     assert got == "unknown", "a missing binary must be fail-open, not a fence"
+
+
+# ---------- codex iter-2 [P1]: tick opts into --reacquire; skew degrades ----------
+
+
+def test_prove_helper_passes_reacquire_flag(
+    fleet_home: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The TICK's proof is the only lease-check caller allowed to renew, so
+    its argv must carry --reacquire (fleet-guard's producer fence does not)."""
+    monkeypatch.setenv("FLEET_LEASE_FAILOVER", "1")
+    seen: dict = {}
+
+    def _capture(cmd, **k):
+        seen["argv"] = list(cmd)
+        return _fake_completed(0)
+
+    monkeypatch.setattr(loop.subprocess, "run", _capture)
+    got = loop._prove_parent_lease_ownership("fleet", home=fleet_home, fleet_bin="fleet")
+    assert got == "owner"
+    assert seen["argv"][-1] == "--reacquire", (
+        f"tick proof must opt into renewal; argv={seen['argv']}"
+    )
+
+
+def test_prove_helper_unknown_flag_degrades_to_readonly(
+    fleet_home: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Mid-vintage binary (has lease-check, predates --reacquire): the helper
+    retries ONCE without the flag — read-only fence semantics, not fail-open,
+    not a wedge."""
+    monkeypatch.setenv("FLEET_LEASE_FAILOVER", "1")
+    calls: list = []
+
+    def _skewed(cmd, **k):
+        calls.append(list(cmd))
+        if "--reacquire" in cmd:
+            return _fake_completed(1, "Error: unknown flag: --reacquire")
+        return _fake_completed(0)
+
+    monkeypatch.setattr(loop.subprocess, "run", _skewed)
+    got = loop._prove_parent_lease_ownership("fleet", home=fleet_home, fleet_bin="fleet")
+    assert got == "owner", "the read-only retry's verdict must be used"
+    assert len(calls) == 2, f"exactly one retry without the flag, got {calls}"
+    assert "--reacquire" not in calls[1], f"retry must drop the flag: {calls[1]}"
+
+
+def test_prove_helper_unknown_flag_retry_fence_maps_fenced(
+    fleet_home: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The degraded read-only retry still maps exit 3 to fenced."""
+    monkeypatch.setenv("FLEET_LEASE_FAILOVER", "1")
+
+    def _skewed(cmd, **k):
+        if "--reacquire" in cmd:
+            return _fake_completed(1, "Error: unknown flag: --reacquire")
+        return _fake_completed(3, "lease-check: REFUSE")
+
+    monkeypatch.setattr(loop.subprocess, "run", _skewed)
+    got = loop._prove_parent_lease_ownership("fleet", home=fleet_home, fleet_bin="fleet")
+    assert got == "fenced"
