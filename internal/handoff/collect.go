@@ -62,9 +62,34 @@ type sessionDoc struct {
 // maintains for the shared recent_decisions buffer (per-entry stamping would
 // break the plain-strings checkpoint round-trip the tick producer shares).
 type coordStateForCollect struct {
-	SessionDocs          []sessionDoc `json:"session_docs"`
-	RecentDecisions      []string     `json:"recent_decisions"`
-	RecentDecisionsOwner string       `json:"recent_decisions_owner"`
+	SessionDocs          []sessionDoc      `json:"session_docs"`
+	RecentDecisions      []string          `json:"recent_decisions"`
+	RecentDecisionsOwner string            `json:"recent_decisions_owner"`
+	SessionNextSteps     []sessionNextStep `json:"session_next_steps"`
+	SessionTasks         []sessionTask     `json:"session_tasks"`
+}
+
+// sessionNextStep is one entry of coord-state.json:session_next_steps — an
+// explicit free-text Next Step the coordinator recorded via `fleet checkpoint
+// next-step`. Slug is optional (used only for exact dedup against the auto
+// block). CoordID stamps the writing coord's generation so CollectNextSteps
+// drops a predecessor's entries after succession (coord-state.json survives).
+type sessionNextStep struct {
+	Text    string `json:"text"`
+	Slug    string `json:"slug,omitempty"`
+	CoordID string `json:"coord_id,omitempty"`
+	TS      string `json:"ts"`
+}
+
+// sessionTask is one entry of coord-state.json:session_tasks — a slug this
+// coordinator promoted or dispatched this session (the auto Next Steps
+// source). Dual-written by the Go `fleet tasks promote` and the Python tick
+// (_record_session_task); the JSON keys are byte-identical across both.
+// CoordID drives the same foreignGeneration filter as sessionDoc.
+type sessionTask struct {
+	Slug    string `json:"slug"`
+	CoordID string `json:"coord_id,omitempty"`
+	TS      string `json:"ts"`
 }
 
 // foreignGeneration reports whether a stamped owner belongs to a DIFFERENT

@@ -1307,7 +1307,11 @@ func runTasksPromote(opts *tasksPromoteOpts, slug string, stdout io.Writer) erro
 	if err != nil {
 		return err
 	}
-	return withTasksLock(project, func() error {
+	// recorded gates the best-effort session_tasks append below — set true
+	// only when the promote reached a "greenlit as ready" outcome (todo→ready
+	// OR already-ready no-op), never the rejected-status error path.
+	recorded := false
+	err = withTasksLock(project, func() error {
 		f, path, err := readTasks(project)
 		if err != nil {
 			return err
@@ -1324,12 +1328,30 @@ func runTasksPromote(opts *tasksPromoteOpts, slug string, stdout io.Writer) erro
 				return fmt.Errorf("write: %w", err)
 			}
 			_, _ = fmt.Fprintf(stdout, "promoted %s: todo → ready\n", slug)
+			recorded = true
 			return nil
 		case tasks.StatusReady:
 			_, _ = fmt.Fprintf(stdout, "%s already ready (no-op)\n", slug)
+			recorded = true
 			return nil
 		default:
 			return fmt.Errorf("tasks promote: %s has status=%s — only todo→ready is allowed (use `fleet tasks set` for other transitions)", slug, t.Status)
 		}
 	})
+	if err != nil {
+		return err
+	}
+	// Record the promoted slug into the session-scoped auto Next Steps buffer
+	// (coord-state.json:session_tasks). SEQUENTIAL — the tasks (state.lock) is
+	// already released, so taking coordinator.lock here can't invert the
+	// coordinator→state order a live tick uses (state→coordinator would AB-BA
+	// vs a coincident `fleet tasks set`). STRICTLY BEST-EFFORT: a
+	// coordinator.lock contention (live tick holds it) is logged + swallowed;
+	// promote still returns success — the stamp must never fail a core command.
+	if recorded {
+		if aerr := appendSessionTask(project, slug); aerr != nil {
+			fmt.Fprintf(os.Stderr, "tasks promote: session_tasks append dropped for %s (%v)\n", slug, aerr)
+		}
+	}
+	return nil
 }

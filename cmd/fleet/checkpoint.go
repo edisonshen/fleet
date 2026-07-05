@@ -42,6 +42,17 @@ import (
 // a cross-package dependency just to share the number 20.
 const checkpointSessionDocsMax = 20
 
+// checkpointNextStepsMax caps coord-state.json:session_next_steps — the
+// explicit free-text Next Steps buffer written by `fleet checkpoint
+// next-step`. Its OWN constant (design: coord-state schema); the reader-side
+// Next Steps cap (nextStepsLimit) bounds the COMBINED explicit+auto render.
+const checkpointNextStepsMax = 10
+
+// sessionTasksMax caps coord-state.json:session_tasks — the auto Next Steps
+// buffer (promoted/dispatched slugs). Byte-identical cap to the Python tick
+// writer (dispatch._SESSION_TASKS_MAX) so the two co-writers agree.
+const sessionTasksMax = 30
+
 // checkpointDefaultDecisions is the recent_decisions cap when
 // FLEET_COORD_CHECKPOINT_DECISIONS is unset/invalid — matches
 // dispatch.resolve_checkpoint_decisions() so the Go CLI and the Python tick
@@ -71,7 +82,126 @@ Both take coordinator.lock and atomically read-modify-write
 	}
 	cmd.AddCommand(newCheckpointDocCmd())
 	cmd.AddCommand(newCheckpointDecisionCmd())
+	cmd.AddCommand(newCheckpointNextStepCmd())
 	return cmd
+}
+
+func newCheckpointNextStepCmd() *cobra.Command {
+	var project, slug string
+	cmd := &cobra.Command{
+		Use:   "next-step [--slug <slug>] <text>",
+		Short: "Record a free-text Next Step for the handoff (session-scoped)",
+		Long: `next-step records a free-text line the coordinator plans to do next but
+has NOT queued as a task (e.g. "revive codex-engine-mvp — replan closed PR").
+It renders under the handoff's Next Steps as ` + "`- [explicit] <text>`" + `,
+scoped to THIS coordinator's session (foreign-generation entries are
+filtered). Optional --slug exact-dedups the line against the auto block
+(a promoted/dispatched task with the same slug renders once, explicit wins).`,
+		Args: cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return runCheckpointNextStep(project, slug, args[0])
+		},
+	}
+	cmd.Flags().StringVar(&project, "project", "", "project name (default: cwd basename)")
+	cmd.Flags().StringVar(&slug, "slug", "", "optional task slug for exact dedup against the auto block")
+	return cmd
+}
+
+// runCheckpointNextStep appends {text, slug?, coord_id, ts} to
+// session_next_steps, deduped by exact text (last wins → tail) and capped to
+// the newest checkpointNextStepsMax.
+func runCheckpointNextStep(project, slug, text string) error {
+	// Flatten CR/LF to spaces BEFORE trimming — identical to the decision /
+	// doc guard. The handoff renders the explicit block body as a fixed
+	// `## H\n%s\n\n` block with no per-line fencing, so an embedded newline
+	// could forge a `## header` the successor coord reads as trusted. This
+	// sanitization is load-bearing, not cosmetic.
+	flat := strings.TrimSpace(strings.ReplaceAll(strings.ReplaceAll(text, "\r", " "), "\n", " "))
+	if flat == "" {
+		return errors.New("next-step text must be non-empty")
+	}
+	slug = strings.TrimSpace(strings.ReplaceAll(strings.ReplaceAll(slug, "\r", " "), "\n", " "))
+	return withCoordState(project, func(cs map[string]any) {
+		steps := toSlice(cs["session_next_steps"])
+		// Dedupe by exact text — drop any prior entry so the new one wins AND
+		// moves to the newest (tail) position.
+		kept := steps[:0]
+		for _, e := range steps {
+			m, ok := e.(map[string]any)
+			if ok && m["text"] == flat {
+				continue
+			}
+			kept = append(kept, e)
+		}
+		entry := map[string]any{
+			"text": flat,
+			"ts":   time.Now().UTC().Format(time.RFC3339),
+		}
+		if slug != "" {
+			entry["slug"] = slug
+		}
+		// Generation stamp: coord-state.json survives succession, so the
+		// reader (CollectNextSteps) drops entries stamped by a DIFFERENT
+		// coord. Empty FLEET_AGENT_ID (operator shell) leaves the entry
+		// unstamped → unfiltered, mirroring runCheckpointDoc.
+		if id := os.Getenv("FLEET_AGENT_ID"); id != "" {
+			entry["coord_id"] = id
+		}
+		kept = append(kept, entry)
+		if len(kept) > checkpointNextStepsMax {
+			kept = kept[len(kept)-checkpointNextStepsMax:]
+		}
+		cs["session_next_steps"] = kept
+	})
+}
+
+// appendSessionTask records slug into coord-state.json:session_tasks (the
+// auto Next Steps buffer), deduped by slug (coord_id/ts refreshed, moved to
+// tail) and capped to sessionTasksMax. Stamps FLEET_AGENT_ID as coord_id.
+// Takes coordinator.lock via withCoordState.
+//
+// `fleet tasks promote` calls this SEQUENTIALLY AFTER releasing the tasks
+// lock (never nested) so the coordinator→state lock order the live tick uses
+// is never inverted here (state→coordinator would AB-BA vs a coincident
+// `fleet tasks set`). The append is strictly best-effort at the call site:
+// a lock-contention error is logged + swallowed, and promote still succeeds.
+func appendSessionTask(project, slug string) error {
+	return withCoordState(project, func(cs map[string]any) {
+		recordSessionTaskEntry(cs, slug, os.Getenv("FLEET_AGENT_ID"))
+	})
+}
+
+// recordSessionTaskEntry mutates cs["session_tasks"] in place: dedupe by
+// slug (drop any prior entry so coord_id/ts refresh + the entry moves to the
+// tail), append {slug, coord_id, ts}, cap to sessionTasksMax. Keys are
+// byte-identical to the Python writer (dispatch.record_session_task) so the
+// shared buffer round-trips across both co-writers.
+func recordSessionTaskEntry(cs map[string]any, slug, coordID string) {
+	slug = strings.TrimSpace(slug)
+	if slug == "" {
+		return
+	}
+	tasksBuf := toSlice(cs["session_tasks"])
+	kept := tasksBuf[:0]
+	for _, e := range tasksBuf {
+		m, ok := e.(map[string]any)
+		if ok && m["slug"] == slug {
+			continue
+		}
+		kept = append(kept, e)
+	}
+	entry := map[string]any{
+		"slug": slug,
+		"ts":   time.Now().UTC().Format(time.RFC3339),
+	}
+	if coordID != "" {
+		entry["coord_id"] = coordID
+	}
+	kept = append(kept, entry)
+	if len(kept) > sessionTasksMax {
+		kept = kept[len(kept)-sessionTasksMax:]
+	}
+	cs["session_tasks"] = kept
 }
 
 func newCheckpointDocCmd() *cobra.Command {

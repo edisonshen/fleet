@@ -14,16 +14,6 @@ import (
 	"github.com/edisonshen/fleet/internal/tasks"
 )
 
-// writeCoordStateJSON writes coord-state.json under pdir with the raw body.
-// The session-scoped collectors read session_next_steps + session_tasks from
-// it; a per-entry coord_id stamp drives the foreignGeneration filter.
-func writeCoordStateJSON(t *testing.T, pdir, body string) {
-	t.Helper()
-	if err := os.WriteFile(filepath.Join(pdir, "coord-state.json"), []byte(body), 0o644); err != nil {
-		t.Fatalf("write coord-state.json: %v", err)
-	}
-}
-
 // mkTask builds a tasks.Task with the given shape. created drives both
 // Created + Updated; an empty created defaults to a fixed base time.
 func mkTask(slug, status, priority, created, spec, parked string) *tasks.Task {

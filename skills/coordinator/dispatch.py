@@ -1625,6 +1625,50 @@ def record_checkpoint_decision(state: dict, line: str) -> None:
     state["recent_decisions"] = raw
 
 
+# _SESSION_TASKS_MAX caps coord-state.json:session_tasks — the auto Next
+# Steps buffer (promoted/dispatched slugs). Byte-identical cap to the Go
+# writer (checkpoint.go sessionTasksMax) so the two co-writers agree.
+_SESSION_TASKS_MAX = 30
+
+
+def record_session_task(state: dict, slug: str, coord_id: str) -> None:
+    """Append {slug, coord_id, ts} to state["session_tasks"] — the auto Next
+    Steps buffer the handoff renders SESSION-SCOPED. Mutates `state` in place.
+
+    Dedupe by slug: a slug promoted then dispatched appears ONCE, its
+    coord_id/ts refreshed to the latest action and the entry moved to the
+    tail. Capped to _SESSION_TASKS_MAX (newest kept). A blank slug is dropped.
+    Tolerates a state dict that has never carried session_tasks or one whose
+    value is corrupt (non-list).
+
+    The entry JSON keys are byte-identical to the Go co-writer
+    (checkpoint.go recordSessionTaskEntry): {"slug","coord_id","ts"} — so the
+    shared dedup-by-slug and the Go reader's struct tags agree.
+    """
+    if slug is None:
+        return
+    slug = str(slug).strip()
+    if not slug:
+        return
+    raw = state.get("session_tasks")
+    if not isinstance(raw, list):
+        raw = []
+    # Drop any prior entry for this slug so coord_id/ts refresh AND the entry
+    # moves to the tail (newest).
+    kept = [
+        e for e in raw
+        if not (isinstance(e, dict) and e.get("slug") == slug)
+    ]
+    kept.append({
+        "slug": slug,
+        "coord_id": coord_id or "",
+        "ts": datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z"),
+    })
+    if len(kept) > _SESSION_TASKS_MAX:
+        kept = kept[-_SESSION_TASKS_MAX:]
+    state["session_tasks"] = kept
+
+
 def record_checkpoint_completion(state: dict, line: str) -> None:
     """Append `line` to state["recent_completions"], capped to the
     FLEET_COORD_CHECKPOINT_DECISIONS limit (shared cap). Mutates `state`

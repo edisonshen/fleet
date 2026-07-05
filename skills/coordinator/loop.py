@@ -711,6 +711,21 @@ def _record_decision(state: dict, action) -> None:
         pass
 
 
+def _record_session_task(state: dict, slug: str, coord_id: str) -> None:
+    """Shared seam: record a slug this coord acted on (promoted or
+    dispatched) into the session_tasks buffer — the AUTO source for the
+    handoff's session-scoped Next Steps / Open Questions. Called at every
+    dispatch-emitting seam (primary, review-handoff, supervisor redispatch)
+    and the reaper promote-to-ready, right beside _record_decision, so
+    reviewer/finisher/reconcile redispatches are covered, not just the
+    primary loop. In-memory; the enclosing loop persists `state`.
+    Best-effort — a session-task-log fault must never wedge a tick."""
+    try:
+        dispatch_mod.record_session_task(state, slug, coord_id)
+    except Exception:  # noqa: BLE001 — a session-task-log fault must not wedge a tick
+        pass
+
+
 def _tick_locked(
     result: TickResult,
     project: str,
@@ -1049,7 +1064,7 @@ def _tick_locked(
     try:
         _consume_reaper_redispatch(
             project=project, fleet_bin=fleet_bin, home=home,
-            coord_state=state, tasks_path=tasks_path,
+            coord_state=state, tasks_path=tasks_path, coord_id=coord_id,
         )
     except Exception as exc:  # noqa: BLE001
         result.errors.append(f"redispatch promote: {exc}")
@@ -1196,6 +1211,9 @@ def _tick_locked(
                 # Checkpoint narrative (Slice 3): reviewer/finisher
                 # dispatch is a decision.
                 _record_decision(state, action)
+                # Session-scoped Next Steps: record the slug this coord
+                # dispatched a reviewer/finisher for (auto buffer).
+                _record_session_task(state, action.slug, coord_id)
         except Exception as exc:
             result.errors.append(f"handoff apply {action.slug}: {exc}")
     dispatched = _dispatch_ready(
@@ -1265,6 +1283,9 @@ def _tick_locked(
                 # Checkpoint narrative (Slice 3): a genuine dispatch (a
                 # block was emitted) is a decision — never a completion.
                 _record_decision(state, action)
+                # Session-scoped Next Steps: record the dispatched slug into
+                # the auto buffer (rendered while still ready/todo).
+                _record_session_task(state, action.slug, coord_id)
         except Exception as exc:
             result.errors.append(f"dispatch {action.slug}: {exc}")
 
@@ -1717,7 +1738,7 @@ def _run_supervisor(
         try:
             _consume_reaper_redispatch(
                 project=project, fleet_bin=fleet_bin, home=home,
-                coord_state=cs0, tasks_path=tasks_path,
+                coord_state=cs0, tasks_path=tasks_path, coord_id=coord_id,
             )
             _save_coord_state(state_path, cs0)
         except Exception as exc:  # noqa: BLE001
@@ -1777,6 +1798,8 @@ def _run_supervisor(
                 # Checkpoint narrative (Slice 3): record into `cs`
                 # (persisted by _save_coord_state at this loop's end).
                 _record_decision(cs, action)
+                # Session-scoped Next Steps: supervisor review-handoff seam.
+                _record_session_task(cs, action.slug, coord_id)
             except Exception as exc:  # noqa: BLE001
                 result.errors.append(
                     f"supervisor handoff apply {action.slug}: {exc}"
@@ -1833,6 +1856,8 @@ def _run_supervisor(
                 # Checkpoint narrative (Slice 3): supervisor-dispatched
                 # worker is a decision; record into `cs`.
                 _record_decision(cs, action)
+                # Session-scoped Next Steps: supervisor dispatch seam.
+                _record_session_task(cs, action.slug, coord_id)
             except Exception as exc:  # noqa: BLE001
                 result.errors.append(f"supervisor dispatch {action.slug}: {exc}")
         _save_coord_state(state_path, cs)
@@ -2638,6 +2663,7 @@ def _consume_reaper_redispatch(
     home: Path,
     coord_state: dict,
     tasks_path: Path,
+    coord_id: str = "",
 ) -> None:
     """Promote `reaper_redispatch_pending` slugs from todo → ready.
 
@@ -2701,6 +2727,11 @@ def _consume_reaper_redispatch(
                     slug,
                     "reaper: error-abort → re-dispatch (replacement worker)",
                 ])
+                # Session-scoped Next Steps: reaper promote-to-ready seam —
+                # the re-dispatched-after-failure slug is work this coord
+                # greenlit this session (in-memory; persisted by the caller's
+                # _save_coord_state).
+                _record_session_task(coord_state, slug, coord_id)
                 reaper_mod.clear_redispatch_pending(coord_state, slug)
             except Exception:
                 continue

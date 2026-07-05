@@ -7,6 +7,7 @@ package main
 
 import (
 	"bytes"
+	"strings"
 	"testing"
 	"time"
 
@@ -27,7 +28,8 @@ func sessionTasksOf(t *testing.T, m map[string]any) []map[string]any {
 	return out
 }
 
-// addTodo adds a todo task and returns its slug.
+// addTodo adds a todo task and returns its ACTUAL slug (tasks add appends a
+// random suffix, so we parse it from the "added <slug>" output).
 func addTodo(t *testing.T, project, slug string) string {
 	t.Helper()
 	out := &bytes.Buffer{}
@@ -37,7 +39,11 @@ func addTodo(t *testing.T, project, slug string) string {
 	}, "", out); err != nil {
 		t.Fatalf("add %s: %v", slug, err)
 	}
-	return slug
+	parts := strings.Fields(out.String())
+	if len(parts) < 2 {
+		t.Fatalf("unexpected add output: %q", out.String())
+	}
+	return parts[1]
 }
 
 // T7 — promote seam: a todo→ready promote records the slug in session_tasks
@@ -73,17 +79,17 @@ func TestTasksPromote_RecordsSessionTask(t *testing.T) {
 // which still refreshes the stamp.
 func TestTasksPromote_DedupesSessionTaskBySlug(t *testing.T) {
 	home, project := setupTasksHome(t)
-	addTodo(t, project, "dup-slug")
-	if err := runTasksPromote(&tasksPromoteOpts{project: project}, "dup-slug", &bytes.Buffer{}); err != nil {
+	slug := addTodo(t, project, "dup-slug")
+	if err := runTasksPromote(&tasksPromoteOpts{project: project}, slug, &bytes.Buffer{}); err != nil {
 		t.Fatalf("promote 1: %v", err)
 	}
 	// Second promote: task is already ready → no-op transition, but the
 	// slug is still recorded once (deduped).
-	if err := runTasksPromote(&tasksPromoteOpts{project: project}, "dup-slug", &bytes.Buffer{}); err != nil {
+	if err := runTasksPromote(&tasksPromoteOpts{project: project}, slug, &bytes.Buffer{}); err != nil {
 		t.Fatalf("promote 2: %v", err)
 	}
 	st := sessionTasksOf(t, readCoordState(t, home, project))
-	if len(st) != 1 || st[0]["slug"] != "dup-slug" {
+	if len(st) != 1 || st[0]["slug"] != slug {
 		t.Fatalf("expected 1 deduped session_task, got %#v", st)
 	}
 }
