@@ -94,7 +94,7 @@ const (
 )
 
 // AllKinds is the default --kinds set when the flag is omitted.
-var AllKinds = []Kind{KindSockets, KindOrphanAgents, KindOrphanTmux, KindWorktrees, KindCoordLocks, KindWorkerRecords, KindInvalidProjects, KindOrphanRCDaemons, KindDrainProcs}
+var AllKinds = []Kind{KindSockets, KindOrphanAgents, KindOrphanTmux, KindWorktrees, KindCoordLocks, KindWorkerRecords, KindInvalidProjects, KindOrphanRCDaemons, KindDrainProcs, KindStaleCoords}
 
 // Verb enumerates the operation attached to each report entry. Two
 // flavors per mutator (would-X vs X) so dry-run vs apply paths share
@@ -446,6 +446,38 @@ type Deps struct {
 	// skipped (narrow unit tests that pre-date this gate). Production wiring
 	// is reloadDrainRunOnDisk.
 	ReloadDrainRun func(path string) (DrainRun, bool, error)
+
+	// Stale-coords (KindStaleCoords, DESIGN-coord-no-auto-kill). These
+	// three platform seams depend on the lease + authenticated-kill
+	// primitives (linux||darwin only), so DefaultDeps leaves them nil and
+	// cmd/fleet's build-tagged wireGCCoordDeps installs the production
+	// wiring; nil fails safe (class (a) skipped, nothing signaled).
+	//
+	// ActiveLeaseOwnerPID reports the pid recorded as the project's
+	// current ACTIVE lease owner (coordlock.CurrentActiveOwnerPID). A
+	// stamped record whose SupervisorPID differs while an active owner
+	// exists is a competitor; no readable active owner -> not provably a
+	// competitor -> never a candidate.
+	ActiveLeaseOwnerPID func(project string) (int, bool)
+	// CoordSupervisorAlive is the pid-reuse-safe (pid + pid_start)
+	// liveness probe. Load-bearing for the never-signal-a-live-pid
+	// promise: KillCoordIfIdentityMatches refuses only the CURRENT active
+	// owner, so a live stale competitor would pass its gates and be
+	// SIGTERMed — the live/dead split MUST be enforced by this gc-side
+	// pre-probe before KillCoord is ever invoked. (The worker-records
+	// PidAlive dep is signal-0 only and pid-reuse-unsafe; not sufficient.)
+	CoordSupervisorAlive func(pid int, pidStart int64) bool
+	// KillCoord reaps a provably-DEAD stamped competitor under --apply:
+	// authenticated kill (benign no-op on a corpse) + the record-archive/
+	// session-reap cleanup its own defer never ran. Takes the gc-local
+	// CoordKillTarget so internal/gc never imports the build-tagged
+	// internal/coord package (freebsd builds).
+	KillCoord func(target CoordKillTarget) error
+	// CoordStandbyTimeout is the `coord-run --standby` self-exit timeout
+	// (owned by cmd/fleet, passed in via Deps). Class (b) treats a
+	// still-present unstamped-standby session OLDER than this as wedged.
+	// Zero skips class (b).
+	CoordStandbyTimeout time.Duration
 }
 
 // ProjectDirInfo is one raw ~/.fleet/projects/<name>/ entry for the
@@ -602,6 +634,11 @@ func Reconcile(opts Options, deps Deps) (Report, error) {
 			}
 		}
 	}
+	if hasKind(opts.Kinds, KindStaleCoords) {
+		if err := reconcileStaleCoords(&r, opts, deps); err != nil {
+			recordErr(fmt.Errorf("stale-coords: %w", err))
+		}
+	}
 
 	// Stable order: Kind primary, Target secondary. Tests rely on
 	// findAction() (linear scan) so the order is for human-readable
@@ -635,6 +672,8 @@ func kindRank(k Kind) int {
 		return 7
 	case KindDrainProcs:
 		return 8
+	case KindStaleCoords:
+		return 9
 	}
 	return 99
 }

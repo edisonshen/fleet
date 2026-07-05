@@ -85,9 +85,9 @@ func TestCoordRun_Lease_AcquireBeforeChild_ReleaseOnCleanExit(t *testing.T) {
 		session:  session,
 		argv:     childSentinelArgv(sentinel),
 		killTmux: func(string) error { return nil },
-		acquireLease: func() (coordLease, bool, error) {
+		acquireLease: func() (coordLease, bool, []liveHolderInfo, error) {
 			note("acquire")
-			return lease, true, nil
+			return lease, true, nil, nil
 		},
 	}
 	// Wrap child observation: the sentinel proves the child ran; we note
@@ -136,8 +136,8 @@ func TestCoordRun_Lease_StandDownDoesNotStartChild(t *testing.T) {
 		session:  session,
 		argv:     childSentinelArgv(sentinel),
 		killTmux: func(string) error { return nil },
-		acquireLease: func() (coordLease, bool, error) {
-			return lease, false, nil // busy: healthy leader exists
+		acquireLease: func() (coordLease, bool, []liveHolderInfo, error) {
+			return lease, false, nil, nil // busy: healthy leader exists
 		},
 		onStandDown: func() { stoodDown = true },
 	}
@@ -177,7 +177,7 @@ func TestCoordRun_Lease_ReleaseOnSignal(t *testing.T) {
 		session:      session,
 		argv:         []string{"sleep", "30"},
 		killTmux:     func(string) error { return nil },
-		acquireLease: func() (coordLease, bool, error) { return lease, true, nil },
+		acquireLease: func() (coordLease, bool, []liveHolderInfo, error) { return lease, true, nil, nil },
 	}
 	done := make(chan error, 1)
 	go func() { done <- runCoordRun(ctx, opts, os.Stdout, os.Stderr) }()
@@ -212,7 +212,7 @@ func TestCoordRun_Lease_ReleaseOnPanic(t *testing.T) {
 		session:         session,
 		argv:            []string{"true"},
 		killTmux:        func(string) error { return nil },
-		acquireLease:    func() (coordLease, bool, error) { return lease, true, nil },
+		acquireLease:    func() (coordLease, bool, []liveHolderInfo, error) { return lease, true, nil, nil },
 		panicAfterStart: true,
 	}
 	defer func() {
@@ -243,7 +243,7 @@ func TestCoordRun_Lease_AcquireFaultAborts(t *testing.T) {
 		session:      session,
 		argv:         childSentinelArgv(sentinel),
 		killTmux:     func(string) error { return nil },
-		acquireLease: func() (coordLease, bool, error) { return nil, false, wantErr },
+		acquireLease: func() (coordLease, bool, []liveHolderInfo, error) { return nil, false, nil, wantErr },
 	}
 	err := runCoordRun(context.Background(), opts, os.Stdout, os.Stderr)
 	if err == nil {

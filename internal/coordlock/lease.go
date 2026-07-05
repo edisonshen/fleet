@@ -199,6 +199,13 @@ type Lease struct {
 
 	epoch int64 // the epoch this lease owns (== on-disk while active)
 
+	// liveAbort carries the KP6 pre-fence gate's detection out of takeOver
+	// (DESIGN-coord-no-auto-kill): the prospective kill targets found ALIVE
+	// when a staleness-triggered takeover stood down instead of fencing.
+	// Set only on the abort path; read by acquireLeaseDetect after the
+	// convergence loop returns not-acquired.
+	liveAbort []identity
+
 	stopHB chan struct{} // closed by Release to stop the heartbeat goroutine
 	hbDone chan struct{} // closed by the heartbeat goroutine on exit
 }
@@ -265,7 +272,8 @@ func failoverEnabled() bool { return FailoverEnabled() }
 // internal/coord.KillCoordIfIdentityMatches primitive. AcquireLease is
 // retained for callers (and tests) that only need the lock semantics.
 func AcquireLease(project, agentID string) (lease *Lease, acquired bool, err error) {
-	return AcquireLeaseWithKill(project, agentID, nil)
+	l, acquired, _, err := AcquireLeaseWithKill(project, agentID, nil)
+	return l, acquired, err
 }
 
 // KillTarget is the exported identity the takeover STONITH hands to the
@@ -292,6 +300,19 @@ type KillTarget struct {
 	FencerEpoch int64
 }
 
+// LiveHolder identifies one prospective takeover kill target the KP6
+// pre-fence gate (DESIGN-coord-no-auto-kill) found ALIVE. When any
+// prospective target is live, the takeover writes NOTHING and stands
+// down; the detection is returned so cmd/fleet can report/quarantine
+// (the standby poll loop owns dedup + emission). coordlock itself stays
+// log-free.
+type LiveHolder struct {
+	Pid      int
+	PidStart int64
+	AgentID  string
+	Project  string
+}
+
 // AcquireLeaseWithKill is AcquireLease plus an injected authenticated
 // kill callback for the takeover STONITH step. kill==nil falls back to
 // the PR1 no-op stub (lock-only semantics; the takeover then relies on
@@ -299,14 +320,22 @@ type KillTarget struct {
 // the correct behavior when no real kill primitive is wired). Refuses
 // unless FLEET_LEASE_FAILOVER is on.
 //
+// Return shape (KP6): live is non-empty ONLY on the pre-fence stand-down
+// — a staleness-triggered takeover found a prospective kill target still
+// ALIVE, wrote nothing, and returned the same acquired=false / nil-error
+// stand-down shape a healthy leader produces. Callers that poll
+// (standbyPollUntilAcquired) keep polling; the detection is theirs to
+// report. acquired=false with live==nil is the ordinary healthy-leader
+// stand-down.
+//
 // The supervisor (cmd/fleet/coord.go) passes a closure that calls
 // internal/coord.KillCoordIfIdentityMatches — the single shared
 // authenticated coord-kill primitive (DESIGN §B.5). Threading it as a
 // callback (not a hard import) keeps the lease primitive free of any
 // dependency on the coord package.
-func AcquireLeaseWithKill(project, agentID string, kill func(KillTarget) error) (*Lease, bool, error) {
+func AcquireLeaseWithKill(project, agentID string, kill func(KillTarget) error) (*Lease, bool, []LiveHolder, error) {
 	if !failoverEnabled() {
-		return nil, false, ErrFailoverDisabled
+		return nil, false, nil, ErrFailoverDisabled
 	}
 	cfg := defaultLeaseConfig()
 	if kill != nil {
@@ -324,26 +353,36 @@ func AcquireLeaseWithKill(project, agentID string, kill func(KillTarget) error) 
 			})
 		}
 	}
-	return acquireLease(project, agentID, cfg)
+	return acquireLeaseDetect(project, agentID, cfg)
 }
 
-// acquireLease is the failover-gate-free core, parameterized by config so
-// tests inject deterministic seams. See AcquireLease for the contract.
+// acquireLease is the failover-gate-free core with the legacy 3-value
+// shape (the internal test-suite entry point). Detection is dropped —
+// callers that need the KP6 live-holder result use acquireLeaseDetect.
 func acquireLease(project, agentID string, cfg leaseConfig) (*Lease, bool, error) {
+	l, acquired, _, err := acquireLeaseDetect(project, agentID, cfg)
+	return l, acquired, err
+}
+
+// acquireLeaseDetect is the failover-gate-free core, parameterized by
+// config so tests inject deterministic seams. See AcquireLease for the
+// base contract and AcquireLeaseWithKill for the live-holder detection
+// contract (KP6).
+func acquireLeaseDetect(project, agentID string, cfg leaseConfig) (*Lease, bool, []LiveHolder, error) {
 	if project == "" {
-		return nil, false, fmt.Errorf("coordlock.AcquireLease: project must not be empty")
+		return nil, false, nil, fmt.Errorf("coordlock.AcquireLease: project must not be empty")
 	}
 	paths, err := resolvePaths(project)
 	if err != nil {
-		return nil, false, fmt.Errorf("coordlock.AcquireLease: resolve paths: %w", err)
+		return nil, false, nil, fmt.Errorf("coordlock.AcquireLease: resolve paths: %w", err)
 	}
 	if err := os.MkdirAll(filepath.Dir(paths.flock), 0o755); err != nil {
-		return nil, false, fmt.Errorf("coordlock.AcquireLease: mkdir lock dir: %w", err)
+		return nil, false, nil, fmt.Errorf("coordlock.AcquireLease: mkdir lock dir: %w", err)
 	}
 
 	self, err := selfIdentity(project, agentID, cfg)
 	if err != nil {
-		return nil, false, err
+		return nil, false, nil, err
 	}
 	l := &Lease{cfg: cfg, paths: paths, self: self, host: hostname(), boot: cfg.boot()}
 
@@ -360,18 +399,37 @@ func acquireLease(project, agentID string, cfg leaseConfig) (*Lease, bool, error
 			continue
 		}
 		if err != nil {
-			return nil, false, err
+			return nil, false, nil, err
 		}
 		if done {
 			if acquired {
-				return l, true, nil
+				return l, true, nil, nil
 			}
-			return nil, false, nil
+			// Stand-down. liveAbort is non-nil ONLY when the KP6 pre-fence
+			// gate aborted a takeover on a live prospective target (mapped
+			// to this same done/!acquired shape so pollers keep polling —
+			// NEVER to retry semantics, which would exhaust this loop into
+			// the "did not converge" error and exit a standby's poll loop
+			// via its error branch).
+			return nil, false, liveHoldersFrom(l.liveAbort), nil
 		}
 		// Not done: a CAS lost / takeover needed and we should re-evaluate
 		// from a clean flock state. Loop.
 	}
-	return nil, false, fmt.Errorf("coordlock.AcquireLease: did not converge after %d attempts (contended)", maxAttempts)
+	return nil, false, nil, fmt.Errorf("coordlock.AcquireLease: did not converge after %d attempts (contended)", maxAttempts)
+}
+
+// liveHoldersFrom projects the internal identity tuples into the
+// exported detection shape.
+func liveHoldersFrom(ids []identity) []LiveHolder {
+	if len(ids) == 0 {
+		return nil
+	}
+	out := make([]LiveHolder, 0, len(ids))
+	for _, id := range ids {
+		out = append(out, LiveHolder(id)) // identical fields modulo json tags
+	}
+	return out
 }
 
 // tryAcquireOnce runs one acquire attempt.
@@ -644,6 +702,10 @@ func (l *Lease) takeOver(rec epochRecord) (done, acquired bool, err error) {
 	// retryFlock just times out into fenced_not_acquired).
 	priorCandidate := rec.Candidate
 
+	// Reset any prior round's detection; set only by this call's gate.
+	l.liveAbort = nil
+	var liveDetected []identity
+
 	// Phase 1: fence under epoch.lock.
 	fenced, err := l.withEpochLock(func() (bool, error) {
 		cur, rerr := readEpoch(l.paths.epoch)
@@ -684,6 +746,21 @@ func (l *Lease) takeOver(rec epochRecord) (done, acquired bool, err error) {
 		if (cur.State == stateFencing || cur.State == stateFencedNotAcquired) && cur.Candidate.Pid != 0 {
 			priorCandidate = cur.Candidate
 		}
+		// KP6 PRE-FENCE LIVENESS GATE (DESIGN-coord-no-auto-kill). A
+		// staleness heuristic (TTL expiry) brought us here — it may fence,
+		// report, and quarantine, but it may never kill OR EVEN FENCE a
+		// LIVE coordinator. Probe every prospective Phase-2 kill target
+		// (recorded owner, prior fencing candidate, flock-body holder)
+		// BEFORE writeEpochLocked: any alive -> write NOTHING and stand
+		// down (the untouched leader re-heartbeats on wake; the standby
+		// keeps polling and self-heals). Placement is load-bearing: a
+		// post-fence abort would leave the live leader permanently fenced
+		// (5a90's live-candidate-is-rival rule blocks its re-acquire) and
+		// inflate the epoch every poll round.
+		if lh := l.liveProspectiveTargets(old, priorCandidate); len(lh) > 0 {
+			liveDetected = lh
+			return false, nil // no fencing write of any kind
+		}
 		l.epoch = cur.Epoch + 1
 		return true, l.writeEpochLocked(epochRecord{
 			Epoch:     l.epoch,
@@ -694,6 +771,18 @@ func (l *Lease) takeOver(rec epochRecord) (done, acquired bool, err error) {
 	})
 	if err != nil {
 		return false, false, err
+	}
+	if len(liveDetected) > 0 {
+		// KP6 abort: a prospective kill target is ALIVE. Map to the
+		// STAND-DOWN shape (done=true, acquired=false, nil error) — the
+		// same shape healthy-leader-present produces — so acquireLease
+		// returns acquired=false/err=nil and a standby keeps polling.
+		// Retry semantics here would exhaust the 8-attempt convergence
+		// loop into a "did not converge" ERROR and exit the standby via
+		// the poll loop's error branch. No markFencedNotAcquired: nothing
+		// was fenced.
+		l.liveAbort = liveDetected
+		return true, false, nil
 	}
 	if !fenced {
 		// Lost the fence race or holder recovered. Let the outer loop
@@ -1195,6 +1284,49 @@ func (l *Lease) syntheticRecordFromFlockBody() epochRecord {
 	}
 	rec.Owner = identity{Pid: body.Pid, PidStart: body.PidStart, Project: l.self.Project}
 	return rec
+}
+
+// liveProspectiveTargets enumerates the prospective STONITH target set —
+// the recorded OLD owner, the prior fencing candidate, and the current
+// flock-body holder (the same set killTargets hands Phase 2) — with
+// exactly ONE filter change vs killTargets: the dead-pid drop is REMOVED
+// (liveness is what we are probing, not a filter). The pid<=0 and self
+// exclusions are RETAINED: probing self would abort every takeover
+// including the resume-own-fencing retry where the prior candidate IS
+// self. Returns the subset found ALIVE (pid+pid_start via the injectable
+// seam); empty means every prospective target is provably dead and the
+// takeover may proceed. Called inside the epoch.lock closure BEFORE the
+// fencing write (KP6, DESIGN-coord-no-auto-kill).
+func (l *Lease) liveProspectiveTargets(old identity, extra ...identity) []identity {
+	candidates := make([]identity, 0, 3)
+	add := func(id identity) {
+		if id.Pid <= 0 || id.Pid == l.self.Pid {
+			return
+		}
+		for _, t := range candidates {
+			if t.Pid == id.Pid && t.PidStart == id.PidStart {
+				return // already queued
+			}
+		}
+		candidates = append(candidates, id)
+	}
+	add(old)
+	for _, e := range extra {
+		add(e)
+	}
+	if b, err := os.ReadFile(l.paths.flock); err == nil && len(b) > 0 {
+		var body flockBody
+		if json.Unmarshal(b, &body) == nil && body.Pid > 0 {
+			add(identity{Pid: body.Pid, PidStart: body.PidStart, Project: l.self.Project})
+		}
+	}
+	var live []identity
+	for _, t := range candidates {
+		if l.pidAlive(t) {
+			live = append(live, t)
+		}
+	}
+	return live
 }
 
 // killTargets returns the distinct live identities a takeover must kill to

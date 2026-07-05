@@ -31,6 +31,7 @@ from datetime import datetime, timezone
 # reject unknown types (best-effort), but callers stay within this set.
 TYPES = frozenset({
     "coord.start", "coord.handoff", "coord.resume", "coord.tick",
+    "coord.quarantine",
     "decision", "dispatch.worker", "worker.start", "tool.call",
     "tool.result", "model.call", "state.transition", "pr.opened",
     "pr.status", "task.completed", "worker.failed", "cli.start",

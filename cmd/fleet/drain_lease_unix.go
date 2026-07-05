@@ -37,12 +37,15 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/edisonshen/fleet/internal/agent"
 	"github.com/edisonshen/fleet/internal/coord"
 	"github.com/edisonshen/fleet/internal/coordlock"
 	"github.com/edisonshen/fleet/internal/coordrepo"
+	"github.com/edisonshen/fleet/internal/fleetlog"
 	"github.com/edisonshen/fleet/internal/handoff"
 	"github.com/edisonshen/fleet/internal/handoffdelivery"
 	"github.com/edisonshen/fleet/internal/handoffop"
@@ -89,10 +92,24 @@ type drainLeaseDeps struct {
 	KillCoord func(coord.KillTarget) error
 	// TakeOver escalates to the safety-net takeover (fence -> kill ->
 	// acquire). Production: a closure over coordlock.AcquireLeaseWithKill +
-	// the authenticated kill. Returns acquired + err. The drain does not
-	// keep the lease (it is not the coord); it only needs the side effect of
-	// the OLD holder being fenced/killed so a standby/successor can lead.
-	TakeOver func(project, agentID string) (acquired bool, err error)
+	// the authenticated kill. Returns acquired + the KP6 live-holder
+	// detection (DESIGN-coord-no-auto-kill: acquired=false with a non-empty
+	// live set means the takeover found a prospective kill target ALIVE and
+	// stood down without fencing — the drain surfaces the pids in its
+	// diagnostic, it never acts on them) + err. The drain does not keep the
+	// lease (it is not the coord); it only needs the side effect of a DEAD
+	// OLD holder being fenced/reaped so a standby/successor can lead.
+	TakeOver func(project, agentID string) (acquired bool, live []liveHolderInfo, err error)
+	// SupervisorAlive reports whether pid is STILL the same live process
+	// recorded at spawn — pid + pid_start identity, the pidAlive standard
+	// (a bare-pid probe false-alives on reuse). It backs the KP7
+	// dead-targets-only escalation gate: takeoverAndRecover proceeds only
+	// when OLD's supervisor is provably dead. Contract: pid gone -> false
+	// (provably dead); start-time mismatch -> false (reused pid, the
+	// recorded process is dead); recorded pidStart==0 -> true (identity
+	// unprovable, NEVER escalate on it). Production wraps
+	// coordlock.PidStartNanos.
+	SupervisorAlive func(pid int, pidStart int64) bool
 	// Resume runs the cold-spawn fallback for a live-leader handoff that has no
 	// barrier yet (the graceful producer hasn't run). Production: handoffop.Resume.
 	// It is run under a SHORT per-agent LockAgent (Resume's contract requires
@@ -156,8 +173,8 @@ func defaultDrainLeaseDeps() drainLeaseDeps {
 		},
 		LoadAgent: agent.Load,
 		KillCoord: coord.KillCoordIfIdentityMatches,
-		TakeOver: func(project, agentID string) (bool, error) {
-			lease, acquired, err := coordlock.AcquireLeaseWithKill(project, agentID,
+		TakeOver: func(project, agentID string) (bool, []liveHolderInfo, error) {
+			lease, acquired, live, err := coordlock.AcquireLeaseWithKill(project, agentID,
 				func(t coordlock.KillTarget) error {
 					return coord.KillCoordIfIdentityMatches(coord.KillTarget{
 						Pid:         t.Pid,
@@ -175,14 +192,15 @@ func defaultDrainLeaseDeps() drainLeaseDeps {
 			if acquired && lease != nil {
 				lease.Release()
 			}
-			return acquired, err
+			return acquired, liveHolderInfosFrom(live), err
 		},
-		Resume:         handoffop.Resume,
-		LockAgent:      state.LockAgent,
-		RecoverSpawn:   productionRecoverSpawn,
-		DeliverPending: drainGracefulDeliverPending,
-		BarrierPoll:    defaultBarrierPoll,
-		Self:           os.Getpid,
+		SupervisorAlive: supervisorAliveByStart,
+		Resume:          handoffop.Resume,
+		LockAgent:       state.LockAgent,
+		RecoverSpawn:    productionRecoverSpawn,
+		DeliverPending:  drainGracefulDeliverPending,
+		BarrierPoll:     defaultBarrierPoll,
+		Self:            os.Getpid,
 	}
 }
 
@@ -927,11 +945,51 @@ func takeoverAndRecover(req queue.SpawnFresh, path string, cachedOld *agent.Reco
 		return nil
 	}
 
+	// KP7 DEAD-TARGETS-ONLY PRECONDITION (DESIGN-coord-no-auto-kill). This
+	// escalation was reached via a staleness/timeout heuristic (barrier
+	// timeout, no-successor budget) — reachable autonomously from the
+	// fleet-guard 50/70 auto-handoff — and a staleness heuristic may never
+	// fence or kill a LIVE coordinator. Proceed only when OLD's supervisor
+	// is PROVABLY dead by pid + pid_start identity:
+	//   - record unloadable (cachedOld nil)     -> not provably dead -> abort;
+	//   - no recorded supervisor identity        -> not provably dead -> abort;
+	//   - SupervisorAlive(pid, pid_start) true   -> LIVE               -> abort.
+	// Abort = loud diagnostic + fleetlog event + drain failure through the
+	// existing "did not confirm the old coord is gone" path: the queue is
+	// preserved for retry, everyone stays alive, and the operator recourse
+	// is `fleet handoff <id>` / `fleet rm <id>`. (KP6 inside
+	// AcquireLeaseWithKill also protects the TakeOver below transitively;
+	// this gate makes the drain-side behavior explicit + tested.)
+	abortEscalation := func(why string) error {
+		msg := fmt.Sprintf(
+			"fleet drain: NOT escalating takeover for %s: %s; refusing to fence/kill (queue %s preserved for retry; if the old coord is truly wedged run `fleet handoff %s` or `fleet rm %s`)",
+			project, why, path, req.OldAgentID, req.OldAgentID)
+		_, _ = fmt.Fprintln(stderr, msg)
+		fleetlog.Log(fleetlog.CompCLI, "coord.quarantine", "warn", fleetlog.Fields{
+			Proj:  project,
+			Agent: req.OldAgentID,
+			Msg:   msg,
+			Data:  map[string]any{"reason": "live-old-coord"},
+		})
+		return fmt.Errorf("fleet drain: takeover for %s did not confirm the old coord is gone (%s)",
+			project, why)
+	}
+	switch {
+	case cachedOld == nil:
+		return abortEscalation("old coord record could not be loaded (not provably dead)")
+	case cachedOld.SupervisorPID <= 0:
+		return abortEscalation("old coord has no recorded supervisor identity (not provably dead)")
+	case d.SupervisorAlive(cachedOld.SupervisorPID, cachedOld.SupervisorPidStart):
+		return abortEscalation(fmt.Sprintf(
+			"old coord supervisor pid=%d is still alive (pid+pid_start identity)",
+			cachedOld.SupervisorPID))
+	}
+
 	// TakeOver runs LOCK-FREE so the hung OLD's coord.Cleanup can take
 	// state.LockAgent(OLD) to archive its record + reap tmux/engine while we
 	// fence->kill it. Holding the per-agent lock here would self-deadlock that
 	// cleanup (see the LOCK DISCIPLINE diagram above).
-	acquired, err := d.TakeOver(project, req.OldAgentID)
+	acquired, liveHolders, err := d.TakeOver(project, req.OldAgentID)
 	if err != nil {
 		return fmt.Errorf("fleet drain: safety-net takeover for %s: %w", project, err)
 	}
@@ -945,9 +1003,18 @@ func takeoverAndRecover(req queue.SpawnFresh, path string, cachedOld *agent.Reco
 	// later drain retries once OLD is provably gone (or `fleet doctor` recovers
 	// the un-killable case — PR6).
 	if !acquired {
+		detail := "old coord still leading or un-killable"
+		if len(liveHolders) > 0 {
+			pids := make([]string, 0, len(liveHolders))
+			for _, h := range liveHolders {
+				pids = append(pids, strconv.Itoa(h.pid))
+			}
+			detail = "live lease holder(s) detected pre-fence, pid(s) " + strings.Join(pids, ",") +
+				" — quarantined, not killed"
+		}
 		_, _ = fmt.Fprintf(stderr,
-			"fleet drain: takeover for %s did not acquire the lease (old coord still leading or un-killable); "+
-				"NOT spawning a successor (would duplicate); leaving queue for retry\n", project)
+			"fleet drain: takeover for %s did not acquire the lease (%s); "+
+				"NOT spawning a successor (would duplicate); leaving queue for retry\n", project, detail)
 		return fmt.Errorf("fleet drain: takeover for %s did not confirm the old coord is gone", project)
 	}
 	// OLD is provably gone now (the takeover fenced+killed it AND its
@@ -1232,6 +1299,9 @@ func fillDrainLeaseDeps(d drainLeaseDeps) drainLeaseDeps {
 	}
 	if d.TakeOver == nil {
 		d.TakeOver = def.TakeOver
+	}
+	if d.SupervisorAlive == nil {
+		d.SupervisorAlive = def.SupervisorAlive
 	}
 	if d.Resume == nil {
 		d.Resume = def.Resume

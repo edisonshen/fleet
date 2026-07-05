@@ -55,6 +55,8 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"sort"
+	"strings"
 	"syscall"
 	"time"
 
@@ -63,6 +65,7 @@ import (
 	fleet "github.com/edisonshen/fleet"
 	"github.com/edisonshen/fleet/internal/agent"
 	"github.com/edisonshen/fleet/internal/coord"
+	"github.com/edisonshen/fleet/internal/fleetlog"
 	"github.com/edisonshen/fleet/internal/install"
 	"github.com/edisonshen/fleet/internal/tmux"
 )
@@ -143,7 +146,14 @@ type coordRunOpts struct {
 	//       the child).
 	//   err!=nil with failover-disabled sentinel -> off-flag: runCoordRun
 	//       skips all lease behavior and runs the legacy bare-child path.
-	acquireLease func() (coordLease, bool, error)
+	//
+	// The []liveHolderInfo return is the KP6 detection outcome
+	// (DESIGN-coord-no-auto-kill): non-empty ONLY when acquired==false
+	// because a staleness-triggered takeover found a prospective kill
+	// target still ALIVE and stood down without fencing. Only the standby
+	// poll loop emits quarantine events from it (with cross-round dedup);
+	// other callers may ignore it.
+	acquireLease func() (coordLease, bool, []liveHolderInfo, error)
 
 	// onStandDown, when non-nil, is invoked instead of the default
 	// stderr print when acquired==false. Test-only seam so a stand-down
@@ -158,6 +168,19 @@ type coordRunOpts struct {
 type coordLease interface {
 	Heartbeat()
 	Release()
+}
+
+// liveHolderInfo is the platform-neutral projection of one LIVE stale
+// lease holder detected — and deliberately NOT killed — by the takeover's
+// KP6 pre-fence gate (DESIGN-coord-no-auto-kill). coord.go compiles on
+// every GOOS, so this local type (not coordlock.LiveHolder, which is
+// linux||darwin-gated) is what the acquire seam and the drain TakeOver
+// seam carry; the unix wiring converts. Detection is REPORT-ONLY: the
+// standby poll loop quarantines (stderr + fleetlog) and keeps polling.
+type liveHolderInfo struct {
+	pid      int
+	pidStart int64
+	agentID  string
 }
 
 // withReady is a tiny helper for the real-OS-signal test that returns
@@ -345,7 +368,7 @@ func runCoordRun(ctx context.Context, opts coordRunOpts, stdout, stderr io.Write
 	if acquire == nil {
 		acquire = defaultAcquireLease(opts, stderr)
 	}
-	lease, acquired, lerr := acquire()
+	lease, acquired, liveHolders, lerr := acquire()
 	switch {
 	case leaseDisabledOrUnsupported(lerr):
 		// Flag OFF (or platform without the lease primitive) — no lease,
@@ -374,7 +397,7 @@ func runCoordRun(ctx context.Context, opts coordRunOpts, stdout, stderr io.Write
 			}
 			return nil
 		}
-		polled, perr := standbyPollUntilAcquired(ctx, acquire, opts, stderr)
+		polled, perr := standbyPollUntilAcquired(ctx, acquire, opts, liveHolders, stderr)
 		switch {
 		case errors.Is(perr, errStandbyTimedOut):
 			return nil
@@ -494,15 +517,26 @@ func runCoordRun(ctx context.Context, opts coordRunOpts, stdout, stderr io.Write
 //
 //	┌──────────────────────────────────────────────────────────────┐
 //	│ for {                                                          │
-//	│   lease, acquired, err := acquire()  ── internally TakeOver    │
+//	│   lease, acquired, live, err := acquire() ── internally        │
 //	│   acquired -> return lease            ── become leader         │
 //	│   err      -> return err              ── surface fault         │
+//	│   live     -> report on STATE CHANGE  ── quarantine, keep poll │
 //	│   else     -> select { <-ctx.Done(): return nil;               │
 //	│                        <-after(poll): continue }  ── retry     │
 //	│ }                                                              │
 //	└──────────────────────────────────────────────────────────────┘
-func standbyPollUntilAcquired(ctx context.Context, acquire func() (coordLease, bool, error),
-	opts coordRunOpts, stderr io.Writer) (coordLease, error) {
+//
+// Quarantine reporting (KP6, DESIGN-coord-no-auto-kill): a busy round may
+// carry live-holder DETECTION — the takeover found a live-but-stale
+// leader/candidate and refused to fence or kill it. This loop owns the
+// cross-round dedup state and emits one stderr line + one fleetlog
+// coord.quarantine{stale-competitor} event per holder on state CHANGE
+// only (first detection, a different holder set, or re-detection after a
+// clear) — never a per-round log storm. initialDetect is the detection
+// from runCoordRun's FIRST acquire (the one that routed us here), so the
+// first report is not delayed a poll round and not double-emitted.
+func standbyPollUntilAcquired(ctx context.Context, acquire func() (coordLease, bool, []liveHolderInfo, error),
+	opts coordRunOpts, initialDetect []liveHolderInfo, stderr io.Writer) (coordLease, error) {
 
 	poll := opts.standbyPoll
 	if poll <= 0 {
@@ -515,6 +549,28 @@ func standbyPollUntilAcquired(ctx context.Context, acquire func() (coordLease, b
 	_, _ = fmt.Fprintf(stderr,
 		"coord-run: standby for %s — a coord is already running; polling for the lease every %s for up to %s\n",
 		opts.project, poll, timeout)
+
+	// Cross-round quarantine dedup: report only when the detected set
+	// changes (including clear -> re-detect).
+	lastQuarantineKey := ""
+	reportDetection := func(holders []liveHolderInfo) {
+		key := quarantineKey(holders)
+		if key == lastQuarantineKey {
+			return
+		}
+		if key == "" {
+			_, _ = fmt.Fprintf(stderr,
+				"coord-run: standby for %s: previously detected live stale holder no longer detected (leader recovered or exited)\n",
+				opts.project)
+			lastQuarantineKey = ""
+			return
+		}
+		for _, h := range holders {
+			emitQuarantine(opts.project, h, stderr)
+		}
+		lastQuarantineKey = key
+	}
+	reportDetection(initialDetect)
 
 	// First attempt already happened in runCoordRun (acquired==false led us
 	// here); start by waiting one interval before re-trying so we don't
@@ -544,7 +600,7 @@ func standbyPollUntilAcquired(ctx context.Context, acquire func() (coordLease, b
 			return nil, errStandbyTimedOut
 		case <-timer.C:
 		}
-		lease, acquired, err := acquire()
+		lease, acquired, live, err := acquire()
 		switch {
 		case err != nil:
 			// A real acquire/takeover fault. Surface-don't-silo: do not keep
@@ -557,8 +613,47 @@ func standbyPollUntilAcquired(ctx context.Context, acquire func() (coordLease, b
 				opts.project)
 			return lease, nil
 		default:
-			// Still busy (healthy leader alive). Re-arm and poll again.
+			// Still busy: a healthy leader is alive, OR the KP6 gate stood
+			// down against a LIVE stale holder (live non-empty). Either way
+			// KEEP POLLING — never exit, never kill; report on state change.
+			reportDetection(live)
 			timer.Reset(poll)
 		}
 	}
+}
+
+// quarantineKey canonicalizes a detected holder set for dedup.
+func quarantineKey(holders []liveHolderInfo) string {
+	if len(holders) == 0 {
+		return ""
+	}
+	parts := make([]string, 0, len(holders))
+	for _, h := range holders {
+		parts = append(parts, fmt.Sprintf("%d/%d/%s", h.pid, h.pidStart, h.agentID))
+	}
+	sort.Strings(parts)
+	return strings.Join(parts, ",")
+}
+
+// emitQuarantine reports one live stale lease holder: a stderr line the
+// operator sees in the standby's pane plus a fleetlog coord.quarantine
+// event (reason=stale-competitor; msg matches the report string exactly).
+// Report-only by design — reaping a LIVE coord takes an explicit
+// per-target operator command (`fleet rm <id>` / `fleet handoff <id>`);
+// `fleet gc` lists it and reaps only corpses.
+func emitQuarantine(project string, h liveHolderInfo, stderr io.Writer) {
+	msg := fmt.Sprintf(
+		"coord-run: standby for %s: live stale lease holder detected (pid=%d agent=%s) — quarantined, NOT killed; reap manually with `fleet rm %s` or `fleet handoff %s` if it is truly wedged",
+		project, h.pid, h.agentID, h.agentID, h.agentID)
+	_, _ = fmt.Fprintln(stderr, msg)
+	fleetlog.Log(fleetlog.CompCoord, "coord.quarantine", "warn", fleetlog.Fields{
+		Proj:  project,
+		Agent: h.agentID,
+		Msg:   msg,
+		Data: map[string]any{
+			"reason":    "stale-competitor",
+			"pid":       h.pid,
+			"pid_start": h.pidStart,
+		},
+	})
 }
