@@ -298,6 +298,38 @@ func TestCollectNextSteps_ExplicitSlugBoundLineAlwaysRenders(t *testing.T) {
 	}
 }
 
+// --- codex iter-14 [P2]: a slug-bound explicit note whose task reached a
+// TERMINAL state (done/abandoned) is finished work and must be DROPPED from
+// Next Steps — not shown as outstanding. Non-terminal + blocked/parked stay. ---
+func TestCollectNextSteps_ExplicitSlugDroppedWhenTerminal(t *testing.T) {
+	pdir := t.TempDir()
+	writeTasksFile(t, filepath.Join(pdir, "tasks.md"),
+		mkTask("done-1111", "done", "P1", "2026-06-01T00:00:00Z", "shipped", ""),
+		mkTask("aband-2222", "abandoned", "P1", "2026-06-01T00:00:00Z", "dropped", ""),
+		mkTask("blocked-3333", "blocked", "P1", "2026-06-01T00:00:00Z", "stuck", ""),
+		mkTask("ready-4444", "ready", "P1", "2026-06-01T00:00:00Z", "go", ""),
+	)
+	writeCoordStateJSON(t, pdir, `{"session_next_steps":[
+		{"text":"finish done-1111","slug":"done-1111","coord_id":"c1","ts":"t"},
+		{"text":"finish aband-2222","slug":"aband-2222","coord_id":"c1","ts":"t"},
+		{"text":"revive blocked-3333","slug":"blocked-3333","coord_id":"c1","ts":"t"},
+		{"text":"do ready-4444","slug":"ready-4444","coord_id":"c1","ts":"t"}]}`)
+
+	got := CollectNextSteps(pdir, "c1")
+	if strings.Contains(got, "done-1111") {
+		t.Errorf("explicit note for a DONE task must be dropped: %q", got)
+	}
+	if strings.Contains(got, "aband-2222") {
+		t.Errorf("explicit note for an ABANDONED task must be dropped: %q", got)
+	}
+	if !strings.Contains(got, "revive blocked-3333") {
+		t.Errorf("explicit note for a BLOCKED task must be kept: %q", got)
+	}
+	if !strings.Contains(got, "do ready-4444") {
+		t.Errorf("explicit note for a READY task must be kept: %q", got)
+	}
+}
+
 // --- codex iter-13 [P2]: a task surfaced ONLY via a slug-bound explicit
 // next-step (never in session_tasks) that is blocked/parked must still reach
 // Open Questions — not just Next Steps. Repro: checkpoint next-step --slug foo

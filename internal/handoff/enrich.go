@@ -681,17 +681,17 @@ func CollectNextSteps(pdir, agentID string) string {
 	bySlug := readTasksBySlug(filepath.Join(pdir, "tasks.md"))
 
 	// Explicit block — this coord's free-text lines. An explicit line is the
-	// operator/coord's own NOTE and ALWAYS renders; its optional --slug is
-	// used ONLY to dedupe the auto twin (design D1 — the slug is not a
-	// live-status tracker). codex iter-12 [P1]: a prior revision dropped a
-	// slug-bound explicit line once its slug left the actionable set, ASSUMING
-	// the slug re-surfaced under Open Questions / Active Subagents. That
-	// assumption broke once `fleet tasks set` stopped stamping session_tasks
-	// (iter-11): a `checkpoint next-step --slug foo` + `tasks set foo blocked`
-	// (before any tick touched foo) then vanished from BOTH sections. Keeping
-	// the explicit line unconditionally is the safe floor — worst case a
-	// dispatched-then-blocked slug shows both the coord's plan (Next Steps)
-	// and its blocker (Open Questions), which is complementary, not lost work.
+	// operator/coord's own NOTE; its optional --slug is used to dedupe the
+	// auto twin (design D1). It renders in ALL states EXCEPT when its slug has
+	// reached a TERMINAL state (done / abandoned): that work is finished, so
+	// showing "revive foo" as an outstanding Next Step would tell the
+	// successor to redo completed work (codex iter-14 [P2]). Non-terminal
+	// slugs (ready/todo/in-progress) and blocked/parked slugs are KEPT: codex
+	// iter-12 [P1] — dropping a blocked slug's note made it vanish from BOTH
+	// sections (it wasn't in session_tasks either). A blocked/parked slug now
+	// ALSO surfaces under Open Questions (iter-13), so its note in Next Steps
+	// is the complementary "plan", not lost work. A no-slug line and a slug
+	// absent from tasks.md always render (no live status to check).
 	var explicit []sessionNextStep
 	explicitSlugs := map[string]bool{}
 	for _, e := range cs.SessionNextSteps {
@@ -701,10 +701,14 @@ func CollectNextSteps(pdir, agentID string) string {
 		if foreignGeneration(e.CoordID, agentID) {
 			continue
 		}
-		explicit = append(explicit, e)
 		if s := strings.TrimSpace(e.Slug); s != "" {
+			if t, ok := bySlug[s]; ok &&
+				(t.Status == tasks.StatusDone || t.Status == tasks.StatusAbandoned) {
+				continue // finished work — don't show as an outstanding step
+			}
 			explicitSlugs[s] = true
 		}
+		explicit = append(explicit, e)
 	}
 
 	// Auto block — this coord's promoted/dispatched slugs, rendered LIVE from
