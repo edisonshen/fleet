@@ -81,19 +81,19 @@ func TestRenewSampler_AtMostOncePerMinute(t *testing.T) {
 // Test 2: renew failure — an injected write fault (or fenced self-demote) logs
 // lease.renew.fail EVERY time (never sampled), carrying the error string.
 func TestEmitRenewResult_FailureAlwaysLogsError(t *testing.T) {
-	cap := &capturingEmitter{}
+	em := &capturingEmitter{}
 	l := &Lease{
-		cfg:   leaseConfig{emit: cap.emit, nowMono: func() int64 { return 0 }},
+		cfg:   leaseConfig{emit: em.emit, nowMono: func() int64 { return 0 }},
 		epoch: 9,
 	}
 	writeFault := errors.New("epoch write: disk full")
 	// Two consecutive failures both log (no sampling on the failure path).
 	l.emitRenewResult(true, writeFault)
 	l.emitRenewResult(true, writeFault)
-	if got := cap.count("lease.renew.fail"); got != 2 {
+	if got := em.count("lease.renew.fail"); got != 2 {
 		t.Fatalf("lease.renew.fail count = %d, want 2 (failures are never sampled)", got)
 	}
-	data, _ := cap.first("lease.renew.fail")
+	data, _ := em.first("lease.renew.fail")
 	reason, _ := data["reason"].(string)
 	if reason != writeFault.Error() {
 		t.Fatalf("lease.renew.fail reason = %q, want the write-fault error string %q", reason, writeFault.Error())
@@ -102,10 +102,10 @@ func TestEmitRenewResult_FailureAlwaysLogsError(t *testing.T) {
 		t.Fatalf("lease.renew.fail epoch = %v, want 9", data["epoch"])
 	}
 	// A fenced self-demote (ok=false, err=nil) also logs, without an error.
-	cap2 := &capturingEmitter{}
-	l.cfg.emit = cap2.emit
+	em2 := &capturingEmitter{}
+	l.cfg.emit = em2.emit
 	l.emitRenewResult(false, nil)
-	if cap2.count("lease.renew.fail") != 1 {
+	if em2.count("lease.renew.fail") != 1 {
 		t.Fatalf("fenced self-demote (ok=false) must log lease.renew.fail")
 	}
 }
@@ -117,9 +117,9 @@ func TestLeaseAcquireRelease_EmitsLifecycle(t *testing.T) {
 	const project = "obs-lifecycle"
 	clk := &fakeClock{}
 	live := newFakeLiveness()
-	cap := &capturingEmitter{}
+	em := &capturingEmitter{}
 	cfg := testCfg(clk, live)
-	cfg.emit = cap.emit
+	cfg.emit = em.emit
 
 	lease, acquired, err := acquireLease(project, "cand", cfg)
 	if err != nil || !acquired {
@@ -128,14 +128,14 @@ func TestLeaseAcquireRelease_EmitsLifecycle(t *testing.T) {
 	epoch := lease.epoch
 	lease.Release()
 
-	if got := cap.count("lease.acquire"); got != 1 {
+	if got := em.count("lease.acquire"); got != 1 {
 		t.Fatalf("lease.acquire count = %d, want 1", got)
 	}
-	if got := cap.count("lease.release"); got != 1 {
+	if got := em.count("lease.release"); got != 1 {
 		t.Fatalf("lease.release count = %d, want 1", got)
 	}
-	acq, _ := cap.first("lease.acquire")
-	rel, _ := cap.first("lease.release")
+	acq, _ := em.first("lease.acquire")
+	rel, _ := em.first("lease.release")
 	if acq["epoch"] != epoch || rel["epoch"] != epoch {
 		t.Fatalf("acquire epoch=%v release epoch=%v, want both %d", acq["epoch"], rel["epoch"], epoch)
 	}
