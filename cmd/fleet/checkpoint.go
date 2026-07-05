@@ -142,8 +142,8 @@ func flattenLineBreaks(s string) string {
 }
 
 // runCheckpointNextStep appends {text, slug?, coord_id, ts} to
-// session_next_steps, deduped by exact text (last wins → tail) and capped to
-// the newest checkpointNextStepsMax.
+// session_next_steps, deduped by the (text, slug) PAIR (last wins → tail)
+// and capped to the newest checkpointNextStepsMax.
 func runCheckpointNextStep(project, slug, text string) error {
 	// Flatten every line-break rune the successor coord's resume parser
 	// recognizes (see flattenLineBreaks) — identical guard as the decision /
@@ -158,12 +158,22 @@ func runCheckpointNextStep(project, slug, text string) error {
 	slug = strings.TrimSpace(flattenLineBreaks(slug))
 	return withCoordState(project, func(cs map[string]any) {
 		steps := toSlice(cs["session_next_steps"])
-		// Dedupe by exact text — drop any prior entry so the new one wins AND
-		// moves to the newest (tail) position.
+		// Dedupe by the (text, slug) PAIR — drop a prior entry only when BOTH
+		// match, so the new one wins AND moves to the tail. codex iter-12
+		// [P2]: deduping on text alone collided two DIFFERENT slug-bound tasks
+		// that happened to share a generic note (e.g. two `--slug` entries
+		// both "wait on review") — the later silently erased the earlier. The
+		// slug distinguishes them; a no-slug entry keys on "" so repeated
+		// no-slug notes with identical text still collapse (intended — a bare
+		// duplicate note is noise).
+		entrySlug := func(m map[string]any) string {
+			s, _ := m["slug"].(string)
+			return s
+		}
 		kept := steps[:0]
 		for _, e := range steps {
 			m, ok := e.(map[string]any)
-			if ok && m["text"] == flat {
+			if ok && m["text"] == flat && entrySlug(m) == slug {
 				continue
 			}
 			kept = append(kept, e)

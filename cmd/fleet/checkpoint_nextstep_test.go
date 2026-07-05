@@ -157,7 +157,7 @@ func TestCheckpointNextStep_FlattensUnicodeLineSeparators(t *testing.T) {
 	}
 }
 
-// Dedupe by exact text (last wins → tail).
+// Dedupe by exact text among NO-SLUG entries (last wins → tail).
 func TestCheckpointNextStep_DedupeExactText(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("FLEET_HOME", home)
@@ -176,6 +176,43 @@ func TestCheckpointNextStep_DedupeExactText(t *testing.T) {
 	// "aaa" moved to tail (last wins); "bbb" first.
 	if steps[0]["text"] != "bbb" || steps[1]["text"] != "aaa" {
 		t.Errorf("dedupe order wrong: %#v", steps)
+	}
+}
+
+// codex iter-12 [P2]: two DIFFERENT slug-bound tasks that share the same
+// generic note text must COEXIST — dedup keys on the (text, slug) PAIR, not
+// text alone. The prior text-only dedup silently erased the earlier task.
+func TestCheckpointNextStep_DedupeByTextSlugPair(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("FLEET_HOME", home)
+	if _, err := state.Bootstrap(); err != nil {
+		t.Fatalf("Bootstrap: %v", err)
+	}
+	// Same text "wait on review", different slugs → both survive.
+	if err := runCheckpoint(t, "next-step", "--project", "myproj", "--slug", "foo-1111", "wait on review"); err != nil {
+		t.Fatalf("next-step foo: %v", err)
+	}
+	if err := runCheckpoint(t, "next-step", "--project", "myproj", "--slug", "bar-2222", "wait on review"); err != nil {
+		t.Fatalf("next-step bar: %v", err)
+	}
+	steps := sessionNextStepsOf(t, readCoordState(t, home, "myproj"))
+	if len(steps) != 2 {
+		t.Fatalf("same text + different slug must coexist, got %d: %#v", len(steps), steps)
+	}
+	slugs := map[string]bool{}
+	for _, s := range steps {
+		slugs[s["slug"].(string)] = true
+	}
+	if !slugs["foo-1111"] || !slugs["bar-2222"] {
+		t.Errorf("both slug-bound notes must survive: %#v", steps)
+	}
+	// Re-recording the SAME (text, slug) pair still dedups (last wins).
+	if err := runCheckpoint(t, "next-step", "--project", "myproj", "--slug", "foo-1111", "wait on review"); err != nil {
+		t.Fatalf("next-step foo again: %v", err)
+	}
+	steps = sessionNextStepsOf(t, readCoordState(t, home, "myproj"))
+	if len(steps) != 2 {
+		t.Errorf("re-recording same (text,slug) must dedup, got %d: %#v", len(steps), steps)
 	}
 }
 

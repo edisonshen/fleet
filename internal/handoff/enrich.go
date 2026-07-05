@@ -680,8 +680,18 @@ func CollectNextSteps(pdir, agentID string) string {
 
 	bySlug := readTasksBySlug(filepath.Join(pdir, "tasks.md"))
 
-	// Explicit block — this coord's free-text lines. Collect the surviving
-	// entries' slugs so the auto block can drop exact-slug twins.
+	// Explicit block — this coord's free-text lines. An explicit line is the
+	// operator/coord's own NOTE and ALWAYS renders; its optional --slug is
+	// used ONLY to dedupe the auto twin (design D1 — the slug is not a
+	// live-status tracker). codex iter-12 [P1]: a prior revision dropped a
+	// slug-bound explicit line once its slug left the actionable set, ASSUMING
+	// the slug re-surfaced under Open Questions / Active Subagents. That
+	// assumption broke once `fleet tasks set` stopped stamping session_tasks
+	// (iter-11): a `checkpoint next-step --slug foo` + `tasks set foo blocked`
+	// (before any tick touched foo) then vanished from BOTH sections. Keeping
+	// the explicit line unconditionally is the safe floor — worst case a
+	// dispatched-then-blocked slug shows both the coord's plan (Next Steps)
+	// and its blocker (Open Questions), which is complementary, not lost work.
 	var explicit []sessionNextStep
 	explicitSlugs := map[string]bool{}
 	for _, e := range cs.SessionNextSteps {
@@ -691,23 +701,10 @@ func CollectNextSteps(pdir, agentID string) string {
 		if foreignGeneration(e.CoordID, agentID) {
 			continue
 		}
-		// codex iter-10 [P2]: a slug-bound explicit line (`checkpoint
-		// next-step --slug foo`) must respect foo's LIVE status. Once foo
-		// leaves the actionable Next-Steps set (in-progress → Active
-		// Subagents, blocked/parked → Open Questions, done → gone), keeping
-		// the `- [explicit] …` line double-lists the SAME work as both a
-		// next step AND a blocker/active-subagent. Drop it — the auto
-		// buffer / Open Questions / Active Subagents already surface foo in
-		// its true state. A no-slug free-text line (no task binding) has no
-		// live status to check, so it always renders; a slug not in tasks.md
-		// also renders (can't verify — keep the operator's note).
+		explicit = append(explicit, e)
 		if s := strings.TrimSpace(e.Slug); s != "" {
-			if t, ok := bySlug[s]; ok && !isNextStepActionable(t) {
-				continue
-			}
 			explicitSlugs[s] = true
 		}
-		explicit = append(explicit, e)
 	}
 
 	// Auto block — this coord's promoted/dispatched slugs, rendered LIVE from

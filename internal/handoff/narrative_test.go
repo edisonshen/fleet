@@ -267,24 +267,28 @@ func TestCollectNextSteps_ParkedReadyTaskNotDoubleListed(t *testing.T) {
 	}
 }
 
-// --- codex iter-10 [P2]: a slug-bound explicit next-step whose task has
-// left the actionable set (in-progress / blocked / done) must be DROPPED
-// from Next Steps, not double-listed against Active Subagents / Open
-// Questions. A no-slug free-text line always renders. ---
-func TestCollectNextSteps_ExplicitSlugDroppedWhenNonActionable(t *testing.T) {
+// --- codex iter-12 [P1]: an explicit next-step is the coord's own NOTE and
+// ALWAYS renders — it must NOT vanish just because its --slug task went
+// blocked/parked. (A prior revision dropped it, which — combined with
+// `tasks set` no longer stamping session_tasks — made a blocked slug-bound
+// note disappear from BOTH Next Steps and Open Questions. The safe floor is
+// to keep the explicit line unconditionally.) ---
+func TestCollectNextSteps_ExplicitSlugBoundLineAlwaysRenders(t *testing.T) {
 	pdir := t.TempDir()
 	writeTasksFile(t, filepath.Join(pdir, "tasks.md"),
 		mkTask("blocked-1111", "blocked", "P1", "2026-06-01T00:00:00Z", "went blocked", ""),
 		mkTask("ready-2222", "ready", "P1", "2026-06-01T00:00:00Z", "still ready", ""),
 	)
+	// blocked-1111 is NOT in session_tasks (tasks set no longer stamps), so
+	// its slug-bound explicit note is the ONLY record of it — must survive.
 	writeCoordStateJSON(t, pdir, `{"session_next_steps":[
 		{"text":"revive blocked-1111","slug":"blocked-1111","coord_id":"c1","ts":"t"},
 		{"text":"finish ready-2222","slug":"ready-2222","coord_id":"c1","ts":"t"},
 		{"text":"free-form idea no slug","coord_id":"c1","ts":"t"}]}`)
 
 	got := CollectNextSteps(pdir, "c1")
-	if strings.Contains(got, "revive blocked-1111") {
-		t.Errorf("explicit line for a now-blocked slug must be dropped: %q", got)
+	if !strings.Contains(got, "revive blocked-1111") {
+		t.Errorf("slug-bound explicit note for a blocked task must NOT vanish: %q", got)
 	}
 	if !strings.Contains(got, "finish ready-2222") {
 		t.Errorf("explicit line for a still-ready slug must render: %q", got)
@@ -292,8 +296,6 @@ func TestCollectNextSteps_ExplicitSlugDroppedWhenNonActionable(t *testing.T) {
 	if !strings.Contains(got, "free-form idea no slug") {
 		t.Errorf("no-slug free-text explicit line must always render: %q", got)
 	}
-	// The now-blocked slug belongs in Open Questions instead — but only if
-	// it's in session_tasks; here it isn't, so it just leaves Next Steps.
 }
 
 // --- T13: Open Questions = session-touched blocked/parked only, with the
