@@ -47,6 +47,11 @@ func addTodo(t *testing.T, project, slug string) string {
 	return parts[1]
 }
 
+// NOTE: `fleet tasks add` deliberately does NOT stamp session_tasks — see
+// the rejection rationale in runTasksAdd (stamping would flip the TUI
+// coord-active signal on a mere file-a-task). TestFleetE2E_FullWorkflow/
+// cold_start_shows_todo_and_idle guards that invariant.
+
 // T7 — promote seam: a todo→ready promote records the slug in session_tasks
 // with a coord_id stamp; sibling coord-state keys survive.
 func TestTasksPromote_RecordsSessionTask(t *testing.T) {

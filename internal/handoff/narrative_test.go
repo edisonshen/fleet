@@ -240,6 +240,33 @@ func TestCollectNextSteps_CapCombinedExplicitFirst(t *testing.T) {
 	}
 }
 
+// --- codex iter-8 [P2]: a ready/todo task that is ALSO parked
+// (Parked != "") must render ONLY under Open Questions, NEVER double-listed
+// under Next Steps as actionable work. A parked task is waiting, not queued. ---
+func TestCollectNextSteps_ParkedReadyTaskNotDoubleListed(t *testing.T) {
+	pdir := t.TempDir()
+	writeTasksFile(t, filepath.Join(pdir, "tasks.md"),
+		mkTask("parked-1111", "ready", "P1", "2026-06-01T00:00:00Z", "queued but parked", "waiting on operator"),
+		mkTask("clean-2222", "ready", "P1", "2026-06-01T00:00:00Z", "genuinely next", ""),
+	)
+	writeCoordStateJSON(t, pdir, `{"session_tasks":[
+		{"slug":"parked-1111","coord_id":"c1","ts":"t"},
+		{"slug":"clean-2222","coord_id":"c1","ts":"t"}]}`)
+
+	next := CollectNextSteps(pdir, "c1")
+	if strings.Contains(next, "parked-1111") {
+		t.Errorf("parked ready task must NOT appear in Next Steps (double-list): %q", next)
+	}
+	if !strings.Contains(next, "clean-2222") {
+		t.Errorf("un-parked ready task must still appear in Next Steps: %q", next)
+	}
+	// It DOES belong in Open Questions (Parked != "").
+	oq := CollectOpenQuestions(pdir, "c1")
+	if !strings.Contains(oq, "- parked-1111: waiting on operator") {
+		t.Errorf("parked task must appear in Open Questions: %q", oq)
+	}
+}
+
 // --- T13: Open Questions = session-touched blocked/parked only, with the
 // foreignGeneration filter — a non-session blocked task AND a foreign-coord
 // session_task are both omitted. ---

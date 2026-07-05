@@ -439,6 +439,17 @@ func runTasksAdd(opts *tasksAddOpts, positional string, stdout io.Writer) error 
 			t.Slug, t.Status, t.Priority, path)
 		return nil
 	})
+	// NOTE (codex iter-8 [P1] — deliberately NOT implemented): codex asked
+	// to stamp `fleet tasks add` into session_tasks so a filed-then-handed-
+	// off todo shows in Next Steps. Rejected with a test-backed reason: the
+	// session_tasks writer creates/touches coord-state.json, and the TUI
+	// dashboard treats coord-state.json's mtime AS the coord heartbeat
+	// (dashboard.go: os.Stat → ModTime → "● active"). Stamping tasks add
+	// would make merely FILING a task falsely flip the project to "coord
+	// active" — TestFleetE2E_FullWorkflow/cold_start_shows_todo_and_idle
+	// enforces the opposite invariant (file a task → still ○ idle, no coord
+	// running). The filed task is NOT lost: it lives in tasks.md and the
+	// successor sees it in its backlog view. The fix is worse than the gap.
 }
 
 // isLikelySlug returns true if s could be interpreted as a slug (no

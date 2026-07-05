@@ -705,6 +705,15 @@ func CollectNextSteps(pdir, agentID string) string {
 		if t.Status != tasks.StatusReady && t.Status != tasks.StatusTodo {
 			continue // in-progress → Active Subagents; done/abandoned → dropped
 		}
+		// codex iter-8 [P2]: a task that is ready/todo AND parked
+		// (Parked != "") is an Open Question, not a Next Step —
+		// CollectOpenQuestions already renders it via the Parked != ""
+		// branch. Without this skip the SAME slug double-lists as both
+		// actionable Next-Steps work AND a blocker in the one handoff.
+		// Open Questions wins (a parked task is waiting, not queued).
+		if t.Parked != "" {
+			continue
+		}
 		seenAuto[slug] = true
 		auto = append(auto, t)
 	}
