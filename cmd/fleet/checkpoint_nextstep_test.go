@@ -216,6 +216,31 @@ func TestCheckpointNextStep_DedupeByTextSlugPair(t *testing.T) {
 	}
 }
 
+// codex iter-13 [P2]: re-recording a next-step for the SAME slug with
+// DIFFERENT text REPLACES the prior note (a slug-bound entry is "the current
+// note for this task"), so Next Steps never accumulates stale/contradictory
+// lines for one task.
+func TestCheckpointNextStep_SameSlugNewTextReplaces(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("FLEET_HOME", home)
+	if _, err := state.Bootstrap(); err != nil {
+		t.Fatalf("Bootstrap: %v", err)
+	}
+	if err := runCheckpoint(t, "next-step", "--project", "myproj", "--slug", "foo-1234", "wait on review"); err != nil {
+		t.Fatalf("next-step 1: %v", err)
+	}
+	if err := runCheckpoint(t, "next-step", "--project", "myproj", "--slug", "foo-1234", "replan after CI"); err != nil {
+		t.Fatalf("next-step 2: %v", err)
+	}
+	steps := sessionNextStepsOf(t, readCoordState(t, home, "myproj"))
+	if len(steps) != 1 {
+		t.Fatalf("same slug must replace, got %d entries: %#v", len(steps), steps)
+	}
+	if steps[0]["text"] != "replan after CI" {
+		t.Errorf("latest note must win: %#v", steps[0])
+	}
+}
+
 // T4 — --slug stored verbatim; absent → no slug key.
 func TestCheckpointNextStep_Slug(t *testing.T) {
 	home := t.TempDir()

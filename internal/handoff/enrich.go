@@ -789,36 +789,47 @@ func specFirstLine(spec string) string {
 }
 
 // CollectOpenQuestions renders the `## Open Questions` body SESSION-SCOPED
-// from coord-state.json under pdir: only THIS coord's session_tasks slugs
+// from coord-state.json under pdir: THIS coord's session slugs
 // (foreignGeneration-filtered, same as CollectNextSteps) that are currently
 // `blocked` OR `parked` (Parked != "") in tasks.md — NOT every blocked row in
-// the backlog. There is no explicit buffer for this section (deferred; see
-// design "Not doing"). A parked task renders its Parked text; a blocked task
-// has no structured reason in tasks.md so it renders `- <slug>: blocked`; a
-// task both blocked AND parked renders the Parked text. Ordered by slug for a
-// deterministic doc. Empty (post-filter) → "" so the caller keeps the
-// placeholder. Never errors: parse drift / missing file → "".
+// the backlog. Candidate slugs come from BOTH session_tasks (dispatched/
+// promoted work) AND the slug bound to a session_next_steps entry (codex
+// iter-13 [P2]: a task the coord recorded an explicit note for, then that went
+// blocked/parked before any dispatch seam stamped session_tasks, must still
+// surface its blocker here — not only in Next Steps). A parked task renders
+// its Parked text; a blocked task has no structured reason in tasks.md so it
+// renders `- <slug>: blocked`; a task both blocked AND parked renders the
+// Parked text. Ordered by slug for a deterministic doc. Empty (post-filter) →
+// "" so the caller keeps the placeholder. Never errors.
 func CollectOpenQuestions(pdir, agentID string) string {
 	cs := readCoordStateForCollect(filepath.Join(pdir, "coord-state.json"))
 	bySlug := readTasksBySlug(filepath.Join(pdir, "tasks.md"))
 	var picked []*tasks.Task
 	seen := map[string]bool{}
-	for _, st := range cs.SessionTasks {
-		slug := strings.TrimSpace(st.Slug)
+	// consider adds slug to picked when it's a this-coord, blocked/parked task.
+	consider := func(slug, coordID string) {
+		slug = strings.TrimSpace(slug)
 		if slug == "" || seen[slug] {
-			continue
+			return
 		}
-		if foreignGeneration(st.CoordID, agentID) {
-			continue
+		if foreignGeneration(coordID, agentID) {
+			return
 		}
 		t, ok := bySlug[slug]
 		if !ok {
-			continue
+			return
 		}
 		if t.Status == tasks.StatusBlocked || t.Parked != "" {
 			seen[slug] = true
 			picked = append(picked, t)
 		}
+	}
+	for _, st := range cs.SessionTasks {
+		consider(st.Slug, st.CoordID)
+	}
+	// Slugs surfaced ONLY via an explicit next-step (never dispatched).
+	for _, e := range cs.SessionNextSteps {
+		consider(e.Slug, e.CoordID)
 	}
 	if len(picked) == 0 {
 		return ""

@@ -158,14 +158,16 @@ func runCheckpointNextStep(project, slug, text string) error {
 	slug = strings.TrimSpace(flattenLineBreaks(slug))
 	return withCoordState(project, func(cs map[string]any) {
 		steps := toSlice(cs["session_next_steps"])
-		// Dedupe by the (text, slug) PAIR — drop a prior entry only when BOTH
-		// match, so the new one wins AND moves to the tail. codex iter-12
-		// [P2]: deduping on text alone collided two DIFFERENT slug-bound tasks
-		// that happened to share a generic note (e.g. two `--slug` entries
-		// both "wait on review") — the later silently erased the earlier. The
-		// slug distinguishes them; a no-slug entry keys on "" so repeated
-		// no-slug notes with identical text still collapse (intended — a bare
-		// duplicate note is noise).
+		// Dedupe key depends on whether the entry is slug-bound:
+		//   - slug SET → a slug-bound entry is "the current note for THIS
+		//     task". Re-recording for the same slug REPLACES the prior note
+		//     regardless of text, so `--slug foo "wait on review"` then
+		//     `--slug foo "replan after CI"` leaves only the latter (codex
+		//     iter-13 [P2] — avoid accumulating stale/contradictory lines for
+		//     one task). Two DIFFERENT slugs never collide (codex iter-12).
+		//   - slug EMPTY → a free-text note keyed on its exact text; repeated
+		//     identical no-slug notes collapse (a bare duplicate is noise).
+		// A no-slug entry never dedups a slug-bound one (different kinds).
 		entrySlug := func(m map[string]any) string {
 			s, _ := m["slug"].(string)
 			return s
@@ -173,7 +175,17 @@ func runCheckpointNextStep(project, slug, text string) error {
 		kept := steps[:0]
 		for _, e := range steps {
 			m, ok := e.(map[string]any)
-			if ok && m["text"] == flat && entrySlug(m) == slug {
+			if !ok {
+				kept = append(kept, e)
+				continue
+			}
+			var dup bool
+			if slug != "" {
+				dup = entrySlug(m) == slug // same task → replace
+			} else {
+				dup = entrySlug(m) == "" && m["text"] == flat // same free-text note
+			}
+			if dup {
 				continue
 			}
 			kept = append(kept, e)

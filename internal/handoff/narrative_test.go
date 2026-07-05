@@ -298,6 +298,36 @@ func TestCollectNextSteps_ExplicitSlugBoundLineAlwaysRenders(t *testing.T) {
 	}
 }
 
+// --- codex iter-13 [P2]: a task surfaced ONLY via a slug-bound explicit
+// next-step (never in session_tasks) that is blocked/parked must still reach
+// Open Questions — not just Next Steps. Repro: checkpoint next-step --slug foo
+// then tasks set foo blocked (which no longer stamps session_tasks). ---
+func TestCollectOpenQuestions_SurfacesExplicitOnlyBlockedSlug(t *testing.T) {
+	pdir := t.TempDir()
+	writeTasksFile(t, filepath.Join(pdir, "tasks.md"),
+		mkTask("foo-1111", "blocked", "P1", "2026-06-01T00:00:00Z", "went blocked", ""),
+		mkTask("bar-2222", "ready", "P2", "2026-06-02T00:00:00Z", "spec", "dirty worktree"),
+	)
+	// foo + bar are referenced ONLY via session_next_steps (empty session_tasks).
+	writeCoordStateJSON(t, pdir, `{"session_next_steps":[
+		{"text":"revive foo","slug":"foo-1111","coord_id":"c1","ts":"t"},
+		{"text":"unpark bar","slug":"bar-2222","coord_id":"c1","ts":"t"}]}`)
+
+	oq := CollectOpenQuestions(pdir, "c1")
+	if !strings.Contains(oq, "- foo-1111: blocked") {
+		t.Errorf("explicit-only blocked slug must reach Open Questions: %q", oq)
+	}
+	if !strings.Contains(oq, "- bar-2222: dirty worktree") {
+		t.Errorf("explicit-only parked slug must reach Open Questions: %q", oq)
+	}
+	// A foreign-generation explicit entry is still filtered out.
+	writeCoordStateJSON(t, pdir, `{"session_next_steps":[
+		{"text":"revive foo","slug":"foo-1111","coord_id":"otherCoord","ts":"t"}]}`)
+	if got := CollectOpenQuestions(pdir, "c1"); strings.Contains(got, "foo-1111") {
+		t.Errorf("foreign-generation explicit slug must be filtered from Open Questions: %q", got)
+	}
+}
+
 // --- T13: Open Questions = session-touched blocked/parked only, with the
 // foreignGeneration filter — a non-session blocked task AND a foreign-coord
 // session_task are both omitted. ---
