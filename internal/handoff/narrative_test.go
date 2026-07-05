@@ -283,6 +283,42 @@ func TestCollectOpenQuestions_NoSessionBlockedPlaceholder(t *testing.T) {
 	}
 }
 
+// --- codex review P1: an UNSTAMPED session entry (empty coord_id, e.g. an
+// operator-shell `fleet checkpoint next-step` / `fleet tasks promote` run
+// with FLEET_AGENT_ID unset) must NOT leak into a REAL coord's handoff —
+// otherwise it resurfaces in every successor forever. A stamped reader only
+// renders entries stamped with its OWN id (stricter than the durable
+// session_docs buffer, which lets unstamped operator entries through). ---
+func TestCollectSessionScoped_UnstampedEntriesFilteredForStampedReader(t *testing.T) {
+	pdir := t.TempDir()
+	writeTasksFile(t, filepath.Join(pdir, "tasks.md"),
+		mkTask("ready-1111", "ready", "P1", "2026-06-01T00:00:00Z", "live ready", ""),
+		mkTask("blocked-2222", "blocked", "P1", "2026-06-01T00:00:00Z", "live blocked", ""),
+	)
+	// Both buffers carry ONLY unstamped rows (coord_id absent).
+	writeCoordStateJSON(t, pdir, `{
+		"session_next_steps":[{"text":"orphan next-step","ts":"t"}],
+		"session_tasks":[
+			{"slug":"ready-1111","ts":"t"},
+			{"slug":"blocked-2222","ts":"t"}]}`)
+
+	// A REAL coord (non-empty id) must see NONE of the unstamped rows.
+	if got := CollectNextSteps(pdir, "realcoord"); got != "" {
+		t.Errorf("stamped reader must filter unstamped next-steps, got: %q", got)
+	}
+	if got := CollectOpenQuestions(pdir, "realcoord"); got != "" {
+		t.Errorf("stamped reader must filter unstamped session_tasks, got: %q", got)
+	}
+	// An UNSTAMPED reader (operator-side render, no generation context)
+	// still sees everything — nothing is silently hidden.
+	if got := CollectNextSteps(pdir, ""); !strings.Contains(got, "orphan next-step") {
+		t.Errorf("unstamped reader should render all, got: %q", got)
+	}
+	if got := CollectOpenQuestions(pdir, ""); !strings.Contains(got, "blocked-2222") {
+		t.Errorf("unstamped reader should render all open questions, got: %q", got)
+	}
+}
+
 // --- missing coord-state.json AND tasks.md → both collectors empty (never
 // errors). ---
 func TestCollectors_MissingFilesEmpty(t *testing.T) {

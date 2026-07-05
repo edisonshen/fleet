@@ -647,8 +647,9 @@ func readTasksBySlug(tasksFile string) map[string]*tasks.Task {
 // CollectNextSteps renders the `## Next Steps (prioritized)` body SESSION-
 // SCOPED from coord-state.json under pdir — NOT a whole-tasks.md backlog
 // dump. agentID is the coord whose handoff is being built; both buffers are
-// foreignGeneration-filtered so a successor never renders a predecessor's
-// entries (coord-state.json survives succession).
+// sessionEntryForeign-filtered so a successor never renders a predecessor's
+// entries AND a stamped reader never renders an unstamped (operator-shell)
+// entry (coord-state.json survives succession).
 //
 //	explicit  session_next_steps  → `- [explicit] <text>`   (this coord only)
 //	auto      session_tasks       → `- [auto] [P{n}] <slug>: <goal>`
@@ -672,7 +673,7 @@ func CollectNextSteps(pdir, agentID string) string {
 		if strings.TrimSpace(e.Text) == "" {
 			continue
 		}
-		if foreignGeneration(e.CoordID, agentID) {
+		if sessionEntryForeign(e.CoordID, agentID) {
 			continue
 		}
 		explicit = append(explicit, e)
@@ -691,7 +692,7 @@ func CollectNextSteps(pdir, agentID string) string {
 		if slug == "" || seenAuto[slug] {
 			continue
 		}
-		if foreignGeneration(st.CoordID, agentID) {
+		if sessionEntryForeign(st.CoordID, agentID) {
 			continue
 		}
 		if explicitSlugs[slug] {
@@ -762,7 +763,7 @@ func specFirstLine(spec string) string {
 
 // CollectOpenQuestions renders the `## Open Questions` body SESSION-SCOPED
 // from coord-state.json under pdir: only THIS coord's session_tasks slugs
-// (foreignGeneration-filtered, same as CollectNextSteps) that are currently
+// (sessionEntryForeign-filtered, same as CollectNextSteps) that are currently
 // `blocked` OR `parked` (Parked != "") in tasks.md — NOT every blocked row in
 // the backlog. There is no explicit buffer for this section (deferred; see
 // design "Not doing"). A parked task renders its Parked text; a blocked task
@@ -780,7 +781,7 @@ func CollectOpenQuestions(pdir, agentID string) string {
 		if slug == "" || seen[slug] {
 			continue
 		}
-		if foreignGeneration(st.CoordID, agentID) {
+		if sessionEntryForeign(st.CoordID, agentID) {
 			continue
 		}
 		t, ok := bySlug[slug]
