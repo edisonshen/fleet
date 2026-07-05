@@ -359,8 +359,9 @@ func statusIsPrePR(status string) bool {
 // buffer's correct home; it finally has a producer wired in loop.py).
 // Each empty buffer leaves the doc's existing section text (Placeholder
 // for synth / the manual stub). NextSteps + Open Questions are NOT touched
-// here -- they come live from tasks.md via CollectNextSteps /
-// CollectOpenQuestions, so a checkpoint lift must not overwrite them.
+// here -- they come session-scoped from coord-state.json (session_next_steps
+// / session_tasks) via CollectNextSteps / CollectOpenQuestions, so a
+// checkpoint lift must not overwrite them.
 func applyCheckpointToDoc(doc *Doc, cp *checkpointDoc) {
 	doc.ActiveSubagents = cp.activeSubagents
 	doc.OpenPRs = cp.openPRs

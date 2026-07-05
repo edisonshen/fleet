@@ -7,6 +7,7 @@ package main
 
 import (
 	"bytes"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -129,4 +130,54 @@ func TestTasksPromote_SessionTaskBestEffortUnderLock(t *testing.T) {
 	// The session_tasks append was dropped (lock held) — coord-state.json
 	// either absent or has no session_tasks for this slug.
 	_ = home
+}
+
+// Rejected-status path: promoting a task that's neither todo nor ready
+// returns an error and must NOT append to session_tasks — the `recorded`
+// gate must stay false on that branch. Reviewer iter-2 test-completeness
+// addition (testing specialist finding): the happy paths (T7, dedupe, T16)
+// were covered but the rejected-status branch's effect on session_tasks
+// was not asserted anywhere.
+func TestTasksPromote_RejectedStatusDoesNotRecordSessionTask(t *testing.T) {
+	home, project := setupTasksHome(t)
+	slug := addTodo(t, project, "not-promotable")
+	if err := runTasksSet(&tasksSetOpts{project: project}, slug, "status=in-progress", &bytes.Buffer{}); err != nil {
+		t.Fatalf("set status=in-progress: %v", err)
+	}
+	seedCoordStateFile(t, home, project, `{"tick_count":1}`)
+
+	if err := runTasksPromote(&tasksPromoteOpts{project: project}, slug, &bytes.Buffer{}); err == nil {
+		t.Fatalf("expected error promoting an in-progress task")
+	}
+	st := sessionTasksOf(t, readCoordState(t, home, project))
+	if len(st) != 0 {
+		t.Errorf("rejected-status promote must not record session_tasks: %#v", st)
+	}
+}
+
+// session_tasks caps at sessionTasksMax (30, newest kept) — mirrors
+// TestCheckpointNextStep_CapsToNewest for the sibling session_next_steps
+// buffer. Reviewer iter-2 test-completeness addition (maintainability
+// specialist finding): the Python co-writer already has an equivalent test
+// (test_record_session_task_caps_to_30); the Go writer did not.
+func TestAppendSessionTask_CapsToNewest(t *testing.T) {
+	home, project := setupTasksHome(t)
+	const n = sessionTasksMax + 5 // 35 > cap 30
+	for i := 0; i < n; i++ {
+		slug := fmt.Sprintf("slug-%02d", i)
+		if err := appendSessionTask(project, slug); err != nil {
+			t.Fatalf("appendSessionTask %d: %v", i, err)
+		}
+	}
+	m := readCoordState(t, home, project)
+	st := sessionTasksOf(t, m)
+	if len(st) != sessionTasksMax {
+		t.Fatalf("expected cap %d, got %d", sessionTasksMax, len(st))
+	}
+	if st[0]["slug"] != "slug-05" {
+		t.Errorf("oldest not trimmed: head=%v want slug-05", st[0]["slug"])
+	}
+	if st[len(st)-1]["slug"] != fmt.Sprintf("slug-%02d", n-1) {
+		t.Errorf("newest not at tail: %v", st[len(st)-1]["slug"])
+	}
 }

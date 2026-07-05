@@ -107,20 +107,53 @@ filtered). Optional --slug exact-dedups the line against the auto block
 	return cmd
 }
 
+// Security fix (review iter-1): the successor coord's resume parser
+// (skills/coordinator/handoff_resume.py) walks the handoff doc via Python's
+// str.splitlines(), which treats U+2028 (LINE SEPARATOR), U+2029 (PARAGRAPH
+// SEPARATOR), U+0085 (NEL), \v, \f, and \x1c-\x1e as line breaks — NOT just
+// \r/\n. A next-step string carrying one of those runes passed the old
+// \r\n-only flatten untouched, yet split into multiple logical lines on the
+// Python reader, letting free text forge a `## Active Subagents` / `## Open
+// PRs` header BEFORE the real ones (Next Steps renders at position 6, ahead
+// of Active Subagents at 7 and Open PRs at 8 — see internal/handoff/handoff.go
+// Render). Because both Python section scanners break on the first line
+// starting `## ` once inside a section, a forged header + forged entries
+// followed by a forged next header would swallow the parse and the real
+// Active Subagents / Open PRs sections would never be read — silently
+// dropping in-flight worker resume + substituting attacker-chosen PR URLs.
+// flattenLineBreaks replaces every rune Python's str.splitlines() treats as
+// a line terminator with a space, matching the successor's actual notion of
+// "line" (not just Go's \r\n) so no forged section header can survive.
+func flattenLineBreaks(s string) string {
+	return strings.Map(func(r rune) rune {
+		switch r {
+		case '\r', '\n', '\v', '\f', // ASCII: CR, LF, vertical tab, form feed
+			'\u001c', '\u001d', '\u001e', // File/Group/Record separator
+			'\u0085', // NEL (Next Line)
+			'\u2028', // LINE SEPARATOR
+			'\u2029': // PARAGRAPH SEPARATOR
+			return ' '
+		default:
+			return r
+		}
+	}, s)
+}
+
 // runCheckpointNextStep appends {text, slug?, coord_id, ts} to
 // session_next_steps, deduped by exact text (last wins → tail) and capped to
 // the newest checkpointNextStepsMax.
 func runCheckpointNextStep(project, slug, text string) error {
-	// Flatten CR/LF to spaces BEFORE trimming — identical to the decision /
-	// doc guard. The handoff renders the explicit block body as a fixed
-	// `## H\n%s\n\n` block with no per-line fencing, so an embedded newline
-	// could forge a `## header` the successor coord reads as trusted. This
-	// sanitization is load-bearing, not cosmetic.
-	flat := strings.TrimSpace(strings.ReplaceAll(strings.ReplaceAll(text, "\r", " "), "\n", " "))
+	// Flatten every line-break rune the successor coord's resume parser
+	// recognizes (see flattenLineBreaks) — identical guard as the decision /
+	// doc buffers. The handoff renders the explicit block body as a fixed
+	// `## H\n%s\n\n` block with no per-line fencing, so an embedded line
+	// break could forge a `## header` the successor coord reads as trusted.
+	// This sanitization is load-bearing, not cosmetic.
+	flat := strings.TrimSpace(flattenLineBreaks(text))
 	if flat == "" {
 		return errors.New("next-step text must be non-empty")
 	}
-	slug = strings.TrimSpace(strings.ReplaceAll(strings.ReplaceAll(slug, "\r", " "), "\n", " "))
+	slug = strings.TrimSpace(flattenLineBreaks(slug))
 	return withCoordState(project, func(cs map[string]any) {
 		steps := toSlice(cs["session_next_steps"])
 		// Dedupe by exact text — drop any prior entry so the new one wins AND

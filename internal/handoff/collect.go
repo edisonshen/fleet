@@ -11,9 +11,11 @@ package handoff
 //	Key Decisions        coord-state.json:recent_decisions   CollectRecentDecisionsLive
 //	                     (live-preferred over the checkpoint)
 //
-// (Next Steps + Open Questions come from tasks.md via CollectNextSteps /
-// CollectOpenQuestions in enrich.go; Completed comes from the rolling
-// checkpoint buffer via applyCheckpointToDoc.)
+// (Next Steps + Open Questions are session-scoped from coord-state.json
+// (session_next_steps / session_tasks) via CollectNextSteps /
+// CollectOpenQuestions in enrich.go, overlaid with tasks.md for live
+// status/priority only; Completed comes from the rolling checkpoint buffer
+// via applyCheckpointToDoc.)
 //
 // Both collectors are best-effort: a missing / malformed coord-state.json, an
 // empty path, or an absent/empty key returns the zero value so the caller
