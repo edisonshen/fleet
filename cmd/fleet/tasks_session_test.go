@@ -181,3 +181,60 @@ func TestAppendSessionTask_CapsToNewest(t *testing.T) {
 		t.Errorf("newest not at tail: %v", st[len(st)-1]["slug"])
 	}
 }
+
+// review iter-4 (codex P1): `fleet tasks set <slug> status=...` is the
+// documented non-promote path for a status transition, but was not a
+// session_tasks-recording seam. A coord that sets a slug to ready via
+// `tasks set` (rather than `tasks promote`) must still see it in a
+// session-scoped Next Steps render.
+func TestTasksSet_StatusChangeRecordsSessionTask(t *testing.T) {
+	home, project := setupTasksHome(t)
+	t.Setenv("FLEET_AGENT_ID", "cafe0002")
+	slug := addTodo(t, project, "set-to-ready")
+
+	if err := runTasksSet(&tasksSetOpts{project: project}, slug, "status=ready", &bytes.Buffer{}); err != nil {
+		t.Fatalf("set status=ready: %v", err)
+	}
+	st := sessionTasksOf(t, readCoordState(t, home, project))
+	if len(st) != 1 || st[0]["slug"] != slug {
+		t.Fatalf("session_tasks: got %#v", st)
+	}
+	if st[0]["coord_id"] != "cafe0002" {
+		t.Errorf("session_tasks entry not coord-stamped: %#v", st[0])
+	}
+}
+
+// `parked=...` is the Open-Questions-relevant field mutation that isn't a
+// status= change at all; it must ALSO stamp session_tasks.
+func TestTasksSet_ParkedChangeRecordsSessionTask(t *testing.T) {
+	home, project := setupTasksHome(t)
+	slug := addTodo(t, project, "park-me")
+
+	if err := runTasksSet(&tasksSetOpts{project: project}, slug, "parked=2026-07-05 waiting on operator", &bytes.Buffer{}); err != nil {
+		t.Fatalf("set parked: %v", err)
+	}
+	st := sessionTasksOf(t, readCoordState(t, home, project))
+	if len(st) != 1 || st[0]["slug"] != slug {
+		t.Fatalf("session_tasks: got %#v", st)
+	}
+}
+
+// Mutating a field the Next Steps/Open Questions collectors don't look
+// at (e.g. priority) must NOT stamp session_tasks — the `recorded` gate
+// stays false so an unrelated field bump doesn't fabricate session
+// activity for a slug this coord never actually queued/blocked.
+func TestTasksSet_NonStatusNonParkedKeyDoesNotRecordSessionTask(t *testing.T) {
+	home, project := setupTasksHome(t)
+	slug := addTodo(t, project, "bump-priority")
+	// Seed coord-state.json so readCoordState below has a file to read
+	// regardless of whether this set records anything.
+	seedCoordStateFile(t, home, project, `{"tick_count":1}`)
+
+	if err := runTasksSet(&tasksSetOpts{project: project}, slug, "priority=P0", &bytes.Buffer{}); err != nil {
+		t.Fatalf("set priority: %v", err)
+	}
+	st := sessionTasksOf(t, readCoordState(t, home, project))
+	if len(st) != 0 {
+		t.Errorf("priority-only set must not record session_tasks: %#v", st)
+	}
+}

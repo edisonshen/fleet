@@ -1153,6 +1153,13 @@ def _tick_locked(
             # for the same slug (one owner per id per tick).
             if rp.slug:
                 supervisor_mod.forget_pending_acquire_agent_id(state, rp.slug)
+                # review iter-4 [P2] (codex): a replayed launch is still
+                # current-session work (the broken-stdout / crash-recovery
+                # path re-emitting a block for a task this coord already
+                # owns) — record it into the session-scoped Next Steps
+                # auto buffer too, or a handoff before the next normal
+                # dispatch/promote seam touches this slug would drop it.
+                _record_session_task(state, rp.slug, coord_id)
 
     # 5a. Review handoffs (reviewer-subagent-arch). Detect in-flight
     # tasks whose state.json reports phase=review-pending (→ dispatch

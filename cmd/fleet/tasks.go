@@ -894,7 +894,19 @@ func runTasksSet(opts *tasksSetOpts, slug, kv string, stdout io.Writer) error {
 	key := strings.TrimSpace(kv[:idx])
 	value := strings.TrimSpace(kv[idx+1:])
 
-	return withTasksLock(project, func() error {
+	// review iter-4 [P1] (codex): `fleet tasks set <slug> status=... /
+	// parked=...` is the documented non-promote path for a task's status
+	// or Open-Questions reason to change — but it never stamped
+	// session_tasks, so a session-scoped Next Steps/Open Questions render
+	// would silently omit a slug this coord explicitly set to ready/
+	// blocked/parked THIS session, unless some later promote/dispatch
+	// happened to also touch it. `recorded` gates the best-effort
+	// session_tasks append below to exactly the two keys the auto
+	// collectors care about; other key= mutations (priority, notes,
+	// worker_pid, ...) don't change what Next Steps/Open Questions would
+	// render for this slug, so they don't need the stamp.
+	recorded := key == "status" || key == "parked"
+	err = withTasksLock(project, func() error {
 		f, path, err := readTasks(project)
 		if err != nil {
 			return err
@@ -934,6 +946,20 @@ func runTasksSet(opts *tasksSetOpts, slug, kv string, stdout io.Writer) error {
 		_, _ = fmt.Fprintf(stdout, "set %s.%s = %s\n", slug, key, value)
 		return nil
 	})
+	if err != nil {
+		return err
+	}
+	// Same sequential (never-nested) lock ordering as runTasksPromote:
+	// the tasks/state lock is already released above, so taking
+	// coordinator.lock here can't invert the coordinator→state order a
+	// live tick uses. Strictly best-effort — a lock-contention error is
+	// logged + swallowed, and `tasks set` still returns success.
+	if recorded {
+		if aerr := appendSessionTask(project, slug); aerr != nil {
+			fmt.Fprintf(os.Stderr, "tasks set: session_tasks append dropped for %s (%v)\n", slug, aerr)
+		}
+	}
+	return nil
 }
 
 // stampLifecycleTransition applies the lifecycle stamping rules in one
