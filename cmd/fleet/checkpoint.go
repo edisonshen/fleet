@@ -193,15 +193,31 @@ func runCheckpointNextStep(project, slug, text string) error {
 // tail) and capped to sessionTasksMax. Stamps FLEET_AGENT_ID as coord_id.
 // Takes coordinator.lock via withCoordState.
 //
-// `fleet tasks promote` calls this SEQUENTIALLY AFTER releasing the tasks
-// lock (never nested) so the coordinator→state lock order the live tick uses
-// is never inverted here (state→coordinator would AB-BA vs a coincident
-// `fleet tasks set`). The append is strictly best-effort at the call site:
-// a lock-contention error is logged + swallowed, and promote still succeeds.
+// `fleet tasks promote` / `fleet tasks set` call this SEQUENTIALLY AFTER
+// releasing the tasks lock (never nested) so the coordinator→state lock order
+// the live tick uses is never inverted here (state→coordinator would AB-BA vs
+// a coincident `fleet tasks set`).
+//
+// FAIL-FAST (codex review P1): the acquire is a single non-blocking LOCK_NB
+// attempt, NOT a bounded wait. `fleet tasks set status=…/parked=…` (and
+// `promote`) can be spawned BY THE LIVE COORD TICK — loop.py's
+// _apply_reconcile / _set_parked / reaper requeue shell out to `fleet tasks
+// set` WHILE the tick holds coordinator.lock. A blocking acquire there would
+// stall the child for the full timeout on EVERY such transition. Fail-fast
+// returns instantly; a lock-contention miss is CORRECT because a tick-owned
+// slug was already stamped at its dispatch seam (loop.py _record_session_task)
+// and the reader overlays live tasks.md status, so the status change still
+// renders. Only a MANUAL `fleet tasks set` (no tick, lock free) needs — and
+// gets — the append. Contention returns nil (silent, expected); only a
+// genuine I/O error propagates so the caller can log it.
 func appendSessionTask(project, slug string) error {
-	return withCoordState(project, func(cs map[string]any) {
+	err := withCoordStateTimeout(project, 0, func(cs map[string]any) {
 		recordSessionTaskEntry(cs, slug, os.Getenv("FLEET_AGENT_ID"))
 	})
+	if err != nil && errors.Is(err, state.ErrLockTimeout) {
+		return nil // coord tick (or a coincident writer) owns the lock; skip
+	}
+	return err
 }
 
 // recordSessionTaskEntry mutates cs["session_tasks"] in place: dedupe by
@@ -358,11 +374,25 @@ func runCheckpointDecision(project, text string) error {
 	})
 }
 
-// withCoordState resolves the project, takes coordinator.lock, and applies
-// mutate to a read coord-state.json dict, then atomically writes it back.
-// Load-mutate-save the WHOLE dict (never reconstruct) so sibling keys the
-// tick owns ride through untouched.
+// withCoordState resolves the project, takes coordinator.lock (bounded by
+// coordLockTimeout), and applies mutate to a read coord-state.json dict, then
+// atomically writes it back. Load-mutate-save the WHOLE dict (never
+// reconstruct) so sibling keys the tick owns ride through untouched. Used by
+// the operator/agent-invoked provenance writers (`fleet checkpoint …`) that
+// are NEVER called from inside a live tick, so blocking-with-timeout is safe.
 func withCoordState(project string, mutate func(map[string]any)) error {
+	return withCoordStateTimeout(project, coordLockTimeout, mutate)
+}
+
+// withCoordStateTimeout is withCoordState with a caller-chosen lock timeout.
+// A non-positive timeout means a single fail-fast LOCK_NB attempt (see
+// state.LockCoordinatorTimeout) — used by appendSessionTask, which can be
+// invoked by a `fleet tasks set/promote` child process the LIVE COORD TICK
+// spawned WHILE the tick itself already holds coordinator.lock (a separate
+// open file description → genuine self-contention). Blocking there would
+// stall every dispatch/requeue transition for the full timeout; fail-fast
+// skips instantly (codex review P1).
+func withCoordStateTimeout(project string, timeout time.Duration, mutate func(map[string]any)) error {
 	proj, err := resolveProject(project)
 	if err != nil {
 		return err
@@ -373,7 +403,7 @@ func withCoordState(project string, mutate func(map[string]any)) error {
 	}
 	csPath := filepath.Join(pdir, "coord-state.json")
 
-	release, err := state.LockCoordinatorTimeout(proj, coordLockTimeout)
+	release, err := state.LockCoordinatorTimeout(proj, timeout)
 	if err != nil {
 		return fmt.Errorf("checkpoint: %w", err)
 	}

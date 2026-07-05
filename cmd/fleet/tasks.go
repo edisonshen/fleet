@@ -960,11 +960,13 @@ func runTasksSet(opts *tasksSetOpts, slug, kv string, stdout io.Writer) error {
 	if err != nil {
 		return err
 	}
-	// Same sequential (never-nested) lock ordering as runTasksPromote:
-	// the tasks/state lock is already released above, so taking
-	// coordinator.lock here can't invert the coordinator→state order a
-	// live tick uses. Strictly best-effort — a lock-contention error is
-	// logged + swallowed, and `tasks set` still returns success.
+	// Same sequential (never-nested) lock ordering as runTasksPromote: the
+	// tasks/state lock is already released above, so taking coordinator.lock
+	// here can't invert the coordinator→state order a live tick uses.
+	// appendSessionTask is FAIL-FAST + silent on lock-contention (the
+	// tick-holds-the-lock case; the slug is already stamped at its dispatch
+	// seam), so this never stalls a tick-invoked `fleet tasks set`. Only a
+	// genuine I/O error surfaces here — logged, never fatal to the command.
 	if recorded {
 		if aerr := appendSessionTask(project, slug); aerr != nil {
 			fmt.Fprintf(os.Stderr, "tasks set: session_tasks append dropped for %s (%v)\n", slug, aerr)
@@ -1399,9 +1401,10 @@ func runTasksPromote(opts *tasksPromoteOpts, slug string, stdout io.Writer) erro
 	// (coord-state.json:session_tasks). SEQUENTIAL — the tasks (state.lock) is
 	// already released, so taking coordinator.lock here can't invert the
 	// coordinator→state order a live tick uses (state→coordinator would AB-BA
-	// vs a coincident `fleet tasks set`). STRICTLY BEST-EFFORT: a
-	// coordinator.lock contention (live tick holds it) is logged + swallowed;
-	// promote still returns success — the stamp must never fail a core command.
+	// vs a coincident `fleet tasks set`). appendSessionTask is FAIL-FAST +
+	// silent on lock-contention (a tick holding the lock; the slug is already
+	// stamped at its dispatch seam), so this never stalls a tick-invoked
+	// promote. Only a genuine I/O error surfaces — logged, never fatal.
 	if recorded {
 		if aerr := appendSessionTask(project, slug); aerr != nil {
 			fmt.Fprintf(os.Stderr, "tasks promote: session_tasks append dropped for %s (%v)\n", slug, aerr)

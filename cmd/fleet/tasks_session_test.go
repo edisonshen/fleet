@@ -95,16 +95,20 @@ func TestTasksPromote_DedupesSessionTaskBySlug(t *testing.T) {
 	}
 }
 
-// T16 — best-effort: when coordinator.lock is held (a live tick), the
-// session_tasks append is dropped but `fleet tasks promote` STILL promotes
-// tasks.md and returns success (exit 0). The append must never fail or block
-// a core command.
+// T16 — best-effort + FAIL-FAST: when coordinator.lock is held (a live
+// tick), the session_tasks append is dropped but `fleet tasks promote`
+// STILL promotes tasks.md and returns success (exit 0). codex review P1:
+// the append must fail-fast (single LOCK_NB attempt) — NOT block for the
+// 2s coordLockTimeout — because the coord tick spawns this very command
+// WHILE holding the lock, so a blocking wait would stall every
+// dispatch/requeue transition. The append returns nil (silent) on
+// contention, never surfaces as an error.
 func TestTasksPromote_SessionTaskBestEffortUnderLock(t *testing.T) {
 	home, project := setupTasksHome(t)
 	slug := addTodo(t, project, "under-lock")
 
-	// Hold coordinator.lock for the whole promote so the append RMW times
-	// out. Separate open file description → contends even in-process.
+	// Hold coordinator.lock for the whole promote so the append RMW
+	// contends. Separate open file description → contends even in-process.
 	release, err := state.LockCoordinatorTimeout(project, 2*time.Second)
 	if err != nil {
 		t.Fatalf("hold coordinator.lock: %v", err)
@@ -112,8 +116,16 @@ func TestTasksPromote_SessionTaskBestEffortUnderLock(t *testing.T) {
 	defer release()
 
 	out := &bytes.Buffer{}
+	start := time.Now()
 	if err := runTasksPromote(&tasksPromoteOpts{project: project}, slug, out); err != nil {
 		t.Fatalf("promote must succeed despite locked coord-state: %v", err)
+	}
+	// Fail-fast: promote must return WELL under the 2s coordLockTimeout —
+	// it must not have blocked waiting for the held lock. Generous 1s bound
+	// (fail-fast is a single non-blocking attempt; 1s absorbs CI jitter
+	// without admitting a 2s blocking-wait regression).
+	if elapsed := time.Since(start); elapsed > 1*time.Second {
+		t.Errorf("promote stalled %s under a held coord lock — append must fail-fast, not block %s", elapsed, coordLockTimeout)
 	}
 	// tasks.md WAS promoted.
 	f, _, err := readTasks(project)
