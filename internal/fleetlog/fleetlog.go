@@ -55,7 +55,8 @@ const (
 // within this set and tests assert membership.
 var Types = map[string]bool{
 	"coord.start": true, "coord.handoff": true, "coord.resume": true,
-	"coord.tick": true, "decision": true, "dispatch.worker": true,
+	"coord.tick": true, "coord.quarantine": true,
+	"decision": true, "dispatch.worker": true,
 	"worker.start": true, "tool.call": true, "tool.result": true,
 	"model.call": true, "state.transition": true, "pr.opened": true,
 	"pr.status": true, "task.completed": true, "worker.failed": true,

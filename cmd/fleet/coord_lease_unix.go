@@ -20,14 +20,15 @@ import (
 	"github.com/edisonshen/fleet/internal/agent"
 	"github.com/edisonshen/fleet/internal/coord"
 	"github.com/edisonshen/fleet/internal/coordlock"
+	"github.com/edisonshen/fleet/internal/fleetlog"
+	"github.com/edisonshen/fleet/internal/gc"
 	"github.com/edisonshen/fleet/internal/spawn"
 	"github.com/edisonshen/fleet/internal/state"
-	"github.com/edisonshen/fleet/internal/tmux"
 )
 
 // defaultAcquireLease is the production lease-acquire seam runCoordRun
 // uses when opts.acquireLease is nil (see productionAcquireLease).
-func defaultAcquireLease(opts coordRunOpts, stderr io.Writer) func() (coordLease, bool, error) {
+func defaultAcquireLease(opts coordRunOpts, stderr io.Writer) func() (coordLease, bool, []liveHolderInfo, error) {
 	return productionAcquireLease(opts, stderr)
 }
 
@@ -71,17 +72,18 @@ func coordLeaderCheck(project string) bool {
 //     primitive simply refuses on an unstamped record).
 //  2. coordlock.AcquireLeaseWithKill, injecting the authenticated
 //     internal/coord.KillCoordIfIdentityMatches as the takeover STONITH.
-//  3. On acquire, run the new-leader competitor SWEEP: enumerate
-//     same-project coord supervisors and reap any stale straggler (a
-//     pre-lease or cross-socket coord the flock alone wouldn't catch)
-//     through the SAME authenticated primitive. The flock is the primary
-//     singleton; the sweep is belt-and-braces.
+//  3. On acquire, run the new-leader competitor SWEEP: DETECT + REPORT
+//     any same-project coord straggler (a pre-lease or cross-socket coord
+//     the flock alone wouldn't catch). Report-only (KP3,
+//     DESIGN-coord-no-auto-kill): the flock is the singleton; reaping is
+//     operator-gated (`fleet gc --apply` for corpses, `fleet rm` /
+//     `fleet handoff` for live ones).
 //
 // All of this is behind FLEET_LEASE_FAILOVER inside coordlock (Acquire-
 // LeaseWithKill returns ErrFailoverDisabled when off), so off-flag the
 // closure is a cheap no-op that signals "legacy path" to runCoordRun.
-func productionAcquireLease(opts coordRunOpts, stderr io.Writer) func() (coordLease, bool, error) {
-	return func() (coordLease, bool, error) {
+func productionAcquireLease(opts coordRunOpts, stderr io.Writer) func() (coordLease, bool, []liveHolderInfo, error) {
+	return func() (coordLease, bool, []liveHolderInfo, error) {
 		// Step 1: stamp supervisor identity (best-effort, only when the
 		// flag is on — off-flag we skip to keep records byte-identical).
 		// spawn.Spawn writes the record BEFORE launching us, but we RETRY
@@ -104,8 +106,10 @@ func productionAcquireLease(opts coordRunOpts, stderr io.Writer) func() (coordLe
 			}
 		}
 
-		// Step 2: acquire with the authenticated kill injected.
-		lease, acquired, err := coordlock.AcquireLeaseWithKill(
+		// Step 2: acquire with the authenticated kill injected. The KP6
+		// live-holder detection rides along (converted to the
+		// platform-neutral shape) so the standby poll loop can quarantine.
+		lease, acquired, live, err := coordlock.AcquireLeaseWithKill(
 			opts.project, opts.agentID,
 			func(t coordlock.KillTarget) error {
 				return coord.KillCoordIfIdentityMatches(coord.KillTarget{
@@ -117,15 +121,29 @@ func productionAcquireLease(opts coordRunOpts, stderr io.Writer) func() (coordLe
 				})
 			})
 		if err != nil || !acquired {
-			return nil, acquired, err
+			return nil, acquired, liveHolderInfosFrom(live), err
 		}
 
-		// Step 3: new-leader competitor sweep. Best-effort: a sweep error
-		// is surfaced but does NOT fail the acquire — we already hold the
-		// flock, so we are the leader regardless.
+		// Step 3: new-leader competitor sweep — detect + report only (KP3).
+		// Best-effort: a sweep error is surfaced but does NOT fail the
+		// acquire — we already hold the flock, so we are the leader
+		// regardless.
 		sweepStaleCompetitors(opts.agentID, opts.project, stderr)
-		return lease, true, nil
+		return lease, true, nil, nil
 	}
+}
+
+// liveHolderInfosFrom converts coordlock's exported detection tuples into
+// the platform-neutral shape coord.go's seams carry.
+func liveHolderInfosFrom(hs []coordlock.LiveHolder) []liveHolderInfo {
+	if len(hs) == 0 {
+		return nil
+	}
+	out := make([]liveHolderInfo, 0, len(hs))
+	for _, h := range hs {
+		out = append(out, liveHolderInfo{pid: h.Pid, pidStart: h.PidStart, agentID: h.AgentID})
+	}
+	return out
 }
 
 // stampSupervisorIdentityRetries / Delay bound the load-modify-write
@@ -169,22 +187,79 @@ func leaseActiveOwnerPID(project string) (int, bool) {
 	return coordlock.CurrentActiveOwnerPID(project)
 }
 
+// wireGCCoordDeps installs the platform-gated stale-coords seams into a
+// gc.Deps (DESIGN-coord-no-auto-kill gc spec). internal/gc is untagged so
+// it keeps building on freebsd; the lease + kill primitives these seams
+// need are linux||darwin-only, so the production wiring lives in THIS
+// build-tagged file (the other-platform stub leaves them nil and the
+// classifier fails safe: class (a) skipped, nothing ever signaled).
+//
+//   - CoordSupervisorAlive is the pid-reuse-safe (pid + pid_start) probe.
+//     The live/dead split MUST be enforced by this gc-side pre-probe:
+//     KillCoordIfIdentityMatches refuses only the CURRENT active lease
+//     owner and WOULD signal a live stale competitor. A recorded
+//     pid_start of 0 makes the identity unprovable -> treat as ALIVE
+//     (never signal on an unprovable identity).
+//   - KillCoord runs the authenticated kill (a provably-dead pid is a
+//     benign no-op there) and then the coord cleanup the corpse's own
+//     `defer Cleanup` never ran: archive the record + reap the session.
+//   - CoordStandbyTimeout feeds class (b): the standby-timeout value is
+//     owned by cmd/fleet, so gc receives it via Deps.
+func wireGCCoordDeps(deps *gc.Deps) {
+	deps.ActiveLeaseOwnerPID = coordlock.CurrentActiveOwnerPID
+	deps.CoordSupervisorAlive = func(pid int, pidStart int64) bool {
+		if pid <= 0 {
+			return false
+		}
+		st, ok := coordlock.PidStartNanos(pid)
+		if !ok {
+			return false // no such process — provably dead
+		}
+		if pidStart == 0 {
+			return true // identity unprovable — never treat as reapable
+		}
+		return st == pidStart
+	}
+	deps.KillCoord = func(t gc.CoordKillTarget) error {
+		if err := coord.KillCoordIfIdentityMatches(coord.KillTarget{
+			Pid:      t.Pid,
+			PidStart: t.PidStart,
+			AgentID:  t.AgentID,
+			Project:  t.Project,
+		}); err != nil {
+			return err
+		}
+		// The dead supervisor's own deferred cleanup never ran; reap its
+		// tmux/engine session + archive the record (idempotent).
+		return coord.Cleanup(t.AgentID, t.Project, coord.Default())
+	}
+	deps.CoordStandbyTimeout = defaultStandbyTimeout
+}
+
 func leaseLeaderPresent(project string) bool {
 	return coordlock.LeaderPresent(project)
 }
 
-var (
-	sweepKillCoordFn   = coord.KillCoordIfIdentityMatches
-	sweepKillSessionFn = tmux.Kill
-)
-
-// sweepStaleCompetitors reaps any OTHER same-project coord supervisor
-// through the authenticated kill primitive after we win the lease. The
-// flock is the primary singleton; this catches a pre-lease or
-// cross-tmux-socket straggler the flock alone can't see. The primitive
-// re-validates every target (pid-reuse, exe-path, epoch, self) and
-// refuses unless it is provably a stale same-project coord-run — so this
-// can never shoot the new leader (us) or a different project's coord.
+// sweepStaleCompetitors DETECTS and REPORTS any OTHER same-project coord
+// record after we win the lease — it never signals a process or reaps a
+// session (KP3, DESIGN-coord-no-auto-kill). The sweep fires on a
+// staleness heuristic (records presumed stale after a lease win), and a
+// staleness heuristic may report and quarantine but never terminate: the
+// 2026-07-04 incident was exactly this machinery shooting live coords
+// after a machine stall. The flock remains the singleton; reaping is
+// operator-gated — `fleet gc` lists both families (dead => --apply reaps,
+// live => surfaced with the `fleet rm <id>` / `fleet handoff <id>` hint).
+//
+// Two detected families, one report line + one fleetlog
+// coord.quarantine{stale-competitor} event each:
+//   - stamped competitors (another coord-run supervisor's record);
+//   - unstamped lease-wrapped standbys (a `coord-run --standby` spawn
+//     that never stamped its supervisor identity). LeaseWrapped is the
+//     discriminator (agent.go): bare/legacy coords (SupervisorPID==0 &&
+//     !LeaseWrapped) are OUT of scope entirely — never even reported.
+//
+// The no-invocation guarantee is asserted structurally by
+// TestSweepStaleCompetitors_StructurallyKillFree.
 func sweepStaleCompetitors(selfAgentID, project string, stderr io.Writer) {
 	recs, err := agent.List()
 	if err != nil {
@@ -192,53 +267,37 @@ func sweepStaleCompetitors(selfAgentID, project string, stderr io.Writer) {
 		return
 	}
 	self := os.Getpid()
+	report := func(r *agent.Record, msg string) {
+		_, _ = fmt.Fprintln(stderr, msg)
+		fleetlog.Log(fleetlog.CompCoord, "coord.quarantine", "warn", fleetlog.Fields{
+			Proj:  project,
+			Agent: r.ID,
+			Msg:   msg,
+			Data: map[string]any{
+				"reason":    "stale-competitor",
+				"pid":       r.SupervisorPID,
+				"pid_start": r.SupervisorPidStart,
+				"session":   r.TmuxSession,
+			},
+		})
+	}
 	for _, r := range recs {
 		if r == nil || r.Project != project {
 			continue
 		}
 		if r.ID == selfAgentID {
-			continue // never target our own record
+			continue // never report our own record
 		}
-		if r.SupervisorPID <= 0 {
-			// Unstamped record: SupervisorPID==0 means either (a) a
-			// lease-wrapped standby that lost the race / hasn't stamped its
-			// supervisor identity yet — safe to reap, OR (b) a live LEGACY/
-			// BARE coord that never runs a supervisor at all. We must NOT
-			// blind-kill (b): a bare coord can be the only working
-			// coordinator, and reaping its session bypasses the handoff
-			// readiness/rollback path and can strand the project coord-less
-			// mid-handoff (codex iter-28 P1).
-			//
-			// LeaseWrapped is the authoritative discriminator (agent.go):
-			// true ONLY for `coord-run --standby` spawns, false/absent for
-			// legacy + bare/direct successors. Reap only the lease-wrapped,
-			// not-yet-stamped losing standby.
-			if r.LeaseWrapped && spawn.IsCoordSpawn(r.TaskID, r.Project) && r.TmuxSession != "" {
-				if err := sweepKillSessionFn(r.TmuxSession); err != nil &&
-					!errors.Is(err, tmux.ErrNoSession) {
-					_, _ = fmt.Fprintf(stderr, "coord-run: sweep reap standby session=%s agent=%s: %v\n",
-						r.TmuxSession, r.ID, err)
-				}
-			}
-			continue
-		}
-		if r.SupervisorPID == self {
-			continue // it's us
-		}
-		if err := sweepKillCoordFn(coord.KillTarget{
-			Pid:      r.SupervisorPID,
-			PidStart: r.SupervisorPidStart,
-			AgentID:  r.ID,
-			Project:  project,
-			// The sweep runs AFTER we became the active owner, so any
-			// other coord is fenced by construction; the primitive's
-			// "never shoot the current active owner" gate protects us.
-			FencerEpoch: 0,
-		}); err != nil && !errors.Is(err, coord.ErrKillRefused) {
-			// A refusal is expected + benign (most records won't match);
-			// only surface real signal/infra faults.
-			_, _ = fmt.Fprintf(stderr, "coord-run: sweep reap pid=%d agent=%s: %v\n",
-				r.SupervisorPID, r.ID, err)
+		switch {
+		case r.SupervisorPID > 0 && r.SupervisorPID != self:
+			report(r, fmt.Sprintf(
+				"coord-run: stale coord competitor detected (report-only): agent=%s supervisor_pid=%d project=%s — run `fleet gc` to reap a dead one, `fleet rm %s` or `fleet handoff %s` for a live one",
+				r.ID, r.SupervisorPID, project, r.ID, r.ID))
+		case r.SupervisorPID == 0 && r.LeaseWrapped &&
+			spawn.IsCoordSpawn(r.TaskID, r.Project) && r.TmuxSession != "":
+			report(r, fmt.Sprintf(
+				"coord-run: stale unstamped standby detected (report-only): agent=%s session=%s project=%s — `fleet gc --apply` reaps it once it is past the standby timeout",
+				r.ID, r.TmuxSession, project))
 		}
 	}
 }

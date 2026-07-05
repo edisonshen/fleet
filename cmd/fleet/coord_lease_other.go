@@ -14,6 +14,8 @@ package main
 import (
 	"errors"
 	"io"
+
+	"github.com/edisonshen/fleet/internal/gc"
 )
 
 // errLeaseUnsupported is the sentinel defaultAcquireLease returns on a
@@ -24,9 +26,9 @@ var errLeaseUnsupported = errors.New(
 		"(linux/darwin only); running coord without a lease supervisor")
 
 // defaultAcquireLease always reports "unsupported" on non-linux/darwin.
-func defaultAcquireLease(_ coordRunOpts, _ io.Writer) func() (coordLease, bool, error) {
-	return func() (coordLease, bool, error) {
-		return nil, false, errLeaseUnsupported
+func defaultAcquireLease(_ coordRunOpts, _ io.Writer) func() (coordLease, bool, []liveHolderInfo, error) {
+	return func() (coordLease, bool, []liveHolderInfo, error) {
+		return nil, false, nil, errLeaseUnsupported
 	}
 }
 
@@ -52,3 +54,8 @@ func leaseFailoverEnabled() bool { return false }
 func leaseActiveOwnerPID(string) (int, bool) { return 0, false }
 
 func leaseLeaderPresent(string) bool { return false }
+
+// wireGCCoordDeps is a no-op on platforms without the lease + kill
+// primitives: the stale-coords classifier's platform seams stay nil and
+// it fails safe (class (a) skipped entirely; nothing is ever signaled).
+func wireGCCoordDeps(*gc.Deps) {}

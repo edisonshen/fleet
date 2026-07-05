@@ -99,6 +99,16 @@ func newGCCmd() *cobra.Command {
                    record. Add --legacy-drains for the one-time coarse
                    ps sweep of the existing 81 that predate the
                    run-record (sleeping + age>=5m) (handoff-drain-storm-leak)
+  stale-coords   — stale same-project coord leftovers, the lease sweep's
+                   FORMER kill targets (DESIGN-coord-no-auto-kill): (a)
+                   stamped competitors whose supervisor is not the current
+                   active lease owner — DEAD supervisor reaped under
+                   --apply; a LIVE one is surfaced with the fleet rm /
+                   fleet handoff hint and --apply SKIPS it (gc never
+                   signals a live pid); (b) unstamped lease-wrapped
+                   standbys whose session outlived the standby timeout —
+                   session reaped under --apply. Bare legacy coords are
+                   never candidates
 
 Default behavior is DRY-RUN — prints a planned action list and exits
 0 WITHOUT mutating. Pass --apply to actually remove / archive / kill.
@@ -135,7 +145,7 @@ Exit codes:
 	cmd.Flags().DurationVar(&f.maxAge, "max-age", gcDefaultMaxAge,
 		"age floor for socket sweep (Go duration; default 24h)")
 	cmd.Flags().StringVar(&f.kindsCSV, "kinds", "",
-		"comma-separated kinds to consider (sockets,orphan-agents,orphan-tmux,worktrees,coord-locks,worker-records,invalid-projects,orphan-rc-daemons,drain-procs); empty = all")
+		"comma-separated kinds to consider (sockets,orphan-agents,orphan-tmux,worktrees,coord-locks,worker-records,invalid-projects,orphan-rc-daemons,drain-procs,stale-coords); empty = all")
 	cmd.Flags().StringVar(&f.project, "project", "",
 		"scope worktree + agent enumeration to one project (default: all projects)")
 	cmd.Flags().BoolVar(&f.legacyDrains, "legacy-drains", false,
@@ -245,6 +255,11 @@ func runGC(stdout, stderr io.Writer, f *gcFlags) error {
 		}
 	}
 	deps := gc.DefaultDeps()
+	// Stale-coords platform seams (lease owner probe, pid-reuse-safe
+	// supervisor liveness, authenticated dead-coord reap) live behind the
+	// linux||darwin build tag; the other-platform stub leaves them nil and
+	// the classifier fails safe (DESIGN-coord-no-auto-kill).
+	wireGCCoordDeps(&deps)
 	report, rerr := gc.Reconcile(opts, deps)
 	// Render the report regardless of error — per-classifier failures
 	// shouldn't suppress the actions that DID succeed.
@@ -297,14 +312,14 @@ func parseKindsCSV(csv string) ([]gc.Kind, error) {
 		}
 		k := gc.Kind(p)
 		switch k {
-		case gc.KindSockets, gc.KindOrphanAgents, gc.KindOrphanTmux, gc.KindWorktrees, gc.KindCoordLocks, gc.KindWorkerRecords, gc.KindInvalidProjects, gc.KindOrphanRCDaemons, gc.KindDrainProcs:
+		case gc.KindSockets, gc.KindOrphanAgents, gc.KindOrphanTmux, gc.KindWorktrees, gc.KindCoordLocks, gc.KindWorkerRecords, gc.KindInvalidProjects, gc.KindOrphanRCDaemons, gc.KindDrainProcs, gc.KindStaleCoords:
 			out = append(out, k)
 		default:
-			return nil, fmt.Errorf("unknown --kinds value %q (allowed: sockets, orphan-agents, orphan-tmux, worktrees, coord-locks, worker-records, invalid-projects, orphan-rc-daemons, drain-procs)", p)
+			return nil, fmt.Errorf("unknown --kinds value %q (allowed: sockets, orphan-agents, orphan-tmux, worktrees, coord-locks, worker-records, invalid-projects, orphan-rc-daemons, drain-procs, stale-coords)", p)
 		}
 	}
 	if len(out) == 0 {
-		return nil, fmt.Errorf("--kinds parsed empty list (allowed: sockets, orphan-agents, orphan-tmux, worktrees, coord-locks, worker-records, invalid-projects, orphan-rc-daemons, drain-procs)")
+		return nil, fmt.Errorf("--kinds parsed empty list (allowed: sockets, orphan-agents, orphan-tmux, worktrees, coord-locks, worker-records, invalid-projects, orphan-rc-daemons, drain-procs, stale-coords)")
 	}
 	return out, nil
 }
@@ -325,7 +340,7 @@ func renderReport(stdout io.Writer, opts gc.Options, r gc.Report) {
 	_, _ = fmt.Fprintf(stdout, "fleet gc — mode=%s aggressive=%t max-age=%s\n",
 		mode, opts.Aggressive, opts.MaxAge)
 
-	var nSockets, nAgents, nTmux, nWorktrees, nCoordLocks, nWorkerRecords, nInvalidProjects, nRCDaemons, nDrainProcs int
+	var nSockets, nAgents, nTmux, nWorktrees, nCoordLocks, nWorkerRecords, nInvalidProjects, nRCDaemons, nDrainProcs, nStaleCoords int
 	for _, a := range r.Actions {
 		_, _ = fmt.Fprintf(stdout, "%s  %s  verb=%s  reason=%s\n",
 			a.Kind, a.Target, a.Verb, a.Reason)
@@ -348,9 +363,11 @@ func renderReport(stdout io.Writer, opts gc.Options, r gc.Report) {
 			nRCDaemons++
 		case gc.KindDrainProcs:
 			nDrainProcs++
+		case gc.KindStaleCoords:
+			nStaleCoords++
 		}
 	}
 	_, _ = fmt.Fprintf(stdout,
-		"summary: %d sockets, %d agents, %d tmux (surface only by default), %d worktrees, %d coord-locks, %d worker-records, %d invalid-projects, %d orphan-rc-daemons, %d drain-procs\n",
-		nSockets, nAgents, nTmux, nWorktrees, nCoordLocks, nWorkerRecords, nInvalidProjects, nRCDaemons, nDrainProcs)
+		"summary: %d sockets, %d agents, %d tmux (surface only by default), %d worktrees, %d coord-locks, %d worker-records, %d invalid-projects, %d orphan-rc-daemons, %d drain-procs, %d stale-coords\n",
+		nSockets, nAgents, nTmux, nWorktrees, nCoordLocks, nWorkerRecords, nInvalidProjects, nRCDaemons, nDrainProcs, nStaleCoords)
 }

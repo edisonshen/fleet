@@ -418,10 +418,16 @@ func TestT2_LeaseReleasedOnHolderDeath(t *testing.T) {
 
 // ---- T3 ----
 
-// T3: takeover on TTL expiry of a HUNG holder whose flock is STILL HELD.
-// Order must be fence (epoch CAS to fencing) -> kill -> acquire. The
-// kill-stub releases the simulated holder's flock so the candidate can
-// acquire it after the kill.
+// T3: takeover on TTL expiry of a DEAD holder whose flock is (in this
+// simulated harness) still held. Order must be fence (epoch CAS to
+// fencing) -> kill -> acquire; the kill-stub releases the simulated
+// holder's flock so the candidate can acquire it after the kill.
+//
+// KP6 rewrite (DESIGN-coord-no-auto-kill): the original T3 holder was
+// hung-but-ALIVE and the takeover shot it. A staleness heuristic may no
+// longer kill a live coordinator — the live-holder shape now ABORTS
+// pre-fence (TestKP6_LiveOwnerAbortsTakeoverPreFence). T3 keeps pinning
+// the fence->kill->acquire order on the provably-dead path.
 func TestT3_TakeoverOnTTLExpiryHungHolder(t *testing.T) {
 	setupHome(t)
 	const project = "rainier"
@@ -430,7 +436,7 @@ func TestT3_TakeoverOnTTLExpiryHungHolder(t *testing.T) {
 
 	const holderPid = 4242
 	const holderStart = int64(222222)
-	live.set(holderPid, holderStart)
+	// Holder pid NOT in the live map: provably dead (all-dead gate passes).
 	relHolder := holdFlock(t, project)
 
 	// Active epoch with renewed_at frozen at t=0.
@@ -790,8 +796,10 @@ func TestT34_TwoPhaseCrashBetweenFenceAndAcquire(t *testing.T) {
 
 	const oldPid = 4242
 	const oldStart = int64(222222)
-	// OLD holder: flock STILL held (hung), pid alive.
-	live.set(oldPid, oldStart)
+	// OLD holder: flock still held in this simulated harness, pid DEAD.
+	// (KP6 rewrite: a live OLD now aborts the resume pre-fence — see
+	// TestKP6_LiveOwnerAbortsTakeoverPreFence; the two-phase resume this
+	// test pins requires every prospective target provably dead.)
 	relOld := holdFlock(t, project)
 
 	// A dead candidate left a stalled fencing record naming OLD as owner.
@@ -1520,9 +1528,12 @@ func TestBusyFlockNoEpoch_StaleHolderRecovers(t *testing.T) {
 	live := newFakeLiveness()
 	paths, _ := resolvePaths(project)
 
-	holdFlock(t, project) // hung holder still holds the flock
+	holdFlock(t, project) // holder's flock still held in this harness
 	const hungPid = 7000
-	live.set(hungPid, int64(777777))
+	// Holder pid NOT in the live map: provably dead. (KP6 rewrite: a
+	// LIVE in-window holder now aborts pre-fence and is quarantined —
+	// TestKP6_LiveFlockBodyHolderAborts; the escalate-loudly contract
+	// this test pins applies to the provably-dead holder.)
 	// Body stamped at mono=0; we advance past TTL so it reads as hung.
 	body, _ := json.Marshal(flockBody{Pid: hungPid, PidStart: int64(777777), BootID: "test-boot-1", Mono: 0})
 	if err := os.WriteFile(paths.flock, body, 0o644); err != nil {
@@ -1634,14 +1645,15 @@ func errorsIsSerializerBusy(err error) bool {
 	return err != nil && err == errSerializerBusy //nolint:errorlint // exact sentinel, never wrapped here.
 }
 
-// ---- codex iter-9 [P2]: resume-takeover kills the actual flock holder ----
+// ---- codex iter-9 [P2] / KP6 rewrite: live flock holder is quarantined ----
 
 // When resuming a STALE fencing record whose previous candidate acquired
 // coordinator.flock and stamped its body before hanging, the live flock
-// holder is that CANDIDATE, not the original `old` owner. The takeover must
-// kill the candidate (the flock-body holder), else retryFlock just times
-// out and we escalate to fenced_not_acquired instead of recovering.
-func TestResumeTakeoverKillsFlockBodyHolder(t *testing.T) {
+// holder is that CANDIDATE, not the original `old` owner. The gate must
+// COVER the candidate (it is a prospective kill target) — and because it
+// is ALIVE, the resume aborts pre-fence and surfaces it in the detection
+// result (DESIGN-coord-no-auto-kill: staleness never kills a live coord).
+func TestResumeTakeover_LiveFlockBodyHolderQuarantined(t *testing.T) {
 	setupHome(t)
 	const project = "rainier"
 	clk := &fakeClock{}
@@ -1669,33 +1681,43 @@ func TestResumeTakeoverKillsFlockBodyHolder(t *testing.T) {
 	})
 
 	cfg := testCfg(clk, live)
-	var killedCand atomic.Bool
-	cfg.killStub = func(target identity, _ int64) error {
-		if target.Pid == candPid {
-			killedCand.Store(true)
-			// Simulate the kill freeing the flock so the takeover completes.
-			live.kill(candPid)
-			relCand()
-		}
+	var kills atomic.Int64
+	cfg.killStub = func(identity, int64) error {
+		kills.Add(1)
 		return nil
 	}
+	_ = relCand
 
 	clk.advance(31 * time.Second) // fencing record past TTL -> resumable
 
-	lease, acquired, err := acquireLease(project, "cand2", cfg)
+	// KP6 rewrite (DESIGN-coord-no-auto-kill): the hung candidate is
+	// ALIVE, so the resume-takeover must ABORT pre-fence — quarantine the
+	// live flock-body holder in the detection result instead of shooting
+	// it. (The original test asserted kill+acquire; killing a live
+	// coordinator on a staleness heuristic is the incident class this
+	// task removes. A DEAD candidate resume still proceeds — T34.)
+	lease, acquired, liveHolders, err := acquireLeaseDetect(project, "cand2", cfg)
 	if err != nil {
-		t.Fatalf("acquireLease (resume): %v", err)
+		t.Fatalf("acquireLeaseDetect (resume): %v", err)
 	}
-	if !killedCand.Load() {
-		t.Fatal("resume-takeover must kill the flock-body holder (the hung candidate), not only OLD")
+	if acquired || lease != nil {
+		t.Fatal("resume against a LIVE hung candidate must stand down, not acquire")
 	}
-	if !acquired {
-		t.Fatal("after killing the real flock holder the takeover must acquire")
+	if kills.Load() != 0 {
+		t.Fatalf("kill fn fired %d times on a live flock-body holder", kills.Load())
 	}
-	defer lease.Release()
+	found := false
+	for _, h := range liveHolders {
+		if h.Pid == candPid && h.PidStart == candStart {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("detection %+v must name the live flock-body holder pid=%d", liveHolders, candPid)
+	}
 	rec := readEpochFor(t, project)
-	if rec.State != stateActive || rec.Owner.AgentID != "cand2" {
-		t.Fatalf("expected active cand2 after resume, got %s/%s", rec.State, rec.Owner.AgentID)
+	if rec.State != stateFencing || rec.Epoch != 6 {
+		t.Fatalf("record must be untouched (fencing/epoch 6), got %s/%d", rec.State, rec.Epoch)
 	}
 }
 
@@ -1711,17 +1733,18 @@ func TestFencedNotAcquiredDoesNotSilentlyStandDown(t *testing.T) {
 	clk := &fakeClock{}
 	live := newFakeLiveness()
 
-	// Busy flock (a hung holder still owns it), fenced_not_acquired record
-	// with a STILL-ALIVE candidate, renewed_at FRESH (within TTL).
+	// Busy flock (still held in this harness), fenced_not_acquired record,
+	// renewed_at FRESH (within TTL). Owner + candidate are DEAD (not in
+	// the live map): the KP6 gate passes and the re-attempt proceeds.
+	// (The LIVE-holder shape now stands down with a quarantine detection
+	// instead — TestFencedNotAcquired_LiveHoldersQuarantined below.)
 	const oldPid = 4242
-	live.set(oldPid, int64(222222))
 	holdFlock(t, project)
-	const liveCandPid = 6000
-	live.set(liveCandPid, int64(666666))
+	const deadCandPid = 6000
 	writeEpochRaw(t, project, epochRecord{
 		Epoch: 7, State: stateFencedNotAcquired,
 		Owner:         identity{Pid: oldPid, PidStart: int64(222222), AgentID: "old", Project: project},
-		Candidate:     identity{Pid: liveCandPid, PidStart: int64(666666), AgentID: "cand1", Project: project},
+		Candidate:     identity{Pid: deadCandPid, PidStart: int64(666666), AgentID: "cand1", Project: project},
 		BootID:        "test-boot-1",
 		RenewedAtMono: clk.now(), // fresh, within TTL
 	})
@@ -1744,6 +1767,53 @@ func TestFencedNotAcquiredDoesNotSilentlyStandDown(t *testing.T) {
 	}
 	if !fenced.Load() {
 		t.Fatal("a fenced_not_acquired record must drive a fresh takeover attempt (re-fence/kill)")
+	}
+}
+
+// KP6 companion: a fenced_not_acquired record whose owner/candidate are
+// STILL ALIVE is not silently ignored either — the gate stands down
+// WITHOUT killing and returns the live holders as the typed detection
+// (cmd/fleet's poll loop reports/quarantines them).
+func TestFencedNotAcquired_LiveHoldersQuarantined(t *testing.T) {
+	setupHome(t)
+	const project = "rainier"
+	clk := &fakeClock{}
+	live := newFakeLiveness()
+
+	const oldPid = 4242
+	live.set(oldPid, int64(222222))
+	holdFlock(t, project)
+	const liveCandPid = 6000
+	live.set(liveCandPid, int64(666666))
+	writeEpochRaw(t, project, epochRecord{
+		Epoch: 7, State: stateFencedNotAcquired,
+		Owner:         identity{Pid: oldPid, PidStart: int64(222222), AgentID: "old", Project: project},
+		Candidate:     identity{Pid: liveCandPid, PidStart: int64(666666), AgentID: "cand1", Project: project},
+		BootID:        "test-boot-1",
+		RenewedAtMono: clk.now(),
+	})
+
+	cfg := testCfg(clk, live)
+	var kills atomic.Int64
+	cfg.killStub = func(identity, int64) error { kills.Add(1); return nil }
+	clk.advance(5 * time.Second)
+
+	lease, acquired, liveHolders, err := acquireLeaseDetect(project, "cand2", cfg)
+	if err != nil {
+		t.Fatalf("acquireLeaseDetect: %v", err)
+	}
+	if acquired || lease != nil {
+		t.Fatal("must stand down against live holders")
+	}
+	if kills.Load() != 0 {
+		t.Fatalf("kill fn fired %d times on live holders", kills.Load())
+	}
+	if len(liveHolders) != 2 {
+		t.Fatalf("detection = %+v, want both live holders (owner + candidate)", liveHolders)
+	}
+	rec := readEpochFor(t, project)
+	if rec.State != stateFencedNotAcquired || rec.Epoch != 7 {
+		t.Fatalf("record must be untouched, got %s/%d", rec.State, rec.Epoch)
 	}
 }
 
@@ -1807,13 +1877,14 @@ func TestSuccessorAcquiresAfterRelease(t *testing.T) {
 	}
 }
 
-// ---- codex iter-13 [P2]: kill the fencing candidate even with no flock body ----
+// ---- codex iter-13 [P2] / KP6 rewrite: candidate covered with no flock body ----
 
 // stampFlockBody is best-effort: the prior candidate may hold the flock
-// with a MISSING body stamp. Resume-takeover must still kill that candidate
-// (read from rec.Candidate), not only the flock-body holder, else the
-// takeover times out into fenced_not_acquired.
-func TestResumeTakeoverKillsCandidateWithoutFlockBody(t *testing.T) {
+// with a MISSING body stamp. The takeover's target set must still cover
+// that candidate (read from rec.Candidate), not only the flock-body
+// holder — and since it is ALIVE, the KP6 gate quarantines it pre-fence
+// instead of killing (DESIGN-coord-no-auto-kill).
+func TestResumeTakeover_LiveCandidateWithoutFlockBodyQuarantined(t *testing.T) {
 	setupHome(t)
 	const project = "rainier"
 	clk := &fakeClock{}
@@ -1827,7 +1898,7 @@ func TestResumeTakeoverKillsCandidateWithoutFlockBody(t *testing.T) {
 	live.set(candPid, candStart)
 	relCand := holdFlock(t, project)
 
-	// Stale fencing record naming the dead OLD owner + the hung candidate.
+	// Stale fencing record naming the dead OLD owner + the LIVE hung candidate.
 	writeEpochRaw(t, project, epochRecord{
 		Epoch: 6, State: stateFencing,
 		Owner:         identity{Pid: 9999, PidStart: 333333, AgentID: "old", Project: project},
@@ -1837,29 +1908,35 @@ func TestResumeTakeoverKillsCandidateWithoutFlockBody(t *testing.T) {
 	})
 
 	cfg := testCfg(clk, live)
-	var killedCand atomic.Bool
-	cfg.killStub = func(target identity, _ int64) error {
-		if target.Pid == candPid {
-			killedCand.Store(true)
-			live.kill(candPid)
-			relCand()
-		}
-		return nil
-	}
+	var kills atomic.Int64
+	cfg.killStub = func(identity, int64) error { kills.Add(1); return nil }
+	_ = relCand
 
 	clk.advance(31 * time.Second) // past TTL -> resumable
 
-	lease, acquired, err := acquireLease(project, "cand2", cfg)
+	// KP6 rewrite: the recorded candidate is a prospective target even
+	// with NO flock body (best-effort stamp never landed) — and it is
+	// ALIVE, so the resume aborts pre-fence and surfaces it. This pins
+	// the enumeration: dropping the candidate from the gate's target set
+	// would let the takeover fence + shoot a live process.
+	lease, acquired, liveHolders, err := acquireLeaseDetect(project, "cand2", cfg)
 	if err != nil {
-		t.Fatalf("acquireLease (resume): %v", err)
+		t.Fatalf("acquireLeaseDetect (resume): %v", err)
 	}
-	if !killedCand.Load() {
-		t.Fatal("resume-takeover must kill the recorded fencing candidate even with no flock body")
+	if acquired || lease != nil {
+		t.Fatal("resume against a LIVE recorded candidate must stand down")
 	}
-	if !acquired {
-		t.Fatal("after killing the candidate holding the flock the takeover must acquire")
+	if kills.Load() != 0 {
+		t.Fatalf("kill fn fired %d times on a live recorded candidate", kills.Load())
 	}
-	defer lease.Release()
+	if len(liveHolders) != 1 || liveHolders[0].Pid != candPid {
+		t.Fatalf("detection = %+v, want the live recorded candidate pid=%d (no flock body needed)",
+			liveHolders, candPid)
+	}
+	rec := readEpochFor(t, project)
+	if rec.State != stateFencing || rec.Epoch != 6 {
+		t.Fatalf("record must be untouched, got %s/%d", rec.State, rec.Epoch)
+	}
 }
 
 // ---- codex iter-15 [P2] #1: candidate resumes its OWN fencing record ----
