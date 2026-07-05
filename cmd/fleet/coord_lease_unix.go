@@ -234,12 +234,27 @@ func wireGCCoordDeps(deps *gc.Deps) {
 	deps.ActiveLeaseOwnerPID = coordlock.CurrentActiveOwnerPID
 	deps.CoordSupervisorAlive = supervisorAliveByStart
 	deps.KillCoord = func(t gc.CoordKillTarget) error {
+		// The classifier only sends provably-dead targets, but re-verify
+		// at the destructive boundary (TOCTOU belt): a pid+pid_start that
+		// reads alive here is NEVER touched.
+		if supervisorAliveByStart(t.Pid, t.PidStart) {
+			return fmt.Errorf("refusing reap: supervisor pid=%d pid_start=%d is ALIVE (probe changed since classification)",
+				t.Pid, t.PidStart)
+		}
+		// Belt-and-braces authenticated kill — a benign no-op on a corpse.
+		// A typed REFUSAL is tolerated here and ONLY here: the refusal
+		// gates (exe-path, active-owner, pid-reuse) exist to stop a signal
+		// reaching the wrong LIVE process, and the corpse re-check above
+		// proves there is nothing live to signal. Without this tolerance a
+		// dead competitor whose record was never exe-stamped (the
+		// stamp-failure warning path) would be unreapable forever. Real
+		// infra faults still surface.
 		if err := coord.KillCoordIfIdentityMatches(coord.KillTarget{
 			Pid:      t.Pid,
 			PidStart: t.PidStart,
 			AgentID:  t.AgentID,
 			Project:  t.Project,
-		}); err != nil {
+		}); err != nil && !errors.Is(err, coord.ErrKillRefused) {
 			return err
 		}
 		// The dead supervisor's own deferred cleanup never ran; reap its

@@ -13,11 +13,15 @@ package main
 
 import (
 	"bytes"
+	"errors"
 	"os"
 	"strings"
 	"testing"
 
 	"github.com/edisonshen/fleet/internal/agent"
+	"github.com/edisonshen/fleet/internal/coordlock"
+	"github.com/edisonshen/fleet/internal/gc"
+	"github.com/edisonshen/fleet/internal/state"
 )
 
 // readQuarantineEvents (shared helper) lives in
@@ -171,5 +175,75 @@ func TestSweepStaleCompetitors_StructurallyKillFree(t *testing.T) {
 	}
 	if strings.Contains(body, "syscall.") {
 		t.Fatalf("sweepStaleCompetitors must not signal processes directly:\n%s", body)
+	}
+}
+
+// Regression (found via manual `fleet gc` smoke on this branch): a DEAD
+// stale competitor whose record was never exe-stamped (the
+// stampSupervisorWithRetry warning path) made KillCoordIfIdentityMatches
+// return ErrKillRefused, so gc --apply could never archive the corpse.
+// The production KillCoord wrapper re-verifies the pid is dead
+// (pid+pid_start) and then tolerates the typed refusal — the refusal
+// gates protect LIVE processes, and the corpse re-check proves there is
+// nothing live to signal. The record must end up archived.
+func TestWireGCCoordDeps_DeadUnstampedCompetitorStillReaped(t *testing.T) {
+	setupFleetHome(t)
+	const project = "rainier"
+	dead := agent.New("deadcomp2")
+	dead.Project = project
+	dead.TaskID = "coord-" + project
+	dead.TmuxSession = "fleet-deadcomp2" // no live session; Cleanup is best-effort
+	dead.SupervisorPID = 999999          // beyond pid_max on darwin/linux defaults
+	dead.SupervisorPidStart = 42
+	dead.LeaseWrapped = true
+	// SupervisorExePath deliberately EMPTY (partial stamp).
+	if err := dead.Write(); err != nil {
+		t.Fatalf("write record: %v", err)
+	}
+
+	var deps gc.Deps
+	wireGCCoordDeps(&deps)
+	if err := deps.KillCoord(gc.CoordKillTarget{
+		Pid: 999999, PidStart: 42, AgentID: "deadcomp2", Project: project,
+	}); err != nil {
+		t.Fatalf("KillCoord on a provably-dead unstamped competitor must reap, got %v", err)
+	}
+	if _, err := agent.Load("deadcomp2"); !errors.Is(err, state.ErrNotFound) {
+		t.Fatalf("record must be archived after the reap, Load err=%v", err)
+	}
+}
+
+// The wrapper's own TOCTOU belt: a target whose pid+pid_start reads
+// ALIVE at the destructive boundary is refused outright — gc never
+// signals (or session-reaps) a live supervisor, even if the classifier
+// mislabeled it.
+func TestWireGCCoordDeps_LiveTargetRefused(t *testing.T) {
+	setupFleetHome(t)
+	const project = "rainier"
+	self := os.Getpid()
+	selfStart, ok := coordlock.PidStartNanos(self)
+	if !ok {
+		t.Fatal("cannot read own pid_start")
+	}
+	rec := agent.New("livecomp2")
+	rec.Project = project
+	rec.TaskID = "coord-" + project
+	rec.TmuxSession = "fleet-livecomp2"
+	rec.SupervisorPID = self
+	rec.SupervisorPidStart = selfStart
+	rec.LeaseWrapped = true
+	if err := rec.Write(); err != nil {
+		t.Fatalf("write record: %v", err)
+	}
+
+	var deps gc.Deps
+	wireGCCoordDeps(&deps)
+	if err := deps.KillCoord(gc.CoordKillTarget{
+		Pid: self, PidStart: selfStart, AgentID: "livecomp2", Project: project,
+	}); err == nil {
+		t.Fatal("KillCoord must refuse a live pid+pid_start target")
+	}
+	if _, err := agent.Load("livecomp2"); err != nil {
+		t.Fatalf("live record must be untouched, Load err=%v", err)
 	}
 }
