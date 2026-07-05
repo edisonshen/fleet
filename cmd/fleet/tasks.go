@@ -914,9 +914,19 @@ func runTasksSet(opts *tasksSetOpts, slug, kv string, stdout io.Writer) error {
 	// dead-weight stamps could evict an older entry that's still ready/
 	// blocked and genuinely due to render. Only stamp on a status target
 	// the auto block (ready/todo) or Open Questions (blocked) actually
-	// reads; `parked` always stamps (Open Questions checks Parked != ""
-	// regardless of status).
-	recorded := key == "parked" || (key == "status" && isSessionTaskRenderableStatus(value))
+	// reads.
+	//
+	// codex iter-7 [P2]: a `parked=` / `parked=null` CLEAR must NOT stamp
+	// either — after an un-park the task is no longer Parked, so Open
+	// Questions renders it only if it's still `blocked` (and a bare park
+	// clear leaves status untouched, so if it were blocked it was already
+	// stamped at the transition that blocked it). Recording a clear just
+	// adds a dead entry that pressures the 30-cap. Only a park SET (a
+	// non-empty, non-"null" reason → the task becomes an Open Question)
+	// stamps. `nullOrValue(value) != ""` is exactly "the resulting Parked
+	// field is non-empty" — reusing the same coercion setTaskField applies.
+	recorded := (key == "parked" && nullOrValue(value) != "") ||
+		(key == "status" && isSessionTaskRenderableStatus(value))
 	err = withTasksLock(project, func() error {
 		f, path, err := readTasks(project)
 		if err != nil {

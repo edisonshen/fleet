@@ -231,6 +231,27 @@ func TestTasksSet_ParkedChangeRecordsSessionTask(t *testing.T) {
 	}
 }
 
+// codex iter-7 [P2]: a park CLEAR (`parked=` or `parked=null`) must NOT
+// stamp — the un-parked task is no longer an Open Question, so recording
+// it just adds a dead entry that pressures the 30-cap.
+func TestTasksSet_ParkedClearDoesNotRecordSessionTask(t *testing.T) {
+	for _, clearVal := range []string{"", "null"} {
+		t.Run("clear="+clearVal, func(t *testing.T) {
+			home, project := setupTasksHome(t)
+			slug := addTodo(t, project, "unpark-me")
+			seedCoordStateFile(t, home, project, `{"tick_count":1}`)
+
+			if err := runTasksSet(&tasksSetOpts{project: project}, slug, "parked="+clearVal, &bytes.Buffer{}); err != nil {
+				t.Fatalf("clear parked (%q): %v", clearVal, err)
+			}
+			st := sessionTasksOf(t, readCoordState(t, home, project))
+			if len(st) != 0 {
+				t.Errorf("park clear (parked=%q) must not record session_tasks: %#v", clearVal, st)
+			}
+		})
+	}
+}
+
 // status=blocked is Open-Questions-renderable — must stamp.
 func TestTasksSet_StatusBlockedRecordsSessionTask(t *testing.T) {
 	home, project := setupTasksHome(t)
