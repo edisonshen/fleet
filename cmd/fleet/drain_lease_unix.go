@@ -194,25 +194,13 @@ func defaultDrainLeaseDeps() drainLeaseDeps {
 			}
 			return acquired, liveHolderInfosFrom(live), err
 		},
-		SupervisorAlive: func(pid int, pidStart int64) bool {
-			if pid <= 0 {
-				return false
-			}
-			st, ok := coordlock.PidStartNanos(pid)
-			if !ok {
-				return false // no such process — provably dead
-			}
-			if pidStart == 0 {
-				return true // identity unprovable — never escalate on it
-			}
-			return st == pidStart
-		},
-		Resume:         handoffop.Resume,
-		LockAgent:      state.LockAgent,
-		RecoverSpawn:   productionRecoverSpawn,
-		DeliverPending: drainGracefulDeliverPending,
-		BarrierPoll:    defaultBarrierPoll,
-		Self:           os.Getpid,
+		SupervisorAlive: supervisorAliveByStart,
+		Resume:          handoffop.Resume,
+		LockAgent:       state.LockAgent,
+		RecoverSpawn:    productionRecoverSpawn,
+		DeliverPending:  drainGracefulDeliverPending,
+		BarrierPoll:     defaultBarrierPoll,
+		Self:            os.Getpid,
 	}
 }
 

@@ -187,6 +187,31 @@ func leaseActiveOwnerPID(project string) (int, bool) {
 	return coordlock.CurrentActiveOwnerPID(project)
 }
 
+// supervisorAliveByStart is the pid-reuse-safe supervisor liveness probe
+// backing BOTH the drain KP7 escalation gate (drainLeaseDeps.
+// SupervisorAlive) and gc's stale-coords live/dead split
+// (Deps.CoordSupervisorAlive). Contract (DESIGN-coord-no-auto-kill):
+//
+//	pid gone                        -> false (provably dead)
+//	live pid, start-time mismatch   -> false (reused pid; recorded proc dead)
+//	live pid, recorded pidStart==0  -> true  (identity UNPROVABLE — never
+//	                                   treat an unprovable process as a
+//	                                   corpse; no escalation, no reap)
+//	live pid, start-time match      -> true
+func supervisorAliveByStart(pid int, pidStart int64) bool {
+	if pid <= 0 {
+		return false
+	}
+	st, ok := coordlock.PidStartNanos(pid)
+	if !ok {
+		return false // no such process — provably dead
+	}
+	if pidStart == 0 {
+		return true // identity unprovable — never escalate/reap on it
+	}
+	return st == pidStart
+}
+
 // wireGCCoordDeps installs the platform-gated stale-coords seams into a
 // gc.Deps (DESIGN-coord-no-auto-kill gc spec). internal/gc is untagged so
 // it keeps building on freebsd; the lease + kill primitives these seams
@@ -207,19 +232,7 @@ func leaseActiveOwnerPID(project string) (int, bool) {
 //     owned by cmd/fleet, so gc receives it via Deps.
 func wireGCCoordDeps(deps *gc.Deps) {
 	deps.ActiveLeaseOwnerPID = coordlock.CurrentActiveOwnerPID
-	deps.CoordSupervisorAlive = func(pid int, pidStart int64) bool {
-		if pid <= 0 {
-			return false
-		}
-		st, ok := coordlock.PidStartNanos(pid)
-		if !ok {
-			return false // no such process — provably dead
-		}
-		if pidStart == 0 {
-			return true // identity unprovable — never treat as reapable
-		}
-		return st == pidStart
-	}
+	deps.CoordSupervisorAlive = supervisorAliveByStart
 	deps.KillCoord = func(t gc.CoordKillTarget) error {
 		if err := coord.KillCoordIfIdentityMatches(coord.KillTarget{
 			Pid:      t.Pid,
