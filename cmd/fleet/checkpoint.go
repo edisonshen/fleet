@@ -204,11 +204,22 @@ func runCheckpointNextStep(project, slug, text string) error {
 // _apply_reconcile / _set_parked / reaper requeue shell out to `fleet tasks
 // set` WHILE the tick holds coordinator.lock. A blocking acquire there would
 // stall the child for the full timeout on EVERY such transition. Fail-fast
-// returns instantly; a lock-contention miss is CORRECT because a tick-owned
-// slug was already stamped at its dispatch seam (loop.py _record_session_task)
-// and the reader overlays live tasks.md status, so the status change still
-// renders. Only a MANUAL `fleet tasks set` (no tick, lock free) needs — and
-// gets — the append. Contention returns nil (silent, expected); only a
+// returns instantly; a lock-contention miss is CORRECT for the tick-spawned
+// case because that slug was already stamped at its dispatch seam (loop.py
+// _record_session_task) and the reader overlays live tasks.md status, so the
+// status change still renders.
+//
+// A bounded wait can't do better: the tick holds coordinator.lock for its
+// ENTIRE duration (seconds), so ANY child racing an active tick — tick-spawned
+// OR a coincident operator-shell `fleet tasks set` — contends longer than any
+// sane timeout and skips regardless. So the fail-fast trade accepts one narrow
+// best-effort miss (codex iter-9 [P2]): a HUMAN `fleet tasks set` that happens
+// to race a live tick loses its session_tasks stamp. Mitigated three ways: it
+// is rare (single-shot ticks run sequentially, so the coord agent never races
+// its own tick; only a concurrent operator shell can), the tasks.md mutation
+// still LANDS, and the next tick's reconcile re-touches the slug. That miss is
+// strictly better than the 2s stall on every tick-invoked transition the
+// blocking acquire caused. Contention returns nil (silent, expected); only a
 // genuine I/O error propagates so the caller can log it.
 func appendSessionTask(project, slug string) error {
 	err := withCoordStateTimeout(project, 0, func(cs map[string]any) {

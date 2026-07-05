@@ -98,30 +98,18 @@ type sessionTask struct {
 // coord generation than the agent whose handoff doc is being built. Empty
 // stamp (legacy entry / operator-shell write) or empty agentID (caller
 // without generation context) can't be attributed, so it is NOT foreign —
-// the exact semantics of loadCheckpointIfFresher's coord_id guard. Used for
-// the DURABLE buffers (session_docs, recent_decisions) where an unstamped
-// operator-added entry is intentionally "always relevant".
+// the exact semantics of loadCheckpointIfFresher's coord_id guard.
+//
+// This is deliberately the SAME filter for the durable buffers (session_docs,
+// recent_decisions) AND the session_next_steps / session_tasks buffers: an
+// unstamped operator-shell write (`fleet checkpoint next-step` / `fleet tasks
+// promote|set` run without FLEET_AGENT_ID) is intentionally "always relevant"
+// — a real coord's handoff still surfaces operator-recorded work. (A prior
+// revision filtered unstamped session entries for a stamped reader; codex
+// review flagged across three consecutive rounds that this silently drops the
+// primary operator-shell usage mode, so it was reverted back to this baseline.)
 func foreignGeneration(stamp, agentID string) bool {
 	return stamp != "" && agentID != "" && stamp != agentID
-}
-
-// sessionEntryForeign is the STRICTER filter for the temporally-scoped
-// session_next_steps / session_tasks buffers. Unlike foreignGeneration, an
-// UNSTAMPED entry (empty stamp) is ALSO foreign when the reader is a real
-// coord (agentID != ""): a "do this next" / "I acted on this slug" line has
-// no provenance to claim as THIS session's work, and — unlike a durable
-// doc reference — a stale unstamped next-step from an unknown/prior
-// generation (e.g. an operator-shell `fleet checkpoint next-step` or
-// `fleet tasks promote` run with FLEET_AGENT_ID unset) must not resurface
-// in EVERY future successor's handoff until it ages out of the cap
-// (codex review P1). When the reader itself is unstamped (agentID == "",
-// e.g. an operator-side render with no generation context), everything
-// passes so nothing is silently hidden.
-func sessionEntryForeign(stamp, agentID string) bool {
-	if agentID == "" {
-		return false
-	}
-	return stamp != agentID
 }
 
 // readCoordStateForCollect loads the collector's view of coord-state.json.
