@@ -52,12 +52,12 @@ func TestCoordRun_Standby_PollsThenAcquiresAndStartsChild(t *testing.T) {
 	// acquires. This models the standby polling while OLD is alive, then
 	// OLD exits and the kernel-released flock is acquirable.
 	var calls int32
-	acquire := func() (coordLease, bool, error) {
+	acquire := func() (coordLease, bool, []liveHolderInfo, error) {
 		n := atomic.AddInt32(&calls, 1)
 		if n < 3 {
-			return nil, false, nil // busy: healthy leader still alive
+			return nil, false, nil, nil // busy: healthy leader still alive
 		}
-		return lease, true, nil // OLD gone -> we acquire
+		return lease, true, nil, nil // OLD gone -> we acquire
 	}
 
 	acquired := make(chan struct{}, 1)
@@ -121,7 +121,7 @@ func TestCoordRun_Standby_CancelBeforeAcquire_NeverStartsChild(t *testing.T) {
 	lease := &fakeLease{}
 
 	// Lease is busy forever (leader never exits during the test window).
-	acquire := func() (coordLease, bool, error) { return nil, false, nil }
+	acquire := func() (coordLease, bool, []liveHolderInfo, error) { return nil, false, nil, nil }
 
 	ctx, cancel := context.WithCancel(context.Background())
 	opts := coordRunOpts{
@@ -183,9 +183,9 @@ func TestCoordRun_Standby_TimeoutBeforeAcquire_ExitsCleanly(t *testing.T) {
 		standbyPoll:     time.Hour,
 		standbyTimeout:  5 * time.Minute,
 		standbyTimeoutC: timeoutC,
-		acquireLease: func() (coordLease, bool, error) {
+		acquireLease: func() (coordLease, bool, []liveHolderInfo, error) {
 			atomic.AddInt32(&calls, 1)
-			return nil, false, nil
+			return nil, false, nil, nil
 		},
 	}
 
@@ -220,11 +220,11 @@ func TestCoordRun_Standby_AcquireFaultDuringPoll_Surfaces(t *testing.T) {
 
 	// First call busy (enters the poll loop); second call faults.
 	var calls int32
-	acquire := func() (coordLease, bool, error) {
+	acquire := func() (coordLease, bool, []liveHolderInfo, error) {
 		if atomic.AddInt32(&calls, 1) == 1 {
-			return nil, false, nil
+			return nil, false, nil, nil
 		}
-		return nil, false, wantErr
+		return nil, false, nil, wantErr
 	}
 
 	opts := coordRunOpts{
@@ -267,7 +267,7 @@ func TestCoordRun_Standby_StampsEnginePIDAfterAcquire(t *testing.T) {
 
 	pidFile := filepath.Join(t.TempDir(), "child.pid")
 	lease := &fakeLease{}
-	acquire := func() (coordLease, bool, error) { return lease, true, nil } // acquire immediately
+	acquire := func() (coordLease, bool, []liveHolderInfo, error) { return lease, true, nil, nil } // acquire immediately
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()

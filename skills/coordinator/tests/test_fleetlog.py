@@ -241,3 +241,19 @@ def test_maybe_prune_daily_first_run_no_marker(flog):
     assert flog.maybe_prune_daily(72 * 3600) is True
     assert not stale.exists()
     assert (d / ".last-prune").exists()
+
+
+def test_coord_quarantine_in_types_mirror(flog):
+    """DESIGN-coord-no-auto-kill: coord.quarantine joins the closed
+    vocabulary; the Python TYPES set is a declared mirror of the Go set
+    and must carry it too."""
+    assert "coord.quarantine" in flog.TYPES
+    d = Path(flog.dir())
+    flog.log(flog.COMP_COORD, "coord.quarantine", "warn", proj="rainier",
+             agent="stale1", msg="stale competitor detected (report-only)",
+             data={"reason": "stale-competitor", "pid": 4242})
+    lines = _read_lines(d)
+    assert len(lines) == 1
+    _, m = lines[0]
+    assert m["type"] == "coord.quarantine" and m["type"] in flog.TYPES
+    assert m["data"]["reason"] == "stale-competitor"

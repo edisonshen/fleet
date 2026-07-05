@@ -161,6 +161,8 @@ func TestDrainLease_LiveLeaderBarrierAppearsMidPoll_NoDuplicateResume(t *testing
 		// iter-14 [P1]: completion needs a confirmed successor, not !ok).
 		ActiveOwnerPID: func(string) (int, bool) { return 555555, true },
 		LoadAgent:      func(string) (*agent.Record, error) { return oldCoordRec(), nil },
+		// KP7: OLD provably dead so the escalation gate proceeds as today.
+		SupervisorAlive: func(int, int64) bool { return false },
 		KillCoord:      func(coord.KillTarget) error { return nil }, // OLD released; reap its lingering supervisor
 		Resume: func(queue.SpawnFresh, string, int, io.Writer, io.Writer) error {
 			atomic.AddInt32(&resumed, 1)
@@ -238,6 +240,8 @@ func TestDrainLease_LiveLeaderFallback_CrashedSuccessorNotCompletion(t *testing.
 		BarrierExists:  func(string, int64) bool { return false },
 		ActiveOwnerPID: func(string) (int, bool) { return 777777, true }, // non-OLD pid, but dead
 		LoadAgent:      func(string) (*agent.Record, error) { return oldCoordRec(), nil },
+		// KP7: OLD provably dead so the escalation gate proceeds as today.
+		SupervisorAlive: func(int, int64) bool { return false },
 		LockAgent:      func(string) (func(), error) { return func() {}, nil },
 		Resume: func(queue.SpawnFresh, string, int, io.Writer, io.Writer) error {
 			atomic.AddInt32(&resumed, 1)
@@ -267,10 +271,12 @@ func TestDrainLease_NoBarrierNoGracefulKill_Escalates(t *testing.T) {
 		CurrentEpoch:   func(string) (int64, bool) { return 5, true },
 		BarrierExists:  func(string, int64) bool { return false }, // never
 		LoadAgent:      func(string) (*agent.Record, error) { return oldCoordRec(), nil },
+		// KP7: OLD provably dead so the escalation gate proceeds as today.
+		SupervisorAlive: func(int, int64) bool { return false },
 		KillCoord:      func(coord.KillTarget) error { atomic.AddInt32(&killed, 1); return nil },
-		TakeOver: func(string, string) (bool, error) {
+		TakeOver: func(string, string) (bool, []liveHolderInfo, error) {
 			atomic.AddInt32(&tookOver, 1)
-			return true, nil
+			return true, nil, nil
 		},
 		RecoverSpawn: func(oldRec *agent.Record, _, preAllocatedID string, _ bool, _, _ io.Writer) error {
 			atomic.AddInt32(&recovered, 1)
@@ -326,7 +332,9 @@ func TestDrainLease_ConcurrentRecovery_NoDuplicate(t *testing.T) {
 		CurrentEpoch:   func(string) (int64, bool) { return 5, true },
 		BarrierExists:  func(string, int64) bool { return false },
 		LoadAgent:      func(string) (*agent.Record, error) { return oldCoordRec(), nil },
-		TakeOver:       func(string, string) (bool, error) { atomic.AddInt32(&tookOver, 1); return true, nil },
+		// KP7: OLD provably dead so the escalation gate proceeds as today.
+		SupervisorAlive: func(int, int64) bool { return false },
+		TakeOver:       func(string, string) (bool, []liveHolderInfo, error) { atomic.AddInt32(&tookOver, 1); return true, nil, nil },
 		RecoverSpawn: func(*agent.Record, string, string, bool, io.Writer, io.Writer) error {
 			atomic.AddInt32(&recovered, 1)
 			return nil
@@ -358,9 +366,11 @@ func TestDrainLease_HungOldEscalatesToTakeOver(t *testing.T) {
 		CurrentEpoch:   func(string) (int64, bool) { return 9, true },
 		BarrierExists:  func(string, int64) bool { return false },
 		LoadAgent:      func(string) (*agent.Record, error) { return oldCoordRec(), nil },
-		TakeOver: func(project, _ string) (bool, error) {
+		// KP7: OLD provably dead so the escalation gate proceeds as today.
+		SupervisorAlive: func(int, int64) bool { return false },
+		TakeOver: func(project, _ string) (bool, []liveHolderInfo, error) {
 			tookOverProject = project
-			return true, nil // takeover acquired -> OLD confirmed gone
+			return true, nil, nil // takeover acquired -> OLD confirmed gone
 		},
 		RecoverSpawn: func(*agent.Record, string, string, bool, io.Writer, io.Writer) error {
 			atomic.AddInt32(&recovered, 1)
@@ -409,7 +419,8 @@ func TestDrainLease_TakeoverRecovery_HonorsQueueAutoResumeOverride(t *testing.T)
 			r.DisableAutoResume = false // baseline DIFFERS from the override
 			return r, nil
 		},
-		TakeOver: func(string, string) (bool, error) { return true, nil },
+		SupervisorAlive: func(int, int64) bool { return false },
+		TakeOver: func(string, string) (bool, []liveHolderInfo, error) { return true, nil, nil },
 		RecoverSpawn: func(_ *agent.Record, _, _ string, disableAutoResume bool, _, _ io.Writer) error {
 			gotDisable = disableAutoResume
 			atomic.AddInt32(&recovered, 1)
@@ -452,9 +463,9 @@ func TestDrainLease_BareCoordRoutesToLegacyResume_NoDuplicate(t *testing.T) {
 			atomic.AddInt32(&resumed, 1)
 			return nil
 		},
-		TakeOver: func(string, string) (bool, error) {
+		TakeOver: func(string, string) (bool, []liveHolderInfo, error) {
 			atomic.AddInt32(&tookOver, 1)
-			return true, nil
+			return true, nil, nil
 		},
 		RecoverSpawn: func(*agent.Record, string, string, bool, io.Writer, io.Writer) error {
 			atomic.AddInt32(&recovered, 1)
@@ -613,8 +624,10 @@ func TestDrainLease_GracefulWaitsForSelfRelease(t *testing.T) {
 			return successorPid, true // standby acquired the freed lease
 		},
 		LoadAgent: func(string) (*agent.Record, error) { return oldCoordRec(), nil },
+		// KP7: OLD provably dead so the escalation gate proceeds as today.
+		SupervisorAlive: func(int, int64) bool { return false },
 		KillCoord: func(coord.KillTarget) error { atomic.AddInt32(&killed, 1); return nil },
-		TakeOver:  func(string, string) (bool, error) { atomic.AddInt32(&tookOver, 1); return true, nil },
+		TakeOver:  func(string, string) (bool, []liveHolderInfo, error) { atomic.AddInt32(&tookOver, 1); return true, nil, nil },
 		DeliverPending: func(queue.SpawnFresh, *agent.Record, io.Writer, io.Writer) error {
 			atomic.AddInt32(&delivered, 1)
 			return nil
@@ -659,8 +672,10 @@ func TestDrainLease_GracefulOldReleasedNoSuccessor_Escalates(t *testing.T) {
 			return 0, false // OLD released but NO successor acquired
 		},
 		LoadAgent: func(string) (*agent.Record, error) { return oldCoordRec(), nil },
+		// KP7: OLD provably dead so the escalation gate proceeds as today.
+		SupervisorAlive: func(int, int64) bool { return false },
 		KillCoord: func(coord.KillTarget) error { atomic.AddInt32(&killed, 1); return nil },
-		TakeOver:  func(string, string) (bool, error) { atomic.AddInt32(&tookOver, 1); return true, nil },
+		TakeOver:  func(string, string) (bool, []liveHolderInfo, error) { atomic.AddInt32(&tookOver, 1); return true, nil, nil },
 		RecoverSpawn: func(*agent.Record, string, string, bool, io.Writer, io.Writer) error {
 			atomic.AddInt32(&recovered, 1)
 			return nil
@@ -704,7 +719,9 @@ func TestDrainLease_GracefulSuccessorCrashedAfterEpoch_Escalates(t *testing.T) {
 		},
 		LeaderPresent: func(string) bool { return false }, // no HEALTHY leader heartbeating
 		LoadAgent:     func(string) (*agent.Record, error) { return oldCoordRec(), nil },
-		TakeOver:      func(string, string) (bool, error) { atomic.AddInt32(&tookOver, 1); return true, nil },
+		// KP7: OLD provably dead so the escalation gate proceeds as today.
+		SupervisorAlive: func(int, int64) bool { return false },
+		TakeOver:      func(string, string) (bool, []liveHolderInfo, error) { atomic.AddInt32(&tookOver, 1); return true, nil, nil },
 		RecoverSpawn: func(*agent.Record, string, string, bool, io.Writer, io.Writer) error {
 			atomic.AddInt32(&recovered, 1)
 			return nil
@@ -745,7 +762,9 @@ func TestDrainLease_GracefulOldHoldsLeasePastBudget_Escalates(t *testing.T) {
 			return 0, false // OLD killed; no successor yet -> RecoverSpawn
 		},
 		LoadAgent: func(string) (*agent.Record, error) { return oldCoordRec(), nil },
-		TakeOver:  func(string, string) (bool, error) { atomic.AddInt32(&tookOver, 1); return true, nil },
+		// KP7: OLD provably dead so the escalation gate proceeds as today.
+		SupervisorAlive: func(int, int64) bool { return false },
+		TakeOver:  func(string, string) (bool, []liveHolderInfo, error) { atomic.AddInt32(&tookOver, 1); return true, nil, nil },
 		RecoverSpawn: func(*agent.Record, string, string, bool, io.Writer, io.Writer) error {
 			atomic.AddInt32(&recovered, 1)
 			return nil
@@ -778,7 +797,9 @@ func TestDrainLease_TakeoverNotAcquired_NoRecoverSpawn(t *testing.T) {
 		CurrentEpoch:   func(string) (int64, bool) { return 5, true },
 		BarrierExists:  func(string, int64) bool { return false },
 		LoadAgent:      func(string) (*agent.Record, error) { return oldCoordRec(), nil },
-		TakeOver:       func(string, string) (bool, error) { return false, nil }, // did NOT acquire
+		// KP7: OLD provably dead so the escalation gate proceeds as today.
+		SupervisorAlive: func(int, int64) bool { return false },
+		TakeOver:       func(string, string) (bool, []liveHolderInfo, error) { return false, nil, nil }, // did NOT acquire
 		RecoverSpawn: func(*agent.Record, string, string, bool, io.Writer, io.Writer) error {
 			atomic.AddInt32(&recovered, 1)
 			return nil
@@ -816,7 +837,7 @@ func TestDrainLease_NoEpochColdSpawnsViaResume(t *testing.T) {
 			atomic.AddInt32(&resumed, 1)
 			return nil
 		},
-		TakeOver: func(string, string) (bool, error) { atomic.AddInt32(&tookOver, 1); return false, nil },
+		TakeOver: func(string, string) (bool, []liveHolderInfo, error) { atomic.AddInt32(&tookOver, 1); return false, nil, nil },
 	}
 	err := drainOneLeaseAwareWith(leaseDrainReq(), "/tmp/q.json", 0, 1000, out, out, d)
 	if err != nil {
@@ -985,6 +1006,8 @@ func TestDrainLease_GracefulPath_HoldsNoPerAgentLock(t *testing.T) {
 			return 555555, true
 		},
 		LoadAgent:      func(string) (*agent.Record, error) { return oldCoordRec(), nil },
+		// KP7: OLD provably dead so the escalation gate proceeds as today.
+		SupervisorAlive: func(int, int64) bool { return false },
 		DeliverPending: func(queue.SpawnFresh, *agent.Record, io.Writer, io.Writer) error { return nil },
 		BarrierPoll:    50 * time.Millisecond,
 		// LockAgent must NEVER be called on the graceful path; fail loudly if so.
@@ -1045,19 +1068,21 @@ func TestDrainLease_TakeoverDoesNotHoldLockAcrossKill(t *testing.T) {
 		CurrentEpoch:   func(string) (int64, bool) { return 9, true },
 		BarrierExists:  func(string, int64) bool { return false },
 		LoadAgent:      func(string) (*agent.Record, error) { return oldCoordRec(), nil },
+		// KP7: OLD provably dead so the escalation gate proceeds as today.
+		SupervisorAlive: func(int, int64) bool { return false },
 		// REAL per-agent lock — the same primitive coord.Cleanup's archive uses.
 		LockAgent: state.LockAgent,
-		TakeOver: func(string, string) (bool, error) {
+		TakeOver: func(string, string) (bool, []liveHolderInfo, error) {
 			// Simulate OLD's coord.Cleanup archive (archiveAgentRecord ->
 			// state.LockAgent(OLD)) running while the kill is in flight. If the
 			// drain holds the lock across TakeOver this blocks forever.
 			rel, err := state.LockAgent("oldcoord1")
 			if err != nil {
-				return false, err
+				return false, nil, err
 			}
 			rel()
 			close(siblingGotLock)
-			return true, nil // takeover acquired -> OLD confirmed gone
+			return true, nil, nil // takeover acquired -> OLD confirmed gone
 		},
 		RecoverSpawn: func(*agent.Record, string, string, bool, io.Writer, io.Writer) error {
 			atomic.AddInt32(&recovered, 1)

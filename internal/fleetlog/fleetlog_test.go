@@ -436,3 +436,33 @@ func TestCLIStartDoesNotMutateCallerData(t *testing.T) {
 		t.Errorf("CLIStart modified existing key in caller's Fields.Data map")
 	}
 }
+
+// coord.quarantine is part of the closed vocabulary
+// (DESIGN-coord-no-auto-kill: KP3 sweep + KP6 standby detection emit it
+// with data.reason=stale-competitor). Emitted through the normal Log
+// lifecycle it must pass the envelope + vocabulary assertions.
+func TestLogCoordQuarantineInVocabulary(t *testing.T) {
+	if !Types["coord.quarantine"] {
+		t.Fatal("coord.quarantine missing from the closed Types vocabulary")
+	}
+	dir := setupLogHome(t)
+
+	Log(CompCoord, "coord.quarantine", "warn", Fields{
+		Proj:  "rainier",
+		Agent: "stale1",
+		Msg:   "stale competitor detected (report-only)",
+		Data:  map[string]any{"reason": "stale-competitor", "pid": 4242},
+	})
+	lines := readLines(t, dir)
+	if len(lines) != 1 {
+		t.Fatalf("want 1 line, got %d", len(lines))
+	}
+	assertEnvelope(t, lines[0])
+	if lines[0]["type"] != "coord.quarantine" {
+		t.Fatalf("type = %v, want coord.quarantine", lines[0]["type"])
+	}
+	data, _ := lines[0]["data"].(map[string]any)
+	if data == nil || data["reason"] != "stale-competitor" {
+		t.Fatalf("data.reason = %v, want stale-competitor", data)
+	}
+}
