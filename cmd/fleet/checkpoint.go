@@ -48,10 +48,12 @@ const checkpointSessionDocsMax = 20
 // Next Steps cap (nextStepsLimit) bounds the COMBINED explicit+auto render.
 const checkpointNextStepsMax = 10
 
-// sessionTasksMax caps coord-state.json:session_tasks — the auto Next Steps
-// buffer (promoted/dispatched slugs). Byte-identical cap to the Python tick
-// writer (dispatch._SESSION_TASKS_MAX) so the two co-writers agree.
-const sessionTasksMax = 30
+// NOTE: session_tasks (the auto Next Steps buffer) is written ONLY by the
+// coord tick (skills/coordinator: dispatch.record_session_task, capped at
+// _SESSION_TASKS_MAX=30) — never by a Go CLI command. A CLI write to
+// coord-state.json would spoof the coord heartbeat coordStateFresh() reads
+// from its mtime (codex iter-11 [P1]). The Go side is READ-ONLY for
+// session_tasks (internal/handoff CollectNextSteps/CollectOpenQuestions).
 
 // checkpointDefaultDecisions is the recent_decisions cap when
 // FLEET_COORD_CHECKPOINT_DECISIONS is unset/invalid — matches
@@ -188,82 +190,6 @@ func runCheckpointNextStep(project, slug, text string) error {
 	})
 }
 
-// appendSessionTask records slug into coord-state.json:session_tasks (the
-// auto Next Steps buffer), deduped by slug (coord_id/ts refreshed, moved to
-// tail) and capped to sessionTasksMax. Stamps FLEET_AGENT_ID as coord_id.
-// Takes coordinator.lock via withCoordState.
-//
-// `fleet tasks promote` / `fleet tasks set` call this SEQUENTIALLY AFTER
-// releasing the tasks lock (never nested) so the coordinator→state lock order
-// the live tick uses is never inverted here (state→coordinator would AB-BA vs
-// a coincident `fleet tasks set`).
-//
-// FAIL-FAST (codex review P1): the acquire is a single non-blocking LOCK_NB
-// attempt, NOT a bounded wait. `fleet tasks set status=…/parked=…` (and
-// `promote`) can be spawned BY THE LIVE COORD TICK — loop.py's
-// _apply_reconcile / _set_parked / reaper requeue shell out to `fleet tasks
-// set` WHILE the tick holds coordinator.lock. A blocking acquire there would
-// stall the child for the full timeout on EVERY such transition. Fail-fast
-// returns instantly; a lock-contention miss is CORRECT for the tick-spawned
-// case because that slug was already stamped at its dispatch seam (loop.py
-// _record_session_task) and the reader overlays live tasks.md status, so the
-// status change still renders.
-//
-// A bounded wait can't do better: the tick holds coordinator.lock for its
-// ENTIRE duration (seconds), so ANY child racing an active tick — tick-spawned
-// OR a coincident operator-shell `fleet tasks set` — contends longer than any
-// sane timeout and skips regardless. So the fail-fast trade accepts one narrow
-// best-effort miss (codex iter-9 [P2]): a HUMAN `fleet tasks set` that happens
-// to race a live tick loses its session_tasks stamp. Mitigated three ways: it
-// is rare (single-shot ticks run sequentially, so the coord agent never races
-// its own tick; only a concurrent operator shell can), the tasks.md mutation
-// still LANDS, and the next tick's reconcile re-touches the slug. That miss is
-// strictly better than the 2s stall on every tick-invoked transition the
-// blocking acquire caused. Contention returns nil (silent, expected); only a
-// genuine I/O error propagates so the caller can log it.
-func appendSessionTask(project, slug string) error {
-	err := withCoordStateTimeout(project, 0, func(cs map[string]any) {
-		recordSessionTaskEntry(cs, slug, os.Getenv("FLEET_AGENT_ID"))
-	})
-	if err != nil && errors.Is(err, state.ErrLockTimeout) {
-		return nil // coord tick (or a coincident writer) owns the lock; skip
-	}
-	return err
-}
-
-// recordSessionTaskEntry mutates cs["session_tasks"] in place: dedupe by
-// slug (drop any prior entry so coord_id/ts refresh + the entry moves to the
-// tail), append {slug, coord_id, ts}, cap to sessionTasksMax. Keys are
-// byte-identical to the Python writer (dispatch.record_session_task) so the
-// shared buffer round-trips across both co-writers.
-func recordSessionTaskEntry(cs map[string]any, slug, coordID string) {
-	slug = strings.TrimSpace(slug)
-	if slug == "" {
-		return
-	}
-	tasksBuf := toSlice(cs["session_tasks"])
-	kept := tasksBuf[:0]
-	for _, e := range tasksBuf {
-		m, ok := e.(map[string]any)
-		if ok && m["slug"] == slug {
-			continue
-		}
-		kept = append(kept, e)
-	}
-	entry := map[string]any{
-		"slug": slug,
-		"ts":   time.Now().UTC().Format(time.RFC3339),
-	}
-	if coordID != "" {
-		entry["coord_id"] = coordID
-	}
-	kept = append(kept, entry)
-	if len(kept) > sessionTasksMax {
-		kept = kept[len(kept)-sessionTasksMax:]
-	}
-	cs["session_tasks"] = kept
-}
-
 func newCheckpointDocCmd() *cobra.Command {
 	var project, role string
 	cmd := &cobra.Command{
@@ -392,18 +318,6 @@ func runCheckpointDecision(project, text string) error {
 // the operator/agent-invoked provenance writers (`fleet checkpoint …`) that
 // are NEVER called from inside a live tick, so blocking-with-timeout is safe.
 func withCoordState(project string, mutate func(map[string]any)) error {
-	return withCoordStateTimeout(project, coordLockTimeout, mutate)
-}
-
-// withCoordStateTimeout is withCoordState with a caller-chosen lock timeout.
-// A non-positive timeout means a single fail-fast LOCK_NB attempt (see
-// state.LockCoordinatorTimeout) — used by appendSessionTask, which can be
-// invoked by a `fleet tasks set/promote` child process the LIVE COORD TICK
-// spawned WHILE the tick itself already holds coordinator.lock (a separate
-// open file description → genuine self-contention). Blocking there would
-// stall every dispatch/requeue transition for the full timeout; fail-fast
-// skips instantly (codex review P1).
-func withCoordStateTimeout(project string, timeout time.Duration, mutate func(map[string]any)) error {
 	proj, err := resolveProject(project)
 	if err != nil {
 		return err
@@ -414,7 +328,7 @@ func withCoordStateTimeout(project string, timeout time.Duration, mutate func(ma
 	}
 	csPath := filepath.Join(pdir, "coord-state.json")
 
-	release, err := state.LockCoordinatorTimeout(proj, timeout)
+	release, err := state.LockCoordinatorTimeout(proj, coordLockTimeout)
 	if err != nil {
 		return fmt.Errorf("checkpoint: %w", err)
 	}

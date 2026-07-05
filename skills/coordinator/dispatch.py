@@ -1626,8 +1626,10 @@ def record_checkpoint_decision(state: dict, line: str) -> None:
 
 
 # _SESSION_TASKS_MAX caps coord-state.json:session_tasks — the auto Next
-# Steps buffer (promoted/dispatched slugs). Byte-identical cap to the Go
-# writer (checkpoint.go sessionTasksMax) so the two co-writers agree.
+# Steps buffer (promoted/dispatched slugs). The coord TICK is the SOLE
+# writer of session_tasks (codex iter-11 [P1]: a Go CLI write would spoof
+# the coord-state.json-mtime heartbeat coordStateFresh reads); the Go side
+# is read-only (internal/handoff collectors).
 _SESSION_TASKS_MAX = 30
 
 
@@ -1641,9 +1643,9 @@ def record_session_task(state: dict, slug: str, coord_id: str) -> None:
     Tolerates a state dict that has never carried session_tasks or one whose
     value is corrupt (non-list).
 
-    The entry JSON keys are byte-identical to the Go co-writer
-    (checkpoint.go recordSessionTaskEntry): {"slug","coord_id","ts"} — so the
-    shared dedup-by-slug and the Go reader's struct tags agree.
+    The entry JSON keys ({"slug","coord_id","ts"}) match the Go READER's
+    struct tags (internal/handoff collect.go sessionTask) so the tick's
+    writes round-trip through CollectNextSteps / CollectOpenQuestions.
     """
     if slug is None:
         return

@@ -905,40 +905,21 @@ func runTasksSet(opts *tasksSetOpts, slug, kv string, stdout io.Writer) error {
 	key := strings.TrimSpace(kv[:idx])
 	value := strings.TrimSpace(kv[idx+1:])
 
-	// review iter-4 [P1] (codex): `fleet tasks set <slug> status=... /
-	// parked=...` is the documented non-promote path for a task's status
-	// or Open-Questions reason to change — but it never stamped
-	// session_tasks, so a session-scoped Next Steps/Open Questions render
-	// would silently omit a slug this coord explicitly set to ready/
-	// blocked/parked THIS session, unless some later promote/dispatch
-	// happened to also touch it. `recorded` gates the best-effort
-	// session_tasks append below to exactly the mutations the auto
-	// collectors care about; other key= mutations (priority, notes,
-	// worker_pid, ...) don't change what Next Steps/Open Questions would
-	// render for this slug, so they don't need the stamp.
-	//
-	// review iter-5 [P2] (codex): a bare `key == "status"` recorded EVERY
-	// status= transition, including targets CollectNextSteps/
-	// CollectOpenQuestions never render (in-review, done, abandoned).
-	// session_tasks is capped at 30 (newest kept) — in a busy session
-	// with many non-renderable status churns on DIFFERENT slugs, those
-	// dead-weight stamps could evict an older entry that's still ready/
-	// blocked and genuinely due to render. Only stamp on a status target
-	// the auto block (ready/todo) or Open Questions (blocked) actually
-	// reads.
-	//
-	// codex iter-7 [P2]: a `parked=` / `parked=null` CLEAR must NOT stamp
-	// either — after an un-park the task is no longer Parked, so Open
-	// Questions renders it only if it's still `blocked` (and a bare park
-	// clear leaves status untouched, so if it were blocked it was already
-	// stamped at the transition that blocked it). Recording a clear just
-	// adds a dead entry that pressures the 30-cap. Only a park SET (a
-	// non-empty, non-"null" reason → the task becomes an Open Question)
-	// stamps. `nullOrValue(value) != ""` is exactly "the resulting Parked
-	// field is non-empty" — reusing the same coercion setTaskField applies.
-	recorded := (key == "parked" && nullOrValue(value) != "") ||
-		(key == "status" && isSessionTaskRenderableStatus(value))
-	err = withTasksLock(project, func() error {
+	// codex iter-11 [P1] — `fleet tasks set` deliberately does NOT stamp
+	// session_tasks. session_tasks lives in coord-state.json, whose mtime IS
+	// the coord tick heartbeat that coordStateFresh() (dispatch_recovery.go)
+	// and the TUI dashboard read as proof a coordinator is alive. A CLI write
+	// from an operator shell (no live coord) would SPOOF that heartbeat —
+	// flipping the project to "● active" and making `fleet dispatch
+	// --coord-spawn` refuse for ~coordFreshnessWindow. session_tasks is
+	// instead recorded ONLY by the coord TICK (loop.py _record_session_task
+	// at every dispatch / reaper-promote seam), which legitimately owns the
+	// heartbeat write. A coord-driven status transition is thus already in
+	// session_tasks via its dispatch seam; the reader overlays live tasks.md
+	// status. (Adjusts the mechanism of design D2 — session_tasks captured by
+	// the tick, not the CLI — to eliminate the verified heartbeat-spoof; the
+	// feature intent is preserved.)
+	return withTasksLock(project, func() error {
 		f, path, err := readTasks(project)
 		if err != nil {
 			return err
@@ -978,39 +959,6 @@ func runTasksSet(opts *tasksSetOpts, slug, kv string, stdout io.Writer) error {
 		_, _ = fmt.Fprintf(stdout, "set %s.%s = %s\n", slug, key, value)
 		return nil
 	})
-	if err != nil {
-		return err
-	}
-	// Same sequential (never-nested) lock ordering as runTasksPromote: the
-	// tasks/state lock is already released above, so taking coordinator.lock
-	// here can't invert the coordinator→state order a live tick uses.
-	// appendSessionTask is FAIL-FAST + silent on lock-contention (the
-	// tick-holds-the-lock case; the slug is already stamped at its dispatch
-	// seam), so this never stalls a tick-invoked `fleet tasks set`. Only a
-	// genuine I/O error surfaces here — logged, never fatal to the command.
-	if recorded {
-		if aerr := appendSessionTask(project, slug); aerr != nil {
-			fmt.Fprintf(os.Stderr, "tasks set: session_tasks append dropped for %s (%v)\n", slug, aerr)
-		}
-	}
-	return nil
-}
-
-// isSessionTaskRenderableStatus reports whether target is a status value
-// CollectNextSteps' auto block (ready, todo) or CollectOpenQuestions
-// (blocked) actually reads. A status= mutation to any OTHER value
-// (in-progress, in-review, done, abandoned, or an invalid enum that
-// setTaskField will reject anyway) never changes what the session-scoped
-// handoff sections would render for this slug, so runTasksSet skips the
-// session_tasks stamp to avoid evicting an older, still-relevant entry
-// out of the capped (30) buffer for no rendering benefit.
-func isSessionTaskRenderableStatus(target string) bool {
-	switch tasks.Status(target) {
-	case tasks.StatusReady, tasks.StatusTodo, tasks.StatusBlocked:
-		return true
-	default:
-		return false
-	}
 }
 
 // stampLifecycleTransition applies the lifecycle stamping rules in one
@@ -1384,11 +1332,16 @@ func runTasksPromote(opts *tasksPromoteOpts, slug string, stdout io.Writer) erro
 	if err != nil {
 		return err
 	}
-	// recorded gates the best-effort session_tasks append below — set true
-	// only when the promote reached a "greenlit as ready" outcome (todo→ready
-	// OR already-ready no-op), never the rejected-status error path.
-	recorded := false
-	err = withTasksLock(project, func() error {
+	// codex iter-11 [P1] — like `fleet tasks set`, promote does NOT stamp
+	// session_tasks: a CLI write to coord-state.json spoofs the coord tick
+	// heartbeat (coordStateFresh / dashboard read its mtime), which on an
+	// idle project falsely shows "● active" and can make `fleet dispatch
+	// --coord-spawn` refuse. The coord TICK records session_tasks at its
+	// reaper-promote + dispatch seams (loop.py _record_session_task), which
+	// legitimately owns the heartbeat write — so a coord-driven promote is
+	// captured there. (Adjusts design D2's mechanism to remove the verified
+	// heartbeat-spoof while preserving the session-scoped Next Steps intent.)
+	return withTasksLock(project, func() error {
 		f, path, err := readTasks(project)
 		if err != nil {
 			return err
@@ -1405,31 +1358,12 @@ func runTasksPromote(opts *tasksPromoteOpts, slug string, stdout io.Writer) erro
 				return fmt.Errorf("write: %w", err)
 			}
 			_, _ = fmt.Fprintf(stdout, "promoted %s: todo → ready\n", slug)
-			recorded = true
 			return nil
 		case tasks.StatusReady:
 			_, _ = fmt.Fprintf(stdout, "%s already ready (no-op)\n", slug)
-			recorded = true
 			return nil
 		default:
 			return fmt.Errorf("tasks promote: %s has status=%s — only todo→ready is allowed (use `fleet tasks set` for other transitions)", slug, t.Status)
 		}
 	})
-	if err != nil {
-		return err
-	}
-	// Record the promoted slug into the session-scoped auto Next Steps buffer
-	// (coord-state.json:session_tasks). SEQUENTIAL — the tasks (state.lock) is
-	// already released, so taking coordinator.lock here can't invert the
-	// coordinator→state order a live tick uses (state→coordinator would AB-BA
-	// vs a coincident `fleet tasks set`). appendSessionTask is FAIL-FAST +
-	// silent on lock-contention (a tick holding the lock; the slug is already
-	// stamped at its dispatch seam), so this never stalls a tick-invoked
-	// promote. Only a genuine I/O error surfaces — logged, never fatal.
-	if recorded {
-		if aerr := appendSessionTask(project, slug); aerr != nil {
-			fmt.Fprintf(os.Stderr, "tasks promote: session_tasks append dropped for %s (%v)\n", slug, aerr)
-		}
-	}
-	return nil
 }
