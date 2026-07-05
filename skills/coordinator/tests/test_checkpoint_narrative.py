@@ -105,3 +105,28 @@ def test_dispatch_and_worker_failed_are_decisions_not_completions():
     ]
     # The completion buffer must stay empty — neither is a true completion.
     assert state.get("recent_completions", []) == []
+
+
+# ---------- _record_session_task seam (auto Next Steps buffer) ----------
+
+
+def test_record_session_task_writes_into_state():
+    """The shared dispatch seam records the acted-on slug into session_tasks
+    with the coord_id stamp (the foreignGeneration filter's load-bearing
+    field)."""
+    state = {}
+    loop._record_session_task(state, "foo-1111", "coord01")
+    assert state["session_tasks"][0]["slug"] == "foo-1111"
+    assert state["session_tasks"][0]["coord_id"] == "coord01"
+
+
+def test_record_session_task_blank_slug_noop():
+    """A blank slug records nothing (no empty auto row)."""
+    state = {}
+    loop._record_session_task(state, "", "coord01")
+    assert state.get("session_tasks", []) == []
+
+
+def test_record_session_task_never_raises():
+    """A session-task-log fault must never wedge a tick (best-effort seam)."""
+    loop._record_session_task(None, "foo", "c1")  # bad state → swallowed

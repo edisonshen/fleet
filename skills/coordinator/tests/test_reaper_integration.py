@@ -558,3 +558,31 @@ def test_redispatch_pending_promotes_todo_to_ready(
     # Marker consumed.
     pending = state.get("reaper_redispatch_pending", [])
     assert "flagged-aaaa" not in pending
+
+
+def test_redispatch_promote_records_session_task(
+    fleet_home: Path, project_dir: Path,
+    fleet_run_recorder, dispatch_subprocess,
+    monkeypatch,
+) -> None:
+    """T8 (reaper seam): the reaper promote-to-ready path records the
+    promoted slug into coord-state.json:session_tasks with the acting
+    coord_id, so a re-dispatched-after-failure task shows up in the
+    handoff's session-scoped Next Steps."""
+    monkeypatch.setenv("FLEET_HOME", str(fleet_home))
+    project = "fleet"
+    _write_tasks(project_dir, [_make_task("flagged-bbbb", status="todo")])
+    coord_state_path = project_dir / "coord-state.json"
+    coord_state_path.write_text(json.dumps({
+        "reaper_redispatch_pending": ["flagged-bbbb"],
+    }), encoding="utf-8")
+
+    state = json.loads(coord_state_path.read_text())
+    loop._consume_reaper_redispatch(
+        project=project, fleet_bin="fleet", home=fleet_home,
+        coord_state=state, tasks_path=project_dir / "tasks.md",
+        coord_id="reaper01",
+    )
+    st = state.get("session_tasks", [])
+    assert [e["slug"] for e in st] == ["flagged-bbbb"]
+    assert st[0]["coord_id"] == "reaper01"

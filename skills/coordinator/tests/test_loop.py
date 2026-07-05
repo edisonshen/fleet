@@ -279,6 +279,28 @@ def test_tick_dispatches_ready_task(
     ), f"unexpected `fleet dispatch` subprocess call: {seen_cmds!r}"
 
 
+def test_tick_dispatch_records_session_task(
+    fleet_home: Path, project_dir: Path,
+    fleet_run_recorder, dispatch_subprocess,
+) -> None:
+    """T8 (primary seam): a real dispatch records the slug into
+    coord-state.json:session_tasks with the coord_id — the auto source for
+    the handoff's session-scoped Next Steps. The tick's load-mutate-save
+    persists the buffer (co-located with the _record_decision seam)."""
+    _write_tasks(project_dir, [_make_task("ready-aaaa", status="ready")])
+    dispatch_subprocess.append("abcdef01")
+
+    result = loop.tick(
+        "fleet", coord_id="cccccc01", cwd="/repo",
+        fleet_home=str(fleet_home),
+    )
+    assert result.dispatched == 1
+    cs = json.loads((project_dir / "coord-state.json").read_text())
+    st = cs.get("session_tasks", [])
+    assert [e["slug"] for e in st] == ["ready-aaaa"]
+    assert st[0]["coord_id"] == "cccccc01"
+
+
 # ---------- reconcile: dead worker, no PR ----------
 
 

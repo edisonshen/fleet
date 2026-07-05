@@ -544,6 +544,60 @@ def test_record_completion_tolerates_corrupt_buffer():
     assert state["recent_completions"] == ["hello"]
 
 
+# ---------- record_session_task (session-scoped Next Steps auto buffer) ----------
+
+
+def test_record_session_task_appends_stamped_entry():
+    """record_session_task appends {slug, coord_id, ts} — the byte-identical
+    key set the Go runTasksPromote writer + the Go reader agree on."""
+    state = {}
+    dispatch.record_session_task(state, "foo-1111", "coord01")
+    assert len(state["session_tasks"]) == 1
+    e = state["session_tasks"][0]
+    assert e["slug"] == "foo-1111"
+    assert e["coord_id"] == "coord01"
+    assert e["ts"]  # non-empty RFC3339-ish stamp
+    assert set(e.keys()) == {"slug", "coord_id", "ts"}
+
+
+def test_record_session_task_dedupes_by_slug_moves_to_tail():
+    """A slug promoted then dispatched appears once — coord_id/ts refreshed
+    to the latest action, entry moved to the tail."""
+    state = {}
+    dispatch.record_session_task(state, "a", "c1")
+    dispatch.record_session_task(state, "b", "c1")
+    dispatch.record_session_task(state, "a", "c2")
+    slugs = [e["slug"] for e in state["session_tasks"]]
+    assert slugs == ["b", "a"]
+    assert state["session_tasks"][-1]["coord_id"] == "c2"
+
+
+def test_record_session_task_caps_to_30():
+    """session_tasks caps at 30 (newest kept)."""
+    state = {}
+    for i in range(35):
+        dispatch.record_session_task(state, f"slug-{i:02d}", "c1")
+    st = state["session_tasks"]
+    assert len(st) == 30
+    assert st[0]["slug"] == "slug-05"
+    assert st[-1]["slug"] == "slug-34"
+
+
+def test_record_session_task_drops_blank_slug():
+    """A blank / whitespace-only slug is dropped (no empty auto row)."""
+    state = {}
+    dispatch.record_session_task(state, "", "c1")
+    dispatch.record_session_task(state, "   ", "c1")
+    assert state.get("session_tasks", []) == []
+
+
+def test_record_session_task_tolerates_corrupt_buffer():
+    """A non-list session_tasks (corrupt state.json) resets to a fresh list."""
+    state = {"session_tasks": "not-a-list"}
+    dispatch.record_session_task(state, "a", "c1")
+    assert [e["slug"] for e in state["session_tasks"]] == ["a"]
+
+
 # ---------- round-trip: frontmatter parses ----------
 
 
