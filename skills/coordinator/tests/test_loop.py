@@ -301,6 +301,38 @@ def test_tick_dispatch_records_session_task(
     assert st[0]["coord_id"] == "cccccc01"
 
 
+def test_handoff_dispatch_records_session_task(
+    fleet_home: Path, project_dir: Path,
+    fleet_run_recorder, dispatch_subprocess,
+) -> None:
+    """T8 (review-handoff seam): a reviewer/finisher dispatch emitted from
+    the handoff-apply loop (a task already `in-progress` whose worker
+    state.json is at phase=review-pending) records the slug into
+    coord-state.json:session_tasks too — NOT just the primary
+    `_dispatch_ready` seam covered by test_tick_dispatch_records_session_task.
+    Distinct code path (the `handoff apply` loop in `_tick_locked`, before
+    `_dispatch_ready` runs)."""
+    _write_tasks(project_dir, [
+        _make_task("revhandoff-aaaa", status="in-progress", worker_pid=0),
+    ])
+    workers_dir = project_dir / "workers" / "revhandoff-aaaa"
+    workers_dir.mkdir(parents=True, exist_ok=True)
+    (workers_dir / "state.json").write_text(
+        json.dumps({"phase": "review-pending"}), encoding="utf-8",
+    )
+    dispatch_subprocess.append("eeee0002")
+
+    result = loop.tick(
+        "fleet", coord_id="cccccc01", cwd="/repo",
+        fleet_home=str(fleet_home),
+    )
+    assert result.dispatched == 1
+    cs = json.loads((project_dir / "coord-state.json").read_text())
+    st = cs.get("session_tasks", [])
+    assert [e["slug"] for e in st] == ["revhandoff-aaaa"]
+    assert st[0]["coord_id"] == "cccccc01"
+
+
 # ---------- reconcile: dead worker, no PR ----------
 
 
