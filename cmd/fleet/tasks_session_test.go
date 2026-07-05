@@ -219,6 +219,43 @@ func TestTasksSet_ParkedChangeRecordsSessionTask(t *testing.T) {
 	}
 }
 
+// status=blocked is Open-Questions-renderable — must stamp.
+func TestTasksSet_StatusBlockedRecordsSessionTask(t *testing.T) {
+	home, project := setupTasksHome(t)
+	slug := addTodo(t, project, "set-to-blocked")
+
+	if err := runTasksSet(&tasksSetOpts{project: project}, slug, "status=blocked", &bytes.Buffer{}); err != nil {
+		t.Fatalf("set status=blocked: %v", err)
+	}
+	st := sessionTasksOf(t, readCoordState(t, home, project))
+	if len(st) != 1 || st[0]["slug"] != slug {
+		t.Fatalf("session_tasks: got %#v", st)
+	}
+}
+
+// review iter-5 [P2] (codex): status targets CollectNextSteps/
+// CollectOpenQuestions never render (in-progress, in-review, done,
+// abandoned) must NOT stamp session_tasks — recording every status
+// churn could evict an older, still-ready/blocked slug out of the
+// capped (30) buffer for zero rendering benefit.
+func TestTasksSet_NonRenderableStatusDoesNotRecordSessionTask(t *testing.T) {
+	for _, status := range []string{"in-progress", "in-review", "done", "abandoned"} {
+		t.Run(status, func(t *testing.T) {
+			home, project := setupTasksHome(t)
+			slug := addTodo(t, project, "set-to-"+status)
+			seedCoordStateFile(t, home, project, `{"tick_count":1}`)
+
+			if err := runTasksSet(&tasksSetOpts{project: project}, slug, "status="+status, &bytes.Buffer{}); err != nil {
+				t.Fatalf("set status=%s: %v", status, err)
+			}
+			st := sessionTasksOf(t, readCoordState(t, home, project))
+			if len(st) != 0 {
+				t.Errorf("status=%s must not record session_tasks: %#v", status, st)
+			}
+		})
+	}
+}
+
 // Mutating a field the Next Steps/Open Questions collectors don't look
 // at (e.g. priority) must NOT stamp session_tasks — the `recorded` gate
 // stays false so an unrelated field bump doesn't fabricate session

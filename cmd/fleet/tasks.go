@@ -901,11 +901,22 @@ func runTasksSet(opts *tasksSetOpts, slug, kv string, stdout io.Writer) error {
 	// would silently omit a slug this coord explicitly set to ready/
 	// blocked/parked THIS session, unless some later promote/dispatch
 	// happened to also touch it. `recorded` gates the best-effort
-	// session_tasks append below to exactly the two keys the auto
+	// session_tasks append below to exactly the mutations the auto
 	// collectors care about; other key= mutations (priority, notes,
 	// worker_pid, ...) don't change what Next Steps/Open Questions would
 	// render for this slug, so they don't need the stamp.
-	recorded := key == "status" || key == "parked"
+	//
+	// review iter-5 [P2] (codex): a bare `key == "status"` recorded EVERY
+	// status= transition, including targets CollectNextSteps/
+	// CollectOpenQuestions never render (in-review, done, abandoned).
+	// session_tasks is capped at 30 (newest kept) — in a busy session
+	// with many non-renderable status churns on DIFFERENT slugs, those
+	// dead-weight stamps could evict an older entry that's still ready/
+	// blocked and genuinely due to render. Only stamp on a status target
+	// the auto block (ready/todo) or Open Questions (blocked) actually
+	// reads; `parked` always stamps (Open Questions checks Parked != ""
+	// regardless of status).
+	recorded := key == "parked" || (key == "status" && isSessionTaskRenderableStatus(value))
 	err = withTasksLock(project, func() error {
 		f, path, err := readTasks(project)
 		if err != nil {
@@ -960,6 +971,23 @@ func runTasksSet(opts *tasksSetOpts, slug, kv string, stdout io.Writer) error {
 		}
 	}
 	return nil
+}
+
+// isSessionTaskRenderableStatus reports whether target is a status value
+// CollectNextSteps' auto block (ready, todo) or CollectOpenQuestions
+// (blocked) actually reads. A status= mutation to any OTHER value
+// (in-progress, in-review, done, abandoned, or an invalid enum that
+// setTaskField will reject anyway) never changes what the session-scoped
+// handoff sections would render for this slug, so runTasksSet skips the
+// session_tasks stamp to avoid evicting an older, still-relevant entry
+// out of the capped (30) buffer for no rendering benefit.
+func isSessionTaskRenderableStatus(target string) bool {
+	switch tasks.Status(target) {
+	case tasks.StatusReady, tasks.StatusTodo, tasks.StatusBlocked:
+		return true
+	default:
+		return false
+	}
 }
 
 // stampLifecycleTransition applies the lifecycle stamping rules in one
