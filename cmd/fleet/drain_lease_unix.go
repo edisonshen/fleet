@@ -174,7 +174,12 @@ func defaultDrainLeaseDeps() drainLeaseDeps {
 		LoadAgent: agent.Load,
 		KillCoord: coord.KillCoordIfIdentityMatches,
 		TakeOver: func(project, agentID string) (bool, []liveHolderInfo, error) {
-			lease, acquired, live, err := coordlock.AcquireLeaseWithKill(project, agentID,
+			// AcquireLeaseTakeover (not AcquireLeaseWithKill): the drain is not
+			// a coordinator — it fences+kills the hung holder then releases
+			// immediately, so it must NOT emit lease.acquire/release lifecycle
+			// events (they would show a phantom coordinator during drain
+			// recovery — codex P2).
+			lease, acquired, live, err := coordlock.AcquireLeaseTakeover(project, agentID,
 				func(t coordlock.KillTarget) error {
 					return coord.KillCoordIfIdentityMatches(coord.KillTarget{
 						Pid:         t.Pid,

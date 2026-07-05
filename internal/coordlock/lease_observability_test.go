@@ -179,6 +179,35 @@ func TestLeaseRelease_FailedDemoteLogsNotDemoted(t *testing.T) {
 	}
 }
 
+// The takeover-only path (logLifecycle=false, mirroring AcquireLeaseTakeover)
+// must NOT emit lease.acquire/lease.release — a drain safety-net fences+kills
+// then releases without ever running a coordinator, so a phantom coordinator
+// lifecycle in fleetlog would mislead operators during drain recovery
+// (codex P2).
+func TestLeaseTakeoverOnly_SuppressesLifecycle(t *testing.T) {
+	setupHome(t)
+	const project = "obs-takeover"
+	clk := &fakeClock{}
+	live := newFakeLiveness()
+	em := &capturingEmitter{}
+	cfg := testCfg(clk, live)
+	cfg.emit = em.emit
+	cfg.logLifecycle = false // takeover-only: suppress lifecycle logs
+
+	lease, acquired, err := acquireLease(project, "cand", cfg)
+	if err != nil || !acquired {
+		t.Fatalf("acquireLease: acquired=%v err=%v", acquired, err)
+	}
+	lease.Release()
+
+	if got := em.count("lease.acquire"); got != 0 {
+		t.Errorf("takeover-only lease.acquire count = %d, want 0 (suppressed)", got)
+	}
+	if got := em.count("lease.release"); got != 0 {
+		t.Errorf("takeover-only lease.release count = %d, want 0 (suppressed)", got)
+	}
+}
+
 // Test 5: no emit ever runs inside coordinator.epoch.lock (the PR #241
 // wedge class). The seam-injected sink tries to LOCK_NB the epoch lock on
 // every emit; if the emitting code path still held the lock, the NB acquire

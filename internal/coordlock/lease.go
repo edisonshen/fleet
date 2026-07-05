@@ -171,6 +171,18 @@ type leaseConfig struct {
 	// error the lease path, and MUST run OUTSIDE the short coordinator.epoch.
 	// lock critical section (the PR #241 wedge class).
 	emit func(evt string, data map[string]any)
+
+	// logLifecycle gates the ownership-transition events (lease.acquire /
+	// lease.release). Only a REAL coordinator lease should log them; the
+	// drain safety-net takeover (AcquireLeaseTakeover) acquires just long
+	// enough to fence+kill a hung holder then releases WITHOUT ever running a
+	// coordinator, so emitting acquire/release there would show a phantom
+	// coordinator lifecycle during drain recovery — exactly the window
+	// operators inspect (codex P2). defaultLeaseConfig sets it true; the
+	// takeover-only path sets it false. renew/renew.fail are unaffected: they
+	// only fire from the heartbeat loop, which a takeover-only caller never
+	// starts.
+	logLifecycle bool
 }
 
 func defaultLeaseConfig() leaseConfig {
@@ -194,6 +206,9 @@ func defaultLeaseConfig() leaseConfig {
 		// the real KillCoordIfIdentityMatches. Tests override this to
 		// simulate the kill.
 		killStub: func(identity, int64) error { return nil },
+		// A real coordinator lease logs its ownership transitions by default;
+		// the takeover-only path overrides this to false (codex P2).
+		logLifecycle: true,
 	}
 }
 
@@ -412,10 +427,28 @@ type LiveHolder struct {
 // callback (not a hard import) keeps the lease primitive free of any
 // dependency on the coord package.
 func AcquireLeaseWithKill(project, agentID string, kill func(KillTarget) error) (*Lease, bool, []LiveHolder, error) {
+	return acquireLeaseWithKill(project, agentID, kill, true /* logLifecycle */)
+}
+
+// AcquireLeaseTakeover is the drain safety-net variant of AcquireLeaseWithKill:
+// it fences+kills a hung holder then the caller Releases immediately WITHOUT
+// running a coordinator or heartbeat. It SUPPRESSES the lease.acquire /
+// lease.release lifecycle events so fleetlog does not show a phantom
+// coordinator lifecycle during drain recovery (codex P2) — the exact window
+// operators inspect. Everything else (fence/kill/detect) is identical.
+func AcquireLeaseTakeover(project, agentID string, kill func(KillTarget) error) (*Lease, bool, []LiveHolder, error) {
+	return acquireLeaseWithKill(project, agentID, kill, false /* logLifecycle */)
+}
+
+// acquireLeaseWithKill is the shared failover-gated core. logLifecycle=true is
+// the real-coordinator path (AcquireLeaseWithKill); false is the takeover-only
+// path (AcquireLeaseTakeover), which suppresses ownership-transition logs.
+func acquireLeaseWithKill(project, agentID string, kill func(KillTarget) error, logLifecycle bool) (*Lease, bool, []LiveHolder, error) {
 	if !failoverEnabled() {
 		return nil, false, nil, ErrFailoverDisabled
 	}
 	cfg := defaultLeaseConfig()
+	cfg.logLifecycle = logLifecycle
 	if kill != nil {
 		// Adapt the exported KillTarget callback into the internal
 		// killStub seam. fencerEpoch is l.epoch — the epoch the takeover
@@ -483,8 +516,10 @@ func acquireLeaseDetect(project, agentID string, cfg leaseConfig) (*Lease, bool,
 			if acquired {
 				// lease.acquire: ownership transition (OUTSIDE epoch.lock —
 				// the acquire CAS already released it). Epoch is the one we
-				// now own.
-				l.emitEvent("lease.acquire", "info", map[string]any{"epoch": l.epoch})
+				// now own. Suppressed on the takeover-only path (codex P2).
+				if l.cfg.logLifecycle {
+					l.emitEvent("lease.acquire", "info", map[string]any{"epoch": l.epoch})
+				}
 				return l, true, nil, nil
 			}
 			// Stand-down. liveAbort is non-nil ONLY when the KP6 pre-fence
@@ -1248,8 +1283,10 @@ func (l *Lease) Release() {
 	// active state) from a fault path where the record may still be active
 	// with valid tokens until TTL (codex P3) — the log must not overstate
 	// success on exactly the path operators inspect during a bad handoff.
-	// Best-effort.
-	if heldFlock {
+	// Best-effort. Suppressed on the takeover-only path (codex P2): a drain
+	// safety-net that fenced+released never ran a coordinator, so it must not
+	// show a phantom coordinator lifecycle.
+	if heldFlock && l.cfg.logLifecycle {
 		l.emitEvent("lease.release", "info", map[string]any{
 			"epoch": l.epoch, "demoted": demoted,
 		})

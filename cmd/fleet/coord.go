@@ -347,17 +347,27 @@ func runCoordRun(ctx context.Context, opts coordRunOpts, stdout, stderr io.Write
 	// internally panic-safe so this defer never re-panics.
 	defer coord.Cleanup(opts.agentID, opts.project, deps) //nolint:errcheck // best-effort
 
+	// exitNote refines the supervisor.exit reason on the nil-return paths
+	// where the supervisor never became the coordinator / never started the
+	// child (stand-down, standby timeout, standby cancel-before-acquire). Left
+	// empty those exits are indistinguishable from a normal clean child exit,
+	// so duplicate-start and failed-standby incidents get mislabeled in the
+	// very signal this feature adds (codex P3). Empty => a real
+	// coordinator/child lifecycle exit.
+	var exitNote string
+
 	// supervisor.exit (DESIGN-coord-lease-false-fence-prevention piece 2):
 	// emit the supervisor's own exit from a defer so it fires on EVERY exit
-	// path (clean, child-error, acquire fault, PANIC) with the reason + exit
-	// code. child_rc is the claude child's exit code when the return is an
-	// *exec.ExitError (-1 when unknown: a non-child fault, a clean exit, or a
-	// panic). A panic unwind leaves the named `err` nil, so recover() here is
-	// the ONLY way to record the crash as a crash (rc=2, reason=panic:<v>)
-	// rather than a spurious clean exit — the exact incident this feature
-	// exists to catch. We re-panic after logging so cleanup (the earlier
-	// defer) still runs on the continued unwind and the operator sees the
-	// original stack. Best-effort fleetlog; never affects the return.
+	// path (clean, child-error, acquire fault, PANIC, stand-down) with the
+	// reason + exit code. child_rc is the claude child's exit code when the
+	// return is an *exec.ExitError (-1 when unknown: a non-child fault, a
+	// clean/stand-down exit, or a panic). A panic unwind leaves the named
+	// `err` nil, so recover() here is the ONLY way to record the crash as a
+	// crash (rc=2, reason=panic:<v>) rather than a spurious clean exit — the
+	// exact incident this feature exists to catch. We re-panic after logging
+	// so cleanup (the earlier defer) still runs on the continued unwind and
+	// the operator sees the original stack. Best-effort fleetlog; never
+	// affects the return.
 	defer func() {
 		p := recover()
 		reason, rc, childRC := "clean", 0, -1
@@ -373,6 +383,10 @@ func runCoordRun(ctx context.Context, opts coordRunOpts, stdout, stderr io.Write
 			} else {
 				rc = 1
 			}
+		case exitNote != "":
+			// A nil-return non-coordinator exit (stand-down / standby). rc
+			// stays 0 (not a failure) but the reason names WHY we exited.
+			reason = exitNote
 		}
 		fleetlog.Log(fleetlog.CompCoord, "supervisor.exit", "info", fleetlog.Fields{
 			Proj:  opts.project,
@@ -432,11 +446,13 @@ func runCoordRun(ctx context.Context, opts coordRunOpts, stdout, stderr io.Write
 			} else {
 				_, _ = fmt.Fprintf(stderr, "a coord is already running for %s\n", opts.project)
 			}
+			exitNote = "stand-down" // a healthy leader exists; we never led
 			return nil
 		}
 		polled, perr := standbyPollUntilAcquired(ctx, acquire, opts, liveHolders, stderr)
 		switch {
 		case errors.Is(perr, errStandbyTimedOut):
+			exitNote = "standby-timeout" // never acquired within the budget
 			return nil
 		case perr != nil:
 			return fmt.Errorf("coord-run: standby acquire for project %q: %w", opts.project, perr)
@@ -444,6 +460,7 @@ func runCoordRun(ctx context.Context, opts coordRunOpts, stdout, stderr io.Write
 			// ctx canceled before we ever acquired — a clean shutdown of a
 			// standby that never led. coord.Cleanup still runs (the deferred
 			// archive of our own record); nothing else to release.
+			exitNote = "standby-canceled"
 			return nil
 		default:
 			lease = polled

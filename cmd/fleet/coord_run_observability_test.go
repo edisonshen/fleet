@@ -143,3 +143,39 @@ func TestCoordRun_SupervisorExitLogsPanic(t *testing.T) {
 		t.Errorf("panic supervisor.exit reason = %q, want a panic: prefix", reason)
 	}
 }
+
+// A stand-down (a healthy leader already holds the lease) is a nil-return exit
+// where the supervisor never became the coordinator. supervisor.exit must
+// record reason="stand-down" rc=0 — NOT reason="clean" — so a duplicate-start
+// incident is distinguishable from a normal child exit in the log (codex P3).
+func TestCoordRun_SupervisorExitStandDownReason(t *testing.T) {
+	t.Setenv("XDG_STATE_HOME", "") // logs under FLEET_HOME
+	_ = coordRunTestHome(t, "obs33333", "obs-standdown", "fleet-obs33333")
+
+	sentinel := filepath.Join(t.TempDir(), "child-ran")
+	opts := coordRunOpts{
+		agentID:  "obs33333",
+		project:  "obs-standdown",
+		session:  "fleet-obs33333",
+		argv:     childSentinelArgv(sentinel),
+		killTmux: func(string) error { return nil },
+		acquireLease: func() (coordLease, bool, []liveHolderInfo, error) {
+			return &fakeLease{}, false, nil, nil // busy: healthy leader exists
+		},
+	}
+	if err := runCoordRun(context.Background(), opts, os.Stdout, os.Stderr); err != nil {
+		t.Fatalf("stand-down must return nil, got %v", err)
+	}
+
+	evts := readFleetlogEvents(t, "supervisor.exit")
+	if len(evts) != 1 {
+		t.Fatalf("supervisor.exit count = %d, want exactly 1", len(evts))
+	}
+	data, _ := evts[0]["data"].(map[string]any)
+	if data["reason"] != "stand-down" {
+		t.Errorf("stand-down supervisor.exit reason = %v, want \"stand-down\"", data["reason"])
+	}
+	if data["rc"] != float64(0) {
+		t.Errorf("stand-down supervisor.exit rc = %v, want 0", data["rc"])
+	}
+}
