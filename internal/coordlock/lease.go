@@ -1182,6 +1182,14 @@ func (l *Lease) Release() {
 	// bounded retry reliably wins. If it ultimately cannot demote, SURFACE
 	// it (surface-don't-silo) rather than silently leaving a stale-active
 	// record; the TTL is then the fallback bound.
+	// demoted records whether the epoch record was cleanly demoted out of
+	// `active` (or already not ours). It gates the lease.release emit below:
+	// on a fault path where demotion failed, the on-disk lease may still be
+	// active with valid outstanding tokens until TTL, so the log must say
+	// demoted=false rather than report a clean release (codex P3). Defaults
+	// true for the no-flock case (nothing to demote), but the emit only fires
+	// when the flock was actually held.
+	demoted := true
 	if l.flock != nil {
 		// guaranteed is true ONLY when no stale-active record of OURS
 		// remains — either we demoted it, or it was already not ours (a
@@ -1220,6 +1228,7 @@ func (l *Lease) Release() {
 				break demoteLoop
 			}
 		}
+		demoted = guaranteed
 		if !guaranteed {
 			fmt.Fprintf(os.Stderr,
 				"coordlock: WARNING: could not demote released lease for project %q "+
@@ -1235,9 +1244,15 @@ func (l *Lease) Release() {
 	// lease.release: ownership transition, emitted AFTER the flock drops so
 	// the emit is unambiguously outside every lock (the demote loop already
 	// released epoch.lock each iteration). Only for a lease that truly held
-	// the flock. Best-effort.
+	// the flock. `demoted` distinguishes a clean release (record left the
+	// active state) from a fault path where the record may still be active
+	// with valid tokens until TTL (codex P3) — the log must not overstate
+	// success on exactly the path operators inspect during a bad handoff.
+	// Best-effort.
 	if heldFlock {
-		l.emitEvent("lease.release", "info", map[string]any{"epoch": l.epoch})
+		l.emitEvent("lease.release", "info", map[string]any{
+			"epoch": l.epoch, "demoted": demoted,
+		})
 	}
 }
 

@@ -11,6 +11,7 @@ package coordlock
 
 import (
 	"errors"
+	"os"
 	"sync"
 	"testing"
 	"time"
@@ -138,6 +139,43 @@ func TestLeaseAcquireRelease_EmitsLifecycle(t *testing.T) {
 	rel, _ := em.first("lease.release")
 	if acq["epoch"] != epoch || rel["epoch"] != epoch {
 		t.Fatalf("acquire epoch=%v release epoch=%v, want both %d", acq["epoch"], rel["epoch"], epoch)
+	}
+	// A clean release demoted the record out of active.
+	if rel["demoted"] != true {
+		t.Errorf("clean release demoted = %v, want true", rel["demoted"])
+	}
+}
+
+// A Release that CANNOT demote the epoch record (corrupt/unreadable epoch
+// file) must log lease.release with demoted=false — the on-disk lease may
+// still be active with valid tokens until TTL, so the log must not overstate
+// success on the exact path operators inspect during a bad handoff (codex P3).
+func TestLeaseRelease_FailedDemoteLogsNotDemoted(t *testing.T) {
+	setupHome(t)
+	const project = "obs-faildemote"
+	clk := &fakeClock{}
+	live := newFakeLiveness()
+	em := &capturingEmitter{}
+	cfg := testCfg(clk, live)
+	cfg.emit = em.emit
+
+	lease, acquired, err := acquireLease(project, "cand", cfg)
+	if err != nil || !acquired {
+		t.Fatalf("acquireLease: acquired=%v err=%v", acquired, err)
+	}
+	// Corrupt the epoch record so the demote loop's readEpoch fails on every
+	// attempt -> guaranteed stays false -> demoted=false.
+	if werr := os.WriteFile(lease.paths.epoch, []byte("not-json"), 0o644); werr != nil {
+		t.Fatalf("corrupt epoch file: %v", werr)
+	}
+	lease.Release()
+
+	if got := em.count("lease.release"); got != 1 {
+		t.Fatalf("lease.release count = %d, want 1", got)
+	}
+	rel, _ := em.first("lease.release")
+	if rel["demoted"] != false {
+		t.Errorf("failed-demote release demoted = %v, want false", rel["demoted"])
 	}
 }
 

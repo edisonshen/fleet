@@ -98,3 +98,48 @@ func TestCoordRun_SupervisorExitLogged(t *testing.T) {
 		})
 	}
 }
+
+// A panic between Start and Wait must be logged as a CRASH, not a clean exit
+// (codex P2). The named `err` return is nil during panic unwinding, so the
+// defer must recover() to record reason=panic:... rc=2 — and re-panic so
+// cleanup still runs and the operator sees the stack.
+func TestCoordRun_SupervisorExitLogsPanic(t *testing.T) {
+	t.Setenv("FLEET_LEASE_FAILOVER", "0") // no lease: isolate supervisor.exit
+	t.Setenv("XDG_STATE_HOME", "")        // logs under FLEET_HOME
+	_ = coordRunTestHome(t, "obs22222", "obs-panic", "fleet-obs22222")
+
+	opts := coordRunOpts{
+		agentID:         "obs22222",
+		project:         "obs-panic",
+		session:         "fleet-obs22222",
+		argv:            []string{"true"},
+		killTmux:        func(string) error { return nil },
+		panicAfterStart: true,
+	}
+
+	// The panic must propagate (re-raised after logging), never be swallowed.
+	func() {
+		defer func() {
+			if r := recover(); r == nil {
+				t.Fatalf("panic must propagate out of runCoordRun, got none")
+			}
+		}()
+		_ = runCoordRun(context.Background(), opts, os.Stdout, os.Stderr)
+	}()
+
+	evts := readFleetlogEvents(t, "supervisor.exit")
+	if len(evts) != 1 {
+		t.Fatalf("supervisor.exit count = %d, want exactly 1", len(evts))
+	}
+	data, _ := evts[0]["data"].(map[string]any)
+	if data == nil {
+		t.Fatalf("supervisor.exit has no data field: %v", evts[0])
+	}
+	if data["rc"] != float64(2) {
+		t.Errorf("panic supervisor.exit rc = %v, want 2", data["rc"])
+	}
+	reason, _ := data["reason"].(string)
+	if !strings.HasPrefix(reason, "panic:") {
+		t.Errorf("panic supervisor.exit reason = %q, want a panic: prefix", reason)
+	}
+}

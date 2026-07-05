@@ -349,13 +349,22 @@ func runCoordRun(ctx context.Context, opts coordRunOpts, stdout, stderr io.Write
 
 	// supervisor.exit (DESIGN-coord-lease-false-fence-prevention piece 2):
 	// emit the supervisor's own exit from a defer so it fires on EVERY exit
-	// path (clean, child-error, acquire fault) with the reason + exit code.
-	// child_rc is the claude child's exit code when the return is an
-	// *exec.ExitError (-1 when unknown: a non-child fault or a clean exit).
-	// Best-effort fleetlog; never affects the return.
+	// path (clean, child-error, acquire fault, PANIC) with the reason + exit
+	// code. child_rc is the claude child's exit code when the return is an
+	// *exec.ExitError (-1 when unknown: a non-child fault, a clean exit, or a
+	// panic). A panic unwind leaves the named `err` nil, so recover() here is
+	// the ONLY way to record the crash as a crash (rc=2, reason=panic:<v>)
+	// rather than a spurious clean exit — the exact incident this feature
+	// exists to catch. We re-panic after logging so cleanup (the earlier
+	// defer) still runs on the continued unwind and the operator sees the
+	// original stack. Best-effort fleetlog; never affects the return.
 	defer func() {
+		p := recover()
 		reason, rc, childRC := "clean", 0, -1
-		if err != nil {
+		switch {
+		case p != nil:
+			reason, rc = fmt.Sprintf("panic: %v", p), 2
+		case err != nil:
 			reason = err.Error()
 			var ee *exec.ExitError
 			if errors.As(err, &ee) {
@@ -370,6 +379,9 @@ func runCoordRun(ctx context.Context, opts coordRunOpts, stdout, stderr io.Write
 			Agent: opts.agentID,
 			Data:  map[string]any{"reason": reason, "rc": rc, "child_rc": childRC},
 		})
+		if p != nil {
+			panic(p) // re-raise: cleanup still runs, operator sees the stack
+		}
 	}()
 
 	if len(opts.argv) == 0 {
