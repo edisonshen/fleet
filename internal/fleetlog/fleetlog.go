@@ -61,6 +61,11 @@ var Types = map[string]bool{
 	"model.call": true, "state.transition": true, "pr.opened": true,
 	"pr.status": true, "task.completed": true, "worker.failed": true,
 	"cli.start": true, "cli.finish": true, "error": true, "cleanup": true,
+	// Coord-run lease lifecycle (DESIGN-coord-lease-false-fence-prevention
+	// piece 2): the babysitter's heartbeat + its death, so a stalled-renewal
+	// incident is diagnosable from logs alone.
+	"lease.renew": true, "lease.renew.fail": true,
+	"lease.acquire": true, "lease.release": true, "supervisor.exit": true,
 }
 
 // dataCap bounds any single string value in `data` (a size bound, not a

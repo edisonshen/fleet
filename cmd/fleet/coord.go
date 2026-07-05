@@ -347,6 +347,31 @@ func runCoordRun(ctx context.Context, opts coordRunOpts, stdout, stderr io.Write
 	// internally panic-safe so this defer never re-panics.
 	defer coord.Cleanup(opts.agentID, opts.project, deps) //nolint:errcheck // best-effort
 
+	// supervisor.exit (DESIGN-coord-lease-false-fence-prevention piece 2):
+	// emit the supervisor's own exit from a defer so it fires on EVERY exit
+	// path (clean, child-error, acquire fault) with the reason + exit code.
+	// child_rc is the claude child's exit code when the return is an
+	// *exec.ExitError (-1 when unknown: a non-child fault or a clean exit).
+	// Best-effort fleetlog; never affects the return.
+	defer func() {
+		reason, rc, childRC := "clean", 0, -1
+		if err != nil {
+			reason = err.Error()
+			var ee *exec.ExitError
+			if errors.As(err, &ee) {
+				childRC = ee.ExitCode()
+				rc = childRC
+			} else {
+				rc = 1
+			}
+		}
+		fleetlog.Log(fleetlog.CompCoord, "supervisor.exit", "info", fleetlog.Fields{
+			Proj:  opts.project,
+			Agent: opts.agentID,
+			Data:  map[string]any{"reason": reason, "rc": rc, "child_rc": childRC},
+		})
+	}()
+
 	if len(opts.argv) == 0 {
 		return errors.New("coord-run: empty child argv")
 	}

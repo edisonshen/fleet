@@ -698,9 +698,32 @@ func LeaseCheckByAncestorReacquire(project string, startPid int) error {
 	return leaseCheckByAncestorWithCfg(project, startPid, cfg)
 }
 
+// fenceEpochSnapshot renders a compact one-line JSON of the fence-time epoch
+// record (DESIGN-coord-lease-false-fence-prevention piece 2). Appended to
+// every fence verdict's error text so `fleet lease-check`'s exit-3 stderr —
+// and the loop.py fleetlog event it feeds — carry WHAT the record looked like
+// at fence time, not just WHICH branch fenced. Best-effort: on a marshal
+// fault it returns "{}" (the tag alone still diagnoses the branch). Keys are
+// sorted by encoding/json, so the output is deterministic for tests.
+func fenceEpochSnapshot(rec epochRecord) string {
+	b, err := json.Marshal(map[string]any{
+		"epoch":           rec.Epoch,
+		"state":           rec.State,
+		"owner_pid":       rec.Owner.Pid,
+		"candidate_pid":   rec.Candidate.Pid,
+		"boot_id":         rec.BootID,
+		"renewed_at_mono": rec.RenewedAtMono,
+		"renewed_at_wall": rec.RenewedAtWall,
+	})
+	if err != nil {
+		return "{}"
+	}
+	return string(b)
+}
+
 // leaseCheckByAncestorWithCfg is the seam-injected core so tests drive a
 // deterministic clock / pid-liveness / ppid walk.
-func leaseCheckByAncestorWithCfg(project string, startPid int, cfg leaseConfig) error {
+func leaseCheckByAncestorWithCfg(project string, startPid int, cfg leaseConfig) (retErr error) {
 	paths, err := resolvePaths(project)
 	if err != nil {
 		return fmt.Errorf("coordlock.LeaseCheck: resolve paths: %w", err)
@@ -715,6 +738,18 @@ func leaseCheckByAncestorWithCfg(project string, startPid int, cfg leaseConfig) 
 		}
 		return fmt.Errorf("coordlock.LeaseCheck: read epoch: %w", err)
 	}
+	// Decorate every fence verdict (ErrNotLeaseOwner) with the probe-time
+	// epoch snapshot for the observability layer. Wrapping with %w keeps
+	// errors.Is(retErr, ErrNotLeaseOwner) true and the branch tag substring
+	// intact; only fence verdicts (not read/resolve faults, not the proceed
+	// nil) get decorated. The re-acquire CAS-race verdicts carry their own
+	// old->new detail; the snapshot here is the probe-time record — a small,
+	// documented approximation for those rare races.
+	defer func() {
+		if errors.Is(retErr, ErrNotLeaseOwner) {
+			retErr = fmt.Errorf("%w [epoch-snapshot %s]", retErr, fenceEpochSnapshot(rec))
+		}
+	}()
 	l := &Lease{cfg: cfg, paths: paths, boot: cfg.boot()}
 
 	// Walk the caller's ancestor chain looking for the RECORDED owner pid.

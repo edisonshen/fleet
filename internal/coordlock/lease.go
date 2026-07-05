@@ -54,6 +54,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/edisonshen/fleet/internal/fleetlog"
 	"github.com/edisonshen/fleet/internal/state"
 )
 
@@ -160,6 +161,16 @@ type leaseConfig struct {
 	// TO (old+1) so the kill can epoch-gate the STONITH. The no-op
 	// default ignores it.
 	killStub func(owner identity, fencerEpoch int64) error
+
+	// emit is the observability seam (DESIGN-coord-lease-false-fence-
+	// prevention piece 2). When set, the lease routes its lifecycle events
+	// (lease.acquire / lease.renew / lease.renew.fail / lease.release)
+	// through it instead of the default fleetlog sink; tests inject a
+	// capturing/lock-checking seam. nil (the default) => the production
+	// fleetlog emitter (emitEvent). Best-effort: an emit MUST never block or
+	// error the lease path, and MUST run OUTSIDE the short coordinator.epoch.
+	// lock critical section (the PR #241 wedge class).
+	emit func(evt string, data map[string]any)
 }
 
 func defaultLeaseConfig() leaseConfig {
@@ -208,6 +219,73 @@ type Lease struct {
 
 	stopHB chan struct{} // closed by Release to stop the heartbeat goroutine
 	hbDone chan struct{} // closed by the heartbeat goroutine on exit
+
+	// renewSampler throttles lease.renew logging so a healthy 10s heartbeat
+	// does not emit 6 lines/min; state lives on the lease across beats.
+	renewSampler renewSampler
+}
+
+// renewSampleInterval bounds lease.renew logging: a healthy renew fires every
+// heartbeat (10s), but logging each is noise, so we log at most one
+// lease.renew per minute. Failures (lease.renew.fail) are never sampled.
+const renewSampleInterval = time.Minute
+
+// renewSampler decides whether a successful renew should be logged. The first
+// success always logs; each later success logs only after
+// renewSampleInterval has elapsed on the injected monotonic clock. Pure +
+// stateful so it is driven directly by a test rather than through the live
+// heartbeat goroutine.
+type renewSampler struct {
+	started      bool
+	lastEmitMono int64
+}
+
+func (s *renewSampler) shouldEmit(nowMono int64, interval time.Duration) bool {
+	if !s.started || nowMono-s.lastEmitMono >= int64(interval) {
+		s.started = true
+		s.lastEmitMono = nowMono
+		return true
+	}
+	return false
+}
+
+// emitEvent routes one lease lifecycle event to the observability sink. The
+// cfg.emit seam (tests) wins; otherwise the production fleetlog emitter tags
+// it comp=coord with the lease's project/agent for correlation. Best-effort:
+// a nil seam + a fleetlog write fault are both swallowed, never blocking the
+// lease path. Callers MUST invoke this OUTSIDE coordinator.epoch.lock.
+func (l *Lease) emitEvent(evt, lvl string, data map[string]any) {
+	if l.cfg.emit != nil {
+		l.cfg.emit(evt, data)
+		return
+	}
+	fleetlog.Log(fleetlog.CompCoord, evt, lvl, fleetlog.Fields{
+		Proj:  l.self.Project,
+		Agent: l.self.AgentID,
+		Data:  data,
+	})
+}
+
+// emitRenewResult logs the outcome of one heartbeat CAS, OUTSIDE the epoch
+// lock (the heartbeat loop calls it after heartbeatOnce returns). A failure —
+// a write fault OR a fenced/epoch-moved self-demote (ok=false) — always logs
+// lease.renew.fail with the reason; a success logs lease.renew at most once
+// per renewSampleInterval.
+func (l *Lease) emitRenewResult(ok bool, err error) {
+	if err != nil || !ok {
+		reason := "fenced-or-epoch-moved"
+		if err != nil {
+			reason = err.Error()
+		}
+		l.emitEvent("lease.renew.fail", "warn", map[string]any{
+			"epoch":  l.epoch,
+			"reason": reason,
+		})
+		return
+	}
+	if l.renewSampler.shouldEmit(l.cfg.nowMono(), renewSampleInterval) {
+		l.emitEvent("lease.renew", "info", map[string]any{"epoch": l.epoch})
+	}
 }
 
 // leasePaths resolves the three files under the project's .locks/ dir.
@@ -403,6 +481,10 @@ func acquireLeaseDetect(project, agentID string, cfg leaseConfig) (*Lease, bool,
 		}
 		if done {
 			if acquired {
+				// lease.acquire: ownership transition (OUTSIDE epoch.lock —
+				// the acquire CAS already released it). Epoch is the one we
+				// now own.
+				l.emitEvent("lease.acquire", "info", map[string]any{"epoch": l.epoch})
 				return l, true, nil, nil
 			}
 			// Stand-down. liveAbort is non-nil ONLY when the KP6 pre-fence
@@ -910,8 +992,13 @@ func (l *Lease) heartbeatLoop() {
 				// Benign: another writer held epoch.lock for this whole
 				// tick. Do NOT demote — skip this tick and renew on the
 				// next one (TTL >= 3x heartbeat, so a skipped tick is safe).
+				// Not a renewal FAILURE (no fault, no fence), so no emit.
 				continue
 			}
+			// Observability (OUTSIDE the epoch.lock — heartbeatOnce already
+			// released it): log the outcome. Success is sampled <=1/min;
+			// failure/fence is always logged with the reason.
+			l.emitRenewResult(ok, err)
 			if err != nil || !ok {
 				// A real write fault, or we were fenced (ok=false) —
 				// self-demote by stopping the heartbeat. The Release path
@@ -1074,6 +1161,10 @@ func (l *Lease) Release() {
 	if l == nil {
 		return
 	}
+	// Only a lease that actually held the flock is a real ownership release;
+	// a never-acquired lease or a second (idempotent) Release must not emit a
+	// spurious lease.release. Captured before the flock is dropped below.
+	heldFlock := l.flock != nil
 	if l.stopHB != nil {
 		close(l.stopHB)
 		<-l.hbDone
@@ -1140,6 +1231,13 @@ func (l *Lease) Release() {
 	if l.flock != nil {
 		_ = releaseFlock(l.flock)
 		l.flock = nil
+	}
+	// lease.release: ownership transition, emitted AFTER the flock drops so
+	// the emit is unambiguously outside every lock (the demote loop already
+	// released epoch.lock each iteration). Only for a lease that truly held
+	// the flock. Best-effort.
+	if heldFlock {
+		l.emitEvent("lease.release", "info", map[string]any{"epoch": l.epoch})
 	}
 }
 
