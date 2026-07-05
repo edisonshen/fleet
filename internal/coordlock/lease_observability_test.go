@@ -208,6 +208,40 @@ func TestLeaseTakeoverOnly_SuppressesLifecycle(t *testing.T) {
 	}
 }
 
+// When a SUCCESSOR has already taken the lease (epoch moved / owner changed),
+// Release must NOT emit lease.release — the successor's lease.acquire already
+// logged the transition, and a second event here would double-count the
+// failover in exactly the sequence these logs diagnose (codex iter-3 P2). The
+// ordinary self-release still emits (covered by the lifecycle test above).
+func TestLeaseRelease_SupersededSuppressesEvent(t *testing.T) {
+	setupHome(t)
+	const project = "obs-superseded"
+	clk := &fakeClock{}
+	live := newFakeLiveness()
+	em := &capturingEmitter{}
+	cfg := testCfg(clk, live)
+	cfg.emit = em.emit
+
+	lease, acquired, err := acquireLease(project, "cand", cfg)
+	if err != nil || !acquired {
+		t.Fatalf("acquireLease: acquired=%v err=%v", acquired, err)
+	}
+	// Simulate a successor: overwrite the epoch record with a DIFFERENT owner
+	// at a higher epoch. Release's demote loop then finds the record is no
+	// longer ours (ok==false) -> superseded -> no lease.release emit.
+	writeEpochRaw(t, project, epochRecord{
+		Epoch: lease.epoch + 1, State: stateActive,
+		Owner:         identity{Pid: 99999, PidStart: 12345, AgentID: "successor", Project: project},
+		BootID:        "test-boot-1",
+		RenewedAtMono: clk.now(),
+	})
+	lease.Release()
+
+	if got := em.count("lease.release"); got != 0 {
+		t.Errorf("superseded lease.release count = %d, want 0 (successor already logged the transition)", got)
+	}
+}
+
 // Test 5: no emit ever runs inside coordinator.epoch.lock (the PR #241
 // wedge class). The seam-injected sink tries to LOCK_NB the epoch lock on
 // every emit; if the emitting code path still held the lock, the NB acquire

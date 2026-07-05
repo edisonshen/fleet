@@ -1225,6 +1225,15 @@ func (l *Lease) Release() {
 	// true for the no-flock case (nothing to demote), but the emit only fires
 	// when the flock was actually held.
 	demoted := true
+	// superseded is true when the demote found the record already belongs to a
+	// SUCCESSOR (epoch moved / owner changed) — leadership transferred during
+	// the successor's fencing, which already logged its own lease.acquire.
+	// Emitting our lease.release here too would add a spurious SECOND
+	// ownership-transition event after the successor's acquire, muddying
+	// exactly the failover sequence these logs exist to diagnose (codex P2).
+	// So it gates the emit below; false on the ordinary self-release + fault
+	// paths, which still emit.
+	superseded := false
 	if l.flock != nil {
 		// guaranteed is true ONLY when no stale-active record of OURS
 		// remains — either we demoted it, or it was already not ours (a
@@ -1256,10 +1265,13 @@ func (l *Lease) Release() {
 				lastErr = err
 				break demoteLoop
 			default:
-				// ok==true: we demoted it. ok==false: already not ours.
-				// Either way no stale-active record of OURS remains.
+				// ok==true: we demoted OUR active record (a genuine self-
+				// release). ok==false: the record already moved to a successor
+				// — leadership transferred during fencing, so we did NOT
+				// release a live coordinator lease (codex P2). Either way no
+				// stale-active record of OURS remains (guarantee met).
 				guaranteed = true
-				_ = ok
+				superseded = !ok
 				break demoteLoop
 			}
 		}
@@ -1283,10 +1295,12 @@ func (l *Lease) Release() {
 	// active state) from a fault path where the record may still be active
 	// with valid tokens until TTL (codex P3) — the log must not overstate
 	// success on exactly the path operators inspect during a bad handoff.
-	// Best-effort. Suppressed on the takeover-only path (codex P2): a drain
-	// safety-net that fenced+released never ran a coordinator, so it must not
-	// show a phantom coordinator lifecycle.
-	if heldFlock && l.cfg.logLifecycle {
+	// Best-effort. Suppressed on: the takeover-only path (a drain safety-net
+	// that fenced+released never ran a coordinator, so it must not show a
+	// phantom coordinator lifecycle); and when a SUCCESSOR already took the
+	// lease (superseded), whose own lease.acquire already logged the transition
+	// — a second event here would double-count the failover (codex P2).
+	if heldFlock && l.cfg.logLifecycle && !superseded {
 		l.emitEvent("lease.release", "info", map[string]any{
 			"epoch": l.epoch, "demoted": demoted,
 		})
