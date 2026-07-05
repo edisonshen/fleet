@@ -381,23 +381,33 @@ def tick(
     # wedge a healthy coord — the coordinator.lock + project-ownership guard
     # remain the defense for those. (A coordinator.lock acquire FAILURE is
     # still never read as "my parent holds it" — that is step 1's job.)
+    # KILL ROUTE DELETED (DESIGN-coord-lease-false-fence-prevention piece 1):
+    # a fence verdict only ever SKIPS the tick — it never tears down the
+    # session. Split-brain safety was always enforced by the fence gating
+    # tick mutations, not by the kill; the kill is what turned FALSE fences
+    # (a stalled supervisor renewal with no rival) into production coord
+    # deaths (rainier, 2x in 9h). The Go lease-check now re-acquires a
+    # rival-free expired lease in place, so a genuine fence here means a
+    # rival exists (or a transient) — either way the right move is: skip,
+    # log loudly, stay alive, re-check next tick. Session teardown of a
+    # genuinely superseded coord belongs to handoff/drain/gc, never here.
     proof = _lease_check_fn(project, home=home, fleet_bin=fleet_bin)
     if proof == "fenced":
         msg = (
             f"[coord] lease fenced: agent {coord_id or '?'} for project "
-            f"{project!r} is no longer under the active coordinator lease "
-            f"owner — a successor took over. Self-demoting (this tick wrote "
-            f"nothing). Run `fleet doctor` if no successor is serving."
+            f"{project!r} is not under the active coordinator lease owner. "
+            f"Skipping this tick (no mutation); the session STAYS ALIVE and "
+            f"re-checks on the next tick. Run `fleet doctor` if this "
+            f"repeats with no successor serving."
         )
         sys.stderr.write(msg + "\n")
         result.errors.append(msg)
         result.skipped = True
-        result.self_exit = True
-        result.reason = "lease-fenced-self-exit"
-        # fleetlog: record the early-exit so log consumers see the gap.
+        result.reason = "lease-fenced"
+        # fleetlog: record the skipped tick so log consumers see the gap.
         _flog(_FLOG_COORD, "coord.tick", "info", proj=project, agent=coord_id,
-              msg=f"coord tick skipped: lease-fenced-self-exit for {project}",
-              data={"skipped": True, "reason": "lease-fenced-self-exit"})
+              msg=f"coord tick skipped: lease-fenced for {project}",
+              data={"skipped": True, "reason": "lease-fenced"})
         return result
 
     # Run the once/day retention prune BEFORE taking the coordinator lock.
@@ -562,28 +572,30 @@ def tick(
     # Go GuardWithLease boundary, so re-proving ownership here — after the lock
     # is held, immediately before _tick_locked — narrows the zombie-write
     # window from the whole tick to just the lock/resolve steps. A fence now
-    # aborts WITHOUT entering the mutation phase; the coord self-demotes.
+    # aborts WITHOUT entering the mutation phase; the coord skips the tick
+    # and stays alive (kill route deleted — it re-checks next tick).
     if _lease_check_fn(project, home=home, fleet_bin=fleet_bin) == "fenced":
+        # Same kill-route deletion as the step-0.5 fence: skip + stay alive.
         msg = (
             f"[coord] lease fenced after lock acquire: agent {coord_id or '?'} "
-            f"for {project!r} lost the lease before mutating; self-demoting "
-            f"(tick wrote nothing). Run `fleet doctor` if no successor serves."
+            f"for {project!r} lost the lease before mutating. Skipping this "
+            f"tick (wrote nothing); the session STAYS ALIVE and re-checks "
+            f"next tick. Run `fleet doctor` if this repeats."
         )
         sys.stderr.write(msg + "\n")
         result.errors.append(msg)
         result.skipped = True
-        result.self_exit = True
-        result.reason = "lease-fenced-self-exit"
+        result.reason = "lease-fenced"
         try:
             fcntl.flock(lock_fd, fcntl.LOCK_UN)
         finally:
             os.close(lock_fd)
-        # fleetlog: record the early-exit AFTER releasing the lock (see
+        # fleetlog: record the skipped tick AFTER releasing the lock (see
         # _refuse_stale rationale) so a BaseException in the emit cannot leak
         # the lock; consumers still see the post-lock fence rather than a gap.
         _flog(_FLOG_COORD, "coord.tick", "info", proj=project, agent=coord_id,
-              msg=f"coord tick skipped: lease-fenced-self-exit (post-lock) for {project}",
-              data={"skipped": True, "reason": "lease-fenced-self-exit",
+              msg=f"coord tick skipped: lease-fenced (post-lock) for {project}",
+              data={"skipped": True, "reason": "lease-fenced",
                     "phase": "post-lock"})
         return result
     # fleetlog: bracket the mutating phase with coord.tick start/end.
@@ -3004,8 +3016,11 @@ def _prove_parent_lease_ownership(
 
       "owner"   — proven owner, OR failover disabled (no lease in play).
                   The tick may mutate.
-      "fenced"  — the Go check returned exit 3: definitively NOT the owner
-                  (a successor took over). The tick MUST abort + self-demote.
+      "fenced"  — the Go check returned exit 3: NOT under the active owner
+                  (a rival takeover is live, or ownership could not be
+                  proven). The tick MUST skip (no mutation) but the session
+                  STAYS ALIVE and re-checks next tick — the fence never
+                  kills (kill route deleted).
       "unknown" — the binary is missing / errored / timed out. Surfaced to
                   stderr but treated as non-fatal: a legacy install or a
                   transient fault must not wedge a healthy coord (the
@@ -3029,24 +3044,65 @@ def _prove_parent_lease_ownership(
         bin_path = os.environ.get("FLEET_BIN", "") or "fleet"
     env = dict(os.environ)
     env["FLEET_HOME"] = str(home)
-    try:
-        proc = subprocess.run(
-            [bin_path, "lease-check", "--project", project],
-            capture_output=True, text=True,
-            timeout=_LEASE_CHECK_TIMEOUT_S, check=False, env=env,
-        )
-    except subprocess.TimeoutExpired:
-        sys.stderr.write(
-            f"[coord] lease-check for {project!r} timed out "
-            f"(>{_LEASE_CHECK_TIMEOUT_S}s); proceeding without the proof\n"
-        )
-        return "unknown"
-    except OSError:
-        # OSError covers FileNotFoundError (no `fleet` on PATH) AND a
-        # non-executable / permission-denied FLEET_BIN (codex PR4 [P2]).
-        # Lease-check unavailable -> inconclusive; don't wedge the tick (the
-        # coordinator.lock + #171 guard remain the defense).
-        return "unknown"
+    # --reacquire: the TICK is the coord's liveness signal, so it may renew
+    # an own expired no-rival lease in place (the false-fence fix). Every
+    # other lease-check caller (fleet-guard's per-turn producer fence,
+    # diagnostics) stays read-only — a check must never keep a wedged
+    # coord's lease fresh as a side effect (codex iter-2 [P1]).
+    argv = [bin_path, "lease-check", "--project", project, "--reacquire"]
+    degraded = False
+    for attempt in (0, 1):
+        try:
+            proc = subprocess.run(
+                argv,
+                capture_output=True, text=True,
+                timeout=_LEASE_CHECK_TIMEOUT_S, check=False, env=env,
+            )
+        except subprocess.TimeoutExpired:
+            sys.stderr.write(
+                f"[coord] lease-check for {project!r} timed out "
+                f"(>{_LEASE_CHECK_TIMEOUT_S}s); proceeding without the proof\n"
+            )
+            return "unknown"
+        except OSError:
+            # OSError covers FileNotFoundError (no `fleet` on PATH) AND a
+            # non-executable / permission-denied FLEET_BIN (codex PR4 [P2]).
+            # Lease-check unavailable -> inconclusive; don't wedge the tick
+            # (the coordinator.lock + #171 guard remain the defense).
+            return "unknown"
+        if attempt == 0 and proc.returncode not in (0, _LEASE_CHECK_NOT_OWNER_EXIT):
+            skew = (proc.stderr or proc.stdout or "").lower()
+            if "unknown flag" in skew:
+                # Mid-vintage binary: has `lease-check` but predates
+                # --reacquire. Degrade to the READ-ONLY check (same fence
+                # semantics, no renewal) instead of failing open/closed on
+                # a version skew.
+                argv = argv[:-1]
+                degraded = True
+                continue
+        break
+    if degraded and proc.returncode == _LEASE_CHECK_NOT_OWNER_EXIT:
+        # codex iter-3 [P1]: the OLD binary fences our OWN expired ACTIVE
+        # lease (its pre-reacquire own-ancestor branch; frozen message
+        # "our lease is no longer active (state=active, possibly
+        # self-expired)"). state=active on the own-ancestor branch means NO
+        # rival (any takeover flips the record to fencing first), i.e. the
+        # exact false-fence this design fixes — and with the kill route
+        # deleted, honoring it would skip EVERY tick until the binary is
+        # upgraded (a permanently idle coord holding coordinator.lock).
+        # Fail OPEN loudly instead: proceed un-renewed, exactly pre-lease
+        # behavior. Any other exit-3 (rival takeover, different owner,
+        # released) still fences.
+        skew_detail = proc.stderr or proc.stdout or ""
+        if "possibly self-expired" in skew_detail and "state=active" in skew_detail:
+            sys.stderr.write(
+                f"[coord] lease-check for {project!r}: installed fleet binary "
+                f"predates --reacquire and fenced our own expired ACTIVE "
+                f"(rival-free) lease; proceeding WITHOUT renewal. Upgrade the "
+                f"fleet binary and run `fleet skills status` to clear this "
+                f"skew.\n"
+            )
+            return "unknown"
     if proc.returncode == 0:
         return "owner"
     if proc.returncode == _LEASE_CHECK_NOT_OWNER_EXIT:

@@ -7,6 +7,6 @@ package main
 // never a lease to fence against. Report OK so the skill behaves exactly as
 // pre-lease — consistent with leaseFailoverEnabled never selecting the
 // lease path on these platforms.
-func leaseCheckOwnership(_ string, _ int) (leaseCheckOutcome, error) {
+func leaseCheckOwnership(_ string, _ int, _ bool) (leaseCheckOutcome, error) {
 	return leaseCheckOK, nil
 }

@@ -442,6 +442,18 @@ directly and notes the diff summary.
 ## Failure Modes
 
 - Parse error: skip tick and report parse error.
+- Lease fenced (`fleet lease-check` exit 3): skip the tick — no mutation, no
+  dispatch — emit a loud stderr diagnostic, and STAY ALIVE (tick reason
+  `lease-fenced`). A fence verdict NEVER kills the session
+  (DESIGN-coord-lease-false-fence-prevention): the tick's `lease-check
+  --reacquire` renews our own expired ACTIVE (rival-free) lease in place at
+  the same epoch, so a tick fence means a rival takeover is live, an
+  abandoned takeover awaits a successor, or a transient — the next tick
+  re-checks. (Non-tick lease-check callers are read-only and may fence on
+  a bare expiry; only the tick renews.) Session teardown of a genuinely
+  superseded coord belongs to handoff/drain/gc, never to the fence path.
+  The duplicate-coord lock-busy self-exit below is a SEPARATE route and
+  stays.
 - Lock busy: skip tick, no mutation. EXCEPTION (coord-self-exit-when-it-6014):
   if a *different live* coord holds `coordinator.lock` AND the `coord-spawn-marker`
   does not name this session (i.e. we are not the project's intended/successor

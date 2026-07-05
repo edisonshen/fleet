@@ -10,9 +10,15 @@ import (
 
 // leaseCheckOwnership runs the real ancestor-ownership proof via coordlock
 // (linux/darwin only). leaseCheckNotOwner maps the typed ErrNotLeaseOwner
-// refusal; any other error is leaseCheckError.
-func leaseCheckOwnership(project string, pid int) (leaseCheckOutcome, error) {
-	err := coordlock.LeaseCheckByAncestor(project, pid)
+// refusal; any other error is leaseCheckError. reacquire selects the
+// coordinator tick's renew-in-place variant; false is strictly read-only.
+func leaseCheckOwnership(project string, pid int, reacquire bool) (leaseCheckOutcome, error) {
+	var err error
+	if reacquire {
+		err = coordlock.LeaseCheckByAncestorReacquire(project, pid)
+	} else {
+		err = coordlock.LeaseCheckByAncestor(project, pid)
+	}
 	switch {
 	case err == nil:
 		return leaseCheckOK, nil

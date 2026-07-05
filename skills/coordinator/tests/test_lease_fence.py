@@ -12,8 +12,11 @@ via the injectable loop._lease_check_fn seam.
 
   T7  — tick under a proven parent-held lease proceeds (no second lifetime
         lock; mutation allowed).
-  T30 — a fenced tick is REFUSED: skipped + self_exit + reason
-        "lease-fenced-self-exit"; the coordinator.lock is never written.
+  T30 — a fenced tick is REFUSED but the session STAYS ALIVE: skipped +
+        reason "lease-fenced", self_exit stays False (kill route deleted —
+        DESIGN-coord-lease-false-fence-prevention piece 1); the
+        coordinator.lock is never written. The fenced coord re-checks on
+        its next tick instead of tearing down its own tmux session.
 """
 from __future__ import annotations
 
@@ -77,9 +80,12 @@ def test_fenced_tick_refuses_without_writing(
     )
 
     assert result.skipped is True
-    assert result.self_exit is True, "a fenced coord must self-demote"
-    assert result.reason == "lease-fenced-self-exit", (
-        f"reason should pin the fence; got {result.reason!r}"
+    assert result.self_exit is False, (
+        "kill route deleted: a fence verdict must NEVER request session "
+        "teardown — the coord skips the tick and re-checks next tick"
+    )
+    assert result.reason == "lease-fenced", (
+        f"reason should pin the fence (no -self-exit suffix); got {result.reason!r}"
     )
     # The fence fired BEFORE _try_lock — the lock content is untouched.
     assert lock_path.read_text() == "PRE_EXISTING_OWNER_DO_NOT_CLOBBER", (
@@ -117,18 +123,19 @@ def test_proven_tick_proceeds(
     assert proof_calls == ["fleet", "fleet"], (
         f"the tick must prove ownership before lock AND before mutating; got {proof_calls}"
     )
-    assert result.reason != "lease-fenced-self-exit", (
+    assert result.reason != "lease-fenced", (
         f"a proven tick must not self-fence; got {result.reason!r}"
     )
     assert result.self_exit is False
 
 
-def test_fence_after_lock_acquire_self_demotes(
+def test_fence_after_lock_acquire_skips_and_stays_alive(
     fleet_home: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     # codex PR4 [P1]: ownership proven at step 0.5 (before lock) but FENCED by
     # the post-lock re-check (a successor took the lease during lock-acquire /
-    # repo-resolve). The tick must self-demote WITHOUT entering _tick_locked.
+    # repo-resolve). The tick must skip WITHOUT entering _tick_locked — and
+    # stay alive (kill route deleted).
     agent_id = "racecond"
     _seed_agent_record(fleet_home, agent_id, project="fleet")
     _minimal_project(fleet_home, project="fleet")
@@ -146,8 +153,52 @@ def test_fence_after_lock_acquire_self_demotes(
         cwd="/tmp/anywhere", fleet_home=str(fleet_home),
     )
     assert calls["n"] == 2, "must re-check after lock acquire"
-    assert result.self_exit is True
-    assert result.reason == "lease-fenced-self-exit"
+    assert result.skipped is True
+    assert result.self_exit is False, (
+        "post-lock fence must skip, never request session teardown"
+    )
+    assert result.reason == "lease-fenced"
+
+
+# ---------- plan test 7: a fenced tick never kills the session ----------
+
+
+def test_main_fenced_tick_never_kills_session(
+    fleet_home: Path, monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """End-to-end through main(): a lease-fenced tick prints a JSON summary
+    with skipped=true + reason="lease-fenced" and NEVER invokes the session
+    kill seam — the session stays alive to re-check on the next tick
+    (kill-route deletion, DESIGN-coord-lease-false-fence-prevention)."""
+    agent_id = "fencedok"
+    _seed_agent_record(fleet_home, agent_id, project="fleet")
+    _minimal_project(fleet_home, project="fleet")
+    monkeypatch.setenv("FLEET_HOME", str(fleet_home))
+    monkeypatch.setenv("FLEET_PROJECT", "fleet")
+    monkeypatch.setenv("FLEET_AGENT_ID", agent_id)
+    monkeypatch.setattr(
+        loop, "_lease_check_fn",
+        lambda project, *, home, fleet_bin="fleet": "fenced",
+    )
+    killed: list[str] = []
+    monkeypatch.setattr(
+        loop, "_kill_own_session_fn",
+        lambda cid: (killed.append(cid) or True),
+    )
+
+    rc = loop.main(["fleet"])
+
+    assert rc == 0
+    assert killed == [], (
+        "a fence verdict must NEVER tear down the session; teardown belongs "
+        f"to handoff/drain/gc — kill seam saw {killed!r}"
+    )
+    captured = capsys.readouterr()
+    payload = json.loads(captured.out.strip().splitlines()[-1])
+    assert payload["skipped"] is True
+    assert payload["reason"] == "lease-fenced"
+    assert not payload.get("self_exit"), "fenced summary must not carry self_exit"
 
 
 # ---------- the proof helper maps `fleet lease-check` exit codes ----------
@@ -239,3 +290,118 @@ def test_prove_helper_binary_missing_is_unknown(
         "fleet", home=fleet_home, fleet_bin="fleet",
     )
     assert got == "unknown", "a missing binary must be fail-open, not a fence"
+
+
+# ---------- codex iter-2 [P1]: tick opts into --reacquire; skew degrades ----------
+
+
+def test_prove_helper_passes_reacquire_flag(
+    fleet_home: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The TICK's proof is the only lease-check caller allowed to renew, so
+    its argv must carry --reacquire (fleet-guard's producer fence does not)."""
+    monkeypatch.setenv("FLEET_LEASE_FAILOVER", "1")
+    seen: dict = {}
+
+    def _capture(cmd, **k):
+        seen["argv"] = list(cmd)
+        return _fake_completed(0)
+
+    monkeypatch.setattr(loop.subprocess, "run", _capture)
+    got = loop._prove_parent_lease_ownership("fleet", home=fleet_home, fleet_bin="fleet")
+    assert got == "owner"
+    assert seen["argv"][-1] == "--reacquire", (
+        f"tick proof must opt into renewal; argv={seen['argv']}"
+    )
+
+
+def test_prove_helper_unknown_flag_degrades_to_readonly(
+    fleet_home: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Mid-vintage binary (has lease-check, predates --reacquire): the helper
+    retries ONCE without the flag — read-only fence semantics, not fail-open,
+    not a wedge."""
+    monkeypatch.setenv("FLEET_LEASE_FAILOVER", "1")
+    calls: list = []
+
+    def _skewed(cmd, **k):
+        calls.append(list(cmd))
+        if "--reacquire" in cmd:
+            return _fake_completed(1, "Error: unknown flag: --reacquire")
+        return _fake_completed(0)
+
+    monkeypatch.setattr(loop.subprocess, "run", _skewed)
+    got = loop._prove_parent_lease_ownership("fleet", home=fleet_home, fleet_bin="fleet")
+    assert got == "owner", "the read-only retry's verdict must be used"
+    assert len(calls) == 2, f"exactly one retry without the flag, got {calls}"
+    assert "--reacquire" not in calls[1], f"retry must drop the flag: {calls[1]}"
+
+
+def test_prove_helper_unknown_flag_retry_fence_maps_fenced(
+    fleet_home: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The degraded read-only retry still maps exit 3 to fenced."""
+    monkeypatch.setenv("FLEET_LEASE_FAILOVER", "1")
+
+    def _skewed(cmd, **k):
+        if "--reacquire" in cmd:
+            return _fake_completed(1, "Error: unknown flag: --reacquire")
+        return _fake_completed(3, "lease-check: REFUSE")
+
+    monkeypatch.setattr(loop.subprocess, "run", _skewed)
+    got = loop._prove_parent_lease_ownership("fleet", home=fleet_home, fleet_bin="fleet")
+    assert got == "fenced"
+
+
+def test_prove_helper_skew_old_active_fence_fails_open(
+    fleet_home: Path, monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """codex iter-3 [P1]: the degraded (old-binary) retry fencing our OWN
+    expired ACTIVE lease (frozen message, rival-free by construction) must
+    fail OPEN ("unknown") — honoring it would idle the coord until the
+    binary upgrade. Any other exit-3 stays fenced."""
+    monkeypatch.setenv("FLEET_LEASE_FAILOVER", "1")
+    old_msg = (
+        "lease-check: REFUSE: coordlock: caller is not under the active "
+        "lease owner (fenced/stale coord) — refuse mutation: our lease is "
+        "no longer active (state=active, possibly self-expired)"
+    )
+
+    def _skewed(cmd, **k):
+        if "--reacquire" in cmd:
+            return _fake_completed(1, "Error: unknown flag: --reacquire")
+        return _fake_completed(3, old_msg)
+
+    monkeypatch.setattr(loop.subprocess, "run", _skewed)
+    got = loop._prove_parent_lease_ownership("fleet", home=fleet_home, fleet_bin="fleet")
+    assert got == "unknown", "old-binary own-expired-ACTIVE fence must fail open"
+    assert "predates --reacquire" in capsys.readouterr().err
+
+    # state=fencing in the old message = possible rival -> stays fenced.
+    fencing_msg = old_msg.replace("state=active", "state=fencing")
+
+    def _skewed2(cmd, **k):
+        if "--reacquire" in cmd:
+            return _fake_completed(1, "Error: unknown flag: --reacquire")
+        return _fake_completed(3, fencing_msg)
+
+    monkeypatch.setattr(loop.subprocess, "run", _skewed2)
+    got = loop._prove_parent_lease_ownership("fleet", home=fleet_home, fleet_bin="fleet")
+    assert got == "fenced", "a possibly-rival old fence must stay fenced"
+
+
+def test_prove_helper_new_binary_exit3_not_treated_as_skew(
+    fleet_home: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A NEW binary's exit-3 (no degrade) maps to fenced even if the message
+    mentions state=active — the fail-open shim applies ONLY after the
+    unknown-flag downgrade."""
+    monkeypatch.setenv("FLEET_LEASE_FAILOVER", "1")
+    monkeypatch.setattr(
+        loop.subprocess, "run",
+        lambda *a, **k: _fake_completed(
+            3, "REFUSE: own-expired-readonly-fenced: state=active possibly self-expired"),
+    )
+    got = loop._prove_parent_lease_ownership("fleet", home=fleet_home, fleet_bin="fleet")
+    assert got == "fenced"
