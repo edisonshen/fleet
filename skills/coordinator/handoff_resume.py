@@ -574,7 +574,24 @@ def record_resumed_session_tasks(
         state_path = project_dir / "coord-state.json"
         lock_path = project_dir / ".locks" / "coordinator.lock"
         with _take_coord_lock(lock_path):
-            cs = _read_coord_state(state_path)
+            # codex iter-10 [P2]: _read_coord_state() flattens BOTH a missing
+            # file AND a MALFORMED (JSONDecodeError / non-dict) file to {}.
+            # A missing file is fine to create fresh, but overwriting a
+            # malformed file with {session_tasks:[…]} would silently DROP its
+            # sibling keys (worker_agent_ids, recent_decisions, redispatch
+            # markers…) — real data loss. This stamp is best-effort, so the
+            # safe move on a present-but-unparseable file is to SKIP the write,
+            # not truncate it. Distinguish the two by reading raw first.
+            if state_path.exists():
+                try:
+                    raw = json.loads(state_path.read_text(encoding="utf-8"))
+                except (ValueError, OSError):
+                    return  # malformed / unreadable → do not clobber
+                if not isinstance(raw, dict):
+                    return  # non-dict payload → do not clobber
+                cs = raw
+            else:
+                cs = {}
             for slug in resumed_slugs:
                 dispatch_mod.record_session_task(cs, slug, coord_id)
             _write_coord_state(state_path, cs)

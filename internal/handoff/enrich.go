@@ -644,6 +644,19 @@ func readTasksBySlug(tasksFile string) map[string]*tasks.Task {
 	return out
 }
 
+// isNextStepActionable reports whether t belongs in the `## Next Steps`
+// block: it must be ready/todo AND not parked. Anything else lives
+// elsewhere in the handoff — in-progress under Active Subagents, blocked
+// or parked under Open Questions, done/abandoned dropped. Single-sourcing
+// this keeps the explicit + auto Next-Steps blocks from double-listing a
+// slug that has moved on (codex iter-8/iter-10 [P2]).
+func isNextStepActionable(t *tasks.Task) bool {
+	if t.Status != tasks.StatusReady && t.Status != tasks.StatusTodo {
+		return false
+	}
+	return t.Parked == ""
+}
+
 // CollectNextSteps renders the `## Next Steps (prioritized)` body SESSION-
 // SCOPED from coord-state.json under pdir — NOT a whole-tasks.md backlog
 // dump. agentID is the coord whose handoff is being built; both buffers are
@@ -665,6 +678,8 @@ func readTasksBySlug(tasksFile string) map[string]*tasks.Task {
 func CollectNextSteps(pdir, agentID string) string {
 	cs := readCoordStateForCollect(filepath.Join(pdir, "coord-state.json"))
 
+	bySlug := readTasksBySlug(filepath.Join(pdir, "tasks.md"))
+
 	// Explicit block — this coord's free-text lines. Collect the surviving
 	// entries' slugs so the auto block can drop exact-slug twins.
 	var explicit []sessionNextStep
@@ -676,15 +691,27 @@ func CollectNextSteps(pdir, agentID string) string {
 		if foreignGeneration(e.CoordID, agentID) {
 			continue
 		}
-		explicit = append(explicit, e)
+		// codex iter-10 [P2]: a slug-bound explicit line (`checkpoint
+		// next-step --slug foo`) must respect foo's LIVE status. Once foo
+		// leaves the actionable Next-Steps set (in-progress → Active
+		// Subagents, blocked/parked → Open Questions, done → gone), keeping
+		// the `- [explicit] …` line double-lists the SAME work as both a
+		// next step AND a blocker/active-subagent. Drop it — the auto
+		// buffer / Open Questions / Active Subagents already surface foo in
+		// its true state. A no-slug free-text line (no task binding) has no
+		// live status to check, so it always renders; a slug not in tasks.md
+		// also renders (can't verify — keep the operator's note).
 		if s := strings.TrimSpace(e.Slug); s != "" {
+			if t, ok := bySlug[s]; ok && !isNextStepActionable(t) {
+				continue
+			}
 			explicitSlugs[s] = true
 		}
+		explicit = append(explicit, e)
 	}
 
 	// Auto block — this coord's promoted/dispatched slugs, rendered LIVE from
-	// tasks.md and ONLY while still ready/todo.
-	bySlug := readTasksBySlug(filepath.Join(pdir, "tasks.md"))
+	// tasks.md and ONLY while still actionable (ready/todo, not parked).
 	var auto []*tasks.Task
 	seenAuto := map[string]bool{}
 	for _, st := range cs.SessionTasks {
@@ -702,16 +729,10 @@ func CollectNextSteps(pdir, agentID string) string {
 		if !ok {
 			continue
 		}
-		if t.Status != tasks.StatusReady && t.Status != tasks.StatusTodo {
-			continue // in-progress → Active Subagents; done/abandoned → dropped
-		}
-		// codex iter-8 [P2]: a task that is ready/todo AND parked
-		// (Parked != "") is an Open Question, not a Next Step —
-		// CollectOpenQuestions already renders it via the Parked != ""
-		// branch. Without this skip the SAME slug double-lists as both
-		// actionable Next-Steps work AND a blocker in the one handoff.
-		// Open Questions wins (a parked task is waiting, not queued).
-		if t.Parked != "" {
+		if !isNextStepActionable(t) {
+			// in-progress → Active Subagents; done/abandoned → dropped;
+			// blocked OR parked → Open Questions (codex iter-8/iter-10 [P2]:
+			// never double-list actionable work with a blocker).
 			continue
 		}
 		seenAuto[slug] = true
