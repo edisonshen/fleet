@@ -122,11 +122,25 @@ func TestLeaseCheck_StalledRenewalReacquiresSameEpoch(t *testing.T) {
 			got.RenewedAtMono, staleMono)
 	}
 
-	// The supervisor's renewal has "stalled" (no heartbeat started). A
-	// lease-check --reacquire for the owner pid must RE-ACQUIRE, not fence
-	// (exit 3 was the pre-fix behavior).
-	cmd := exec.Command(bin, "lease-check", "--project", project,
+	// --reacquire + --pid must be REJECTED (codex iter-4 [P2]: --pid would
+	// otherwise be a write primitive for arbitrary local callers).
+	rejCmd := exec.Command(bin, "lease-check", "--project", project,
 		"--pid", strconv.Itoa(os.Getpid()), "--reacquire")
+	rejCmd.Env = append(os.Environ(),
+		"FLEET_HOME="+fleetHome,
+		"FLEET_LEASE_FAILOVER=1",
+	)
+	rejOut, rejErr := rejCmd.CombinedOutput()
+	var rejExit *exec.ExitError
+	if !errors.As(rejErr, &rejExit) || rejExit.ExitCode() != 1 {
+		t.Fatalf("--reacquire with --pid must be rejected (exit 1), got err=%v\noutput:\n%s", rejErr, rejOut)
+	}
+
+	// The supervisor's renewal has "stalled" (no heartbeat started). A
+	// lease-check --reacquire (default ppid flow: this fleet subprocess's
+	// parent IS the test process, the lease owner) must RE-ACQUIRE, not
+	// fence (exit 3 was the pre-fix behavior).
+	cmd := exec.Command(bin, "lease-check", "--project", project, "--reacquire")
 	cmd.Env = append(os.Environ(),
 		"FLEET_HOME="+fleetHome,
 		"FLEET_LEASE_FAILOVER=1",

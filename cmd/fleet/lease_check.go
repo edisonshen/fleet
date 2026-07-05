@@ -68,6 +68,14 @@ func runLeaseCheck(project string, pid int, reacquire bool, stdout, stderr io.Wr
 	if project == "" {
 		return fmt.Errorf("lease-check: --project is required")
 	}
+	// --pid is a READ-ONLY test/diagnostic hook. Combined with --reacquire
+	// it would be a write primitive letting any local process renew someone
+	// else's lease by naming the owner pid — keeping a wedged leader alive
+	// and blocking standby takeover (codex iter-4 [P2]). Renewal is only
+	// valid for the caller's own ancestry (the default ppid flow).
+	if reacquire && pid != 0 {
+		return fmt.Errorf("lease-check: --reacquire cannot be combined with --pid (renewal is only valid for the caller's own ancestry)")
+	}
 	// Reversibility: flag explicitly off -> no lease -> no-op success.
 	if !leaseFailoverEnabled() {
 		_, _ = fmt.Fprintln(stdout, "lease-check: failover disabled; no lease to check (ok)")
@@ -76,7 +84,8 @@ func runLeaseCheck(project string, pid int, reacquire bool, stdout, stderr io.Wr
 	// Default to the CALLER'S PARENT — the skill runs `fleet lease-check` as
 	// a child, so the supervisor it must prove ownership for is the skill's
 	// own parent (this fleet process's parent). An explicit --pid overrides
-	// for tests / non-standard invocations.
+	// for tests / non-standard invocations (read-only; rejected above when
+	// combined with --reacquire).
 	target := pid
 	if target == 0 {
 		target = os.Getppid()

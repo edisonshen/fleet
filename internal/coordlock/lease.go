@@ -841,27 +841,12 @@ func (l *Lease) heartbeatOnce() (bool, error) {
 		if err != nil {
 			return false, err
 		}
-		// Write ONLY if still ours.
-		if cur.State != stateActive || !cur.Owner.equal(l.self) {
+		// Write ONLY if still exactly ours. (No higher-epoch adoption: the
+		// only same-epoch writer besides us is reacquireOwnExpired, which
+		// is restricted to expired-ACTIVE records at OUR epoch — a bumped
+		// epoch always means a rival fenced us; codex iter-4 [P1].)
+		if cur.State != stateActive || cur.Epoch != l.epoch || !cur.Owner.equal(l.self) {
 			return false, nil // fenced / not ours -> self-demote, do NOT write
-		}
-		switch {
-		case cur.Epoch == l.epoch:
-			// Normal renew.
-		case cur.Epoch > l.epoch && cur.BootID == l.boot:
-			// ADOPT the higher epoch (codex iter-1 [P1]): an in-place
-			// re-acquire (reacquireOwnExpired, stale-fencing sub-case)
-			// republished OUR lease at the dead candidate's bumped epoch.
-			// That is the ONLY writer that produces active+our-owner at a
-			// higher epoch — a completed rival takeover writes the RIVAL's
-			// owner identity, and an in-progress one is state=fencing (both
-			// demote above/below). Demoting here would strand the
-			// re-acquired lease on tick-time CPR renewals and hand a
-			// healthy coord to the next takeover. Rollback protection is
-			// untouched: a LOWER epoch still demotes.
-			l.epoch = cur.Epoch
-		default:
-			return false, nil // epoch rolled back / moved unrecognizably
 		}
 		// Update ONLY renewed_at; never the epoch, never from cached state.
 		cur.RenewedAtMono = l.cfg.nowMono()
@@ -876,7 +861,15 @@ func (l *Lease) heartbeatOnce() (bool, error) {
 // the SAME epoch (DESIGN-coord-lease-false-fence-prevention piece 1). It is
 // the lease-check side's answer to a rival-free stall: prev is the probe
 // snapshot leaseCheckByAncestorWithCfg read (owner == the caller's ancestor,
-// state expired `active` or stale `fencing` with a dead candidate).
+// state expired `active` ONLY — the supervisor's heartbeat goroutine never
+// stops on an expired-active record, so a same-epoch refresh restores
+// normal renewal. A stale `fencing` record is NEVER re-acquired even with a
+// dead candidate (codex iter-4 [P1]): the incumbent's heartbeat self-demoted
+// permanently the moment it saw state!=active, so re-activating the record
+// would leave a lease no goroutine renews — expiring every TTL until a
+// standby steals leadership from a still-healthy coord. An abandoned
+// takeover instead FENCES and waits for a successor to resume it via
+// transientResumable).
 //
 // The write is the heartbeatOnce CAS shape — state→active, refresh
 // renewed_at_mono/_wall, owner unchanged, epoch UNCHANGED — under
@@ -927,8 +920,11 @@ func (l *Lease) reacquireOwnExpired(prev epochRecord) error {
 			verdict = fmt.Errorf("%w: %s: a takeover rival appeared during re-acquire (candidate pid=%d)",
 				ErrNotLeaseOwner, fenceTagOwnExpiredRival, cur.Candidate.Pid)
 			return false, nil
-		case cur.State != stateActive && cur.State != stateFencing:
-			verdict = fmt.Errorf("%w: %s: unrecognized lease state %q during re-acquire",
+		case cur.State != stateActive:
+			// stateFencing included: even a dead-candidate fencing record is
+			// not re-acquirable (the incumbent heartbeat is gone; codex
+			// iter-4 [P1]) — and any unrecognized state fences too.
+			verdict = fmt.Errorf("%w: %s: lease state %q is not re-acquirable",
 				ErrNotLeaseOwner, fenceTagOwnExpiredRival, cur.State)
 			return false, nil
 		case cur.BootID != l.boot:
@@ -950,13 +946,13 @@ func (l *Lease) reacquireOwnExpired(prev epochRecord) error {
 				ErrNotLeaseOwner, fenceTagOwnExpiredRival, cur.Owner.Pid)
 			return false, nil
 		}
-		// Still a re-acquirable shape: same-identity, same-epoch refresh.
-		// Candidate is cleared (the stale-fencing sub-case's dead candidate
-		// must not linger as a phantom rival). Host is PRESERVED: this
-		// process's Lease has host unset (lease-check builds it bare), so
-		// the heartbeatOnce shape's `cur.Host = l.host` would blank it.
-		// BootID re-stamp is a same-boot no-op (cross-boot records fenced
-		// above); kept so the written record is always complete.
+		// Still the one re-acquirable shape (expired active, same boot,
+		// live owner): same-identity, same-epoch refresh. Candidate is
+		// cleared defensively. Host is PRESERVED: this process's Lease has
+		// host unset (lease-check builds it bare), so the heartbeatOnce
+		// shape's `cur.Host = l.host` would blank it. BootID re-stamp is a
+		// same-boot no-op (cross-boot records fenced above); kept so the
+		// written record is always complete.
 		cur.State = stateActive
 		cur.Candidate = identity{}
 		cur.BootID = l.boot

@@ -661,10 +661,11 @@ const (
 //	  └─ a record exists; walk startPid's ancestors:
 //	        ├─ an ancestor IS the recorded owner (pid+pid_start match)
 //	        │     ├─ record active AND NOT self-expired -> PROCEED (live leader)
-//	        │     ├─ released / rival takeover -> FENCE (a verdict that only
-//	        │     │  SKIPS the tick; loop.py re-checks next tick — no kill).
-//	        │     └─ expired with NO rival -> RE-ACQUIRE in place at the
-//	        │        SAME epoch and PROCEED (see the own-expired branch).
+//	        │     ├─ released / rival or abandoned takeover / cross-boot /
+//	        │     │  read-only probe -> FENCE (a verdict that only SKIPS the
+//	        │     │  tick; loop.py re-checks next tick — no kill).
+//	        │     └─ expired ACTIVE with NO rival (reacquire path) ->
+//	        │        RE-ACQUIRE in place at the SAME epoch and PROCEED.
 //	        └─ NO ancestor is the recorded owner
 //	              ├─ a DIFFERENT owner is healthy+active -> FENCE (a live
 //	              │  successor holds the lease; we are the zombie).
@@ -768,14 +769,20 @@ func leaseCheckByAncestorWithCfg(project string, startPid int, cfg leaseConfig) 
 		//	  │    comparable within a boot, so the ancestor match above is
 		//	  │    unprovable — a recycled pid could coincidentally match;
 		//	  │    codex iter-2 [P2]. Await a real takeover.)
+		//	  ├─ fencing with a DEAD candidate (abandoned takeover) -> FENCE
+		//	  │    (codex iter-4 [P1]: our heartbeat self-demoted when the
+		//	  │     candidate fenced, so re-activating the record would leave
+		//	  │     a lease nothing renews — churn + a spurious steal. A
+		//	  │     successor resumes it via transientResumable.)
 		//	  ├─ read-only probe (no cfg.reacquire) -> FENCE own-expired-
 		//	  │    readonly-fenced. Only the coord tick's opt-in path may
 		//	  │    renew (codex iter-2 [P1]): fleet-guard's per-turn producer
 		//	  │    fence must never keep a wedged coord's lease fresh and
 		//	  │    block a standby takeover.
-		//	  └─ expired active / stale fencing with DEAD candidate, same
-		//	       boot, reacquire path -> RE-ACQUIRE in place, SAME epoch
-		//	       (zero downtime); the verdict is nil and the tick proceeds.
+		//	  └─ expired ACTIVE, same boot, reacquire path -> RE-ACQUIRE in
+		//	       place, SAME epoch (zero downtime — the heartbeat goroutine
+		//	       never stops on an expired-active record, so normal renewal
+		//	       resumes); verdict nil, the tick proceeds.
 		//
 		// Every fence verdict here only SKIPS the tick — loop.py no longer
 		// kills the session on a fence; it re-checks on the next tick.
@@ -786,7 +793,15 @@ func leaseCheckByAncestorWithCfg(project string, startPid int, cfg leaseConfig) 
 		case l.ownExpiredRival(rec):
 			return fmt.Errorf("%w: %s: a takeover rival exists for our expired lease (state=fencing, candidate pid=%d)",
 				ErrNotLeaseOwner, fenceTagOwnExpiredRival, rec.Candidate.Pid)
-		case rec.State != stateActive && rec.State != stateFencing:
+		case rec.State == stateFencing:
+			// Abandoned takeover (dead candidate — the live-candidate case
+			// fenced above as a rival). NOT re-acquirable: our heartbeat
+			// self-demoted when the candidate fenced, so a re-activated
+			// record would never be renewed (codex iter-4 [P1]). Fence; a
+			// successor resumes the takeover via transientResumable.
+			return fmt.Errorf("%w: %s: abandoned takeover (state=fencing, dead candidate); awaiting a successor to resume it",
+				ErrNotLeaseOwner, fenceTagOwnExpiredRival)
+		case rec.State != stateActive:
 			// Unrecognized state string: fence conservatively (skip one
 			// tick, re-check next) rather than guess at a write.
 			return fmt.Errorf("%w: %s: unrecognized lease state %q for our expired lease",
@@ -803,8 +818,8 @@ func leaseCheckByAncestorWithCfg(project string, startPid int, cfg leaseConfig) 
 			return fmt.Errorf("%w: %s: our lease is expired (state=%s) and this is a read-only probe; not renewing",
 				ErrNotLeaseOwner, fenceTagOwnExpiredReadOnly, rec.State)
 		default:
-			// No rival: pure renewal stall (expired active) or an abandoned
-			// takeover (stale fencing, dead candidate). Re-acquire in place.
+			// No rival: a pure renewal stall on our own ACTIVE record.
+			// Re-acquire in place at the same epoch.
 			return l.reacquireOwnExpired(rec)
 		}
 	}
