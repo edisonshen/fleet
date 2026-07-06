@@ -269,6 +269,23 @@ def _flog(comp, evt, lvl="info", **fields):
         return ""
 
 
+def _fence_flog_detail(proof) -> dict:
+    """Fence detail to merge into a lease-fenced coord.tick fleetlog event.
+
+    Reads the branch tag + epoch snapshot off a LeaseCheckResult via getattr,
+    so a bare-string stub (or the fail-CLOSED path, which carries neither)
+    forwards nothing rather than raising. Only non-empty fields are included —
+    both are OPTIONAL in the forwarded data."""
+    detail = {}
+    tag = getattr(proof, "tag", "")
+    snapshot = getattr(proof, "snapshot", "")
+    if tag:
+        detail["fence_tag"] = tag
+    if snapshot:
+        detail["epoch_snapshot"] = snapshot
+    return detail
+
+
 def tick(
     project: str,
     *,
@@ -404,10 +421,15 @@ def tick(
         result.errors.append(msg)
         result.skipped = True
         result.reason = "lease-fenced"
-        # fleetlog: record the skipped tick so log consumers see the gap.
+        # fleetlog: record the skipped tick so log consumers see the gap, plus
+        # the fence branch tag + epoch snapshot forwarded from lease-check's
+        # exit-3 stderr (piece 2) — both best-effort (absent on the fail-CLOSED
+        # path). This turns the 53-minute mystery into a one-line read.
+        data = {"skipped": True, "reason": "lease-fenced"}
+        data.update(_fence_flog_detail(proof))
         _flog(_FLOG_COORD, "coord.tick", "info", proj=project, agent=coord_id,
               msg=f"coord tick skipped: lease-fenced for {project}",
-              data={"skipped": True, "reason": "lease-fenced"})
+              data=data)
         return result
 
     # Run the once/day retention prune BEFORE taking the coordinator lock.
@@ -574,7 +596,8 @@ def tick(
     # window from the whole tick to just the lock/resolve steps. A fence now
     # aborts WITHOUT entering the mutation phase; the coord skips the tick
     # and stays alive (kill route deleted — it re-checks next tick).
-    if _lease_check_fn(project, home=home, fleet_bin=fleet_bin) == "fenced":
+    proof = _lease_check_fn(project, home=home, fleet_bin=fleet_bin)
+    if proof == "fenced":
         # Same kill-route deletion as the step-0.5 fence: skip + stay alive.
         msg = (
             f"[coord] lease fenced after lock acquire: agent {coord_id or '?'} "
@@ -593,10 +616,11 @@ def tick(
         # fleetlog: record the skipped tick AFTER releasing the lock (see
         # _refuse_stale rationale) so a BaseException in the emit cannot leak
         # the lock; consumers still see the post-lock fence rather than a gap.
+        data = {"skipped": True, "reason": "lease-fenced", "phase": "post-lock"}
+        data.update(_fence_flog_detail(proof))
         _flog(_FLOG_COORD, "coord.tick", "info", proj=project, agent=coord_id,
               msg=f"coord tick skipped: lease-fenced (post-lock) for {project}",
-              data={"skipped": True, "reason": "lease-fenced",
-                    "phase": "post-lock"})
+              data=data)
         return result
     # fleetlog: bracket the mutating phase with coord.tick start/end.
     # Best-effort: a logging failure must never affect the tick result.
@@ -3033,6 +3057,50 @@ def _lease_failover_enabled() -> bool:
         not in ("0", "false", "off", "no")
 
 
+class LeaseCheckResult(str):
+    """The `_lease_check_fn` verdict — "owner" | "fenced" | "unknown" —
+    carrying optional fence detail (DESIGN-coord-lease-false-fence-prevention
+    piece 2). It subclasses ``str`` so existing ``== "fenced"`` comparisons and
+    any bare-string test stub keep working unchanged; the observability layer
+    reads ``.tag`` / ``.snapshot`` (best-effort, ``""`` when absent — e.g. the
+    fail-CLOSED exit-1 path has no exit-3 stderr) via getattr, so a stub that
+    returns a plain ``str`` simply forwards empty detail.
+
+        tag       fence branch tag, e.g. "own-expired-rival-fenced" (5a90).
+        snapshot  epoch-snapshot JSON string appended to the exit-3 stderr.
+    """
+
+    tag: str
+    snapshot: str
+
+    def __new__(cls, verdict: str, tag: str = "", snapshot: str = ""):
+        obj = super().__new__(cls, verdict)
+        obj.tag = tag
+        obj.snapshot = snapshot
+        return obj
+
+
+# The fence branch tag sits immediately after the ErrNotLeaseOwner text
+# ("... — refuse mutation: <tag>: ..."). Matched structurally (any hyphenated
+# lowercase token) so this never enumerates 5a90's tag taxonomy — "forward
+# whatever tag appears." The snapshot is the "[epoch-snapshot {json}]" blob
+# piece 2 appends in internal/coordlock/rpo.go.
+_FENCE_TAG_RE = re.compile(r"refuse mutation:\s*([a-z0-9][a-z0-9-]*)")
+_EPOCH_SNAPSHOT_RE = re.compile(r"\[epoch-snapshot\s+(\{[^}]*\})\]")
+
+
+def _parse_fence_detail(stderr_text: str) -> tuple[str, str]:
+    """Pull (branch_tag, epoch_snapshot_json) out of a `fleet lease-check`
+    exit-3 stderr line. Best-effort: a bare / internal-error stderr with
+    neither marker yields ("", "") — never an exception. Both fields are
+    OPTIONAL in the forwarded fleetlog data (absent on the fail-CLOSED exit-1
+    path), so an empty result is valid."""
+    tag_m = _FENCE_TAG_RE.search(stderr_text or "")
+    snap_m = _EPOCH_SNAPSHOT_RE.search(stderr_text or "")
+    return (tag_m.group(1) if tag_m else "",
+            snap_m.group(1) if snap_m else "")
+
+
 def _lease_check_unknown_command(stderr_text: str) -> bool:
     """True if a `fleet lease-check` exit-1 was an UNKNOWN-COMMAND error (the
     installed binary is too old to have the subcommand) rather than a genuine
@@ -3046,11 +3114,13 @@ def _lease_check_unknown_command(stderr_text: str) -> bool:
 
 def _prove_parent_lease_ownership(
     project: str, *, home: Path, fleet_bin: str = "fleet",
-) -> str:
+) -> LeaseCheckResult:
     """Prove this tick descends from the active coordinator lease owner.
 
     Routes through `fleet lease-check --project <p>` so the epoch re-read +
-    ancestor proof happen in Go (one source of truth). Returns one of:
+    ancestor proof happen in Go (one source of truth). Returns a
+    LeaseCheckResult (a str subclass, so `== "fenced"` still works) whose
+    value is one of:
 
       "owner"   — proven owner, OR failover disabled (no lease in play).
                   The tick may mutate.
@@ -3068,7 +3138,7 @@ def _prove_parent_lease_ownership(
     legacy bare-child path has no lease, so there is nothing to fence.
     """
     if not _lease_failover_enabled():
-        return "owner"
+        return LeaseCheckResult("owner")
     # Resolve the binary the SAME way the producer/kick paths do: prefer the
     # FLEET_BIN the spawn stamped into the coord's env over a bare `fleet` on
     # PATH (codex PR4 [P2]). main() calls tick() without fleet_bin, so without
@@ -3101,13 +3171,13 @@ def _prove_parent_lease_ownership(
                 f"[coord] lease-check for {project!r} timed out "
                 f"(>{_LEASE_CHECK_TIMEOUT_S}s); proceeding without the proof\n"
             )
-            return "unknown"
+            return LeaseCheckResult("unknown")
         except OSError:
             # OSError covers FileNotFoundError (no `fleet` on PATH) AND a
             # non-executable / permission-denied FLEET_BIN (codex PR4 [P2]).
             # Lease-check unavailable -> inconclusive; don't wedge the tick
             # (the coordinator.lock + #171 guard remain the defense).
-            return "unknown"
+            return LeaseCheckResult("unknown")
         if attempt == 0 and proc.returncode not in (0, _LEASE_CHECK_NOT_OWNER_EXIT):
             skew = (proc.stderr or proc.stdout or "").lower()
             if "unknown flag" in skew:
@@ -3140,11 +3210,12 @@ def _prove_parent_lease_ownership(
                 f"fleet binary and run `fleet skills status` to clear this "
                 f"skew.\n"
             )
-            return "unknown"
+            return LeaseCheckResult("unknown")
     if proc.returncode == 0:
-        return "owner"
+        return LeaseCheckResult("owner")
     if proc.returncode == _LEASE_CHECK_NOT_OWNER_EXIT:
-        return "fenced"
+        tag, snapshot = _parse_fence_detail(proc.stderr or proc.stdout or "")
+        return LeaseCheckResult("fenced", tag=tag, snapshot=snapshot)
     # Any OTHER non-zero is exit 1. Two sub-cases (codex PR4 [P1]):
     #
     #   - The binary is too OLD to have the `lease-check` subcommand (a skill
@@ -3162,12 +3233,14 @@ def _prove_parent_lease_ownership(
             f"[coord] lease-check unsupported by this fleet binary for {project!r} "
             f"(too old?); proceeding without the proof\n"
         )
-        return "unknown"
+        return LeaseCheckResult("unknown")
     sys.stderr.write(
         f"[coord] lease-check for {project!r} could not prove ownership "
         f"(exit {proc.returncode}): {detail}; FENCING (cannot prove ownership)\n"
     )
-    return "fenced"
+    # Fail-CLOSED internal error: no exit-3 stderr, so no branch tag/snapshot —
+    # detail stays empty (OPTIONAL, never required).
+    return LeaseCheckResult("fenced")
 
 
 # _lease_check_fn is the injectable seam tick() calls for the parent-lease

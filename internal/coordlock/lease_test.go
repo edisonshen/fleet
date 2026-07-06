@@ -87,6 +87,7 @@ func testCfg(clk *fakeClock, live *fakeLiveness) leaseConfig {
 		pidStart:         live.get,
 		boot:             func() string { return "test-boot-1" },
 		killStub:         func(identity, int64) error { return nil },
+		logLifecycle:     true, // exercises the real-coordinator lifecycle-log path
 	}
 }
 
