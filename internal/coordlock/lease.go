@@ -54,6 +54,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/edisonshen/fleet/internal/fleetlog"
 	"github.com/edisonshen/fleet/internal/state"
 )
 
@@ -160,6 +161,28 @@ type leaseConfig struct {
 	// TO (old+1) so the kill can epoch-gate the STONITH. The no-op
 	// default ignores it.
 	killStub func(owner identity, fencerEpoch int64) error
+
+	// emit is the observability seam (DESIGN-coord-lease-false-fence-
+	// prevention piece 2). When set, the lease routes its lifecycle events
+	// (lease.acquire / lease.renew / lease.renew.fail / lease.release)
+	// through it instead of the default fleetlog sink; tests inject a
+	// capturing/lock-checking seam. nil (the default) => the production
+	// fleetlog emitter (emitEvent). Best-effort: an emit MUST never block or
+	// error the lease path, and MUST run OUTSIDE the short coordinator.epoch.
+	// lock critical section (the PR #241 wedge class).
+	emit func(evt string, data map[string]any)
+
+	// logLifecycle gates the ownership-transition events (lease.acquire /
+	// lease.release). Only a REAL coordinator lease should log them; the
+	// drain safety-net takeover (AcquireLeaseTakeover) acquires just long
+	// enough to fence+kill a hung holder then releases WITHOUT ever running a
+	// coordinator, so emitting acquire/release there would show a phantom
+	// coordinator lifecycle during drain recovery — exactly the window
+	// operators inspect (codex P2). defaultLeaseConfig sets it true; the
+	// takeover-only path sets it false. renew/renew.fail are unaffected: they
+	// only fire from the heartbeat loop, which a takeover-only caller never
+	// starts.
+	logLifecycle bool
 }
 
 func defaultLeaseConfig() leaseConfig {
@@ -183,6 +206,9 @@ func defaultLeaseConfig() leaseConfig {
 		// the real KillCoordIfIdentityMatches. Tests override this to
 		// simulate the kill.
 		killStub: func(identity, int64) error { return nil },
+		// A real coordinator lease logs its ownership transitions by default;
+		// the takeover-only path overrides this to false (codex P2).
+		logLifecycle: true,
 	}
 }
 
@@ -208,6 +234,73 @@ type Lease struct {
 
 	stopHB chan struct{} // closed by Release to stop the heartbeat goroutine
 	hbDone chan struct{} // closed by the heartbeat goroutine on exit
+
+	// renewSampler throttles lease.renew logging so a healthy 10s heartbeat
+	// does not emit 6 lines/min; state lives on the lease across beats.
+	renewSampler renewSampler
+}
+
+// renewSampleInterval bounds lease.renew logging: a healthy renew fires every
+// heartbeat (10s), but logging each is noise, so we log at most one
+// lease.renew per minute. Failures (lease.renew.fail) are never sampled.
+const renewSampleInterval = time.Minute
+
+// renewSampler decides whether a successful renew should be logged. The first
+// success always logs; each later success logs only after
+// renewSampleInterval has elapsed on the injected monotonic clock. Pure +
+// stateful so it is driven directly by a test rather than through the live
+// heartbeat goroutine.
+type renewSampler struct {
+	started      bool
+	lastEmitMono int64
+}
+
+func (s *renewSampler) shouldEmit(nowMono int64, interval time.Duration) bool {
+	if !s.started || nowMono-s.lastEmitMono >= int64(interval) {
+		s.started = true
+		s.lastEmitMono = nowMono
+		return true
+	}
+	return false
+}
+
+// emitEvent routes one lease lifecycle event to the observability sink. The
+// cfg.emit seam (tests) wins; otherwise the production fleetlog emitter tags
+// it comp=coord with the lease's project/agent for correlation. Best-effort:
+// a nil seam + a fleetlog write fault are both swallowed, never blocking the
+// lease path. Callers MUST invoke this OUTSIDE coordinator.epoch.lock.
+func (l *Lease) emitEvent(evt, lvl string, data map[string]any) {
+	if l.cfg.emit != nil {
+		l.cfg.emit(evt, data)
+		return
+	}
+	fleetlog.Log(fleetlog.CompCoord, evt, lvl, fleetlog.Fields{
+		Proj:  l.self.Project,
+		Agent: l.self.AgentID,
+		Data:  data,
+	})
+}
+
+// emitRenewResult logs the outcome of one heartbeat CAS, OUTSIDE the epoch
+// lock (the heartbeat loop calls it after heartbeatOnce returns). A failure —
+// a write fault OR a fenced/epoch-moved self-demote (ok=false) — always logs
+// lease.renew.fail with the reason; a success logs lease.renew at most once
+// per renewSampleInterval.
+func (l *Lease) emitRenewResult(ok bool, err error) {
+	if err != nil || !ok {
+		reason := "fenced-or-epoch-moved"
+		if err != nil {
+			reason = err.Error()
+		}
+		l.emitEvent("lease.renew.fail", "warn", map[string]any{
+			"epoch":  l.epoch,
+			"reason": reason,
+		})
+		return
+	}
+	if l.renewSampler.shouldEmit(l.cfg.nowMono(), renewSampleInterval) {
+		l.emitEvent("lease.renew", "info", map[string]any{"epoch": l.epoch})
+	}
 }
 
 // leasePaths resolves the three files under the project's .locks/ dir.
@@ -334,10 +427,28 @@ type LiveHolder struct {
 // callback (not a hard import) keeps the lease primitive free of any
 // dependency on the coord package.
 func AcquireLeaseWithKill(project, agentID string, kill func(KillTarget) error) (*Lease, bool, []LiveHolder, error) {
+	return acquireLeaseWithKill(project, agentID, kill, true /* logLifecycle */)
+}
+
+// AcquireLeaseTakeover is the drain safety-net variant of AcquireLeaseWithKill:
+// it fences+kills a hung holder then the caller Releases immediately WITHOUT
+// running a coordinator or heartbeat. It SUPPRESSES the lease.acquire /
+// lease.release lifecycle events so fleetlog does not show a phantom
+// coordinator lifecycle during drain recovery (codex P2) — the exact window
+// operators inspect. Everything else (fence/kill/detect) is identical.
+func AcquireLeaseTakeover(project, agentID string, kill func(KillTarget) error) (*Lease, bool, []LiveHolder, error) {
+	return acquireLeaseWithKill(project, agentID, kill, false /* logLifecycle */)
+}
+
+// acquireLeaseWithKill is the shared failover-gated core. logLifecycle=true is
+// the real-coordinator path (AcquireLeaseWithKill); false is the takeover-only
+// path (AcquireLeaseTakeover), which suppresses ownership-transition logs.
+func acquireLeaseWithKill(project, agentID string, kill func(KillTarget) error, logLifecycle bool) (*Lease, bool, []LiveHolder, error) {
 	if !failoverEnabled() {
 		return nil, false, nil, ErrFailoverDisabled
 	}
 	cfg := defaultLeaseConfig()
+	cfg.logLifecycle = logLifecycle
 	if kill != nil {
 		// Adapt the exported KillTarget callback into the internal
 		// killStub seam. fencerEpoch is l.epoch — the epoch the takeover
@@ -403,6 +514,12 @@ func acquireLeaseDetect(project, agentID string, cfg leaseConfig) (*Lease, bool,
 		}
 		if done {
 			if acquired {
+				// lease.acquire: ownership transition (OUTSIDE epoch.lock —
+				// the acquire CAS already released it). Epoch is the one we
+				// now own. Suppressed on the takeover-only path (codex P2).
+				if l.cfg.logLifecycle {
+					l.emitEvent("lease.acquire", "info", map[string]any{"epoch": l.epoch})
+				}
 				return l, true, nil, nil
 			}
 			// Stand-down. liveAbort is non-nil ONLY when the KP6 pre-fence
@@ -910,8 +1027,13 @@ func (l *Lease) heartbeatLoop() {
 				// Benign: another writer held epoch.lock for this whole
 				// tick. Do NOT demote — skip this tick and renew on the
 				// next one (TTL >= 3x heartbeat, so a skipped tick is safe).
+				// Not a renewal FAILURE (no fault, no fence), so no emit.
 				continue
 			}
+			// Observability (OUTSIDE the epoch.lock — heartbeatOnce already
+			// released it): log the outcome. Success is sampled <=1/min;
+			// failure/fence is always logged with the reason.
+			l.emitRenewResult(ok, err)
 			if err != nil || !ok {
 				// A real write fault, or we were fenced (ok=false) —
 				// self-demote by stopping the heartbeat. The Release path
@@ -1074,6 +1196,10 @@ func (l *Lease) Release() {
 	if l == nil {
 		return
 	}
+	// Only a lease that actually held the flock is a real ownership release;
+	// a never-acquired lease or a second (idempotent) Release must not emit a
+	// spurious lease.release. Captured before the flock is dropped below.
+	heldFlock := l.flock != nil
 	if l.stopHB != nil {
 		close(l.stopHB)
 		<-l.hbDone
@@ -1091,6 +1217,23 @@ func (l *Lease) Release() {
 	// bounded retry reliably wins. If it ultimately cannot demote, SURFACE
 	// it (surface-don't-silo) rather than silently leaving a stale-active
 	// record; the TTL is then the fallback bound.
+	// demoted records whether the epoch record was cleanly demoted out of
+	// `active` (or already not ours). It gates the lease.release emit below:
+	// on a fault path where demotion failed, the on-disk lease may still be
+	// active with valid outstanding tokens until TTL, so the log must say
+	// demoted=false rather than report a clean release (codex P3). Defaults
+	// true for the no-flock case (nothing to demote), but the emit only fires
+	// when the flock was actually held.
+	demoted := true
+	// superseded is true when the demote found the record already belongs to a
+	// SUCCESSOR (epoch moved / owner changed) — leadership transferred during
+	// the successor's fencing, which already logged its own lease.acquire.
+	// Emitting our lease.release here too would add a spurious SECOND
+	// ownership-transition event after the successor's acquire, muddying
+	// exactly the failover sequence these logs exist to diagnose (codex P2).
+	// So it gates the emit below; false on the ordinary self-release + fault
+	// paths, which still emit.
+	superseded := false
 	if l.flock != nil {
 		// guaranteed is true ONLY when no stale-active record of OURS
 		// remains — either we demoted it, or it was already not ours (a
@@ -1122,13 +1265,17 @@ func (l *Lease) Release() {
 				lastErr = err
 				break demoteLoop
 			default:
-				// ok==true: we demoted it. ok==false: already not ours.
-				// Either way no stale-active record of OURS remains.
+				// ok==true: we demoted OUR active record (a genuine self-
+				// release). ok==false: the record already moved to a successor
+				// — leadership transferred during fencing, so we did NOT
+				// release a live coordinator lease (codex P2). Either way no
+				// stale-active record of OURS remains (guarantee met).
 				guaranteed = true
-				_ = ok
+				superseded = !ok
 				break demoteLoop
 			}
 		}
+		demoted = guaranteed
 		if !guaranteed {
 			fmt.Fprintf(os.Stderr,
 				"coordlock: WARNING: could not demote released lease for project %q "+
@@ -1140,6 +1287,23 @@ func (l *Lease) Release() {
 	if l.flock != nil {
 		_ = releaseFlock(l.flock)
 		l.flock = nil
+	}
+	// lease.release: ownership transition, emitted AFTER the flock drops so
+	// the emit is unambiguously outside every lock (the demote loop already
+	// released epoch.lock each iteration). Only for a lease that truly held
+	// the flock. `demoted` distinguishes a clean release (record left the
+	// active state) from a fault path where the record may still be active
+	// with valid tokens until TTL (codex P3) — the log must not overstate
+	// success on exactly the path operators inspect during a bad handoff.
+	// Best-effort. Suppressed on: the takeover-only path (a drain safety-net
+	// that fenced+released never ran a coordinator, so it must not show a
+	// phantom coordinator lifecycle); and when a SUCCESSOR already took the
+	// lease (superseded), whose own lease.acquire already logged the transition
+	// — a second event here would double-count the failover (codex P2).
+	if heldFlock && l.cfg.logLifecycle && !superseded {
+		l.emitEvent("lease.release", "info", map[string]any{
+			"epoch": l.epoch, "demoted": demoted,
+		})
 	}
 }
 

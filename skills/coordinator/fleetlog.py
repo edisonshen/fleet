@@ -36,6 +36,10 @@ TYPES = frozenset({
     "tool.result", "model.call", "state.transition", "pr.opened",
     "pr.status", "task.completed", "worker.failed", "cli.start",
     "cli.finish", "error", "cleanup",
+    # Coord-run lease lifecycle (emitted Go-side; declared here to keep the
+    # Python TYPES mirror complete).
+    "lease.renew", "lease.renew.fail",
+    "lease.acquire", "lease.release", "supervisor.exit",
 })
 
 COMP_COORD = "coord"
