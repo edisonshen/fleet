@@ -373,6 +373,85 @@ def test_main_emits_dispatch_blocks_on_stdout(
     assert "agent_id: abcd1234" in out
 
 
+def test_main_records_resumed_task_into_session_tasks(
+    capsys: pytest.CaptureFixture, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Review iter-2 (codex P1): a resumed task must be stamped into THIS
+    (successor) coord's own coord-state.json:session_tasks under its own
+    coord_id — otherwise the resumed task silently disappears from the
+    session-scoped Next Steps/Open Questions if this coord hands off
+    again before any loop.py tick seam independently re-touches it.
+    Without the fix, coord-state.json never gets a session_tasks entry
+    for a resume-only task."""
+    fleet_home = tmp_path / "fleet-home"
+    wip_dir = tmp_path / "wip"
+    fleet_home.mkdir()
+    wip_dir.mkdir()
+    (fleet_home / "inbox").mkdir()
+    (fleet_home / "inbox" / "abcd1234.md").write_text("orig prompt", encoding="utf-8")
+    (wip_dir / "fix-foo.md").write_text("phase 1", encoding="utf-8")
+    doc = tmp_path / "handoff.md"
+    _seed_handoff(
+        doc,
+        body_subagents=(
+            '- task="fix-foo" branch="worker/fix-foo" phase="tdd-green" '
+            'agent_id="abcd1234" subagent_id=""'
+        ),
+    )
+    monkeypatch.setenv("FLEET_HOME", str(fleet_home))
+    monkeypatch.setenv("FLEET_SUBAGENT_WIP_DIR", str(wip_dir))
+    monkeypatch.setenv("FLEET_PROJECT", "myproj")
+    monkeypatch.setenv("FLEET_AGENT_ID", "succ0001")
+
+    rc = handoff_resume.main([str(doc)])
+    assert rc == 0
+
+    state_path = fleet_home / "projects" / "myproj" / "coord-state.json"
+    cs = json.loads(state_path.read_text(encoding="utf-8"))
+    st = cs.get("session_tasks", [])
+    assert [e["slug"] for e in st] == ["fix-foo"]
+    assert st[0]["coord_id"] == "succ0001"
+
+
+def test_record_resumed_session_tasks_preserves_malformed_coord_state(
+    tmp_path: Path,
+) -> None:
+    """codex iter-10 [P2]: a present-but-MALFORMED coord-state.json must NOT
+    be clobbered by the best-effort resume stamp. Overwriting it would drop
+    sibling keys (worker_agent_ids, recent_decisions, redispatch markers).
+    On a parse failure the safe move is to SKIP the write entirely."""
+    fleet_home = tmp_path / "fleet-home"
+    project_dir = fleet_home / "projects" / "myproj"
+    (project_dir / ".locks").mkdir(parents=True)
+    state_path = project_dir / "coord-state.json"
+    garbage = '{"worker_agent_ids": {"foo": "aaaa1111"}, TRUNCATED'
+    state_path.write_text(garbage, encoding="utf-8")
+
+    handoff_resume.record_resumed_session_tasks(
+        ["fix-foo"], project="myproj", coord_id="succ0001", home=fleet_home,
+    )
+
+    # The malformed file is left byte-for-byte intact — NOT truncated to a
+    # fresh {session_tasks:[…]} that would have lost worker_agent_ids.
+    assert state_path.read_text(encoding="utf-8") == garbage
+
+
+def test_record_resumed_session_tasks_writes_when_absent(
+    tmp_path: Path,
+) -> None:
+    """A MISSING coord-state.json is fine to create fresh (only the absent
+    case, never a malformed one)."""
+    fleet_home = tmp_path / "fleet-home"
+    project_dir = fleet_home / "projects" / "myproj"
+    (project_dir / ".locks").mkdir(parents=True)
+
+    handoff_resume.record_resumed_session_tasks(
+        ["fix-foo"], project="myproj", coord_id="succ0001", home=fleet_home,
+    )
+    cs = json.loads((project_dir / "coord-state.json").read_text(encoding="utf-8"))
+    assert [e["slug"] for e in cs.get("session_tasks", [])] == ["fix-foo"]
+
+
 def test_main_no_resumable_writes_footer_to_stderr(
     capsys: pytest.CaptureFixture, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:

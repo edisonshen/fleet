@@ -66,6 +66,37 @@ func addSessionDocs(t *testing.T, projectsRoot, project string, docs [][2]string
 	}
 }
 
+// addSessionScoped merges session_next_steps (explicit free-text) +
+// session_tasks (auto slug set) into the project's coord-state.json, each
+// entry stamped with coordID — mirroring what `fleet checkpoint next-step`
+// and the tick's _record_session_task write. These drive the session-scoped
+// Next Steps / Open Questions collectors.
+func addSessionScoped(t *testing.T, projectsRoot, project, coordID string, nextStepTexts, taskSlugs []string) {
+	t.Helper()
+	path := filepath.Join(projectsRoot, project, "coord-state.json")
+	m := map[string]any{}
+	if data, err := os.ReadFile(path); err == nil {
+		_ = json.Unmarshal(data, &m)
+	}
+	var steps []any
+	for _, txt := range nextStepTexts {
+		steps = append(steps, map[string]any{"text": txt, "coord_id": coordID, "ts": "2026-07-02T00:00:00Z"})
+	}
+	var tsk []any
+	for _, slug := range taskSlugs {
+		tsk = append(tsk, map[string]any{"slug": slug, "coord_id": coordID, "ts": "2026-07-02T00:00:00Z"})
+	}
+	m["session_next_steps"] = steps
+	m["session_tasks"] = tsk
+	out, err := json.MarshalIndent(m, "", "  ")
+	if err != nil {
+		t.Fatalf("marshal coord-state: %v", err)
+	}
+	if err := os.WriteFile(path, out, 0o644); err != nil {
+		t.Fatalf("write coord-state: %v", err)
+	}
+}
+
 // ---------- applyCheckpointToDoc mapping ----------
 
 func TestApplyCheckpointToDoc_CompletionsAndDecisions(t *testing.T) {
@@ -154,6 +185,12 @@ func lifecycleState(t *testing.T, pdir string, now time.Time) {
 		{"authored", "docs/DESIGN-x.md"},
 		{"implementing", "docs/TASK-PLAN-x.md"},
 	})
+	// Session-scoped Next Steps / Open Questions buffers (coord_id "deadbeef"
+	// matches the handing-off coord id both lifecycle tests pass). One
+	// explicit free-text step + the slugs this coord acted on this session.
+	addSessionScoped(t, pdir, "myproj", "deadbeef",
+		[]string{"revive codex-engine-mvp"},
+		[]string{"have-state-1111", "ready-3333", "todo-4444", "blocked-5555", "parked-6666"})
 	// Only one worker has a state.json on disk; the other is emit-on-missing.
 	seedWorkerState(t, pdir, "myproj", "have-state-1111", "tdd-green", "")
 	seedCheckpointFull(t, pdir, "myproj", now,
@@ -197,14 +234,19 @@ func TestEnrichManualDoc_Lifecycle_FillsFiveSections(t *testing.T) {
 	if strings.Contains(doc.Completed, "dispatched") {
 		t.Errorf("Completed must not contain dispatch events: %q", doc.Completed)
 	}
-	// 2. Next Steps — ready + todo (priority-desc); NOT in-progress.
-	if doc.NextSteps != "- [P0] ready-3333: queued urgent\n- [P2] todo-4444: queued later" {
-		t.Errorf("NextSteps: got %q", doc.NextSteps)
+	// 2. Next Steps — SESSION-SCOPED: explicit first, then this coord's
+	// promoted/dispatched slugs still ready/todo (priority-desc); the
+	// in-progress session slug (have-state-1111) is NOT double-listed here.
+	wantNext := "- [explicit] revive codex-engine-mvp\n" +
+		"- [auto] [P0] ready-3333: queued urgent\n" +
+		"- [auto] [P2] todo-4444: queued later"
+	if doc.NextSteps != wantNext {
+		t.Errorf("NextSteps: got %q want %q", doc.NextSteps, wantNext)
 	}
 	if strings.Contains(doc.NextSteps, "have-state-1111") {
-		t.Errorf("NextSteps must exclude in-progress: %q", doc.NextSteps)
+		t.Errorf("NextSteps must exclude in-progress session slug: %q", doc.NextSteps)
 	}
-	// 3. Open Questions — blocked + parked.
+	// 3. Open Questions — SESSION-SCOPED blocked + parked slugs only.
 	if !strings.Contains(doc.OpenQuestions, "- blocked-5555: blocked") ||
 		!strings.Contains(doc.OpenQuestions, "- parked-6666: awaiting operator decision") {
 		t.Errorf("OpenQuestions: got %q", doc.OpenQuestions)
@@ -256,8 +298,14 @@ func TestSynthesizeRecovery_Lifecycle_FullSectionParity(t *testing.T) {
 	if !strings.Contains(doc.Completed, "reconciled old-task → done") {
 		t.Errorf("synth Completed: got %q", doc.Completed)
 	}
-	if doc.NextSteps != "- [P0] ready-3333: queued urgent\n- [P2] todo-4444: queued later" {
-		t.Errorf("synth NextSteps: got %q", doc.NextSteps)
+	// T15 recovery parity: the synth (dead-coord) path fills Next Steps
+	// identically to the live manual path — same coord-state source, same
+	// coord id.
+	wantSynthNext := "- [explicit] revive codex-engine-mvp\n" +
+		"- [auto] [P0] ready-3333: queued urgent\n" +
+		"- [auto] [P2] todo-4444: queued later"
+	if doc.NextSteps != wantSynthNext {
+		t.Errorf("synth NextSteps: got %q want %q", doc.NextSteps, wantSynthNext)
 	}
 	if !strings.Contains(doc.OpenQuestions, "blocked-5555") || !strings.Contains(doc.OpenQuestions, "parked-6666") {
 		t.Errorf("synth OpenQuestions: got %q", doc.OpenQuestions)
@@ -269,6 +317,31 @@ func TestSynthesizeRecovery_Lifecycle_FullSectionParity(t *testing.T) {
 	if !strings.Contains(doc.SessionDocs, "- authored: docs/DESIGN-x.md") ||
 		!strings.Contains(doc.SessionDocs, "- implementing: docs/TASK-PLAN-x.md") {
 		t.Errorf("synth SessionDocs: got %q", doc.SessionDocs)
+	}
+}
+
+// T15b — recovery, empty session buffers: a crashed coord that never
+// recorded a next-step / session-task hands off a PLACEHOLDER Next Steps +
+// Open Questions, NOT a dump of the (present) ready/blocked backlog.
+func TestSynthesizeRecovery_EmptyBuffersPlaceholderNoBacklogDump(t *testing.T) {
+	pdir := withFleetHomeSynth(t)
+	now := time.Now().UTC()
+	seedCoordState(t, pdir, "myproj", map[string]string{})
+	// A real backlog exists in tasks.md — none of it is session-scoped.
+	seedRichTasksMD(t, pdir, "myproj", []*tasks.Task{
+		{Slug: "old-ready-1", Status: tasks.StatusReady, Priority: tasks.PriorityP0, Spec: "ancient P0"},
+		{Slug: "old-blocked-1", Status: tasks.StatusBlocked, Priority: tasks.PriorityP0, Spec: "stuck"},
+	})
+
+	doc, err := SynthesizeRecoveryWithLastHandoff("deadbeef", "myproj", "", now.Add(time.Second))
+	if err != nil {
+		t.Fatalf("SynthesizeRecoveryWithLastHandoff: %v", err)
+	}
+	if doc.NextSteps != Placeholder {
+		t.Errorf("empty session → Next Steps must be placeholder, got: %q", doc.NextSteps)
+	}
+	if doc.OpenQuestions != Placeholder {
+		t.Errorf("empty session → Open Questions must be placeholder, got: %q", doc.OpenQuestions)
 	}
 }
 

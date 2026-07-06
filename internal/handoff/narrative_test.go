@@ -4,6 +4,7 @@
 package handoff
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -42,137 +43,410 @@ func writeTasksFile(t *testing.T, path string, ts ...*tasks.Task) {
 	}
 }
 
-// --- Test 17: Next Steps from ready/todo queue, priority-desc then age. ---
-func TestCollectNextSteps_PriorityAndAgeOrder(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "tasks.md")
-	writeTasksFile(t, path,
-		// P1, older
-		mkTask("alpha-1111", "ready", "P1", "2026-06-01T00:00:00Z", "Fix the alpha widget", ""),
-		// P0, newest — should sort first (priority desc)
-		mkTask("zulu-2222", "todo", "P0", "2026-06-10T00:00:00Z", "Patch the zulu hole", ""),
-		// P1, newer than alpha — sorts after alpha (same priority, older first)
-		mkTask("bravo-3333", "ready", "P1", "2026-06-05T00:00:00Z", "Refactor bravo", ""),
-	)
-
-	got := CollectNextSteps(path)
-	// Expect P0 first, then the two P1s oldest-first.
-	wantOrder := []string{
-		"- [P0] zulu-2222: Patch the zulu hole",
-		"- [P1] alpha-1111: Fix the alpha widget",
-		"- [P1] bravo-3333: Refactor bravo",
+// --- Reader substring table: T9 (auto ready/todo-only), T10/T10b
+// (explicit-slug dedup / no-dedup), T14/T14b (per-entry generation filter),
+// and malformed-tasks explicit-survives. Each row names the bug it catches.
+// Structural assertions (ordering, cap, empty) live in dedicated tests below
+// since they check non-substring properties. ---
+func TestCollectNextSteps_Table(t *testing.T) {
+	fooReady := []*tasks.Task{mkTask("foo-1111", "ready", "P1", "2026-06-01T00:00:00Z", "Fix foo", "")}
+	cases := []struct {
+		name        string
+		tasks       []*tasks.Task
+		rawTasksMD  string // written verbatim when set (malformed-degrade case)
+		coordState  string
+		agentID     string
+		contains    []string
+		notContains []string
+	}{
+		{
+			name: "T9 auto renders only ready/todo session slugs",
+			tasks: []*tasks.Task{
+				mkTask("foo-1111", "ready", "P1", "2026-06-01T00:00:00Z", "Fix foo", ""),
+				mkTask("bar-2222", "in-progress", "P0", "2026-06-01T00:00:00Z", "Work bar", ""),
+				mkTask("baz-3333", "done", "P0", "2026-06-01T00:00:00Z", "Done baz", ""),
+			},
+			coordState: `{"session_tasks":[
+				{"slug":"foo-1111","coord_id":"c1","ts":"t"},
+				{"slug":"bar-2222","coord_id":"c1","ts":"t"},
+				{"slug":"baz-3333","coord_id":"c1","ts":"t"}]}`,
+			agentID:     "c1",
+			contains:    []string{"- [auto] [P1] foo-1111: Fix foo"},
+			notContains: []string{"bar-2222", "baz-3333"}, // in-progress/done dropped
+		},
+		{
+			name:  "T10 explicit --slug dedups the auto twin (explicit wins)",
+			tasks: fooReady,
+			coordState: `{
+				"session_next_steps":[{"text":"finish foo","slug":"foo-1111","coord_id":"c1","ts":"t"}],
+				"session_tasks":[{"slug":"foo-1111","coord_id":"c1","ts":"t"}]}`,
+			agentID:     "c1",
+			contains:    []string{"- [explicit] finish foo"},
+			notContains: []string{"[auto]"},
+		},
+		{
+			name:  "T10b explicit with no slug does NOT dedup (both render)",
+			tasks: fooReady,
+			coordState: `{
+				"session_next_steps":[{"text":"look at foo again","coord_id":"c1","ts":"t"}],
+				"session_tasks":[{"slug":"foo-1111","coord_id":"c1","ts":"t"}]}`,
+			agentID:  "c1",
+			contains: []string{"- [explicit] look at foo again", "- [auto] [P1] foo-1111"},
+		},
+		{
+			name:  "T14 successor renders none of the predecessor's entries",
+			tasks: fooReady,
+			coordState: `{
+				"session_next_steps":[{"text":"A step","coord_id":"coordA","ts":"t"}],
+				"session_tasks":[{"slug":"foo-1111","coord_id":"coordA","ts":"t"}]}`,
+			agentID:     "coordB",
+			notContains: []string{"A step", "foo-1111", "[auto]", "[explicit]"},
+		},
+		{
+			name: "T14b mixed generation filters per entry",
+			tasks: []*tasks.Task{
+				mkTask("foo-1111", "ready", "P1", "2026-06-01T00:00:00Z", "Fix foo", ""),
+				mkTask("bar-2222", "ready", "P1", "2026-06-01T00:00:00Z", "Fix bar", ""),
+			},
+			coordState: `{
+				"session_next_steps":[
+					{"text":"A step","coord_id":"coordA","ts":"t"},
+					{"text":"B step","coord_id":"coordB","ts":"t"}],
+				"session_tasks":[
+					{"slug":"foo-1111","coord_id":"coordA","ts":"t"},
+					{"slug":"bar-2222","coord_id":"coordB","ts":"t"}]}`,
+			agentID:     "coordB",
+			contains:    []string{"B step", "bar-2222"},
+			notContains: []string{"A step", "foo-1111"},
+		},
+		{
+			name:       "malformed tasks.md degrades auto to nothing; explicit survives",
+			rawTasksMD: "---\nschema: 1\n---\n\n## task: broken-1234\n\n- status: not-a-real-status\n- priority: P1\n\n",
+			coordState: `{
+				"session_next_steps":[{"text":"explicit survives","coord_id":"c1","ts":"t"}],
+				"session_tasks":[{"slug":"broken-1234","coord_id":"c1","ts":"t"}]}`,
+			agentID:     "c1",
+			contains:    []string{"- [explicit] explicit survives"},
+			notContains: []string{"[auto]"},
+		},
 	}
-	for i, w := range wantOrder {
-		if !strings.Contains(got, w) {
-			t.Errorf("Next Steps missing line %q in:\n%s", w, got)
-		}
-		// Order check: each subsequent line appears after the prior.
-		if i > 0 {
-			if strings.Index(got, w) < strings.Index(got, wantOrder[i-1]) {
-				t.Errorf("Next Steps order wrong: %q before %q in:\n%s", w, wantOrder[i-1], got)
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			pdir := t.TempDir()
+			if tc.rawTasksMD != "" {
+				if err := os.WriteFile(filepath.Join(pdir, "tasks.md"), []byte(tc.rawTasksMD), 0o644); err != nil {
+					t.Fatalf("write tasks.md: %v", err)
+				}
+			} else {
+				writeTasksFile(t, filepath.Join(pdir, "tasks.md"), tc.tasks...)
 			}
+			writeCoordStateJSON(t, pdir, tc.coordState)
+			got := CollectNextSteps(pdir, tc.agentID)
+			for _, want := range tc.contains {
+				if !strings.Contains(got, want) {
+					t.Errorf("missing %q in:\n%s", want, got)
+				}
+			}
+			for _, bad := range tc.notContains {
+				if strings.Contains(got, bad) {
+					t.Errorf("must NOT contain %q in:\n%s", bad, got)
+				}
+			}
+		})
+	}
+}
+
+// --- Auto ordering (priority-desc, then age) + Spec truncation to <=80 +
+// empty-Spec slug renders no trailing colon. ---
+func TestCollectNextSteps_AutoPriorityAgeAndTruncation(t *testing.T) {
+	pdir := t.TempDir()
+	long := strings.Repeat("x", 120)
+	writeTasksFile(t, filepath.Join(pdir, "tasks.md"),
+		mkTask("alpha-1111", "ready", "P1", "2026-06-01T00:00:00Z", long+"\nsecond", ""),
+		mkTask("zulu-2222", "todo", "P0", "2026-06-10T00:00:00Z", "Patch zulu", ""),
+		mkTask("bravo-3333", "ready", "P1", "2026-06-05T00:00:00Z", "Refactor bravo", ""),
+		mkTask("nospec-4444", "ready", "P2", "2026-06-01T00:00:00Z", "", ""),
+	)
+	writeCoordStateJSON(t, pdir, `{"session_tasks":[
+		{"slug":"alpha-1111","coord_id":"c1","ts":"t"},
+		{"slug":"zulu-2222","coord_id":"c1","ts":"t"},
+		{"slug":"bravo-3333","coord_id":"c1","ts":"t"},
+		{"slug":"nospec-4444","coord_id":"c1","ts":"t"}]}`)
+	got := CollectNextSteps(pdir, "c1")
+	want := []string{
+		"- [auto] [P0] zulu-2222: Patch zulu",
+		"- [auto] [P1] alpha-1111: " + strings.Repeat("x", 80),
+		"- [auto] [P1] bravo-3333: Refactor bravo",
+	}
+	for i, w := range want {
+		if !strings.Contains(got, w) {
+			t.Errorf("missing %q in:\n%s", w, got)
+		}
+		if i > 0 && strings.Index(got, w) < strings.Index(got, want[i-1]) {
+			t.Errorf("order wrong: %q before %q in:\n%s", w, want[i-1], got)
+		}
+	}
+	if strings.Contains(got, "second") {
+		t.Errorf("goal must be first Spec line only: %q", got)
+	}
+	if !strings.Contains(got, "- [auto] [P2] nospec-4444") || strings.Contains(got, "nospec-4444:") {
+		t.Errorf("empty-spec auto slug should have no trailing colon: %q", got)
+	}
+}
+
+// --- T11: empty session buffers + large backlog → placeholder (empty),
+// NEVER a backlog dump. ---
+func TestCollectNextSteps_EmptyBuffersNoBacklogDump(t *testing.T) {
+	pdir := t.TempDir()
+	var backlog []*tasks.Task
+	for i := 0; i < 15; i++ {
+		backlog = append(backlog,
+			mkTask(fmt.Sprintf("old-%04d", i), "ready", "P0", "2026-05-01T00:00:00Z", "ancient backlog", ""))
+	}
+	writeTasksFile(t, filepath.Join(pdir, "tasks.md"), backlog...)
+	// No coord-state buffers at all.
+	if got := CollectNextSteps(pdir, "c1"); got != "" {
+		t.Errorf("empty session buffers must yield placeholder (empty), got backlog dump:\n%s", got)
+	}
+}
+
+// --- T12: 15 combined (5 explicit + 10 auto) → 10 rendered, explicit first. ---
+func TestCollectNextSteps_CapCombinedExplicitFirst(t *testing.T) {
+	pdir := t.TempDir()
+	var tsk []*tasks.Task
+	var autoEntries []string
+	for i := 0; i < 10; i++ {
+		slug := fmt.Sprintf("auto-%04d", i)
+		tsk = append(tsk, mkTask(slug, "ready", "P1", "2026-06-01T00:00:00Z", "goal", ""))
+		autoEntries = append(autoEntries, fmt.Sprintf(`{"slug":"%s","coord_id":"c1","ts":"t"}`, slug))
+	}
+	writeTasksFile(t, filepath.Join(pdir, "tasks.md"), tsk...)
+	var explicit []string
+	for i := 0; i < 5; i++ {
+		explicit = append(explicit, fmt.Sprintf(`{"text":"explicit-%d","coord_id":"c1","ts":"t"}`, i))
+	}
+	writeCoordStateJSON(t, pdir, fmt.Sprintf(
+		`{"session_next_steps":[%s],"session_tasks":[%s]}`,
+		strings.Join(explicit, ","), strings.Join(autoEntries, ",")))
+	got := CollectNextSteps(pdir, "c1")
+	lines := strings.Split(got, "\n")
+	if len(lines) != 10 {
+		t.Fatalf("expected 10 lines (cap), got %d:\n%s", len(lines), got)
+	}
+	for i := 0; i < 5; i++ {
+		if !strings.Contains(lines[i], "[explicit]") {
+			t.Errorf("line %d should be explicit-first, got: %q", i, lines[i])
 		}
 	}
 }
 
-// --- Test 17b: ready task with empty Spec → slug only, no trailing colon. ---
-func TestCollectNextSteps_EmptySpecSlugOnly(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "tasks.md")
-	writeTasksFile(t, path,
-		mkTask("nospec-1234", "ready", "P2", "2026-06-01T00:00:00Z", "", ""),
+// --- codex iter-8 [P2]: a ready/todo task that is ALSO parked
+// (Parked != "") must render ONLY under Open Questions, NEVER double-listed
+// under Next Steps as actionable work. A parked task is waiting, not queued. ---
+func TestCollectNextSteps_ParkedReadyTaskNotDoubleListed(t *testing.T) {
+	pdir := t.TempDir()
+	writeTasksFile(t, filepath.Join(pdir, "tasks.md"),
+		mkTask("parked-1111", "ready", "P1", "2026-06-01T00:00:00Z", "queued but parked", "waiting on operator"),
+		mkTask("clean-2222", "ready", "P1", "2026-06-01T00:00:00Z", "genuinely next", ""),
 	)
+	writeCoordStateJSON(t, pdir, `{"session_tasks":[
+		{"slug":"parked-1111","coord_id":"c1","ts":"t"},
+		{"slug":"clean-2222","coord_id":"c1","ts":"t"}]}`)
 
-	got := CollectNextSteps(path)
-	if !strings.Contains(got, "- [P2] nospec-1234") {
-		t.Errorf("expected slug-only bullet, got:\n%s", got)
+	next := CollectNextSteps(pdir, "c1")
+	if strings.Contains(next, "parked-1111") {
+		t.Errorf("parked ready task must NOT appear in Next Steps (double-list): %q", next)
 	}
-	if strings.Contains(got, "nospec-1234:") {
-		t.Errorf("empty Spec must NOT render a trailing colon, got:\n%s", got)
+	if !strings.Contains(next, "clean-2222") {
+		t.Errorf("un-parked ready task must still appear in Next Steps: %q", next)
+	}
+	// It DOES belong in Open Questions (Parked != "").
+	oq := CollectOpenQuestions(pdir, "c1")
+	if !strings.Contains(oq, "- parked-1111: waiting on operator") {
+		t.Errorf("parked task must appear in Open Questions: %q", oq)
 	}
 }
 
-// --- Spec first-line truncation to <=80 chars. ---
-func TestCollectNextSteps_SpecTruncated(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "tasks.md")
-	long := strings.Repeat("x", 120)
-	writeTasksFile(t, path,
-		mkTask("longspec-1234", "ready", "P1", "2026-06-01T00:00:00Z", long+"\nsecond line", ""),
+// --- codex iter-12 [P1]: an explicit next-step is the coord's own NOTE and
+// ALWAYS renders — it must NOT vanish just because its --slug task went
+// blocked/parked. (A prior revision dropped it, which — combined with
+// `tasks set` no longer stamping session_tasks — made a blocked slug-bound
+// note disappear from BOTH Next Steps and Open Questions. The safe floor is
+// to keep the explicit line unconditionally.) ---
+func TestCollectNextSteps_ExplicitSlugBoundLineAlwaysRenders(t *testing.T) {
+	pdir := t.TempDir()
+	writeTasksFile(t, filepath.Join(pdir, "tasks.md"),
+		mkTask("blocked-1111", "blocked", "P1", "2026-06-01T00:00:00Z", "went blocked", ""),
+		mkTask("ready-2222", "ready", "P1", "2026-06-01T00:00:00Z", "still ready", ""),
 	)
+	// blocked-1111 is NOT in session_tasks (tasks set no longer stamps), so
+	// its slug-bound explicit note is the ONLY record of it — must survive.
+	writeCoordStateJSON(t, pdir, `{"session_next_steps":[
+		{"text":"revive blocked-1111","slug":"blocked-1111","coord_id":"c1","ts":"t"},
+		{"text":"finish ready-2222","slug":"ready-2222","coord_id":"c1","ts":"t"},
+		{"text":"free-form idea no slug","coord_id":"c1","ts":"t"}]}`)
 
-	got := CollectNextSteps(path)
-	// Single task → the body is exactly one bullet. The goal must be the
-	// first Spec line truncated to 80 x's, no more.
-	want := "- [P1] longspec-1234: " + strings.Repeat("x", 80)
-	if got != want {
-		t.Errorf("Spec not truncated to 80 chars:\n got %q\nwant %q", got, want)
+	got := CollectNextSteps(pdir, "c1")
+	if !strings.Contains(got, "revive blocked-1111") {
+		t.Errorf("slug-bound explicit note for a blocked task must NOT vanish: %q", got)
 	}
-	if strings.Contains(got, "second line") {
-		t.Errorf("goal must be first non-blank Spec line only, got:\n%s", got)
+	if !strings.Contains(got, "finish ready-2222") {
+		t.Errorf("explicit line for a still-ready slug must render: %q", got)
+	}
+	if !strings.Contains(got, "free-form idea no slug") {
+		t.Errorf("no-slug free-text explicit line must always render: %q", got)
 	}
 }
 
-// --- Test 20: only terminal / in-progress tasks → empty (placeholder). ---
-func TestCollectNextSteps_ExcludesInProgressAndTerminal(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "tasks.md")
-	writeTasksFile(t, path,
+// --- codex iter-14 [P2]: a slug-bound explicit note whose task reached a
+// TERMINAL state (done/abandoned) is finished work and must be DROPPED from
+// Next Steps — not shown as outstanding. Non-terminal + blocked/parked stay. ---
+func TestCollectNextSteps_ExplicitSlugDroppedWhenTerminal(t *testing.T) {
+	pdir := t.TempDir()
+	writeTasksFile(t, filepath.Join(pdir, "tasks.md"),
 		mkTask("done-1111", "done", "P1", "2026-06-01T00:00:00Z", "shipped", ""),
-		mkTask("inflight-2222", "in-progress", "P1", "2026-06-01T00:00:00Z", "working", ""),
-		mkTask("dropped-3333", "abandoned", "P1", "2026-06-01T00:00:00Z", "nope", ""),
+		mkTask("aband-2222", "abandoned", "P1", "2026-06-01T00:00:00Z", "dropped", ""),
+		mkTask("blocked-3333", "blocked", "P1", "2026-06-01T00:00:00Z", "stuck", ""),
+		mkTask("ready-4444", "ready", "P1", "2026-06-01T00:00:00Z", "go", ""),
 	)
+	writeCoordStateJSON(t, pdir, `{"session_next_steps":[
+		{"text":"finish done-1111","slug":"done-1111","coord_id":"c1","ts":"t"},
+		{"text":"finish aband-2222","slug":"aband-2222","coord_id":"c1","ts":"t"},
+		{"text":"revive blocked-3333","slug":"blocked-3333","coord_id":"c1","ts":"t"},
+		{"text":"do ready-4444","slug":"ready-4444","coord_id":"c1","ts":"t"}]}`)
 
-	if got := CollectNextSteps(path); got != "" {
-		t.Errorf("Next Steps should be empty (no ready/todo), got:\n%s", got)
+	got := CollectNextSteps(pdir, "c1")
+	if strings.Contains(got, "done-1111") {
+		t.Errorf("explicit note for a DONE task must be dropped: %q", got)
+	}
+	if strings.Contains(got, "aband-2222") {
+		t.Errorf("explicit note for an ABANDONED task must be dropped: %q", got)
+	}
+	if !strings.Contains(got, "revive blocked-3333") {
+		t.Errorf("explicit note for a BLOCKED task must be kept: %q", got)
+	}
+	if !strings.Contains(got, "do ready-4444") {
+		t.Errorf("explicit note for a READY task must be kept: %q", got)
 	}
 }
 
-// --- Test 18: Open Questions selects blocked OR Parked!=""; reason text. ---
-func TestCollectOpenQuestions_BlockedOrParked(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "tasks.md")
-	writeTasksFile(t, path,
-		mkTask("stuck-1111", "blocked", "P1", "2026-06-01T00:00:00Z", "stuck spec", ""),
-		mkTask("parked-2222", "ready", "P2", "2026-06-02T00:00:00Z", "parked spec", "2026-06-02 dirty worktree"),
-		mkTask("fine-3333", "ready", "P1", "2026-06-03T00:00:00Z", "fine", ""),
+// --- codex iter-13 [P2]: a task surfaced ONLY via a slug-bound explicit
+// next-step (never in session_tasks) that is blocked/parked must still reach
+// Open Questions — not just Next Steps. Repro: checkpoint next-step --slug foo
+// then tasks set foo blocked (which no longer stamps session_tasks). ---
+func TestCollectOpenQuestions_SurfacesExplicitOnlyBlockedSlug(t *testing.T) {
+	pdir := t.TempDir()
+	writeTasksFile(t, filepath.Join(pdir, "tasks.md"),
+		mkTask("foo-1111", "blocked", "P1", "2026-06-01T00:00:00Z", "went blocked", ""),
+		mkTask("bar-2222", "ready", "P2", "2026-06-02T00:00:00Z", "spec", "dirty worktree"),
 	)
+	// foo + bar are referenced ONLY via session_next_steps (empty session_tasks).
+	writeCoordStateJSON(t, pdir, `{"session_next_steps":[
+		{"text":"revive foo","slug":"foo-1111","coord_id":"c1","ts":"t"},
+		{"text":"unpark bar","slug":"bar-2222","coord_id":"c1","ts":"t"}]}`)
 
-	got := CollectOpenQuestions(path)
-	if !strings.Contains(got, "stuck-1111") || !strings.Contains(got, "blocked") {
-		t.Errorf("Open Questions missing blocked task reason-less, got:\n%s", got)
+	oq := CollectOpenQuestions(pdir, "c1")
+	if !strings.Contains(oq, "- foo-1111: blocked") {
+		t.Errorf("explicit-only blocked slug must reach Open Questions: %q", oq)
 	}
-	if !strings.Contains(got, "parked-2222") || !strings.Contains(got, "dirty worktree") {
-		t.Errorf("Open Questions missing parked task + Parked text, got:\n%s", got)
+	if !strings.Contains(oq, "- bar-2222: dirty worktree") {
+		t.Errorf("explicit-only parked slug must reach Open Questions: %q", oq)
 	}
-	if strings.Contains(got, "fine-3333") {
-		t.Errorf("Open Questions must not include a non-blocked non-parked task, got:\n%s", got)
+	// A foreign-generation explicit entry is still filtered out.
+	writeCoordStateJSON(t, pdir, `{"session_next_steps":[
+		{"text":"revive foo","slug":"foo-1111","coord_id":"otherCoord","ts":"t"}]}`)
+	if got := CollectOpenQuestions(pdir, "c1"); strings.Contains(got, "foo-1111") {
+		t.Errorf("foreign-generation explicit slug must be filtered from Open Questions: %q", got)
 	}
 }
 
-// --- Test 19: missing file → empty (never errors). ---
-func TestCollectors_MissingFileEmpty(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "does-not-exist.md")
-	if got := CollectNextSteps(path); got != "" {
-		t.Errorf("CollectNextSteps missing file: got %q want empty", got)
+// --- T13: Open Questions = session-touched blocked/parked only, with the
+// foreignGeneration filter — a non-session blocked task AND a foreign-coord
+// session_task are both omitted. ---
+func TestCollectOpenQuestions_SessionScopedAndGenerationFiltered(t *testing.T) {
+	pdir := t.TempDir()
+	writeTasksFile(t, filepath.Join(pdir, "tasks.md"),
+		mkTask("foo-1111", "blocked", "P1", "2026-06-01T00:00:00Z", "stuck", ""),
+		mkTask("parked-2222", "ready", "P2", "2026-06-02T00:00:00Z", "spec", "dirty worktree"),
+		mkTask("qux-9999", "blocked", "P0", "2026-06-01T00:00:00Z", "also stuck", ""),        // non-session
+		mkTask("foreign-8888", "blocked", "P1", "2026-06-01T00:00:00Z", "predecessor's", ""), // foreign gen
+	)
+	writeCoordStateJSON(t, pdir, `{"session_tasks":[
+		{"slug":"foo-1111","coord_id":"c1","ts":"t"},
+		{"slug":"parked-2222","coord_id":"c1","ts":"t"},
+		{"slug":"foreign-8888","coord_id":"other","ts":"t"}]}`)
+	got := CollectOpenQuestions(pdir, "c1")
+	if !strings.Contains(got, "- foo-1111: blocked") {
+		t.Errorf("session blocked task missing: %q", got)
 	}
-	if got := CollectOpenQuestions(path); got != "" {
-		t.Errorf("CollectOpenQuestions missing file: got %q want empty", got)
+	if !strings.Contains(got, "- parked-2222: dirty worktree") {
+		t.Errorf("session parked task missing: %q", got)
+	}
+	if strings.Contains(got, "qux-9999") {
+		t.Errorf("non-session blocked task must be omitted: %q", got)
+	}
+	if strings.Contains(got, "foreign-8888") {
+		t.Errorf("foreign-generation session_task must be filtered: %q", got)
 	}
 }
 
-// --- Test 19: malformed block → strict parse fails → collectors degrade
-// to empty (no panic, no error surfaced). ---
-func TestCollectors_MalformedDegradesToEmpty(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "tasks.md")
-	// A block with a bad status enum trips the strict tasks.Read. Written
-	// as raw bytes (the tasks writer would refuse to render an invalid
-	// task). Collectors must swallow the parse error → empty.
-	body := "---\nschema: 1\n---\n\n## task: broken-1234\n\n- status: not-a-real-status\n- priority: P1\n\n"
-	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
-		t.Fatalf("write: %v", err)
+// --- Open Questions: no session-touched blocked → placeholder even with a
+// backlog full of blocked rows. ---
+func TestCollectOpenQuestions_NoSessionBlockedPlaceholder(t *testing.T) {
+	pdir := t.TempDir()
+	writeTasksFile(t, filepath.Join(pdir, "tasks.md"),
+		mkTask("qux-9999", "blocked", "P0", "2026-06-01T00:00:00Z", "backlog blocked", ""),
+	)
+	writeCoordStateJSON(t, pdir, `{"session_tasks":[]}`)
+	if got := CollectOpenQuestions(pdir, "c1"); got != "" {
+		t.Errorf("no session-blocked → placeholder, got: %q", got)
 	}
+}
 
-	if got := CollectNextSteps(path); got != "" {
-		t.Errorf("CollectNextSteps malformed: got %q want empty", got)
+// --- codex review (settled across 3 rounds): an UNSTAMPED session entry
+// (empty coord_id — an operator-shell `fleet checkpoint next-step` / `fleet
+// tasks promote|set` run without FLEET_AGENT_ID) is the PRIMARY operator
+// usage mode and MUST stay visible to a real coord's handoff. Only a
+// FOREIGN-STAMPED entry (a different coord generation) is filtered; unstamped
+// entries pass, exactly like the durable session_docs buffer. ---
+func TestCollectSessionScoped_UnstampedEntriesVisibleToStampedReader(t *testing.T) {
+	pdir := t.TempDir()
+	writeTasksFile(t, filepath.Join(pdir, "tasks.md"),
+		mkTask("ready-1111", "ready", "P1", "2026-06-01T00:00:00Z", "live ready", ""),
+		mkTask("blocked-2222", "blocked", "P1", "2026-06-01T00:00:00Z", "live blocked", ""),
+		mkTask("foreign-3333", "ready", "P1", "2026-06-01T00:00:00Z", "prev gen", ""),
+	)
+	// Unstamped operator rows + one FOREIGN-stamped row.
+	writeCoordStateJSON(t, pdir, `{
+		"session_next_steps":[{"text":"operator next-step","ts":"t"}],
+		"session_tasks":[
+			{"slug":"ready-1111","ts":"t"},
+			{"slug":"blocked-2222","ts":"t"},
+			{"slug":"foreign-3333","coord_id":"otherCoord","ts":"t"}]}`)
+
+	// A REAL coord (non-empty id) STILL sees the unstamped operator rows...
+	next := CollectNextSteps(pdir, "realcoord")
+	if !strings.Contains(next, "operator next-step") || !strings.Contains(next, "ready-1111") {
+		t.Errorf("stamped reader must keep unstamped operator entries: %q", next)
 	}
-	if got := CollectOpenQuestions(path); got != "" {
-		t.Errorf("CollectOpenQuestions malformed: got %q want empty", got)
+	if got := CollectOpenQuestions(pdir, "realcoord"); !strings.Contains(got, "blocked-2222") {
+		t.Errorf("stamped reader must keep unstamped operator open-questions: %q", got)
+	}
+	// ...but a FOREIGN-stamped (different generation) row is still filtered.
+	if strings.Contains(next, "foreign-3333") {
+		t.Errorf("foreign-generation stamped entry must be filtered: %q", next)
+	}
+}
+
+// --- missing coord-state.json AND tasks.md → both collectors empty (never
+// errors). ---
+func TestCollectors_MissingFilesEmpty(t *testing.T) {
+	pdir := t.TempDir() // nothing seeded
+	if got := CollectNextSteps(pdir, "c1"); got != "" {
+		t.Errorf("CollectNextSteps missing files: got %q want empty", got)
+	}
+	if got := CollectOpenQuestions(pdir, "c1"); got != "" {
+		t.Errorf("CollectOpenQuestions missing files: got %q want empty", got)
 	}
 }
 

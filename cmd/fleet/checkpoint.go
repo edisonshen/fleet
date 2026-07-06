@@ -42,6 +42,19 @@ import (
 // a cross-package dependency just to share the number 20.
 const checkpointSessionDocsMax = 20
 
+// checkpointNextStepsMax caps coord-state.json:session_next_steps — the
+// explicit free-text Next Steps buffer written by `fleet checkpoint
+// next-step`. Its OWN constant (design: coord-state schema); the reader-side
+// Next Steps cap (nextStepsLimit) bounds the COMBINED explicit+auto render.
+const checkpointNextStepsMax = 10
+
+// NOTE: session_tasks (the auto Next Steps buffer) is written ONLY by the
+// coord tick (skills/coordinator: dispatch.record_session_task, capped at
+// _SESSION_TASKS_MAX=30) — never by a Go CLI command. A CLI write to
+// coord-state.json would spoof the coord heartbeat coordStateFresh() reads
+// from its mtime (codex iter-11 [P1]). The Go side is READ-ONLY for
+// session_tasks (internal/handoff CollectNextSteps/CollectOpenQuestions).
+
 // checkpointDefaultDecisions is the recent_decisions cap when
 // FLEET_COORD_CHECKPOINT_DECISIONS is unset/invalid — matches
 // dispatch.resolve_checkpoint_decisions() so the Go CLI and the Python tick
@@ -71,7 +84,132 @@ Both take coordinator.lock and atomically read-modify-write
 	}
 	cmd.AddCommand(newCheckpointDocCmd())
 	cmd.AddCommand(newCheckpointDecisionCmd())
+	cmd.AddCommand(newCheckpointNextStepCmd())
 	return cmd
+}
+
+func newCheckpointNextStepCmd() *cobra.Command {
+	var project, slug string
+	cmd := &cobra.Command{
+		Use:   "next-step [--slug <slug>] <text>",
+		Short: "Record a free-text Next Step for the handoff (session-scoped)",
+		Long: `next-step records a free-text line the coordinator plans to do next but
+has NOT queued as a task (e.g. "revive codex-engine-mvp — replan closed PR").
+It renders under the handoff's Next Steps as ` + "`- [explicit] <text>`" + `,
+scoped to THIS coordinator's session (foreign-generation entries are
+filtered). Optional --slug exact-dedups the line against the auto block
+(a promoted/dispatched task with the same slug renders once, explicit wins).`,
+		Args: cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return runCheckpointNextStep(project, slug, args[0])
+		},
+	}
+	cmd.Flags().StringVar(&project, "project", "", "project name (default: cwd basename)")
+	cmd.Flags().StringVar(&slug, "slug", "", "optional task slug for exact dedup against the auto block")
+	return cmd
+}
+
+// Security fix (review iter-1): the successor coord's resume parser
+// (skills/coordinator/handoff_resume.py) walks the handoff doc via Python's
+// str.splitlines(), which treats U+2028 (LINE SEPARATOR), U+2029 (PARAGRAPH
+// SEPARATOR), U+0085 (NEL), \v, \f, and \x1c-\x1e as line breaks — NOT just
+// \r/\n. A next-step string carrying one of those runes passed the old
+// \r\n-only flatten untouched, yet split into multiple logical lines on the
+// Python reader, letting free text forge a `## Active Subagents` / `## Open
+// PRs` header BEFORE the real ones (Next Steps renders at position 6, ahead
+// of Active Subagents at 7 and Open PRs at 8 — see internal/handoff/handoff.go
+// Render). Because both Python section scanners break on the first line
+// starting `## ` once inside a section, a forged header + forged entries
+// followed by a forged next header would swallow the parse and the real
+// Active Subagents / Open PRs sections would never be read — silently
+// dropping in-flight worker resume + substituting attacker-chosen PR URLs.
+// flattenLineBreaks replaces every rune Python's str.splitlines() treats as
+// a line terminator with a space, matching the successor's actual notion of
+// "line" (not just Go's \r\n) so no forged section header can survive.
+func flattenLineBreaks(s string) string {
+	return strings.Map(func(r rune) rune {
+		switch r {
+		case '\r', '\n', '\v', '\f', // ASCII: CR, LF, vertical tab, form feed
+			'\u001c', '\u001d', '\u001e', // File/Group/Record separator
+			'\u0085', // NEL (Next Line)
+			'\u2028', // LINE SEPARATOR
+			'\u2029': // PARAGRAPH SEPARATOR
+			return ' '
+		default:
+			return r
+		}
+	}, s)
+}
+
+// runCheckpointNextStep appends {text, slug?, coord_id, ts} to
+// session_next_steps, deduped by the (text, slug) PAIR (last wins → tail)
+// and capped to the newest checkpointNextStepsMax.
+func runCheckpointNextStep(project, slug, text string) error {
+	// Flatten every line-break rune the successor coord's resume parser
+	// recognizes (see flattenLineBreaks) — identical guard as the decision /
+	// doc buffers. The handoff renders the explicit block body as a fixed
+	// `## H\n%s\n\n` block with no per-line fencing, so an embedded line
+	// break could forge a `## header` the successor coord reads as trusted.
+	// This sanitization is load-bearing, not cosmetic.
+	flat := strings.TrimSpace(flattenLineBreaks(text))
+	if flat == "" {
+		return errors.New("next-step text must be non-empty")
+	}
+	slug = strings.TrimSpace(flattenLineBreaks(slug))
+	return withCoordState(project, func(cs map[string]any) {
+		steps := toSlice(cs["session_next_steps"])
+		// Dedupe key depends on whether the entry is slug-bound:
+		//   - slug SET → a slug-bound entry is "the current note for THIS
+		//     task". Re-recording for the same slug REPLACES the prior note
+		//     regardless of text, so `--slug foo "wait on review"` then
+		//     `--slug foo "replan after CI"` leaves only the latter (codex
+		//     iter-13 [P2] — avoid accumulating stale/contradictory lines for
+		//     one task). Two DIFFERENT slugs never collide (codex iter-12).
+		//   - slug EMPTY → a free-text note keyed on its exact text; repeated
+		//     identical no-slug notes collapse (a bare duplicate is noise).
+		// A no-slug entry never dedups a slug-bound one (different kinds).
+		entrySlug := func(m map[string]any) string {
+			s, _ := m["slug"].(string)
+			return s
+		}
+		kept := steps[:0]
+		for _, e := range steps {
+			m, ok := e.(map[string]any)
+			if !ok {
+				kept = append(kept, e)
+				continue
+			}
+			var dup bool
+			if slug != "" {
+				dup = entrySlug(m) == slug // same task → replace
+			} else {
+				dup = entrySlug(m) == "" && m["text"] == flat // same free-text note
+			}
+			if dup {
+				continue
+			}
+			kept = append(kept, e)
+		}
+		entry := map[string]any{
+			"text": flat,
+			"ts":   time.Now().UTC().Format(time.RFC3339),
+		}
+		if slug != "" {
+			entry["slug"] = slug
+		}
+		// Generation stamp: coord-state.json survives succession, so the
+		// reader (CollectNextSteps) drops entries stamped by a DIFFERENT
+		// coord. Empty FLEET_AGENT_ID (operator shell) leaves the entry
+		// unstamped → unfiltered, mirroring runCheckpointDoc.
+		if id := os.Getenv("FLEET_AGENT_ID"); id != "" {
+			entry["coord_id"] = id
+		}
+		kept = append(kept, entry)
+		if len(kept) > checkpointNextStepsMax {
+			kept = kept[len(kept)-checkpointNextStepsMax:]
+		}
+		cs["session_next_steps"] = kept
+	})
 }
 
 func newCheckpointDocCmd() *cobra.Command {
@@ -195,10 +333,12 @@ func runCheckpointDecision(project, text string) error {
 	})
 }
 
-// withCoordState resolves the project, takes coordinator.lock, and applies
-// mutate to a read coord-state.json dict, then atomically writes it back.
-// Load-mutate-save the WHOLE dict (never reconstruct) so sibling keys the
-// tick owns ride through untouched.
+// withCoordState resolves the project, takes coordinator.lock (bounded by
+// coordLockTimeout), and applies mutate to a read coord-state.json dict, then
+// atomically writes it back. Load-mutate-save the WHOLE dict (never
+// reconstruct) so sibling keys the tick owns ride through untouched. Used by
+// the operator/agent-invoked provenance writers (`fleet checkpoint …`) that
+// are NEVER called from inside a live tick, so blocking-with-timeout is safe.
 func withCoordState(project string, mutate func(map[string]any)) error {
 	proj, err := resolveProject(project)
 	if err != nil {

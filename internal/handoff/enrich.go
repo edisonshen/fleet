@@ -359,8 +359,9 @@ func statusIsPrePR(status string) bool {
 // buffer's correct home; it finally has a producer wired in loop.py).
 // Each empty buffer leaves the doc's existing section text (Placeholder
 // for synth / the manual stub). NextSteps + Open Questions are NOT touched
-// here -- they come live from tasks.md via CollectNextSteps /
-// CollectOpenQuestions, so a checkpoint lift must not overwrite them.
+// here -- they come session-scoped from coord-state.json (session_next_steps
+// / session_tasks) via CollectNextSteps / CollectOpenQuestions, so a
+// checkpoint lift must not overwrite them.
 func applyCheckpointToDoc(doc *Doc, cp *checkpointDoc) {
 	doc.ActiveSubagents = cp.activeSubagents
 	doc.OpenPRs = cp.openPRs
@@ -570,16 +571,17 @@ func EnrichManualDoc(doc *Doc, project, agentID, repoDir string, lastHandoffPath
 		// placeholder if no checkpoint).
 	}
 
-	// NARRATIVE: Next Steps + Open Questions come LIVE from tasks.md (always
-	// fresh, fill even when the coord died before its first checkpoint). Both
-	// never-error: parse drift / missing file → empty → keep the placeholder.
-	// Completed is set above by the checkpoint lift (applyCheckpointToDoc);
-	// Key Decisions is set live above.
-	tasksPath := filepath.Join(pdir, "tasks.md")
-	if ns := CollectNextSteps(tasksPath); ns != "" {
+	// NARRATIVE: Next Steps + Open Questions come SESSION-SCOPED from
+	// coord-state.json (this coord's explicit next-steps + promoted/dispatched
+	// slugs), overlaid with LIVE tasks.md status. Both foreignGeneration-
+	// filtered on agentID so a successor never renders a predecessor's plan.
+	// Never-error: parse drift / missing file / empty buffers → empty → keep
+	// the placeholder (a quiet section beats a stale backlog dump). Completed
+	// is set above by the checkpoint lift; Key Decisions is set live above.
+	if ns := CollectNextSteps(pdir, agentID); ns != "" {
 		doc.NextSteps = ns
 	}
-	if oq := CollectOpenQuestions(tasksPath); oq != "" {
+	if oq := CollectOpenQuestions(pdir, agentID); oq != "" {
 		doc.OpenQuestions = oq
 	}
 	// Docs (this session): the plan docs THIS coord recorded via
@@ -625,58 +627,153 @@ func priorityRank(p tasks.Priority) int {
 	}
 }
 
-// nextStepsLimit caps the Next Steps list so a huge backlog doesn't bloat
-// the handoff doc. The successor sees the top-N most-urgent queued tasks.
+// nextStepsLimit caps the COMBINED explicit+auto Next Steps list so a busy
+// session doesn't bloat the handoff doc. Explicit lines are retained first.
 const nextStepsLimit = 10
 
-// CollectNextSteps renders the `## Next Steps (prioritized)` body live from
-// tasks.md: the top-N ready/todo tasks (NOT in-progress — those appear
-// under Active Subagents / Open PRs, listing them here double-lists),
-// ordered priority-descending then by age (oldest first), each rendered
-// `- [P{n}] <slug>: <goal>` where goal = first non-blank line of Spec,
-// trimmed, ≤80 chars; an empty Spec renders the slug alone (no trailing
-// colon). Never errors: parse drift / missing file → "" (caller keeps the
-// placeholder). There is no Goal field on tasks.Task — Spec is the source.
-func CollectNextSteps(tasksFile string) string {
+// readTasksBySlug reads tasks.md (tolerant) into a slug→task map for the
+// session-scoped collectors' live status/priority/goal overlay. Missing /
+// malformed file → empty map (auto block degrades to nothing; the caller's
+// explicit block still renders from coord-state.json).
+func readTasksBySlug(tasksFile string) map[string]*tasks.Task {
 	all := readTasksTolerant(tasksFile)
-	var queued []*tasks.Task
+	out := make(map[string]*tasks.Task, len(all))
 	for _, t := range all {
-		if t.Status == tasks.StatusReady || t.Status == tasks.StatusTodo {
-			queued = append(queued, t)
-		}
+		out[t.Slug] = t
 	}
-	if len(queued) == 0 {
+	return out
+}
+
+// isNextStepActionable reports whether t belongs in the `## Next Steps`
+// block: it must be ready/todo AND not parked. Anything else lives
+// elsewhere in the handoff — in-progress under Active Subagents, blocked
+// or parked under Open Questions, done/abandoned dropped. Single-sourcing
+// this keeps the explicit + auto Next-Steps blocks from double-listing a
+// slug that has moved on (codex iter-8/iter-10 [P2]).
+func isNextStepActionable(t *tasks.Task) bool {
+	if t.Status != tasks.StatusReady && t.Status != tasks.StatusTodo {
+		return false
+	}
+	return t.Parked == ""
+}
+
+// CollectNextSteps renders the `## Next Steps (prioritized)` body SESSION-
+// SCOPED from coord-state.json under pdir — NOT a whole-tasks.md backlog
+// dump. agentID is the coord whose handoff is being built; both buffers are
+// foreignGeneration-filtered so a successor never renders a predecessor's
+// STAMPED entries, while unstamped operator-shell entries stay visible
+// (coord-state.json survives succession).
+//
+//	explicit  session_next_steps  → `- [explicit] <text>`   (this coord only)
+//	auto      session_tasks       → `- [auto] [P{n}] <slug>: <goal>`
+//	                                (slug still ready/todo in tasks.md;
+//	                                 in-progress → Active Subagents, done → dropped)
+//
+// Dedup: an explicit entry whose optional slug equals an auto slug keeps the
+// explicit line and drops the auto twin (exact match only; a no-slug explicit
+// line never dedups). Order: explicit first (buffer order), then auto
+// priority-desc then age; capped to nextStepsLimit total. Empty (post-filter)
+// → "" so the caller keeps the placeholder — a quiet section beats a
+// misleading backlog dump. Never errors.
+func CollectNextSteps(pdir, agentID string) string {
+	cs := readCoordStateForCollect(filepath.Join(pdir, "coord-state.json"))
+
+	bySlug := readTasksBySlug(filepath.Join(pdir, "tasks.md"))
+
+	// Explicit block — this coord's free-text lines. An explicit line is the
+	// operator/coord's own NOTE; its optional --slug is used to dedupe the
+	// auto twin (design D1). It renders in ALL states EXCEPT when its slug has
+	// reached a TERMINAL state (done / abandoned): that work is finished, so
+	// showing "revive foo" as an outstanding Next Step would tell the
+	// successor to redo completed work (codex iter-14 [P2]). Non-terminal
+	// slugs (ready/todo/in-progress) and blocked/parked slugs are KEPT: codex
+	// iter-12 [P1] — dropping a blocked slug's note made it vanish from BOTH
+	// sections (it wasn't in session_tasks either). A blocked/parked slug now
+	// ALSO surfaces under Open Questions (iter-13), so its note in Next Steps
+	// is the complementary "plan", not lost work. A no-slug line and a slug
+	// absent from tasks.md always render (no live status to check).
+	var explicit []sessionNextStep
+	explicitSlugs := map[string]bool{}
+	for _, e := range cs.SessionNextSteps {
+		if strings.TrimSpace(e.Text) == "" {
+			continue
+		}
+		if foreignGeneration(e.CoordID, agentID) {
+			continue
+		}
+		if s := strings.TrimSpace(e.Slug); s != "" {
+			if t, ok := bySlug[s]; ok &&
+				(t.Status == tasks.StatusDone || t.Status == tasks.StatusAbandoned) {
+				continue // finished work — don't show as an outstanding step
+			}
+			explicitSlugs[s] = true
+		}
+		explicit = append(explicit, e)
+	}
+
+	// Auto block — this coord's promoted/dispatched slugs, rendered LIVE from
+	// tasks.md and ONLY while still actionable (ready/todo, not parked).
+	var auto []*tasks.Task
+	seenAuto := map[string]bool{}
+	for _, st := range cs.SessionTasks {
+		slug := strings.TrimSpace(st.Slug)
+		if slug == "" || seenAuto[slug] {
+			continue
+		}
+		if foreignGeneration(st.CoordID, agentID) {
+			continue
+		}
+		if explicitSlugs[slug] {
+			continue // explicit wins the exact-slug dedup
+		}
+		t, ok := bySlug[slug]
+		if !ok {
+			continue
+		}
+		if !isNextStepActionable(t) {
+			// in-progress → Active Subagents; done/abandoned → dropped;
+			// blocked OR parked → Open Questions (codex iter-8/iter-10 [P2]:
+			// never double-list actionable work with a blocker).
+			continue
+		}
+		seenAuto[slug] = true
+		auto = append(auto, t)
+	}
+
+	if len(explicit) == 0 && len(auto) == 0 {
 		return ""
 	}
 	// priority-desc (P0 first) then age (oldest Created first). Stable so
-	// equal keys keep tasks.md order.
-	sort.SliceStable(queued, func(i, j int) bool {
-		ri, rj := priorityRank(queued[i].Priority), priorityRank(queued[j].Priority)
+	// equal keys keep session-record order.
+	sort.SliceStable(auto, func(i, j int) bool {
+		ri, rj := priorityRank(auto[i].Priority), priorityRank(auto[j].Priority)
 		if ri != rj {
 			return ri < rj
 		}
-		return queued[i].Created.Before(queued[j].Created)
+		return auto[i].Created.Before(auto[j].Created)
 	})
-	if len(queued) > nextStepsLimit {
-		queued = queued[:nextStepsLimit]
+
+	// Render explicit first, then auto; cap the combined total.
+	var lines []string
+	for _, e := range explicit {
+		lines = append(lines, "- [explicit] "+strings.TrimSpace(e.Text))
 	}
-	var b strings.Builder
-	for i, t := range queued {
-		if i > 0 {
-			b.WriteByte('\n')
-		}
+	for _, t := range auto {
 		prio := string(t.Priority)
 		if prio == "" {
 			prio = "P?"
 		}
 		goal := specFirstLine(t.Spec)
 		if goal == "" {
-			fmt.Fprintf(&b, "- [%s] %s", prio, t.Slug)
+			lines = append(lines, fmt.Sprintf("- [auto] [%s] %s", prio, t.Slug))
 		} else {
-			fmt.Fprintf(&b, "- [%s] %s: %s", prio, t.Slug, goal)
+			lines = append(lines, fmt.Sprintf("- [auto] [%s] %s: %s", prio, t.Slug, goal))
 		}
 	}
-	return b.String()
+	if len(lines) > nextStepsLimit {
+		lines = lines[:nextStepsLimit]
+	}
+	return strings.Join(lines, "\n")
 }
 
 // specFirstLine returns the first non-blank line of spec, trimmed and
@@ -695,21 +792,48 @@ func specFirstLine(spec string) string {
 	return ""
 }
 
-// CollectOpenQuestions renders the `## Open Questions` body live from
-// tasks.md: tasks where Status == "blocked" OR Parked != "" (there is no
-// `parked` status — Parked is a separate free-form field). A parked task
-// renders its Parked text; a blocked task has no structured reason in
-// tasks.md (it lives in coord sentinels) so it renders reason-less:
-// `- <slug>: blocked`. A task both blocked AND parked renders the Parked
-// text. Ordered by slug for a deterministic doc. Never errors: parse
-// drift / missing file → "" (caller keeps the placeholder).
-func CollectOpenQuestions(tasksFile string) string {
-	all := readTasksTolerant(tasksFile)
+// CollectOpenQuestions renders the `## Open Questions` body SESSION-SCOPED
+// from coord-state.json under pdir: THIS coord's session slugs
+// (foreignGeneration-filtered, same as CollectNextSteps) that are currently
+// `blocked` OR `parked` (Parked != "") in tasks.md — NOT every blocked row in
+// the backlog. Candidate slugs come from BOTH session_tasks (dispatched/
+// promoted work) AND the slug bound to a session_next_steps entry (codex
+// iter-13 [P2]: a task the coord recorded an explicit note for, then that went
+// blocked/parked before any dispatch seam stamped session_tasks, must still
+// surface its blocker here — not only in Next Steps). A parked task renders
+// its Parked text; a blocked task has no structured reason in tasks.md so it
+// renders `- <slug>: blocked`; a task both blocked AND parked renders the
+// Parked text. Ordered by slug for a deterministic doc. Empty (post-filter) →
+// "" so the caller keeps the placeholder. Never errors.
+func CollectOpenQuestions(pdir, agentID string) string {
+	cs := readCoordStateForCollect(filepath.Join(pdir, "coord-state.json"))
+	bySlug := readTasksBySlug(filepath.Join(pdir, "tasks.md"))
 	var picked []*tasks.Task
-	for _, t := range all {
+	seen := map[string]bool{}
+	// consider adds slug to picked when it's a this-coord, blocked/parked task.
+	consider := func(slug, coordID string) {
+		slug = strings.TrimSpace(slug)
+		if slug == "" || seen[slug] {
+			return
+		}
+		if foreignGeneration(coordID, agentID) {
+			return
+		}
+		t, ok := bySlug[slug]
+		if !ok {
+			return
+		}
 		if t.Status == tasks.StatusBlocked || t.Parked != "" {
+			seen[slug] = true
 			picked = append(picked, t)
 		}
+	}
+	for _, st := range cs.SessionTasks {
+		consider(st.Slug, st.CoordID)
+	}
+	// Slugs surfaced ONLY via an explicit next-step (never dispatched).
+	for _, e := range cs.SessionNextSteps {
+		consider(e.Slug, e.CoordID)
 	}
 	if len(picked) == 0 {
 		return ""

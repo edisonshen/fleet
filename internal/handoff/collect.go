@@ -11,9 +11,11 @@ package handoff
 //	Key Decisions        coord-state.json:recent_decisions   CollectRecentDecisionsLive
 //	                     (live-preferred over the checkpoint)
 //
-// (Next Steps + Open Questions come from tasks.md via CollectNextSteps /
-// CollectOpenQuestions in enrich.go; Completed comes from the rolling
-// checkpoint buffer via applyCheckpointToDoc.)
+// (Next Steps + Open Questions are session-scoped from coord-state.json
+// (session_next_steps / session_tasks) via CollectNextSteps /
+// CollectOpenQuestions in enrich.go, overlaid with tasks.md for live
+// status/priority only; Completed comes from the rolling checkpoint buffer
+// via applyCheckpointToDoc.)
 //
 // Both collectors are best-effort: a missing / malformed coord-state.json, an
 // empty path, or an absent/empty key returns the zero value so the caller
@@ -62,9 +64,34 @@ type sessionDoc struct {
 // maintains for the shared recent_decisions buffer (per-entry stamping would
 // break the plain-strings checkpoint round-trip the tick producer shares).
 type coordStateForCollect struct {
-	SessionDocs          []sessionDoc `json:"session_docs"`
-	RecentDecisions      []string     `json:"recent_decisions"`
-	RecentDecisionsOwner string       `json:"recent_decisions_owner"`
+	SessionDocs          []sessionDoc      `json:"session_docs"`
+	RecentDecisions      []string          `json:"recent_decisions"`
+	RecentDecisionsOwner string            `json:"recent_decisions_owner"`
+	SessionNextSteps     []sessionNextStep `json:"session_next_steps"`
+	SessionTasks         []sessionTask     `json:"session_tasks"`
+}
+
+// sessionNextStep is one entry of coord-state.json:session_next_steps — an
+// explicit free-text Next Step the coordinator recorded via `fleet checkpoint
+// next-step`. Slug is optional (used only for exact dedup against the auto
+// block). CoordID stamps the writing coord's generation so CollectNextSteps
+// drops a predecessor's entries after succession (coord-state.json survives).
+type sessionNextStep struct {
+	Text    string `json:"text"`
+	Slug    string `json:"slug,omitempty"`
+	CoordID string `json:"coord_id,omitempty"`
+	TS      string `json:"ts"`
+}
+
+// sessionTask is one entry of coord-state.json:session_tasks — a slug this
+// coordinator promoted or dispatched this session (the auto Next Steps
+// source). Dual-written by the Go `fleet tasks promote` and the Python tick
+// (_record_session_task); the JSON keys are byte-identical across both.
+// CoordID drives the same foreignGeneration filter as sessionDoc.
+type sessionTask struct {
+	Slug    string `json:"slug"`
+	CoordID string `json:"coord_id,omitempty"`
+	TS      string `json:"ts"`
 }
 
 // foreignGeneration reports whether a stamped owner belongs to a DIFFERENT
@@ -72,6 +99,15 @@ type coordStateForCollect struct {
 // stamp (legacy entry / operator-shell write) or empty agentID (caller
 // without generation context) can't be attributed, so it is NOT foreign —
 // the exact semantics of loadCheckpointIfFresher's coord_id guard.
+//
+// This is deliberately the SAME filter for the durable buffers (session_docs,
+// recent_decisions) AND the session_next_steps / session_tasks buffers: an
+// unstamped operator-shell write (`fleet checkpoint next-step` / `fleet tasks
+// promote|set` run without FLEET_AGENT_ID) is intentionally "always relevant"
+// — a real coord's handoff still surfaces operator-recorded work. (A prior
+// revision filtered unstamped session entries for a stamped reader; codex
+// review flagged across three consecutive rounds that this silently drops the
+// primary operator-shell usage mode, so it was reverted back to this baseline.)
 func foreignGeneration(stamp, agentID string) bool {
 	return stamp != "" && agentID != "" && stamp != agentID
 }

@@ -439,6 +439,17 @@ func runTasksAdd(opts *tasksAddOpts, positional string, stdout io.Writer) error 
 			t.Slug, t.Status, t.Priority, path)
 		return nil
 	})
+	// NOTE (codex iter-8 [P1] — deliberately NOT implemented): codex asked
+	// to stamp `fleet tasks add` into session_tasks so a filed-then-handed-
+	// off todo shows in Next Steps. Rejected with a test-backed reason: the
+	// session_tasks writer creates/touches coord-state.json, and the TUI
+	// dashboard treats coord-state.json's mtime AS the coord heartbeat
+	// (dashboard.go: os.Stat → ModTime → "● active"). Stamping tasks add
+	// would make merely FILING a task falsely flip the project to "coord
+	// active" — TestFleetE2E_FullWorkflow/cold_start_shows_todo_and_idle
+	// enforces the opposite invariant (file a task → still ○ idle, no coord
+	// running). The filed task is NOT lost: it lives in tasks.md and the
+	// successor sees it in its backlog view. The fix is worse than the gap.
 }
 
 // isLikelySlug returns true if s could be interpreted as a slug (no
@@ -894,6 +905,20 @@ func runTasksSet(opts *tasksSetOpts, slug, kv string, stdout io.Writer) error {
 	key := strings.TrimSpace(kv[:idx])
 	value := strings.TrimSpace(kv[idx+1:])
 
+	// codex iter-11 [P1] — `fleet tasks set` deliberately does NOT stamp
+	// session_tasks. session_tasks lives in coord-state.json, whose mtime IS
+	// the coord tick heartbeat that coordStateFresh() (dispatch_recovery.go)
+	// and the TUI dashboard read as proof a coordinator is alive. A CLI write
+	// from an operator shell (no live coord) would SPOOF that heartbeat —
+	// flipping the project to "● active" and making `fleet dispatch
+	// --coord-spawn` refuse for ~coordFreshnessWindow. session_tasks is
+	// instead recorded ONLY by the coord TICK (loop.py _record_session_task
+	// at every dispatch / reaper-promote seam), which legitimately owns the
+	// heartbeat write. A coord-driven status transition is thus already in
+	// session_tasks via its dispatch seam; the reader overlays live tasks.md
+	// status. (Adjusts the mechanism of design D2 — session_tasks captured by
+	// the tick, not the CLI — to eliminate the verified heartbeat-spoof; the
+	// feature intent is preserved.)
 	return withTasksLock(project, func() error {
 		f, path, err := readTasks(project)
 		if err != nil {
@@ -1307,6 +1332,15 @@ func runTasksPromote(opts *tasksPromoteOpts, slug string, stdout io.Writer) erro
 	if err != nil {
 		return err
 	}
+	// codex iter-11 [P1] — like `fleet tasks set`, promote does NOT stamp
+	// session_tasks: a CLI write to coord-state.json spoofs the coord tick
+	// heartbeat (coordStateFresh / dashboard read its mtime), which on an
+	// idle project falsely shows "● active" and can make `fleet dispatch
+	// --coord-spawn` refuse. The coord TICK records session_tasks at its
+	// reaper-promote + dispatch seams (loop.py _record_session_task), which
+	// legitimately owns the heartbeat write — so a coord-driven promote is
+	// captured there. (Adjusts design D2's mechanism to remove the verified
+	// heartbeat-spoof while preserving the session-scoped Next Steps intent.)
 	return withTasksLock(project, func() error {
 		f, path, err := readTasks(project)
 		if err != nil {

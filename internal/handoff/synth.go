@@ -123,20 +123,20 @@ func SynthesizeRecoveryWithLastHandoff(
 	}
 	pdir = filepath.Clean(pdir)
 
-	// NARRATIVE (Slice 2): Next Steps + Open Questions come LIVE from
-	// tasks.md on EVERY recovery return path (checkpoint-lift AND the
-	// state-walk), in lockstep with the manual EnrichManualDoc path.
-	// Always fresh, fill even when the coord died before its first
-	// checkpoint. Never-error: parse drift / missing file → keep the
-	// placeholder. Applied BEFORE the checkpoint branch so the early
-	// return still carries them (applyCheckpointToDoc only sets Completed,
-	// never NextSteps/OpenQuestions). Completed comes from the checkpoint
-	// buffer (lift below); Key Decisions is set live below.
-	tasksPath := filepath.Join(pdir, "tasks.md")
-	if ns := CollectNextSteps(tasksPath); ns != "" {
+	// NARRATIVE: Next Steps + Open Questions come SESSION-SCOPED from
+	// coord-state.json on EVERY recovery return path (checkpoint-lift AND the
+	// state-walk), in lockstep with the manual EnrichManualDoc path — read
+	// with the DEAD coord's own id, so a recovered handoff fills these
+	// sections identically (or degrades to placeholder). Applied BEFORE the
+	// checkpoint branch so the early return still carries them
+	// (applyCheckpointToDoc only sets Completed, never NextSteps/OpenQuestions).
+	// Never-error: parse drift / missing file / empty buffers → keep the
+	// placeholder. Completed comes from the checkpoint buffer (lift below);
+	// Key Decisions is set live below.
+	if ns := CollectNextSteps(pdir, agentID); ns != "" {
 		doc.NextSteps = ns
 	}
-	if oq := CollectOpenQuestions(tasksPath); oq != "" {
+	if oq := CollectOpenQuestions(pdir, agentID); oq != "" {
 		doc.OpenQuestions = oq
 	}
 

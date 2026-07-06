@@ -52,11 +52,16 @@ the coord agent doesn't pick up the wakeup-loop conventions.
 """
 from __future__ import annotations
 
+import fcntl
+import json
 import os
 import re
 import sys
+import tempfile
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Callable
 
 # Local sibling module — keep imports stable when running as a script
 # under sys.path = [skills/coordinator].
@@ -280,6 +285,7 @@ def build_resume_dispatches(
     wip_dir: str | os.PathLike,
     fleet_home: str | os.PathLike,
     project: str | None = None,
+    on_resume: Callable[[str], None] | None = None,
 ) -> tuple[list[str], list[str]]:
     """Build DISPATCH blocks the coord agent can act on to re-spawn
     each Active Subagent whose WIP file exists AND whose status/pr_url
@@ -290,6 +296,17 @@ def build_resume_dispatches(
     one-line human-readable reasons for entries that were NOT
     re-dispatched (missing WIP, missing inbox, malformed agent_id,
     pr already open and in review, or terminal status).
+
+    `on_resume`, if given, is called with each `task_id` that actually
+    gets a DISPATCH block emitted (review iter-2: codex flagged that the
+    resumed task's slug was never recorded into coord-state.json:
+    session_tasks, so the session-scoped Next Steps/Open Questions
+    collectors silently drop a just-resumed active task if THIS coord
+    hands off again before any loop.py tick seam independently touches
+    it). `main()` uses this hook to stamp the successor's own coord_id
+    into session_tasks for every task it just resumed — kept as a
+    callback (not a 3rd return value) so this stays backward compatible
+    with the existing 2-tuple unpacking at every call site.
 
     v0.8.3 decision branches:
       - status in {in-review, done, abandoned, blocked} → SKIP Agent
@@ -449,7 +466,137 @@ def build_resume_dispatches(
             )
             continue
         blocks.append(block)
+        if on_resume is not None:
+            on_resume(e.task_id)
     return blocks, skipped
+
+
+# ---------- session_tasks recording (review iter-2) ----------
+#
+# handoff_resume is a standalone script (not run inside loop.py's tick),
+# so it needs its own tiny coord-state.json RMW — mirrors
+# register_subagent._read_coord_state / _write_coord_state / _take_coord_lock
+# verbatim rather than importing them (established convention in this
+# package: each small script that touches coord-state.json keeps its own
+# local copy of the atomic-write + coordinator.lock helpers instead of a
+# shared cross-module dependency).
+
+_LOCK_RETRY_ATTEMPTS = 10
+_LOCK_RETRY_INTERVAL_S = 0.1
+
+
+def _read_coord_state(path: Path) -> dict:
+    """Load coord-state.json. Empty dict on first run / read error."""
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+        if isinstance(data, dict):
+            return data
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        pass
+    return {}
+
+
+def _write_coord_state(path: Path, state: dict) -> None:
+    """Atomic publish (tmp + rename + fsync)."""
+    parent = path.parent
+    parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix=path.name + ".tmp.", dir=str(parent))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump(state, fh, indent=2, sort_keys=True)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, path)
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except FileNotFoundError:
+            pass
+        raise
+
+
+def _take_coord_lock(path: Path):
+    """Acquire coordinator.lock LOCK_EX | LOCK_NB with a brief retry.
+    Returns a context manager; raises OSError after exhausting retries."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(str(path), os.O_CREAT | os.O_RDWR, 0o644)
+    last_err: OSError | None = None
+    for _ in range(_LOCK_RETRY_ATTEMPTS):
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return _ResumeLockHandle(fd)
+        except OSError as exc:
+            last_err = exc
+            time.sleep(_LOCK_RETRY_INTERVAL_S)
+    os.close(fd)
+    raise OSError(f"coordinator.lock busy after {_LOCK_RETRY_ATTEMPTS} attempts") from last_err
+
+
+class _ResumeLockHandle:
+    """Tiny RAII handle for the coord lock (mirrors register_subagent's
+    _LockHandle). Errors during release are swallowed — the kernel
+    reclaims the flock on close regardless."""
+
+    def __init__(self, fd: int) -> None:
+        self.fd = fd
+
+    def __enter__(self) -> "_ResumeLockHandle":
+        return self
+
+    def __exit__(self, *_exc) -> None:
+        try:
+            fcntl.flock(self.fd, fcntl.LOCK_UN)
+        except OSError:
+            pass
+        try:
+            os.close(self.fd)
+        except OSError:
+            pass
+
+
+def record_resumed_session_tasks(
+    resumed_slugs: list[str], *, project: str, coord_id: str, home: Path,
+) -> None:
+    """Best-effort RMW: stamp each just-resumed task_id into
+    coord-state.json:session_tasks under THIS (successor) coord's own
+    coord_id, via the shared dispatch.record_session_task writer — the
+    same buffer/dedupe/cap logic every other dispatch seam uses.
+
+    Never raises: a resume that can't record its session_tasks stamp
+    must not abort the resume dispatch itself (the DISPATCH blocks are
+    already built and about to be printed to stdout regardless).
+    """
+    if not resumed_slugs:
+        return
+    try:
+        project_dir = home / "projects" / project
+        state_path = project_dir / "coord-state.json"
+        lock_path = project_dir / ".locks" / "coordinator.lock"
+        with _take_coord_lock(lock_path):
+            # codex iter-10 [P2]: _read_coord_state() flattens BOTH a missing
+            # file AND a MALFORMED (JSONDecodeError / non-dict) file to {}.
+            # A missing file is fine to create fresh, but overwriting a
+            # malformed file with {session_tasks:[…]} would silently DROP its
+            # sibling keys (worker_agent_ids, recent_decisions, redispatch
+            # markers…) — real data loss. This stamp is best-effort, so the
+            # safe move on a present-but-unparseable file is to SKIP the write,
+            # not truncate it. Distinguish the two by reading raw first.
+            if state_path.exists():
+                try:
+                    raw = json.loads(state_path.read_text(encoding="utf-8"))
+                except (ValueError, OSError):
+                    return  # malformed / unreadable → do not clobber
+                if not isinstance(raw, dict):
+                    return  # non-dict payload → do not clobber
+                cs = raw
+            else:
+                cs = {}
+            for slug in resumed_slugs:
+                dispatch_mod.record_session_task(cs, slug, coord_id)
+            _write_coord_state(state_path, cs)
+    except Exception:  # noqa: BLE001 — best-effort, mirrors loop._record_session_task
+        pass
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -486,10 +633,24 @@ def main(argv: list[str] | None = None) -> int:
     wip_dir = os.environ.get(
         "FLEET_SUBAGENT_WIP_DIR",
     ) or os.path.expanduser("~/.fleet/subagent-wip")
+    project = os.environ.get("FLEET_PROJECT", "") or None
+    resumed_slugs: list[str] = []
     blocks, skipped = build_resume_dispatches(
         entries, wip_dir=wip_dir, fleet_home=fleet_home,
-        project=os.environ.get("FLEET_PROJECT", "") or None,
+        project=project, on_resume=resumed_slugs.append,
     )
+    # review iter-2 (codex): stamp every resumed task_id into THIS coord's
+    # own session_tasks under its own coord_id — without this, a resumed
+    # active task silently disappears from Next Steps/Open Questions if
+    # this successor hands off again before any loop.py tick seam
+    # independently touches it. Best-effort: the DISPATCH blocks below are
+    # unconditional regardless of whether this stamp lands.
+    if project:
+        record_resumed_session_tasks(
+            resumed_slugs, project=project,
+            coord_id=os.environ.get("FLEET_AGENT_ID", ""),
+            home=Path(fleet_home),
+        )
     for line in skipped:
         print(f"# {line}", file=sys.stderr)
     for url in open_pr_urls:
