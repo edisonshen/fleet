@@ -13,24 +13,27 @@ Background (the live failure mode this fixes):
 
 The fix: in the lock-busy branch, a coord that lost the lock to a
 DIFFERENT LIVE coord AND is NOT the project's intended coord (per the
-coord-spawn-marker) sets result.self_exit=True + emits a clear stderr
-diagnostic (feedback_surface_dont_silo). `main()` then kills THIS
-coord's own tmux session so the duplicate self-heals.
+coordinator LEASE — D3, the coord-spawn marker is deleted) sets
+result.self_exit=True + emits a clear stderr diagnostic
+(feedback_surface_dont_silo). `main()` then kills THIS coord's own tmux
+session so the duplicate self-heals.
 
 Conservatism gates (each one => skip, never self-exit):
   - no coord_id (manual shell invocation)
   - lock body has no valid holder ID
   - holder == self (own stale flock)
-  - spawn-marker == self (WE are the intended / successor coord =
-    the mid-handoff guard)
+  - lease names self (live active owner OR in-flight handoff successor
+    = the mid-handoff guard)
   - holder's agent record missing OR holder's tmux session dead
     (normal takeover, next tick acquires)
 
 Determinism: we monkeypatch supervisor.tmux_session_alive so no test
-shells out to tmux; the lock contention is created by holding the real
-flock on a throwaway fd inside the test process (deterministic, no
-sleeps). main()'s session kill is exercised via the injected
-loop._kill_own_session_fn seam — never a real `tmux kill-session`.
+shells out to tmux, AND stub loop._coord_lease_identity_fn (autouse
+fixture) so no test shells out to the real `fleet coord-owner` binary;
+the lock contention is created by holding the real flock on a throwaway
+fd inside the test process (deterministic, no sleeps). main()'s session
+kill is exercised via the injected loop._kill_own_session_fn seam —
+never a real `tmux kill-session`.
 """
 from __future__ import annotations
 
@@ -94,8 +97,18 @@ def _hold_lock(pdir: Path, holder_id: str) -> int:
     return fd
 
 
-def _write_marker(pdir: Path, agent_id: str) -> None:
-    (pdir / ".locks" / "coord-spawn-marker").write_text(agent_id + "\n")
+@pytest.fixture(autouse=True)
+def _stub_lease_identity(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Default: the coordinator lease names nobody this session recognizes, so
+    gate 5 (lease-names-us) never fires and the remaining gates decide. This
+    replaces the deleted coord-spawn marker as the identity source (D3) AND
+    keeps the suite deterministic — no test ever shells out to the real
+    `fleet coord-owner` binary (which would be the CI trap). Tests exercising
+    the lease-names-us skip override this with their own stub."""
+    monkeypatch.setattr(
+        loop, "_coord_lease_identity_fn",
+        lambda project, *, home, fleet_bin="fleet": ("", ""),
+    )
 
 
 @pytest.fixture
@@ -145,7 +158,6 @@ def test_live_other_coord_not_intended_triggers_self_exit(
     _seed_agent_record(fleet_home, holder)
     held_lock(pdir, holder)
     # Marker names the holder (the real intended coord), not us.
-    _write_marker(pdir, holder)
     # Holder's tmux session is "alive" (deterministic stub).
     monkeypatch.setattr(
         supervisor_mod, "tmux_session_alive",
@@ -268,7 +280,12 @@ def test_intended_coord_per_marker_does_not_self_exit(
     _seed_agent_record(fleet_home, me)
     _seed_agent_record(fleet_home, old)
     held_lock(pdir, old)
-    _write_marker(pdir, me)  # WE are the intended coord
+    # The coordinator lease names US as the live active owner => intended /
+    # successor coord => never self-exit (D3: replaces the marker-names-us guard).
+    monkeypatch.setattr(
+        loop, "_coord_lease_identity_fn",
+        lambda project, *, home, fleet_bin="fleet": (me, ""),
+    )
     monkeypatch.setattr(
         supervisor_mod, "tmux_session_alive", lambda session, **kw: True,
     )
@@ -300,7 +317,6 @@ def test_dead_holder_does_not_self_exit(
     _seed_agent_record(fleet_home, me)
     _seed_agent_record(fleet_home, holder)
     held_lock(pdir, holder)
-    _write_marker(pdir, holder)
     monkeypatch.setattr(
         supervisor_mod, "tmux_session_alive", lambda session, **kw: False,
     )
@@ -360,7 +376,6 @@ def test_self_is_worker_does_not_self_exit(
     # The lock is held by the genuine project coord.
     _seed_agent_record(fleet_home, real_coord)
     held_lock(pdir, real_coord)
-    _write_marker(pdir, real_coord)
     monkeypatch.setattr(
         supervisor_mod, "tmux_session_alive", lambda session, **kw: True,
     )
@@ -516,7 +531,6 @@ def test_main_self_exit_invokes_session_kill(
     _seed_agent_record(fleet_home, me)
     _seed_agent_record(fleet_home, holder)
     held_lock(pdir, holder)
-    _write_marker(pdir, holder)
     monkeypatch.setenv("FLEET_HOME", str(fleet_home))
     monkeypatch.setenv("FLEET_PROJECT", "fleet")
     monkeypatch.setenv("FLEET_AGENT_ID", me)
@@ -557,7 +571,6 @@ def test_main_self_exit_kill_failure_surfaces_diagnostic(
     _seed_agent_record(fleet_home, me)
     _seed_agent_record(fleet_home, holder)
     held_lock(pdir, holder)
-    _write_marker(pdir, holder)
     monkeypatch.setenv("FLEET_HOME", str(fleet_home))
     monkeypatch.setenv("FLEET_PROJECT", "fleet")
     monkeypatch.setenv("FLEET_AGENT_ID", me)

@@ -429,9 +429,9 @@ func runMaintenanceBootstrapRemoteControl(
 		// Agent-tool subagents never get --remote-control by design;
 		// surveying them under the default-on gate would flag every
 		// worker on every project. Same predicate as the handoff /
-		// drain inject gates: the coord-spawn marker resolves to this
-		// agent's ID.
-		if r.Project == "" || state.ReadCoordSpawnMarker(r.Project) != r.ID {
+		// drain inject gates: spawn.IsCoordSpawn (the coord-spawn marker
+		// is gone, D3).
+		if !spawn.IsCoordSpawn(r.TaskID, r.Project) {
 			continue
 		}
 		if commandHasRemoteControl(r.Command) {

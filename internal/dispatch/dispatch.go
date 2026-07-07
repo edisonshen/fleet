@@ -139,7 +139,6 @@ const (
 	KindRemoteControlInbox = "remote_control_inbox"   // PR2
 	KindTmuxSession        = "tmux_session"           // PR2
 	KindAgentRecord        = "agent_record"           // PR2
-	KindCoordSpawnMarker   = "coord_spawn_marker"     // PR3
 	KindWorkerDir          = "worker_dir"             // PR2
 	KindWorktree           = "worktree"               // PR2
 	KindSupervisorEntry    = "supervisor_entry"       // PR4 (derived)

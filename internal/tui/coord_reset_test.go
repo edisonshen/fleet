@@ -156,7 +156,7 @@ func TestKeyA_StaleCoordID_Table(t *testing.T) {
 				records = append(records, tc.successor)
 				markers[project] = tc.successor.ID
 			}
-			(&stubCoordSpawnMarker{markers: markers}).install(t)
+			(&stubCoordLeaseIdentity{markers: markers}).install(t)
 
 			m := New("test")
 			m.records = records
@@ -772,7 +772,7 @@ func TestIntegration_StaleCoordLock_DeadEndRecovery_AndReset(t *testing.T) {
 	// (findExistingCoordForProject) resolves it.
 	(&stubSessionAlive{}).install(t)
 	(&stubSessionProbe{}).install(t)
-	(&stubCoordSpawnMarker{markers: map[string]string{project: liveID}}).install(t)
+	(&stubCoordLeaseIdentity{markers: map[string]string{project: liveID}}).install(t)
 
 	// Stub the reset reap so we don't fork real `fleet rm`/`fleet gc`,
 	// but assert the exact shell-out intent (project + coord IDs).

@@ -78,19 +78,23 @@ func TestDeliverToCurrentOwner_OwnerSeenButUndeliverable_NotSentinel(t *testing.
 	}
 }
 
-func TestDeliverToCurrentOwnerTargetsLeaseOwnerAndPromotesMarker(t *testing.T) {
+// TestDeliverToCurrentOwnerTargetsLeaseOwnerAndDelivers pins the happy path:
+// the active lease owner is resolved to its agent record and the prompt is
+// verified-sent to that owner's tmux session, returning the owner record. The
+// lease owner IS the coord identity now, so there is nothing to promote after
+// the send.
+func TestDeliverToCurrentOwnerTargetsLeaseOwnerAndDelivers(t *testing.T) {
 	winner := &agent.Record{
 		ID:          "winner1",
 		Project:     "rainier",
 		TmuxSession: "fleet-winner1",
 	}
-	var sentSession, sentPrompt, markerProject, markerID string
+	var sentSession, sentPrompt string
 	rec, err := DeliverToCurrentOwner(Options{
-		Project:       "rainier",
-		Prompt:        "read the doc",
-		PromoteMarker: true,
-		Timeout:       time.Second,
-		Poll:          time.Millisecond,
+		Project: "rainier",
+		Prompt:  "read the doc",
+		Timeout: time.Second,
+		Poll:    time.Millisecond,
 	}, Deps{
 		CurrentOwner: func(project string) (coordlock.Owner, bool) {
 			if project != "rainier" {
@@ -110,10 +114,6 @@ func TestDeliverToCurrentOwnerTargetsLeaseOwnerAndPromotesMarker(t *testing.T) {
 			sentSession, sentPrompt = session, prompt
 			return true, nil
 		},
-		WriteMarker: func(project, id string) error {
-			markerProject, markerID = project, id
-			return nil
-		},
 		Now:   time.Now,
 		Sleep: func(time.Duration) {},
 	})
@@ -126,21 +126,17 @@ func TestDeliverToCurrentOwnerTargetsLeaseOwnerAndPromotesMarker(t *testing.T) {
 	if sentSession != winner.TmuxSession || sentPrompt != "read the doc" {
 		t.Fatalf("sent (%q,%q), want (%q,%q)", sentSession, sentPrompt, winner.TmuxSession, "read the doc")
 	}
-	if markerProject != "rainier" || markerID != winner.ID {
-		t.Fatalf("marker = (%q,%q), want (rainier,%s)", markerProject, markerID, winner.ID)
-	}
 }
 
 // TestDeliverToCurrentOwner_OwnerFlipAfterSend_StaysPending pins codex iter-32
-// P1: when the lock owner flips AFTER the verified send but BEFORE marker
-// promotion, the prompt landed on the now-superseded owner and the marker was
-// NOT promoted to the new owner. DeliverToCurrentOwner must surface this as
-// PENDING (an error), NOT success — otherwise the caller deletes the durable
-// queue + drops the superseded replacement, stranding the handoff (the new
-// owner never got the prompt, discovery points at a stale agent, no retry).
+// P1: when the lock owner flips AFTER the verified send but BEFORE we can
+// confirm the recipient still owns the lease, the prompt landed on the
+// now-superseded owner. DeliverToCurrentOwner must surface this as PENDING (an
+// error), NOT success — otherwise the caller deletes the durable queue + drops
+// the superseded replacement, stranding the handoff (the new owner never got
+// the prompt, discovery points at a stale agent, no retry).
 //
-// Invariants that REMAIN: no double-send WITHIN this call, no marker write for
-// an owner that no longer holds the lock. The retry (a fresh
+// Invariant that REMAINS: no double-send WITHIN this call. The retry (a fresh
 // DeliverToCurrentOwner) re-targets the new stable owner (a benign duplicate
 // prompt, §5c).
 func TestDeliverToCurrentOwner_OwnerFlipAfterSend_StaysPending(t *testing.T) {
@@ -151,17 +147,15 @@ func TestDeliverToCurrentOwner_OwnerFlipAfterSend_StaysPending(t *testing.T) {
 
 	currentCalls := 0
 	sendCalls := 0
-	markerWrites := 0
 	var sentSession, sentPrompt string
 	var stderr strings.Builder
 
 	rec, err := DeliverToCurrentOwner(Options{
-		Project:       "rainier",
-		Prompt:        "resume now",
-		PromoteMarker: true,
-		Timeout:       time.Second,
-		Poll:          time.Millisecond,
-		Stderr:        &stderr,
+		Project: "rainier",
+		Prompt:  "resume now",
+		Timeout: time.Second,
+		Poll:    time.Millisecond,
+		Stderr:  &stderr,
 	}, Deps{
 		CurrentOwner: func(project string) (coordlock.Owner, bool) {
 			if project != "rainier" {
@@ -191,10 +185,6 @@ func TestDeliverToCurrentOwner_OwnerFlipAfterSend_StaysPending(t *testing.T) {
 			sentSession, sentPrompt = session, prompt
 			return true, nil
 		},
-		WriteMarker: func(string, string) error {
-			markerWrites++
-			return nil
-		},
 		Now:   time.Now,
 		Sleep: func(time.Duration) {},
 	})
@@ -209,9 +199,6 @@ func TestDeliverToCurrentOwner_OwnerFlipAfterSend_StaysPending(t *testing.T) {
 	}
 	if sentSession != recA.TmuxSession || sentPrompt != "resume now" {
 		t.Fatalf("sent (%q,%q), want (%q,%q)", sentSession, sentPrompt, recA.TmuxSession, "resume now")
-	}
-	if markerWrites != 0 {
-		t.Fatalf("marker writes = %d, want 0 — must NOT promote a marker for an owner that lost the lock", markerWrites)
 	}
 	if !strings.Contains(stderr.String(), "changed after verified send") {
 		t.Fatalf("stderr = %q, want owner-flip warning", stderr.String())
@@ -313,41 +300,5 @@ func TestDeliverToCurrentOwner_StaleOwnerButLeaseActive_NotSentinel(t *testing.T
 	}
 	if errors.Is(err, ErrNoOwnerObserved) {
 		t.Fatalf("error = %v, must NOT be ErrNoOwnerObserved (lease record is active)", err)
-	}
-}
-
-// codex iter-25 [P2] regression: when the resume prompt is delivered to the lock
-// owner but the coord-spawn marker promotion fails, DeliverToCurrentOwner must
-// return an error (not success). Otherwise callers delete the queue + drop the
-// superseded replacement, leaving attach/TUI discovery pointed at a removed agent.
-func TestDeliverToCurrentOwner_MarkerWriteFailure_IsError(t *testing.T) {
-	winner := &agent.Record{ID: "winner1", Project: "rainier", TmuxSession: "fleet-winner1"}
-	sent := false
-	_, err := DeliverToCurrentOwner(Options{
-		Project:       "rainier",
-		Prompt:        "read the doc",
-		PromoteMarker: true,
-		Timeout:       time.Second,
-		Poll:          time.Millisecond,
-	}, Deps{
-		CurrentOwner: func(string) (coordlock.Owner, bool) {
-			return coordlock.Owner{AgentID: winner.ID, PID: 4242, PidStart: 99}, true
-		},
-		LoadAgent:    func(string) (*agent.Record, error) { return winner, nil },
-		WaitReady:    func(string) error { return nil },
-		SessionAlive: func(string) (bool, error) { return true, nil },
-		SendVerified: func(string, string) (bool, error) { sent = true; return true, nil },
-		WriteMarker:  func(string, string) error { return fmt.Errorf("disk full") },
-		Now:          time.Now,
-		Sleep:        func(time.Duration) {},
-	})
-	if !sent {
-		t.Fatal("prompt should have been verified-sent before the marker write")
-	}
-	if err == nil {
-		t.Fatal("marker write failure must surface as an error, not silent success")
-	}
-	if !strings.Contains(err.Error(), "marker promotion") {
-		t.Fatalf("error = %v, want marker promotion failure", err)
 	}
 }

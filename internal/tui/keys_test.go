@@ -731,7 +731,7 @@ func TestActionHandoffProject_CoordIDLinked_FiresHandoff(t *testing.T) {
 func TestActionHandoffProject_CoordIDUnlinked_FallsBackToRecordsScan(t *testing.T) {
 	(&stubSessionAlive{}).install(t)
 	(&stubProjectTreeExists{}).install(t)
-	(&stubCoordSpawnMarker{markers: map[string]string{"demo": "129c9824"}}).install(t)
+	(&stubCoordLeaseIdentity{markers: map[string]string{"demo": "129c9824"}}).install(t)
 	stub := &stubFleetCmd{}
 	stub.install(t)
 
@@ -760,7 +760,7 @@ func TestActionHandoffProject_GenuinelyNoCoord_Flashes(t *testing.T) {
 	(&stubSessionAlive{}).install(t)
 	(&stubProjectTreeExists{}).install(t)
 	// Empty marker map → findExistingCoordForProject returns no match.
-	(&stubCoordSpawnMarker{markers: map[string]string{}}).install(t)
+	(&stubCoordLeaseIdentity{markers: map[string]string{}}).install(t)
 	stub := &stubFleetCmd{}
 	stub.install(t)
 
@@ -797,7 +797,7 @@ func TestActionHandoffProject_GenuinelyNoCoord_Flashes(t *testing.T) {
 func TestActionHandoffProject_AutoRedGated(t *testing.T) {
 	(&stubSessionAlive{}).install(t)
 	(&stubProjectTreeExists{}).install(t)
-	(&stubCoordSpawnMarker{markers: map[string]string{"demo": "129c9824"}}).install(t)
+	(&stubCoordLeaseIdentity{markers: map[string]string{"demo": "129c9824"}}).install(t)
 	stub := &stubFleetCmd{}
 	stub.install(t)
 
@@ -851,7 +851,7 @@ func TestResolveCoordRecord_PrefersCoordID(t *testing.T) {
 // coord record.
 func TestResolveCoordRecord_FallsBackToScan(t *testing.T) {
 	(&stubSessionAlive{}).install(t)
-	(&stubCoordSpawnMarker{markers: map[string]string{"demo": "129c9824"}}).install(t)
+	(&stubCoordLeaseIdentity{markers: map[string]string{"demo": "129c9824"}}).install(t)
 
 	coord := agent.New("129c9824")
 	coord.Project = "demo"
@@ -874,17 +874,17 @@ func TestResolveCoordRecord_FallsBackToScan(t *testing.T) {
 // TestResolveCoordRecord_CoordIDSet_RecordMissing_DoesNotScanStale pins
 // codex review iter-1 [P2]: when p.CoordID is set (authoritative lock-
 // body link) but the matching record hasn't loaded yet, resolveCoordRecord
-// must return nil — NOT fall through to the marker scan, which keys off
-// coordSpawnMarkerFn and could resolve a DIFFERENT, stale coord-<project>
+// must return nil — NOT fall through to the lease-identity scan, which keys
+// off coordSpawnIdentityFn and could resolve a DIFFERENT, stale coord-<project>
 // record (e.g., an old session still alive mid-handoff while the new
 // coord already holds the lock). Routing [a]/[h] to that stale coord
 // would attach / hand off the wrong owner. The caller surfaces the
 // "pending refresh" race flash instead.
 func TestResolveCoordRecord_CoordIDSet_RecordMissing_DoesNotScanStale(t *testing.T) {
 	(&stubSessionAlive{}).install(t)
-	// On-disk marker points at a STALE coord (old session, still alive),
+	// Lease identity names a STALE coord (old session, still alive),
 	// distinct from the authoritative p.CoordID below.
-	(&stubCoordSpawnMarker{markers: map[string]string{"demo": "stale999"}}).install(t)
+	(&stubCoordLeaseIdentity{markers: map[string]string{"demo": "stale999"}}).install(t)
 
 	stale := agent.New("stale999")
 	stale.Project = "demo"
@@ -911,7 +911,7 @@ func TestResolveCoordRecord_FallsBackToLockBody(t *testing.T) {
 	(&stubSessionAlive{}).install(t)
 	// No marker → findExistingCoordForProject misses; the lock body
 	// rescues.
-	(&stubCoordSpawnMarker{markers: map[string]string{}}).install(t)
+	(&stubCoordLeaseIdentity{markers: map[string]string{}}).install(t)
 
 	coord := agent.New("lockbody1")
 	coord.Project = "demo"
@@ -1003,83 +1003,78 @@ func (s *stubProjectTreeExists) install(t *testing.T) {
 	t.Cleanup(func() { projectTreeExistsFn = prev })
 }
 
-// stubCoordSpawnMarker replaces coordSpawnMarkerFn for tests. Map
-// projectName → agentID; missing key returns "". The dashboard's
-// task_id fallback requires the marker to match the candidate
-// agent's ID before promoting.
-//
-// Also installs a fresh-mtime stub so the boot-window freshness gate
-// (codex iter-4 P1) doesn't reject the test setup. Tests that need
-// to exercise the stale-marker path should use stubCoordSpawnMarkerStale.
-type stubCoordSpawnMarker struct {
-	markers map[string]string // project → agent ID
+// coordBootWindow is a test-only constant retained after the production
+// marker-freshness window was deleted (the coordinator lease is now the
+// sole identity, so there is no marker mtime to age out). It survives only
+// as a duration referenced by a few test error messages / fixtures; its
+// exact value is cosmetic now (was 60s in the pre-lease production code).
+const coordBootWindow = 60 * time.Second
+
+// stubCoordLeaseIdentity replaces the coord-identity signal for tests. Map
+// projectName → agentID; missing key returns "". The coord-spawn marker is
+// deleted (D3): the coordinator LEASE is the identity now, read via
+// coordSpawnIdentityFn. The dashboard's task_id fallback + [a] dedup both
+// require the lease to NAME the candidate agent's ID before promoting, so
+// stubbing coordSpawnIdentityFn to project→agentID reproduces exactly what
+// the old marker file drove — minus the separate mtime gate (LiveOwner is
+// process-live and CurrentStarting is TTL-bounded, so identity subsumes
+// freshness). Tests that want "a dead/stale coord no longer names identity"
+// use stubCoordLeaseIdentityStale.
+type stubCoordLeaseIdentity struct {
+	markers map[string]string // project → agent ID (the lease-named coord)
 }
 
-func (s *stubCoordSpawnMarker) install(t *testing.T) {
+func (s *stubCoordLeaseIdentity) install(t *testing.T) {
 	t.Helper()
-	prevContent := coordSpawnMarkerFn
-	coordSpawnMarkerFn = func(projectName string) string {
+	prev := coordSpawnIdentityFn
+	coordSpawnIdentityFn = func(projectName string) string {
 		return s.markers[projectName]
 	}
-	t.Cleanup(func() { coordSpawnMarkerFn = prevContent })
-
-	// Default to "fresh" mtime (now) for all known projects so the
-	// freshness gate doesn't reject test fixtures by default.
-	prevMtime := coordSpawnMarkerMtimeFn
-	coordSpawnMarkerMtimeFn = func(projectName string) (time.Time, bool) {
-		if _, ok := s.markers[projectName]; !ok {
-			return time.Time{}, false
-		}
-		return time.Now(), true
-	}
-	t.Cleanup(func() { coordSpawnMarkerMtimeFn = prevMtime })
+	t.Cleanup(func() { coordSpawnIdentityFn = prev })
 }
 
-// stubCoordSpawnMarkerStale installs a marker stub that returns a
-// stale mtime (older than coordBootWindow). Used to exercise codex
-// iter-4 P1's freshness gate.
-type stubCoordSpawnMarkerStale struct {
-	markers map[string]string // project → agent ID
+// stubCoordLeaseIdentityStale models a stale/dead coord in the lease world:
+// its process exited, so LiveOwner/CurrentStarting no longer name it and
+// coordSpawnIdentityFn returns "" for the project. That reproduces the old
+// "marker mtime aged out → not promoted" behavior via the single lease
+// signal — the row flips to Idle and the record stays on the RIGHT column
+// for triage. The markers map records which agent WOULD have been named;
+// the value is intentionally ignored (a dead coord names no identity).
+type stubCoordLeaseIdentityStale struct {
+	markers map[string]string // project → agent ID (no longer lease-named)
 }
 
-func (s *stubCoordSpawnMarkerStale) install(t *testing.T) {
+func (s *stubCoordLeaseIdentityStale) install(t *testing.T) {
 	t.Helper()
-	prevContent := coordSpawnMarkerFn
-	coordSpawnMarkerFn = func(projectName string) string {
-		return s.markers[projectName]
+	prev := coordSpawnIdentityFn
+	coordSpawnIdentityFn = func(projectName string) string {
+		// Dead/stale coord: the lease dropped it, so no identity.
+		return ""
 	}
-	t.Cleanup(func() { coordSpawnMarkerFn = prevContent })
-
-	prevMtime := coordSpawnMarkerMtimeFn
-	coordSpawnMarkerMtimeFn = func(projectName string) (time.Time, bool) {
-		if _, ok := s.markers[projectName]; !ok {
-			return time.Time{}, false
-		}
-		// 2× the boot window in the past — well outside.
-		return time.Now().Add(-2 * coordBootWindow), true
-	}
-	t.Cleanup(func() { coordSpawnMarkerMtimeFn = prevMtime })
+	t.Cleanup(func() { coordSpawnIdentityFn = prev })
 }
 
-// stubWriteCoordSpawnMarker replaces writeCoordSpawnMarkerFn for
-// tests so we don't write to FLEET_HOME during unit tests. Captures
-// (project, id) tuples per call.
-type stubWriteCoordSpawnMarker struct {
+// stubClaimStartingRecord replaces claimStartingRecordFn for tests so the
+// TUI's post-spawn `starting`-lease claim (which replaced the deleted
+// coord-spawn marker write, D3) doesn't touch FLEET_HOME / the real lease.
+// Captures (project, id) tuples per claim so callers can assert the TUI
+// claimed (or, on the veto / prompt-failed paths, did NOT claim) the lease.
+type stubClaimStartingRecord struct {
 	calls map[string]string // project → agent ID
-	err   error             // returned from each write
+	err   error             // returned from each claim
 }
 
-func (s *stubWriteCoordSpawnMarker) install(t *testing.T) {
+func (s *stubClaimStartingRecord) install(t *testing.T) {
 	t.Helper()
-	prev := writeCoordSpawnMarkerFn
-	writeCoordSpawnMarkerFn = func(projectName, agentID string) error {
+	prev := claimStartingRecordFn
+	claimStartingRecordFn = func(projectName, agentID string) error {
 		if s.calls == nil {
 			s.calls = map[string]string{}
 		}
 		s.calls[projectName] = agentID
 		return s.err
 	}
-	t.Cleanup(func() { writeCoordSpawnMarkerFn = prev })
+	t.Cleanup(func() { claimStartingRecordFn = prev })
 }
 
 // stubSessionProbe replaces sessionProbeFn (used by loadAgentsCmd's

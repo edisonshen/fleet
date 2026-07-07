@@ -9,7 +9,6 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
-	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 
@@ -1855,8 +1854,8 @@ func coordLockRefusal(gcOutput string) string {
 // resolveCoordRecord finds the live coord record for a project row,
 // trying the dashboard-linked CoordID first, then the records scan that
 // actionAttachProject already relies on (findExistingCoordForProject:
-// an agent tagged task_id=coord-<project>, project matching, marker on
-// disk, alive tmux session). Read-only — no spawn, no dead-session
+// an agent tagged task_id=coord-<project>, project matching, named by the
+// coordinator lease, alive tmux session). Read-only — no spawn, no dead-session
 // recovery; callers handle the not-found (nil) case.
 //
 // tui-nav-handoff-regressions Fix 2: shared by actionHandoffProject and
@@ -1870,16 +1869,15 @@ func coordLockRefusal(gcOutput string) string {
 // is empty. A non-empty CoordID is the dashboard's authoritative lock-
 // body link — when it's set but the matching record hasn't loaded yet
 // (the snapshot/agents refresh race), we must NOT fall through to the
-// marker scan, which keys off coordSpawnMarkerFn and can resolve a
-// DIFFERENT, stale coord-<project> record (e.g., an old session still
-// alive mid-handoff while the new coord already holds the lock). Routing
-// [a]/[h] to that stale coord would hand off / attach the wrong owner.
+// lease scan (findExistingCoordForProject, which keys off the coordinator
+// lease identity) and resolve a DIFFERENT record before the CoordID-linked
+// one loads. Routing [a]/[h] there would hand off / attach the wrong owner.
 // Returning nil here preserves actionAttachProject's intentional
 // "pending refresh — try again" flash for the CoordID-set race; the
 // operator re-presses after the next tick binds the record.
 //
 // codex review iter-2 [P2]: when CoordID is empty, mirror BOTH of
-// actionAttachProject's read-only fallbacks in order — the marker scan
+// actionAttachProject's read-only fallbacks in order — the lease scan
 // (findExistingCoordForProject, path 2) THEN the lock-body fallback
 // (findCoordByLockBody, path 2.5). Without the lock-body tier, the
 // prompt-delivery-recovery state (operator attached + manually typed
@@ -1990,53 +1988,37 @@ var findCoordByLockBody = func(records []*agent.Record, projectName string) (*ag
 	return projectlookup.FindCoordByLockBody(records, projectName)
 }
 
-// findExistingCoordForProject searches records for an alive agent
-// already tagged as the coord for projectName. "Tagged" means
-// task_id == coordTaskID(projectName) AND project == projectName
-// AND ID matches the project's coord-spawn marker. "Alive" uses the
-// tristate session probe so a tmux transport error doesn't drop a
-// live claim.
+// findExistingCoordForProject searches records for the alive agent the
+// coordinator LEASE names as the coord for projectName. "Named" means
+// coordSpawnIdentityFn (the live active owner via coordlock.LiveOwner, or the
+// current `starting` owner within TTL via coordlock.CurrentStarting) equals the
+// record's ID, with task_id == coordTaskID(projectName) AND project match AND a
+// live tmux session (tristate probe so a transport error doesn't drop a live
+// claim).
 //
 // Returns (record, true) on a match; (nil, false) when nothing matches
 // or every match has a dead session. Used by the project-row [a] handler
-// to skip a duplicate dispatch when a coord was already spawned for the
-// same project (issue #63's "[a] press during the 30s skill-boot window
+// to skip a duplicate dispatch when a coord already holds/booting the lease for
+// the same project (issue #63's "[a] press during the 30s skill-boot window
 // piles up zombies" failure mode).
 //
-// Marker requirement (codex iter-6 P1): a coord whose initial-prompt
-// delivery FAILED has no marker on disk. The [a] re-attach path must
-// NOT bind that session — the operator's intent on second [a] is to
-// recover from the prompt failure, which means spawning fresh, not
-// dropping back into a plain Claude shell. The marker requirement
-// distinguishes "we successfully booted a coord here" from "we tried
-// to but the prompt didn't land".
-//
-// No freshness / project-tree gates here (codex iter-5 P1): a coord
-// stalled at a permissions prompt past 60s, or one whose project
-// tree got moved, must still be re-attached rather than respawned.
-// The dashboard's findCoordByTaskID is stricter because that's about
-// rendering identity; this is about "is the in-flight session still
-// the right thing to re-enter?"
-//
-// Tristate liveness (codex iter-6 P2): use sessionProbeOrAliveFn so a
-// tmux transport error (bad FLEET_TMUX_SOCKET, restarting server)
-// doesn't drop a live coord and force a duplicate spawn.
+// D3 (marker deleted): the lease is the sole identity. The old "marker required,
+// so a prompt-failed coord is excluded from dedup and [a] respawns" behavior is
+// gone — a coord that acquired the LEASE holds coordinator.lock, so respawning
+// beside it would just lose the lock race. [a] attaches to the live lease owner
+// (the operator/coord re-runs /coordinator if the prompt never landed) rather
+// than spawning a duplicate. Only when NO coord holds/boots the lease does [a]
+// fall through to a fresh spawn.
 //
 // Relationship to projectlookup.FindLiveCoord (attach-failover-59db):
-// the shared helper is the DEDUP-AGNOSTIC version — it accepts ANY
-// live coord for the project (the right call for Tier 3 failover,
-// where the operator's intent is "land me in some live coord, any
-// one"). This TUI-local helper layers the marker gate on top: a coord
-// whose initial prompt failed is INTENTIONALLY excluded from
-// idempotency dedup so a second [a] respawns rather than dropping
-// into a bare Claude shell.
+// that shared helper is the DEDUP-AGNOSTIC record+tmux version (the right call
+// for Tier 3 failover, "land me in some live coord"); this TUI-local helper
+// layers the LEASE gate on top for the [a] exactly-one dedup guarantee.
 func findExistingCoordForProject(records []*agent.Record, projectName string) (*agent.Record, bool) {
 	want := coordTaskID(projectName)
-	wantID := coordSpawnMarkerFn(projectName)
+	wantID := coordSpawnIdentityFn(projectName)
 	if wantID == "" {
-		// No marker → either no coord ever booted here, or the previous
-		// spawn's prompt failed (so we deliberately skipped writing
-		// the marker). Either way [a] should fall through to spawn.
+		// No coord holds or is booting the lease → [a] falls through to spawn.
 		return nil, false
 	}
 	for _, r := range records {
@@ -2114,76 +2096,41 @@ func cwdGitCandidate() string {
 	return strings.TrimSpace(string(out))
 }
 
-// writeCoordSpawnMarkerFn writes the coord-spawn marker file under the
-// per-project coord-spawn NB-flock so a concurrent coord.Cleanup on an
-// older agent can't race our write (codex iter-3 [P1]: TUI marker write
-// happens AFTER `fleet dispatch` releases its own coordlock, so without
-// re-acquiring here the old coord's cleanup can interleave between our
-// read and our unlink — even though cleanup itself holds the lock for
-// its compare-and-remove step, the TUI write outside the lock reopens
-// the race window).
+// claimStartingRecordFn claims the coord's `starting` lease record after the
+// TUI's `[a]` auto-spawn — the D2 spawn-serialization primitive that replaced
+// the deleted coord-spawn marker as the identity signal (D3). See
+// claimCoordStartingRecord below for the semantics.
 //
-// On contention (extremely rare — another dispatch / drain is in flight
-// for the same project), we surface the error to the caller so the TUI
-// flash message stays accurate. The caller already handles a non-nil
-// werr by warning the operator that marker write failed (model.go:718).
-//
-// var so tests can stub the disk write (test helpers in
+// var so tests can stub the lease claim (test helpers in
 // internal/tui/keys_test.go install a fake that records calls without
-// hitting FLEET_HOME or shelling out to flock).
-var writeCoordSpawnMarkerFn = writeCoordSpawnMarkerLocked
+// touching FLEET_HOME or the real lease).
+var claimStartingRecordFn = claimCoordStartingRecord
 
-// writeCoordSpawnMarkerLocked is the production implementation of
-// writeCoordSpawnMarkerFn: acquire coord-spawn lock, write marker,
-// release. The lock is the SAME one cmd/fleet/dispatch.go +
-// internal/handoffop + internal/coord/cleanup take for their own
-// marker-touching sections, so all four writers / clearers serialize
-// cleanly. Without this serialization, codex iter-3 [P1] showed the
-// race: cleanup acquires lock after dispatch released, reads old
-// marker body, TUI writes new id (outside lock), cleanup unlinks the
-// just-written new marker.
+// claimCoordStartingRecord is the production implementation of
+// claimStartingRecordFn. The coord-spawn marker is gone (D3); the coordinator
+// LEASE is the identity now. After `fleet dispatch` returns the coord's agent
+// ID, the TUI claims a `starting` lease record naming that agent
+// (coordlock.ClaimStartingRecord — the D2 spawn-serialization primitive) to
+// close the pre-boot window between dispatch returning and the coord-run
+// supervisor claiming the lease itself. That window is where a racing [a] could
+// otherwise spawn a duplicate.
 //
-// Retry budget (codex iter-6 [P1]): coordlock.Acquire is non-blocking
-// (LOCK_NB) and returns EWOULDBLOCK on contention. The previous fail-
-// fast behavior was wrong for THIS caller: TUI invokes us AFTER a
-// successful spawn — failing the marker write strands the new coord
-// (record exists, marker doesn't, dashboard misses it). cleanup holds
-// the lock for microseconds while it captures + restores the marker;
-// a short retry budget rides over that window without making the
-// operator wait noticeably. Dispatch / drain callers stay fail-fast
-// because their criticial sections are longer and contention there
-// means a real concurrent spawn, not a transient cleanup blip.
-//
-// Budget: 2 seconds total at 50ms intervals = 40 attempts. Well over
-// the upper bound for a cleanup compare-and-remove; well under the
-// human-perceptible latency floor (the TUI is already mid-attach when
-// this runs).
-func writeCoordSpawnMarkerLocked(projectName, agentID string) error {
-	const (
-		retryInterval = 50 * time.Millisecond
-		retryBudget   = 2 * time.Second
-	)
-	deadline := time.Now().Add(retryBudget)
-	var lastErr error
-	for {
-		release, err := coordlockAcquireFn(projectName)
-		if err == nil {
-			defer release()
-			return state.WriteCoordSpawnMarker(projectName, agentID)
-		}
-		lastErr = err
-		if time.Now().After(deadline) {
-			return fmt.Errorf("writeCoordSpawnMarker: coord-spawn lock contended after %s of retries: %w",
-				retryBudget, lastErr)
-		}
-		time.Sleep(retryInterval)
+// Best-effort by contract: ClaimStartingRecord returns ok=false (not an error)
+// when the lease is already owned / booting — e.g. the coord-run supervisor beat
+// us to it, or a racing standby is active. That is the expected, benign case
+// (the lease is already serialized by someone), so ok=false is NOT surfaced as a
+// failure; only a real error (unreadable epoch, mkdir failure) propagates so the
+// caller's flash message stays accurate.
+func claimCoordStartingRecord(projectName, agentID string) error {
+	if _, err := coordClaimStartingFn(projectName, agentID); err != nil {
+		return fmt.Errorf("claim coord starting record: %w", err)
 	}
+	return nil
 }
 
-// coordlockAcquireFn is the seam that the marker-lock unit test
-// stubs to deterministically simulate contention without spinning
-// up a real flock holder for the full 2s budget.
-var coordlockAcquireFn = coordlock.Acquire
+// coordClaimStartingFn is the seam the unit test stubs to record the claim
+// without touching the real lease.
+var coordClaimStartingFn = coordlock.ClaimStartingRecord
 
 // dispatchAgentIDPattern matches an "agent <8-hex-id> spawned" line in
 // `fleet dispatch` stdout. We extract the ID so the follow-up lock-poll

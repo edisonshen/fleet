@@ -2,11 +2,12 @@
 // `[a]` auto-spawn so the operator sees feedback while the coord skill
 // is booting (issue #86).
 //
-// Inputs are pure (marker mtime + coord-state.json mtime + now), so
-// the state derivation is testable without touching disk; the
-// production callsite reuses coordSpawnMarkerMtimeFn (already
-// stub-overridable from rows.go) and the same coord-state.json mtime
-// the dashboard scanner reads into ProjectRow.LastTick / .Active.
+// Inputs are pure (spawn start time + coord-state.json mtime + now), so
+// the state derivation is testable without touching disk; the production
+// callsite derives the coord identity from the coordinator lease
+// (coordSpawnIdentityFn in rows.go) and the spawn start from the coord
+// record's SpawnedAt, plus the coord-state.json mtime the dashboard scanner
+// reads into ProjectRow.LastTick / .Active.
 //
 // State machine (issue #86 spec):
 //
@@ -463,9 +464,9 @@ func downgradeStuckOnNeedsInput(
 // and keeps Path A working when the agent record was never written
 // (silent spawn death).
 //
-// Inputs are pure: caller supplies the derived state, the agent ID
-// from `state.ReadCoordSpawnMarker` (empty when no body / unreadable),
-// the tmux liveness probe (`tmux.HasSession`), the agent-record-fresh
+// Inputs are pure: caller supplies the derived state, the coord agent ID
+// (from the coordinator lease identity, empty when no coord holds/boots the
+// lease), the tmux liveness probe (`tmux.HasSession`), the agent-record-fresh
 // probe (computed from the loaded record's last_activity_ts), and a
 // remover stub. The remover is invoked exactly once per healed row;
 // errors are returned so the caller can surface them in a flash but
@@ -588,7 +589,7 @@ func agentRecordExists(records []*agent.Record, id string) bool {
 // red chip — operator-visible failure).
 //
 // var for stub-ability — same pattern as sessionAliveFn /
-// coordSpawnMarkerFn elsewhere in this file. PID ≤ 0 is treated as
+// coordSpawnIdentityFn elsewhere in this file. PID ≤ 0 is treated as
 // "no PID recorded" → false (we can't confirm liveness without a PID,
 // default to "treat as dead" so the stuck warning surfaces).
 var agentProcessAliveFn = func(pid int) bool {

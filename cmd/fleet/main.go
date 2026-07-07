@@ -119,6 +119,7 @@ Engine selection:
 	root.AddCommand(newCoordRunCmd())
 	root.AddCommand(newSkillsCmd())
 	root.AddCommand(newLeaseCheckCmd())
+	root.AddCommand(newCoordOwnerCmd())
 	return root
 }
 

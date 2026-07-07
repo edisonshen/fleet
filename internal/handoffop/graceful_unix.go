@@ -358,16 +358,12 @@ func GracefulCoordSwap(oldRec, newRec *agent.Record, docPath string,
 		HandoffDocPath: docPath, // already durable — empty HandoffDoc skips the write
 	}, deps); err != nil {
 		// Pre-retire failure (epoch read / barrier write / seam validation):
-		// AtomicCoordSwap never ran, so its marker rollback (codex iter-10/16)
-		// never ran either. The callers eagerly wrote the coord-spawn marker
-		// → newRec.ID before invoking us; without an undo the marker keeps
-		// naming a polling standby while OLD is still leader — a retry's
-		// `marker == oldRec.ID` coord-swap detection then misroutes the coord
-		// handoff down the WORKER path, and [a] discovery follows the marker
-		// into a supervisor pane (codex PR3-completion iter-1 [P1]). Once
-		// RetireOld has started, marker ownership belongs to AtomicCoordSwap
-		// (pre-commit failures roll back internally; post-commit failures
-		// legitimately leave the marker at NEW) — never undo it here.
+		// AtomicCoordSwap never ran, so it never reserved a handoff on OLD's
+		// lease. There is nothing to undo — the coord-spawn marker is gone
+		// (D3) and the identity commit is the winner's async epoch bump, which
+		// only happens once the standby actually acquires the freed flock. OLD
+		// still owns the lease, so discovery keeps resolving to OLD; retireStarted
+		// only distinguishes whether AtomicCoordSwap ran for logging/future use.
 		//
 		// The standby (newRec) is deliberately NOT reaped on this path
 		// (codex iter-4 [P1] reviewed + rejected): the callers preserve the
@@ -377,31 +373,10 @@ func GracefulCoordSwap(oldRec, newRec *agent.Record, docPath string,
 		// standby wins the freed lease, the pending queue's lock-owner
 		// delivery heals it (§5c) — it is never a blank strand. A standby
 		// that never wins self-reaps at the standby timeout (10 min).
-		if !retireStarted {
-			rollbackEagerCoordMarker(oldRec, newRec, stderr)
-		}
+		_ = retireStarted
 		return nil, err
 	}
 	return winner, nil
-}
-
-// rollbackEagerCoordMarker undoes a caller's eager coord-spawn-marker write
-// (marker → NEW before the swap) after a failure that happened BEFORE the
-// retire phase ran. CAS-guarded: only restores when the marker actually
-// points at NEW — an eager write that never landed, or a concurrent
-// takeover's marker, is left alone. Best-effort; surface-don't-silo.
-func rollbackEagerCoordMarker(oldRec, newRec *agent.Record, stderr io.Writer) {
-	if oldRec == nil || newRec == nil || oldRec.Project == "" {
-		return
-	}
-	if state.ReadCoordSpawnMarker(oldRec.Project) != newRec.ID {
-		return
-	}
-	if werr := writeCoordSpawnMarkerFn(oldRec.Project, oldRec.ID); werr != nil && stderr != nil {
-		_, _ = fmt.Fprintf(stderr,
-			"warning: graceful coord swap: rollback coord-spawn marker for project %s to %s failed: %v (operator: re-write manually if dashboard misses OLD)\n",
-			oldRec.Project, oldRec.ID, werr)
-	}
 }
 
 // gracefulDurableSteps runs steps 2-5 (doc, checkpoint, drain, barrier) in

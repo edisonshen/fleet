@@ -1855,11 +1855,9 @@ func TestRunDispatch_DeadCoordRecovery_StandDownDeliversRecoveryDoc(t *testing.T
 	winnerRec.Project = "myproj"
 	winnerRec.TmuxSession = "fleet-" + winnerID
 	var deliveredPrompt string
-	var deliveredMarker bool
 	prevDeliver := deliverToCurrentOwner
 	deliverToCurrentOwner = func(opts handoffdelivery.Options) (*agent.Record, error) {
 		deliveredPrompt = opts.Prompt
-		deliveredMarker = opts.PromoteMarker
 		if opts.Project != "myproj" {
 			t.Errorf("delivery project = %q, want myproj", opts.Project)
 		}
@@ -1908,12 +1906,11 @@ func TestRunDispatch_DeadCoordRecovery_StandDownDeliversRecoveryDoc(t *testing.T
 		t.Fatalf("expected a veto error on lease stand-down; got nil\n%s", out.String())
 	}
 	// The CRUX: the recovery doc was delivered to the winner with a resume
-	// prompt + marker promotion, despite this spawn standing down.
+	// prompt, despite this spawn standing down. (Marker promotion is gone —
+	// D3: the lease owner IS the coord identity, so DeliverToCurrentOwner
+	// has nothing to promote after the send.)
 	if deliveredPrompt == "" {
 		t.Errorf("recovery doc must be delivered to the lock owner on stand-down; deliverToCurrentOwner got empty prompt\n%s", out.String())
-	}
-	if !deliveredMarker {
-		t.Errorf("stand-down recovery delivery must promote the coord-spawn marker to the winner")
 	}
 	if !strings.Contains(out.String(), "recovery doc delivered to live coord "+winnerID) {
 		t.Errorf("expected stand-down recovery-delivery confirmation for %s; got:\n%s", winnerID, out.String())

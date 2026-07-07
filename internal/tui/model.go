@@ -943,8 +943,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// project whose coord already holds the lease). The callback
 		// already re-resolved the live coord from disk, so we ONLY
 		// attach here — and crucially we do NOT call
-		// writeCoordSpawnMarkerFn (codex round-2 P1): the TUI did not
-		// spawn this coord, so stamping the coord-spawn marker would
+		// claimStartingRecordFn (codex round-2 P1): the TUI did not
+		// spawn this coord, so claiming a `starting` lease record for it would
 		// falsely promote a leader the TUI never booted and corrupt
 		// future [a] dedup. The in-flight gate is already cleared above.
 		if msg.attachedExisting {
@@ -1053,16 +1053,15 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			return m, loadAgentsCmd()
 		}
-		// Codex iter-5 P2: only write the coord-spawn marker when the
-		// dispatch actually delivered the /coordinator prompt to the
-		// pane. A prompt-delivery failure leaves a plain Claude
-		// session running with no coord skill — promoting it via the
-		// marker would render a healthy in-flight coord in the
-		// dashboard while the project is actually unowned. We still
-		// attach the operator to the session (they can type the
-		// prompt manually), but the dashboard's task_id fallback
-		// stays inactive until the operator re-presses [a] from a
-		// proper boot.
+		// Codex iter-5 P2: only claim the coord's `starting` lease record when
+		// the dispatch actually delivered the /coordinator prompt to the pane. A
+		// prompt-delivery failure leaves a plain Claude session running with no
+		// coord skill — claiming the lease for it would render a healthy in-flight
+		// coord in the dashboard while the project is actually unowned. We still
+		// attach the operator to the session (they can type the prompt manually),
+		// but the dashboard stays inactive until the operator re-presses [a] from
+		// a proper boot. (D3: the coord-spawn marker is gone; ClaimStartingRecord
+		// closes the pre-boot window until the coord-run supervisor takes over.)
 		switch {
 		case !msg.promptDelivered:
 			m.flash = &flashMsg{
@@ -1072,10 +1071,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				isErr: true,
 			}
 		default:
-			if werr := writeCoordSpawnMarkerFn(msg.projectName, msg.agentID); werr != nil {
+			if werr := claimStartingRecordFn(msg.projectName, msg.agentID); werr != nil {
 				m.flash = &flashMsg{
 					text: fmt.Sprintf(
-						"coord %s spawned for project %s (marker write failed: %v) — attaching to %s",
+						"coord %s spawned for project %s (lease claim failed: %v) — attaching to %s",
 						msg.agentID, msg.projectName, werr, msg.session),
 				}
 			} else {

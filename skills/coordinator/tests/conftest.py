@@ -112,6 +112,28 @@ def _stub_lease_check(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _stub_coord_lease_identity(monkeypatch):
+    """Default: the coord-identity read (the deleted coord-spawn marker's
+    replacement, D3) names nobody.
+
+    `loop._classify_lock_busy` gate 5 shells out to `fleet coord-owner --json`
+    to decide "never self-exit when the lease names me". The vast majority of
+    coordinator tests never reach that gate and must not shell out to the real
+    binary (the CI trap + it perturbs timing-sensitive tests). This autouse
+    fixture substitutes the seam with a stub that names nobody ("", "") so gate
+    5 falls through to the other conservatism gates — the pre-D3 "marker absent"
+    behavior. Tests exercising the lease-names-us skip override this in their
+    own body (a later monkeypatch wins).
+    """
+    import loop
+
+    def _no_lease_identity(project, *, home, fleet_bin="fleet"):
+        return "", ""
+
+    monkeypatch.setattr(loop, "_coord_lease_identity_fn", _no_lease_identity)
+
+
+@pytest.fixture(autouse=True)
 def _disable_supervisor_by_default(monkeypatch):
     """Default: supervisor disabled. Tests that need it set their own
     FLEET_COORD_POLL_INTERVAL_S inside the test body via monkeypatch.

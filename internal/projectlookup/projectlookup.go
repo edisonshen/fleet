@@ -175,9 +175,9 @@ func KnownProjects() ([]string, error) {
 // claim — same conservative discipline the TUI uses (codex iter-6 P2).
 //
 // Differs intentionally from the TUI's findExistingCoordForProject:
-// no coord-spawn-marker requirement here. Tier 3 PROJECT RECOVERY is
-// failover, not dedup — any live coord for the project is acceptable.
-// The TUI's [a]-dedup helper layers the marker gate on top of this.
+// this is pure record+tmux failover recovery, not dedup — any live coord for
+// the project is acceptable. The TUI's [a]-dedup helper resolves the
+// coordinator lease (coordreconcile) on top of this to guarantee exactly one.
 //
 // Returned record always has TmuxSession populated (codex review iter-3
 // P2): legacy/pre-spawn records may have TmuxSession=="" on disk; we

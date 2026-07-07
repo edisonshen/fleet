@@ -116,18 +116,19 @@ func projectRowModelForVeto(project string) Model {
 	return m
 }
 
-// stubMarkerWrite swaps writeCoordSpawnMarkerFn for a recording stub so
-// tests can assert the marker was (or was NOT) written. Returns a
-// pointer to the call count.
+// stubMarkerWrite swaps claimStartingRecordFn (which replaced the deleted
+// coord-spawn marker write, D3) for a recording stub so tests can assert the
+// TUI claimed (or, on the attach-existing veto path, did NOT claim) the
+// coord's `starting` lease record. Returns a pointer to the call count.
 func stubMarkerWrite(t *testing.T) *int {
 	t.Helper()
-	prev := writeCoordSpawnMarkerFn
+	prev := claimStartingRecordFn
 	calls := 0
-	writeCoordSpawnMarkerFn = func(project, agentID string) error {
+	claimStartingRecordFn = func(project, agentID string) error {
 		calls++
 		return nil
 	}
-	t.Cleanup(func() { writeCoordSpawnMarkerFn = prev })
+	t.Cleanup(func() { claimStartingRecordFn = prev })
 	return &calls
 }
 
@@ -213,10 +214,10 @@ func TestVeto_MarkerlessLiveLeader_Attaches(t *testing.T) {
 		nil,
 	)
 	t.Cleanup(restorePL)
-	// No coord-spawn marker stub → coordSpawnMarkerFn returns "" for the
-	// project (the marker file doesn't exist in this fresh FLEET_HOME),
-	// so the marker-gated resolver would have bailed. The record is still
-	// tagged coord-<project> so the markerless FindLiveCoord matches.
+	// No lease-identity stub → coordSpawnIdentityFn returns "" for the
+	// project (no coord holds the lease in this fresh FLEET_HOME), so the
+	// lease-gated findExistingCoordForProject would have bailed. The record
+	// is still tagged coord-<project> so the markerless FindLiveCoord matches.
 	seedDiskCoord(t, "nomarker", "demo", coordTaskID("demo"))
 	(&stubSessionProbe{}).install(t)
 	markerWrites := stubMarkerWrite(t)
@@ -230,7 +231,7 @@ func TestVeto_MarkerlessLiveLeader_Attaches(t *testing.T) {
 		t.Errorf("pendingAttach = %q; want fleet-nomarker", mm.pendingAttach)
 	}
 	if *markerWrites != 0 {
-		t.Errorf("writeCoordSpawnMarkerFn called %d times; want 0 (TUI did not spawn this coord — codex round-2 P1)", *markerWrites)
+		t.Errorf("claimStartingRecordFn called %d times; want 0 (TUI did not spawn this coord — codex round-2 P1)", *markerWrites)
 	}
 }
 

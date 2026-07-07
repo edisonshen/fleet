@@ -713,112 +713,6 @@ func TestResume_RefusesLegacyRecordMissingCwd(t *testing.T) {
 	}
 }
 
-// -- coord-spawn marker transfer (bug coord-marker-transfer-on-46a3) --------
-//
-// When an agent that IS the project's coord (marker == oldRec.ID)
-// handoffs through the auto-drain path, the marker must re-point
-// at the replacement so the TUI's [a] keystroke finds the live
-// coord instead of spawning a duplicate. Workers and other non-coord
-// agents leave the marker untouched.
-
-// TestAutoHandoff_TransfersCoordMarkerWhenOldWasCoord asserts the
-// happy path: pre-seed marker = oldRec.ID, run Resume, marker should
-// now equal newRec.ID.
-func TestAutoHandoff_TransfersCoordMarkerWhenOldWasCoord(t *testing.T) {
-	requireFakeTmux(t)
-	setupFleetHome(t)
-	oldRec := spawnSeedAgent(t)
-
-	// Initialize the project dir so WriteCoordSpawnMarker can land
-	// (matches the TUI's pre-dispatch flow).
-	if _, err := state.EnsureProjectInitialized(oldRec.Project); err != nil {
-		t.Fatalf("EnsureProjectInitialized: %v", err)
-	}
-	if err := state.WriteCoordSpawnMarker(oldRec.Project, oldRec.ID); err != nil {
-		t.Fatalf("seed marker: %v", err)
-	}
-
-	req, qp, _ := writeSkillQueue(t, oldRec)
-	out := &bytes.Buffer{}
-	if err := Resume(req, qp, 1, out, out); err != nil {
-		t.Fatalf("Resume: %v\n%s", err, out.String())
-	}
-
-	newRec, err := agent.Load(req.NewAgentID)
-	if err != nil {
-		t.Fatalf("load new record: %v", err)
-	}
-	t.Cleanup(func() { _ = tmux.Kill(newRec.TmuxSession) })
-
-	got := state.ReadCoordSpawnMarker(oldRec.Project)
-	if got != newRec.ID {
-		t.Errorf("coord marker not transferred: got %q want %q (oldRec.ID=%q)",
-			got, newRec.ID, oldRec.ID)
-	}
-}
-
-// TestAutoHandoff_NoMarkerUpdate_WhenOldWasNotCoord asserts the
-// guard: marker points at some OTHER agent ID (not oldRec.ID); after
-// a handoff of oldRec, the marker is unchanged.
-func TestAutoHandoff_NoMarkerUpdate_WhenOldWasNotCoord(t *testing.T) {
-	requireFakeTmux(t)
-	setupFleetHome(t)
-	oldRec := spawnSeedAgent(t)
-
-	const unrelatedID = "abcdef12"
-	if _, err := state.EnsureProjectInitialized(oldRec.Project); err != nil {
-		t.Fatalf("EnsureProjectInitialized: %v", err)
-	}
-	if err := state.WriteCoordSpawnMarker(oldRec.Project, unrelatedID); err != nil {
-		t.Fatalf("seed marker: %v", err)
-	}
-
-	req, qp, _ := writeSkillQueue(t, oldRec)
-	out := &bytes.Buffer{}
-	if err := Resume(req, qp, 1, out, out); err != nil {
-		t.Fatalf("Resume: %v\n%s", err, out.String())
-	}
-
-	newRec, err := agent.Load(req.NewAgentID)
-	if err != nil {
-		t.Fatalf("load new record: %v", err)
-	}
-	t.Cleanup(func() { _ = tmux.Kill(newRec.TmuxSession) })
-
-	got := state.ReadCoordSpawnMarker(oldRec.Project)
-	if got != unrelatedID {
-		t.Errorf("unrelated coord marker mutated: got %q want %q", got, unrelatedID)
-	}
-}
-
-// TestAutoHandoff_NoMarkerUpdate_WhenNoMarkerExists asserts the
-// absent-marker branch: no marker file before Resume → no marker file
-// after Resume (no error, no spurious creation). Most non-coord agents
-// run with no marker at all.
-func TestAutoHandoff_NoMarkerUpdate_WhenNoMarkerExists(t *testing.T) {
-	requireFakeTmux(t)
-	setupFleetHome(t)
-	oldRec := spawnSeedAgent(t)
-
-	// Intentionally do NOT seed a marker. Project dir may or may not
-	// exist; ReadCoordSpawnMarker returns "" either way.
-	req, qp, _ := writeSkillQueue(t, oldRec)
-	out := &bytes.Buffer{}
-	if err := Resume(req, qp, 1, out, out); err != nil {
-		t.Fatalf("Resume: %v\n%s", err, out.String())
-	}
-
-	newRec, err := agent.Load(req.NewAgentID)
-	if err != nil {
-		t.Fatalf("load new record: %v", err)
-	}
-	t.Cleanup(func() { _ = tmux.Kill(newRec.TmuxSession) })
-
-	if got := state.ReadCoordSpawnMarker(oldRec.Project); got != "" {
-		t.Errorf("marker created from nothing: got %q want empty", got)
-	}
-}
-
 // -- codex iter-1 P1: SessionAlive tristate gate at outer cleanup sites -----
 //
 // HasSession used to gate the cleanup branches in Resume's case-3
@@ -971,385 +865,41 @@ func TestResume_Case3_DefinitiveDeadStillEntersCleanup(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = tmux.Kill(freshRec.TmuxSession) })
 }
-func TestResume_StaleCoordMarker_RolledBackBeforeRespawn(t *testing.T) {
-	requireFakeTmux(t)
-	setupFleetHome(t)
-	oldRec := spawnSeedAgent(t)
-	req, qp, _ := writeSkillQueue(t, oldRec)
 
-	// Initialize project + seed marker pointing at the would-be
-	// replacement (req.NewAgentID), simulating a prior swap that
-	// committed the marker and then failed.
-	if _, err := state.EnsureProjectInitialized(oldRec.Project); err != nil {
-		t.Fatalf("EnsureProjectInitialized: %v", err)
-	}
-	if err := state.WriteCoordSpawnMarker(oldRec.Project, req.NewAgentID); err != nil {
-		t.Fatalf("seed stale marker: %v", err)
-	}
-
-	// Plant a stale replacement record but no tmux session (so the
-	// outer gate's SessionAlive returns alive=false, triggering
-	// cleanup + fall-through to spawnAndRetire).
-	staleNew := agent.New(req.NewAgentID)
-	staleNew.TaskID = oldRec.TaskID
-	staleNew.Project = oldRec.Project
-	staleNew.Cwd = oldRec.Cwd
-	staleNew.Command = oldRec.Command
-	staleNew.TmuxSession = req.NewSession
-	staleNew.SpawnedAt = time.Now().UTC()
-	if err := staleNew.Write(); err != nil {
-		t.Fatalf("plant stale new rec: %v", err)
-	}
-
-	// Kill OLD's session so iter-14's "old still alive" refusal gate
-	// passes (this test exercises the rollback + respawn path; the
-	// refusal path is covered separately by
-	// TestResume_StaleCoordMarker_OldStillAlive_RefusesRespawn).
-	_ = tmux.Kill(oldRec.TmuxSession)
-
-	// Force the outer-gate probe to report "definitively dead" on the
-	// first call so cleanup fires deterministically.
-	origAlive := tmuxSessionAliveFn
-	var probedSessions []string
-	tmuxSessionAliveFn = func(s string) (bool, error) {
-		probedSessions = append(probedSessions, s)
-		if s == req.NewSession && len(probedSessions) == 1 {
-			return false, nil
-		}
-		return origAlive(s)
-	}
-	t.Cleanup(func() { tmuxSessionAliveFn = origAlive })
-
-	out := &bytes.Buffer{}
-	if err := Resume(req, qp, 1, out, out); err != nil {
-		t.Fatalf("Resume: %v\n%s", err, out.String())
-	}
-
-	// Fresh replacement spawned at the same pre-allocated ID and alive.
-	freshRec, err := agent.Load(req.NewAgentID)
-	if err != nil {
-		t.Fatalf("load fresh record: %v", err)
-	}
-	t.Cleanup(func() { _ = tmux.Kill(freshRec.TmuxSession) })
-	if !tmux.HasSession(freshRec.TmuxSession) {
-		t.Errorf("fresh replacement session %s not alive after respawn", freshRec.TmuxSession)
-	}
-
-	// The load-bearing assertion: after Resume completes, the coord
-	// marker must point at the FRESH replacement (freshRec.ID, same as
-	// the pre-allocated req.NewAgentID), proving:
-	//
-	//   1. The rollback fired (marker stepped back from staleNew →
-	//      oldRec.ID after the drop), AND
-	//   2. spawnAndRetire's isCoordSwap detection saw marker ==
-	//      oldRec.ID and routed through AtomicCoordSwap, which then
-	//      committed marker → freshRec.ID.
-	//
-	// Pre-fix: marker would still equal req.NewAgentID (the
-	// pre-allocated ID), but only because the stale marker was
-	// pointing at the deleted record's same ID. That coincidence
-	// makes the pre-fix bug invisible in this test. So we also assert
-	// the freshRec is alive — which proves a NEW spawn happened with
-	// the marker-rooted swap path completing successfully.
-	got := state.ReadCoordSpawnMarker(oldRec.Project)
-	if got != freshRec.ID {
-		t.Errorf("coord marker not at fresh replacement: got %q want %q",
-			got, freshRec.ID)
-	}
-
-	// Stronger pin: assert oldRec was archived (proves AtomicCoordSwap
-	// ran end-to-end, not the inline retire path). The inline retire
-	// path also archives, but the marker rebase to freshRec.ID is the
-	// AtomicCoordSwap commit-point signature — without isCoordSwap
-	// firing on the retry, the marker would NOT be moved to freshRec.ID
-	// at all (the inline path doesn't touch the marker).
-	if _, lerr := agent.Load(oldRec.ID); !errors.Is(lerr, state.ErrNotFound) {
-		t.Errorf("oldRec %s should be archived (not findable in live agents): err=%v",
-			oldRec.ID, lerr)
-	}
-}
-
-// TestResume_StaleCoordMarker_NonCoord_NoRollback pins the guard
-// branch: when the marker exists but points at some UNRELATED agent
-// (not oldRec.ID and not newRec.ID), the cleanup must NOT rewrite it.
-// Touching an unrelated marker would corrupt another project's coord
-// pointer. Idempotency of RollbackCoordMarkerIfPointingAt covers this.
-func TestResume_StaleCoordMarker_NonCoord_NoRollback(t *testing.T) {
-	requireFakeTmux(t)
-	setupFleetHome(t)
-	oldRec := spawnSeedAgent(t)
-	req, qp, _ := writeSkillQueue(t, oldRec)
-
-	const unrelatedID = "deadbeef"
-	if _, err := state.EnsureProjectInitialized(oldRec.Project); err != nil {
-		t.Fatalf("EnsureProjectInitialized: %v", err)
-	}
-	if err := state.WriteCoordSpawnMarker(oldRec.Project, unrelatedID); err != nil {
-		t.Fatalf("seed unrelated marker: %v", err)
-	}
-
-	// Plant a stale replacement record with no tmux session.
-	staleNew := agent.New(req.NewAgentID)
-	staleNew.TaskID = oldRec.TaskID
-	staleNew.Project = oldRec.Project
-	staleNew.Cwd = oldRec.Cwd
-	staleNew.Command = oldRec.Command
-	staleNew.TmuxSession = req.NewSession
-	staleNew.SpawnedAt = time.Now().UTC()
-	if err := staleNew.Write(); err != nil {
-		t.Fatalf("plant stale new rec: %v", err)
-	}
-
-	origAlive := tmuxSessionAliveFn
-	var probedSessions []string
-	tmuxSessionAliveFn = func(s string) (bool, error) {
-		probedSessions = append(probedSessions, s)
-		if s == req.NewSession && len(probedSessions) == 1 {
-			return false, nil
-		}
-		return origAlive(s)
-	}
-	t.Cleanup(func() { tmuxSessionAliveFn = origAlive })
-
-	out := &bytes.Buffer{}
-	if err := Resume(req, qp, 1, out, out); err != nil {
-		t.Fatalf("Resume: %v\n%s", err, out.String())
-	}
-
-	// Marker must STILL be at the unrelated ID — the rollback only
-	// fires on marker == staleNew.ID (the deleted replacement's ID).
-	if got := state.ReadCoordSpawnMarker(oldRec.Project); got != unrelatedID {
-		t.Errorf("unrelated marker corrupted: got %q want %q",
-			got, unrelatedID)
-	}
-
-	// Fresh replacement must still be alive (the cleanup + respawn
-	// still works regardless of marker rollback path).
-	freshRec, err := agent.Load(req.NewAgentID)
-	if err != nil {
-		t.Fatalf("load fresh record: %v", err)
-	}
-	t.Cleanup(func() { _ = tmux.Kill(freshRec.TmuxSession) })
-	if !tmux.HasSession(freshRec.TmuxSession) {
-		t.Errorf("fresh replacement session %s not alive", freshRec.TmuxSession)
-	}
-}
-
-// TestResume_StaleCoordMarker_OldStillAlive_RefusesRespawn pins codex
-// iter-14 [P1] + iter-15 [P1] narrowing: AtomicCoordSwap preserves the
-// queue on ErrOrphanSurvived / ErrOldKillProbeAmbiguous — NEW exited
-// (lost the coordinator.lock race or crashed) but OLD is still the
-// live coord. Post-commit means marker == newRec.ID. On the next drain
-// pass we land in Resume's case-3 outer gate with newRec session dead.
-// Auto-respawning here would stack a second replacement on top of the
-// live OLD coord, recreating the duplicate-coord loop the preserved
-// queue is supposed to avoid.
+// TestIsCoordHandoffForAgent_GatesOnCoordTask is the codex review iter-7
+// [P1] regression: spawnAndRetire's --remote-control inject
+// (rc.GateAttachFlag) MUST gate on whether the OLD agent is the project's
+// coord, not just on the project-wide rc-enabled marker. Without this, a
+// worker handoff resumed via fleet drain / crash recovery would silently
+// inherit RC attach — defeating the strict opt-in carve-out for workers /
+// subagents.
 //
-// iter-15 narrowing: the refusal only fires on marker == newRec.ID
-// (post-commit). Marker == oldRec.ID (pre-commit) means OLD is the
-// only legitimate coord and respawning is safe — see
-// TestResume_PreCommitStaleNewRec_OldAlive_StillRespawns below.
-func TestResume_StaleCoordMarker_OldStillAlive_RefusesRespawn(t *testing.T) {
-	requireFakeTmux(t)
-	setupFleetHome(t)
-	oldRec := spawnSeedAgent(t) // OLD session alive for the duration of the test.
-	req, qp, _ := writeSkillQueue(t, oldRec)
-
-	// Marker at newRec.ID (committed by a prior swap that returned
-	// ErrOrphanSurvived / ErrOldKillProbeAmbiguous before retire).
-	if _, err := state.EnsureProjectInitialized(oldRec.Project); err != nil {
-		t.Fatalf("EnsureProjectInitialized: %v", err)
-	}
-	if err := state.WriteCoordSpawnMarker(oldRec.Project, req.NewAgentID); err != nil {
-		t.Fatalf("seed marker: %v", err)
-	}
-
-	// Plant a stale replacement record with a dead session (the helper
-	// session string we never spawned).
-	staleNew := agent.New(req.NewAgentID)
-	staleNew.TaskID = oldRec.TaskID
-	staleNew.Project = oldRec.Project
-	staleNew.Cwd = oldRec.Cwd
-	staleNew.Command = oldRec.Command
-	staleNew.TmuxSession = req.NewSession
-	staleNew.SpawnedAt = time.Now().UTC()
-	if err := staleNew.Write(); err != nil {
-		t.Fatalf("plant stale new rec: %v", err)
-	}
-
-	// Outer-gate probe says NEW is definitively dead. OLD probes fall
-	// through to real tmux.SessionAlive — OLD is alive (spawnSeedAgent).
-	origAlive := tmuxSessionAliveFn
-	tmuxSessionAliveFn = func(s string) (bool, error) {
-		if s == req.NewSession {
-			return false, nil
-		}
-		return origAlive(s)
-	}
-	t.Cleanup(func() { tmuxSessionAliveFn = origAlive })
-
-	out := &bytes.Buffer{}
-	err := Resume(req, qp, 1, out, out)
-	if err == nil {
-		t.Fatalf("Resume must refuse when OLD coord still alive; got nil error\n%s", out.String())
-	}
-	if !strings.Contains(err.Error(), "still alive") || !strings.Contains(err.Error(), "duplicate coord") {
-		t.Errorf("expected refusal mentioning 'still alive' + 'duplicate coord'; got: %v", err)
-	}
-
-	// Stale newRec record MUST NOT have been deleted (operator triage).
-	if _, lerr := agent.Load(staleNew.ID); lerr != nil {
-		t.Errorf("stale newRec record should be preserved for operator inspection; got load err=%v", lerr)
-	}
-
-	// Marker untouched.
-	if got := state.ReadCoordSpawnMarker(oldRec.Project); got != req.NewAgentID {
-		t.Errorf("marker mutated on refusal: got %q want %q", got, req.NewAgentID)
-	}
-
-	// Queue file must persist so the next pass (or operator's
-	// triage-then-retry) can resume.
-	if _, qerr := os.Stat(qp); qerr != nil {
-		t.Errorf("queue file should be preserved on refusal: stat err=%v", qerr)
-	}
-
-	// OLD record + session untouched.
-	if _, lerr := agent.Load(oldRec.ID); lerr != nil {
-		t.Errorf("oldRec should still be live: %v", lerr)
-	}
-	if !tmux.HasSession(oldRec.TmuxSession) {
-		t.Errorf("oldRec session %s should still be alive", oldRec.TmuxSession)
-	}
-}
-
-// TestResume_PreCommitStaleNewRec_OldAlive_StillRespawns pins codex
-// iter-15 [P1] narrowing: the iter-14 refusal gate must fire ONLY on
-// post-commit state (marker == newRec.ID). A pre-commit crash —
-// previous handoff spawned newRec but failed BEFORE the AtomicCoordSwap
-// step 4 marker write — leaves marker at oldRec.ID. OLD is still the
-// only legitimate coord. Auto-respawning is safe and required (no
-// duplicate-coord risk: no NEW2 because OLD never lost coordinator.lock).
-//
-// Pre-iter-15: my iter-14 predicate `marker == oldRec.ID || marker ==
-// newRec.ID` would refuse this case, blocking automatic recovery and
-// requiring operator intervention. iter-15 narrows the predicate to
-// `marker == newRec.ID` only.
-func TestResume_PreCommitStaleNewRec_OldAlive_StillRespawns(t *testing.T) {
-	requireFakeTmux(t)
-	setupFleetHome(t)
-	oldRec := spawnSeedAgent(t) // OLD session stays alive.
-	req, qp, _ := writeSkillQueue(t, oldRec)
-
-	// Pre-commit state: marker at oldRec.ID (eager write never landed
-	// or AtomicCoordSwap step 4 never reached).
-	if _, err := state.EnsureProjectInitialized(oldRec.Project); err != nil {
-		t.Fatalf("EnsureProjectInitialized: %v", err)
-	}
-	if err := state.WriteCoordSpawnMarker(oldRec.Project, oldRec.ID); err != nil {
-		t.Fatalf("seed marker: %v", err)
-	}
-
-	// Plant a stale newRec with a dead session (previous handoff
-	// crashed after spawn but before marker commit).
-	staleNew := agent.New(req.NewAgentID)
-	staleNew.TaskID = oldRec.TaskID
-	staleNew.Project = oldRec.Project
-	staleNew.Cwd = oldRec.Cwd
-	staleNew.Command = oldRec.Command
-	staleNew.TmuxSession = req.NewSession
-	staleNew.SpawnedAt = time.Now().UTC()
-	if err := staleNew.Write(); err != nil {
-		t.Fatalf("plant stale new rec: %v", err)
-	}
-
-	// Outer-gate probe: NEW definitively dead.
-	origAlive := tmuxSessionAliveFn
-	var probedSessions []string
-	tmuxSessionAliveFn = func(s string) (bool, error) {
-		probedSessions = append(probedSessions, s)
-		if s == req.NewSession && len(probedSessions) == 1 {
-			return false, nil
-		}
-		return origAlive(s)
-	}
-	t.Cleanup(func() { tmuxSessionAliveFn = origAlive })
-
-	// Resume must NOT refuse — pre-commit state is safe to auto-recover.
-	out := &bytes.Buffer{}
-	if err := Resume(req, qp, 1, out, out); err != nil {
-		t.Fatalf("Resume on pre-commit stale newRec must succeed; got: %v\n%s", err, out.String())
-	}
-
-	// Fresh replacement spawned + alive.
-	freshRec, err := agent.Load(req.NewAgentID)
-	if err != nil {
-		t.Fatalf("load fresh: %v", err)
-	}
-	t.Cleanup(func() { _ = tmux.Kill(freshRec.TmuxSession) })
-	if !tmux.HasSession(freshRec.TmuxSession) {
-		t.Errorf("fresh replacement session %s not alive", freshRec.TmuxSession)
-	}
-
-	// Marker committed to fresh replacement (AtomicCoordSwap completed
-	// the swap end-to-end on the retry).
-	if got := state.ReadCoordSpawnMarker(oldRec.Project); got != freshRec.ID {
-		t.Errorf("marker not at fresh replacement: got %q want %q", got, freshRec.ID)
-	}
-
-	// OLD archived (proves the swap committed normally, not refused).
-	if _, lerr := agent.Load(oldRec.ID); !errors.Is(lerr, state.ErrNotFound) {
-		t.Errorf("oldRec should be archived after successful swap: err=%v", lerr)
-	}
-}
-
-// TestIsCoordHandoffForAgent_GatesOnCoordSpawnMarker is the codex
-// review iter-7 [P1] regression: spawnAndRetire's --remote-control
-// inject (rc.GateAttachFlag) MUST gate on whether the OLD agent is
-// the project's coord, not just on the project-wide rc-enabled
-// marker. Without this, a worker handoff resumed via fleet drain /
-// crash recovery would silently inherit RC attach once the v0.12.1
-// coord-spawn auto-write had marked the project — defeating the
-// strict opt-in carve-out for workers / subagents.
-//
-// Mirrors cmd/fleet/handoff.go's predicate test (T6) for the auto-
-// drain path. Tests the predicate directly because spawnAndRetire's
-// inject site is a 1-line gated expression — the predicate's
-// correctness IS the gate's correctness, and exercising it through
-// spawn.Spawn would require either tmux or a deeper test double.
-func TestIsCoordHandoffForAgent_GatesOnCoordSpawnMarker(t *testing.T) {
+// The coord-spawn marker is gone (D3): isCoordHandoffForAgent now takes an
+// *agent.Record and returns spawn.IsCoordSpawn(rec.TaskID, rec.Project) —
+// true iff the task_id is coord-<project>. The table exercises the
+// task-based predicate directly (the inject site is a 1-line gated
+// expression, so the predicate's correctness IS the gate's correctness).
+func TestIsCoordHandoffForAgent_GatesOnCoordTask(t *testing.T) {
 	const project = "test-drain-gate"
-	const coordID = "ccccdddd"
-	const workerID = "wwwweeee"
 
 	cases := []struct {
-		name      string
-		project   string
-		agentID   string
-		setMarker string
-		want      bool
+		name    string
+		taskID  string
+		project string
+		want    bool
 	}{
-		{"empty project rejects", "", coordID, "", false},
-		{"unset marker rejects", project, coordID, "", false},
-		{"marker points elsewhere rejects",
-			project, workerID, coordID, false},
-		{"marker matches agentID accepts",
-			project, coordID, coordID, true},
+		{"empty project rejects", "coord-" + project, "", false},
+		{"worker task rejects", "auth-fix", project, false},
+		{"non-coord feature task rejects", "some-feature", project, false},
+		{"coord task accepts", "coord-" + project, project, true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			setupFleetHome(t)
-			if tc.setMarker != "" {
-				if _, err := state.EnsureProjectInitialized(tc.project); err != nil {
-					t.Fatalf("EnsureProjectInitialized: %v", err)
-				}
-				if err := state.WriteCoordSpawnMarker(tc.project, tc.setMarker); err != nil {
-					t.Fatalf("WriteCoordSpawnMarker: %v", err)
-				}
-			}
-			got := isCoordHandoffForAgent(tc.project, tc.agentID)
+			rec := &agent.Record{TaskID: tc.taskID, Project: tc.project}
+			got := isCoordHandoffForAgent(rec)
 			if got != tc.want {
-				t.Errorf("isCoordHandoffForAgent(%q, %q) with marker=%q: got %v, want %v",
-					tc.project, tc.agentID, tc.setMarker, got, tc.want)
+				t.Errorf("isCoordHandoffForAgent(task=%q project=%q): got %v, want %v",
+					tc.taskID, tc.project, got, tc.want)
 			}
 		})
 	}
@@ -1363,7 +913,7 @@ func TestIsCoordHandoffForAgent_GatesOnCoordSpawnMarker(t *testing.T) {
 // helper (unit-tested below so the suite never execs a rewritten
 // claude argv for real); the isCoordHandoffForAgent call-site gate is
 // the worker carve-out (push-storm protection), pinned by
-// TestIsCoordHandoffForAgent_GatesOnCoordSpawnMarker above and the
+// TestIsCoordHandoffForAgent_GatesOnCoordTask above and the
 // worker integration test below.
 
 // TestCoordDrainExecArgv_DefaultInjects: native default-on — the
@@ -1443,12 +993,7 @@ func TestDrain_LeaseFailoverCoordHandoff_ResumeFallbackCompletes(t *testing.T) {
 	if err := oldRec.Write(); err != nil {
 		t.Fatalf("rewrite old coord supervisor pid: %v", err)
 	}
-	if _, err := state.EnsureProjectInitialized(oldRec.Project); err != nil {
-		t.Fatalf("EnsureProjectInitialized: %v", err)
-	}
-	if err := state.WriteCoordSpawnMarker(oldRec.Project, oldRec.ID); err != nil {
-		t.Fatalf("WriteCoordSpawnMarker: %v", err)
-	}
+	// D3: coord identity is the task_id (coord-<project>) + lease, no marker.
 
 	req, qp := writeCoordSkillQueue(t, oldRec)
 	origDeliveryDeps := handoffDeliveryDepsFn
@@ -1488,9 +1033,6 @@ func TestDrain_LeaseFailoverCoordHandoff_ResumeFallbackCompletes(t *testing.T) {
 	if _, lerr := agent.Load(oldRec.ID); !errors.Is(lerr, state.ErrNotFound) {
 		t.Fatalf("old coord record should be archived after fallback resume, load err=%v", lerr)
 	}
-	if got := state.ReadCoordSpawnMarker(oldRec.Project); got != req.NewAgentID {
-		t.Fatalf("coord marker = %q, want new id %q", got, req.NewAgentID)
-	}
 	if _, statErr := os.Stat(qp); !errors.Is(statErr, os.ErrNotExist) {
 		t.Fatalf("queue file should be consumed, stat err=%v", statErr)
 	}
@@ -1512,13 +1054,12 @@ func TestDrain_LeaseFailoverCoordHandoff_FinalizesDeliveredLockOwner(t *testing.
 	t.Setenv("FLEET_LEASE_FAILOVER", "1")
 	setupFleetHome(t)
 
-	oldRec := spawnSeedAgent(t)
-	if _, err := state.EnsureProjectInitialized(oldRec.Project); err != nil {
-		t.Fatalf("EnsureProjectInitialized: %v", err)
-	}
-	if err := state.WriteCoordSpawnMarker(oldRec.Project, oldRec.ID); err != nil {
-		t.Fatalf("WriteCoordSpawnMarker: %v", err)
-	}
+	// D3: coord-swap detection is now the task_id (coord-<project>), so the
+	// OLD agent must be a real coord for the cold-spawn delivery routing under
+	// test (a worker never lease-wraps and would trivially direct-send).
+	const project = "rainier"
+	cwd := seedCoordRepoMeta(t, project)
+	oldRec := spawnSeedCoord(t, project, cwd)
 
 	winner := agent.New(agent.NewID())
 	winner.TaskID = oldRec.TaskID
@@ -1627,12 +1168,6 @@ func TestDrain_LeaseFailoverCoordStaleQueue_UsesLockOwnerForCapApprovedCoord(t *
 	if err := winner.Write(); err != nil {
 		t.Fatalf("write lock-winning standby: %v", err)
 	}
-	if _, err := state.EnsureProjectInitialized(project); err != nil {
-		t.Fatalf("EnsureProjectInitialized: %v", err)
-	}
-	if err := state.WriteCoordSpawnMarker(project, newRec.ID); err != nil {
-		t.Fatalf("WriteCoordSpawnMarker: %v", err)
-	}
 	if err := oldRec.ArchiveWithHandoff(newRec.ID); err != nil {
 		t.Fatalf("archive old coord: %v", err)
 	}
@@ -1707,9 +1242,6 @@ func TestDrain_LeaseFailoverCoordStaleQueue_UsesLockOwnerForCapApprovedCoord(t *
 	if _, lerr := agent.Load(newRec.ID); !errors.Is(lerr, state.ErrNotFound) {
 		t.Fatalf("superseded replacement %s should have been removed, load err=%v", newRec.ID, lerr)
 	}
-	if got := state.ReadCoordSpawnMarker(project); got != winner.ID {
-		t.Fatalf("coord marker = %q, want delivered lock owner %q", got, winner.ID)
-	}
 	if _, statErr := os.Stat(qp); !errors.Is(statErr, os.ErrNotExist) {
 		t.Fatalf("queue file should be consumed after verified delivery, stat err=%v", statErr)
 	}
@@ -1761,12 +1293,6 @@ func TestDrain_LeaseFailoverCoord_DeadLoserSession_StillDeliversToLockOwner(t *t
 	if err := winner.Write(); err != nil {
 		t.Fatalf("write lock-winning standby: %v", err)
 	}
-	if _, err := state.EnsureProjectInitialized(project); err != nil {
-		t.Fatalf("EnsureProjectInitialized: %v", err)
-	}
-	if err := state.WriteCoordSpawnMarker(project, newRec.ID); err != nil {
-		t.Fatalf("WriteCoordSpawnMarker: %v", err)
-	}
 	if err := oldRec.ArchiveWithHandoff(newRec.ID); err != nil {
 		t.Fatalf("archive old coord: %v", err)
 	}
@@ -1811,9 +1337,6 @@ func TestDrain_LeaseFailoverCoord_DeadLoserSession_StillDeliversToLockOwner(t *t
 	}
 	if sentSession != winner.TmuxSession {
 		t.Fatalf("resume prompt sent to %q, want lock winner %q (must not require dead loser session)", sentSession, winner.TmuxSession)
-	}
-	if got := state.ReadCoordSpawnMarker(project); got != winner.ID {
-		t.Fatalf("coord marker = %q, want delivered lock owner %q", got, winner.ID)
 	}
 	if _, statErr := os.Stat(qp); !errors.Is(statErr, os.ErrNotExist) {
 		t.Fatalf("queue file must be consumed after delivery to the lock owner, stat err=%v", statErr)
@@ -1860,8 +1383,8 @@ func TestDrain_WorkerHandoff_NeverCarriesRemoteControl(t *testing.T) {
 	oldRec := spawnSeedAgentWithCommand(t,
 		[]string{"sh", "-c", `claude --dangerously-skip-permissions; cat`})
 
-	// Coord-spawn marker absent → isCoordHandoffForAgent=false.
-	// (We deliberately do NOT WriteCoordSpawnMarker.)
+	// Worker task ("auth-fix") → isCoordHandoffForAgent=false (task-based,
+	// D3: no coord-spawn marker anymore).
 
 	req, qp, _ := writeSkillQueue(t, oldRec)
 	out := &bytes.Buffer{}
@@ -1929,15 +1452,10 @@ func TestDrain_WorkerHandoff_NeverCarriesRemoteControl(t *testing.T) {
 func TestDrainAndDispatch_ShareSameLock(t *testing.T) {
 	requireFakeTmux(t)
 	setupFleetHome(t)
-	oldRec := spawnSeedAgent(t)
-
-	// Marker = oldRec.ID so isCoordHandoffForAgent fires.
-	if _, err := state.EnsureProjectInitialized(oldRec.Project); err != nil {
-		t.Fatalf("EnsureProjectInitialized: %v", err)
-	}
-	if err := state.WriteCoordSpawnMarker(oldRec.Project, oldRec.ID); err != nil {
-		t.Fatalf("WriteCoordSpawnMarker: %v", err)
-	}
+	// D3: a coord (task_id coord-<project>) makes isCoordHandoffForAgent fire
+	// — the coord-spawn lock branch under test. Fails fast at coordlock.Acquire
+	// before any repo resolution, so no meta seeding is needed.
+	oldRec := spawnSeedCoord(t, "rainier", t.TempDir())
 
 	// Hold the lock outside Resume — simulates a concurrent
 	// `fleet dispatch --coord-spawn` that's mid-flight when the
@@ -1988,16 +1506,12 @@ func TestDrainAndDispatch_ShareSameLock(t *testing.T) {
 func TestDrain_LockReleasedOnReturn(t *testing.T) {
 	requireFakeTmux(t)
 	setupFleetHome(t)
-	oldRec := spawnSeedAgent(t)
+	// D3: coord (task_id coord-<project>) runs the coord-spawn lock branch.
+	// This Resume runs to completion, so the coord repo must resolve.
+	cwd := seedCoordRepoMeta(t, "rainier")
+	oldRec := spawnSeedCoord(t, "rainier", cwd)
 
-	if _, err := state.EnsureProjectInitialized(oldRec.Project); err != nil {
-		t.Fatalf("EnsureProjectInitialized: %v", err)
-	}
-	if err := state.WriteCoordSpawnMarker(oldRec.Project, oldRec.ID); err != nil {
-		t.Fatalf("WriteCoordSpawnMarker: %v", err)
-	}
-
-	req, qp, _ := writeSkillQueue(t, oldRec)
+	req, qp := writeCoordSkillQueue(t, oldRec)
 	stdout := &bytes.Buffer{}
 	stderr := &bytes.Buffer{}
 	if err := Resume(req, qp, 1, stdout, stderr); err != nil {
@@ -2033,14 +1547,9 @@ func TestDrain_LockReleasedOnReturn(t *testing.T) {
 func TestDrain_ContentionPreservesQueueFile(t *testing.T) {
 	requireFakeTmux(t)
 	setupFleetHome(t)
-	oldRec := spawnSeedAgent(t)
-
-	if _, err := state.EnsureProjectInitialized(oldRec.Project); err != nil {
-		t.Fatalf("EnsureProjectInitialized: %v", err)
-	}
-	if err := state.WriteCoordSpawnMarker(oldRec.Project, oldRec.ID); err != nil {
-		t.Fatalf("WriteCoordSpawnMarker: %v", err)
-	}
+	// D3: a coord (task_id coord-<project>) drives the coord-spawn lock branch;
+	// it fails fast at coordlock.Acquire before repo resolution.
+	oldRec := spawnSeedCoord(t, "rainier", t.TempDir())
 
 	// Hold the lock from outside for the entire Resume.
 	release, err := coordlock.Acquire(oldRec.Project)
@@ -2188,13 +1697,7 @@ func TestResume_Case3_CapApprovedCoord_DeliversToLockOwner(t *testing.T) {
 	if err := winner.Write(); err != nil {
 		t.Fatalf("write lock-winning standby: %v", err)
 	}
-	if _, err := state.EnsureProjectInitialized(project); err != nil {
-		t.Fatalf("EnsureProjectInitialized: %v", err)
-	}
-	// Marker == oldRec.ID → isCoordSwap fires in case-3.
-	if err := state.WriteCoordSpawnMarker(project, oldRec.ID); err != nil {
-		t.Fatalf("WriteCoordSpawnMarker: %v", err)
-	}
+	// D3: isCoordSwap fires in case-3 off the coord task_id (coord-<project>).
 
 	req, qp := writeCoordSkillQueue(t, oldRec)
 	req.NewAgentID = newRec.ID
@@ -2238,9 +1741,6 @@ func TestResume_Case3_CapApprovedCoord_DeliversToLockOwner(t *testing.T) {
 		t.Fatalf("resume prompt sent to %q, want lock WINNER %q (not the queued loser %q)",
 			sentSession, winner.TmuxSession, newRec.TmuxSession)
 	}
-	if got := state.ReadCoordSpawnMarker(project); got != winner.ID {
-		t.Fatalf("coord marker = %q, want delivered lock owner %q", got, winner.ID)
-	}
 	if _, statErr := os.Stat(qp); !errors.Is(statErr, os.ErrNotExist) {
 		t.Fatalf("queue file should be consumed after verified delivery, stat err=%v", statErr)
 	}
@@ -2261,12 +1761,6 @@ func TestDrain_CoordColdSpawn_CapApproved_DeliversDirectNotLockOwner(t *testing.
 	// Old coord (taskID coord-<project> → legacyCoordResume=true), NOT archived,
 	// NO pre-spawned replacement → Resume routes to spawnAndRetire (cold spawn).
 	oldRec := spawnSeedCoord(t, project, t.TempDir())
-	if _, err := state.EnsureProjectInitialized(project); err != nil {
-		t.Fatalf("EnsureProjectInitialized: %v", err)
-	}
-	if err := state.WriteCoordSpawnMarker(project, oldRec.ID); err != nil {
-		t.Fatalf("WriteCoordSpawnMarker: %v", err)
-	}
 
 	req, qp := writeCoordSkillQueue(t, oldRec)
 	req.CapApproved = true
@@ -2349,12 +1843,7 @@ func seedGracefulRouteCase3(t *testing.T) (oldRec, newRec *agent.Record, req que
 	if err := newRec.Write(); err != nil {
 		t.Fatalf("write journaled replacement: %v", err)
 	}
-	if _, err := state.EnsureProjectInitialized(project); err != nil {
-		t.Fatalf("EnsureProjectInitialized: %v", err)
-	}
-	if err := state.WriteCoordSpawnMarker(project, oldRec.ID); err != nil {
-		t.Fatalf("WriteCoordSpawnMarker: %v", err)
-	}
+	// D3: coord identity is the task_id (coord-<project>) + lease, no marker.
 	req, qp = writeCoordSkillQueue(t, oldRec)
 	req.NewAgentID = newRec.ID
 	req.NewSession = newRec.TmuxSession
@@ -2574,14 +2063,6 @@ func TestLiveCoordGracefulSpawn_DecidesLeaseWrap(t *testing.T) {
 	setupFleetHome(t)
 	oldRec := agent.New("oldcoord1")
 	oldRec.Project = "rainier"
-	if _, err := state.EnsureProjectInitialized(oldRec.Project); err != nil {
-		t.Fatalf("EnsureProjectInitialized: %v", err)
-	}
-	// The wrap decision gates on the SAME marker predicate retireOldAgent's
-	// isCoordSwap uses (codex PR3-completion iter-6 [P2]).
-	if err := state.WriteCoordSpawnMarker(oldRec.Project, oldRec.ID); err != nil {
-		t.Fatalf("seed marker: %v", err)
-	}
 
 	origElig := gracefulSwapEligibleFn
 	t.Cleanup(func() { gracefulSwapEligibleFn = origElig })
@@ -2595,6 +2076,10 @@ func TestLiveCoordGracefulSpawn_DecidesLeaseWrap(t *testing.T) {
 		return autoResume // mirror autoResume so the table below exercises it
 	}
 
+	// D3: the wrap decision gates on the isCoordResume PARAMETER (the caller's
+	// spawn.IsCoordSpawn result) + gracefulSwapEligibleFn — the coord-spawn
+	// marker is gone, so a non-coord resume (isCoordResume=false) short-circuits
+	// before consulting eligibility.
 	if liveCoordGracefulSpawn(oldRec, false, true) {
 		t.Error("worker resume must never take the graceful coord route")
 	}
@@ -2606,21 +2091,6 @@ func TestLiveCoordGracefulSpawn_DecidesLeaseWrap(t *testing.T) {
 	}
 	if liveCoordGracefulSpawn(oldRec, true, false) {
 		t.Error("auto-resume off must not take the graceful route")
-	}
-
-	// Marker missing/stale -> the later retire takes the worker/inline path
-	// (isCoordSwap=false), so the wrap decision must say NO too — a
-	// lease-wrapped standby would otherwise get its prompt direct-sent into
-	// the supervisor pane (codex PR3-completion iter-6 [P2]).
-	if err := state.WriteCoordSpawnMarker(oldRec.Project, "someoneelse1"); err != nil {
-		t.Fatalf("re-point marker: %v", err)
-	}
-	consulted = 0
-	if liveCoordGracefulSpawn(oldRec, true, true) {
-		t.Error("stale coord-spawn marker must not take the graceful route")
-	}
-	if consulted != 0 {
-		t.Error("eligibility consulted despite a stale marker (marker gate must short-circuit)")
 	}
 }
 

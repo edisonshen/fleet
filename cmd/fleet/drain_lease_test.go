@@ -1140,7 +1140,7 @@ func TestDrainLease_TakeoverDoesNotHoldLockAcrossKill(t *testing.T) {
 // AND send handoff.ResumePrompt(docPath) (so the fresh coord actually resumes
 // from the handoff doc instead of sitting idle). Without it the replacement is
 // invisible + inert.
-func TestRecoverHandoffTail_WritesMarkerAndSendsPrompt(t *testing.T) {
+func TestRecoverHandoffTail_SendsPromptToLockOwner(t *testing.T) {
 	t.Setenv("FLEET_HOME", t.TempDir())
 	if _, err := state.Bootstrap(); err != nil {
 		t.Fatalf("bootstrap: %v", err)
@@ -1148,20 +1148,17 @@ func TestRecoverHandoffTail_WritesMarkerAndSendsPrompt(t *testing.T) {
 	oldRec := oldCoordRec()
 	oldRec.TaskID = "coord-projects-fleet" // IsCoordSpawn requires "coord-<project>"
 
-	var gotMarkerProj, gotMarkerID, gotSession, gotPrompt string
-	origMarker := recoverWriteMarkerFn
+	var gotSession, gotPrompt string
 	origReady := recoverWaitForReadyFn
 	origAlive := recoverSessionAliveFn
 	origPrompt := recoverSendPromptVerifiedFn
 	origCurrentOwner := recoverCurrentOwnerFn
 	t.Cleanup(func() {
-		recoverWriteMarkerFn = origMarker
 		recoverWaitForReadyFn = origReady
 		recoverSessionAliveFn = origAlive
 		recoverSendPromptVerifiedFn = origPrompt
 		recoverCurrentOwnerFn = origCurrentOwner
 	})
-	recoverWriteMarkerFn = func(project, id string) error { gotMarkerProj, gotMarkerID = project, id; return nil }
 	recoverWaitForReadyFn = func(string) error { return nil }
 	recoverSessionAliveFn = func(string) (bool, error) { return true, nil }
 	recoverSendPromptVerifiedFn = func(session, prompt string) (bool, error) {
@@ -1182,10 +1179,9 @@ func TestRecoverHandoffTail_WritesMarkerAndSendsPrompt(t *testing.T) {
 		t.Fatalf("recoverHandoffTail returned %v", err)
 	}
 
-	if gotMarkerProj != "projects-fleet" || gotMarkerID != "newcoord9" {
-		t.Errorf("coord-spawn marker = (%q,%q), want (projects-fleet,newcoord9) — TUI cannot discover the replacement without it",
-			gotMarkerProj, gotMarkerID)
-	}
+	// D3: there is no coord-spawn marker to write — discovery follows the lease
+	// (the winning standby IS the owner). The tail's job is to deliver the resume
+	// prompt to that lock owner so the recovered coord picks up the in-flight work.
 	if gotSession != "fleet-newcoord9" {
 		t.Errorf("resume prompt sent to session %q, want fleet-newcoord9", gotSession)
 	}
@@ -1195,8 +1191,9 @@ func TestRecoverHandoffTail_WritesMarkerAndSendsPrompt(t *testing.T) {
 }
 
 // The tail honors DisableAutoResume: no resume prompt is typed (the operator
-// drives the first turn), but the marker is STILL written so discovery works.
-func TestRecoverHandoffTail_DisableAutoResume_NoPromptStillMarks(t *testing.T) {
+// drives the first turn). D3: there is no marker to write either — discovery
+// follows the coordinator lease, independent of resume delivery.
+func TestRecoverHandoffTail_DisableAutoResume_NoPrompt(t *testing.T) {
 	t.Setenv("FLEET_HOME", t.TempDir())
 	if _, err := state.Bootstrap(); err != nil {
 		t.Fatalf("bootstrap: %v", err)
@@ -1204,20 +1201,17 @@ func TestRecoverHandoffTail_DisableAutoResume_NoPromptStillMarks(t *testing.T) {
 	oldRec := oldCoordRec()
 	oldRec.TaskID = "coord-projects-fleet"
 
-	var markerWritten, promptSent bool
-	origMarker := recoverWriteMarkerFn
+	var promptSent bool
 	origReady := recoverWaitForReadyFn
 	origAlive := recoverSessionAliveFn
 	origPrompt := recoverSendPromptVerifiedFn
 	origCurrentOwner := recoverCurrentOwnerFn
 	t.Cleanup(func() {
-		recoverWriteMarkerFn = origMarker
 		recoverWaitForReadyFn = origReady
 		recoverSessionAliveFn = origAlive
 		recoverSendPromptVerifiedFn = origPrompt
 		recoverCurrentOwnerFn = origCurrentOwner
 	})
-	recoverWriteMarkerFn = func(string, string) error { markerWritten = true; return nil }
 	recoverWaitForReadyFn = func(string) error { return nil }
 	recoverSessionAliveFn = func(string) (bool, error) { return true, nil }
 	recoverSendPromptVerifiedFn = func(string, string) (bool, error) {
@@ -1239,9 +1233,6 @@ func TestRecoverHandoffTail_DisableAutoResume_NoPromptStillMarks(t *testing.T) {
 		t.Fatalf("recoverHandoffTail returned %v", err)
 	}
 
-	if !markerWritten {
-		t.Error("marker must be written even when auto-resume is disabled (discovery is independent of resume)")
-	}
 	if promptSent {
 		t.Error("resume prompt must NOT be sent when DisableAutoResume is set")
 	}
@@ -1280,17 +1271,14 @@ func TestDeliverRecoverResumePrompt_LockOwner_AtMostOnce(t *testing.T) {
 	origAlive := recoverSessionAliveFn
 	origPrompt := recoverSendPromptVerifiedFn
 	origCurrentOwner := recoverCurrentOwnerFn
-	origMarker := recoverWriteMarkerFn
 	t.Cleanup(func() {
 		recoverWaitForReadyFn = origReady
 		recoverSessionAliveFn = origAlive
 		recoverSendPromptVerifiedFn = origPrompt
 		recoverCurrentOwnerFn = origCurrentOwner
-		recoverWriteMarkerFn = origMarker
 	})
 	recoverWaitForReadyFn = func(string) error { return nil }
 	recoverSessionAliveFn = func(string) (bool, error) { return true, nil }
-	recoverWriteMarkerFn = func(string, string) error { return nil }
 	recoverCurrentOwnerFn = func(string) (coordlock.Owner, bool) {
 		return coordlock.Owner{AgentID: rec.ID, PID: 4242, PidStart: 99}, true
 	}
@@ -1445,17 +1433,14 @@ func TestDrainGracefulDeliverPending_ArchivedOldPolicy_NoPrompt(t *testing.T) {
 	origAlive := recoverSessionAliveFn
 	origPrompt := recoverSendPromptVerifiedFn
 	origCurrentOwner := recoverCurrentOwnerFn
-	origMarker := recoverWriteMarkerFn
 	t.Cleanup(func() {
 		recoverWaitForReadyFn = origReady
 		recoverSessionAliveFn = origAlive
 		recoverSendPromptVerifiedFn = origPrompt
 		recoverCurrentOwnerFn = origCurrentOwner
-		recoverWriteMarkerFn = origMarker
 	})
 	recoverWaitForReadyFn = func(string) error { return nil }
 	recoverSessionAliveFn = func(string) (bool, error) { return true, nil }
-	recoverWriteMarkerFn = func(string, string) error { return nil }
 	recoverCurrentOwnerFn = func(string) (coordlock.Owner, bool) {
 		return coordlock.Owner{AgentID: winner.ID, PID: 4242, PidStart: 99}, true
 	}
@@ -1525,17 +1510,14 @@ func TestDrainGracefulDeliverPending_LegacySchemaNeverPrompts(t *testing.T) {
 	origAlive := recoverSessionAliveFn
 	origPrompt := recoverSendPromptVerifiedFn
 	origCurrentOwner := recoverCurrentOwnerFn
-	origMarker := recoverWriteMarkerFn
 	t.Cleanup(func() {
 		recoverWaitForReadyFn = origReady
 		recoverSessionAliveFn = origAlive
 		recoverSendPromptVerifiedFn = origPrompt
 		recoverCurrentOwnerFn = origCurrentOwner
-		recoverWriteMarkerFn = origMarker
 	})
 	recoverWaitForReadyFn = func(string) error { return nil }
 	recoverSessionAliveFn = func(string) (bool, error) { return true, nil }
-	recoverWriteMarkerFn = func(string, string) error { return nil }
 	recoverCurrentOwnerFn = func(string) (coordlock.Owner, bool) {
 		return coordlock.Owner{AgentID: winner.ID, PID: 4242, PidStart: 99}, true
 	}

@@ -1074,11 +1074,10 @@ func runDispatch(opts *dispatchOpts, stdout io.Writer) error {
 		// !disableAutoResume to honor --no-auto-resume.
 		if opts.coordSpawn && newDocPath != "" && !disableAutoResume && leaseFailoverEnabled() {
 			ownerRec, derr := deliverToCurrentOwner(handoffdelivery.Options{
-				Project:       opts.project,
-				Prompt:        handoff.ResumePrompt(newDocPath),
-				PromoteMarker: true,
-				Stdout:        stdout,
-				Stderr:        os.Stderr,
+				Project: opts.project,
+				Prompt:  handoff.ResumePrompt(newDocPath),
+				Stdout:  stdout,
+				Stderr:  os.Stderr,
 			})
 			switch {
 			case derr == nil && ownerRec != nil && ownerRec.ID != "":
@@ -1211,18 +1210,17 @@ func runDispatch(opts *dispatchOpts, stdout io.Writer) error {
 		//     as full success, but the coord won't actually run
 		//     /coordinator until the operator attaches and presses
 		//     Enter manually. Logging here lets operator log analysis
-		//     correlate "coord-spawn-marker exists but coord is idle"
+		//     correlate "coord lease claimed but coord is idle"
 		//     with the unsubmitted-warning that fired during dispatch.
 		submitted := false
 		var perr error
 		if opts.coordSpawn && newDocPath != "" && leaseFailoverEnabled() {
 			var ownerRec *agent.Record
 			ownerRec, perr = deliverToCurrentOwner(handoffdelivery.Options{
-				Project:       rec.Project,
-				Prompt:        opts.prompt,
-				PromoteMarker: true,
-				Stdout:        stdout,
-				Stderr:        stdout,
+				Project: rec.Project,
+				Prompt:  opts.prompt,
+				Stdout:  stdout,
+				Stderr:  stdout,
 			})
 			if perr == nil && ownerRec != nil && ownerRec.ID != "" {
 				attachID = ownerRec.ID

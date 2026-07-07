@@ -283,7 +283,6 @@ func productionRecoverSpawn(oldRec *agent.Record, docPath, preAllocatedID string
 // Seams for recoverHandoffTail / deliverRecoverResumePrompt, kept injectable so
 // the recover-tail tests stay deterministic (no real tmux send / marker FS).
 var (
-	recoverWriteMarkerFn        = state.WriteCoordSpawnMarker
 	recoverWaitForReadyFn       = spawn.WaitForReadyToPrompt
 	recoverSessionAliveFn       = tmux.SessionAlive
 	recoverSendPromptVerifiedFn = spawn.SendPromptKeysVerified
@@ -314,17 +313,15 @@ func effectiveDisableAutoResume(req queue.SpawnFresh, cachedOld *agent.Record) b
 
 // recoverHandoffTail runs the same post-spawn handoff TAIL the normal recovery
 // path runs, plus PR4's verified prompt-delivery semantics. Without it the
-// takeover-recovered successor is INVISIBLE + INERT:
-//   - the dead OLD's coord.Cleanup cleared the coord-spawn marker, so the TUI /
-//     `fleet attach` discovery (which reads the marker for the live coord's id)
-//     cannot find the replacement -> point the marker at the NEW agent;
-//   - a freshly-spawned coord does nothing until it is told to resume from the
-//     handoff doc -> deliver handoff.ResumePrompt(docPath) once its pane is
-//     ready, with at-most-once retry handling.
+// takeover-recovered successor is INERT: a freshly-spawned coord does nothing
+// until it is told to resume from the handoff doc, so we deliver
+// handoff.ResumePrompt(docPath) to the lease OWNER (the winning standby) once
+// its pane is ready, with at-most-once retry handling. Discovery no longer needs
+// a marker repair — the successor becomes the coord by acquiring the lease
+// (the epoch bump IS the identity), and attach/TUI resolve it via the lease.
 //
-// Marker repair is best-effort with surfaced warnings (surface-don't-silo). The
-// prompt delivery returns errors so the queue is preserved when the replacement
-// would otherwise be left idle.
+// The prompt delivery returns errors so the queue is preserved when the
+// replacement would otherwise be left idle.
 func recoverHandoffTail(oldRec *agent.Record, rec *agent.Record, docPath string, disableAutoResume bool,
 	stdout, stderr io.Writer) error {
 	if spawn.IsCoordSpawn(oldRec.TaskID, oldRec.Project) {
@@ -380,13 +377,11 @@ func deliverRecoverResumePrompt(rec *agent.Record, docPath string, disableAutoRe
 		deps.WaitReady = recoverWaitForReadyFn
 		deps.SessionAlive = recoverSessionAliveFn
 		deps.SendVerified = recoverSendPromptVerifiedFn
-		deps.WriteMarker = recoverWriteMarkerFn
 		_, err := handoffdelivery.DeliverToCurrentOwner(handoffdelivery.Options{
-			Project:       rec.Project,
-			Prompt:        prompt,
-			PromoteMarker: true,
-			Stdout:        stdout,
-			Stderr:        stderr,
+			Project: rec.Project,
+			Prompt:  prompt,
+			Stdout:  stdout,
+			Stderr:  stderr,
 		}, deps)
 		if err != nil {
 			return err

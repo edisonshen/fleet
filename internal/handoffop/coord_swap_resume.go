@@ -5,7 +5,7 @@ import (
 	"github.com/edisonshen/fleet/internal/tmux"
 )
 
-// coord_swap_resume.go re-derives the DELETED coord-spawn-marker's synchronous
+// coord_swap_resume.go re-derives the DELETED spawn marker's synchronous
 // "did the swap commit?" oracle onto the coordinator LEASE, for the
 // crash-recovery retry path (TASK-PLAN-coord-lease-sole-identity D3, resume
 // matrix operator-approved 2026-07-07).

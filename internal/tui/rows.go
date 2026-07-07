@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/edisonshen/fleet/internal/agent"
+	"github.com/edisonshen/fleet/internal/coordlock"
 	"github.com/edisonshen/fleet/internal/state"
 )
 
@@ -229,76 +230,37 @@ func (m Model) unifiedProjectsFiltered(hiddenSet map[string]bool) []*ProjectRow 
 	return out
 }
 
-// coordBootWindow is the time window during which the task_id
-// fallback signal is allowed to bind a coord on LEFT. Beyond this,
-// the only valid coord identity signal is the lock-body branch in
-// scanProject (gated by coord-state.json mtime within
-// coordActiveWindow). The marker file's mtime is the freshness
-// reference: it's last written when the TUI dispatches the coord, so
-// it pins "the coord skill is still booting".
-//
-// Codex iter-4 P1: without a freshness gate the fallback would
-// resurrect any coord whose claude process exited (leaving the tmux
-// shell wrapper alive) — the marker plus the alive shell would re-
-// promote forever, hiding the dead agent from [a]/[x] recovery.
-// 60s is comfortable: the coord skill normally takes 10-30s to boot
-// + write its first coord-state.json. Past 60s either the lock-body
-// branch has taken over (coord is genuinely running) or the boot
-// failed and the operator should triage via the right column.
-const coordBootWindow = 60 * time.Second
-
 // findCoordByTaskID returns the first agent.Record whose task_id is
 // coordTaskID(projectName) AND project matches AND tmux session is
-// alive AND the per-project state tree exists at
-// ~/.fleet/projects/<name>/ AND the project's coord-spawn marker
-// (state.CoordSpawnMarkerPath) contains the candidate agent's ID
-// AND the marker's mtime is within coordBootWindow.
+// alive AND the per-project state tree exists at ~/.fleet/projects/<name>/
+// AND the coordinator LEASE names the candidate agent's ID (the live active
+// owner, or the current `starting` owner within TTL).
 //
-// Marker gate (codex iter-3 P2) closes the "operator runs `fleet
-// dispatch coord-<project> --project <project> --coord-spawn`" spoof:
-// the spoofer can write a record but cannot make the dashboard treat
-// it as the coord (the marker is written by the TUI's
-// coordSpawnDoneMsg handler post-dispatch and contains the agent ID
-// the TUI is in the middle of attaching to). Without the right
-// marker content, no promotion happens.
-//
-// Marker freshness gate (codex iter-4 P1) keeps the fallback from
-// resurrecting a stale coord whose claude process exited but whose
-// tmux shell wrapper is still alive — beyond the boot window, the
-// only authoritative identity signal is the lock-body branch in
-// scanProject (which requires a fresh coord-state.json tick).
+// Lease gate (D3, replaces the deleted coord-spawn marker): the coordinator
+// lease is the identity now, so the "operator hand-spawns a coord-shaped
+// record" spoof no longer promotes — a bare record that never acquired the
+// lease is never named by LiveOwner/CurrentStarting. The lease's process-liveness
+// (LiveOwner) + starting TTL (CurrentStarting) subsume the old marker-mtime
+// freshness gate: a coord whose process exited stops being named, so a stale
+// tmux shell wrapper can't resurrect a dead coord.
 //
 // Project-tree gate (codex iter-2 P2) keeps legacy records (pre-PR
 // agents with the same task_id shape) from auto-promoting on first
-// upgrade — the TUI's post-issue-#63 auto-spawn always runs
-// state.EnsureProjectInitialized BEFORE dispatch, so post-PR records
-// always satisfy the gate.
+// upgrade.
 //
 // Distinct from findExistingCoordForProject in keys.go: this one is
 // the dashboard's binding signal (does this agent represent the
 // project's coord visually?); the keys.go counterpart is the [a]
-// idempotency signal. Same predicate; kept separate so the rendering
-// layer doesn't import keys.go's action wiring.
+// idempotency signal. Both read the same lease identity.
 func findCoordByTaskID(records []*agent.Record, projectName string) *agent.Record {
 	want := coordTaskID(projectName)
-	// Project-tree existence and marker read are 1-3 stats per call,
-	// fast enough to run inline in unifiedProjects on every render.
-	// Cache only if a future profile shows it's hot.
+	// Project-tree existence is 1 stat per call, fast enough to run inline in
+	// unifiedProjects on every render.
 	if !projectTreeExistsFn(projectName) {
 		return nil
 	}
-	wantID := coordSpawnMarkerFn(projectName)
+	wantID := coordSpawnIdentityFn(projectName)
 	if wantID == "" {
-		return nil
-	}
-	// Freshness gate (codex iter-4 P1): the marker's mtime must be
-	// within coordBootWindow. Beyond that, the lock-body branch in
-	// scanProject is the only valid identity signal.
-	mt, ok := coordSpawnMarkerMtimeFn(projectName)
-	if !ok {
-		return nil
-	}
-	if nowFn().Sub(mt) > coordBootWindow {
 		return nil
 	}
 	for _, r := range records {
@@ -312,8 +274,8 @@ func findCoordByTaskID(records []*agent.Record, projectName string) *agent.Recor
 			continue
 		}
 		if r.ID != wantID {
-			// Marker content names a different agent — this record is
-			// either a duplicate spawn or a spoof. Don't promote.
+			// The lease names a different agent — this record is either a
+			// duplicate spawn or a spoof. Don't promote.
 			continue
 		}
 		if r.TmuxSession == "" {
@@ -356,38 +318,28 @@ func projectTreeExists(projectName string) bool {
 	return info.IsDir()
 }
 
-// coordSpawnMarkerFn returns the agent ID stored in the project's
-// coord-spawn marker file. var so tests can stub. Production calls
-// state.ReadCoordSpawnMarker.
-var coordSpawnMarkerFn = state.ReadCoordSpawnMarker
-
-// coordSpawnMarkerMtimeFn returns the marker file's modification time
-// + ok=true when present. var so tests can stub the freshness check
-// without timing-sensitive disk writes. Production stat-reads the
-// marker; missing returns ok=false.
-var coordSpawnMarkerMtimeFn = func(projectName string) (time.Time, bool) {
-	path, err := state.CoordSpawnMarkerPath(projectName)
-	if err != nil {
-		return time.Time{}, false
-	}
-	info, err := os.Stat(path)
-	if err != nil {
-		return time.Time{}, false
-	}
-	return info.ModTime(), true
-}
-
-// removeCoordSpawnMarkerFn deletes the coord-spawn marker for project.
-// var so tests can stub the disk write. Production calls
-// state.RemoveCoordSpawnMarker, which is idempotent on ENOENT (the
-// self-heal path can race with a concurrent dispatch goroutine that
-// just rewrote the marker, and "already gone" is the goal here).
+// coordSpawnIdentityFn returns the agent ID the coordinator LEASE names as the
+// project's coord — the live active owner (coordlock.LiveOwner) or, during boot,
+// the current `starting` owner within its TTL (coordlock.CurrentStarting). Empty
+// when no coord holds or is booting the lease. It replaces the deleted
+// coord-spawn marker as the dashboard's + [a]-dedup's coord-identity signal
+// (D3): the lease IS the identity now. var so tests can stub the lease read.
 //
-// Used by the dashboard renderer (issue #96 gap 1) to clear stale
-// markers when the tmux session for the agent_id named in the marker
-// is gone — the next render then flips Stuck → Idle naturally because
-// `coordSpawnMarkerMtimeFn` returns ok=false for the deleted file.
-var removeCoordSpawnMarkerFn = state.RemoveCoordSpawnMarker
+// This also subsumes the marker's freshness gate: LiveOwner is process-live (no
+// staleness), and CurrentStarting is TTL-bounded, so a coord whose process died
+// no longer names an identity — the dashboard row flips to Idle automatically
+// without a marker-removal self-heal.
+var coordSpawnIdentityFn = coordSpawnLeaseIdentity
+
+func coordSpawnLeaseIdentity(projectName string) string {
+	if o, ok := coordlock.LiveOwner(projectName); ok && o.AgentID != "" {
+		return o.AgentID
+	}
+	if st, ok := coordlock.CurrentStarting(projectName); ok && st.WithinTTL && st.Owner.AgentID != "" {
+		return st.Owner.AgentID
+	}
+	return ""
+}
 
 // nowFn returns the current wall-clock time. var so tests can pin
 // "now" deterministically without touching time.Now globally.

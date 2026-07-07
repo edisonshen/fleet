@@ -20,14 +20,18 @@ import (
 // fakeSwap collects the configurable knobs for a single AtomicCoordSwap
 // test case. Each field corresponds to one of the package-level seams
 // the helper consults; nil/zero values pick a sensible default
-// (spawn succeeds, session always alive, marker write succeeds, etc.).
+// (spawn succeeds, session always alive, handoff reserve succeeds, etc.).
+//
+// D3: the coord-spawn marker is gone. The helper no longer writes a marker at a
+// synchronous commit point; instead it RESERVES a handoff on OLD's lease (naming
+// NEW) before retiring OLD. reserveHandoffFn is the injected seam.
 type fakeSwap struct {
 	spawnErr       error
 	spawnNewRec    *agent.Record // override the synthesized NEW record
 	waitErr        error
 	postReadyAlive bool  // step 3.b alive return
 	postReadyErr   error // step 3.b err return
-	markerWriteErr error
+	reserveErr     error // step 4 ReserveHandoff error (best-effort; never rolls back)
 	sendKeysErr    error
 	killErr        error
 	postKillAlive  bool  // step 5.c alive return
@@ -37,8 +41,9 @@ type fakeSwap struct {
 	spawnCalls         int
 	waitCalls          int
 	postReadyProbeOf   []string
-	markerWroteValue   string
-	markerWroteProj    string
+	reserveCalled      bool
+	reservedSuccessor  string
+	reservedProj       string
 	sendKeysCalled     bool
 	killCalled         bool
 	postKillProbeCalls int
@@ -52,7 +57,7 @@ func (f *fakeSwap) install(t *testing.T, newRec *agent.Record) func() {
 	origSpawn := spawnFn
 	origWait := waitForReadyToPromptFn
 	origAlive := sessionAliveFn
-	origMarker := writeCoordSpawnMarkerFn
+	origReserve := reserveHandoffFn
 	origSendKeys := tmuxSendKeysFn
 	origKill := tmuxKillFn
 	origSleep := sleepFn
@@ -88,13 +93,14 @@ func (f *fakeSwap) install(t *testing.T, newRec *agent.Record) func() {
 		f.postKillProbeCalls++
 		return f.postKillAlive, f.postKillErr
 	}
-	writeCoordSpawnMarkerFn = func(project, agentID string) error {
-		f.markerWroteProj = project
-		f.markerWroteValue = agentID
-		if f.markerWriteErr != nil {
-			return f.markerWriteErr
+	reserveHandoffFn = func(project, successorID string, ttl time.Duration) (bool, error) {
+		f.reserveCalled = true
+		f.reservedProj = project
+		f.reservedSuccessor = successorID
+		if f.reserveErr != nil {
+			return false, f.reserveErr
 		}
-		return state.WriteCoordSpawnMarker(project, agentID)
+		return true, nil
 	}
 	tmuxSendKeysFn = func(session string, keys ...string) error {
 		f.sendKeysCalled = true
@@ -112,7 +118,7 @@ func (f *fakeSwap) install(t *testing.T, newRec *agent.Record) func() {
 		spawnFn = origSpawn
 		waitForReadyToPromptFn = origWait
 		sessionAliveFn = origAlive
-		writeCoordSpawnMarkerFn = origMarker
+		reserveHandoffFn = origReserve
 		tmuxSendKeysFn = origSendKeys
 		tmuxKillFn = origKill
 		sleepFn = origSleep
@@ -120,9 +126,10 @@ func (f *fakeSwap) install(t *testing.T, newRec *agent.Record) func() {
 }
 
 // seedCoordSwap initializes FLEET_HOME + project dir + writes the OLD
-// coord record + sets the marker to OLD.ID. Returns a populated
-// AtomicCoordSwapInputs (caller can mutate before passing to the helper)
-// and a synthesized NEW record (returned via the fake spawn).
+// coord record. Returns a populated AtomicCoordSwapInputs (caller can mutate
+// before passing to the helper) and a synthesized NEW record (returned via the
+// fake spawn). D3: no marker is seeded — the lease is the identity, and
+// AtomicCoordSwap has no marker precondition anymore.
 func seedCoordSwap(t *testing.T, project, oldID, newID string) (AtomicCoordSwapInputs, *agent.Record) {
 	t.Helper()
 	setupFleetHome(t)
@@ -134,9 +141,6 @@ func seedCoordSwap(t *testing.T, project, oldID, newID string) (AtomicCoordSwapI
 	old.TmuxSession = tmux.SessionName(oldID)
 	if err := old.Write(); err != nil {
 		t.Fatalf("old.Write: %v", err)
-	}
-	if err := state.WriteCoordSpawnMarker(project, oldID); err != nil {
-		t.Fatalf("WriteCoordSpawnMarker(old): %v", err)
 	}
 
 	newRec := agent.New(newID)
@@ -174,8 +178,8 @@ func TestAtomicCoordSwap_HappyPath_LiveOld(t *testing.T) {
 	if err != nil {
 		t.Fatalf("AtomicCoordSwap: %v (stderr=%s)", err, stderr.String())
 	}
-	if got := state.ReadCoordSpawnMarker("rainier"); got != "newcoord" {
-		t.Errorf("marker = %q; want newcoord", got)
+	if !fake.reserveCalled || fake.reservedSuccessor != "newcoord" {
+		t.Errorf("expected ReserveHandoff(newcoord) on the commit path; reserveCalled=%v successor=%q", fake.reserveCalled, fake.reservedSuccessor)
 	}
 	if !res.OldArchived {
 		t.Errorf("OldArchived = false; want true")
@@ -213,8 +217,10 @@ func TestAtomicCoordSwap_HappyPath_DeadOld(t *testing.T) {
 	if err != nil {
 		t.Fatalf("AtomicCoordSwap: %v", err)
 	}
-	if got := state.ReadCoordSpawnMarker("rainier"); got != "newcoord" {
-		t.Errorf("marker = %q; want newcoord", got)
+	// oldIsDead=true: the handoff reservation is SKIPPED (no live OLD lease to
+	// reserve against) — NEW is spawned and OLD is preserved for operator [x].
+	if fake.reserveCalled {
+		t.Errorf("ReserveHandoff must be SKIPPED when oldIsDead=true; reserved %q", fake.reservedSuccessor)
 	}
 	if res.OldArchived {
 		t.Errorf("OldArchived = true; want false for oldIsDead=true case")
@@ -229,71 +235,6 @@ func TestAtomicCoordSwap_HappyPath_DeadOld(t *testing.T) {
 	livePath, _ := state.AgentPath("deadcoord")
 	if _, err := os.Stat(livePath); err != nil {
 		t.Errorf("OLD record should be preserved when oldIsDead=true; stat err: %v", err)
-	}
-}
-
-// TestAtomicCoordSwap_Preconditions_MarkerNotOld verifies that step 1.b
-// catches a marker that's already been moved by a concurrent swap.
-// Helper aborts with ErrConcurrentSwap; NEW is NOT spawned.
-func TestAtomicCoordSwap_Preconditions_MarkerNotOld(t *testing.T) {
-	in, newRec := seedCoordSwap(t, "rainier", "oldcoord", "newcoord")
-	// Race: another swap moved the marker to "racedcoord" before we
-	// got the lock.
-	if err := state.WriteCoordSpawnMarker("rainier", "racedcoord"); err != nil {
-		t.Fatalf("seed race marker: %v", err)
-	}
-	fake := &fakeSwap{}
-	restore := fake.install(t, newRec)
-	defer restore()
-
-	_, err := AtomicCoordSwap(in, nil)
-	if err == nil {
-		t.Fatalf("expected error when marker is not OLD; got nil")
-	}
-	if !errors.Is(err, ErrConcurrentSwap) {
-		t.Errorf("expected ErrConcurrentSwap; got: %v", err)
-	}
-	if fake.spawnCalls != 0 {
-		t.Errorf("spawn should NOT be called when preconditions fail; got %d calls", fake.spawnCalls)
-	}
-}
-
-// TestAtomicCoordSwap_Preconditions_MarkerNotOld_AlreadySpawned_CleansUpNEW
-// is the codex iter-1 [P2] regression: when the caller pre-spawned NEW
-// (AlreadySpawnedNewRec set) AND the marker races to a different ID
-// before we acquire the lock, the helper MUST clean up the pre-spawned
-// NEW. Otherwise the detection of the race produces the duplicate-agent
-// state the check was meant to prevent.
-func TestAtomicCoordSwap_Preconditions_MarkerNotOld_AlreadySpawned_CleansUpNEW(t *testing.T) {
-	in, newRec := seedCoordSwap(t, "rainier", "oldcoord", "newcoord")
-	// Caller pre-spawned NEW and wrote its record.
-	if err := newRec.Write(); err != nil {
-		t.Fatalf("newRec.Write seed: %v", err)
-	}
-	in.AlreadySpawnedNewRec = newRec
-	// Race: marker moved to someone else.
-	if err := state.WriteCoordSpawnMarker("rainier", "racedcoord"); err != nil {
-		t.Fatalf("seed race marker: %v", err)
-	}
-	fake := &fakeSwap{}
-	restore := fake.install(t, newRec)
-	defer restore()
-
-	_, err := AtomicCoordSwap(in, nil)
-	if err == nil {
-		t.Fatalf("expected ErrConcurrentSwap")
-	}
-	if !errors.Is(err, ErrConcurrentSwap) {
-		t.Errorf("expected ErrConcurrentSwap; got: %v", err)
-	}
-	// Pre-spawned NEW record MUST be cleaned up (DropReplacementRecord).
-	newPath, _ := state.AgentPath("newcoord")
-	if _, statErr := os.Stat(newPath); !errors.Is(statErr, os.ErrNotExist) {
-		t.Errorf("pre-spawned NEW record should be cleaned up on concurrent-swap detection; statErr=%v", statErr)
-	}
-	// Marker untouched.
-	if got := state.ReadCoordSpawnMarker("rainier"); got != "racedcoord" {
-		t.Errorf("marker = %q; want racedcoord (unchanged)", got)
 	}
 }
 
@@ -314,7 +255,7 @@ func TestAtomicCoordSwap_Preconditions_LockHeld(t *testing.T) {
 	origSpawn := spawnFn
 	origWait := waitForReadyToPromptFn
 	origAlive := sessionAliveFn
-	origMarker := writeCoordSpawnMarkerFn
+	origReserve := reserveHandoffFn
 	origSendKeys := tmuxSendKeysFn
 	origKill := tmuxKillFn
 	origSleep := sleepFn
@@ -322,7 +263,7 @@ func TestAtomicCoordSwap_Preconditions_LockHeld(t *testing.T) {
 		spawnFn = origSpawn
 		waitForReadyToPromptFn = origWait
 		sessionAliveFn = origAlive
-		writeCoordSpawnMarkerFn = origMarker
+		reserveHandoffFn = origReserve
 		tmuxSendKeysFn = origSendKeys
 		tmuxKillFn = origKill
 		sleepFn = origSleep
@@ -354,7 +295,7 @@ func TestAtomicCoordSwap_Preconditions_LockHeld(t *testing.T) {
 		}
 		return false, nil
 	}
-	writeCoordSpawnMarkerFn = state.WriteCoordSpawnMarker
+	reserveHandoffFn = func(project, successorID string, ttl time.Duration) (bool, error) { return true, nil }
 	tmuxSendKeysFn = func(session string, keys ...string) error { return nil }
 	tmuxKillFn = func(session string) error { return nil }
 	sleepFn = func(d time.Duration) {}
@@ -374,8 +315,14 @@ func TestAtomicCoordSwap_Preconditions_LockHeld(t *testing.T) {
 	// Issue the second call. It must block on the swap lock and NOT
 	// reach spawnFn until we release the first.
 	in2 := in
-	// Second swap operates under SAME OLD (marker hasn't moved yet
-	// because the first hasn't reached step 4) and a different NEW ID.
+	// D3: the second swap no longer aborts on a marker precondition, so it now
+	// runs the full retire (including in.OldRec.ArchiveWithHandoff). Give it a
+	// DISTINCT OldRec pointer — the real production shape is two independent
+	// swap invocations, each with its own record — so the two goroutines don't
+	// race on the shared *agent.Record.
+	oldCopy := *in.OldRec
+	in2.OldRec = &oldCopy
+	// Second swap uses a different NEW ID.
 	in2.NewRecSpec.PreAllocatedID = "newcoord2"
 	secondDone := make(chan struct{})
 	wg.Add(1)
@@ -399,12 +346,13 @@ func TestAtomicCoordSwap_Preconditions_LockHeld(t *testing.T) {
 	if firstErr != nil {
 		t.Errorf("first swap: %v", firstErr)
 	}
-	// Second swap will see the marker as newcoord (committed by first)
-	// and abort with ErrConcurrentSwap — that's the correct
-	// serialization behavior.
-	if !errors.Is(secondErr, ErrConcurrentSwap) {
-		t.Errorf("second swap should fail with ErrConcurrentSwap (first committed the marker); got: %v", secondErr)
-	}
+	// D3: the marker precondition is gone, so the second swap no longer aborts
+	// with a concurrent-swap error — the load-bearing guarantee this test pins is
+	// SERIALIZATION: the two swaps never overlapped inside spawnFn (proven below),
+	// and the second blocked on the flock until the first released (proven by the
+	// secondDone select above). We deliberately do NOT assert on secondErr's value
+	// (the second swap runs against an already-retired OLD, a benign edge).
+	_ = secondErr
 	if overlapped.Load() {
 		t.Errorf("two swaps were inside spawnFn concurrently — flock did not enforce mutual exclusion")
 	}
@@ -424,8 +372,8 @@ func TestAtomicCoordSwap_Spawn_Fails_NoObservable(t *testing.T) {
 	if err == nil {
 		t.Fatalf("expected error on spawn failure")
 	}
-	if got := state.ReadCoordSpawnMarker("rainier"); got != "oldcoord" {
-		t.Errorf("marker changed to %q on spawn failure; want oldcoord (unchanged)", got)
+	if fake.reserveCalled {
+		t.Errorf("swap aborted pre-reserve; ReserveHandoff must NOT be called (reserved %q)", fake.reservedSuccessor)
 	}
 	livePath, _ := state.AgentPath("oldcoord")
 	if _, err := os.Stat(livePath); err != nil {
@@ -453,8 +401,8 @@ func TestAtomicCoordSwap_WaitForReady_Timeout(t *testing.T) {
 	if err != nil {
 		t.Fatalf("AtomicCoordSwap should not fail on wait-timeout alone (probe is authoritative): %v", err)
 	}
-	if got := state.ReadCoordSpawnMarker("rainier"); got != "newcoord" {
-		t.Errorf("marker = %q; want newcoord", got)
+	if !fake.reserveCalled || fake.reservedSuccessor != "newcoord" {
+		t.Errorf("expected ReserveHandoff(newcoord) on the commit path; reserveCalled=%v successor=%q", fake.reserveCalled, fake.reservedSuccessor)
 	}
 	if !strings.Contains(stderr.String(), "did not converge") {
 		t.Errorf("stderr should warn about wait-timeout; got: %s", stderr.String())
@@ -484,8 +432,8 @@ func TestAtomicCoordSwap_ReProbe_DefinitivelyDead(t *testing.T) {
 	if !strings.Contains(err.Error(), "exited during readiness wait") {
 		t.Errorf("error should mention readiness wait; got: %v", err)
 	}
-	if got := state.ReadCoordSpawnMarker("rainier"); got != "oldcoord" {
-		t.Errorf("marker = %q; want oldcoord (unchanged)", got)
+	if fake.reserveCalled {
+		t.Errorf("swap aborted pre-reserve; ReserveHandoff must NOT be called (reserved %q)", fake.reservedSuccessor)
 	}
 	// NEW record should be removed.
 	newPath, _ := state.AgentPath("newcoord")
@@ -516,98 +464,13 @@ func TestAtomicCoordSwap_ReProbe_AmbiguousError(t *testing.T) {
 	if !strings.Contains(err.Error(), "preserved for operator inspection") {
 		t.Errorf("error should mention preservation; got: %v", err)
 	}
-	if got := state.ReadCoordSpawnMarker("rainier"); got != "oldcoord" {
-		t.Errorf("marker = %q; want oldcoord", got)
+	if fake.reserveCalled {
+		t.Errorf("swap aborted pre-reserve; ReserveHandoff must NOT be called (reserved %q)", fake.reservedSuccessor)
 	}
 	// NEW record MUST be preserved (operator inspection).
 	newPath, _ := state.AgentPath("newcoord")
 	if _, statErr := os.Stat(newPath); statErr != nil {
 		t.Errorf("NEW record should be preserved on ambiguous probe; statErr=%v", statErr)
-	}
-}
-
-// TestAtomicCoordSwap_PreSpawned_MarkerAtNew_ProbeError_RollsBackMarker
-// pins codex iter-16 [P1]: when AlreadySpawnedNewRec is set AND the
-// caller pre-eager-wrote marker → newRec.ID, a transient probe failure
-// on NEW must roll the marker back to oldRec.ID. Pre-iter-16 the
-// `perr != nil` branch returned without undoing the eager write,
-// leaving marker pointing at a NEW we never confirmed alive while OLD
-// was still the real coord. Downstream retry paths use
-// `marker == newRec.ID` as a post-commit signal — they'd treat this
-// never-committed state as committed and refuse safe recovery.
-func TestAtomicCoordSwap_PreSpawned_MarkerAtNew_ProbeError_RollsBackMarker(t *testing.T) {
-	in, newRec := seedCoordSwap(t, "rainier", "oldcoord", "newcoord")
-	if err := newRec.Write(); err != nil {
-		t.Fatalf("newRec.Write seed: %v", err)
-	}
-	in.AlreadySpawnedNewRec = newRec
-
-	// Simulate the caller's eager marker write to newRec.ID BEFORE
-	// invoking the helper. This is what handoffop.Resume's case-3
-	// path + runHandoff's step 8a-bis do in production.
-	if err := state.WriteCoordSpawnMarker("rainier", "newcoord"); err != nil {
-		t.Fatalf("seed eager marker write: %v", err)
-	}
-
-	fake := &fakeSwap{
-		postReadyAlive: false,
-		postReadyErr:   errors.New("simulated NEW probe transport failure"),
-	}
-	restore := fake.install(t, newRec)
-	defer restore()
-
-	var stderr bytes.Buffer
-	_, err := AtomicCoordSwap(in, &stderr)
-	if err == nil {
-		t.Fatalf("expected probe-error to surface; got nil")
-	}
-	if !strings.Contains(err.Error(), "preserves the record for operator inspection") {
-		t.Errorf("error should preserve NEW record for operator inspection; got: %v", err)
-	}
-
-	// Load-bearing assertion: marker must be rolled back to oldcoord.
-	// Pre-iter-16 this would still be at "newcoord".
-	if got := state.ReadCoordSpawnMarker("rainier"); got != "oldcoord" {
-		t.Errorf("marker not rolled back: got %q want oldcoord", got)
-	}
-
-	// NEW record preserved for operator inspection (the existing
-	// contract — separate from the marker rollback fix).
-	newPath, _ := state.AgentPath("newcoord")
-	if _, statErr := os.Stat(newPath); statErr != nil {
-		t.Errorf("NEW record should be preserved: %v", statErr)
-	}
-}
-
-// TestAtomicCoordSwap_MarkerWrite_Fails: step 4 errors. NEW is alive
-// but not declared as coord — roll back NEW (kill + remove record).
-// Marker unchanged at OLD.
-func TestAtomicCoordSwap_MarkerWrite_Fails(t *testing.T) {
-	in, newRec := seedCoordSwap(t, "rainier", "oldcoord", "newcoord")
-	if err := newRec.Write(); err != nil {
-		t.Fatalf("newRec.Write seed: %v", err)
-	}
-	fake := &fakeSwap{
-		postReadyAlive: true,
-		markerWriteErr: errors.New("simulated marker write EIO"),
-	}
-	restore := fake.install(t, newRec)
-	defer restore()
-
-	_, err := AtomicCoordSwap(in, nil)
-	if err == nil {
-		t.Fatalf("expected error on marker write failure")
-	}
-	if !strings.Contains(err.Error(), "marker write failed") {
-		t.Errorf("error should mention marker write; got: %v", err)
-	}
-	if got := state.ReadCoordSpawnMarker("rainier"); got != "oldcoord" {
-		t.Errorf("marker = %q; want oldcoord", got)
-	}
-	// NEW record should be cleaned up.
-	newPath, _ := state.AgentPath("newcoord")
-	if _, statErr := os.Stat(newPath); !errors.Is(statErr, os.ErrNotExist) {
-		t.Errorf("NEW record should be removed on marker-write rollback; statErr=%v", statErr)
 	}
 }
 
@@ -650,8 +513,8 @@ func TestAtomicCoordSwap_OldKill_Fails_StillAlive(t *testing.T) {
 		t.Errorf("orphan.NewAgentID = %q; want newcoord", orphan.NewAgentID)
 	}
 	// Marker MUST be at NEW (committed in step 4).
-	if got := state.ReadCoordSpawnMarker("rainier"); got != "newcoord" {
-		t.Errorf("marker = %q; want newcoord (invariant: NEW owns post-commit)", got)
+	if !fake.reserveCalled || fake.reservedSuccessor != "newcoord" {
+		t.Errorf("expected ReserveHandoff(newcoord) on the commit path; reserveCalled=%v successor=%q", fake.reserveCalled, fake.reservedSuccessor)
 	}
 	// OLD record MUST be PRESERVED on disk (codex iter-7 [P1]).
 	// Operator can see the live OLD via `fleet status` and decide
@@ -716,8 +579,8 @@ func TestAtomicCoordSwap_OldKill_ProbeAmbiguous(t *testing.T) {
 		t.Errorf("expected ErrOldKillProbeAmbiguous; got: %v", err)
 	}
 	// Marker committed.
-	if got := state.ReadCoordSpawnMarker("rainier"); got != "newcoord" {
-		t.Errorf("marker = %q; want newcoord (invariant: NEW owns post-commit)", got)
+	if !fake.reserveCalled || fake.reservedSuccessor != "newcoord" {
+		t.Errorf("expected ReserveHandoff(newcoord) on the commit path; reserveCalled=%v successor=%q", fake.reserveCalled, fake.reservedSuccessor)
 	}
 	// OLD record MUST stay on disk (operator triage).
 	livePath, _ := state.AgentPath("oldcoord")
@@ -782,8 +645,8 @@ func TestAtomicCoordSwap_OldKill_Fails_PostProbeNotOnSocket(t *testing.T) {
 	}
 	// Marker still committed in step 4 — that's the load-bearing
 	// invariant of the helper.
-	if got := state.ReadCoordSpawnMarker("rainier"); got != "newcoord" {
-		t.Errorf("marker = %q; want newcoord (commit invariant)", got)
+	if !fake.reserveCalled || fake.reservedSuccessor != "newcoord" {
+		t.Errorf("expected ReserveHandoff(newcoord) on the commit path; reserveCalled=%v successor=%q", fake.reserveCalled, fake.reservedSuccessor)
 	}
 	// OLD record MUST be preserved (operator triage).
 	if res.OldArchived {
@@ -839,8 +702,8 @@ func TestAtomicCoordSwap_OldArchive_Fails_KillConfirmed(t *testing.T) {
 	if err != nil {
 		t.Fatalf("AtomicCoordSwap should fall back to os.Remove when Archive fails but kill confirmed: %v (stderr=%s)", err, stderr.String())
 	}
-	if got := state.ReadCoordSpawnMarker("rainier"); got != "newcoord" {
-		t.Errorf("marker = %q; want newcoord", got)
+	if !fake.reserveCalled || fake.reservedSuccessor != "newcoord" {
+		t.Errorf("expected ReserveHandoff(newcoord) on the commit path; reserveCalled=%v successor=%q", fake.reserveCalled, fake.reservedSuccessor)
 	}
 	if !res.OldArchived {
 		t.Errorf("OldArchived = false; fallback path should still set OldArchived=true")
@@ -872,267 +735,5 @@ func TestAtomicCoordSwap_DeadOldRecord_NotArchived(t *testing.T) {
 	livePath, _ := state.AgentPath("deadold")
 	if _, err := os.Stat(livePath); err != nil {
 		t.Errorf("OLD record should be PRESERVED when oldIsDead=true; stat err: %v", err)
-	}
-}
-
-// TestAtomicCoordSwap_WriteAtomic_ParentDirFsync exercises the
-// integration with commit 1's parent-dir fsync. The swap calls
-// state.WriteCoordSpawnMarker which calls state.WriteAtomic, which
-// invokes fsyncParent. We hook fsyncParent here to assert the call
-// happened with the correct dir.
-func TestAtomicCoordSwap_WriteAtomic_ParentDirFsync(t *testing.T) {
-	in, newRec := seedCoordSwap(t, "rainier", "oldcoord", "newcoord")
-	fake := &fakeSwap{postReadyAlive: true, postKillAlive: false}
-	restore := fake.install(t, newRec)
-	defer restore()
-
-	// Don't go through the markerWriteErr override path — use the real
-	// state.WriteCoordSpawnMarker so fsyncParent runs.
-	writeCoordSpawnMarkerFn = state.WriteCoordSpawnMarker
-
-	// Spy on the package-level fsyncParent via state's exported test seam.
-	// state package's fsyncParent is package-private; tests in state/
-	// already verify it. We test that the marker file ends up at the
-	// right path and matches the new ID — the durability of the rename
-	// (parent-dir fsync) is exercised end-to-end via the commit-1 unit
-	// tests in state_test.go. Here we just confirm the integration.
-	_, err := AtomicCoordSwap(in, nil)
-	if err != nil {
-		t.Fatalf("AtomicCoordSwap: %v", err)
-	}
-	if got := state.ReadCoordSpawnMarker("rainier"); got != "newcoord" {
-		t.Errorf("marker = %q; want newcoord", got)
-	}
-	// Verify the marker file exists on disk (rename committed).
-	markerPath, _ := state.CoordSpawnMarkerPath("rainier")
-	if _, err := os.Stat(markerPath); err != nil {
-		t.Errorf("marker file not present on disk after swap: %v", err)
-	}
-}
-
-// ----- Crash recovery test cases -----
-
-// TestAtomicCoordSwap_CrashWindowA_NEWLiveBothRecords simulates a
-// crash AFTER step 2 (NEW spawned + record written) BEFORE step 3
-// (probe). State observable after restart: marker at OLD, both NEW
-// and OLD records on disk, both tmux sessions live. The recovery
-// command for case 4 (non-queued) is `fleet rm <NEW_ID>`; queued
-// cases would also work via the resume path but case A is pre-commit
-// so no queue file exists in any case.
-//
-// This test doesn't simulate the crash in-process — we set up the
-// post-crash state manually and verify the recovery command shape
-// (in production: `fleet rm <NEW_ID>` archives NEW + kills its tmux,
-// marker stays at OLD). Here we just verify state matches the plan's
-// description: both records on disk, marker at OLD, no queue file.
-func TestAtomicCoordSwap_CrashWindowA_NEWLiveBothRecords(t *testing.T) {
-	setupFleetHome(t)
-	project := "rainier"
-	if _, err := state.EnsureProjectInitialized(project); err != nil {
-		t.Fatalf("EnsureProjectInitialized: %v", err)
-	}
-	// Seed OLD record + marker at OLD.
-	old := agent.New("oldcoord")
-	old.Project = project
-	old.TmuxSession = tmux.SessionName("oldcoord")
-	if err := old.Write(); err != nil {
-		t.Fatalf("old.Write: %v", err)
-	}
-	if err := state.WriteCoordSpawnMarker(project, "oldcoord"); err != nil {
-		t.Fatalf("WriteCoordSpawnMarker: %v", err)
-	}
-	// Seed NEW record (step 2 ran).
-	newRec := agent.New("newcoord")
-	newRec.Project = project
-	newRec.TmuxSession = tmux.SessionName("newcoord")
-	if err := newRec.Write(); err != nil {
-		t.Fatalf("newRec.Write: %v", err)
-	}
-
-	// Assert the post-crash state matches the plan.
-	if got := state.ReadCoordSpawnMarker(project); got != "oldcoord" {
-		t.Errorf("post-crash marker = %q; want oldcoord", got)
-	}
-	if _, err := agent.Load("oldcoord"); err != nil {
-		t.Errorf("OLD record should be loadable: %v", err)
-	}
-	if _, err := agent.Load("newcoord"); err != nil {
-		t.Errorf("NEW record should be loadable: %v", err)
-	}
-	// No queue file expected (Window A is pre-commit; case 4 doesn't
-	// write queue journals at all, and queued cases write the journal
-	// elsewhere — runHandoff writes its own journal which is unrelated
-	// to AtomicCoordSwap's commit point).
-}
-
-// TestAtomicCoordSwap_CrashWindowB_Queued_MarkerAtNew_OldAlive
-// simulates a crash AFTER step 4 (marker committed) BEFORE step 5.b
-// (OLD kill never sent). State: marker at NEW, both records live,
-// queue journal present (queued cases 1/2/3/5 — auto-handoff /
-// manual / engine swap). Recovery: `fleet handoff <OLD>` (resume path)
-// finishes the swap idempotently. `fleet rm <OLD>` would refuse
-// while the queue journal exists.
-//
-// We don't drive the full recovery here (that's tested in the
-// commit-3 / commit-4 integration tests). This case verifies the
-// observable post-crash state matches the plan.
-func TestAtomicCoordSwap_CrashWindowB_Queued_MarkerAtNew_OldAlive(t *testing.T) {
-	setupFleetHome(t)
-	project := "rainier"
-	if _, err := state.EnsureProjectInitialized(project); err != nil {
-		t.Fatalf("EnsureProjectInitialized: %v", err)
-	}
-	// Both records on disk.
-	old := agent.New("oldcoord")
-	old.Project = project
-	old.TmuxSession = tmux.SessionName("oldcoord")
-	if err := old.Write(); err != nil {
-		t.Fatalf("old.Write: %v", err)
-	}
-	newRec := agent.New("newcoord")
-	newRec.Project = project
-	newRec.TmuxSession = tmux.SessionName("newcoord")
-	if err := newRec.Write(); err != nil {
-		t.Fatalf("newRec.Write: %v", err)
-	}
-	// Marker at NEW (step 4 committed).
-	if err := state.WriteCoordSpawnMarker(project, "newcoord"); err != nil {
-		t.Fatalf("WriteCoordSpawnMarker: %v", err)
-	}
-	// Queue file present (queued case).
-	root, _ := state.Root()
-	queuePath := filepath.Join(root, "queue", "spawn-fresh-oldcoord.json")
-	if err := os.WriteFile(queuePath, []byte(`{"old_agent_id":"oldcoord","new_agent_id":"newcoord","schema_version":2}`), 0o644); err != nil {
-		t.Fatalf("seed queue file: %v", err)
-	}
-
-	// Verify post-crash state.
-	if got := state.ReadCoordSpawnMarker(project); got != "newcoord" {
-		t.Errorf("marker = %q; want newcoord", got)
-	}
-	if _, err := os.Stat(queuePath); err != nil {
-		t.Errorf("queue file should be present for queued case: %v", err)
-	}
-}
-
-// TestAtomicCoordSwap_CrashWindowB_NonQueued_MarkerAtNew_OldAlive
-// simulates Window B for case 4 (dead-coord resume via [a]). No
-// queue journal. Recovery: `fleet rm <OLD>` resolves cleanly.
-func TestAtomicCoordSwap_CrashWindowB_NonQueued_MarkerAtNew_OldAlive(t *testing.T) {
-	setupFleetHome(t)
-	project := "rainier"
-	if _, err := state.EnsureProjectInitialized(project); err != nil {
-		t.Fatalf("EnsureProjectInitialized: %v", err)
-	}
-	old := agent.New("oldcoord")
-	old.Project = project
-	old.TmuxSession = tmux.SessionName("oldcoord")
-	if err := old.Write(); err != nil {
-		t.Fatalf("old.Write: %v", err)
-	}
-	newRec := agent.New("newcoord")
-	newRec.Project = project
-	newRec.TmuxSession = tmux.SessionName("newcoord")
-	if err := newRec.Write(); err != nil {
-		t.Fatalf("newRec.Write: %v", err)
-	}
-	if err := state.WriteCoordSpawnMarker(project, "newcoord"); err != nil {
-		t.Fatalf("WriteCoordSpawnMarker: %v", err)
-	}
-
-	if got := state.ReadCoordSpawnMarker(project); got != "newcoord" {
-		t.Errorf("marker = %q; want newcoord", got)
-	}
-	// NO queue file expected (case 4 / non-queued).
-	root, _ := state.Root()
-	queuePath := filepath.Join(root, "queue", "spawn-fresh-oldcoord.json")
-	if _, err := os.Stat(queuePath); !errors.Is(err, os.ErrNotExist) {
-		t.Errorf("queue file unexpectedly present for non-queued case: %v", err)
-	}
-}
-
-// TestAtomicCoordSwap_CrashWindowC_Queued_MarkerAtNew_OldDead
-// simulates a crash AFTER step 5.c success BEFORE step 6 (Archive).
-// State: marker at NEW, OLD tmux dead, OLD record still on disk
-// (Archive never ran), queue journal present. Recovery: rerun
-// `fleet handoff <OLD>` which archives idempotently and clears
-// the queue.
-func TestAtomicCoordSwap_CrashWindowC_Queued_MarkerAtNew_OldDead(t *testing.T) {
-	setupFleetHome(t)
-	project := "rainier"
-	if _, err := state.EnsureProjectInitialized(project); err != nil {
-		t.Fatalf("EnsureProjectInitialized: %v", err)
-	}
-	old := agent.New("oldcoord")
-	old.Project = project
-	old.TmuxSession = tmux.SessionName("oldcoord")
-	if err := old.Write(); err != nil {
-		t.Fatalf("old.Write: %v", err)
-	}
-	newRec := agent.New("newcoord")
-	newRec.Project = project
-	newRec.TmuxSession = tmux.SessionName("newcoord")
-	if err := newRec.Write(); err != nil {
-		t.Fatalf("newRec.Write: %v", err)
-	}
-	if err := state.WriteCoordSpawnMarker(project, "newcoord"); err != nil {
-		t.Fatalf("WriteCoordSpawnMarker: %v", err)
-	}
-	root, _ := state.Root()
-	queuePath := filepath.Join(root, "queue", "spawn-fresh-oldcoord.json")
-	if err := os.WriteFile(queuePath, []byte(`{"old_agent_id":"oldcoord","new_agent_id":"newcoord","schema_version":2}`), 0o644); err != nil {
-		t.Fatalf("seed queue file: %v", err)
-	}
-
-	// OLD tmux dead is not asserted here (no real tmux session
-	// was ever started); the plan's invariant is "OLD record stale
-	// (live file present, no live tmux)". Operator running `fleet
-	// status` would see the stale-tmux signal. We assert the file
-	// shape.
-	if _, err := agent.Load("oldcoord"); err != nil {
-		t.Errorf("OLD record should still be on disk: %v", err)
-	}
-	if got := state.ReadCoordSpawnMarker(project); got != "newcoord" {
-		t.Errorf("marker = %q; want newcoord", got)
-	}
-}
-
-// TestAtomicCoordSwap_CrashWindowC_NonQueued_MarkerAtNew_OldDead
-// simulates Window C for case 4 (non-queued). Recovery: `fleet rm
-// <OLD>` is idempotent — tmux already dead, just archives the
-// record.
-func TestAtomicCoordSwap_CrashWindowC_NonQueued_MarkerAtNew_OldDead(t *testing.T) {
-	setupFleetHome(t)
-	project := "rainier"
-	if _, err := state.EnsureProjectInitialized(project); err != nil {
-		t.Fatalf("EnsureProjectInitialized: %v", err)
-	}
-	old := agent.New("oldcoord")
-	old.Project = project
-	old.TmuxSession = tmux.SessionName("oldcoord")
-	if err := old.Write(); err != nil {
-		t.Fatalf("old.Write: %v", err)
-	}
-	newRec := agent.New("newcoord")
-	newRec.Project = project
-	newRec.TmuxSession = tmux.SessionName("newcoord")
-	if err := newRec.Write(); err != nil {
-		t.Fatalf("newRec.Write: %v", err)
-	}
-	if err := state.WriteCoordSpawnMarker(project, "newcoord"); err != nil {
-		t.Fatalf("WriteCoordSpawnMarker: %v", err)
-	}
-
-	if _, err := agent.Load("oldcoord"); err != nil {
-		t.Errorf("OLD record should still be on disk: %v", err)
-	}
-	if got := state.ReadCoordSpawnMarker(project); got != "newcoord" {
-		t.Errorf("marker = %q; want newcoord", got)
-	}
-	// No queue file for case 4 (non-queued).
-	root, _ := state.Root()
-	queuePath := filepath.Join(root, "queue", "spawn-fresh-oldcoord.json")
-	if _, err := os.Stat(queuePath); !errors.Is(err, os.ErrNotExist) {
-		t.Errorf("queue file unexpectedly present for non-queued case: %v", err)
 	}
 }

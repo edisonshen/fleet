@@ -222,8 +222,8 @@ func newCoordRunCmd() *cobra.Command {
 		Long: `Supervise a coord child (claude in production). On every exit
 path — clean exit, signal-killed, internal panic — the supervisor
 reaps the coord's own tmux session, archives its agent record to
-~/.fleet/agents/archive/<id>-<UTC>.json, and clears the project's
-coord-spawn-marker iff its body matches <id>.
+~/.fleet/agents/archive/<id>-<UTC>.json, and releases the project's
+coordinator lease if this coord still holds it.
 
 Required: --agent <id>, --project <name>, and a child argv after --.`,
 		// Use Args=ArbitraryArgs so anything after the flags is passed to
@@ -255,7 +255,7 @@ Required: --agent <id>, --project <name>, and a child argv after --.`,
 	cmd.Flags().StringVar(&agentID, "agent", "",
 		"agent ID this coord belongs to (REQUIRED; matches ~/.fleet/agents/<id>.json)")
 	cmd.Flags().StringVar(&project, "project", "",
-		"project name (REQUIRED; the project whose coord-spawn-marker we own)")
+		"project name (REQUIRED; the project whose coordinator lease we own)")
 	cmd.Flags().BoolVar(&standby, "standby", false,
 		"run as a WARM-STANDBY coord: on a busy lease, POLL until the leader exits "+
 			"(graceful handoff) instead of standing down + exiting")
