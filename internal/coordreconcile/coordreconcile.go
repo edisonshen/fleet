@@ -185,6 +185,20 @@ func Resolve(d Deps, project, agentID string) (Verdict, error) {
 			// epoch each pass (the resolver is stateless and cannot see the
 			// already-polling standby). That is bounded epoch inflation on
 			// rare manual presses, NOT a poll loop — acceptable.
+			if agentID == "" {
+				// A pure READ (agentID=="", documented at the top of Resolve)
+				// must not perform the mutating Supersede CAS: without an id
+				// to spawn a standby behind it, superseding here would
+				// permanently fence the wedged starter's Activate and then
+				// leave the project with NO recovery path until some LATER
+				// caller happens to probe with a real id (codex D4 iter-6
+				// [P2]) — a needless, one-way mutation from what the caller
+				// asked to be a read-only probe.
+				return Verdict{
+					Decision: Wait,
+					Reason:   "wedged starting lease observed; caller has no id to supersede+spawn a standby",
+				}, nil
+			}
 			bumped, err := d.Supersede(project, st.Epoch)
 			if err != nil {
 				return Verdict{}, fmt.Errorf("coordreconcile: supersede wedged starting lease (project=%q epoch=%d): %w", project, st.Epoch, err)
@@ -195,12 +209,6 @@ func Resolve(d Deps, project, agentID string) (Verdict, error) {
 				return Verdict{
 					Decision: Wait,
 					Reason:   "wedged starting lease raced during supersede; re-resolve",
-				}, nil
-			}
-			if agentID == "" {
-				return Verdict{
-					Decision: Wait,
-					Reason:   "wedged starting superseded; caller has no id to spawn a standby",
 				}, nil
 			}
 			return Verdict{

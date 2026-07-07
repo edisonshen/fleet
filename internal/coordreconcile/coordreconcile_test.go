@@ -173,9 +173,12 @@ func TestResolveMatrix(t *testing.T) {
 			wantSupersede: 1,
 		},
 		{
-			// wedged starting with no agentID -> superseded but caller can't
-			// spawn a standby -> WAIT (still superseded, so the zombie is fenced).
-			name:    "T6s_wedged_no_agentid_waits_after_supersede",
+			// codex D4 iter-6 [P2]: wedged starting with no agentID -> a pure
+			// READ must NOT supersede (it can't follow through with a
+			// SpawnStandby, so mutating here would leave the project with no
+			// recovery path until a later caller arrives with a real id).
+			// WAIT without touching the record.
+			name:    "T6s_wedged_no_agentid_waits_without_superseding",
 			agentID: "",
 			state: leaseState{
 				starting: &coordlock.StartingStatus{
@@ -184,7 +187,7 @@ func TestResolveMatrix(t *testing.T) {
 				supersedeOK: true,
 			},
 			wantDec:       Wait,
-			wantSupersede: 1,
+			wantSupersede: 0,
 		},
 		{
 			// starting past TTL with a DEAD owner -> NOT superseded (no live

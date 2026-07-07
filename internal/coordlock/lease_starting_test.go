@@ -207,6 +207,25 @@ func TestClaimStarting_WithinTTLDeadOwnerClaimable(t *testing.T) {
 	} else if ok {
 		t.Fatal("within-TTL LIVE-owner starting must stay unclaimable")
 	}
+
+	// codex D3 iter-5 [P2] regression: a LIVE owner PAST TTL (wedged, but
+	// alive) must ALSO stay unclaimable — this primitive must never clobber
+	// a live process. The only sanctioned path to dethrone a live wedged
+	// starter is the resolver's Supersede+SpawnStandby record-CAS-first
+	// sequence (T6s), not a raw ClaimStartingRecord.
+	const wedgedLive = "wedged-live-boot"
+	live.set(8484, 666)
+	writeEpochRaw(t, wedgedLive, epochRecord{
+		Epoch: 4, State: stateStarting, BootID: "test-boot-1",
+		Owner: identity{Pid: 8484, PidStart: 666, AgentID: "wedgedboot", Project: wedgedLive},
+		// stale: past startingTTL.
+		RenewedAtMono: clk.now() - int64(cfg.startingTTL) - int64(time.Second),
+	})
+	if ok, err := claimStartingWithCfg(wedgedLive, "newC", cfg); err != nil {
+		t.Fatalf("claim err: %v", err)
+	} else if ok {
+		t.Fatal("past-TTL LIVE-owner starting must stay unclaimable (only Supersede+SpawnStandby may dethrone it)")
+	}
 }
 
 // codex D2 iter-3 [P2]: SupersedeStartingLease returns ok=FALSE when the record

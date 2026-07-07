@@ -1359,6 +1359,17 @@ func (l *Lease) leaseClaimable(cur epochRecord) bool {
 		withinTTL := cur.BootID == l.boot &&
 			l.cfg.nowMono()-cur.RenewedAtMono <= int64(l.cfg.startingTTL)
 		ownerConfirmedDead := cur.Owner.Pid > 0 && !l.pidAlive(cur.Owner)
+		if cur.Owner.Pid > 0 && !ownerConfirmedDead {
+			// The owner pid IS stamped and IS live — a wedged-but-alive
+			// starter, TTL-independent. This primitive must NEVER clobber a
+			// live process (no-auto-kill): the only sanctioned path to
+			// dethrone a live wedged starter is the resolver's
+			// Supersede+SpawnStandby record-CAS-first sequence (T6s), not a
+			// raw claim. Without this guard, any direct or racing caller of
+			// ClaimStartingRecord could overwrite a live starter's record —
+			// bypassing the standby handoff entirely (codex D3 iter-5 [P2]).
+			return false
+		}
 		return !withinTTL || ownerConfirmedDead
 	case stateFencing:
 		return l.transientResumable(cur) // a fresh in-progress takeover blocks
