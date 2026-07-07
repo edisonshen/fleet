@@ -1224,6 +1224,48 @@ func supersedeStartingWithCfg(project string, observedEpoch int64, cfg leaseConf
 	})
 }
 
+// ReserveHandoff stamps a successor reservation into the CURRENT epoch record
+// (D3 identity commit moves off the deleted coord-spawn marker onto the
+// lease). An OLD coord that is handing off calls it BEFORE releasing the lease
+// so a contender that observes the freed lease waits for successorID until the
+// reservation expires (rule (a)) instead of spawning a duplicate. The real
+// identity COMMIT is the epoch bump the winning successor performs on acquire
+// (which writes a fresh record WITHOUT the Handoff field — clearing it, T5);
+// this reservation is only the bounded gap-window guard.
+//
+// Record-only CAS (no flock): it edits the current record in place, so it must
+// be called while OLD still owns the lease. ok=false when there is no readable
+// record to stamp (the caller proceeds without a reservation — a benign
+// degrade to the winner-delivery guarantee).
+func ReserveHandoff(project, successorID string, ttl time.Duration) (ok bool, err error) {
+	return reserveHandoffWithCfg(project, successorID, ttl, defaultLeaseConfig())
+}
+
+func reserveHandoffWithCfg(project, successorID string, ttl time.Duration, cfg leaseConfig) (bool, error) {
+	if successorID == "" {
+		return false, fmt.Errorf("coordlock.ReserveHandoff: successorID required")
+	}
+	paths, rerr := resolvePaths(project)
+	if rerr != nil {
+		return false, rerr
+	}
+	if ttl <= 0 {
+		ttl = cfg.handoffTTL
+	}
+	l := &Lease{cfg: cfg, paths: paths, host: hostname(), boot: cfg.boot()}
+	return l.withEpochLock(func() (bool, error) {
+		cur, err := readEpoch(l.paths.epoch)
+		if err != nil {
+			return false, nil // no record to stamp -> degrade to winner-delivery
+		}
+		cur.Handoff = &handoffInfo{
+			SuccessorID:   successorID,
+			ExpiresAtMono: l.cfg.nowMono() + int64(ttl),
+		}
+		return true, l.writeEpochLocked(cur)
+	})
+}
+
 // ClaimStartingRecord writes a `starting` epoch record naming agentID as the
 // to-be owner BEFORE that agent's coord-run supervisor has acquired the flock
 // (D2 spawn-serialization — replaces the deleted marker's spawn-in-flight
