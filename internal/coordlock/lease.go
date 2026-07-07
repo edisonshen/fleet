@@ -2121,9 +2121,10 @@ func currentOwnerWithCfg(project string, cfg leaseConfig) (Owner, bool) {
 // fresh ClaimStartingRecord.
 //
 // ok=false when there is no readable record, the state is not active, the
-// owner pid is unset, or the owner process is provably DEAD (pid+pid_start
-// reuse-safe). A dead active owner IS stealable — the resolver claims +
-// spawns a successor there. Read-only; a torn read degrades to ok=false.
+// owner pid is unset, the record is from a PREVIOUS boot, or the owner
+// process is provably DEAD (pid+pid_start reuse-safe). A dead active owner
+// IS stealable — the resolver claims + spawns a successor there. Read-only;
+// a torn read degrades to ok=false.
 func LiveOwner(project string) (Owner, bool) {
 	return liveOwnerWithCfg(project, defaultLeaseConfig())
 }
@@ -2140,9 +2141,23 @@ func liveOwnerWithCfg(project string, cfg leaseConfig) (Owner, bool) {
 	if rec.State != stateActive || rec.Owner.Pid <= 0 || rec.Owner.AgentID == "" {
 		return Owner{}, false
 	}
-	// pidAlive is pid+pid_start reuse-safe, so a cross-boot/stale record
-	// whose pid was recycled fails the check (the owner is really gone).
-	// No BootID or TTL gate: process-live overrides stale heartbeat.
+	// A cross-boot record is provably DEAD by construction (any real live
+	// process's boot must be the CURRENT boot — a machine reboot kills
+	// everything). This gate is load-bearing, not merely a TTL heuristic:
+	// on Linux, pidStartNanos is boot-relative (platform_linux.go), so
+	// pid+pid_start equality ALONE is only reuse-safe within the SAME boot
+	// — across a reboot, a stale record's (pid, pid_start) can coincidentally
+	// collide with an unrelated post-reboot process (e.g. a low-numbered,
+	// deterministic-timing early-boot daemon), which would make pidAlive
+	// wrongly report a dead owner as live. Every other pidAlive caller
+	// (holderHealthy) already gates on BootID first; LiveOwner is the
+	// resolver's #1 decision-matrix branch, so skipping it here was the
+	// most exposed instance of the gap (codex-adversarial review finding).
+	// No TTL gate otherwise: process-live (same-boot) overrides stale
+	// heartbeat, per the no-auto-kill invariant.
+	if rec.BootID != cfg.boot() {
+		return Owner{}, false
+	}
 	l := &Lease{cfg: cfg, paths: paths, boot: cfg.boot()}
 	if !l.pidAlive(rec.Owner) {
 		return Owner{}, false
@@ -2191,7 +2206,10 @@ func currentHandoffWithCfg(project string, cfg leaseConfig) (Handoff, bool) {
 // CurrentStarting reports whether project's lease is currently in `starting`
 // state and, if so, the owner tuple + liveness + whether it is within its
 // startingTTL. ok=false when the record is missing/unreadable or its state
-// is not `starting`. Read-only; a torn read degrades to ok=false.
+// is not `starting`. OwnerLive is same-boot-gated (see liveOwnerWithCfg):
+// pid+pid_start equality alone is only reuse-safe within the SAME boot, so a
+// cross-boot record's owner is reported dead regardless of the raw pidAlive
+// result. Read-only; a torn read degrades to ok=false.
 func CurrentStarting(project string) (StartingStatus, bool) {
 	return currentStartingWithCfg(project, defaultLeaseConfig())
 }
@@ -2209,8 +2227,8 @@ func currentStartingWithCfg(project string, cfg leaseConfig) (StartingStatus, bo
 		return StartingStatus{}, false
 	}
 	l := &Lease{cfg: cfg, paths: paths, boot: cfg.boot()}
-	withinTTL := rec.BootID == cfg.boot() &&
-		cfg.nowMono()-rec.RenewedAtMono <= int64(cfg.startingTTL)
+	sameBoot := rec.BootID == cfg.boot()
+	withinTTL := sameBoot && cfg.nowMono()-rec.RenewedAtMono <= int64(cfg.startingTTL)
 	return StartingStatus{
 		Owner: Owner{
 			AgentID:       rec.Owner.AgentID,
@@ -2218,7 +2236,12 @@ func currentStartingWithCfg(project string, cfg leaseConfig) (StartingStatus, bo
 			PidStart:      rec.Owner.PidStart,
 			EngineStamped: rec.Owner.AgentID != "" && rec.Owner.PidStart > 0,
 		},
-		OwnerLive: l.pidAlive(rec.Owner),
+		// Cross-boot record -> the owner is provably dead (a reboot kills
+		// every process), regardless of what a bare pid+pid_start equality
+		// on Linux's boot-relative starttime might coincidentally match
+		// (codex-adversarial review finding, same root cause as
+		// liveOwnerWithCfg above).
+		OwnerLive: sameBoot && l.pidAlive(rec.Owner),
 		WithinTTL: withinTTL,
 		Epoch:     rec.Epoch,
 	}, true

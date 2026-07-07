@@ -378,6 +378,66 @@ func TestClaimStartingRecord_FreeAndBlocked(t *testing.T) {
 	}
 }
 
+// codex-adversarial review finding: LiveOwner (the resolver's #1
+// decision-matrix branch, ATTACH-gate) must never report a CROSS-BOOT
+// record's owner as live, even when its raw pid+pid_start happens to
+// match a currently-live process. On Linux, pidStartNanos is boot-relative
+// (platform_linux.go) — comparable for equality ONLY within the same boot
+// — so a stale pre-reboot record's (pid, pid_start) pair can coincidentally
+// collide with an unrelated post-reboot process (e.g. a low-numbered,
+// deterministic-timing early-boot daemon). Every other pidAlive caller
+// (holderHealthy) already gates on BootID first; this locks in that
+// LiveOwner and CurrentStarting.OwnerLive do too.
+func TestLiveOwner_CrossBootRecordNeverLive(t *testing.T) {
+	setupHome(t)
+	clk := &fakeClock{ns: int64(time.Hour)}
+	live := newFakeLiveness()
+	cfg := startingCfg(clk, live)
+
+	// Same-boot, pid genuinely live -> LiveOwner reports it.
+	const sameBoot = "liveowner-sameboot"
+	live.set(4242, 111)
+	writeEpochRaw(t, sameBoot, epochRecord{
+		Epoch: 1, State: stateActive, BootID: "test-boot-1",
+		Owner:         identity{Pid: 4242, PidStart: 111, AgentID: "coordA", Project: sameBoot},
+		RenewedAtMono: clk.now(),
+	})
+	if owner, ok := liveOwnerWithCfg(sameBoot, cfg); !ok || owner.AgentID != "coordA" {
+		t.Fatalf("same-boot live owner must be reported: ok=%v owner=%+v", ok, owner)
+	}
+
+	// Cross-boot record naming the SAME (pid, pid_start) that IS currently
+	// live (the exact collision scenario) -> must NOT be reported live.
+	const crossBoot = "liveowner-crossboot"
+	writeEpochRaw(t, crossBoot, epochRecord{
+		Epoch: 1, State: stateActive, BootID: "stale-boot-from-before-reboot",
+		Owner:         identity{Pid: 4242, PidStart: 111, AgentID: "coordA-stale", Project: crossBoot},
+		RenewedAtMono: clk.now(),
+	})
+	if owner, ok := liveOwnerWithCfg(crossBoot, cfg); ok {
+		t.Fatalf("cross-boot record must NEVER be reported live even on a pid+pid_start match: got owner=%+v", owner)
+	}
+
+	// Same collision, but via CurrentStarting.OwnerLive (the `starting`
+	// counterpart) — must also refuse.
+	const crossBootStarting = "starting-crossboot"
+	writeEpochRaw(t, crossBootStarting, epochRecord{
+		Epoch: 1, State: stateStarting, BootID: "stale-boot-from-before-reboot",
+		Owner:         identity{Pid: 4242, PidStart: 111, AgentID: "coordA-stale", Project: crossBootStarting},
+		RenewedAtMono: clk.now(),
+	})
+	st, ok := currentStartingWithCfg(crossBootStarting, cfg)
+	if !ok {
+		t.Fatal("CurrentStarting must still report the record (state=starting), just not as live")
+	}
+	if st.OwnerLive {
+		t.Fatal("CurrentStarting.OwnerLive must be false for a cross-boot record, even on a pid+pid_start match")
+	}
+	if st.WithinTTL {
+		t.Fatal("a cross-boot record must also never read as WithinTTL")
+	}
+}
+
 // T11: writeEpochLocked leaves a durable, re-readable record (parent-dir fsync
 // path exercised on the happy write).
 func TestT11_EpochWriteDurableReadback(t *testing.T) {
