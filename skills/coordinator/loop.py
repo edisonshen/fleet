@@ -2863,7 +2863,7 @@ def _read_lock_holder(lock_path: Path) -> str:
 
 def _read_coord_lease_identity(
     project: str, *, home: Path, fleet_bin: str = "fleet",
-) -> tuple[str, str]:
+) -> tuple[str | None, str | None]:
     """Return (live_owner_id, handoff_successor_id) from the coordinator LEASE.
 
     Shells out to ``fleet coord-owner --project <p> --json`` — the read-only
@@ -2875,12 +2875,30 @@ def _read_coord_lease_identity(
     never self-exit even while a stale predecessor still holds the flock for one
     more tick (``_classify_lock_busy`` gate 5).
 
-    Fail-soft: any error (binary too old to have ``coord-owner``, timeout,
-    unparseable output, or failover disabled → empty fields) returns ("", "")
-    so the caller falls through conservatively to the remaining gates rather
-    than crashing the tick — matching the marker's old "unreadable → empty"
-    behavior. Resolves the binary the same way the lease-check path does
-    (prefer the spawn-stamped FLEET_BIN over a bare ``fleet`` on PATH).
+    THREE outcomes — the read is tri-state, NOT boolean:
+
+      ("<id>", "<id>")  CONCLUSIVE: the CLI ran and the lease names these ids
+                        (either field may be "" = that lease slot is genuinely
+                        free). Gate 5 keys on this.
+      ("", "")          CONCLUSIVE-EMPTY: the CLI ran fine and the lease names
+                        NOBODY (free lease / no reservation / failover disabled).
+      (None, None)      INCONCLUSIVE: the read FAILED — a stale ``FLEET_BIN``
+                        that predates the ``coord-owner`` subcommand (exit!=0,
+                        the #182 stale-binary class fleet's symlinked-skill /
+                        copied-binary split makes reachable), a timeout, empty
+                        output (the CLI always emits a JSON object on success),
+                        or unparseable/non-object JSON.
+
+    The old marker was a LOCAL FILE read (no subprocess, never "unavailable").
+    Shelling to a possibly-stale binary reintroduces an unavailable path, so the
+    caller MUST NOT treat "read failed" as "lease empty": an INCONCLUSIVE result
+    (None, None) means gate 5 cannot prove the successor's identity either way,
+    and self-exiting on an unknowable identity would neuter the mid-handoff guard
+    into an over-eager self-exit (no-auto-kill invariant; D5 "bare mismatch →
+    skip, never exit"). Gate 5 treats (None, None) as skip.
+
+    Resolves the binary the same way the lease-check path does (prefer the
+    spawn-stamped FLEET_BIN over a bare ``fleet`` on PATH).
     """
     bin_path = fleet_bin
     if bin_path == "fleet":
@@ -2894,20 +2912,26 @@ def _read_coord_lease_identity(
             timeout=_LEASE_CHECK_TIMEOUT_S, check=False, env=env,
         )
     except (subprocess.TimeoutExpired, OSError):
-        return "", ""
+        return None, None  # INCONCLUSIVE: binary missing / hung — cannot prove identity
     if proc.returncode != 0:
         # Binary too old (no `coord-owner` subcommand → exit 1), usage fault, or
-        # internal error: inconclusive → empty, fall through to the other gates.
-        return "", ""
+        # internal error: INCONCLUSIVE, NOT empty. A stale binary must never let
+        # gate 5 self-exit a legit successor (#182 stale-binary class).
+        return None, None
+    out = (proc.stdout or "").strip()
+    if not out:
+        # returncode 0 but no output violates the CLI contract (it always emits a
+        # JSON object on success) — the read did not really happen. INCONCLUSIVE.
+        return None, None
     try:
-        data = json.loads((proc.stdout or "").strip() or "{}")
+        data = json.loads(out)
     except (ValueError, TypeError):
-        return "", ""
+        return None, None  # INCONCLUSIVE: unparseable
     if not isinstance(data, dict):
-        return "", ""
+        return None, None  # INCONCLUSIVE: not a JSON object
     live = str(data.get("live_owner_id", "") or "")
     succ = str(data.get("handoff_successor_id", "") or "")
-    return live, succ
+    return live, succ  # CONCLUSIVE (either field may be "" = that slot is free)
 
 
 # _coord_lease_identity_fn is the injectable seam _classify_lock_busy calls for
@@ -3054,8 +3078,18 @@ def _classify_lock_busy(
     # is the coord identity now. Never self-exit when the lease names US: either
     # WE are the live active owner, or an in-flight handoff reservation names us
     # as the successor (mid-handoff, the stale predecessor still holds the flock
-    # for one more tick). Fail-soft empty ("", "") falls through to gate 6.
+    # for one more tick).
     live_owner, handoff_succ = _coord_lease_identity_fn(project_dir.name, home=home)
+    if live_owner is None:
+        # INCONCLUSIVE identity read: the `fleet coord-owner` shell-out failed
+        # (stale FLEET_BIN without the subcommand — the #182 class — timeout, or
+        # unparseable output). The deleted marker was a local file read that never
+        # went "unavailable"; a failed binary read must NOT be mistaken for "lease
+        # empty" and neuter this guard into an over-eager self-exit of a legit
+        # mid-handoff successor. Cannot prove identity → skip, never exit
+        # (no-auto-kill invariant; D5 "bare mismatch → skip, never exit").
+        return "skip", ""
+    # Fail-soft CONCLUSIVE-empty ("", "") falls through to gate 6.
     if live_owner == coord_id or handoff_succ == coord_id:
         return "skip", ""
     # The holder must be a genuinely live coord FOR THIS PROJECT, not a

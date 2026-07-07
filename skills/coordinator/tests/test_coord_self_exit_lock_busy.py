@@ -301,6 +301,84 @@ def test_intended_coord_per_marker_does_not_self_exit(
     assert result.reason == "lock-busy"
 
 
+def test_handoff_successor_does_not_self_exit(
+    fleet_home: Path,
+    held_lock,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Gate-5 handoff-successor arm: the lease has NO live active owner but an
+    in-flight handoff reservation names US as the successor (the production
+    mid-handoff state — predecessor still holds the flock, epoch not yet
+    committed to us). `live_owner==coord_id OR handoff_succ==coord_id` must skip
+    on the SUCCESSOR clause too, not only the owner clause. A live OTHER coord
+    holding the flock must NOT make us self-exit."""
+    me = "eeee7777"
+    old = "ffff8888"
+    pdir = _minimal_project(fleet_home)
+    _seed_agent_record(fleet_home, me)
+    _seed_agent_record(fleet_home, old)
+    held_lock(pdir, old)
+    # No active owner; the handoff reservation names US as successor.
+    monkeypatch.setattr(
+        loop, "_coord_lease_identity_fn",
+        lambda project, *, home, fleet_bin="fleet": ("", me),
+    )
+    monkeypatch.setattr(
+        supervisor_mod, "tmux_session_alive", lambda session, **kw: True,
+    )
+
+    result = loop.tick(
+        project="fleet", coord_id=me, cwd="/tmp/x",
+        fleet_home=str(fleet_home),
+    )
+
+    assert result.self_exit is False, (
+        "the named handoff successor must never self-exit (gate-5 succ arm)"
+    )
+    assert result.reason == "lock-busy"
+
+
+def test_inconclusive_lease_read_does_not_self_exit(
+    fleet_home: Path,
+    held_lock,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """P0 regression: gate-5's `fleet coord-owner` read FAILED (stale FLEET_BIN
+    lacking the subcommand — the #182 class — timeout, or unparseable output),
+    returning the INCONCLUSIVE sentinel (None, None). Even with a live OTHER
+    coord holding the flock, an unknowable identity must SKIP, never self-exit:
+    a failed binary read must not be mistaken for 'lease empty' and neuter the
+    mid-handoff guard into over-eager self-exit of a legit successor
+    (no-auto-kill invariant). If this regresses, a stale binary silently kills
+    live successors."""
+    me = "eeee9999"
+    old = "ffffaaaa"
+    pdir = _minimal_project(fleet_home)
+    _seed_agent_record(fleet_home, me)
+    _seed_agent_record(fleet_home, old)
+    held_lock(pdir, old)
+    # coord-owner read failed -> INCONCLUSIVE. (Contrast: the default autouse
+    # stub returns the CONCLUSIVE-empty ("", "") which DOES fall through to
+    # gate 6 and self-exits — see test_live_other_coord_not_intended_...).
+    monkeypatch.setattr(
+        loop, "_coord_lease_identity_fn",
+        lambda project, *, home, fleet_bin="fleet": (None, None),
+    )
+    monkeypatch.setattr(
+        supervisor_mod, "tmux_session_alive", lambda session, **kw: True,
+    )
+
+    result = loop.tick(
+        project="fleet", coord_id=me, cwd="/tmp/x",
+        fleet_home=str(fleet_home),
+    )
+
+    assert result.self_exit is False, (
+        "an inconclusive lease-identity read must skip, never self-exit"
+    )
+    assert result.reason == "lock-busy"
+
+
 # ---------- conservatism gates: each one => skip, never self-exit ----------
 
 
