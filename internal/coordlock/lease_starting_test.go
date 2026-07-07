@@ -87,6 +87,36 @@ func TestT6f_SupersededStarterActivateFailsClosed(t *testing.T) {
 	}
 }
 
+// codex D2 iter-1 [P1] regression: a coord that acquired the lease as
+// `starting` but exits on a PRE-activation failure path (never flipped to
+// active) must have its record demoted to `released` by Release() — NOT left
+// behind as `starting`. A leftover `starting` record reads as a live lease
+// generation (LeaseRecordActive), so an un-reaped one would keep handoff
+// delivery pending until startingTTL even though the owner is already gone.
+func TestReleaseDemotesStartingRecord(t *testing.T) {
+	setupHome(t)
+	const project = "rel-starting"
+	clk := &fakeClock{}
+	live := newFakeLiveness()
+
+	lease, acquired, _, err := acquireLeaseDetect(project, "crashboot", startingCfg(clk, live))
+	if err != nil || !acquired {
+		t.Fatalf("acquire: acquired=%v err=%v", acquired, err)
+	}
+	if rec := readEpochFor(t, project); rec.State != stateStarting {
+		t.Fatalf("precondition: state=%s want starting", rec.State)
+	}
+	// Exit before Activate (pre-activation failure) -> Release must reap it.
+	lease.Release()
+	rec := readEpochFor(t, project)
+	if rec.State != stateReleased {
+		t.Fatalf("Release must demote a starting record to released, got %s", rec.State)
+	}
+	if LeaseRecordActive(project) {
+		t.Fatal("a released (was-starting) record must not read as a live lease")
+	}
+}
+
 // SupersedeStartingLease is a benign no-op if the record already flipped to
 // active (a race where the starter won before the resolver superseded).
 func TestSupersede_NoOpIfActivated(t *testing.T) {

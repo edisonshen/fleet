@@ -1478,7 +1478,16 @@ func (l *Lease) Release() {
 	// Demote the record to `released` while we still hold the flock (so a
 	// successor can't have advanced the epoch under us yet). Only if it is
 	// still exactly ours — never stomp a successor's record. This is what
-	// makes outstanding tokens invalid IMMEDIATELY (state != active).
+	// makes outstanding tokens invalid IMMEDIATELY (state != active). Both
+	// `active` (a normal leader release) AND `starting` (D2: a coord that
+	// acquired the lease but exited on a PRE-activation failure path —
+	// child.Start() failed, or Activate() errored/was superseded — before
+	// the starting->active flip) are demoted. Without the `starting` case a
+	// crashed pre-activation boot leaves the epoch file `starting`, which
+	// LeaseRecordActive now counts as a live lease generation, so handoff
+	// delivery keeps the doc pending until startingTTL even though the owner
+	// is already gone (codex D2 iter-1 [P1] — fleet-owns-its-resources: the
+	// failure path must reap the record it wrote).
 	//
 	// The demote is RETRIED across transient epoch.lock contention because
 	// leaving the record `active` after we drop the flock would keep a
@@ -1518,7 +1527,8 @@ func (l *Lease) Release() {
 				if rerr != nil {
 					return false, rerr
 				}
-				if cur.State != stateActive || cur.Epoch != l.epoch || !cur.Owner.equal(l.self) {
+				if (cur.State != stateActive && cur.State != stateStarting) ||
+					cur.Epoch != l.epoch || !cur.Owner.equal(l.self) {
 					return false, nil // not ours anymore -> nothing to demote
 				}
 				cur.State = stateReleased
