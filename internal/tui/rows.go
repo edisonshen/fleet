@@ -332,23 +332,52 @@ func projectTreeExists(projectName string) bool {
 var coordSpawnIdentityFn = coordSpawnLeaseIdentity
 
 func coordSpawnLeaseIdentity(projectName string) string {
-	if o, ok := coordlock.LiveOwner(projectName); ok && o.AgentID != "" {
-		return o.AgentID
+	owner, ownerOK := coordlock.LiveOwner(projectName)
+	starting, startingOK := coordlock.CurrentStarting(projectName)
+	handoff, handoffOK := coordlock.CurrentHandoff(projectName)
+	return resolveCoordSpawnIdentity(owner, ownerOK, starting, startingOK, handoff, handoffOK)
+}
+
+// resolveCoordSpawnIdentity is the PURE identity decision (no I/O — the lease
+// reads are threaded in) so the branch ordering + liveness gates are unit
+// testable without a real lease. It mirrors the Python `fleet coord-owner`
+// path + loop.py gate-5, which treat BOTH the active owner AND the in-flight
+// handoff successor as coord identity — so the three signals must AGREE.
+//
+// Priority: a process-live active owner, else a booting starter (unless
+// CONFIRMED dead), else a named in-flight handoff successor.
+func resolveCoordSpawnIdentity(
+	owner coordlock.Owner, ownerOK bool,
+	st coordlock.StartingStatus, stOK bool,
+	h coordlock.Handoff, hOK bool,
+) string {
+	// (1) A process-live active owner is unambiguously the coord.
+	if ownerOK && owner.AgentID != "" {
+		return owner.AgentID
 	}
-	// Starting (pre-activation) owner — mirror coordreconcile.Resolve's exact
-	// gate (coordreconcile.go ~165): treat the starter as the coord identity
-	// only while it is within its TTL AND not CONFIRMED dead. "Confirmed dead"
-	// requires a RECORDED pid (PID>0) that is not live: a just-claimed record
-	// has an unknown pid pre-spawn (PID==0), so it is NOT confirmed dead and the
-	// boot-window [a]-dedup still holds. A crashed pre-activation starter (pid
-	// recorded, process since died) is dropped here so [a] recovers by spawning
-	// a replacement instead of re-attaching to the dead starter for the whole
-	// starting TTL (WithinTTL alone would strand it — codex review [P2]).
-	if st, ok := coordlock.CurrentStarting(projectName); ok && st.Owner.AgentID != "" {
+	// (2) Starting (pre-activation) owner — mirror coordreconcile.Resolve's exact
+	// gate (coordreconcile.go ~165): keep the starter as the identity only while
+	// it is within its TTL AND not CONFIRMED dead. "Confirmed dead" requires a
+	// RECORDED pid (PID>0) that is not live: a just-claimed record has an unknown
+	// pid pre-spawn (PID==0), so it is NOT confirmed dead and the boot-window
+	// [a]-dedup still holds. A crashed pre-activation starter (pid recorded,
+	// process since died) is dropped so [a] recovers by spawning a replacement
+	// instead of re-attaching to the dead starter for the whole starting TTL
+	// (WithinTTL alone would strand it — codex review [P2]).
+	if stOK && st.Owner.AgentID != "" {
 		ownerConfirmedDead := st.Owner.PID > 0 && !st.OwnerLive
 		if st.WithinTTL && !ownerConfirmedDead {
 			return st.Owner.AgentID
 		}
+	}
+	// (3) In-flight handoff successor: OLD released the flock and NEW is the
+	// named (non-expired, CurrentHandoff is TTL-gated) successor but has not yet
+	// claimed a starting record or activated. Mirror the coord-owner CLI +
+	// loop.py gate-5, which both treat CurrentHandoff.SuccessorID as coord
+	// identity — otherwise the dashboard flashes "no coord" mid-handoff and [a]
+	// dedup falls through to a duplicate fresh dispatch (codex review [P2]).
+	if hOK && h.SuccessorID != "" {
+		return h.SuccessorID
 	}
 	return ""
 }

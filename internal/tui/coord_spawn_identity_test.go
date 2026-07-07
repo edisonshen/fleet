@@ -63,3 +63,81 @@ func TestCoordSpawnLeaseIdentity_FreeLease_Empty(t *testing.T) {
 		t.Errorf("coordSpawnLeaseIdentity on a free lease = %q; want empty", got)
 	}
 }
+
+// resolveCoordSpawnIdentity is the pure branch-ordering + liveness decision.
+// Table-drives every cell (mirrors coordreconcile.Resolve's starting gate + the
+// coord-owner CLI / loop.py gate-5 handoff-successor identity) without a real
+// lease.
+func TestResolveCoordSpawnIdentity(t *testing.T) {
+	owner := func(id string) (coordlock.Owner, bool) { return coordlock.Owner{AgentID: id}, id != "" }
+	// starting builds a StartingStatus; pid==0 models the just-claimed
+	// (unknown-pid) boot window, pid>0 + !live models a crashed starter.
+	starting := func(id string, pid int, live, withinTTL bool) (coordlock.StartingStatus, bool) {
+		if id == "" {
+			return coordlock.StartingStatus{}, false
+		}
+		return coordlock.StartingStatus{
+			Owner:     coordlock.Owner{AgentID: id, PID: pid},
+			OwnerLive: live,
+			WithinTTL: withinTTL,
+		}, true
+	}
+	handoff := func(id string) (coordlock.Handoff, bool) { return coordlock.Handoff{SuccessorID: id}, id != "" }
+
+	tests := []struct {
+		name string
+		o    coordlock.Owner
+		oOK  bool
+		st   coordlock.StartingStatus
+		stOK bool
+		h    coordlock.Handoff
+		hOK  bool
+		want string
+	}{
+		{name: "live owner wins over all"},                // filled below
+		{name: "booting starter (pid==0)"},                //
+		{name: "confirmed-dead starter drops"},            //
+		{name: "expired starter drops"},                   //
+		{name: "handoff successor when no owner/starter"}, //
+		{name: "owner beats handoff"},                     //
+		{name: "starter beats handoff"},                   //
+		{name: "nothing -> empty"},                        //
+	}
+	// Populate (kept out of the literal for readability of the builders).
+	o1, ook1 := owner("coord-A")
+	st1, stok1 := starting("start-B", 0, false, true)
+	hh1, hok1 := handoff("succ-C")
+	tests[0].o, tests[0].oOK, tests[0].st, tests[0].stOK, tests[0].h, tests[0].hOK, tests[0].want = o1, ook1, st1, stok1, hh1, hok1, "coord-A"
+
+	st2, stok2 := starting("start-B", 0, false, true) // pid unknown -> not confirmed dead
+	tests[1].st, tests[1].stOK, tests[1].want = st2, stok2, "start-B"
+
+	st3, stok3 := starting("start-B", 4242, false, true) // pid recorded + dead -> confirmed dead
+	hh3, hok3 := handoff("succ-C")
+	tests[2].st, tests[2].stOK, tests[2].h, tests[2].hOK, tests[2].want = st3, stok3, hh3, hok3, "succ-C" // falls through to handoff
+
+	st4, stok4 := starting("start-B", 0, false, false)         // past TTL
+	tests[3].st, tests[3].stOK, tests[3].want = st4, stok4, "" // no handoff -> empty
+
+	hh5, hok5 := handoff("succ-C")
+	tests[4].h, tests[4].hOK, tests[4].want = hh5, hok5, "succ-C"
+
+	o6, ook6 := owner("coord-A")
+	hh6, hok6 := handoff("succ-C")
+	tests[5].o, tests[5].oOK, tests[5].h, tests[5].hOK, tests[5].want = o6, ook6, hh6, hok6, "coord-A"
+
+	st7, stok7 := starting("start-B", 7373, true, true) // live starter
+	hh7, hok7 := handoff("succ-C")
+	tests[6].st, tests[6].stOK, tests[6].h, tests[6].hOK, tests[6].want = st7, stok7, hh7, hok7, "start-B"
+
+	// tests[7]: all zero -> "".
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := resolveCoordSpawnIdentity(tc.o, tc.oOK, tc.st, tc.stOK, tc.h, tc.hOK)
+			if got != tc.want {
+				t.Errorf("resolveCoordSpawnIdentity = %q; want %q", got, tc.want)
+			}
+		})
+	}
+}
