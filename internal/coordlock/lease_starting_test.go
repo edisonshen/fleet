@@ -173,6 +173,72 @@ func TestFreshClaim_StartingRecordIsWithinTTL(t *testing.T) {
 	}
 }
 
+// codex D2 iter-3 [P1]: a within-startingTTL `starting` record whose owner pid
+// was stamped (post-claim, a real coord acquired) but is now DEAD (pre-
+// activation crash) is CLAIMABLE immediately — recovery must not wait out the
+// full TTL. A within-TTL record whose owner is LIVE stays unclaimable.
+func TestClaimStarting_WithinTTLDeadOwnerClaimable(t *testing.T) {
+	setupHome(t)
+	clk := &fakeClock{ns: int64(time.Hour)}
+	live := newFakeLiveness()
+	cfg := startingCfg(clk, live)
+
+	// Dead owner (pid not in the live map) within TTL -> claimable now.
+	const dead = "crash-dead"
+	writeEpochRaw(t, dead, epochRecord{
+		Epoch: 4, State: stateStarting, BootID: "test-boot-1",
+		Owner:         identity{Pid: 424242, PidStart: 999, AgentID: "crashboot", Project: dead},
+		RenewedAtMono: clk.now(), // fresh -> within TTL
+	})
+	if ok, err := claimStartingWithCfg(dead, "newA", cfg); err != nil || !ok {
+		t.Fatalf("within-TTL dead-owner starting must be claimable now: ok=%v err=%v", ok, err)
+	}
+
+	// Control: a LIVE owner within TTL stays unclaimable (boot in flight).
+	const liveP = "live-boot"
+	live.set(7373, 555)
+	writeEpochRaw(t, liveP, epochRecord{
+		Epoch: 4, State: stateStarting, BootID: "test-boot-1",
+		Owner:         identity{Pid: 7373, PidStart: 555, AgentID: "booting", Project: liveP},
+		RenewedAtMono: clk.now(),
+	})
+	if ok, err := claimStartingWithCfg(liveP, "newB", cfg); err != nil {
+		t.Fatalf("claim err: %v", err)
+	} else if ok {
+		t.Fatal("within-TTL LIVE-owner starting must stay unclaimable")
+	}
+}
+
+// codex D2 iter-3 [P2]: SupersedeStartingLease returns ok=FALSE when the record
+// already advanced past observedEpoch (another resolver bumped it, or a
+// replacement went active/released), so Resolve re-resolves instead of
+// spawning a standby from a stale snapshot.
+func TestSupersede_NewerEpochReResolves(t *testing.T) {
+	setupHome(t)
+	const project = "sup-newer"
+	clk := &fakeClock{ns: int64(time.Hour)}
+	live := newFakeLiveness()
+	cfg := startingCfg(clk, live)
+
+	// The record is already at epoch 9; a resolver observed the stale epoch 7.
+	writeEpochRaw(t, project, epochRecord{
+		Epoch: 9, State: stateStarting, BootID: "test-boot-1",
+		Owner:         identity{Pid: 8888, PidStart: 333, AgentID: "newer", Project: project},
+		RenewedAtMono: clk.now(),
+	})
+	ok, err := supersedeStartingWithCfg(project, 7, cfg)
+	if err != nil {
+		t.Fatalf("supersede err: %v", err)
+	}
+	if ok {
+		t.Fatal("supersede of a record already past observedEpoch must return false (re-resolve), not true")
+	}
+	// The record must be untouched (no spurious epoch bump).
+	if rec := readEpochFor(t, project); rec.Epoch != 9 {
+		t.Fatalf("record must be untouched at epoch 9, got %d", rec.Epoch)
+	}
+}
+
 // SupersedeStartingLease is a benign no-op if the record already flipped to
 // active (a race where the starter won before the resolver superseded).
 func TestSupersede_NoOpIfActivated(t *testing.T) {

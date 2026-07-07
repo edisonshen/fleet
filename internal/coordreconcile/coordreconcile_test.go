@@ -204,6 +204,44 @@ func TestResolveMatrix(t *testing.T) {
 			wantClaimID:   agentID,
 		},
 		{
+			// codex D4 iter-1 [P1] regression: a pre-activation crash — the
+			// owner pid IS stamped (post-flock-acquire) but confirmed DEAD —
+			// must fall through to spawn IMMEDIATELY even while still
+			// WithinTTL. No-auto-kill protects LIVE processes only; a
+			// confirmed-dead owner must not stall attach/spawn recovery for
+			// the rest of startingTTL (~120s).
+			name:    "starting_within_ttl_pid_stamped_dead_falls_through_immediately",
+			agentID: agentID,
+			state: leaseState{
+				starting: &coordlock.StartingStatus{
+					Owner: coordlock.Owner{AgentID: "crashedboot01", PID: 222}, OwnerLive: false, WithinTTL: true, Epoch: 9,
+				},
+				claimOK: true,
+			},
+			wantDec:       Spawn,
+			wantSupersede: 0,
+			wantClaim:     1,
+			wantClaimID:   agentID,
+		},
+		{
+			// codex D2 iter-3 [P1]: starting WITHIN TTL but owner pid was
+			// stamped and is DEAD (pre-activation SIGKILL) -> do NOT wait out
+			// the TTL; fall through to claim + SPAWN. Recovery is immediate,
+			// not a ~120s outage.
+			name:    "starting_within_ttl_dead_owner_recovers_now",
+			agentID: agentID,
+			state: leaseState{
+				starting: &coordlock.StartingStatus{
+					Owner: coordlock.Owner{AgentID: "crashboot01", PID: 424242}, OwnerLive: false, WithinTTL: true, Epoch: 9,
+				},
+				claimOK: true,
+			},
+			wantDec:       Spawn,
+			wantSupersede: 0,
+			wantClaim:     1,
+			wantClaimID:   agentID,
+		},
+		{
 			// Handoff reservation naming a successor -> WAIT for it (#247 rule a).
 			name:      "handoff_reservation_waits",
 			agentID:   agentID,

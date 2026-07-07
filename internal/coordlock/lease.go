@@ -1207,9 +1207,13 @@ func (l *Lease) Activate() (bool, error) {
 // acquire path's live-starting stand-down keeps protecting the live zombie
 // until then.
 //
-//	ok=true  -> superseded (epoch bumped), or already past observedEpoch (idempotent).
-//	ok=false -> benign race: the record flipped to active/released or moved to
-//	            a NEWER epoch than observedEpoch; the caller re-resolves.
+//	ok=true  -> WE superseded the wedged starter at observedEpoch (epoch bumped).
+//	ok=false -> benign race: the record flipped to active/released, or ANOTHER
+//	            resolver already advanced the epoch past observedEpoch; the
+//	            caller MUST re-resolve rather than assume a standby is still
+//	            needed. A stale-snapshot true here would make Resolve emit
+//	            SpawnStandby beside an already-running replacement (codex D2
+//	            iter-3 [P2]).
 func SupersedeStartingLease(project string, observedEpoch int64) (ok bool, err error) {
 	return supersedeStartingWithCfg(project, observedEpoch, defaultLeaseConfig())
 }
@@ -1225,11 +1229,13 @@ func supersedeStartingWithCfg(project string, observedEpoch int64, cfg leaseConf
 		if err != nil {
 			return false, err
 		}
-		if cur.Epoch > observedEpoch {
-			return true, nil // already superseded by an earlier resolver pass
-		}
+		// Only a supersede WE performed at the observed epoch returns true. A
+		// record that already moved past observedEpoch (another resolver
+		// bumped it, or a replacement went active/released) is NOT our
+		// supersede: return false so Resolve re-resolves against the fresh
+		// state instead of spawning a standby from a stale snapshot.
 		if cur.State != stateStarting || cur.Epoch != observedEpoch {
-			return false, nil // flipped/released/raced -> re-resolve
+			return false, nil // flipped/released/advanced/raced -> re-resolve
 		}
 		cur.Epoch = observedEpoch + 1
 		// Keep State=starting + the same Owner so the acquire path's
@@ -1339,10 +1345,21 @@ func (l *Lease) leaseClaimable(cur epochRecord) bool {
 	case stateActive:
 		return !l.holderHealthy(cur) // a healthy active owner blocks a claim
 	case stateStarting:
-		// A same-boot within-startingTTL record is a live boot in flight.
+		// A same-boot within-startingTTL record is a live boot in flight —
+		// UNLESS its owner pid was stamped (the pre-spawn claim window closed:
+		// a real coord-run acquired) and that pid is PROVABLY dead. That is a
+		// pre-activation crash (SIGKILL before Activate); the flock is already
+		// free and there is nothing left to protect (no-auto-kill guards LIVE
+		// processes only), so it is claimable NOW rather than after the full
+		// startingTTL. This keeps leaseClaimable consistent with the resolver's
+		// ownerConfirmedDead fall-through (codex D2 iter-3 [P1]); without it a
+		// pre-activation crash blocks attach/spawn recovery for ~120s. A
+		// pre-spawn claim record (pid unset) stays unclaimable within TTL, so
+		// spawn-serialization is preserved.
 		withinTTL := cur.BootID == l.boot &&
 			l.cfg.nowMono()-cur.RenewedAtMono <= int64(l.cfg.startingTTL)
-		return !withinTTL
+		ownerConfirmedDead := cur.Owner.Pid > 0 && !l.pidAlive(cur.Owner)
+		return !withinTTL || ownerConfirmedDead
 	case stateFencing:
 		return l.transientResumable(cur) // a fresh in-progress takeover blocks
 	default: // released / fenced_not_acquired / empty(epoch 0)
