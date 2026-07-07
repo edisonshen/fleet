@@ -335,8 +335,20 @@ func coordSpawnLeaseIdentity(projectName string) string {
 	if o, ok := coordlock.LiveOwner(projectName); ok && o.AgentID != "" {
 		return o.AgentID
 	}
-	if st, ok := coordlock.CurrentStarting(projectName); ok && st.WithinTTL && st.Owner.AgentID != "" {
-		return st.Owner.AgentID
+	// Starting (pre-activation) owner — mirror coordreconcile.Resolve's exact
+	// gate (coordreconcile.go ~165): treat the starter as the coord identity
+	// only while it is within its TTL AND not CONFIRMED dead. "Confirmed dead"
+	// requires a RECORDED pid (PID>0) that is not live: a just-claimed record
+	// has an unknown pid pre-spawn (PID==0), so it is NOT confirmed dead and the
+	// boot-window [a]-dedup still holds. A crashed pre-activation starter (pid
+	// recorded, process since died) is dropped here so [a] recovers by spawning
+	// a replacement instead of re-attaching to the dead starter for the whole
+	// starting TTL (WithinTTL alone would strand it — codex review [P2]).
+	if st, ok := coordlock.CurrentStarting(projectName); ok && st.Owner.AgentID != "" {
+		ownerConfirmedDead := st.Owner.PID > 0 && !st.OwnerLive
+		if st.WithinTTL && !ownerConfirmedDead {
+			return st.Owner.AgentID
+		}
 	}
 	return ""
 }
