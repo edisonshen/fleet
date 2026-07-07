@@ -2128,10 +2128,13 @@ func TestReleaseSurfacesDemoteFaultOnCorruptEpoch(t *testing.T) {
 }
 
 // codex iter-23 [P1] regression: LeaseRecordActive distinguishes a real lease
-// generation (active / fencing / fenced_not_acquired) from "no lease" (released
-// / missing). A failed takeover (fenced_not_acquired) MUST count as a real lease
-// so handoff delivery stays pending/doctor-gated instead of direct-sending to a
-// queued replacement as if the coord were legacy/bare.
+// generation (active / starting / fencing / fenced_not_acquired) from "no
+// lease" (released / missing). A failed takeover (fenced_not_acquired) MUST
+// count as a real lease so handoff delivery stays pending/doctor-gated instead
+// of direct-sending to a queued replacement as if the coord were legacy/bare.
+// `starting` (D2 two-phase startup) MUST also count as a real lease — a
+// handoff-delivery poll landing inside a real coord's boot window must not
+// misread it as "no lease at all" and trigger the legacy direct-send fallback.
 func TestLeaseRecordActive(t *testing.T) {
 	setupHome(t)
 	const project = "lra-test"
@@ -2145,6 +2148,7 @@ func TestLeaseRecordActive(t *testing.T) {
 		want  bool
 	}{
 		{stateActive, true},
+		{stateStarting, true},
 		{stateFencing, true},
 		{stateFencedNotAcquired, true},
 		{stateReleased, false},

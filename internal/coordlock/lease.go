@@ -2189,15 +2189,22 @@ func CurrentEpoch(project string) (epoch int64, ok bool) {
 }
 
 // LeaseRecordActive reports whether a readable epoch record exists on disk in a
-// NON-terminal state (active or fencing) — i.e. a lease generation is live for
-// project even if its current owner is momentarily unhealthy/stale or a takeover
-// is mid-flight. It is the "is this a real lease, or a legacy/bare coord that
-// never wrote an epoch" discriminator for handoff delivery (codex iter-22 [P1]):
-// CurrentOwner suppresses a stale/dead active owner as ok=false, but that is NOT
-// the same as "no lease exists". Delivery must keep the doc PENDING for a healthy
-// takeover when a lease record is present, and only direct-send (legacy fallback)
-// when there is genuinely no lease record. Read-only; a missing/torn/terminal
-// record degrades to false.
+// NON-terminal state (active, starting, or fencing) — i.e. a lease generation
+// is live for project even if its current owner is momentarily unhealthy/stale,
+// mid-boot (D2 two-phase startup), or a takeover is mid-flight. It is the "is
+// this a real lease, or a legacy/bare coord that never wrote an epoch"
+// discriminator for handoff delivery (codex iter-22 [P1]): CurrentOwner
+// suppresses a stale/dead active owner (and a `starting` owner, since it isn't
+// active yet) as ok=false, but that is NOT the same as "no lease exists".
+// Delivery must keep the doc PENDING for a healthy takeover OR a coord that is
+// still booting when a lease record is present, and only direct-send (legacy
+// fallback) when there is genuinely no lease record. `starting` was added
+// alongside D2 (two-phase startup, TASK-PLAN-coord-lease-sole-identity): without
+// it, a handoff-delivery poll that lands entirely inside a real coord's
+// starting->active boot window would misread the live boot as "no lease at
+// all" and trigger the legacy direct-send fallback instead of staying pending
+// for the booting owner. Read-only; a missing/torn/terminal record degrades to
+// false.
 func LeaseRecordActive(project string) bool {
 	paths, err := resolvePaths(project)
 	if err != nil {
@@ -2207,12 +2214,15 @@ func LeaseRecordActive(project string) bool {
 	if err != nil {
 		return false
 	}
-	// active / fencing / fenced_not_acquired all denote a real lease generation
-	// (a healthy holder, a mid-flight takeover, or a failed takeover awaiting
-	// doctor recovery with a possibly-unreaped old holder). Only released or a
-	// missing record means "no lease" (codex iter-23 [P1]: a failed takeover
-	// must NOT be mistaken for a legacy/bare coord and direct-sent).
+	// active / starting / fencing / fenced_not_acquired all denote a real lease
+	// generation (a healthy holder, a coord mid-boot, a mid-flight takeover, or
+	// a failed takeover awaiting doctor recovery with a possibly-unreaped old
+	// holder). Only released or a missing record means "no lease" (codex
+	// iter-23 [P1]: a failed takeover must NOT be mistaken for a legacy/bare
+	// coord and direct-sent; D2 extends the same rule to a booting `starting`
+	// owner).
 	return rec.State == stateActive ||
+		rec.State == stateStarting ||
 		rec.State == stateFencing ||
 		rec.State == stateFencedNotAcquired
 }
