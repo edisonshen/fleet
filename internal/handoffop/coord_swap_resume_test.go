@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"github.com/edisonshen/fleet/internal/coordlock"
+	"github.com/edisonshen/fleet/internal/testutil/tmuxtest"
 )
 
 // The P0 regression guards for the D3 Class-4 crash-recovery resume matrix
@@ -43,6 +44,11 @@ func (c leaseCell) deps() CoordSwapResumeDeps {
 }
 
 func TestClassifyCoordSwapResume_Matrix(t *testing.T) {
+	// ClassifyCoordSwapResume never spawns tmux — every dep is injected —
+	// but the isolation lint (scripts/lint-test-isolation.sh) matches the
+	// `Resume(` trigger substring inside the call and requires the canonical
+	// FLEET_TMUX_SOCKET guard regardless. Cheap belt-and-suspenders.
+	tmuxtest.RequireTmux(t)
 	const (
 		oldID   = "OLD"
 		oldSess = "coord-OLD"
@@ -144,6 +150,7 @@ func TestClassifyCoordSwapResume_Matrix(t *testing.T) {
 // The committed arm must not perform the defensive probe when --force is given
 // (operator override short-circuits) — and respawn regardless of OLD liveness.
 func TestClassifyCoordSwapResume_ForceSkipsProbe(t *testing.T) {
+	tmuxtest.RequireTmux(t) // isolation lint: `Resume(` trigger; no real spawn.
 	probed := false
 	d := CoordSwapResumeDeps{
 		CurrentOwner: func(string) (coordlock.Owner, bool) {
@@ -167,6 +174,7 @@ func TestClassifyCoordSwapResume_ForceSkipsProbe(t *testing.T) {
 // A nil OLD probe seam (or empty session) on the committed arm must still
 // refuse — the probe is belt-and-suspenders, never load-bearing for the verdict.
 func TestClassifyCoordSwapResume_NilProbeStillRefuses(t *testing.T) {
+	tmuxtest.RequireTmux(t) // isolation lint: `Resume(` trigger; no real spawn.
 	d := CoordSwapResumeDeps{
 		CurrentOwner:    func(string) (coordlock.Owner, bool) { return coordlock.Owner{AgentID: "NEW"}, true },
 		CurrentHandoff:  func(string) (coordlock.Handoff, bool) { return coordlock.Handoff{}, false },
