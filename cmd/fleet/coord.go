@@ -166,6 +166,11 @@ type coordRunOpts struct {
 // (acquire -> heartbeat -> release on every exit path) is exercised
 // without a real kernel flock.
 type coordLease interface {
+	// Activate performs the starting->active flip (D2 two-phase startup):
+	// the LAST startup step, run after the engine child starts and BEFORE
+	// the first tick. ok=false means a resolver superseded this wedged
+	// starter (fail-closed CAS) — the supervisor self-demotes + exits.
+	Activate() (bool, error)
 	Heartbeat()
 	Release()
 }
@@ -468,7 +473,9 @@ func runCoordRun(ctx context.Context, opts coordRunOpts, stdout, stderr io.Write
 				opts.standbyOnAcquired()
 			}
 			defer lease.Release()
-			lease.Heartbeat()
+			// Heartbeat starts AFTER the starting->active flip (below), not
+			// here: a `starting` record self-demotes the heartbeat (state !=
+			// active), so the flip must land first.
 		}
 	default:
 		// acquired==true: we are the leader. Release joins the cleanup
@@ -495,7 +502,8 @@ func runCoordRun(ctx context.Context, opts coordRunOpts, stdout, stderr io.Write
 		// freshness is PR3's job; doing it here would duplicate the
 		// progress-tracking the warm-standby owns.
 		defer lease.Release()
-		lease.Heartbeat()
+		// Heartbeat starts AFTER the starting->active flip (below): a
+		// `starting` record self-demotes the heartbeat (state != active).
 	}
 
 	// Build the child with the cancellable context — when the parent's
@@ -511,6 +519,41 @@ func runCoordRun(ctx context.Context, opts coordRunOpts, stdout, stderr io.Write
 
 	if err := child.Start(); err != nil {
 		return fmt.Errorf("coord-run: start child: %w", err)
+	}
+
+	// --- starting->active flip (D2 two-phase startup) ---
+	//
+	// We acquired the lease as `starting` (has done zero coord work). The
+	// engine child (claude) is now running but sits IDLE at its prompt — the
+	// /coordinator prompt is delivered LATER by the dispatcher/winner-delivery
+	// path — so no tick has run. Flip `starting`->`active` NOW, before the
+	// first tick, via an owner-CAS that FAILS CLOSED: if a resolver superseded
+	// us while we were a wedged starter (SupersedeStartingLease bumped the
+	// epoch, T6f), Activate refuses and we self-demote + exit BEFORE any tick —
+	// two owners can never coexist. Only AFTER a successful flip do we start
+	// the heartbeat (a `starting` record self-demotes it). Guarded on lease !=
+	// nil so the failover-OFF legacy path is byte-identical.
+	if lease != nil {
+		activated, aerr := lease.Activate()
+		switch {
+		case aerr != nil:
+			// A write fault flipping the lease. Surface-don't-silo: refuse to
+			// run a coord whose ownership record we could not commit.
+			_ = child.Process.Kill()
+			return fmt.Errorf("coord-run: activate lease for project %q: %w", opts.project, aerr)
+		case !activated:
+			// Superseded while starting (a resolver spawned a replacement).
+			// Self-demote: kill the never-ticked child + exit 0. Deferred
+			// Release()/Cleanup reap our flock + record. NEVER run a tick.
+			_ = child.Process.Kill()
+			_, _ = fmt.Fprintf(stderr,
+				"coord-run: superseded while starting for %s (a replacement acquired the lease); exiting before first tick\n",
+				opts.project)
+			exitNote = "superseded-starting"
+			return nil
+		default:
+			lease.Heartbeat()
+		}
 	}
 
 	// WARM STANDBY engine-pid stamp (codex PR3 iter-14 [P1]): a standby spawn

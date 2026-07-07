@@ -79,6 +79,7 @@ var ErrFailoverDisabled = errors.New(
 // serve / heartbeat / hold the flock as owner. The two transient states
 // belong to an in-progress takeover (see the two-phase rule).
 const (
+	stateStarting          = "starting"            // holder acquired the flock but its /coordinator loop is not up yet
 	stateActive            = "active"              // a live leader holds the flock and heartbeats
 	stateFencing           = "fencing"             // a candidate fenced the old epoch, mid-takeover
 	stateFencedNotAcquired = "fenced_not_acquired" // takeover could not kill/acquire; doctor recovery (PR6)
@@ -95,6 +96,22 @@ const (
 	// post-kill flock acquire (old holder slow to die) before escalating
 	// to fenced_not_acquired.
 	defaultFlockRetryBudget = 5 * time.Second
+	// defaultStartingTTL bounds how long a lease may sit in `starting`
+	// (acquired the flock, /coordinator not yet up + flipped to active)
+	// before an attach/spawn resolver may SUPERSEDE the stale record and
+	// spawn fresh (D2 `starting-wedged` backstop). It is generously longer
+	// than worst-case coord boot (10-30s to type the skill + first tick) so
+	// a slow-but-healthy boot is never superseded. This is NOT a kill
+	// timeout: supersession is a pure record CAS (see SupersedeStartingLease)
+	// that touches no process — the wedged session lingers as a visible
+	// zombie for `fleet gc`'s dead/live split (no-auto-kill invariant).
+	defaultStartingTTL = 120 * time.Second
+	// defaultHandoffTTL bounds how long a `handoff{successor,expires}` record
+	// (written by an OLD coord as it releases the lease, D3) reserves the
+	// freed lease for the named successor. A contender that sees a valid
+	// handoff record within TTL waits for the successor; past TTL the record
+	// is stale (the successor died mid-boot, #247) and the lease is free.
+	defaultHandoffTTL = 90 * time.Second
 )
 
 // epochRecord is the on-disk fencing data (coordinator.epoch). It is data
@@ -111,6 +128,25 @@ type epochRecord struct {
 	// for TTL). The mono value is comparable only within BootID.
 	RenewedAtMono int64 `json:"renewed_at_mono"`
 	RenewedAtWall int64 `json:"renewed_at_wall"`
+	// Handoff, when non-nil, records that the owner is releasing the lease
+	// to a named successor (D3: the lease epoch — not the deleted
+	// coord-spawn marker — is the handoff identity-commit point). A
+	// contender that observes a free lease AND a non-expired Handoff record
+	// waits for SuccessorID until ExpiresAtMono; past the deadline the
+	// record is stale (successor died mid-boot) and the lease is free.
+	// Same-boot-only: cross-boot (BootID mismatch) reads it as expired.
+	Handoff *handoffInfo `json:"handoff,omitempty"`
+}
+
+// handoffInfo is the successor reservation an OLD coord stamps into the
+// epoch record as it releases the lease during a graceful handoff (D3).
+// It replaces the four roles of the deleted coord-spawn marker's
+// handoff-commit path: the identity commit is now the lease epoch bump the
+// winning successor performs, and this record only reserves the freed lease
+// for the named successor for a bounded window.
+type handoffInfo struct {
+	SuccessorID   string `json:"successor_id"`
+	ExpiresAtMono int64  `json:"expires_at_mono"`
 }
 
 // identity is the full identity tuple of a lease holder/candidate. Both
@@ -135,6 +171,17 @@ type leaseConfig struct {
 	heartbeat        time.Duration
 	ttl              time.Duration
 	flockRetryBudget time.Duration
+	// startingTTL bounds the `starting` state before the resolver may
+	// supersede a wedged never-flipped owner (D2). handoffTTL bounds a
+	// successor reservation (D3). Both default from the package consts;
+	// tests inject short values to drive the TTL boundaries deterministically.
+	startingTTL time.Duration
+	handoffTTL  time.Duration
+	// startAsStarting makes a fresh acquire write state=`starting` instead of
+	// `active` (D2 two-phase startup). Set true ONLY on the real-coordinator
+	// acquire (AcquireLeaseWithKill); the takeover-only path and the internal
+	// test entry keep it false (acquire straight to active).
+	startAsStarting bool
 
 	// nowMono returns monotonic ns. Production: monotonicNanos.
 	nowMono func() int64
@@ -190,6 +237,8 @@ func defaultLeaseConfig() leaseConfig {
 		heartbeat:        defaultHeartbeat,
 		ttl:              defaultTTL,
 		flockRetryBudget: defaultFlockRetryBudget,
+		startingTTL:      defaultStartingTTL,
+		handoffTTL:       defaultHandoffTTL,
 		nowMono:          monotonicNanos,
 		pidStart: func(pid int) (int64, bool) {
 			st, err := pidStartNanos(pid)
@@ -449,6 +498,11 @@ func acquireLeaseWithKill(project, agentID string, kill func(KillTarget) error, 
 	}
 	cfg := defaultLeaseConfig()
 	cfg.logLifecycle = logLifecycle
+	// The real-coordinator acquire (logLifecycle=true) starts in `starting`
+	// and the supervisor flips to `active` via Activate once /coordinator is
+	// up (D2). The takeover-only path (logLifecycle=false) fences+releases
+	// without running a coordinator, so it acquires straight to `active`.
+	cfg.startAsStarting = logLifecycle
 	if kill != nil {
 		// Adapt the exported KillTarget callback into the internal
 		// killStub seam. fencerEpoch is l.epoch — the epoch the takeover
@@ -632,6 +686,20 @@ func (l *Lease) tryAcquireOnce() (done, acquired bool, err error) {
 	if l.holderHealthy(rec) {
 		return true, false, nil // healthy live leader -> stand down
 	}
+	// STARTING holder (D2): a coord acquired the flock and is booting its
+	// /coordinator loop (has not flipped to `active` yet). If its supervisor
+	// pid is ALIVE, STAND DOWN — never takeOver — even past startingTTL. A
+	// live starting holder is either healthy-booting or wedged, and the
+	// no-auto-kill invariant forbids fencing/killing a LIVE process on a
+	// staleness heuristic. The wedged case is handled at the RECORD level by
+	// the attach/spawn resolver (SupersedeStartingLease bumps the epoch so
+	// the wedged Activate fails closed) + a fresh `--standby` that polls
+	// behind this held flock and wins when the zombie dies. Only a starting
+	// record whose owner is DEAD falls through to recovery (its flock would
+	// normally already be free; defensive).
+	if rec.State == stateStarting && l.pidAlive(rec.Owner) {
+		return true, false, nil
+	}
 	// A transient (fencing / fenced_not_acquired) record means another
 	// candidate is mid-takeover. Do NOT barge in and re-fence a FRESH
 	// in-progress takeover whose candidate is still alive and within its
@@ -785,12 +853,43 @@ func (l *Lease) casToActiveAfterFlock(observedEpoch int64) (bool, error) {
 			return false, nil // someone advanced the epoch in our window
 		}
 		l.epoch = cur.Epoch + 1
-		return true, l.writeEpochLocked(epochRecord{
-			Epoch: l.epoch,
-			State: stateActive,
-			Owner: l.self,
-		})
+		return true, l.writeEpochLocked(l.freshLeaseRecord(l.epoch, l.startState(), l.self))
 	})
+}
+
+// freshLeaseRecord builds the epoch record a fresh acquire/claim writes,
+// stamping BootID + RenewedAt* + Host so the record reads as WITHIN-TTL from
+// birth. This is load-bearing for a `starting` record (D2): unlike an
+// `active` record — which the heartbeat goroutine re-stamps within a
+// heartbeat interval of acquire — a `starting` record is NEVER heartbeat-
+// stamped before Activate (the heartbeat starts only AFTER the flip). Without
+// these fields a fresh starter carries BootID="" + RenewedAtMono=0, so
+// CurrentStarting/leaseClaimable read it as past-startingTTL IMMEDIATELY, and
+// a concurrent attach/spawn during a normal boot would supersede/overwrite a
+// perfectly healthy starter instead of waiting (codex D2 iter-2 [P1]).
+func (l *Lease) freshLeaseRecord(epoch int64, state string, owner identity) epochRecord {
+	return epochRecord{
+		Epoch:         epoch,
+		State:         state,
+		Owner:         owner,
+		Host:          l.host,
+		BootID:        l.boot,
+		RenewedAtMono: l.cfg.nowMono(),
+		RenewedAtWall: time.Now().UnixNano(),
+	}
+}
+
+// startState returns the state a fresh acquire writes when it becomes the
+// leader: `starting` for the real-coordinator path (D2 two-phase startup —
+// the supervisor flips to `active` via Activate once its /coordinator loop
+// is up), or `active` for the takeover-only path (AcquireLeaseTakeover, which
+// fences+releases without ever running a coordinator) and the internal
+// test-suite entry (default cfg). Gated by cfg.startAsStarting.
+func (l *Lease) startState() string {
+	if l.cfg.startAsStarting {
+		return stateStarting
+	}
+	return stateActive
 }
 
 // takeOver runs the fence -> kill -> acquire state machine against a
@@ -970,11 +1069,8 @@ func (l *Lease) casFencingToActive(_ *os.File) (bool, error) {
 		if cur.Epoch != l.epoch {
 			return false, nil // someone advanced past our fencing epoch
 		}
-		return true, l.writeEpochLocked(epochRecord{
-			Epoch: l.epoch, // keep our fencing epoch; we are the same authority
-			State: stateActive,
-			Owner: l.self,
-		})
+		// keep our fencing epoch; we are the same authority
+		return true, l.writeEpochLocked(l.freshLeaseRecord(l.epoch, l.startState(), l.self))
 	})
 }
 
@@ -1066,6 +1162,224 @@ func (l *Lease) heartbeatOnce() (bool, error) {
 		cur.BootID = l.boot
 		return true, l.writeEpochLocked(cur)
 	})
+}
+
+// Activate performs the starting->active flip: the LAST startup step (D2).
+// A coord acquires the lease as `starting` (having done zero coord work) and
+// calls Activate once its /coordinator loop is up, IMMEDIATELY before its
+// first tick. The flip is an epoch-preserving CAS that FAILS CLOSED — the
+// same guard heartbeatOnce uses: it writes state=active ONLY if the on-disk
+// record still names us at our epoch in `starting`. A superseded starter (a
+// resolver bumped the epoch via SupersedeStartingLease while we were wedged,
+// T6f) finds the record no longer ours -> ok=false, NO write. The caller MUST
+// self-demote + exit BEFORE running any tick on ok=false; two owners can
+// never coexist because the superseded starter can never flip over the
+// replacement's record.
+//
+//	ok=true  -> we are now the active leader; start the heartbeat + first tick.
+//	ok=false -> superseded (or already not starting); self-demote + exit.
+//	err!=nil -> a write fault; treat as fatal (surface + exit).
+func (l *Lease) Activate() (bool, error) {
+	return l.withEpochLock(func() (bool, error) {
+		cur, err := readEpoch(l.paths.epoch)
+		if err != nil {
+			return false, err
+		}
+		if cur.State != stateStarting || cur.Epoch != l.epoch || !cur.Owner.equal(l.self) {
+			return false, nil // superseded / not ours -> fail closed, do NOT write
+		}
+		cur.State = stateActive
+		cur.RenewedAtMono = l.cfg.nowMono()
+		cur.RenewedAtWall = time.Now().UnixNano()
+		cur.Host = l.host
+		cur.BootID = l.boot
+		return true, l.writeEpochLocked(cur)
+	})
+}
+
+// SupersedeStartingLease fences a WEDGED `starting` owner (D2 backstop). If
+// the on-disk record is still `starting` at observedEpoch, it bumps the epoch
+// so the wedged owner's Activate flip fails closed (T6f). It is a PURE RECORD
+// CAS — it signals NO process (no-auto-kill invariant): the wedged session
+// lingers as a visible zombie for `fleet gc`'s dead/live split, and a fresh
+// `--standby` (spawned by the resolver) wins the lease when the zombie's
+// still-held flock releases on its death. The owner tuple is preserved so the
+// acquire path's live-starting stand-down keeps protecting the live zombie
+// until then.
+//
+//	ok=true  -> WE superseded the wedged starter at observedEpoch (epoch bumped).
+//	ok=false -> benign race: the record flipped to active/released, or ANOTHER
+//	            resolver already advanced the epoch past observedEpoch; the
+//	            caller MUST re-resolve rather than assume a standby is still
+//	            needed. A stale-snapshot true here would make Resolve emit
+//	            SpawnStandby beside an already-running replacement (codex D2
+//	            iter-3 [P2]).
+func SupersedeStartingLease(project string, observedEpoch int64) (ok bool, err error) {
+	return supersedeStartingWithCfg(project, observedEpoch, defaultLeaseConfig())
+}
+
+func supersedeStartingWithCfg(project string, observedEpoch int64, cfg leaseConfig) (bool, error) {
+	paths, rerr := resolvePaths(project)
+	if rerr != nil {
+		return false, rerr
+	}
+	l := &Lease{cfg: cfg, paths: paths, host: hostname(), boot: cfg.boot()}
+	return l.withEpochLock(func() (bool, error) {
+		cur, err := readEpoch(l.paths.epoch)
+		if err != nil {
+			return false, err
+		}
+		// Only a supersede WE performed at the observed epoch returns true. A
+		// record that already moved past observedEpoch (another resolver
+		// bumped it, or a replacement went active/released) is NOT our
+		// supersede: return false so Resolve re-resolves against the fresh
+		// state instead of spawning a standby from a stale snapshot.
+		if cur.State != stateStarting || cur.Epoch != observedEpoch {
+			return false, nil // flipped/released/advanced/raced -> re-resolve
+		}
+		cur.Epoch = observedEpoch + 1
+		// Keep State=starting + the same Owner so the acquire path's
+		// live-starting stand-down still protects the live zombie's held
+		// flock; keep the (stale) renewed_at so the record stays past-TTL.
+		return true, l.writeEpochLocked(cur)
+	})
+}
+
+// ReserveHandoff stamps a successor reservation into the CURRENT epoch record
+// (D3 identity commit moves off the deleted coord-spawn marker onto the
+// lease). An OLD coord that is handing off calls it BEFORE releasing the lease
+// so a contender that observes the freed lease waits for successorID until the
+// reservation expires (rule (a)) instead of spawning a duplicate. The real
+// identity COMMIT is the epoch bump the winning successor performs on acquire
+// (which writes a fresh record WITHOUT the Handoff field — clearing it, T5);
+// this reservation is only the bounded gap-window guard.
+//
+// Record-only CAS (no flock): it edits the current record in place, so it must
+// be called while OLD still owns the lease. ok=false when there is no readable
+// record to stamp (the caller proceeds without a reservation — a benign
+// degrade to the winner-delivery guarantee).
+func ReserveHandoff(project, successorID string, ttl time.Duration) (ok bool, err error) {
+	return reserveHandoffWithCfg(project, successorID, ttl, defaultLeaseConfig())
+}
+
+func reserveHandoffWithCfg(project, successorID string, ttl time.Duration, cfg leaseConfig) (bool, error) {
+	if successorID == "" {
+		return false, fmt.Errorf("coordlock.ReserveHandoff: successorID required")
+	}
+	paths, rerr := resolvePaths(project)
+	if rerr != nil {
+		return false, rerr
+	}
+	if ttl <= 0 {
+		ttl = cfg.handoffTTL
+	}
+	l := &Lease{cfg: cfg, paths: paths, host: hostname(), boot: cfg.boot()}
+	return l.withEpochLock(func() (bool, error) {
+		cur, err := readEpoch(l.paths.epoch)
+		if err != nil {
+			return false, nil // no record to stamp -> degrade to winner-delivery
+		}
+		cur.Handoff = &handoffInfo{
+			SuccessorID:   successorID,
+			ExpiresAtMono: l.cfg.nowMono() + int64(ttl),
+		}
+		return true, l.writeEpochLocked(cur)
+	})
+}
+
+// ClaimStartingRecord writes a `starting` epoch record naming agentID as the
+// to-be owner BEFORE that agent's coord-run supervisor has acquired the flock
+// (D2 spawn-serialization — replaces the deleted marker's spawn-in-flight
+// role). It is a RECORD-ONLY CAS (no flock, owner pid unknown pre-spawn): it
+// writes ONLY when the lease is currently CLAIMABLE (free / stealable / no
+// live boot in flight / no valid handoff reservation), so it never clobbers a
+// live owner or an in-progress takeover. The spawned coord-run then acquires
+// the free flock, CASes the epoch forward, and Activates. A concurrent
+// resolver that observes this record WAITs (a boot is in flight) instead of
+// spawning a duplicate — closing the session-spawn→acquire boot window the
+// deleted coord-spawn marker used to bridge.
+//
+//	ok=true  -> claimed (a `starting` record now names agentID).
+//	ok=false -> a live owner / booting starter / valid handoff exists; the
+//	            caller must NOT spawn (attach/wait instead).
+func ClaimStartingRecord(project, agentID string) (ok bool, err error) {
+	return claimStartingWithCfg(project, agentID, defaultLeaseConfig())
+}
+
+func claimStartingWithCfg(project, agentID string, cfg leaseConfig) (bool, error) {
+	paths, rerr := resolvePaths(project)
+	if rerr != nil {
+		return false, rerr
+	}
+	if err := os.MkdirAll(filepath.Dir(paths.flock), 0o755); err != nil {
+		return false, err
+	}
+	self := identity{AgentID: agentID, Project: project} // pid unknown pre-spawn
+	l := &Lease{cfg: cfg, paths: paths, self: self, host: hostname(), boot: cfg.boot()}
+	return l.withEpochLock(func() (bool, error) {
+		cur, rerr := readEpoch(l.paths.epoch)
+		switch {
+		case errors.Is(rerr, os.ErrNotExist):
+			cur = epochRecord{Epoch: 0}
+		case rerr != nil:
+			return false, rerr
+		}
+		if !l.leaseClaimable(cur) {
+			return false, nil
+		}
+		l.epoch = cur.Epoch
+		// Stamp BootID + RenewedAt* so the pre-spawn claim reads as
+		// within-startingTTL from birth (codex D2 iter-2 [P1]); otherwise a
+		// second concurrent claim would read the fresh record as past-TTL and
+		// overwrite it, defeating the spawn-serialization this record exists
+		// for.
+		return true, l.writeEpochLocked(l.freshLeaseRecord(cur.Epoch, stateStarting, self))
+	})
+}
+
+// leaseClaimable reports whether a fresh spawn may claim the lease as
+// `starting` given the current record — i.e. there is no live owner, no live
+// boot in flight, no in-progress takeover, and no valid handoff reservation.
+func (l *Lease) leaseClaimable(cur epochRecord) bool {
+	switch cur.State {
+	case stateActive:
+		return !l.holderHealthy(cur) // a healthy active owner blocks a claim
+	case stateStarting:
+		// A same-boot within-startingTTL record is a live boot in flight —
+		// UNLESS its owner pid was stamped (the pre-spawn claim window closed:
+		// a real coord-run acquired) and that pid is PROVABLY dead. That is a
+		// pre-activation crash (SIGKILL before Activate); the flock is already
+		// free and there is nothing left to protect (no-auto-kill guards LIVE
+		// processes only), so it is claimable NOW rather than after the full
+		// startingTTL. This keeps leaseClaimable consistent with the resolver's
+		// ownerConfirmedDead fall-through (codex D2 iter-3 [P1]); without it a
+		// pre-activation crash blocks attach/spawn recovery for ~120s. A
+		// pre-spawn claim record (pid unset) stays unclaimable within TTL, so
+		// spawn-serialization is preserved.
+		withinTTL := cur.BootID == l.boot &&
+			l.cfg.nowMono()-cur.RenewedAtMono <= int64(l.cfg.startingTTL)
+		ownerConfirmedDead := cur.Owner.Pid > 0 && !l.pidAlive(cur.Owner)
+		if cur.Owner.Pid > 0 && !ownerConfirmedDead {
+			// The owner pid IS stamped and IS live — a wedged-but-alive
+			// starter, TTL-independent. This primitive must NEVER clobber a
+			// live process (no-auto-kill): the only sanctioned path to
+			// dethrone a live wedged starter is the resolver's
+			// Supersede+SpawnStandby record-CAS-first sequence (T6s), not a
+			// raw claim. Without this guard, any direct or racing caller of
+			// ClaimStartingRecord could overwrite a live starter's record —
+			// bypassing the standby handoff entirely (codex D3 iter-5 [P2]).
+			return false
+		}
+		return !withinTTL || ownerConfirmedDead
+	case stateFencing:
+		return l.transientResumable(cur) // a fresh in-progress takeover blocks
+	default: // released / fenced_not_acquired / empty(epoch 0)
+		if cur.Handoff != nil && cur.Handoff.SuccessorID != "" &&
+			cur.BootID == l.boot && l.cfg.nowMono() <= cur.Handoff.ExpiresAtMono {
+			return false // a valid successor reservation blocks a fresh claim
+		}
+		return true
+	}
 }
 
 // reacquireOwnExpired re-acquires the caller's own expired lease IN PLACE at
@@ -1208,7 +1522,16 @@ func (l *Lease) Release() {
 	// Demote the record to `released` while we still hold the flock (so a
 	// successor can't have advanced the epoch under us yet). Only if it is
 	// still exactly ours — never stomp a successor's record. This is what
-	// makes outstanding tokens invalid IMMEDIATELY (state != active).
+	// makes outstanding tokens invalid IMMEDIATELY (state != active). Both
+	// `active` (a normal leader release) AND `starting` (D2: a coord that
+	// acquired the lease but exited on a PRE-activation failure path —
+	// child.Start() failed, or Activate() errored/was superseded — before
+	// the starting->active flip) are demoted. Without the `starting` case a
+	// crashed pre-activation boot leaves the epoch file `starting`, which
+	// LeaseRecordActive now counts as a live lease generation, so handoff
+	// delivery keeps the doc pending until startingTTL even though the owner
+	// is already gone (codex D2 iter-1 [P1] — fleet-owns-its-resources: the
+	// failure path must reap the record it wrote).
 	//
 	// The demote is RETRIED across transient epoch.lock contention because
 	// leaving the record `active` after we drop the flock would keep a
@@ -1248,7 +1571,8 @@ func (l *Lease) Release() {
 				if rerr != nil {
 					return false, rerr
 				}
-				if cur.State != stateActive || cur.Epoch != l.epoch || !cur.Owner.equal(l.self) {
+				if (cur.State != stateActive && cur.State != stateStarting) ||
+					cur.Epoch != l.epoch || !cur.Owner.equal(l.self) {
 					return false, nil // not ours anymore -> nothing to demote
 				}
 				cur.State = stateReleased
@@ -1686,6 +2010,16 @@ func (l *Lease) writeEpochLocked(rec epochRecord) error {
 		_ = os.Remove(tmp)
 		return fmt.Errorf("rename epoch: %w", rerr)
 	}
+	// Parent-dir fsync (D1): make the rename itself durable so a crash
+	// immediately after this write can never lose the epoch record. The
+	// deleted coord-spawn marker got this durability via state.WriteAtomic;
+	// the lease is now the SOLE owner record, so it must carry the same
+	// guarantee. Best-effort — a dir-fsync failure on exotic filesystems
+	// must not fail an otherwise-committed rename.
+	if dir, derr := os.Open(filepath.Dir(l.paths.epoch)); derr == nil {
+		_ = dir.Sync()
+		_ = dir.Close()
+	}
 	return nil
 }
 
@@ -1774,6 +2108,145 @@ func currentOwnerWithCfg(project string, cfg leaseConfig) (Owner, bool) {
 	}, true
 }
 
+// LiveOwner reports the ACTIVE lease owner for project whenever its
+// supervisor pid+pid_start is a LIVE process — REGARDLESS of heartbeat
+// TTL. It is the resolver's (internal/coordreconcile) attach gate and
+// implements the §2A / §7.0 "process-live overrides stale heartbeat"
+// rule: a live-but-stale active owner (its renewal briefly stalled during
+// a machine sleep/load stall) is STILL the coord and MUST be attached to,
+// never spawned beside (the no-auto-kill invariant — a live coord is never
+// clobbered on a staleness heuristic). This is deliberately weaker than
+// CurrentOwner's holderHealthy (which TTL-gates), precisely so a
+// stale-but-alive leader is not misread as "no owner" and overwritten by a
+// fresh ClaimStartingRecord.
+//
+// ok=false when there is no readable record, the state is not active, the
+// owner pid is unset, the record is from a PREVIOUS boot, or the owner
+// process is provably DEAD (pid+pid_start reuse-safe). A dead active owner
+// IS stealable — the resolver claims + spawns a successor there. Read-only;
+// a torn read degrades to ok=false.
+func LiveOwner(project string) (Owner, bool) {
+	return liveOwnerWithCfg(project, defaultLeaseConfig())
+}
+
+func liveOwnerWithCfg(project string, cfg leaseConfig) (Owner, bool) {
+	paths, err := resolvePaths(project)
+	if err != nil {
+		return Owner{}, false
+	}
+	rec, err := readEpoch(paths.epoch)
+	if err != nil {
+		return Owner{}, false
+	}
+	if rec.State != stateActive || rec.Owner.Pid <= 0 || rec.Owner.AgentID == "" {
+		return Owner{}, false
+	}
+	// A cross-boot record is provably DEAD by construction (any real live
+	// process's boot must be the CURRENT boot — a machine reboot kills
+	// everything). This gate is load-bearing, not merely a TTL heuristic:
+	// on Linux, pidStartNanos is boot-relative (platform_linux.go), so
+	// pid+pid_start equality ALONE is only reuse-safe within the SAME boot
+	// — across a reboot, a stale record's (pid, pid_start) can coincidentally
+	// collide with an unrelated post-reboot process (e.g. a low-numbered,
+	// deterministic-timing early-boot daemon), which would make pidAlive
+	// wrongly report a dead owner as live. Every other pidAlive caller
+	// (holderHealthy) already gates on BootID first; LiveOwner is the
+	// resolver's #1 decision-matrix branch, so skipping it here was the
+	// most exposed instance of the gap (codex-adversarial review finding).
+	// No TTL gate otherwise: process-live (same-boot) overrides stale
+	// heartbeat, per the no-auto-kill invariant.
+	if rec.BootID != cfg.boot() {
+		return Owner{}, false
+	}
+	l := &Lease{cfg: cfg, paths: paths, boot: cfg.boot()}
+	if !l.pidAlive(rec.Owner) {
+		return Owner{}, false
+	}
+	return Owner{
+		AgentID:       rec.Owner.AgentID,
+		PID:           rec.Owner.Pid,
+		PidStart:      rec.Owner.PidStart,
+		EngineStamped: rec.Owner.AgentID != "" && rec.Owner.PidStart > 0,
+	}, true
+}
+
+// CurrentHandoff returns the NON-expired successor reservation for project,
+// if the current owner stamped one while releasing the lease (D3). ok=false
+// when there is no readable record, no handoff sub-record, the reservation
+// is from a previous boot, or it has expired (successor died mid-boot →
+// the lease is free and #247's respawn proceeds). Read-only; a torn read
+// degrades to ok=false.
+func CurrentHandoff(project string) (Handoff, bool) {
+	return currentHandoffWithCfg(project, defaultLeaseConfig())
+}
+
+func currentHandoffWithCfg(project string, cfg leaseConfig) (Handoff, bool) {
+	paths, err := resolvePaths(project)
+	if err != nil {
+		return Handoff{}, false
+	}
+	rec, err := readEpoch(paths.epoch)
+	if err != nil {
+		return Handoff{}, false
+	}
+	if rec.Handoff == nil || rec.Handoff.SuccessorID == "" {
+		return Handoff{}, false
+	}
+	// Same-boot only: the monotonic deadline is meaningless across boots, so
+	// a reservation from a previous boot is treated as expired.
+	if rec.BootID != cfg.boot() {
+		return Handoff{}, false
+	}
+	if cfg.nowMono() > rec.Handoff.ExpiresAtMono {
+		return Handoff{}, false
+	}
+	return Handoff{SuccessorID: rec.Handoff.SuccessorID}, true
+}
+
+// CurrentStarting reports whether project's lease is currently in `starting`
+// state and, if so, the owner tuple + liveness + whether it is within its
+// startingTTL. ok=false when the record is missing/unreadable or its state
+// is not `starting`. OwnerLive is same-boot-gated (see liveOwnerWithCfg):
+// pid+pid_start equality alone is only reuse-safe within the SAME boot, so a
+// cross-boot record's owner is reported dead regardless of the raw pidAlive
+// result. Read-only; a torn read degrades to ok=false.
+func CurrentStarting(project string) (StartingStatus, bool) {
+	return currentStartingWithCfg(project, defaultLeaseConfig())
+}
+
+func currentStartingWithCfg(project string, cfg leaseConfig) (StartingStatus, bool) {
+	paths, err := resolvePaths(project)
+	if err != nil {
+		return StartingStatus{}, false
+	}
+	rec, err := readEpoch(paths.epoch)
+	if err != nil {
+		return StartingStatus{}, false
+	}
+	if rec.State != stateStarting {
+		return StartingStatus{}, false
+	}
+	l := &Lease{cfg: cfg, paths: paths, boot: cfg.boot()}
+	sameBoot := rec.BootID == cfg.boot()
+	withinTTL := sameBoot && cfg.nowMono()-rec.RenewedAtMono <= int64(cfg.startingTTL)
+	return StartingStatus{
+		Owner: Owner{
+			AgentID:       rec.Owner.AgentID,
+			PID:           rec.Owner.Pid,
+			PidStart:      rec.Owner.PidStart,
+			EngineStamped: rec.Owner.AgentID != "" && rec.Owner.PidStart > 0,
+		},
+		// Cross-boot record -> the owner is provably dead (a reboot kills
+		// every process), regardless of what a bare pid+pid_start equality
+		// on Linux's boot-relative starttime might coincidentally match
+		// (codex-adversarial review finding, same root cause as
+		// liveOwnerWithCfg above).
+		OwnerLive: sameBoot && l.pidAlive(rec.Owner),
+		WithinTTL: withinTTL,
+		Epoch:     rec.Epoch,
+	}, true
+}
+
 // CurrentEpoch returns the project's current on-disk fencing epoch (the
 // monotonic token) and ok=false if no epoch record exists / is unreadable.
 // It is the value the graceful handoff stamps into its
@@ -1793,15 +2266,22 @@ func CurrentEpoch(project string) (epoch int64, ok bool) {
 }
 
 // LeaseRecordActive reports whether a readable epoch record exists on disk in a
-// NON-terminal state (active or fencing) — i.e. a lease generation is live for
-// project even if its current owner is momentarily unhealthy/stale or a takeover
-// is mid-flight. It is the "is this a real lease, or a legacy/bare coord that
-// never wrote an epoch" discriminator for handoff delivery (codex iter-22 [P1]):
-// CurrentOwner suppresses a stale/dead active owner as ok=false, but that is NOT
-// the same as "no lease exists". Delivery must keep the doc PENDING for a healthy
-// takeover when a lease record is present, and only direct-send (legacy fallback)
-// when there is genuinely no lease record. Read-only; a missing/torn/terminal
-// record degrades to false.
+// NON-terminal state (active, starting, or fencing) — i.e. a lease generation
+// is live for project even if its current owner is momentarily unhealthy/stale,
+// mid-boot (D2 two-phase startup), or a takeover is mid-flight. It is the "is
+// this a real lease, or a legacy/bare coord that never wrote an epoch"
+// discriminator for handoff delivery (codex iter-22 [P1]): CurrentOwner
+// suppresses a stale/dead active owner (and a `starting` owner, since it isn't
+// active yet) as ok=false, but that is NOT the same as "no lease exists".
+// Delivery must keep the doc PENDING for a healthy takeover OR a coord that is
+// still booting when a lease record is present, and only direct-send (legacy
+// fallback) when there is genuinely no lease record. `starting` was added
+// alongside D2 (two-phase startup, TASK-PLAN-coord-lease-sole-identity): without
+// it, a handoff-delivery poll that lands entirely inside a real coord's
+// starting->active boot window would misread the live boot as "no lease at
+// all" and trigger the legacy direct-send fallback instead of staying pending
+// for the booting owner. Read-only; a missing/torn/terminal record degrades to
+// false.
 func LeaseRecordActive(project string) bool {
 	paths, err := resolvePaths(project)
 	if err != nil {
@@ -1811,12 +2291,15 @@ func LeaseRecordActive(project string) bool {
 	if err != nil {
 		return false
 	}
-	// active / fencing / fenced_not_acquired all denote a real lease generation
-	// (a healthy holder, a mid-flight takeover, or a failed takeover awaiting
-	// doctor recovery with a possibly-unreaped old holder). Only released or a
-	// missing record means "no lease" (codex iter-23 [P1]: a failed takeover
-	// must NOT be mistaken for a legacy/bare coord and direct-sent).
+	// active / starting / fencing / fenced_not_acquired all denote a real lease
+	// generation (a healthy holder, a coord mid-boot, a mid-flight takeover, or
+	// a failed takeover awaiting doctor recovery with a possibly-unreaped old
+	// holder). Only released or a missing record means "no lease" (codex
+	// iter-23 [P1]: a failed takeover must NOT be mistaken for a legacy/bare
+	// coord and direct-sent; D2 extends the same rule to a booting `starting`
+	// owner).
 	return rec.State == stateActive ||
+		rec.State == stateStarting ||
 		rec.State == stateFencing ||
 		rec.State == stateFencedNotAcquired
 }
@@ -1900,6 +2383,10 @@ func leaderPresentWithCfg(project string, cfg leaseConfig) bool {
 	switch rec.State {
 	case stateActive:
 		return l.holderHealthy(rec)
+	case stateStarting:
+		// A live starting holder is a leader mid-boot (D2) — present, so a
+		// duplicate spawn stands down. A dead starting owner is stealable.
+		return l.pidAlive(rec.Owner)
 	case stateFencing:
 		// A fresh, live, in-budget takeover (NOT resumable by a newcomer)
 		// means a legitimate successor is mid-acquire -> treat as present.

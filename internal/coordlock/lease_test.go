@@ -1081,8 +1081,9 @@ func TestParseFailoverTriState(t *testing.T) {
 	}
 }
 
-// TestAcquireLeaseEnabledByEnv: with the flag on, the public entry point
-// runs the real path (first-ever leader acquires epoch 1).
+// TestAcquireLeaseEnabledByEnv: with the flag on, the public real-coordinator
+// entry point acquires epoch 1 in `starting` (D2 two-phase startup), then
+// Activate flips it to `active`.
 func TestAcquireLeaseEnabledByEnv(t *testing.T) {
 	setupHome(t)
 	t.Setenv(FailoverEnvVar, "1")
@@ -1095,8 +1096,17 @@ func TestAcquireLeaseEnabledByEnv(t *testing.T) {
 	}
 	defer lease.Release()
 	rec := readEpochFor(t, "rainier")
+	if rec.Epoch != 1 || rec.State != stateStarting {
+		t.Fatalf("first leader should be epoch 1 starting, got %d/%s", rec.Epoch, rec.State)
+	}
+	// The starting->active flip (D2): reuses the heartbeatOnce guard.
+	ok, err := lease.Activate()
+	if err != nil || !ok {
+		t.Fatalf("Activate: ok=%v err=%v", ok, err)
+	}
+	rec = readEpochFor(t, "rainier")
 	if rec.Epoch != 1 || rec.State != stateActive {
-		t.Fatalf("first leader should be epoch 1 active, got %d/%s", rec.Epoch, rec.State)
+		t.Fatalf("after Activate: epoch 1 active, got %d/%s", rec.Epoch, rec.State)
 	}
 }
 
@@ -2118,10 +2128,13 @@ func TestReleaseSurfacesDemoteFaultOnCorruptEpoch(t *testing.T) {
 }
 
 // codex iter-23 [P1] regression: LeaseRecordActive distinguishes a real lease
-// generation (active / fencing / fenced_not_acquired) from "no lease" (released
-// / missing). A failed takeover (fenced_not_acquired) MUST count as a real lease
-// so handoff delivery stays pending/doctor-gated instead of direct-sending to a
-// queued replacement as if the coord were legacy/bare.
+// generation (active / starting / fencing / fenced_not_acquired) from "no
+// lease" (released / missing). A failed takeover (fenced_not_acquired) MUST
+// count as a real lease so handoff delivery stays pending/doctor-gated instead
+// of direct-sending to a queued replacement as if the coord were legacy/bare.
+// `starting` (D2 two-phase startup) MUST also count as a real lease — a
+// handoff-delivery poll landing inside a real coord's boot window must not
+// misread it as "no lease at all" and trigger the legacy direct-send fallback.
 func TestLeaseRecordActive(t *testing.T) {
 	setupHome(t)
 	const project = "lra-test"
@@ -2135,6 +2148,7 @@ func TestLeaseRecordActive(t *testing.T) {
 		want  bool
 	}{
 		{stateActive, true},
+		{stateStarting, true},
 		{stateFencing, true},
 		{stateFencedNotAcquired, true},
 		{stateReleased, false},
