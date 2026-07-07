@@ -2054,6 +2054,53 @@ func currentOwnerWithCfg(project string, cfg leaseConfig) (Owner, bool) {
 	}, true
 }
 
+// LiveOwner reports the ACTIVE lease owner for project whenever its
+// supervisor pid+pid_start is a LIVE process — REGARDLESS of heartbeat
+// TTL. It is the resolver's (internal/coordreconcile) attach gate and
+// implements the §2A / §7.0 "process-live overrides stale heartbeat"
+// rule: a live-but-stale active owner (its renewal briefly stalled during
+// a machine sleep/load stall) is STILL the coord and MUST be attached to,
+// never spawned beside (the no-auto-kill invariant — a live coord is never
+// clobbered on a staleness heuristic). This is deliberately weaker than
+// CurrentOwner's holderHealthy (which TTL-gates), precisely so a
+// stale-but-alive leader is not misread as "no owner" and overwritten by a
+// fresh ClaimStartingRecord.
+//
+// ok=false when there is no readable record, the state is not active, the
+// owner pid is unset, or the owner process is provably DEAD (pid+pid_start
+// reuse-safe). A dead active owner IS stealable — the resolver claims +
+// spawns a successor there. Read-only; a torn read degrades to ok=false.
+func LiveOwner(project string) (Owner, bool) {
+	return liveOwnerWithCfg(project, defaultLeaseConfig())
+}
+
+func liveOwnerWithCfg(project string, cfg leaseConfig) (Owner, bool) {
+	paths, err := resolvePaths(project)
+	if err != nil {
+		return Owner{}, false
+	}
+	rec, err := readEpoch(paths.epoch)
+	if err != nil {
+		return Owner{}, false
+	}
+	if rec.State != stateActive || rec.Owner.Pid <= 0 || rec.Owner.AgentID == "" {
+		return Owner{}, false
+	}
+	// pidAlive is pid+pid_start reuse-safe, so a cross-boot/stale record
+	// whose pid was recycled fails the check (the owner is really gone).
+	// No BootID or TTL gate: process-live overrides stale heartbeat.
+	l := &Lease{cfg: cfg, paths: paths, boot: cfg.boot()}
+	if !l.pidAlive(rec.Owner) {
+		return Owner{}, false
+	}
+	return Owner{
+		AgentID:       rec.Owner.AgentID,
+		PID:           rec.Owner.Pid,
+		PidStart:      rec.Owner.PidStart,
+		EngineStamped: rec.Owner.AgentID != "" && rec.Owner.PidStart > 0,
+	}, true
+}
+
 // CurrentHandoff returns the NON-expired successor reservation for project,
 // if the current owner stamped one while releasing the lease (D3). ok=false
 // when there is no readable record, no handoff sub-record, the reservation

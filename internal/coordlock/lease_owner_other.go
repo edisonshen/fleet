@@ -8,6 +8,10 @@ import "time"
 // primitive.
 func CurrentOwner(string) (Owner, bool) { return Owner{}, false }
 
+// LiveOwner is unsupported on platforms without the coordinator lease
+// primitive.
+func LiveOwner(string) (Owner, bool) { return Owner{}, false }
+
 // CurrentHandoff is unsupported without the lease primitive (no epoch record
 // is ever written), so there is never a successor reservation to read.
 func CurrentHandoff(string) (Handoff, bool) { return Handoff{}, false }
