@@ -16,6 +16,10 @@ func CurrentStarting(string) (StartingStatus, bool) { return StartingStatus{}, f
 // SupersedeStartingLease is unsupported without the lease primitive.
 func SupersedeStartingLease(string, int64) (bool, error) { return false, nil }
 
+// ClaimStartingRecord is unsupported without the lease primitive; the caller
+// falls back to the legacy (non-lease) spawn path.
+func ClaimStartingRecord(string, string) (bool, error) { return true, nil }
+
 // LeaseRecordActive is false on platforms without the lease primitive (no epoch
 // records are ever written), so handoff delivery treats every coord as a
 // legacy/bare coord and direct-sends — matching the never-wrapped spawn path.

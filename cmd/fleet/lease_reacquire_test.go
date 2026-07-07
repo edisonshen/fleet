@@ -98,6 +98,11 @@ func TestLeaseCheck_StalledRenewalReacquiresSameEpoch(t *testing.T) {
 		t.Fatalf("pre-acquire lease failed (acquired=%v err=%v)", acquired, err)
 	}
 	t.Cleanup(lease.Release)
+	// A coord that serves ticks has flipped starting->active (D2): the
+	// reacquire-own-expired path only handles an expired ACTIVE record.
+	if ok, aerr := lease.Activate(); aerr != nil || !ok {
+		t.Fatalf("Activate (flip to active) failed: ok=%v err=%v", ok, aerr)
+	}
 
 	epochPath := epochPathFor(t, fleetHome, project)
 	before := readEpochJSON(t, epochPath)
@@ -186,6 +191,10 @@ func TestCoordIntegration_StalledLeaseTickReacquiresAndProceeds(t *testing.T) {
 		t.Fatalf("pre-acquire lease failed (acquired=%v err=%v)", acquired, err)
 	}
 	t.Cleanup(lease.Release)
+	// A coord that serves ticks has flipped starting->active (D2).
+	if ok, aerr := lease.Activate(); aerr != nil || !ok {
+		t.Fatalf("Activate (flip to active) failed: ok=%v err=%v", ok, aerr)
+	}
 
 	epochPath := epochPathFor(t, env.fleetHome, env.project)
 	before := readEpochJSON(t, epochPath)

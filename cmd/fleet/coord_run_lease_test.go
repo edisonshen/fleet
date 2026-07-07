@@ -29,6 +29,21 @@ type fakeLease struct {
 	mu            sync.Mutex
 	heartbeatRuns int
 	releaseRuns   int
+	activateRuns  int
+	// activateFail exercises the superseded self-demote path: zero value
+	// (false) means the starting->active flip SUCCEEDS (the normal two-phase
+	// startup), so existing &fakeLease{} literals are unaffected. A test sets
+	// it true to make Activate return ok=false. activateErr, when set, is
+	// returned from Activate.
+	activateFail bool
+	activateErr  error
+}
+
+func (f *fakeLease) Activate() (bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.activateRuns++
+	return !f.activateFail, f.activateErr
 }
 
 func (f *fakeLease) Heartbeat() {

@@ -1224,6 +1224,78 @@ func supersedeStartingWithCfg(project string, observedEpoch int64, cfg leaseConf
 	})
 }
 
+// ClaimStartingRecord writes a `starting` epoch record naming agentID as the
+// to-be owner BEFORE that agent's coord-run supervisor has acquired the flock
+// (D2 spawn-serialization — replaces the deleted marker's spawn-in-flight
+// role). It is a RECORD-ONLY CAS (no flock, owner pid unknown pre-spawn): it
+// writes ONLY when the lease is currently CLAIMABLE (free / stealable / no
+// live boot in flight / no valid handoff reservation), so it never clobbers a
+// live owner or an in-progress takeover. The spawned coord-run then acquires
+// the free flock, CASes the epoch forward, and Activates. A concurrent
+// resolver that observes this record WAITs (a boot is in flight) instead of
+// spawning a duplicate — closing the session-spawn→acquire boot window the
+// deleted coord-spawn marker used to bridge.
+//
+//	ok=true  -> claimed (a `starting` record now names agentID).
+//	ok=false -> a live owner / booting starter / valid handoff exists; the
+//	            caller must NOT spawn (attach/wait instead).
+func ClaimStartingRecord(project, agentID string) (ok bool, err error) {
+	return claimStartingWithCfg(project, agentID, defaultLeaseConfig())
+}
+
+func claimStartingWithCfg(project, agentID string, cfg leaseConfig) (bool, error) {
+	paths, rerr := resolvePaths(project)
+	if rerr != nil {
+		return false, rerr
+	}
+	if err := os.MkdirAll(filepath.Dir(paths.flock), 0o755); err != nil {
+		return false, err
+	}
+	self := identity{AgentID: agentID, Project: project} // pid unknown pre-spawn
+	l := &Lease{cfg: cfg, paths: paths, self: self, host: hostname(), boot: cfg.boot()}
+	return l.withEpochLock(func() (bool, error) {
+		cur, rerr := readEpoch(l.paths.epoch)
+		switch {
+		case errors.Is(rerr, os.ErrNotExist):
+			cur = epochRecord{Epoch: 0}
+		case rerr != nil:
+			return false, rerr
+		}
+		if !l.leaseClaimable(cur) {
+			return false, nil
+		}
+		l.epoch = cur.Epoch
+		return true, l.writeEpochLocked(epochRecord{
+			Epoch: cur.Epoch,
+			State: stateStarting,
+			Owner: self,
+		})
+	})
+}
+
+// leaseClaimable reports whether a fresh spawn may claim the lease as
+// `starting` given the current record — i.e. there is no live owner, no live
+// boot in flight, no in-progress takeover, and no valid handoff reservation.
+func (l *Lease) leaseClaimable(cur epochRecord) bool {
+	switch cur.State {
+	case stateActive:
+		return !l.holderHealthy(cur) // a healthy active owner blocks a claim
+	case stateStarting:
+		// A same-boot within-startingTTL record is a live boot in flight.
+		withinTTL := cur.BootID == l.boot &&
+			l.cfg.nowMono()-cur.RenewedAtMono <= int64(l.cfg.startingTTL)
+		return !withinTTL
+	case stateFencing:
+		return l.transientResumable(cur) // a fresh in-progress takeover blocks
+	default: // released / fenced_not_acquired / empty(epoch 0)
+		if cur.Handoff != nil && cur.Handoff.SuccessorID != "" &&
+			cur.BootID == l.boot && l.cfg.nowMono() <= cur.Handoff.ExpiresAtMono {
+			return false // a valid successor reservation blocks a fresh claim
+		}
+		return true
+	}
+}
+
 // reacquireOwnExpired re-acquires the caller's own expired lease IN PLACE at
 // the SAME epoch (DESIGN-coord-lease-false-fence-prevention piece 1). It is
 // the lease-check side's answer to a rival-free stall: prev is the probe
