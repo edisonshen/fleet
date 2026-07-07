@@ -853,12 +853,30 @@ func (l *Lease) casToActiveAfterFlock(observedEpoch int64) (bool, error) {
 			return false, nil // someone advanced the epoch in our window
 		}
 		l.epoch = cur.Epoch + 1
-		return true, l.writeEpochLocked(epochRecord{
-			Epoch: l.epoch,
-			State: l.startState(),
-			Owner: l.self,
-		})
+		return true, l.writeEpochLocked(l.freshLeaseRecord(l.epoch, l.startState(), l.self))
 	})
+}
+
+// freshLeaseRecord builds the epoch record a fresh acquire/claim writes,
+// stamping BootID + RenewedAt* + Host so the record reads as WITHIN-TTL from
+// birth. This is load-bearing for a `starting` record (D2): unlike an
+// `active` record — which the heartbeat goroutine re-stamps within a
+// heartbeat interval of acquire — a `starting` record is NEVER heartbeat-
+// stamped before Activate (the heartbeat starts only AFTER the flip). Without
+// these fields a fresh starter carries BootID="" + RenewedAtMono=0, so
+// CurrentStarting/leaseClaimable read it as past-startingTTL IMMEDIATELY, and
+// a concurrent attach/spawn during a normal boot would supersede/overwrite a
+// perfectly healthy starter instead of waiting (codex D2 iter-2 [P1]).
+func (l *Lease) freshLeaseRecord(epoch int64, state string, owner identity) epochRecord {
+	return epochRecord{
+		Epoch:         epoch,
+		State:         state,
+		Owner:         owner,
+		Host:          l.host,
+		BootID:        l.boot,
+		RenewedAtMono: l.cfg.nowMono(),
+		RenewedAtWall: time.Now().UnixNano(),
+	}
 }
 
 // startState returns the state a fresh acquire writes when it becomes the
@@ -1051,11 +1069,8 @@ func (l *Lease) casFencingToActive(_ *os.File) (bool, error) {
 		if cur.Epoch != l.epoch {
 			return false, nil // someone advanced past our fencing epoch
 		}
-		return true, l.writeEpochLocked(epochRecord{
-			Epoch: l.epoch, // keep our fencing epoch; we are the same authority
-			State: l.startState(),
-			Owner: l.self,
-		})
+		// keep our fencing epoch; we are the same authority
+		return true, l.writeEpochLocked(l.freshLeaseRecord(l.epoch, l.startState(), l.self))
 	})
 }
 
@@ -1307,11 +1322,12 @@ func claimStartingWithCfg(project, agentID string, cfg leaseConfig) (bool, error
 			return false, nil
 		}
 		l.epoch = cur.Epoch
-		return true, l.writeEpochLocked(epochRecord{
-			Epoch: cur.Epoch,
-			State: stateStarting,
-			Owner: self,
-		})
+		// Stamp BootID + RenewedAt* so the pre-spawn claim reads as
+		// within-startingTTL from birth (codex D2 iter-2 [P1]); otherwise a
+		// second concurrent claim would read the fresh record as past-TTL and
+		// overwrite it, defeating the spawn-serialization this record exists
+		// for.
+		return true, l.writeEpochLocked(l.freshLeaseRecord(cur.Epoch, stateStarting, self))
 	})
 }
 

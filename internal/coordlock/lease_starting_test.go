@@ -117,6 +117,62 @@ func TestReleaseDemotesStartingRecord(t *testing.T) {
 	}
 }
 
+// codex D2 iter-2 [P1] regression: a FRESH `starting` record (written by the
+// real acquire path, NOT writeEpochRaw) must read as within-startingTTL
+// immediately — it carries BootID + RenewedAtMono so a concurrent resolver
+// WAITs on a healthy boot instead of superseding it. Before the fix these
+// fields were dropped, so every fresh starter read as past-TTL at birth.
+func TestFreshAcquire_StartingRecordIsWithinTTL(t *testing.T) {
+	setupHome(t)
+	const project = "fresh-within-ttl"
+	clk := &fakeClock{ns: int64(time.Hour)}
+	live := newFakeLiveness()
+	cfg := startingCfg(clk, live)
+
+	lease, acquired, _, err := acquireLeaseDetect(project, "boot01", cfg)
+	if err != nil || !acquired {
+		t.Fatalf("acquire: acquired=%v err=%v", acquired, err)
+	}
+	t.Cleanup(lease.Release)
+
+	st, ok := currentStartingWithCfg(project, cfg)
+	if !ok {
+		t.Fatal("CurrentStarting must report the fresh starting record")
+	}
+	if !st.WithinTTL {
+		rec := readEpochFor(t, project)
+		t.Fatalf("fresh starter must be within TTL; got WithinTTL=false (bootID=%q renewedAtMono=%d)",
+			rec.BootID, rec.RenewedAtMono)
+	}
+}
+
+// A FRESH pre-spawn claim (ClaimStartingRecord) must likewise read as
+// within-TTL, so a second concurrent claim sees a live boot-in-flight and
+// stands down instead of overwriting it (spawn-serialization).
+func TestFreshClaim_StartingRecordIsWithinTTL(t *testing.T) {
+	setupHome(t)
+	const project = "fresh-claim-within-ttl"
+	clk := &fakeClock{ns: int64(time.Hour)}
+	live := newFakeLiveness()
+	cfg := startingCfg(clk, live)
+
+	if ok, err := claimStartingWithCfg(project, "newA", cfg); err != nil || !ok {
+		t.Fatalf("claim on free lease: ok=%v err=%v", ok, err)
+	}
+	st, ok := currentStartingWithCfg(project, cfg)
+	if !ok || !st.WithinTTL {
+		rec := readEpochFor(t, project)
+		t.Fatalf("fresh claim must be within TTL; ok=%v withinTTL=%v (bootID=%q renewedAtMono=%d)",
+			ok, st.WithinTTL, rec.BootID, rec.RenewedAtMono)
+	}
+	// A second claim must now stand down (not overwrite the live boot).
+	if ok, err := claimStartingWithCfg(project, "newB", cfg); err != nil {
+		t.Fatalf("second claim err: %v", err)
+	} else if ok {
+		t.Fatal("second claim must refuse: a within-TTL boot is in flight")
+	}
+}
+
 // SupersedeStartingLease is a benign no-op if the record already flipped to
 // active (a race where the starter won before the resolver superseded).
 func TestSupersede_NoOpIfActivated(t *testing.T) {
