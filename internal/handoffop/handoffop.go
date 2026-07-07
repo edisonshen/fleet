@@ -689,11 +689,11 @@ func spawnAndRetire(req queue.SpawnFresh, queuePath string,
 	// Agent-tool subagents must NEVER carry the flag (push-storm
 	// protection). Mirrors cmd/fleet/handoff.go and dispatch.go.
 	//
-	// The predicate matches the post-spawn isCoordSwap detector at
-	// line ~602 below — same fact (coord-spawn marker resolves to
-	// oldRec.ID), used at two points (pre-inject + post-spawn marker
-	// transfer). Extracted as isCoordHandoffForAgent for unit-testable
-	// gate coverage without driving full spawnAndRetire.
+	// The predicate matches the post-spawn isCoordSwap detector below —
+	// same fact (spawn.IsCoordSpawn: task_id == coord-<project>), used
+	// at two points (pre-inject + post-spawn). Extracted as
+	// isCoordHandoffForAgent for unit-testable gate coverage without
+	// driving full spawnAndRetire.
 	var rewrittenExecArgv []string
 	if isCoordHandoffForAgent(oldRec) {
 		// v0.12.2 P0 v3 (DESIGN-coord-spawn-atomic-gate.md §Change 7;

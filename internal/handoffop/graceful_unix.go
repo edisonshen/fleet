@@ -331,11 +331,9 @@ func GracefulCoordSwap(oldRec, newRec *agent.Record, docPath string,
 		return nil, fmt.Errorf("handoffop.GracefulCoordSwap: deliver closure required")
 	}
 	var winner *agent.Record
-	retireStarted := false
 	deps := gracefulSwapDepsFn()
 	deps.SpawnStandby = func(time.Duration) error { return nil } // standby == newRec, already spawned
 	deps.RetireOld = func() error {
-		retireStarted = true
 		_, err := atomicCoordSwapFn(AtomicCoordSwapInputs{
 			Project:              oldRec.Project,
 			OldRec:               oldRec,
@@ -362,8 +360,7 @@ func GracefulCoordSwap(oldRec, newRec *agent.Record, docPath string,
 		// lease. There is nothing to undo — the coord-spawn marker is gone
 		// (D3) and the identity commit is the winner's async epoch bump, which
 		// only happens once the standby actually acquires the freed flock. OLD
-		// still owns the lease, so discovery keeps resolving to OLD; retireStarted
-		// only distinguishes whether AtomicCoordSwap ran for logging/future use.
+		// still owns the lease, so discovery keeps resolving to OLD.
 		//
 		// The standby (newRec) is deliberately NOT reaped on this path
 		// (codex iter-4 [P1] reviewed + rejected): the callers preserve the
@@ -373,7 +370,6 @@ func GracefulCoordSwap(oldRec, newRec *agent.Record, docPath string,
 		// standby wins the freed lease, the pending queue's lock-owner
 		// delivery heals it (§5c) — it is never a blank strand. A standby
 		// that never wins self-reaps at the standby timeout (10 min).
-		_ = retireStarted
 		return nil, err
 	}
 	return winner, nil

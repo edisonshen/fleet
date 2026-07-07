@@ -6,9 +6,10 @@
 // coord for project X" — without duplicating the rules.
 //
 // The TUI's per-project attach uses a SUPERSET of this package: it
-// also gates [a] dedup on the coord-spawn marker so a failed-prompt
-// dispatch re-spawns instead of dropping the operator into a bare
-// Claude. Tier 3 has no such gate — by the time PROJECT RECOVERY
+// also gates [a] dedup on the coordinator LEASE identity (D3, the
+// coord-spawn marker is deleted) so a failed-prompt dispatch re-spawns
+// instead of dropping the operator into a bare Claude. Tier 3 has no
+// such gate — by the time PROJECT RECOVERY
 // fires, any live coord is acceptable. Keeping that nuance in the
 // TUI wrapper rather than this package preserves the failover
 // invariant ("never exit").

@@ -1008,14 +1008,15 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// dead) agent record appears on the right column for the
 		// operator to investigate via [x] or [a].
 		//
-		// Codex iter-3 P2: write the coord-spawn marker so the
-		// dashboard's task_id fallback can validate the agent ID
-		// matches our intent. Without this, an operator shelling out
+		// Codex iter-3 P2 (D3: marker deleted): claim the `starting`
+		// lease record (claimStartingRecordFn) so the dashboard's
+		// task_id fallback can validate the agent ID matches our intent.
+		// Without this, an operator shelling out
 		// `fleet dispatch coord-X --project X --coord-spawn` could
-		// hijack the LEFT-column slot. The marker is best-effort: a
-		// write failure is logged in the flash but doesn't abort the
+		// hijack the LEFT-column slot. The claim is best-effort: a
+		// failure is logged in the flash but doesn't abort the
 		// attach (the agent is up; worst case the dashboard renders
-		// the coord on RIGHT until the lock body publishes).
+		// the coord on RIGHT until the lease owner publishes).
 		if msg.err != nil {
 			// Spec: a [+]-initiated spawn failure must surface the
 			// "project is registered — [a] on the new row to retry"

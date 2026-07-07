@@ -67,15 +67,19 @@ type coordSpawnCtx struct {
 }
 
 // coordSpawnState enumerates the indicator states the project row can
-// be in with respect to the coord-spawn marker: Idle, Spawning, Active,
-// Stuck, Waiting (PART 2b downgrade), and NeverTicked (Path C
-// post-suppression hint). Naming mirrors the spec language in issue #86
-// to keep the test names readable.
+// be in with respect to the coordinator lease identity (D3: the
+// coord-spawn marker is deleted; the caller derives "a coord is
+// present" from coordSpawnIdentityFn and the spawn start from the coord
+// record's SpawnedAt): Idle, Spawning, Active, Stuck, Waiting (PART 2b
+// downgrade), and NeverTicked (Path C post-suppression hint). Naming
+// mirrors the spec language in issue #86 to keep the test names readable.
+// (The derivation function still uses marker-shaped parameter names —
+// markerOK/markerMtime — now fed from the lease identity + SpawnedAt.)
 type coordSpawnState int
 
 const (
-	// coordSpawnIdle: no marker on disk. Render exactly what the
-	// dashboard rendered before this PR — no spawning line.
+	// coordSpawnIdle: the lease names no coord for this project. Render
+	// exactly what the dashboard rendered before this PR — no spawning line.
 	coordSpawnIdle coordSpawnState = iota
 
 	// coordSpawnSpawning: marker exists AND coord-state.json is missing

@@ -48,7 +48,7 @@ const DisabledMarkerFilename = "rc-disabled"
 // MarkerPath returns
 // ~/.fleet/projects/<safe-name>/rc-enabled.
 //
-// Mirrors state.CoordSpawnMarkerPath shape. Validation matches
+// Uses the same per-project state.ProjectDir layout; validation matches
 // state.ValidateProjectName via state.ProjectDir.
 func MarkerPath(project string) (string, error) {
 	dir, err := state.ProjectDir(project)

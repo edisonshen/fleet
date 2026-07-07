@@ -212,10 +212,11 @@ type coordSpawnDoneMsg struct {
 	// attachedExisting is true when dispatch vetoed the spawn (exit 75 —
 	// a healthy leader already holds the lease) AND the callback re-
 	// resolved that live leader on disk. The Update handler then attaches
-	// to the existing coord (pendingAttach + tea.Quit) WITHOUT writing the
-	// coord-spawn marker — the TUI did not spawn this coord, so stamping
-	// the marker would corrupt [a] dedup semantics (codex round-2 P1). A
-	// distinct field (not reusing the spawn-success shape) keeps the
+	// to the existing coord (pendingAttach + tea.Quit) WITHOUT claiming a
+	// starting lease record (D3: the coord-spawn marker is deleted) — the
+	// TUI did not spawn this coord, so claiming its identity would corrupt
+	// [a] dedup semantics (codex round-2 P1). A distinct field (not reusing
+	// the spawn-success shape) keeps the
 	// "attached a live coord" outcome from threading through the marker-
 	// writing default branch in model.go.
 	attachedExisting bool
@@ -1459,9 +1460,10 @@ func (m Model) actionAttachProject(p *ProjectRow) (Model, tea.Cmd, bool) {
 	// Path 2.5: lock-body fallback (codex iter-7 P2). Recovery case
 	// after a prompt-delivery failure: the operator attached and
 	// manually typed /coordinator; the skill ran and wrote the lock
-	// body — but no coord-spawn marker exists (we deliberately
-	// skipped it on the failed dispatch). The dashboard's freshness
-	// gate may also lag if coord-state.json hasn't ticked yet.
+	// body — but the TUI never claimed a starting lease record (D3:
+	// the coord-spawn marker is deleted; we deliberately skipped the
+	// claim on the failed dispatch). The dashboard's freshness gate
+	// may also lag if coord-state.json hasn't ticked yet.
 	// Reading the lock body directly bridges that gap: an ID written
 	// into coordinator.lock came from a coord that successfully
 	// acquired LOCK_EX, so it's authoritative regardless of marker
@@ -2160,9 +2162,10 @@ func dispatchAgentID(out string) string {
 // runDispatch when SendInitialPrompt failed. The dispatch CLI exits 0
 // in this case (the agent + tmux session ARE up; the operator just
 // has to type the prompt manually) but the coord skill never started
-// — so the TUI must NOT write the coord-spawn marker, which would
-// cause the dashboard to render a plain Claude session as the
-// project's verified coord (codex iter-5 P2).
+// — so the TUI must NOT claim a starting lease record (D3: the
+// coord-spawn marker is deleted), which would cause the dashboard to
+// render a plain Claude session as the project's verified coord
+// (codex iter-5 P2).
 //
 // Stable across the dispatch.go output shape; the CLI test
 // TestDispatch_PromptFailureWarningShape pins the literal text.

@@ -404,12 +404,13 @@ func renderColumnHeadings(m Model, leftW, rightW int) string {
 //
 // PURE: takes the already-built line COUNTS (leftLen / workerLen /
 // agentLen) rather than rebuilding the body. buildBodyLines reaches
-// projectFooterLines, which probes tmux and can REMOVE a stale
-// coord-spawn marker — a real side effect. Rebuilding here (the old shape)
-// duplicated that I/O on every bounded render and again on every
-// key-driven scroll alignment, and risked budgeting against different
-// marker state than the rendered lines (codex review [P2]). Callers build
-// once and thread the counts in.
+// projectFooterLines, which probes tmux for coord liveness — a real
+// I/O side effect. Rebuilding here (the old shape) duplicated that I/O
+// on every bounded render and again on every key-driven scroll
+// alignment, and risked budgeting against different coord state than
+// the rendered lines (codex review [P2]). Callers build once and thread
+// the counts in. (D3: the marker-removal side effect this once described
+// is gone — the coord-spawn marker is deleted; the lease is the identity.)
 func (m Model) bodyRowBudget(leftLen, workerLen, agentLen int) (leftRows, rightRows int, ok bool) {
 	const (
 		minProjectsRows = 6
@@ -1042,7 +1043,8 @@ func rowsHaveLeft(rows []dashRow) bool {
 // loose-agent-tagged record, which is the v0.2 norm). When CoordID is
 // empty, the block stays at three lines and we skip the coord row.
 //
-// Spawning indicator (issue #86): when the coord-spawn marker exists
+// Spawning indicator (issue #86): when the lease names a coord (D3:
+// coordSpawnIdentityFn non-empty; the coord-spawn marker is deleted)
 // AND coord-state.json hasn't published a fresh tick yet, we render
 // "⠋ spawning coord... 1m 23s" in the same slot as the coord-id line.
 // Beyond ctx.spawnTimeout, the slot flips to a red "▲ coord spawn
