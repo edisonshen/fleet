@@ -18,9 +18,10 @@
 // Decision matrix (evaluated top-to-bottom; first match wins):
 //
 //	LiveOwner (active, pid alive, TTL-independent) -> ATTACH  (T3, T7b)
-//	starting within TTL                            -> WAIT    (T2: boot in flight)
+//	starting, owner pid stamped + confirmed DEAD    -> claim   (falls to free branch, TTL-independent)
+//	starting within TTL (owner unset/live)          -> WAIT    (T2: boot in flight)
 //	starting past TTL, owner LIVE                   -> SUPERSEDE + SPAWN-STANDBY (T6s)
-//	starting past TTL, owner DEAD                   -> claim   (falls to free branch)
+//	starting past TTL, owner unset                  -> claim   (falls to free branch)
 //	valid handoff reservation                       -> WAIT   (#247 gap-window rule a)
 //	free / dead-active lease                         -> CLAIM + SPAWN (T7a, T8)
 //
@@ -151,11 +152,22 @@ func Resolve(d Deps, project, agentID string) (Verdict, error) {
 	// (2) A `starting` owner: a coord acquired the flock and is booting its
 	// /coordinator loop but has not flipped to `active` yet.
 	if st, ok := d.CurrentStarting(project); ok {
-		if st.WithinTTL {
-			// Healthy boot in flight -> WAIT regardless of OwnerLive: the
-			// owner pid is not stamped during the pre-spawn
-			// ClaimStartingRecord window, so a not-yet-live owner within TTL
-			// is still a legitimate boot, not a duplicate trigger (T2).
+		// ownerConfirmedDead is true only when the pid WAS stamped (the
+		// pre-spawn ClaimStartingRecord window has closed — a real
+		// coord-run supervisor holds/held the flock) and that pid is
+		// PROVABLY dead (pid+pid_start reuse-safe). No-auto-kill protects
+		// LIVE processes only; a confirmed-dead owner has nothing left to
+		// protect, so it must NOT wait out the rest of startingTTL. Without
+		// this, a pre-activation crash (child.Start() failed, or the
+		// supervisor was killed before Activate) reads as WithinTTL for up
+		// to ~120s even though the flock is already free, turning attach/
+		// spawn recovery into a multi-minute outage (codex D4 iter-1 [P1]).
+		ownerConfirmedDead := st.Owner.PID > 0 && !st.OwnerLive
+		if st.WithinTTL && !ownerConfirmedDead {
+			// Healthy boot in flight -> WAIT: the owner pid is not stamped
+			// during the pre-spawn ClaimStartingRecord window, so a
+			// not-yet-live owner within TTL is still a legitimate boot, not
+			// a duplicate trigger (T2).
 			return Verdict{
 				Decision: Wait,
 				Reason:   "coord boot in flight (starting within TTL)",
