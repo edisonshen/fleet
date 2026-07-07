@@ -555,7 +555,7 @@ func TestKeyA_WorkerRow_RoutesToCoordTmux(t *testing.T) {
 	// findExistingCoordForProject also requires a coord-spawn marker
 	// on disk. Stub the marker so the test doesn't need to seed real
 	// marker files.
-	(&stubCoordSpawnMarker{markers: map[string]string{"fleet": "c0fdc0ff"}}).install(t)
+	(&stubCoordLeaseIdentity{markers: map[string]string{"fleet": "c0fdc0ff"}}).install(t)
 	pdir := withFleetHome(t)
 	seedTasks(t, pdir, "fleet", TaskCounts{Todo: 1})
 	seedWorker(t, pdir, "fleet", "do-x-1a2b", workers.State{
@@ -2246,7 +2246,7 @@ func TestKeyA_ProjectRow_ForwardsResolvedRepoAsCwd(t *testing.T) {
 func TestFindExistingCoordForProject_ReturnsAliveMatch(t *testing.T) {
 	(&stubSessionAlive{}).install(t)
 	(&stubProjectTreeExists{}).install(t)
-	(&stubCoordSpawnMarker{markers: map[string]string{"demo": "c0ffeec0"}}).install(t)
+	(&stubCoordLeaseIdentity{markers: map[string]string{"demo": "c0ffeec0"}}).install(t)
 
 	r := agent.New("c0ffeec0")
 	r.Project = "demo"
@@ -2283,7 +2283,7 @@ func TestFindExistingCoordForProject_ReturnsFalseOnNoMatch(t *testing.T) {
 func TestFindExistingCoordForProject_ReturnsFalseOnDeadSession(t *testing.T) {
 	(&stubSessionAlive{dead: map[string]bool{"fleet-deadc0de": true}}).install(t)
 	(&stubProjectTreeExists{}).install(t)
-	(&stubCoordSpawnMarker{markers: map[string]string{"demo": "deadc0de"}}).install(t)
+	(&stubCoordLeaseIdentity{markers: map[string]string{"demo": "deadc0de"}}).install(t)
 	// Also stub session probe so the conservative re-probe path
 	// (sessionProbeOrAliveFn) returns "definitively dead" rather than
 	// "probe error → alive".
@@ -2322,7 +2322,7 @@ func TestFindExistingCoordForProject_ProjectMismatchedSkipped(t *testing.T) {
 func TestKeyA_ProjectRow_FindsExistingCoordByTaskID(t *testing.T) {
 	(&stubSessionAlive{}).install(t)
 	(&stubProjectTreeExists{}).install(t)
-	(&stubCoordSpawnMarker{markers: map[string]string{"demo": "c00bf001"}}).install(t)
+	(&stubCoordLeaseIdentity{markers: map[string]string{"demo": "c00bf001"}}).install(t)
 	stub := &stubFleetCmd{}
 	stub.install(t)
 
@@ -2466,8 +2466,8 @@ func TestKeyA_ProjectRow_InFlightSpawn_RejectsDuplicate(t *testing.T) {
 // resolves, subsequent [a] presses go through the full lookup again.
 func TestModel_CoordSpawnDoneMsg_ClearsInFlight(t *testing.T) {
 	(&stubSessionAlive{}).install(t)
-	// Marker stub so writeCoordSpawnMarkerFn doesn't hit FLEET_HOME.
-	(&stubWriteCoordSpawnMarker{}).install(t)
+	// Lease-claim stub so claimStartingRecordFn doesn't hit FLEET_HOME.
+	(&stubClaimStartingRecord{}).install(t)
 
 	m := New("test")
 	m.coordOpInFlight = map[string]string{"demo": coordOpSpawn}
@@ -2489,7 +2489,7 @@ func TestModel_CoordSpawnDoneMsg_ClearsInFlight(t *testing.T) {
 // next refresh. Requires promptDelivered=true (codex iter-5 P2).
 func TestModel_CoordSpawnDoneMsg_WritesMarker(t *testing.T) {
 	(&stubSessionAlive{}).install(t)
-	markerStub := &stubWriteCoordSpawnMarker{}
+	markerStub := &stubClaimStartingRecord{}
 	markerStub.install(t)
 
 	m := New("test")
@@ -2517,7 +2517,7 @@ func TestModel_CoordSpawnDoneMsg_WritesMarker(t *testing.T) {
 // visibly unowned until they retry.
 func TestModel_CoordSpawnDoneMsg_PromptFailed_SkipsMarker(t *testing.T) {
 	(&stubSessionAlive{}).install(t)
-	markerStub := &stubWriteCoordSpawnMarker{}
+	markerStub := &stubClaimStartingRecord{}
 	markerStub.install(t)
 
 	m := New("test")
@@ -2643,38 +2643,16 @@ func TestKeyA_ProjectRow_DeadSessionAfterSpawn_FlashesNoAttach(t *testing.T) {
 	}
 }
 
-// TestFindExistingCoordForProject_AlivePastBootWindow_MarkerPresent
-// pins codex iter-5/iter-6 P1: the [a] idempotency predicate is
-// LOOSER than the dashboard's findCoordByTaskID for project-tree
-// existence and marker-mtime freshness, but it DOES require the
-// marker to be present (codex iter-6 P1 — without that gate, a
-// prompt-failed coord would auto-attach instead of allowing a
-// recovery respawn).
-//
-// This test exercises the "stalled past 60s" recovery: alive coord,
-// marker present, but stale-mtime + project-tree-missing. The [a]
-// path re-attaches; the dashboard would NOT (correct: it wants
-// freshness for rendering identity).
-func TestFindExistingCoordForProject_AlivePastBootWindow_MarkerPresent(t *testing.T) {
-	(&stubSessionAlive{}).install(t)
-	// Stale marker — older than coordBootWindow.
-	(&stubCoordSpawnMarkerStale{markers: map[string]string{"demo": "stalled1"}}).install(t)
-	// Project tree gate would also block the dashboard fallback.
-	(&stubProjectTreeExists{missing: map[string]bool{"demo": true}}).install(t)
-
-	r := agent.New("stalled1")
-	r.Project = "demo"
-	r.TaskID = "coord-demo"
-	r.TmuxSession = "fleet-stalled1"
-
-	got, ok := findExistingCoordForProject([]*agent.Record{r}, "demo")
-	if !ok {
-		t.Fatal("[a] idempotency must re-attach to alive coord with present marker, regardless of staleness/tree gates")
-	}
-	if got.ID != "stalled1" {
-		t.Errorf("found wrong record: %+v", got)
-	}
-}
+// (Deleted: TestFindExistingCoordForProject_AlivePastBootWindow_MarkerPresent.
+// Its premise — that [a]'s findExistingCoordForProject is LOOSER than the
+// dashboard's findCoordByTaskID on the marker's mtime-freshness gate — no
+// longer exists. D3 deleted the coord-spawn marker + its separate mtime
+// gate; both paths now gate identically on the coordinator lease
+// (coordSpawnIdentityFn). A live coord IS named by the lease for both, and a
+// dead one is named by neither, so there is no stale-but-present state to
+// re-attach differently. The remaining [a] contracts are covered by
+// TestFindExistingCoordForProject_NoMarker_FallsThroughToSpawn (no identity
+// → spawn) and the lock-body recovery test below.)
 
 // TestKeyA_ProjectRow_PromptRecoveryDoesNotDuplicateSpawn pins
 // codex iter-7 P2: after a prompt-failed dispatch, the operator
@@ -2739,7 +2717,7 @@ func TestKeyA_ProjectRow_PromptRecoveryDoesNotDuplicateSpawn(t *testing.T) {
 // The operator's intent is to recover via spawn.
 func TestFindExistingCoordForProject_NoMarker_FallsThroughToSpawn(t *testing.T) {
 	(&stubSessionAlive{}).install(t)
-	(&stubCoordSpawnMarker{markers: map[string]string{}}).install(t) // empty
+	(&stubCoordLeaseIdentity{markers: map[string]string{}}).install(t) // empty
 	(&stubProjectTreeExists{}).install(t)
 
 	r := agent.New("phantom1")
@@ -2760,7 +2738,7 @@ func TestKeyA_ProjectRow_PromptFailedDispatch_NoMarker(t *testing.T) {
 	withFleetHome(t)
 	seedProjectMeta(t, "demo", t.TempDir()) // resolver binds via meta (PR3)
 	(&stubSessionAlive{}).install(t)
-	markerStub := &stubWriteCoordSpawnMarker{}
+	markerStub := &stubClaimStartingRecord{}
 	markerStub.install(t)
 
 	// Production-shaped stdout: dispatch returned 0 (no err), printed

@@ -2,18 +2,19 @@
 // exit path (signal, clean exit, panic). See docs/DESIGN-cleanup-fleet-
 // owns-resources.md §PR-C and docs/TASK-PLAN-cleanup-pr-c-coord-exit-6acc.md.
 //
-// The three side-effects MUST all fire on every call:
+// The two side-effects MUST all fire on every call:
 //
 //  1. tmux.Kill(session)  — best-effort, non-fatal.
 //  2. Move ~/.fleet/agents/<id>.json → ~/.fleet/agents/archive/<id>-<UTC-ts>.json.
-//  3. Remove ~/.fleet/projects/<p>/.locks/coord-spawn-marker if its
-//     body equals <id>. Other-ID markers are preserved.
+//
+// (The coord-spawn marker step is gone — D3. The coord's identity lives in
+// the coordinator lease now, released by the coord-run supervisor on exit.)
 //
 // Panic-safety: each step runs in its own goroutine-local
 // `func() { defer recover(); ... }()` so a panic in one (e.g. a buggy
 // tmux killer) does NOT skip the remaining steps. The PanicViaDefer
 // test pins this contract by injecting a tmux killer that panics and
-// asserting the agent JSON + marker were still cleared.
+// asserting the agent JSON was still archived.
 package coord
 
 import (
@@ -28,8 +29,8 @@ import (
 )
 
 // helperFleetHome points FLEET_HOME at a fresh tmpdir + bootstraps the
-// canonical subdirs so AgentPath / CoordSpawnMarkerPath / AgentArchivePath
-// resolve cleanly. Mirrors internal/state/hidden_test.go withFleetHome.
+// canonical subdirs so AgentPath / AgentArchivePath resolve cleanly.
+// Mirrors internal/state/hidden_test.go withFleetHome.
 func helperFleetHome(t *testing.T) string {
 	t.Helper()
 	dir := t.TempDir()
@@ -52,24 +53,6 @@ func writeAgentRecord(t *testing.T, id, project, session string) {
 	}
 }
 
-// writeMarker bootstraps the project's .locks dir + writes the
-// coord-spawn-marker with body = id (so tests don't reimplement the
-// project-path resolution).
-func writeMarker(t *testing.T, project, id string) string {
-	t.Helper()
-	if _, err := state.EnsureProjectInitialized(project); err != nil {
-		t.Fatalf("ensure project: %v", err)
-	}
-	if err := state.WriteCoordSpawnMarker(project, id); err != nil {
-		t.Fatalf("write marker: %v", err)
-	}
-	path, err := state.CoordSpawnMarkerPath(project)
-	if err != nil {
-		t.Fatalf("marker path: %v", err)
-	}
-	return path
-}
-
 // TestCleanup_CleanExitPath exercises the happy-path direct call:
 // every side-effect fires, no errors.
 func TestCleanup_CleanExitPath(t *testing.T) {
@@ -83,7 +66,6 @@ func TestCleanup_CleanExitPath(t *testing.T) {
 		session = "fleet-abcd1234"
 	)
 	writeAgentRecord(t, agentID, project, session)
-	markerPath := writeMarker(t, project, agentID)
 
 	// Stub tmux killer to record the session name it was asked to kill,
 	// without actually shelling out to tmux (tests must be deterministic
@@ -139,56 +121,6 @@ func TestCleanup_CleanExitPath(t *testing.T) {
 			t.Errorf("archive timestamp stem %q has wrong width (want 15)", stem)
 		}
 	}
-
-	// Marker (body matched id) must be cleared.
-	if _, err := os.Stat(markerPath); !errors.Is(err, os.ErrNotExist) {
-		t.Errorf("marker still exists at %s (err=%v)", markerPath, err)
-	}
-}
-
-// TestCleanup_MarkerClearedWhenMatched pins the marker-body gate:
-// body==id ⇒ removed; body==other ⇒ untouched. Operator's contract is
-// "never stomp another coord's marker even if you're the named agent
-// for THIS project under some other identity."
-func TestCleanup_MarkerClearedWhenMatched(t *testing.T) {
-	tests := []struct {
-		name        string
-		markerBody  string
-		agentID     string
-		wantRemoved bool
-	}{
-		{
-			name:        "marker-body-matches-our-id",
-			markerBody:  "aaaa1111",
-			agentID:     "aaaa1111",
-			wantRemoved: true,
-		},
-		{
-			name:        "marker-body-is-other-id",
-			markerBody:  "bbbb2222",
-			agentID:     "aaaa1111",
-			wantRemoved: false,
-		},
-	}
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			helperFleetHome(t)
-			const project = "marker-test"
-			writeAgentRecord(t, tc.agentID, project, "fleet-"+tc.agentID)
-			markerPath := writeMarker(t, project, tc.markerBody)
-
-			deps := Deps{KillTmux: func(string) error { return nil }}
-			if err := Cleanup(tc.agentID, project, deps); err != nil {
-				t.Fatalf("Cleanup: %v", err)
-			}
-
-			_, statErr := os.Stat(markerPath)
-			removed := errors.Is(statErr, os.ErrNotExist)
-			if removed != tc.wantRemoved {
-				t.Errorf("marker removed=%v, want %v (statErr=%v)", removed, tc.wantRemoved, statErr)
-			}
-		})
-	}
 }
 
 // TestCleanup_PanicViaDefer is the critical failure-path test: a buggy
@@ -205,7 +137,6 @@ func TestCleanup_PanicViaDefer(t *testing.T) {
 		session = "fleet-panic1234"
 	)
 	writeAgentRecord(t, agentID, project, session)
-	markerPath := writeMarker(t, project, agentID)
 
 	deps := Deps{
 		KillTmux: func(string) error {
@@ -224,17 +155,13 @@ func TestCleanup_PanicViaDefer(t *testing.T) {
 
 	_ = Cleanup(agentID, project, deps)
 
-	// Even though KillTmux panicked, the archive + marker steps must
-	// still have fired.
+	// Even though KillTmux panicked, the archive step must still have fired.
 	livePath, err := state.AgentPath(agentID)
 	if err != nil {
 		t.Fatalf("AgentPath: %v", err)
 	}
 	if _, err := os.Stat(livePath); !errors.Is(err, os.ErrNotExist) {
 		t.Errorf("post-panic: live record still exists at %s (err=%v)", livePath, err)
-	}
-	if _, err := os.Stat(markerPath); !errors.Is(err, os.ErrNotExist) {
-		t.Errorf("post-panic: marker still exists at %s (err=%v)", markerPath, err)
 	}
 }
 
@@ -250,7 +177,6 @@ func TestCleanup_IdempotentOnMissingRecord(t *testing.T) {
 		session = "fleet-idem1234"
 	)
 	writeAgentRecord(t, agentID, project, session)
-	writeMarker(t, project, agentID)
 
 	deps := Deps{KillTmux: func(string) error { return nil }}
 
@@ -259,210 +185,6 @@ func TestCleanup_IdempotentOnMissingRecord(t *testing.T) {
 	}
 	if err := Cleanup(agentID, project, deps); err != nil {
 		t.Fatalf("second Cleanup (idempotency): %v", err)
-	}
-}
-
-// TestCleanup_MarkerStepSkippedOnSpawnLockContended pins the codex
-// iter-2 [P1] fix: when a replacement coord is in flight (it holds the
-// coord-spawn lock right now), Cleanup MUST skip the marker removal
-// step rather than race the replacement's marker write. Preserving the
-// marker is strictly safer than deleting one belonging to another coord.
-//
-// The injected AcquireSpawnLock returns a permission-denied error to
-// stand in for "lock currently held by another process" — we don't
-// need the real flock here, just the contract that contention → skip.
-func TestCleanup_MarkerStepSkippedOnSpawnLockContended(t *testing.T) {
-	helperFleetHome(t)
-	const (
-		agentID = "cont1234"
-		project = "cont-test"
-		session = "fleet-cont1234"
-	)
-	writeAgentRecord(t, agentID, project, session)
-	markerPath := writeMarker(t, project, agentID)
-
-	deps := Deps{
-		KillTmux: func(string) error { return nil },
-		AcquireSpawnLock: func(string) (func(), error) {
-			return nil, errors.New("simulated coord-spawn lock contention")
-		},
-	}
-	if err := Cleanup(agentID, project, deps); err != nil {
-		t.Fatalf("Cleanup: %v", err)
-	}
-
-	// Steps 1+2 still ran: live record archived.
-	livePath, err := state.AgentPath(agentID)
-	if err != nil {
-		t.Fatalf("AgentPath: %v", err)
-	}
-	if _, err := os.Stat(livePath); !errors.Is(err, os.ErrNotExist) {
-		t.Errorf("live record still exists: %v", err)
-	}
-	// Step 3 was SKIPPED (lock contended) → marker preserved verbatim.
-	body, err := os.ReadFile(markerPath)
-	if err != nil {
-		t.Fatalf("marker should still exist when spawn-lock is contended: %v", err)
-	}
-	got := strings.TrimSpace(string(body))
-	if got != agentID {
-		t.Errorf("marker body = %q, want %q (preserved)", got, agentID)
-	}
-}
-
-// TestCleanup_MarkerStepHoldsSpawnLock pins the lock-held-during-step
-// half of the codex iter-2 [P1] fix: while step 3 runs, the spawn-lock
-// release function is NOT invoked. We assert this by inspecting a
-// release-was-called flag that the injected stub flips. The check
-// itself happens INSIDE clearMarkerIfMatched's callback path, so if
-// the implementation releases too early (before the unlink) the flag
-// would already be true at marker-read time.
-//
-// Mechanically: the stub returns a release that increments a counter;
-// we verify the counter goes 0→1 exactly once (acquire holds across
-// the whole step, then release fires once via defer).
-func TestCleanup_MarkerStepHoldsSpawnLock(t *testing.T) {
-	helperFleetHome(t)
-	const (
-		agentID = "hold1234"
-		project = "hold-test"
-		session = "fleet-hold1234"
-	)
-	writeAgentRecord(t, agentID, project, session)
-	writeMarker(t, project, agentID)
-
-	var releaseCount int
-	deps := Deps{
-		KillTmux: func(string) error { return nil },
-		AcquireSpawnLock: func(p string) (func(), error) {
-			if p != project {
-				t.Errorf("AcquireSpawnLock called with %q, want %q", p, project)
-			}
-			return func() { releaseCount++ }, nil
-		},
-	}
-	if err := Cleanup(agentID, project, deps); err != nil {
-		t.Fatalf("Cleanup: %v", err)
-	}
-	if releaseCount != 1 {
-		t.Errorf("AcquireSpawnLock release called %d times, want 1", releaseCount)
-	}
-}
-
-// TestCleanup_MarkerAtomicCaptureRestoresWhenBodyChanges pins the
-// codex iter-4 [P1] fix: the atomic-rename capture in
-// clearMarkerIfMatched MUST preserve a marker whose body has been
-// rewritten by a non-cooperative concurrent writer. We simulate this
-// by pre-writing a side file with a DIFFERENT body before invoking
-// Cleanup — the rename → side captures the other-body marker, the
-// content check fails the match, and the marker is renamed back. End
-// state: marker exists with body == other (preserved verbatim).
-//
-// This is the test that catches a regression to the old non-atomic
-// "read then unlink" path: if the implementation reverts to
-// state.RemoveCoordSpawnMarker after a non-matching body, the marker
-// would be unlinked instead of restored.
-func TestCleanup_MarkerAtomicCaptureRestoresWhenBodyChanges(t *testing.T) {
-	helperFleetHome(t)
-	const (
-		agentID = "aaaa1111"
-		otherID = "ZZZZ9999"
-		project = "atomic-restore-test"
-		session = "fleet-aaaa1111"
-	)
-	writeAgentRecord(t, agentID, project, session)
-	// Marker body deliberately != agentID. clearMarkerIfMatched must
-	// rename-capture → see non-matching body → rename-back.
-	markerPath := writeMarker(t, project, otherID)
-
-	deps := Deps{KillTmux: func(string) error { return nil }}
-	if err := Cleanup(agentID, project, deps); err != nil {
-		t.Fatalf("Cleanup: %v", err)
-	}
-
-	data, err := os.ReadFile(markerPath)
-	if err != nil {
-		t.Fatalf("marker missing after non-match restore: %v", err)
-	}
-	got := strings.TrimSpace(string(data))
-	if got != otherID {
-		t.Errorf("marker body = %q, want %q (restored verbatim)", got, otherID)
-	}
-
-	// No leftover side files in the .locks/ dir (only the marker
-	// itself).
-	parent := filepath.Dir(markerPath)
-	entries, err := os.ReadDir(parent)
-	if err != nil {
-		t.Fatalf("readdir %s: %v", parent, err)
-	}
-	for _, e := range entries {
-		if strings.Contains(e.Name(), ".clearing.") {
-			t.Errorf("leftover side file %s in %s — restore did not clean up its scratch path", e.Name(), parent)
-		}
-	}
-}
-
-// TestCleanup_MarkerRestoreUsesLinkNotRename pins the codex iter-5
-// [P1] fix: the non-match restore path uses os.Link (atomic +
-// EEXIST-on-occupied-dest), NOT os.Rename (which would silently
-// clobber a concurrent writer's NEW marker).
-//
-// We can't easily inject a writer mid-clearMarkerIfMatched, so we
-// pin the LOWER-LEVEL invariant instead: os.Link must fail with
-// os.ErrExist when the destination is already populated. A regression
-// to os.Rename would silently succeed (overwriting the dest) and this
-// test would fail.
-//
-// This is the contract the post-capture restore relies on. Concrete
-// fix: cleanup.go's clearMarkerIfMatched uses os.Link(side, marker)
-// and treats os.ErrExist as "writer beat us — leave their NEW marker
-// alone, drop our captured stale copy."
-func TestCleanup_MarkerRestoreUsesLinkNotRename(t *testing.T) {
-	helperFleetHome(t)
-	const (
-		project = "restore-race-test"
-		newID   = "NEWNEWNN"
-	)
-	if _, err := state.EnsureProjectInitialized(project); err != nil {
-		t.Fatalf("ensure project: %v", err)
-	}
-
-	markerPath, err := state.CoordSpawnMarkerPath(project)
-	if err != nil {
-		t.Fatalf("CoordSpawnMarkerPath: %v", err)
-	}
-
-	// Pre-position a NEW marker at the canonical path (simulating a
-	// writer that ran between cleanup's capture and cleanup's
-	// restore) and a stale captured side file.
-	stalePath := markerPath + ".clearing.test"
-	if err := os.WriteFile(stalePath, []byte("OLDOLDOL\n"), 0o644); err != nil {
-		t.Fatalf("seed side: %v", err)
-	}
-	defer func() { _ = os.Remove(stalePath) }()
-	if err := os.WriteFile(markerPath, []byte(newID+"\n"), 0o644); err != nil {
-		t.Fatalf("seed new marker: %v", err)
-	}
-
-	// The contract under test: os.Link(stale, marker) MUST fail with
-	// ErrExist because marker already exists. A regression to
-	// os.Rename would succeed and silently clobber the new marker.
-	err = os.Link(stalePath, markerPath)
-	if err == nil {
-		t.Fatal("os.Link did NOT fail on existing dest — cannot rely on it for non-clobber restore")
-	}
-	if !errors.Is(err, os.ErrExist) {
-		t.Fatalf("os.Link err = %v, want os.ErrExist (was %T)", err, err)
-	}
-
-	// Marker contents must still be the NEW body, NOT the stale one.
-	got, rerr := os.ReadFile(markerPath)
-	if rerr != nil {
-		t.Fatalf("read marker after attempted clobber: %v", rerr)
-	}
-	if strings.TrimSpace(string(got)) != newID {
-		t.Errorf("marker body = %q, want %q (NEW preserved)", got, newID)
 	}
 }
 
@@ -478,7 +200,6 @@ func TestCleanup_TmuxKillErrorIsNonFatal(t *testing.T) {
 		session = "fleet-errk1234"
 	)
 	writeAgentRecord(t, agentID, project, session)
-	markerPath := writeMarker(t, project, agentID)
 
 	deps := Deps{
 		KillTmux: func(string) error {
@@ -495,8 +216,5 @@ func TestCleanup_TmuxKillErrorIsNonFatal(t *testing.T) {
 	}
 	if _, err := os.Stat(livePath); !errors.Is(err, os.ErrNotExist) {
 		t.Errorf("live record still exists after tmux-kill error: %v", err)
-	}
-	if _, err := os.Stat(markerPath); !errors.Is(err, os.ErrNotExist) {
-		t.Errorf("marker still exists after tmux-kill error: %v", err)
 	}
 }

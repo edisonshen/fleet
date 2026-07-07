@@ -59,9 +59,6 @@ func TestRunDispatch_DeadCoordRecovery_AdvertisesLockWinner(t *testing.T) {
 		if opts.Project != "myproj" {
 			t.Errorf("delivery project = %q, want myproj", opts.Project)
 		}
-		if !opts.PromoteMarker {
-			t.Errorf("recovery delivery must promote the coord-spawn marker")
-		}
 		return winnerRec, nil
 	}
 	t.Cleanup(func() { deliverToCurrentOwner = prevDeliver })

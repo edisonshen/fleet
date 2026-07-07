@@ -404,12 +404,13 @@ func renderColumnHeadings(m Model, leftW, rightW int) string {
 //
 // PURE: takes the already-built line COUNTS (leftLen / workerLen /
 // agentLen) rather than rebuilding the body. buildBodyLines reaches
-// projectFooterLines, which probes tmux and can REMOVE a stale
-// coord-spawn marker — a real side effect. Rebuilding here (the old shape)
-// duplicated that I/O on every bounded render and again on every
-// key-driven scroll alignment, and risked budgeting against different
-// marker state than the rendered lines (codex review [P2]). Callers build
-// once and thread the counts in.
+// projectFooterLines, which probes tmux for coord liveness — a real
+// I/O side effect. Rebuilding here (the old shape) duplicated that I/O
+// on every bounded render and again on every key-driven scroll
+// alignment, and risked budgeting against different coord state than
+// the rendered lines (codex review [P2]). Callers build once and thread
+// the counts in. (D3: the marker-removal side effect this once described
+// is gone — the coord-spawn marker is deleted; the lease is the identity.)
 func (m Model) bodyRowBudget(leftLen, workerLen, agentLen int) (leftRows, rightRows int, ok bool) {
 	const (
 		minProjectsRows = 6
@@ -1042,7 +1043,8 @@ func rowsHaveLeft(rows []dashRow) bool {
 // loose-agent-tagged record, which is the v0.2 norm). When CoordID is
 // empty, the block stays at three lines and we skip the coord row.
 //
-// Spawning indicator (issue #86): when the coord-spawn marker exists
+// Spawning indicator (issue #86): when the lease names a coord (D3:
+// coordSpawnIdentityFn non-empty; the coord-spawn marker is deleted)
 // AND coord-state.json hasn't published a fresh tick yet, we render
 // "⠋ spawning coord... 1m 23s" in the same slot as the coord-id line.
 // Beyond ctx.spawnTimeout, the slot flips to a red "▲ coord spawn
@@ -1225,10 +1227,21 @@ func projectFooterLines(p *ProjectRow, w int, prefix string, ctx coordSpawnCtx) 
 	// the marker, not `fleet-<projectName>`. We read the agent_id once
 	// here and thread it through to the renderer; both gaps share the
 	// same marker read so the cost is one os.ReadFile per row per render.
-	markerMtime, markerOK := coordSpawnMarkerMtimeFn(p.Name)
-	markerAgentID := ""
+	// Identity comes from the coordinator LEASE now (D3, marker deleted):
+	// coordSpawnIdentityFn names the live active owner or the current `starting`
+	// owner. The boot-window "spawning coord... Xs" timing that used the marker's
+	// mtime now uses the coord record's SpawnedAt (a more accurate spawn start).
+	markerAgentID := coordSpawnIdentityFn(p.Name)
+	markerOK := markerAgentID != ""
+	markerMtime := time.Time{}
 	if markerOK {
-		markerAgentID = coordSpawnMarkerFn(p.Name)
+		if rec := findRecordByID(ctx.records, markerAgentID); rec != nil && !rec.SpawnedAt.IsZero() {
+			markerMtime = rec.SpawnedAt
+		} else {
+			// Lease names an agent whose record isn't loaded yet (the pre-boot
+			// ClaimStartingRecord window) — treat the spawn as just-started.
+			markerMtime = ctx.now
+		}
 	}
 	st := deriveCoordSpawnState(
 		markerOK, markerMtime,
@@ -1271,18 +1284,16 @@ func projectFooterLines(p *ProjectRow, w int, prefix string, ctx coordSpawnCtx) 
 		// /coordinator never published — heal the warning but PRESERVE
 		// the marker so the operator can re-attach (codex iter-5 P1).
 		fresh := isAgentRecordFresh(ctx.records, markerAgentID, ctx.now, agentRecordFreshWindow)
+		// There is no marker to remove (D3): the lease reflects coord death
+		// directly — a dead starting/active owner stops being named by
+		// coordSpawnIdentityFn, so the row flips to Idle on the next render
+		// without an explicit self-heal removal. applyStuckSelfHeal still
+		// performs the STATE transition; the remover is a no-op.
+		noopRemove := func() error { return nil }
 		if !neverTicked {
-			st, _ = applyStuckSelfHeal(st, markerAgentID, sessAlive, fresh, func() error {
-				return removeCoordSpawnMarkerFn(p.Name)
-			})
+			st, _ = applyStuckSelfHeal(st, markerAgentID, sessAlive, fresh, noopRemove)
 		} else if !sessAlive {
-			// Dead session AND coord never ticked: Path A still heals
-			// and removes the marker (re-attach impossible for a dead
-			// session, so preserving the marker has no benefit and
-			// leaves a stale claim that the next [a] would skip).
-			st, _ = applyStuckSelfHeal(st, markerAgentID, sessAlive, fresh, func() error {
-				return removeCoordSpawnMarkerFn(p.Name)
-			})
+			st, _ = applyStuckSelfHeal(st, markerAgentID, sessAlive, fresh, noopRemove)
 		}
 	}
 

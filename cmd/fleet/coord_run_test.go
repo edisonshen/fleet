@@ -28,9 +28,14 @@ import (
 )
 
 // coordRunTestHome bootstraps an isolated FLEET_HOME + writes a live
-// agent record + a marker pointing at the agent. Returns the agent ID
-// + project name + marker path so the test can assert post-cleanup
-// state.
+// agent record for the coord. The coord-spawn marker is gone (D3); the
+// coord-run supervisor's lease release, not a marker file, is the
+// identity teardown, so cleanup asserts on the archived record only.
+//
+// The returned markerPath is retained (now always "") for signature
+// compatibility with sibling test files (coord_run_lease_test.go) that
+// still thread it through assertCleanupRan; there is no marker to point
+// at anymore.
 func coordRunTestHome(t *testing.T, agentID, project, session string) (markerPath string) {
 	t.Helper()
 	t.Setenv("FLEET_HOME", t.TempDir())
@@ -46,17 +51,14 @@ func coordRunTestHome(t *testing.T, agentID, project, session string) (markerPat
 	if _, err := state.EnsureProjectInitialized(project); err != nil {
 		t.Fatalf("ensure project: %v", err)
 	}
-	if err := state.WriteCoordSpawnMarker(project, agentID); err != nil {
-		t.Fatalf("write marker: %v", err)
-	}
-	path, err := state.CoordSpawnMarkerPath(project)
-	if err != nil {
-		t.Fatalf("marker path: %v", err)
-	}
-	return path
+	return "" // coord-spawn marker deleted (D3)
 }
 
-func assertCleanupRan(t *testing.T, agentID, markerPath string) {
+// assertCleanupRan verifies the coord's live record was archived (exactly
+// one UTC-suffixed archive copy, no live record). The trailing string
+// param is the vestigial markerPath (D3: no marker to assert); it is
+// accepted for signature compatibility with sibling callers and ignored.
+func assertCleanupRan(t *testing.T, agentID, _ string) {
 	t.Helper()
 	livePath, err := state.AgentPath(agentID)
 	if err != nil {
@@ -72,9 +74,6 @@ func assertCleanupRan(t *testing.T, agentID, markerPath string) {
 	matches, _ := filepath.Glob(filepath.Join(filepath.Dir(archivePath), agentID+"-*.json"))
 	if len(matches) != 1 {
 		t.Errorf("archive glob = %v, want exactly one UTC-suffixed file", matches)
-	}
-	if _, err := os.Stat(markerPath); !errors.Is(err, os.ErrNotExist) {
-		t.Errorf("marker still exists at %s", markerPath)
 	}
 }
 

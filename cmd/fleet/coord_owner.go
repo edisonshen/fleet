@@ -1,0 +1,86 @@
+package main
+
+// coord_owner.go — `fleet coord-owner --project <p> [--json]`. A thin READ-ONLY
+// window onto the coordinator LEASE identity for the skill-side Python tick
+// (skills/coordinator/loop.py).
+//
+// WHY THIS EXISTS: the coord-spawn marker used to be Python's identity reader —
+// `_read_coord_spawn_marker(project_dir) == coord_id` answered "is THIS session
+// the project's intended/successor coord, so it must never self-exit?"
+// (loop.py::_classify_lock_busy gate 5). Deleting the marker
+// (TASK-PLAN-coord-lease-sole-identity D5/D6) forces a lease-based replacement,
+// but `fleet lease-check` only returns an exit-code verdict (owner/fenced/
+// unknown) — it cannot report WHICH agent ID owns the lease or is the named
+// handoff successor. This command prints those IDs so loop.py can re-key gate 5
+// to "never self-exit when the lease names me" (live owner OR handoff successor).
+//
+// Output shape (--json, the only consumer today):
+//
+//	{"project":"p","live_owner_id":"<id|>","owner_id":"<id|>","handoff_successor_id":"<id|>"}
+//
+// Every ID is "" when the lease has no such state (free lease, no handoff
+// reservation, FLEET_LEASE_FAILOVER disabled, or an unsupported platform). The
+// coordlock reads live in coord_owner_unix.go / coord_owner_other.go
+// (build-tagged) because the lease primitive is linux||darwin only.
+
+import (
+	"encoding/json"
+	"fmt"
+	"io"
+
+	"github.com/spf13/cobra"
+)
+
+// coordOwnerInfo is the JSON shape emitted by `fleet coord-owner --json`.
+type coordOwnerInfo struct {
+	Project string `json:"project"`
+	// LiveOwnerID is coordlock.LiveOwner — the process-live active owner
+	// (TTL-independent). The load-bearing "am I the coord?" signal for loop.py.
+	LiveOwnerID string `json:"live_owner_id"`
+	// OwnerID is coordlock.CurrentOwner — the TTL-gated active owner. Reported
+	// for completeness/diagnostics; loop.py keys on LiveOwnerID.
+	OwnerID string `json:"owner_id"`
+	// HandoffSuccessorID is coordlock.CurrentHandoff.SuccessorID — a non-expired
+	// successor reservation naming the in-flight replacement coord.
+	HandoffSuccessorID string `json:"handoff_successor_id"`
+}
+
+func newCoordOwnerCmd() *cobra.Command {
+	var project string
+	var asJSON bool
+	cmd := &cobra.Command{
+		Use:   "coord-owner --project <project> [--json]",
+		Short: "Print the coordinator lease identity (owner + handoff successor) for a project",
+		Long: "Report the agent IDs the coordinator lease currently names for " +
+			"--project: the process-live active owner (live_owner_id), the " +
+			"TTL-gated active owner (owner_id), and any in-flight handoff " +
+			"successor reservation (handoff_successor_id). Each is empty when the " +
+			"lease has no such state (free lease / no reservation / failover " +
+			"disabled / unsupported platform). Read-only; never mutates the lease.",
+		SilenceUsage:  true,
+		SilenceErrors: true,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			return runCoordOwner(project, asJSON, cmd.OutOrStdout())
+		},
+	}
+	cmd.Flags().StringVar(&project, "project", "", "project whose lease identity to report (required)")
+	cmd.Flags().BoolVar(&asJSON, "json", false, "emit a single JSON object")
+	return cmd
+}
+
+func runCoordOwner(project string, asJSON bool, stdout io.Writer) error {
+	if project == "" {
+		return fmt.Errorf("coord-owner: --project is required")
+	}
+	info := coordOwnerLeaseIdentity(project) // build-tagged
+	info.Project = project
+	if asJSON {
+		enc := json.NewEncoder(stdout)
+		return enc.Encode(info)
+	}
+	_, _ = fmt.Fprintf(stdout, "project:              %s\n", info.Project)
+	_, _ = fmt.Fprintf(stdout, "live_owner_id:        %s\n", info.LiveOwnerID)
+	_, _ = fmt.Fprintf(stdout, "owner_id:             %s\n", info.OwnerID)
+	_, _ = fmt.Fprintf(stdout, "handoff_successor_id: %s\n", info.HandoffSuccessorID)
+	return nil
+}

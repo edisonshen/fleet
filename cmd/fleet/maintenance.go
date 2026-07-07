@@ -351,8 +351,8 @@ func newMaintenanceBootstrapRemoteControlCmd() *cobra.Command {
 		Use:   "bootstrap-remote-control",
 		Short: "Survey live COORD agents missing the --remote-control flag",
 		Long: `bootstrap-remote-control walks ~/.fleet/agents/*.json and
-identifies live COORD agents (the project's coord-spawn marker
-resolves to the agent ID) whose persisted Command lacks
+identifies live COORD agents (task_id == coord-<project>, via
+spawn.IsCoordSpawn) whose persisted Command lacks
 --remote-control. Workers / Agent-tool subagents are out of scope —
 they never carry the flag by design (push-storm protection).
 Live = the record's tmux session is currently alive (HasSession). For
@@ -386,8 +386,8 @@ Exit codes:
 //
 // Native model (codex review iter-1 [P2]): RC rides ONLY on coord
 // spawns, and rc.Enabled is default-on — so the survey must scope to
-// COORD agents (the project's coord-spawn marker resolves to the
-// agent's ID). Workers / Agent-tool subagents are intentionally never
+// COORD agents (task_id == coord-<project>, via spawn.IsCoordSpawn).
+// Workers / Agent-tool subagents are intentionally never
 // flagged: reporting them would generate false "needs remediation"
 // noise for every normal default-on project. Within coords, the
 // survey differentiates "RC disabled for project" (operator opt-out
@@ -429,9 +429,9 @@ func runMaintenanceBootstrapRemoteControl(
 		// Agent-tool subagents never get --remote-control by design;
 		// surveying them under the default-on gate would flag every
 		// worker on every project. Same predicate as the handoff /
-		// drain inject gates: the coord-spawn marker resolves to this
-		// agent's ID.
-		if r.Project == "" || state.ReadCoordSpawnMarker(r.Project) != r.ID {
+		// drain inject gates: spawn.IsCoordSpawn (the coord-spawn marker
+		// is gone, D3).
+		if !spawn.IsCoordSpawn(r.TaskID, r.Project) {
 			continue
 		}
 		if commandHasRemoteControl(r.Command) {

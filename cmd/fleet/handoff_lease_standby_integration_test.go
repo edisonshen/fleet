@@ -318,11 +318,10 @@ func TestHandoff_LeaseFailoverCoordHandoffRefusesBeforeRetiringOld(t *testing.T)
 	if err := old.Write(); err != nil {
 		t.Fatalf("write old coord: %v", err)
 	}
+	// old.TaskID == coord-<project> already makes it the project's coord
+	// (spawn.IsCoordSpawn); the coord-spawn marker is gone (D3).
 	if _, err := state.EnsureProjectInitialized(project); err != nil {
 		t.Fatalf("EnsureProjectInitialized: %v", err)
-	}
-	if err := state.WriteCoordSpawnMarker(project, old.ID); err != nil {
-		t.Fatalf("seed marker: %v", err)
 	}
 
 	out := &bytes.Buffer{}
@@ -442,11 +441,10 @@ func TestHandoff_LeaseFailoverCoordHandoffFinalizesDeliveredLockOwner(t *testing
 	if err := winner.Write(); err != nil {
 		t.Fatalf("write lock-winning standby: %v", err)
 	}
+	// old.TaskID == coord-<project> already marks it as the coord
+	// (spawn.IsCoordSpawn); the coord-spawn marker is gone (D3).
 	if _, err := state.EnsureProjectInitialized(project); err != nil {
 		t.Fatalf("EnsureProjectInitialized: %v", err)
-	}
-	if err := state.WriteCoordSpawnMarker(project, old.ID); err != nil {
-		t.Fatalf("seed marker: %v", err)
 	}
 
 	out := &bytes.Buffer{}
@@ -476,9 +474,6 @@ func TestHandoff_LeaseFailoverCoordHandoffFinalizesDeliveredLockOwner(t *testing
 		if rec.Project == project && rec.ID != winner.ID {
 			t.Fatalf("superseded replacement %s should have been removed; live project record: %+v", rec.ID, rec)
 		}
-	}
-	if got := state.ReadCoordSpawnMarker(project); got != winner.ID {
-		t.Fatalf("coord marker = %q, want delivered lock owner %q", got, winner.ID)
 	}
 	if !strings.Contains(out.String(), "handed off → "+winner.ID) {
 		t.Fatalf("output did not report delivered lock owner %q:\n%s", winner.ID, out.String())

@@ -1,0 +1,159 @@
+package handoffop
+
+import (
+	"github.com/edisonshen/fleet/internal/coordlock"
+	"github.com/edisonshen/fleet/internal/tmux"
+)
+
+// coord_swap_resume.go re-derives the DELETED spawn marker's synchronous
+// "did the swap commit?" oracle onto the coordinator LEASE, for the
+// crash-recovery retry path (TASK-PLAN-coord-lease-sole-identity D3, resume
+// matrix operator-approved 2026-07-07).
+//
+// The marker used to be a synchronous binary commit sentinel: on a `fleet
+// handoff` / drain retry where the queued replacement NEW's tmux session is
+// already dead, `marker == NEW` meant "the swap already committed to NEW, so
+// respawning would DUPLICATE the coord — refuse." The lease commit is ASYNC:
+// the winning standby bumps the epoch to NEW only AFTER OLD is killed/releases,
+// so at the recovery probe the lease is in one of three states, not two:
+//
+//	owner == OLD        retire not started/finished        NOT committed
+//	handoff{NEW} + no active owner   swap in flight          committing (standby recovers)
+//	owner == NEW        epoch committed                      committed
+//	free + no handoff   pre-commit crash / clean            NOT committed
+//
+// Critically OLD and NEW can NEVER both be the active lease owner, so the old
+// "NEW-committed AND OLD-alive" duplicate-prevention clause changes CHARACTER:
+// it is re-derived as a LEASE decision plus a DEFENSIVE OLD-liveness surface
+// (operator-approved "lease decision + defensive OLD-liveness surface").
+//
+//	CurrentOwner == NEW  → REFUSE unless --force-replacement.
+//	                       DEFENSE-IN-DEPTH: if a probe finds OLD's session
+//	                       STILL ALIVE here (cross-socket blind spot) → LOUD
+//	                       stderr diagnostic + refuse. NEVER auto-kills;
+//	                       operator-gate (DESIGN-coord-no-auto-kill).
+//	handoff{NEW}, no owner → WAIT: the standby is the recovery vehicle; do NOT
+//	                       respawn a 2nd replacement.
+//	CurrentOwner == OLD, or free lease + no handoff → RESPAWN (safe: not committed).
+
+// ResumeAction is the crash-recovery verdict for a dead queued replacement.
+type ResumeAction int
+
+const (
+	// ResumeRespawn: the swap is NOT committed (OLD still owns, or a free lease
+	// with no handoff reservation) — drop the dead NEW and respawn safely.
+	ResumeRespawn ResumeAction = iota
+	// ResumeRefuse: the epoch already committed to NEW — respawning would
+	// duplicate the coord. Refuse unless --force-replacement.
+	ResumeRefuse
+	// ResumeWait: a handoff reservation names NEW and no active owner exists —
+	// the swap is in flight and the warm standby is the recovery vehicle. Do
+	// NOT respawn a second replacement; wait / redeliver.
+	ResumeWait
+)
+
+func (a ResumeAction) String() string {
+	switch a {
+	case ResumeRespawn:
+		return "respawn"
+	case ResumeRefuse:
+		return "refuse"
+	case ResumeWait:
+		return "wait"
+	default:
+		return "resume-action(?)"
+	}
+}
+
+// CoordSwapResumeDeps are the injected lease/probe seams. Production wires
+// coordlock + tmux via DefaultCoordSwapResumeDeps; deterministic tests build
+// the committed/reserved/free × NEW-dead/live matrix in memory (no disk, no
+// clock).
+type CoordSwapResumeDeps struct {
+	// CurrentOwner reports the healthy active lease owner (TTL-gated).
+	CurrentOwner func(project string) (coordlock.Owner, bool)
+	// CurrentHandoff reports a non-expired successor reservation.
+	CurrentHandoff func(project string) (coordlock.Handoff, bool)
+	// OldSessionAlive is the DEFENSIVE cross-socket OLD-liveness probe, used
+	// only on the committed (refuse) arm. It NEVER drives a kill — only shapes
+	// the refusal diagnostic.
+	OldSessionAlive func(session string) (bool, error)
+}
+
+// DefaultCoordSwapResumeDeps wires the classifier to the real lease + tmux
+// probe. The OLD-liveness probe routes through the package tmux seam so tests
+// of the call sites can fake it.
+func DefaultCoordSwapResumeDeps() CoordSwapResumeDeps {
+	return CoordSwapResumeDeps{
+		CurrentOwner:    coordlock.CurrentOwner,
+		CurrentHandoff:  coordlock.CurrentHandoff,
+		OldSessionAlive: tmux.SessionAlive,
+	}
+}
+
+// CoordSwapResume is the classifier verdict plus the defensive-probe evidence
+// the caller needs to shape its stderr diagnostic.
+type CoordSwapResume struct {
+	Action ResumeAction
+	// OldStillAlive is set only on the ResumeRefuse (committed) arm: the
+	// defensive OLD-liveness probe found OLD's session STILL ALIVE — a
+	// cross-socket blind-spot signal. It NEVER triggers a kill; it only makes
+	// the refusal diagnostic LOUD (surface + operator-gate).
+	OldStillAlive bool
+	// OldProbeErr is a non-nil defensive-probe error on the committed arm
+	// (ambiguous OLD liveness → still refuse, conservative).
+	OldProbeErr error
+	// Reason is a short human-readable explanation for the diagnostic.
+	Reason string
+}
+
+// ClassifyCoordSwapResume decides what to do when the queued replacement NEW's
+// session is confirmed dead on a handoff/drain retry. Pure: all state comes
+// through d; no side effects.
+func ClassifyCoordSwapResume(project, oldID, oldSession, newID string, force bool, d CoordSwapResumeDeps) CoordSwapResume {
+	owner, ownerOK := d.CurrentOwner(project)
+
+	// (1) Committed: the epoch names NEW. Respawning would duplicate the coord.
+	if ownerOK && owner.AgentID == newID {
+		if force {
+			return CoordSwapResume{
+				Action: ResumeRespawn,
+				Reason: "epoch committed to replacement " + newID + " but --force-replacement given",
+			}
+		}
+		res := CoordSwapResume{
+			Action: ResumeRefuse,
+			Reason: "epoch committed to replacement " + newID,
+		}
+		// Defensive OLD-liveness probe (belt-and-suspenders). The lease
+		// commit-ordering invariant means owner==NEW should imply OLD already
+		// released/died; a cross-socket OLD is the blind spot — surface, never
+		// kill.
+		if d.OldSessionAlive != nil && oldSession != "" {
+			alive, perr := d.OldSessionAlive(oldSession)
+			res.OldStillAlive = alive
+			res.OldProbeErr = perr
+		}
+		return res
+	}
+
+	// (2) Swap in flight: a handoff reservation names NEW and there is no active
+	// owner (OLD released, the standby has not yet bumped the epoch). The
+	// standby IS the recovery vehicle — do NOT respawn a second replacement.
+	if !ownerOK {
+		if h, ok := d.CurrentHandoff(project); ok && h.SuccessorID == newID {
+			return CoordSwapResume{
+				Action: ResumeWait,
+				Reason: "handoff reservation names successor " + newID + "; standby is the recovery vehicle",
+			}
+		}
+	}
+
+	// (3) Not committed: OLD still owns the lease, or a free lease with no
+	// handoff reservation (a pre-commit crash, or a clean free lease). Safe to
+	// drop the dead NEW and respawn a fresh replacement.
+	return CoordSwapResume{
+		Action: ResumeRespawn,
+		Reason: "swap not committed (OLD owns lease, or free lease with no handoff reservation)",
+	}
+}

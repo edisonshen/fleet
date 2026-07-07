@@ -228,7 +228,7 @@ class TickResult:
 
     self_exit=True (reason="duplicate-coord-self-exit") means this
     coord lost the coordinator.lock to a DIFFERENT live coord and is
-    NOT the project's intended coord (per the coord-spawn-marker) — it
+    NOT the project's intended coord (per the coordinator lease) — it
     is a duplicate session that would otherwise idle forever holding a
     tmux session and doing no work (coord-self-exit-when-it-6014). The
     tick stays side-effect-free; main() reads this flag and tears down
@@ -466,8 +466,8 @@ def tick(
         #
         #   lock body holder == ""            -> can't prove duplicate; skip only
         #   holder == coord_id                -> our own stale flock;   skip only
-        #   spawn-marker == coord_id          -> WE are the intended    skip only
-        #                                        coord (mid-handoff /
+        #   lease names coord_id              -> WE are the intended    skip only
+        #     (live owner OR handoff succ)       coord (mid-handoff /
         #                                        successor); never exit
         #   holder != me AND holder is LIVE   -> DUPLICATE: self-exit
         #   holder dead / stale               -> normal takeover;       skip only
@@ -2861,23 +2861,85 @@ def _read_lock_holder(lock_path: Path) -> str:
     return s if _AGENT_ID_RE.match(s) else ""
 
 
-def _read_coord_spawn_marker(project_dir: Path) -> str:
-    """Return the agent ID in the project's coord-spawn-marker, or "".
+def _read_coord_lease_identity(
+    project: str, *, home: Path, fleet_bin: str = "fleet",
+) -> tuple[str | None, str | None]:
+    """Return (live_owner_id, handoff_successor_id) from the coordinator LEASE.
 
-    The marker (``.locks/coord-spawn-marker``) names the project's
-    INTENDED coord — the TUI/CLI writes it on every fresh coord spawn
-    (state.WriteCoordSpawnMarker). When the marker names US, this
-    session is the legitimate / successor coord and must never
-    self-exit even while a stale predecessor still holds the flock for
-    one more tick. Mirrors state.ReadCoordSpawnMarker.
+    Shells out to ``fleet coord-owner --project <p> --json`` — the read-only
+    window onto the lease that REPLACES the deleted coord-spawn marker as the
+    skill's coord-identity signal (TASK-PLAN-coord-lease-sole-identity D5). The
+    marker used to name the project's INTENDED coord; the lease does now — its
+    live active owner, or the in-flight handoff successor reservation. When the
+    lease names US, this session is the legitimate / successor coord and must
+    never self-exit even while a stale predecessor still holds the flock for one
+    more tick (``_classify_lock_busy`` gate 5).
+
+    THREE outcomes — the read is tri-state, NOT boolean:
+
+      ("<id>", "<id>")  CONCLUSIVE: the CLI ran and the lease names these ids
+                        (either field may be "" = that lease slot is genuinely
+                        free). Gate 5 keys on this.
+      ("", "")          CONCLUSIVE-EMPTY: the CLI ran fine and the lease names
+                        NOBODY (free lease / no reservation / failover disabled).
+      (None, None)      INCONCLUSIVE: the read FAILED — a stale ``FLEET_BIN``
+                        that predates the ``coord-owner`` subcommand (exit!=0,
+                        the #182 stale-binary class fleet's symlinked-skill /
+                        copied-binary split makes reachable), a timeout, empty
+                        output (the CLI always emits a JSON object on success),
+                        or unparseable/non-object JSON.
+
+    The old marker was a LOCAL FILE read (no subprocess, never "unavailable").
+    Shelling to a possibly-stale binary reintroduces an unavailable path, so the
+    caller MUST NOT treat "read failed" as "lease empty": an INCONCLUSIVE result
+    (None, None) means gate 5 cannot prove the successor's identity either way,
+    and self-exiting on an unknowable identity would neuter the mid-handoff guard
+    into an over-eager self-exit (no-auto-kill invariant; D5 "bare mismatch →
+    skip, never exit"). Gate 5 treats (None, None) as skip.
+
+    Resolves the binary the same way the lease-check path does (prefer the
+    spawn-stamped FLEET_BIN over a bare ``fleet`` on PATH).
     """
-    marker_path = project_dir / ".locks" / "coord-spawn-marker"
+    bin_path = fleet_bin
+    if bin_path == "fleet":
+        bin_path = os.environ.get("FLEET_BIN", "") or "fleet"
+    env = dict(os.environ)
+    env["FLEET_HOME"] = str(home)
+    argv = [bin_path, "coord-owner", "--project", project, "--json"]
     try:
-        with open(marker_path, "r", encoding="utf-8", errors="replace") as fh:
-            first = fh.readline()
-    except OSError:
-        return ""
-    return first.strip()
+        proc = subprocess.run(
+            argv, capture_output=True, text=True,
+            timeout=_LEASE_CHECK_TIMEOUT_S, check=False, env=env,
+        )
+    except (subprocess.TimeoutExpired, OSError):
+        return None, None  # INCONCLUSIVE: binary missing / hung — cannot prove identity
+    if proc.returncode != 0:
+        # Binary too old (no `coord-owner` subcommand → exit 1), usage fault, or
+        # internal error: INCONCLUSIVE, NOT empty. A stale binary must never let
+        # gate 5 self-exit a legit successor (#182 stale-binary class).
+        return None, None
+    out = (proc.stdout or "").strip()
+    if not out:
+        # returncode 0 but no output violates the CLI contract (it always emits a
+        # JSON object on success) — the read did not really happen. INCONCLUSIVE.
+        return None, None
+    try:
+        data = json.loads(out)
+    except (ValueError, TypeError):
+        return None, None  # INCONCLUSIVE: unparseable
+    if not isinstance(data, dict):
+        return None, None  # INCONCLUSIVE: not a JSON object
+    live = str(data.get("live_owner_id", "") or "")
+    succ = str(data.get("handoff_successor_id", "") or "")
+    return live, succ  # CONCLUSIVE (either field may be "" = that slot is free)
+
+
+# _coord_lease_identity_fn is the injectable seam _classify_lock_busy calls for
+# the coord-identity read (replaces the deleted _read_coord_spawn_marker).
+# Production shells out to `fleet coord-owner --json`; tests substitute a
+# deterministic stub so the suite never shells out. Mirrors the _lease_check_fn
+# seam pattern.
+_coord_lease_identity_fn = _read_coord_lease_identity
 
 
 # Filename of the durable pending-spawn claim the Go dispatch path
@@ -2983,10 +3045,11 @@ def _classify_lock_busy(
          holder published its body.)
       4. holder == coord_id -> our own stale flock from a prior tick
          that hasn't been reaped yet. Not a duplicate. Skip.
-      5. spawn-marker == coord_id -> WE are the project's intended /
-         successor coord (mid-handoff). Never self-exit; the stale
-         holder is the one to be reaped (by the swap / `fleet gc`).
-         Skip.
+      5. lease names coord_id (live active owner OR in-flight handoff
+         successor) -> WE are the project's intended / successor coord
+         (mid-handoff). Never self-exit; the stale holder is the one to
+         be reaped (by the swap / `fleet gc`). Skip. (D3: replaces the
+         deleted coord-spawn marker read with `fleet coord-owner`.)
       6. holder's record is not THIS project's coord (missing record,
          project mismatch, or task_id != coord-<project> — e.g. a
          same-project worker that hijacked the lock, or a cross-project
@@ -3011,7 +3074,23 @@ def _classify_lock_busy(
         return "skip", ""
     if holder == coord_id:
         return "skip", ""
-    if _read_coord_spawn_marker(project_dir) == coord_id:
+    # Gate 5 (D3): the coordinator LEASE — not the deleted coord-spawn marker —
+    # is the coord identity now. Never self-exit when the lease names US: either
+    # WE are the live active owner, or an in-flight handoff reservation names us
+    # as the successor (mid-handoff, the stale predecessor still holds the flock
+    # for one more tick).
+    live_owner, handoff_succ = _coord_lease_identity_fn(project_dir.name, home=home)
+    if live_owner is None:
+        # INCONCLUSIVE identity read: the `fleet coord-owner` shell-out failed
+        # (stale FLEET_BIN without the subcommand — the #182 class — timeout, or
+        # unparseable output). The deleted marker was a local file read that never
+        # went "unavailable"; a failed binary read must NOT be mistaken for "lease
+        # empty" and neuter this guard into an over-eager self-exit of a legit
+        # mid-handoff successor. Cannot prove identity → skip, never exit
+        # (no-auto-kill invariant; D5 "bare mismatch → skip, never exit").
+        return "skip", ""
+    # Fail-soft CONCLUSIVE-empty ("", "") falls through to gate 6.
+    if live_owner == coord_id or handoff_succ == coord_id:
         return "skip", ""
     # The holder must be a genuinely live coord FOR THIS PROJECT, not a
     # stale lock body, a hijacking same-project worker, or a cross-

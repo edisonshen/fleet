@@ -59,7 +59,7 @@ func TestAttachProject_BindsResolverRepoNotLaunchCwd(t *testing.T) {
 	t.Setenv("FLEET_HOME", t.TempDir())
 	(&stubSessionAlive{}).install(t)
 	(&stubProjectTreeExists{}).install(t)
-	(&stubCoordSpawnMarker{markers: map[string]string{}}).install(t) // no coord
+	(&stubCoordLeaseIdentity{markers: map[string]string{}}).install(t) // no coord
 	stub := &stubFleetCmd{}
 	stub.install(t)
 
@@ -105,7 +105,7 @@ func TestAttachProject_RefusesWhenUnresolvable_NoSpawn(t *testing.T) {
 	t.Setenv("FLEET_HOME", t.TempDir())
 	(&stubSessionAlive{}).install(t)
 	(&stubProjectTreeExists{}).install(t)
-	(&stubCoordSpawnMarker{markers: map[string]string{}}).install(t)
+	(&stubCoordLeaseIdentity{markers: map[string]string{}}).install(t)
 	stub := &stubFleetCmd{}
 	stub.install(t)
 

@@ -1396,7 +1396,7 @@ func TestDashboard_CoordSignal_LockBodyPrimaryWins(t *testing.T) {
 func TestDashboard_CoordSignal_TaskIDFallbackWhenNoLock(t *testing.T) {
 	(&stubSessionAlive{}).install(t)
 	(&stubProjectTreeExists{}).install(t)
-	(&stubCoordSpawnMarker{markers: map[string]string{"demo": "c00bf001"}}).install(t)
+	(&stubCoordLeaseIdentity{markers: map[string]string{"demo": "c00bf001"}}).install(t)
 
 	m := New("test")
 	m.dashboard = &Snapshot{
@@ -1447,7 +1447,7 @@ func TestDashboard_CoordSignal_DeadSessionNotPromoted(t *testing.T) {
 	(&stubSessionAlive{dead: map[string]bool{"fleet-deadc0de": true}}).install(t)
 	(&stubSessionProbe{dead: map[string]bool{"fleet-deadc0de": true}}).install(t)
 	(&stubProjectTreeExists{}).install(t)
-	(&stubCoordSpawnMarker{markers: map[string]string{"demo": "deadc0de"}}).install(t)
+	(&stubCoordLeaseIdentity{markers: map[string]string{"demo": "deadc0de"}}).install(t)
 
 	m := New("test")
 	m.dashboard = &Snapshot{
@@ -1471,7 +1471,7 @@ func TestDashboard_CoordSignal_DeadSessionNotPromoted(t *testing.T) {
 func TestDashboard_FiltersClaimedCoordFromRight(t *testing.T) {
 	(&stubSessionAlive{}).install(t)
 	(&stubProjectTreeExists{}).install(t)
-	(&stubCoordSpawnMarker{markers: map[string]string{"demo": "c00bf001"}}).install(t)
+	(&stubCoordLeaseIdentity{markers: map[string]string{"demo": "c00bf001"}}).install(t)
 
 	m := New("test")
 	m.dashboard = &Snapshot{
@@ -1508,7 +1508,7 @@ func TestDashboard_CoordSignal_TaskIDFallbackGatedOnMarker(t *testing.T) {
 	(&stubSessionAlive{}).install(t)
 	(&stubProjectTreeExists{}).install(t)
 	// Marker file is missing for "demo" — no promotion.
-	(&stubCoordSpawnMarker{markers: map[string]string{}}).install(t)
+	(&stubCoordLeaseIdentity{markers: map[string]string{}}).install(t)
 
 	m := New("test")
 	m.dashboard = &Snapshot{
@@ -1534,7 +1534,7 @@ func TestDashboard_CoordSignal_TaskIDFallback_MarkerMismatchSkipped(t *testing.T
 	(&stubSessionAlive{}).install(t)
 	(&stubProjectTreeExists{}).install(t)
 	// Marker names a different agent than the record below.
-	(&stubCoordSpawnMarker{markers: map[string]string{"demo": "realone1"}}).install(t)
+	(&stubCoordLeaseIdentity{markers: map[string]string{"demo": "realone1"}}).install(t)
 
 	m := New("test")
 	m.dashboard = &Snapshot{
@@ -1563,7 +1563,7 @@ func TestDashboard_CoordSignal_TaskIDFallback_TmuxProbeErrorNotDead(t *testing.T
 	(&stubSessionAlive{dead: map[string]bool{"fleet-realcoord": true}}).install(t)
 	(&stubSessionProbe{errSessions: map[string]bool{"fleet-realcoord": true}}).install(t)
 	(&stubProjectTreeExists{}).install(t)
-	(&stubCoordSpawnMarker{markers: map[string]string{"demo": "realcoord"}}).install(t)
+	(&stubCoordLeaseIdentity{markers: map[string]string{"demo": "realcoord"}}).install(t)
 
 	m := New("test")
 	m.dashboard = &Snapshot{
@@ -1591,7 +1591,7 @@ func TestDashboard_CoordSignal_TaskIDFallback_TmuxProbeErrorNotDead(t *testing.T
 func TestDashboard_CoordSignal_TaskIDFallback_StaleMarkerSkipped(t *testing.T) {
 	(&stubSessionAlive{}).install(t)
 	(&stubProjectTreeExists{}).install(t)
-	(&stubCoordSpawnMarkerStale{markers: map[string]string{"demo": "stalecrd"}}).install(t)
+	(&stubCoordLeaseIdentityStale{markers: map[string]string{"demo": "stalecrd"}}).install(t)
 
 	m := New("test")
 	m.dashboard = &Snapshot{

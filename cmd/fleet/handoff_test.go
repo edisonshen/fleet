@@ -691,94 +691,26 @@ func TestHandoff_WorkerStillInheritsOldCwd(t *testing.T) {
 	}
 }
 
-func TestHandoff_ResumeHandoff_CoordMarker_WritesBeforeReadinessWait(t *testing.T) {
-	requireFakeTmux(t)
-	setupFleetHome(t)
-
-	old := seedAgent(t)
-	t.Cleanup(func() { _ = tmux.Kill(old.TmuxSession) })
-
-	// Seed marker at old.ID so isCoordSwap fires on the recovery path.
-	if _, err := state.EnsureProjectInitialized(old.Project); err != nil {
-		t.Fatalf("EnsureProjectInitialized: %v", err)
-	}
-	if err := state.WriteCoordSpawnMarker(old.Project, old.ID); err != nil {
-		t.Fatalf("seed marker: %v", err)
-	}
-
-	// Pre-spawn a live replacement (simulating the crash window
-	// between original spawn and queue.Delete).
-	replacement, err := agentSpawnForTest(t, t.TempDir(),
-		[]string{"sleep", "120"}, old.Project, old.TaskID)
-	if err != nil {
-		t.Fatalf("seed replacement: %v", err)
-	}
-	t.Cleanup(func() { _ = tmux.Kill(replacement.TmuxSession) })
-
-	docPath := "/some/handoffs/" + old.ID + "-stub.md"
-	if _, err := queue.WriteSpawnFresh(queue.SpawnFresh{
-		SchemaVersion: queue.SchemaVersion,
-		OldAgentID:    old.ID,
-		HandoffDoc:    docPath,
-		Project:       old.Project,
-		TaskID:        old.TaskID,
-		NewAgentID:    replacement.ID,
-		NewSession:    replacement.TmuxSession,
-	}); err != nil {
-		t.Fatalf("seed queue: %v", err)
-	}
-
-	out := &bytes.Buffer{}
-	if err := runHandoff(&handoffOpts{
-		oldID:       old.ID,
-		graceMillis: 1,
-	}, out, out); err != nil {
-		t.Fatalf("runHandoff: %v\n%s", err, out.String())
-	}
-
-	// Marker must land at replacement.ID — AtomicCoordSwap's commit
-	// point. Pre-fix iter-13: same end state, but the marker spent
-	// the wait window stuck at old.ID. Test guards the end state;
-	// the structural defense is the code order in resumeHandoff.
-	got := state.ReadCoordSpawnMarker(old.Project)
-	if got != replacement.ID {
-		t.Errorf("coord marker not at replacement after resumeHandoff: got %q want %q",
-			got, replacement.ID)
-	}
-}
-
-// TestHandoff_RecoveryProbe_StaleMarker_RolledBackBeforeRespawn pins
-// codex iter-12 [P1] on the manual-handoff recovery path
-// (cmd/fleet/handoff.go:378-387). When the recovery probe finds a stale
-// replacement record with a dead tmux session, it drops the record and
-// falls through to the normal spawn flow. A previous coord-swap attempt
-// may have committed marker → staleNew.ID before failing; without
-// rolling back the marker, the fall-through's isCoordSwap detection at
-// line 693-694 (`marker == oldRec.ID`) returns false, the inline retire
-// path runs (no AtomicCoordSwap), and the marker is left pointing at
-// the deleted ID — letting `[a]` spawn a duplicate coord.
-//
-// Post-fix: the cleanup branch calls
-// handoffop.RollbackCoordMarkerIfPointingAt before the fall-through.
-// The marker steps back to oldRec.ID, isCoordSwap fires on the retry,
-// AtomicCoordSwap commits marker → fresh replacement's ID.
-func TestHandoff_RecoveryProbe_StaleMarker_RolledBackBeforeRespawn(t *testing.T) {
+// TestHandoff_RecoveryProbe_DeadReplacement_ForceRespawns pins the
+// manual-handoff recovery path (cmd/fleet/handoff.go, the `case !alive`
+// arm). When the recovery probe finds a journaled replacement record
+// whose tmux session is dead, it consults the coordinator LEASE via
+// handoffop.ClassifyCoordSwapResume (the coord-spawn marker is gone,
+// D3). With a free lease (no committed epoch, no handoff reservation)
+// AND --force-replacement, the classifier returns ResumeRespawn: drop
+// the dead replacement, then fall through to a fresh spawn while the old
+// agent is retired. No duplicate coord, no orphaned stale record.
+func TestHandoff_RecoveryProbe_DeadReplacement_ForceRespawns(t *testing.T) {
 	requireFakeTmux(t)
 	tmp := setupFleetHome(t)
 
 	old := seedAgent(t)
 	t.Cleanup(func() { _ = tmux.Kill(old.TmuxSession) })
 
-	// Seed coord marker → old.ID (a real coord setup) THEN stomp it to
-	// a fake "previous attempt" newAgentID, simulating the stale
-	// marker a prior crashed swap would leave behind.
 	if _, err := state.EnsureProjectInitialized(old.Project); err != nil {
 		t.Fatalf("EnsureProjectInitialized: %v", err)
 	}
 	const staleNewID = "stalenew"
-	if err := state.WriteCoordSpawnMarker(old.Project, staleNewID); err != nil {
-		t.Fatalf("seed stale marker: %v", err)
-	}
 
 	// Plant a stale replacement record whose tmux session is dead
 	// (the session string points at a name we never spawned, so
@@ -814,12 +746,12 @@ func TestHandoff_RecoveryProbe_StaleMarker_RolledBackBeforeRespawn(t *testing.T)
 		t.Fatalf("seed queue: %v", err)
 	}
 
-	// Run handoff with --force-replacement so the iter-14 P1 refusal
-	// gate (which protects against duplicate-coord respawns when OLD
-	// is still alive) is bypassed. This test specifically exercises
-	// the iter-12 P1 rollback path; the iter-14 refusal gate is
-	// covered by TestHandoff_RecoveryProbe_OldCoordAlive_RefusesRespawn
-	// below.
+	// Run handoff with --force-replacement so the recovery refusal gate
+	// (which protects against duplicate-coord respawns when the epoch
+	// committed to the dead replacement) is bypassed. Here the lease is
+	// free, so the classifier would respawn regardless; force keeps the
+	// path deterministic. The committed-refuse gate is covered by
+	// TestHandoff_RecoveryProbe_OldCoordAlive_RefusesRespawn below.
 	out := &bytes.Buffer{}
 	if err := runHandoff(&handoffOpts{
 		oldID:            old.ID,
@@ -849,31 +781,30 @@ func TestHandoff_RecoveryProbe_StaleMarker_RolledBackBeforeRespawn(t *testing.T)
 	if _, err := os.Stat(filepath.Join(tmp, "agents", old.ID+".json")); !os.IsNotExist(err) {
 		t.Errorf("old live record should be archived (not in live dir): stat err=%v", err)
 	}
-
-	// Marker must point at the FRESH replacement, NOT the deleted
-	// staleNewID. Pre-fix this assertion failed because isCoordSwap
-	// went false on the retry (marker == staleNewID, not == old.ID)
-	// and the inline retire path never moved the marker.
-	got := state.ReadCoordSpawnMarker(old.Project)
-	if got != fresh.ID {
-		t.Errorf("coord marker not at fresh replacement: got %q want %q (staleNewID=%q, old.ID=%q)",
-			got, fresh.ID, staleNewID, old.ID)
+	// The fresh replacement is distinct from the dropped stale one.
+	if fresh.ID == staleNewID {
+		t.Errorf("fresh replacement reused the dropped stale id %q", staleNewID)
 	}
 }
 
-// TestHandoff_RecoveryProbe_OldCoordAlive_RefusesRespawn pins codex
-// iter-14 [P1] on the manual-handoff recovery path
-// (cmd/fleet/handoff.go:378-410). When AtomicCoordSwap preserves the
-// queue on ErrOrphanSurvived / ErrOldKillProbeAmbiguous, the next
-// `fleet handoff` invocation lands in the recovery probe with newRec
-// session dead but OLD still alive. Auto-respawning would create a
-// duplicate coord.
+// TestHandoff_RecoveryProbe_OldCoordAlive_RefusesRespawn pins the
+// duplicate-coord guard on the manual-handoff recovery path
+// (cmd/fleet/handoff.go, the `case !alive` arm). When a prior graceful
+// swap preserved the queue but the coordinator epoch already COMMITTED
+// to the replacement NEW, the next `fleet handoff` lands in the recovery
+// probe with NEW's session dead. The coord-spawn marker is gone (D3);
+// handoffop.ClassifyCoordSwapResume reads the LEASE: owner == NEW means
+// the swap committed, so auto-respawning would create a duplicate coord.
 //
-// Post-fix: refuse-and-preserve when marker resolves to oldRec.ID or
-// newRec.ID AND OLD's session is alive. Operator can pass
+// Re-keyed onto the lease: the committed epoch is established by
+// acquiring the project lease FOR the replacement id (owner == NEW).
+// The classifier returns ResumeRefuse; because OLD's session is still
+// alive here (a cross-socket blind spot), the defensive probe also fires
+// the loud [P1] diagnostic. Nothing is auto-killed; the operator passes
 // --force-replacement once OLD is confirmed dead.
 func TestHandoff_RecoveryProbe_OldCoordAlive_RefusesRespawn(t *testing.T) {
 	requireFakeTmux(t)
+	t.Setenv("FLEET_LEASE_FAILOVER", "1") // override requireFakeTmux's OFF: AcquireLease needs it
 	tmp := setupFleetHome(t)
 
 	old := seedAgent(t)
@@ -883,8 +814,19 @@ func TestHandoff_RecoveryProbe_OldCoordAlive_RefusesRespawn(t *testing.T) {
 		t.Fatalf("EnsureProjectInitialized: %v", err)
 	}
 	const staleNewID = "stalenew"
-	if err := state.WriteCoordSpawnMarker(old.Project, staleNewID); err != nil {
-		t.Fatalf("seed marker: %v", err)
+
+	// Establish the committed epoch: the coordinator lease names the
+	// replacement (owner == NEW). CurrentOwner then reports staleNewID, so
+	// the classifier's committed arm (ResumeRefuse) fires. The lease owner
+	// pid is this live test process, so holderHealthy keeps it fresh for
+	// the duration of runHandoff.
+	lease, acquired, lerr := coordlock.AcquireLease(old.Project, staleNewID)
+	if lerr != nil || !acquired || lease == nil {
+		t.Fatalf("acquire committed lease for NEW: acquired=%v err=%v", acquired, lerr)
+	}
+	t.Cleanup(lease.Release)
+	if ok, aerr := lease.Activate(); aerr != nil || !ok {
+		t.Fatalf("activate committed lease: ok=%v err=%v", ok, aerr)
 	}
 
 	staleNew := agent.New(staleNewID)
@@ -917,9 +859,9 @@ func TestHandoff_RecoveryProbe_OldCoordAlive_RefusesRespawn(t *testing.T) {
 		t.Fatalf("seed queue: %v", err)
 	}
 
-	// Run WITHOUT --force-replacement. Must refuse — OLD's session is
-	// alive (seedAgent left it running), marker == newRec.ID (coord
-	// swap journal), so the iter-14 gate fires.
+	// Run WITHOUT --force-replacement. Must refuse — the epoch committed
+	// to NEW (lease owner == staleNewID) and OLD's session is still alive,
+	// so the classifier's ResumeRefuse arm fires.
 	out := &bytes.Buffer{}
 	err := runHandoff(&handoffOpts{
 		oldID:       old.ID,
@@ -928,10 +870,15 @@ func TestHandoff_RecoveryProbe_OldCoordAlive_RefusesRespawn(t *testing.T) {
 		graceMillis: 1,
 	}, out, out)
 	if err == nil {
-		t.Fatalf("expected handoff to refuse when OLD coord still alive; got nil\n%s", out.String())
+		t.Fatalf("expected handoff to refuse when the epoch committed to NEW; got nil\n%s", out.String())
 	}
-	if !strings.Contains(err.Error(), "still alive") || !strings.Contains(err.Error(), "duplicate coord") {
-		t.Errorf("expected refusal mentioning 'still alive' + 'duplicate coord'; got: %v", err)
+	if !strings.Contains(err.Error(), "refusing auto-respawn") || !strings.Contains(err.Error(), "duplicate coord") {
+		t.Errorf("expected refusal mentioning 'refusing auto-respawn' + 'duplicate coord'; got: %v", err)
+	}
+	// OLD is still alive: the classifier's defensive cross-socket probe
+	// surfaces the loud [P1] OLD-still-alive diagnostic on stderr.
+	if !strings.Contains(out.String(), "may still be alive") {
+		t.Errorf("expected loud [P1] OLD-still-alive diagnostic; got:\n%s", out.String())
 	}
 
 	// State must be preserved:
@@ -947,9 +894,6 @@ func TestHandoff_RecoveryProbe_OldCoordAlive_RefusesRespawn(t *testing.T) {
 	queuePath := filepath.Join(tmp, "queue", "spawn-fresh-"+old.ID+".json")
 	if _, err := os.Stat(queuePath); err != nil {
 		t.Errorf("queue file should persist on refusal: %v", err)
-	}
-	if got := state.ReadCoordSpawnMarker(old.Project); got != staleNewID {
-		t.Errorf("marker mutated on refusal: got %q want %q", got, staleNewID)
 	}
 }
 
@@ -1373,10 +1317,16 @@ func TestHandoff_DeadSession_RecoveryStillWinsWhenPendingExists(t *testing.T) {
 func TestHandoff_ReplacementSpawnedWithRemoteControlFlag(t *testing.T) {
 	enableRCBootstrapForTest(t)
 	requireTmux(t)
-	setupFleetHome(t)
+	root := setupFleetHome(t)
 	// Native model: injection is DEFAULT-ON for coord handoffs — no
 	// marker setup needed (the legacy rc-enabled marker is ignored by
 	// the gate; only the rc-disabled opt-out or the env-gate suppress).
+	// The outgoing agent is the project's COORD (task_id ==
+	// coord-<project>); after the D3 marker deletion that task shape is
+	// the sole coord discriminator isCoordHandoffForProject gates on. A
+	// coord handoff re-resolves cwd via the shared resolver, so seed a
+	// bindable repo for "rainier".
+	seedRecoveryRepo(t, root, "rainier")
 
 	// Wrapper body that (a) starts with `claude ` (matcher trigger),
 	// (b) is observable in the pane regardless of whether claude is
@@ -1422,24 +1372,17 @@ func TestHandoff_ReplacementSpawnedWithRemoteControlFlag(t *testing.T) {
 	// `sh -c` body finds our shim before any system claude.
 	t.Setenv("PATH", shimDir+":"+os.Getenv("PATH"))
 
-	first, err := agentSpawnForTest(t, originalCwd, wrapperCmd, "rainier", "auth-fix")
+	// v0.12.1 (codex review iter-5 [P1]): the handoff inject is gated on
+	// isCoordHandoffForProject so worker handoffs in RC-enabled projects
+	// don't silently inherit --remote-control. This test exercises the
+	// WITH-coord path (the contract it was written to pin) — the outgoing
+	// agent's task_id is coord-<project>, which spawn.IsCoordSpawn (the
+	// post-D3 coord discriminator) recognizes as the project's coord.
+	first, err := agentSpawnForTest(t, originalCwd, wrapperCmd, "rainier", "coord-rainier")
 	if err != nil {
 		t.Fatalf("seed spawn: %v", err)
 	}
 	t.Cleanup(func() { _ = tmux.Kill(first.TmuxSession) })
-
-	// v0.12.1 (codex review iter-5 [P1]): the handoff inject is now
-	// gated on isCoordHandoffForProject so worker handoffs in
-	// RC-enabled projects don't silently inherit --remote-control.
-	// This test exercises the WITH-coord path (the contract it was
-	// written to pin); seed the coord-spawn marker pointing at the
-	// outgoing agent so it counts as the project's coord.
-	if _, err := state.EnsureProjectInitialized("rainier"); err != nil {
-		t.Fatalf("EnsureProjectInitialized: %v", err)
-	}
-	if err := state.WriteCoordSpawnMarker("rainier", first.ID); err != nil {
-		t.Fatalf("seed coord-spawn marker: %v", err)
-	}
 
 	// Run handoff. Command/cwd inherited from the outgoing record.
 	out := &bytes.Buffer{}
@@ -1605,120 +1548,12 @@ func TestHandoff_CoordReplacementLineageGetsCoordinatorPrompt(t *testing.T) {
 	}
 }
 
-// -- coord-spawn marker transfer (bug coord-marker-transfer-on-46a3) --------
-//
-// Same intent as the handoffop tests: when the OLD agent IS the
-// project's coord (marker file points at oldRec.ID), the interactive
-// `fleet handoff` path must re-point the marker at the replacement.
-// Non-coord agents leave the marker untouched.
-
-// TestHandoff_TransfersCoordMarkerWhenOldWasCoord — happy path: marker
-// = old.ID before handoff, marker = newRec.ID after.
-func TestHandoff_TransfersCoordMarkerWhenOldWasCoord(t *testing.T) {
-	requireFakeTmux(t)
-	setupFleetHome(t)
-
-	old := seedAgent(t)
-	t.Cleanup(func() { _ = tmux.Kill(old.TmuxSession) })
-
-	if _, err := state.EnsureProjectInitialized(old.Project); err != nil {
-		t.Fatalf("EnsureProjectInitialized: %v", err)
-	}
-	if err := state.WriteCoordSpawnMarker(old.Project, old.ID); err != nil {
-		t.Fatalf("seed marker: %v", err)
-	}
-
-	out := &bytes.Buffer{}
-	if err := runHandoff(&handoffOpts{
-		oldID:       old.ID,
-		command:     []string{"sleep", "60"},
-		graceMillis: 1,
-	}, out, out); err != nil {
-		t.Fatalf("handoff: %v\n%s", err, out.String())
-	}
-
-	live, err := agent.List()
-	if err != nil {
-		t.Fatalf("List: %v", err)
-	}
-	if len(live) != 1 {
-		t.Fatalf("expected 1 live agent after handoff, got %d", len(live))
-	}
-	newRec := live[0]
-	t.Cleanup(func() { _ = tmux.Kill(newRec.TmuxSession) })
-
-	got := state.ReadCoordSpawnMarker(old.Project)
-	if got != newRec.ID {
-		t.Errorf("coord marker not transferred: got %q want %q (old.ID=%q)",
-			got, newRec.ID, old.ID)
-	}
-}
-
-// TestHandoff_NoMarkerUpdate_WhenOldWasNotCoord — marker points at an
-// unrelated agent ID; handoff of old must NOT mutate it.
-func TestHandoff_NoMarkerUpdate_WhenOldWasNotCoord(t *testing.T) {
-	requireFakeTmux(t)
-	setupFleetHome(t)
-
-	old := seedAgent(t)
-	t.Cleanup(func() { _ = tmux.Kill(old.TmuxSession) })
-
-	const unrelatedID = "abcdef12"
-	if _, err := state.EnsureProjectInitialized(old.Project); err != nil {
-		t.Fatalf("EnsureProjectInitialized: %v", err)
-	}
-	if err := state.WriteCoordSpawnMarker(old.Project, unrelatedID); err != nil {
-		t.Fatalf("seed marker: %v", err)
-	}
-
-	out := &bytes.Buffer{}
-	if err := runHandoff(&handoffOpts{
-		oldID:       old.ID,
-		command:     []string{"sleep", "60"},
-		graceMillis: 1,
-	}, out, out); err != nil {
-		t.Fatalf("handoff: %v\n%s", err, out.String())
-	}
-
-	live, _ := agent.List()
-	if len(live) != 1 {
-		t.Fatalf("expected 1 live agent, got %d", len(live))
-	}
-	t.Cleanup(func() { _ = tmux.Kill(live[0].TmuxSession) })
-
-	if got := state.ReadCoordSpawnMarker(old.Project); got != unrelatedID {
-		t.Errorf("unrelated coord marker mutated: got %q want %q", got, unrelatedID)
-	}
-}
-
-// TestHandoff_NoMarkerUpdate_WhenNoMarkerExists — no marker file
-// before handoff; no marker file after, no error.
-func TestHandoff_NoMarkerUpdate_WhenNoMarkerExists(t *testing.T) {
-	requireFakeTmux(t)
-	setupFleetHome(t)
-
-	old := seedAgent(t)
-	t.Cleanup(func() { _ = tmux.Kill(old.TmuxSession) })
-
-	out := &bytes.Buffer{}
-	if err := runHandoff(&handoffOpts{
-		oldID:       old.ID,
-		command:     []string{"sleep", "60"},
-		graceMillis: 1,
-	}, out, out); err != nil {
-		t.Fatalf("handoff: %v\n%s", err, out.String())
-	}
-
-	live, _ := agent.List()
-	if len(live) != 1 {
-		t.Fatalf("expected 1 live agent, got %d", len(live))
-	}
-	t.Cleanup(func() { _ = tmux.Kill(live[0].TmuxSession) })
-
-	if got := state.ReadCoordSpawnMarker(old.Project); got != "" {
-		t.Errorf("marker created from nothing: got %q want empty", got)
-	}
-}
+// NOTE: the coord-spawn marker transfer tests (TransfersCoordMarker*,
+// NoMarkerUpdate_*) were deleted with the D3 marker removal — the coord
+// identity handoff now rides the coordinator LEASE (AtomicCoordSwap
+// reserves the handoff, the winning standby bumps the epoch), covered by
+// the lease/standby integration tests (handoff_lease_standby_integration_test.go).
+// There is no marker file to transfer or leave untouched anymore.
 
 // Codex P2 regression: retargetArchivedHandoffSuccessor rewrites the archived
 // predecessor's SuccessorID so chain-follow (`fleet attach <old>`) resolves to
@@ -1770,7 +1605,9 @@ func TestRetargetArchivedHandoffSuccessor_RewritesChain(t *testing.T) {
 // the barrier completion; runHandoff must not deliver a second time.
 // ---------------------------------------------------------------------------
 
-// seedGracefulHandoffOld seeds a live coord OLD agent (marker -> OLD).
+// seedGracefulHandoffOld seeds a live coord OLD agent. Its task_id is
+// coord-<project>, which spawn.IsCoordSpawn recognizes as the project's
+// coord (the coord-spawn marker is gone — D3).
 func seedGracefulHandoffOld(t *testing.T, project, cwd string) *agent.Record {
 	t.Helper()
 	old := agent.New(agent.NewID())
@@ -1792,9 +1629,6 @@ func seedGracefulHandoffOld(t *testing.T, project, cwd string) *agent.Record {
 	}
 	if _, err := state.EnsureProjectInitialized(project); err != nil {
 		t.Fatalf("EnsureProjectInitialized: %v", err)
-	}
-	if err := state.WriteCoordSpawnMarker(project, old.ID); err != nil {
-		t.Fatalf("seed marker: %v", err)
 	}
 	return old
 }

@@ -75,17 +75,16 @@ var (
 // duplicate-coord incident). Dead-coord recovery (OLD not the live lease
 // owner) keeps the bare cold-resume shape: a standby polling a dead owner's
 // lease has no live releaser to wait on.
-// Gates on the SAME marker predicate retireOldAgent's isCoordSwap uses
-// (codex PR3-completion iter-6 [P2]): a coord-shaped task whose coord-spawn
-// marker is missing/stale takes the worker/inline retire path later, where a
-// lease-wrapped standby would receive its prompt via direct-send into the
-// supervisor pane instead of the lock-owner poll. Keeping the wrap decision
-// aligned with the route decision prevents that split.
+// Gates on the SAME lease predicate retireOldAgent's isCoordSwap uses (codex
+// PR3-completion iter-6 [P2]): gracefulSwapEligibleFn already requires OLD to be
+// the current lease owner (coordlock.CurrentOwner == oldRec.ID), so the wrap
+// decision stays aligned with the graceful-route decision — an OLD that no
+// longer owns the lease takes the worker/inline retire path, where a
+// lease-wrapped standby would mis-route its prompt into the supervisor pane.
+// The coord-spawn marker (D3, deleted) is no longer consulted: isCoordResume
+// (spawn.IsCoordSpawn) + gracefulSwapEligibleFn (lease owner) cover it.
 func liveCoordGracefulSpawn(oldRec *agent.Record, isCoordResume, autoResume bool) bool {
 	if !isCoordResume || oldRec == nil || oldRec.Project == "" {
-		return false
-	}
-	if state.ReadCoordSpawnMarker(oldRec.Project) != oldRec.ID {
 		return false
 	}
 	return gracefulSwapEligibleFn(oldRec, autoResume)
@@ -104,13 +103,12 @@ func deliverResumePrompt(project string, isCoordSwap, leaseWrappedSuccessor, req
 	prompt := handoff.ResumePrompt(docPath)
 	if coordlock.FailoverEnabled() && isCoordSwap && leaseWrappedSuccessor && project != "" {
 		delivered, err := handoffdelivery.DeliverToCurrentOwner(handoffdelivery.Options{
-			Project:       project,
-			Prompt:        prompt,
-			PromoteMarker: true,
-			Timeout:       handoffDeliveryTimeout,
-			Poll:          handoffDeliveryPoll,
-			Stdout:        stdout,
-			Stderr:        stderr,
+			Project: project,
+			Prompt:  prompt,
+			Timeout: handoffDeliveryTimeout,
+			Poll:    handoffDeliveryPoll,
+			Stdout:  stdout,
+			Stderr:  stderr,
 		}, handoffDeliveryDepsFn())
 		if err != nil {
 			// Legacy/bare coord with no lease record: the owner-poll can never
@@ -194,23 +192,41 @@ func coordDrainExecArgv(project string, command []string, rcSessionName string) 
 	return rewritten
 }
 
-// isCoordHandoffForAgent reports whether (project, agentID) identifies
-// the project's current coord — i.e. the coord-spawn marker resolves
-// to agentID. spawnAndRetire calls this to gate the v0.12.1 RC inject
-// (codex review iter-7 [P1]): worker handoffs that happen during
-// fleet drain / crash recovery must NOT silently inherit
-// --remote-control just because the project is RC-enabled — that
-// would reopen the v0.12 push-storm class for the auto-drained
-// successor agent.
+// isCoordHandoffForAgent reports whether rec is a COORD (not a worker /
+// Agent-tool subagent) being handed off. spawnAndRetire calls this to gate the
+// v0.12.1 RC inject (codex review iter-7 [P1]) AND the coord-spawn lock
+// acquisition (duplicate-coord prevention): worker handoffs during fleet drain /
+// crash recovery must NOT silently inherit --remote-control (which would reopen
+// the v0.12 push-storm class) and must NOT contend on the coord-spawn lock.
 //
-// Mirrors cmd/fleet/handoff.go's isCoordHandoffForProject (same
-// predicate, package-local copy to keep the handoffop package self-
-// contained without importing cmd/fleet/main).
-func isCoordHandoffForAgent(project, agentID string) bool {
-	if project == "" {
+// The coord-spawn marker (D3, deleted) is replaced by spawn.IsCoordSpawn — the
+// primary task-based coord detector (task_id == coord-<project>). It is
+// TTL-INDEPENDENT (unlike the lease owner), so a busy coord whose heartbeat
+// briefly stalled is never mis-classified as a worker at the lock-acquire gate,
+// keeping the duplicate-prevention guard robust.
+func isCoordHandoffForAgent(rec *agent.Record) bool {
+	return rec != nil && spawn.IsCoordSpawn(rec.TaskID, rec.Project)
+}
+
+// leaseNamesCoord reports whether the coordinator lease for project names
+// agentID as its coord identity — either the current active owner
+// (coordlock.CurrentOwner) or an in-flight handoff successor reservation
+// (coordlock.CurrentHandoff). It replaces the deleted spawn marker's
+// `marker == agentID` fallback in the coord-delivery detectors (D3): the lease
+// owner/successor IS the identity now. spawn.IsCoordSpawn stays the PRIMARY
+// coord detector at the call sites; this is the secondary "the lease points at
+// this specific agent" signal that the marker used to carry.
+func leaseNamesCoord(project, agentID string) bool {
+	if project == "" || agentID == "" {
 		return false
 	}
-	return state.ReadCoordSpawnMarker(project) == agentID
+	if o, ok := coordlock.CurrentOwner(project); ok && o.AgentID == agentID {
+		return true
+	}
+	if h, ok := coordlock.CurrentHandoff(project); ok && h.SuccessorID == agentID {
+		return true
+	}
+	return false
 }
 
 // Resume completes a handoff for which the queue file already exists.
@@ -304,113 +320,57 @@ func Resume(req queue.SpawnFresh, queuePath string,
 			"resume: probe replacement %s session %s failed: %w (record preserved for operator inspection)",
 			newRec.ID, newRec.TmuxSession, perr)
 	case !alive:
-		// Codex iter-14 [P1]: AtomicCoordSwap preserves the queue
-		// journal on ErrOrphanSurvived / ErrOldKillProbeAmbiguous —
-		// the cases where NEW may have lost the coordinator.lock race
-		// + exited, while OLD is still the live coord. On the next
-		// drain / watcher pass we land here with newRec session
-		// definitively dead. Auto-respawning would put a SECOND
-		// replacement on top of a still-alive OLD, recreating the
-		// duplicate-coord loop the preserved queue is meant to avoid.
+		// NEW's session is definitively dead. Decide respawn / refuse / wait
+		// PURELY from the coordinator LEASE (the coord-spawn marker is gone, D3)
+		// via the Class-4 classifier — the P0 duplicate-coord guard. The lease
+		// commit is ASYNC (the winning standby bumps the epoch), so at this
+		// recovery probe the lease is in one of three states:
 		//
-		// Codex iter-15 [P1] narrowing: refuse ONLY when marker is at
-		// newRec.ID (post-commit), not at oldRec.ID (pre-commit).
+		//   owner == NEW (epoch committed)   → REFUSE: respawning duplicates the
+		//     coord. DEFENSE-IN-DEPTH: a cross-socket OLD still alive here is a
+		//     LOUD diagnostic (surface, operator-gate; never auto-kill).
+		//   handoff{NEW}, no active owner    → WAIT: swap in flight, the warm
+		//     standby is the recovery vehicle; do NOT respawn a 2nd replacement.
+		//   owner == OLD, or free + no handoff → RESPAWN: not committed, safe to
+		//     drop the dead NEW and spawn fresh.
 		//
-		//   - marker == newRec.ID → AtomicCoordSwap's step 4 succeeded
-		//     and step 5 returned ErrOrphanSurvived / ErrOldKillProbeAmbiguous.
-		//     The swap "committed" — NEW briefly owned by the marker —
-		//     and OLD's record was preserved (helper iter-7 P1 stopped
-		//     archiving OLD on these paths). If OLD's tmux is still
-		//     alive (orphan or live coord on another socket), respawning
-		//     here would put a NEW2 competing for coordinator.lock with
-		//     the OLD orphan that's still holding it.
-		//
-		//   - marker == oldRec.ID → previous handoff crashed BEFORE the
-		//     atomic commit (no eager write yet, or eager write failed,
-		//     or the helper rolled the marker back). OLD is still the
-		//     only legitimate coord. Respawning is the correct recovery:
-		//     drop NEW, fresh-spawn a replacement, normal swap path
-		//     completes the handoff.
-		//
-		// Codex iter-18 [P1] (deferred — known limitation, conservative
-		// stance): The eager marker write in spawnAndRetire (search
-		// "Eager marker write — closes the duplicate-coord window")
-		// moves marker → newRec.ID BEFORE retireOldAgent invokes
-		// AtomicCoordSwap. A crash in that pre-commit window leaves
-		// marker == newRec.ID with no real commit having happened, and
-		// this branch treats it as post-commit (refuses auto-respawn
-		// instead of dropping the dead NEW + retrying the swap).
-		// Distinguishing pre-commit-eager-write from post-commit-real-
-		// commit on disk requires a separate "swap-committed" sentinel
-		// written only by AtomicCoordSwap step 4 — a structural addition
-		// deferred to a follow-up PR. Current behavior errs conservative
-		// (preserves the queue, surfaces refusal to operator) rather
-		// than risk auto-respawning into a real ErrOrphanSurvived state.
-		// Operator workaround: `--force-replacement` on `fleet handoff`,
-		// or manually rewriting the marker to oldRec.ID before retry.
-		coordSwapPostCommit := false
-		if oldRec.Project != "" &&
-			state.ReadCoordSpawnMarker(oldRec.Project) == newRec.ID {
-			coordSwapPostCommit = true
-		}
-		if coordSwapPostCommit {
-			// Codex iter-17 [P1] (deferred — known scope limitation):
-			// tmuxSessionAliveFn only probes the CURRENT
-			// FLEET_TMUX_SOCKET. (alive=false, err=nil) here means
-			// "not on our socket," not "globally dead." If OLD's coord
-			// was always on a different tmux socket, we fall through
-			// and respawn — creating a duplicate coord. Distinguishing
-			// requires persisting OLD's originating socket on
-			// agent.Record (schema change cross-cutting spawn + state
-			// + every probe site); deferred to a follow-up PR per the
-			// PR #149 cross-socket cap precedent. Single-socket fleet
-			// (the default) is correct here.
-			oldAlive, probeErr := tmuxSessionAliveFn(oldRec.TmuxSession)
-			switch {
-			case probeErr != nil:
-				// Ambiguous OLD probe — refuse rather than risk
-				// respawning into a live coord. Queue stays so the
-				// next pass (or operator's explicit `fleet handoff`)
-				// can retry once the probe is reliable.
-				return fmt.Errorf(
-					"resume: replacement %s session %s appears dead but probing old coord %s session %s failed: %w (queue preserved; investigate manually)",
-					newRec.ID, newRec.TmuxSession, oldRec.ID, oldRec.TmuxSession, probeErr)
-			case oldAlive:
-				// OLD coord is still alive — typically because the
-				// previous AtomicCoordSwap returned ErrOrphanSurvived
-				// or ErrOldKillProbeAmbiguous and preserved OLD.
-				// Auto-respawning here would compound the problem
-				// with a second replacement competing for the same
-				// coordinator.lock. Refuse, leave queue intact, surface
-				// the orphan to the operator.
-				return fmt.Errorf(
-					"resume: replacement %s session %s exited but old coord %s session %s is still alive — refusing auto-respawn (would create duplicate coord); kill the orphan replacement or the old coord manually, then re-run fleet drain (queue preserved at %s)",
-					newRec.ID, newRec.TmuxSession, oldRec.ID, oldRec.TmuxSession, queuePath)
+		// force=false: the auto-drain path has no operator to pass
+		// --force-replacement.
+		deps := DefaultCoordSwapResumeDeps()
+		deps.OldSessionAlive = tmuxSessionAliveFn // reuse the test-injectable probe seam
+		resume := ClassifyCoordSwapResume(oldRec.Project, oldRec.ID, oldRec.TmuxSession, newRec.ID, false, deps)
+		switch resume.Action {
+		case ResumeRefuse:
+			// Committed to NEW — refuse. Surface a LOUD diagnostic when the
+			// defensive probe found OLD still alive (cross-socket blind spot)
+			// or was ambiguous; the verdict is unchanged (refuse), the probe
+			// only shapes the message. NEVER auto-kills.
+			if resume.OldStillAlive || resume.OldProbeErr != nil {
+				_, _ = fmt.Fprintf(stderr,
+					"[P1] resume: replacement %s session %s exited AFTER the epoch committed to it, but a defensive probe found OLD coord %s session %s may still be alive (alive=%v err=%v) — refusing auto-respawn (would create a duplicate coord); operator: confirm which coord is live, then re-run fleet drain (queue preserved at %s)\n",
+					newRec.ID, newRec.TmuxSession, oldRec.ID, oldRec.TmuxSession, resume.OldStillAlive, resume.OldProbeErr, queuePath)
 			}
-			// OLD is definitively dead — safe to drop NEW and spawn
-			// fresh. Falls through to DropReplacementRecord + rollback
-			// + spawnAndRetire below.
+			return fmt.Errorf(
+				"resume: replacement %s session %s exited but the coordinator epoch already committed to it (%s) — refusing auto-respawn (would create a duplicate coord); kill the orphan or use `fleet handoff --force-replacement` (queue preserved at %s)",
+				newRec.ID, newRec.TmuxSession, resume.Reason, queuePath)
+		case ResumeWait:
+			// Swap in flight (a handoff reservation names NEW, no active owner):
+			// the warm standby is the recovery vehicle. Do NOT respawn a 2nd
+			// replacement; keep the queue for the standby's eventual win.
+			return fmt.Errorf(
+				"resume: replacement %s session %s exited while a handoff to it is in flight (%s) — the standby is the recovery vehicle; not respawning a duplicate (queue preserved at %s)",
+				newRec.ID, newRec.TmuxSession, resume.Reason, queuePath)
 		}
+		// ResumeRespawn: not committed (OLD owns the lease, or a free lease with
+		// no reservation) — safe to drop the dead NEW and spawn fresh.
 		if dropErr := DropReplacementRecord(newRec.TmuxSession, newRec.ID, stderr); dropErr != nil {
 			return fmt.Errorf(
 				"resume: stale replacement %s session %s appeared dead but cleanup failed (%w); spawn fresh aborted",
 				newRec.ID, newRec.TmuxSession, dropErr)
 		}
-		// Codex iter-12 [P1]: a prior coord-swap attempt may have
-		// committed marker → newRec.ID (eager write before retire,
-		// or the AtomicCoordSwap commit point) and then returned
-		// ErrOrphanSurvived / ErrOldKillProbeAmbiguous / similar,
-		// leaving the marker pointing at the replacement we just
-		// dropped. The fall-through to spawnAndRetire's isCoordSwap
-		// check only matches marker == oldRec.ID, so without this
-		// rollback the retry's swap detection misses, the inline
-		// retire path runs (no AtomicCoordSwap), and `[a]` can spawn
-		// a duplicate coord because the marker still names the dead
-		// agent. Idempotent if marker is already at oldRec.ID.
-		RollbackCoordMarkerIfPointingAt(oldRec.Project, oldRec.ID, newRec.ID, stderr)
 		_, _ = fmt.Fprintf(stderr,
-			"note: stale replacement %s (session %s already exited) cleaned up; spawning fresh replacement\n",
-			newRec.ID, newRec.TmuxSession)
+			"note: stale replacement %s (session %s already exited) cleaned up; spawning fresh replacement (%s)\n",
+			newRec.ID, newRec.TmuxSession, resume.Reason)
 		return spawnAndRetire(req, queuePath, oldRec, graceMillis, stdout, stderr)
 	}
 	// Resolve THIS handoff's auto-resume policy from queue override
@@ -428,30 +388,13 @@ func Resume(req queue.SpawnFresh, queuePath string,
 	if req.SchemaVersion < 2 {
 		thisHandoffDisable = true
 	}
-	// Coord-swap detection for the case-3 resume path (replacement
-	// already spawned + alive). isCoordSwap fires when the marker
-	// resolves to either oldRec.ID (previous run crashed BEFORE
-	// commit) or newRec.ID (previous run committed but crashed during
-	// retire — still need atomic kill+archive bookkeeping). The
-	// helper's step 1.b accepts both states (codex iter-9 [P1]).
-	//
-	// On marker==oldRec.ID, eager-write the marker → newRec.ID before
-	// retireOldAgent so the readiness wait doesn't open a duplicate-
-	// coord window.
-	isCoordSwap := false
-	if oldRec.Project != "" {
-		switch state.ReadCoordSpawnMarker(oldRec.Project) {
-		case oldRec.ID:
-			isCoordSwap = true
-			if werr := state.WriteCoordSpawnMarker(oldRec.Project, newRec.ID); werr != nil {
-				_, _ = fmt.Fprintf(stderr,
-					"warning: eager coord-spawn marker update for project %s failed: %v (retireOldAgent will retry inside AtomicCoordSwap)\n",
-					oldRec.Project, werr)
-			}
-		case newRec.ID:
-			isCoordSwap = true
-		}
-	}
+	// Coord-swap detection for the case-3 resume path (replacement already
+	// spawned + alive). isCoordSwap is now the task-based coord detector
+	// (spawn.IsCoordSpawn) — the coord-spawn marker is gone (D3), and the
+	// identity commit is the winning standby's async epoch bump. No eager write
+	// is needed: there is no marker to move, and retireOldAgent's graceful /
+	// AtomicCoordSwap branches reserve the handoff on OLD's lease themselves.
+	isCoordSwap := spawn.IsCoordSpawn(oldRec.TaskID, oldRec.Project)
 	// Read the ACTUAL wrap state from the already-spawned replacement record
 	// (codex iter-24 [P2]) — a bare drain cold-resume coord records false even
 	// on a CapApproved queue, so do NOT infer wrapping from req.CapApproved.
@@ -495,7 +438,7 @@ func cleanUpStaleQueue(req queue.SpawnFresh, queuePath string,
 	// winner and deliver to it (codex iter-31 P1).
 	coordOwnerDelivery := autoResume && coordlock.FailoverEnabled() && newRec.LeaseWrapped &&
 		(spawn.IsCoordSpawn(newRec.TaskID, newRec.Project) ||
-			(newRec.Project != "" && state.ReadCoordSpawnMarker(newRec.Project) == newRec.ID))
+			leaseNamesCoord(newRec.Project, newRec.ID))
 
 	if !tmux.HasSession(newRec.TmuxSession) && !coordOwnerDelivery {
 		return fmt.Errorf(
@@ -535,7 +478,7 @@ func cleanUpStaleQueue(req queue.SpawnFresh, queuePath string,
 	supersededID := ""
 	if autoResume {
 		coordDelivery := spawn.IsCoordSpawn(newRec.TaskID, newRec.Project) ||
-			(newRec.Project != "" && state.ReadCoordSpawnMarker(newRec.Project) == newRec.ID)
+			leaseNamesCoord(newRec.Project, newRec.ID)
 		// Read the ACTUAL wrap state from the already-spawned replacement
 		// record (codex iter-24 [P2]), not the producer's cap-approval bit: a
 		// bare drain cold-resume coord records false even on a CapApproved queue.
@@ -746,13 +689,13 @@ func spawnAndRetire(req queue.SpawnFresh, queuePath string,
 	// Agent-tool subagents must NEVER carry the flag (push-storm
 	// protection). Mirrors cmd/fleet/handoff.go and dispatch.go.
 	//
-	// The predicate matches the post-spawn isCoordSwap detector at
-	// line ~602 below — same fact (coord-spawn marker resolves to
-	// oldRec.ID), used at two points (pre-inject + post-spawn marker
-	// transfer). Extracted as isCoordHandoffForAgent for unit-testable
-	// gate coverage without driving full spawnAndRetire.
+	// The predicate matches the post-spawn isCoordSwap detector below —
+	// same fact (spawn.IsCoordSpawn: task_id == coord-<project>), used
+	// at two points (pre-inject + post-spawn). Extracted as
+	// isCoordHandoffForAgent for unit-testable gate coverage without
+	// driving full spawnAndRetire.
 	var rewrittenExecArgv []string
-	if isCoordHandoffForAgent(oldRec.Project, oldRec.ID) {
+	if isCoordHandoffForAgent(oldRec) {
 		// v0.12.2 P0 v3 (DESIGN-coord-spawn-atomic-gate.md §Change 7;
 		// codex iter-1 [P1] from the v2 reviewer + v3 reviewer codex
 		// iter-1 [P1] on warn-and-continue): acquire the SAME
@@ -861,42 +804,15 @@ func spawnAndRetire(req queue.SpawnFresh, queuePath string,
 			newRec.ID, newRec.TmuxSession)
 	}
 
-	// Coord-spawn marker transfer in two passes (codex iter-1 [P1] +
-	// iter-9 [P1]):
-	//
-	//   1. DETECT isCoordSwap by reading the marker BEFORE we change
-	//      it. Pass through to retireOldAgent so its isCoordSwap branch
-	//      fires regardless of subsequent marker reads.
-	//
-	//   2. EAGERLY write marker → newRec.ID BEFORE retireOldAgent's
-	//      readiness wait. Without this the marker stays at oldRec.ID
-	//      during NEW's boot. If OLD exits during that window, the
-	//      TUI's [a] path can't find NEW (record.ID != marker) and
-	//      spawns a duplicate coord.
-	//
-	// AtomicCoordSwap's step 1.b accepts EITHER marker==oldRec.ID OR
-	// marker==newRec.ID (when AlreadySpawnedNewRec is set), so the
-	// eager write is idempotent w.r.t. the helper's commit contract.
-	// The helper's step 4 also skips a redundant rename when
-	// markerAtNew is already true.
-	//
-	// Workers and other non-coord agents go through retireOldAgent's
-	// inline path unchanged — the v0.2 worker-swap transactional
-	// refactor is deferred per the v5 plan's Non-goals.
-	isCoordSwap := false
-	if oldRec.Project != "" && state.ReadCoordSpawnMarker(oldRec.Project) == oldRec.ID {
-		isCoordSwap = true
-		// Eager marker write — closes the duplicate-coord window
-		// during NEW's readiness wait. Best-effort; marker errors
-		// print a warning but don't fail the drain. retireOldAgent's
-		// AtomicCoordSwap call will re-commit (idempotent) or
-		// commit fresh, whichever applies.
-		if werr := state.WriteCoordSpawnMarker(oldRec.Project, newRec.ID); werr != nil {
-			_, _ = fmt.Fprintf(stderr,
-				"warning: eager coord-spawn marker update for project %s failed: %v (retireOldAgent will retry inside AtomicCoordSwap)\n",
-				oldRec.Project, werr)
-		}
-	}
+	// Coord-swap detection is now the task-based coord detector
+	// (spawn.IsCoordSpawn) — the coord-spawn marker is gone (D3). There is no
+	// eager marker write anymore: the identity commit is the winning standby's
+	// async epoch bump, and retireOldAgent's graceful / AtomicCoordSwap branches
+	// reserve the handoff on OLD's lease themselves (a soft TTL guard that closes
+	// the duplicate-coord window without a marker). Workers and other non-coord
+	// agents go through retireOldAgent's inline path unchanged — the v0.2
+	// worker-swap transactional refactor is deferred per the v5 plan's Non-goals.
+	isCoordSwap := spawn.IsCoordSpawn(oldRec.TaskID, oldRec.Project)
 
 	// A coord successor here is BARE on the dead-coord cold resume
 	// (DisableLeaseWrap above; codex iter-20 P2) but LEASE-WRAPPED on the
@@ -992,39 +908,26 @@ func retireOldAgent(oldRec, newRec *agent.Record, docPath, queuePath string,
 			_ = os.Remove(path)
 		}
 		_ = queue.Delete(queuePath)
-		// Codex iter-11 [P1]: the caller (spawnAndRetire / Resume
-		// case-3) may have eagerly moved the marker to newRec.ID
-		// before invoking us. NEW is now dead — restore the marker
-		// to oldRec.ID so dashboard discovery + a retry's
-		// isCoordSwap detection keep working.
-		if isCoordSwap && oldRec.Project != "" && state.ReadCoordSpawnMarker(oldRec.Project) == newRec.ID {
-			if werr := state.WriteCoordSpawnMarker(oldRec.Project, oldRec.ID); werr != nil {
-				_, _ = fmt.Fprintf(stderr,
-					"warning: rollback coord-spawn marker for project %s failed: %v (operator may need to re-write manually)\n",
-					oldRec.Project, werr)
-			}
-		}
+		// NEW died during the readiness wait. There is no marker to roll back
+		// (D3, deleted): OLD still owns the lease, so discovery keeps resolving
+		// to OLD and no eager write ever moved the identity off it.
 		return fmt.Errorf(
 			"resume: replacement %s tmux session %s exited during readiness wait; old agent %s untouched, retry handoff",
 			newRec.ID, newRec.TmuxSession, oldRec.ID)
 	}
 
 	// Coord swap fast path. When OLD is the project's coordinator
-	// (caller-supplied isCoordSwap from spawnAndRetire's pre-flight
-	// marker check — codex iter-1 [P1] fix: doing the check HERE
-	// would always see the marker already at newRec.ID because the
-	// pre-helper marker write moved it before this function ran),
-	// the retire sequence runs through the transactional
-	// AtomicCoordSwap helper instead of the inline marker-flip +
-	// /exit + grace + Kill + Archive sequence. This collapses the
-	// four observable writes into one atomic commit point at the
-	// marker rename (the v5 plan's load-bearing invariant). Worker
-	// handoffs fall through to the inline path.
+	// (caller-supplied isCoordSwap = spawn.IsCoordSpawn), the retire sequence
+	// runs through the transactional AtomicCoordSwap helper (reserve handoff on
+	// OLD's lease → /exit + grace + Kill + Archive) instead of the inline
+	// worker retire. The identity commit is the winning standby's async epoch
+	// bump — there is no synchronous marker write anymore. Worker handoffs fall
+	// through to the inline path.
 	//
 	// IMPORTANT: the spawnAndRetire caller has already (a) written
 	// the NEW agent record and (b) probed NEW alive. AtomicCoordSwap's
 	// AlreadySpawnedNewRec entrypoint skips its own spawn + probe
-	// steps and proceeds straight to the marker commit.
+	// steps and proceeds straight to reserving the handoff + retiring OLD.
 	//
 	// PR3 (DESIGN-coord-spawn-unified-standby §6): a LIVE-coord swap —
 	// OLD currently owns the lease, the successor is a lease-wrapped

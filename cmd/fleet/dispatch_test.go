@@ -234,7 +234,7 @@ func TestDispatch_PromptFailureWarningShape(t *testing.T) {
 // prompt remained in Claude's input box even after the retry — the
 // dispatch CLI must surface a stronger warning distinct from the
 // generic transport-error warning above. Operator log analysis
-// uses this to correlate "coord-spawn-marker exists but coord is
+// uses this to correlate "coord lease claimed but coord is
 // idle" with the dispatch's verification outcome.
 func TestDispatch_PromptUnsubmittedWarningShape(t *testing.T) {
 	var out bytes.Buffer

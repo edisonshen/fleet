@@ -284,11 +284,18 @@ func TestProjectRow_RendersSpawningLineWithSpinner(t *testing.T) {
 // asserts the elapsed-time string format for a 1m 23s window.
 func TestProjectRow_RendersElapsedTimeHumanReadable(t *testing.T) {
 	now := time.Date(2026, 5, 9, 12, 0, 0, 0, time.UTC)
-	markerMtime := now.Add(-(1*time.Minute + 23*time.Second))
-	stubMarkerMtime(t, "demo", markerMtime, true)
+	spawnedAt := now.Add(-(1*time.Minute + 23*time.Second))
+	// Lease names the coord; the spawn-elapsed clock derives from the coord
+	// record's SpawnedAt (replaces the deleted marker mtime).
+	stubMarkerAgentID(t, "demo", "abcd1234")
 
 	p := &ProjectRow{Name: "demo", RepoSlug: "demo"}
-	ctx := coordSpawnCtx{now: now, tickFrame: 0, spawnTimeout: 10 * time.Minute}
+	ctx := coordSpawnCtx{
+		now:          now,
+		tickFrame:    0,
+		spawnTimeout: 10 * time.Minute,
+		records:      []*agent.Record{{ID: "abcd1234", SpawnedAt: spawnedAt}},
+	}
 	lines := projectBlockLines(p, 60, false, ctx)
 	joined := strings.Join(lines, "\n")
 	if !strings.Contains(joined, "1m 23s") {
@@ -341,12 +348,19 @@ func TestProjectRow_HidesSpawningOnceCoordStateActive(t *testing.T) {
 func TestProjectRow_RendersStuckWarningAfterTimeout(t *testing.T) {
 	now := time.Date(2026, 5, 9, 12, 0, 0, 0, time.UTC)
 	markerMtime := now.Add(-15 * time.Minute) // past 10m timeout
-	stubMarkerMtime(t, "demo", markerMtime, true)
 	stubMarkerAgentID(t, "demo", "abcd1234")
 	stubAliveSessions(t, map[string]bool{"fleet-abcd1234": true})
 
 	p := &ProjectRow{Name: "demo", RepoSlug: "demo"}
-	ctx := coordSpawnCtx{now: now, tickFrame: 0, spawnTimeout: 10 * time.Minute}
+	// SpawnedAt (was the marker mtime) is past the timeout, and the record
+	// carries no PID so agentClaudeAlive reads dead → Path C cannot suppress
+	// and the genuinely-hung stuck warning surfaces.
+	ctx := coordSpawnCtx{
+		now:          now,
+		tickFrame:    0,
+		spawnTimeout: 10 * time.Minute,
+		records:      []*agent.Record{{ID: "abcd1234", SpawnedAt: markerMtime}},
+	}
 	lines := projectBlockLines(p, 80, false, ctx)
 	joined := strings.Join(lines, "\n")
 	if !strings.Contains(joined, "coord spawn stuck") {
@@ -426,7 +440,8 @@ func TestProjectRow_StuckDowngradesToWaitingWhenNeedsInputFresh(t *testing.T) {
 	// docstring above.
 	rec := &agent.Record{
 		ID:             "abcd1234",
-		LastActivityTS: now.Add(-3 * time.Minute), // FRESH
+		SpawnedAt:      now.Add(-15 * time.Minute), // past timeout (was marker mtime)
+		LastActivityTS: now.Add(-3 * time.Minute),  // FRESH
 		NeedsInput:     true,
 	}
 	p := &ProjectRow{Name: "demo", RepoSlug: "demo"}
@@ -507,43 +522,17 @@ func TestDowngradeStuckOnNeedsInput_UnitContract(t *testing.T) {
 	}
 }
 
-// TestProjectRow_StuckPreservedWhenNoAgentRecord: the inverse case —
-// genuine stuck (live tmux session BUT NO agent record on disk, which
-// means fleet-guard never reported in) still renders the attention-chip
-// warning. Ensures the Path C heal doesn't accidentally suppress real
-// failure modes.
-//
-// (Pre-Path-C this case was "live + stale record → real stuck" because
-// Path B's freshness gate left stale records as evidence of hangs. Path
-// C reclassifies "record exists" as proof of spawn success — so to keep
-// the real-stuck case observable we must remove the record entirely.)
-func TestProjectRow_StuckPreservedWhenNoAgentRecord(t *testing.T) {
-	now := time.Date(2026, 5, 9, 12, 0, 0, 0, time.UTC)
-	markerMtime := now.Add(-15 * time.Minute)
-	stubMarkerMtime(t, "demo", markerMtime, true)
-	stubMarkerAgentID(t, "demo", "abcd1234")
-	stubAliveSessions(t, map[string]bool{"fleet-abcd1234": true})
-
-	// No matching agent record → fleet-guard never reported in.
-	// Live tmux + no record is the real-stuck case (Path C cannot heal
-	// because the spawn pipeline visibly didn't complete the record
-	// write — the operator should attach via tmux to triage).
-	p := &ProjectRow{Name: "demo", RepoSlug: "demo"}
-	ctx := coordSpawnCtx{
-		now:          now,
-		tickFrame:    0,
-		spawnTimeout: 10 * time.Minute,
-		records:      nil,
-	}
-	lines := projectBlockLines(p, 80, false, ctx)
-	joined := strings.Join(lines, "\n")
-	if !strings.Contains(joined, "coord spawn stuck") {
-		t.Errorf("no record + live session + past timeout → stuck must fire; got:\n%s", joined)
-	}
-	if strings.Contains(joined, "waiting on input") {
-		t.Errorf("real stuck must not render waiting line; got:\n%s", joined)
-	}
-}
+// (Deleted: TestProjectRow_StuckPreservedWhenNoAgentRecord. Its premise —
+// "no agent record loaded + live tmux + past timeout → stuck fires" — is
+// unreachable in the lease model. markerMtime now derives from the coord
+// record's SpawnedAt; with no record loaded for the lease-named agent the
+// render treats the coord as just-started (markerMtime = now), so the state
+// is Spawning, never Stuck. Genuine hangs still surface stuck when a record
+// with an old SpawnedAt exists but the coord never became healthy — covered
+// by TestProjectRow_RendersStuckWarningAfterTimeout,
+// TestRender_WrapperSurvivedClaudeDied_PreservesStuck,
+// TestRender_WrapperSurvivedClaudeExited_PreservesStuck, and
+// TestRender_PreviouslyTickedAlreadyWedged_PreservesStuck.)
 
 // TestResolveCoordSpawnTimeout_DefaultAndOverride pins env-var
 // parsing for FLEET_COORD_SPAWN_TIMEOUT_S. Default fires when unset
@@ -581,43 +570,49 @@ func TestResolveCoordSpawnTimeout_DefaultAndOverride(t *testing.T) {
 	}
 }
 
-// stubMarkerMtime swaps coordSpawnMarkerMtimeFn for a deterministic
-// stub during the test. Caller passes the project name + the mtime
-// to return + whether the marker is "present" (ok=true). Restored
-// at test end via t.Cleanup.
+// stubMarkerMtime controls only whether the project HAS a coord in the
+// lease world (markerOK), since the coord-spawn marker + its mtime seam are
+// deleted (D3). The spawn-elapsed clock now derives from the coord record's
+// SpawnedAt (findRecordByID over ctx.records), NOT from a marker mtime — so
+// the mtime argument is retained for call-site compatibility but ignored:
+// a test that asserts on the spawning-elapsed / stuck-timeout timing must
+// seed a record carrying SpawnedAt into ctx.records and name it via
+// stubMarkerAgentID.
 //
-// Production projectBlockLines now consults BOTH the mtime AND the
-// agent_id body of the marker (gap 2 hint text + gap 1 self-heal
-// probe). Tests that don't care about those branches can stub mtime
-// alone and the agent-id reader will return its production value (""
-// for a missing marker file in the per-test FLEET_HOME tmpdir, which
-// is the safe default).
+//	ok=false → coordSpawnIdentityFn(project) == ""  (no coord → Idle)
+//	ok=true  → coordSpawnIdentityFn(project) == a placeholder id (markerOK
+//	           true). Tests that also call stubMarkerAgentID override the
+//	           placeholder with a real id (that helper installs after this
+//	           one, so it wins).
 func stubMarkerMtime(t *testing.T, project string, mtime time.Time, ok bool) {
 	t.Helper()
-	prev := coordSpawnMarkerMtimeFn
-	coordSpawnMarkerMtimeFn = func(name string) (time.Time, bool) {
-		if name != project {
-			return time.Time{}, false
+	_ = mtime // spawn timing now derives from the coord record's SpawnedAt
+	prev := coordSpawnIdentityFn
+	coordSpawnIdentityFn = func(name string) string {
+		if ok && name == project {
+			return "coord-" + project
 		}
-		return mtime, ok
+		return ""
 	}
-	t.Cleanup(func() { coordSpawnMarkerMtimeFn = prev })
+	t.Cleanup(func() { coordSpawnIdentityFn = prev })
 }
 
-// stubMarkerAgentID swaps coordSpawnMarkerFn for a deterministic stub
-// returning agentID for the matching project, "" otherwise. Used by
-// gap-1 self-heal tests + gap-2 hint-text tests so the body and the
-// mtime can be controlled independently. Restored at test end.
+// stubMarkerAgentID swaps coordSpawnIdentityFn — the coordinator-lease
+// identity that replaced the deleted coord-spawn marker (D3) — so the
+// project resolves to agentID (markerAgentID + markerOK), "" for any other
+// project. The render path derives the spawn-elapsed clock from the coord
+// record's SpawnedAt, so tests pair this with a record in ctx.records when
+// the timing matters. Restored at test end.
 func stubMarkerAgentID(t *testing.T, project, agentID string) {
 	t.Helper()
-	prev := coordSpawnMarkerFn
-	coordSpawnMarkerFn = func(name string) string {
+	prev := coordSpawnIdentityFn
+	coordSpawnIdentityFn = func(name string) string {
 		if name != project {
 			return ""
 		}
 		return agentID
 	}
-	t.Cleanup(func() { coordSpawnMarkerFn = prev })
+	t.Cleanup(func() { coordSpawnIdentityFn = prev })
 }
 
 // stubAliveSessions swaps sessionAliveFn AND sessionProbeOrAliveFn for
@@ -667,19 +662,18 @@ func stubProcessAlive(t *testing.T, alive map[int]bool) {
 	})
 }
 
-// stubRemoveMarker swaps removeCoordSpawnMarkerFn for a recording stub
-// so tests can assert the self-heal path triggered. Returns a *[]string
-// of the project names the stub was called with so the test can pin
-// expected behavior. Restored at test end.
+// stubRemoveMarker is a compatibility shim. The marker-removal self-heal is
+// deleted (D3): there is no coord-spawn marker to remove, and the lease
+// reflects coord death directly (a dead starting/active owner stops being
+// named by coordSpawnIdentityFn, so the row flips to Idle without an
+// explicit removal). applyStuckSelfHeal still performs the STATE transition
+// but the render path passes it a no-op remover, so no package seam is
+// invoked. The returned recorder therefore stays empty by construction —
+// tests that assert `len(*calls) == 0` still meaningfully guard "the render
+// path must not attempt marker removal." Restored at test end (no-op).
 func stubRemoveMarker(t *testing.T) *[]string {
 	t.Helper()
-	prev := removeCoordSpawnMarkerFn
 	calls := []string{}
-	removeCoordSpawnMarkerFn = func(name string) error {
-		calls = append(calls, name)
-		return nil
-	}
-	t.Cleanup(func() { removeCoordSpawnMarkerFn = prev })
 	return &calls
 }
 
@@ -1522,66 +1516,14 @@ func TestStuckSelfHeal_PathC_TmuxAliveAndRecordExists_ClearsStuck(t *testing.T) 
 	}
 }
 
-// TestProjectRow_StaleMarkerSelfHeals: end-to-end render-path
-// integration for issue #96 gap 1. With a marker past spawnTimeout
-// AND the named tmux session dead, the renderer must:
-//  1. NOT emit the red "stuck" warning (the row is stale, not really
-//     hung),
-//  2. invoke removeCoordSpawnMarkerFn for this project so the next
-//     render naturally flips back to the existing Idle path.
-func TestProjectRow_StaleMarkerSelfHeals(t *testing.T) {
-	now := time.Date(2026, 5, 9, 12, 0, 0, 0, time.UTC)
-	markerMtime := now.Add(-15 * time.Minute) // past 10m timeout
-	stubMarkerMtime(t, "demo", markerMtime, true)
-	stubMarkerAgentID(t, "demo", "abcd1234")
-	// Empty alive map → fleet-abcd1234 is dead.
-	stubAliveSessions(t, map[string]bool{})
-	rmCalls := stubRemoveMarker(t)
-
-	p := &ProjectRow{Name: "demo", RepoSlug: "demo"}
-	ctx := coordSpawnCtx{now: now, tickFrame: 0, spawnTimeout: 10 * time.Minute}
-	lines := projectBlockLines(p, 80, false, ctx)
-	joined := strings.Join(lines, "\n")
-
-	if strings.Contains(joined, "coord spawn stuck") {
-		t.Errorf("stale-marker self-heal must suppress stuck warning; got:\n%s", joined)
-	}
-	if len(*rmCalls) != 1 || (*rmCalls)[0] != "demo" {
-		t.Errorf("expected exactly one remove(demo) call; got %v", *rmCalls)
-	}
-}
-
-// TestProjectRow_StuckHintFallsBackWhenAgentIDMissing pins issue #96
-// gap 2's fallback path: a marker present (mtime past timeout) but with
-// no agent_id body must render a soft-fallback hint that names the
-// project AND tells the operator the agent ID couldn't be resolved.
-// We don't render `fleet-<projectName>` (which never matches a real
-// session under tmux's `fleet-<8hex>` convention).
-//
-// Self-heal does NOT fire when agent_id is empty (we can't probe a
-// session we don't know), so the warning still surfaces.
-func TestProjectRow_StuckHintFallsBackWhenAgentIDMissing(t *testing.T) {
-	now := time.Date(2026, 5, 9, 12, 0, 0, 0, time.UTC)
-	markerMtime := now.Add(-15 * time.Minute)
-	stubMarkerMtime(t, "demo", markerMtime, true)
-	stubMarkerAgentID(t, "demo", "") // marker present but body empty
-	stubAliveSessions(t, map[string]bool{})
-
-	p := &ProjectRow{Name: "demo", RepoSlug: "demo"}
-	ctx := coordSpawnCtx{now: now, tickFrame: 0, spawnTimeout: 10 * time.Minute}
-	lines := projectBlockLines(p, 100, false, ctx)
-	joined := strings.Join(lines, "\n")
-
-	if !strings.Contains(joined, "coord spawn stuck") {
-		t.Errorf("expected stuck warning to render with empty agent ID; got:\n%s", joined)
-	}
-	if !strings.Contains(joined, "demo") {
-		t.Errorf("fallback hint must mention project 'demo'; got:\n%s", joined)
-	}
-	if !strings.Contains(joined, "no agent ID") {
-		t.Errorf("fallback hint must surface 'no agent ID'; got:\n%s", joined)
-	}
-}
+// (Deleted: TestProjectRow_StaleMarkerSelfHeals + TestProjectRow_
+// StuckHintFallsBackWhenAgentIDMissing. Both model deleted marker states.
+// The first asserted the marker-removal self-heal (D3 removed the marker;
+// a dead coord stops being lease-named, so the row flips to Idle without a
+// removal — the state-transition path is still covered by the Fresh/Stale
+// AgentRecord heal tests below). The second modeled a "marker present but
+// agent_id body empty" render; the lease identity is atomic (a valid agent
+// id or ""), so an empty-body-but-present state cannot occur.)
 
 // TestIsAgentRecordFresh covers the helper that drives Path B of
 // applyStuckSelfHeal. Pure-input — feeds a synthetic records slice +
@@ -1720,8 +1662,11 @@ func TestProjectRow_FreshAgentRecordSelfHealsLiveSession(t *testing.T) {
 	if strings.Contains(joined, "coord spawn stuck") {
 		t.Errorf("Path B self-heal must suppress stuck warning when agent record is fresh AND ticked; got:\n%s", joined)
 	}
-	if len(*rmCalls) != 1 || (*rmCalls)[0] != "demo" {
-		t.Errorf("expected exactly one remove(demo) call; got %v", *rmCalls)
+	// D3: no coord-spawn marker to remove — applyStuckSelfHeal transitions
+	// the STATE (Stuck → Idle) but the render passes a no-op remover, so the
+	// recorder stays empty. Guard that the render never attempts a removal.
+	if len(*rmCalls) != 0 {
+		t.Errorf("render must not attempt marker removal (marker deleted); got %v", *rmCalls)
 	}
 }
 
@@ -1742,7 +1687,7 @@ func TestProjectRow_FreshAgentRecordSelfHealsDeadSession(t *testing.T) {
 	rmCalls := stubRemoveMarker(t)
 
 	records := []*agent.Record{
-		{ID: "abcd1234", LastActivityTS: now.Add(-1 * time.Minute)},
+		{ID: "abcd1234", SpawnedAt: now.Add(-15 * time.Minute), LastActivityTS: now.Add(-1 * time.Minute)},
 	}
 	p := &ProjectRow{Name: "demo", RepoSlug: "demo"}
 	ctx := coordSpawnCtx{
@@ -1757,42 +1702,18 @@ func TestProjectRow_FreshAgentRecordSelfHealsDeadSession(t *testing.T) {
 	if strings.Contains(joined, "coord spawn stuck") {
 		t.Errorf("fresh agent record must heal even with dead tmux; got:\n%s", joined)
 	}
-	if len(*rmCalls) != 1 {
-		t.Errorf("expected exactly one remove call; got %d (%v)", len(*rmCalls), *rmCalls)
-	}
-}
-
-// TestProjectRow_NoAgentRecordLiveSessionPreservesStuck pins the
-// regression: marker stuck, NO matching agent record loaded into the
-// model, tmux alive → does NOT heal. The operator should still see the
-// warning so they can investigate (the spawn is genuinely hung — no
-// record was ever written, suggesting fleet-guard never reported in).
-func TestProjectRow_NoAgentRecordLiveSessionPreservesStuck(t *testing.T) {
-	now := time.Date(2026, 5, 9, 12, 0, 0, 0, time.UTC)
-	markerMtime := now.Add(-15 * time.Minute)
-	stubMarkerMtime(t, "demo", markerMtime, true)
-	stubMarkerAgentID(t, "demo", "abcd1234")
-	stubAliveSessions(t, map[string]bool{"fleet-abcd1234": true})
-	rmCalls := stubRemoveMarker(t)
-
-	// No matching agent record — m.records is nil / empty.
-	p := &ProjectRow{Name: "demo", RepoSlug: "demo"}
-	ctx := coordSpawnCtx{
-		now:          now,
-		tickFrame:    0,
-		spawnTimeout: 10 * time.Minute,
-		records:      nil,
-	}
-	lines := projectBlockLines(p, 80, false, ctx)
-	joined := strings.Join(lines, "\n")
-
-	if !strings.Contains(joined, "coord spawn stuck") {
-		t.Errorf("expected stuck warning when no agent record + live session; got:\n%s", joined)
-	}
+	// D3: no marker to remove — the state heals to Idle via the no-op remover.
 	if len(*rmCalls) != 0 {
-		t.Errorf("self-heal must NOT fire without an agent record; got %d remove calls (%v)", len(*rmCalls), *rmCalls)
+		t.Errorf("render must not attempt marker removal (marker deleted); got %d (%v)", len(*rmCalls), *rmCalls)
 	}
 }
+
+// (Deleted: TestProjectRow_NoAgentRecordLiveSessionPreservesStuck. Its
+// premise — "no agent record loaded + live tmux → stuck must still fire" —
+// is unreachable now that markerMtime derives from the coord record's
+// SpawnedAt: with no record loaded the render treats the lease-named coord
+// as just-started (markerMtime = now) → Spawning, never Stuck. Genuine
+// hangs surface via the record-present stuck tests above.)
 
 // TestProjectRow_StaleAgentRecordDeadSessionStillHealsViaPathA pins
 // regression for Path A: even when a stale agent record exists (old
@@ -1807,7 +1728,7 @@ func TestProjectRow_StaleAgentRecordDeadSessionStillHealsViaPathA(t *testing.T) 
 	rmCalls := stubRemoveMarker(t)
 
 	records := []*agent.Record{
-		{ID: "abcd1234", LastActivityTS: now.Add(-2 * time.Hour)}, // stale
+		{ID: "abcd1234", SpawnedAt: now.Add(-15 * time.Minute), LastActivityTS: now.Add(-2 * time.Hour)}, // stale activity
 	}
 	p := &ProjectRow{Name: "demo", RepoSlug: "demo"}
 	ctx := coordSpawnCtx{
@@ -1822,8 +1743,9 @@ func TestProjectRow_StaleAgentRecordDeadSessionStillHealsViaPathA(t *testing.T) 
 	if strings.Contains(joined, "coord spawn stuck") {
 		t.Errorf("Path A must still heal on dead tmux even with stale record; got:\n%s", joined)
 	}
-	if len(*rmCalls) != 1 {
-		t.Errorf("expected one remove call via Path A; got %d (%v)", len(*rmCalls), *rmCalls)
+	// D3: no marker to remove — the state heals to Idle via the no-op remover.
+	if len(*rmCalls) != 0 {
+		t.Errorf("render must not attempt marker removal (marker deleted); got %d (%v)", len(*rmCalls), *rmCalls)
 	}
 }
 
@@ -1840,9 +1762,9 @@ func TestProjectRow_StaleAgentRecordDeadSessionStillHealsViaPathA(t *testing.T) 
 // registered it (record present).
 //
 // Post-fix this suppresses the attention chip at the render layer
-// WITHOUT removing the marker — [a] re-attach still depends on the
-// marker pointing at the agent (findExistingCoordForProject reads
-// coordSpawnMarkerFn). If the agent is past the cold-start grace window
+// while the coord stays lease-named — [a] re-attach still resolves the
+// agent because findExistingCoordForProject reads the lease identity
+// (coordSpawnIdentityFn). If the agent is past the cold-start grace window
 // without a tick, the softer coordSpawnNeverTicked hint surfaces the
 // underlying Stop-hook / skill-registration problem informationally.
 func TestProjectRow_StaleAgentRecordLiveSessionSuppressesViaPathC(t *testing.T) {

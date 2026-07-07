@@ -9,7 +9,6 @@ import (
 	"github.com/edisonshen/fleet/internal/agent"
 	"github.com/edisonshen/fleet/internal/coordlock"
 	"github.com/edisonshen/fleet/internal/spawn"
-	"github.com/edisonshen/fleet/internal/state"
 	"github.com/edisonshen/fleet/internal/tmux"
 )
 
@@ -35,7 +34,6 @@ type Deps struct {
 	WaitReady         func(session string) error
 	SessionAlive      func(session string) (bool, error)
 	SendVerified      func(session, prompt string) (bool, error)
-	WriteMarker       func(project, id string) error
 	Now               func() time.Time
 	Sleep             func(time.Duration)
 }
@@ -49,7 +47,6 @@ func DefaultDeps() Deps {
 		WaitReady:         spawn.WaitForReadyToPrompt,
 		SessionAlive:      tmux.SessionAlive,
 		SendVerified:      spawn.SendPromptKeysVerified,
-		WriteMarker:       state.WriteCoordSpawnMarker,
 		Now:               time.Now,
 		Sleep:             time.Sleep,
 	}
@@ -57,13 +54,12 @@ func DefaultDeps() Deps {
 
 // Options controls a lock-owner delivery attempt.
 type Options struct {
-	Project       string
-	Prompt        string
-	PromoteMarker bool
-	Timeout       time.Duration
-	Poll          time.Duration
-	Stdout        io.Writer
-	Stderr        io.Writer
+	Project string
+	Prompt  string
+	Timeout time.Duration
+	Poll    time.Duration
+	Stdout  io.Writer
+	Stderr  io.Writer
 }
 
 // DeliverToCurrentOwner polls the coordinator lease, resolves the active owner
@@ -208,19 +204,16 @@ func finishDelivery(opts Options, deps Deps, owner coordlock.Owner, rec *agent.R
 		current, ok = deps.CurrentOwner(opts.Project)
 		if !ok || current.AgentID != owner.AgentID || current.PID != owner.PID ||
 			current.PidStart != owner.PidStart {
-			// Ownership flipped AFTER the verified send but BEFORE marker
-			// promotion. The prompt physically landed on the now-SUPERSEDED
-			// owner, and we have NOT promoted the marker — so the NEW owner has
-			// neither the resume prompt nor a marker pointing at it. Reporting
-			// success here would let the caller delete the durable queue + drop
-			// the superseded replacement, stranding the handoff: discovery stays
-			// pointed at a stale/removed agent and the doc is never retried
-			// (codex iter-32 P1).
+			// Ownership flipped AFTER the verified send but BEFORE we could
+			// confirm the recipient still owns the lease. The prompt physically
+			// landed on the now-SUPERSEDED owner. Reporting success here would let
+			// the caller delete the durable queue + drop the superseded
+			// replacement, stranding the handoff: the lease points at the new
+			// owner, which never got the doc (codex iter-32 P1).
 			//
-			// Keep it PENDING (return an error, do not promote a marker for an
-			// owner that no longer holds the lock): a retry re-targets the new
-			// stable owner. The cost is a benign duplicate prompt to the
-			// eventual owner — explicitly preferred over a silent strand (§5c).
+			// Keep it PENDING (return an error) so a retry re-targets the new
+			// stable owner. The cost is a benign duplicate prompt to the eventual
+			// owner — explicitly preferred over a silent strand (§5c).
 			if opts.Stderr != nil {
 				_, _ = fmt.Fprintf(opts.Stderr,
 					"warning: lock owner for project %s changed after verified send to %s; "+
@@ -228,24 +221,12 @@ func finishDelivery(opts Options, deps Deps, owner coordlock.Owner, rec *agent.R
 					opts.Project, owner.AgentID)
 			}
 			return false, fmt.Errorf(
-				"handoff delivery: lock owner for project %s flipped after verified send to %s before marker promotion",
+				"handoff delivery: lock owner for project %s flipped after verified send to %s before confirmation",
 				opts.Project, owner.AgentID)
 		}
 	}
-	if opts.PromoteMarker && deps.WriteMarker != nil {
-		if werr := deps.WriteMarker(opts.Project, owner.AgentID); werr != nil {
-			// The prompt is already verified-submitted, but the coord-spawn
-			// marker still points at the OLD/queued agent. Returning success
-			// here lets callers delete the queue + drop the superseded
-			// replacement, stranding attach/TUI discovery on a removed/losing
-			// agent (codex iter-25 [P2]). Surface the failure so the caller
-			// keeps the doc PENDING: a retry re-promotes the marker (and
-			// re-sends a benign duplicate prompt — preferred over broken
-			// discovery, §5c).
-			return false, fmt.Errorf(
-				"resume prompt delivered to lock owner %s but coord-spawn marker promotion for project %s failed: %w",
-				owner.AgentID, opts.Project, werr)
-		}
-	}
+	// The lease OWNER already IS the coord identity (the epoch bump on acquire),
+	// so there is nothing to promote after the send — the flip-after-send guard
+	// above is the whole correctness gate now.
 	return true, nil
 }
