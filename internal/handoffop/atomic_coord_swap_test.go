@@ -200,6 +200,55 @@ func TestAtomicCoordSwap_HappyPath_LiveOld(t *testing.T) {
 	}
 }
 
+// TestAtomicCoordSwap_ReserveFailure_SoftGuard is the D3 regression guard for
+// the new soft-reserve contract that REPLACED the old marker-write commit. The
+// deleted marker write was HARD: a write failure rolled back NEW and aborted the
+// swap (ErrConcurrentSwap / marker-write-failed). The lease reserve is SOFT — a
+// best-effort record-only CAS whose failure MUST NOT roll back NEW or abort the
+// retire: OLD is still retired + archived, the swap completes, and the failure
+// only logs (the identity commit is the winner's async epoch bump, not this
+// reserve). Without this test a future refactor could silently re-harden the
+// reserve into an abort and reintroduce a stuck-handoff class.
+func TestAtomicCoordSwap_ReserveFailure_SoftGuard(t *testing.T) {
+	in, newRec := seedCoordSwap(t, "rainier", "oldcoord", "newcoord")
+	fake := &fakeSwap{
+		postReadyAlive: true,                               // NEW alive
+		postKillAlive:  false,                              // OLD dead after kill
+		reserveErr:     errors.New("epoch lock contended"), // reserve fails
+	}
+	restore := fake.install(t, newRec)
+	defer restore()
+
+	var stderr bytes.Buffer
+	res, err := AtomicCoordSwap(in, &stderr)
+	// Soft guard: reserve failure must NOT abort the swap.
+	if err != nil {
+		t.Fatalf("reserve failure must NOT abort the swap; got err=%v (stderr=%s)", err, stderr.String())
+	}
+	if !fake.reserveCalled {
+		t.Errorf("ReserveHandoff should still be attempted on the live-OLD commit path")
+	}
+	// Retire proceeds despite the failed reserve — NEW is NOT rolled back, OLD is
+	// killed + archived exactly as on the happy path.
+	if !fake.killCalled {
+		t.Errorf("Kill OLD must still run after a soft reserve failure")
+	}
+	if !res.OldArchived {
+		t.Errorf("OldArchived = false; the swap must complete despite the reserve failure")
+	}
+	livePath, _ := state.AgentPath("oldcoord")
+	if _, statErr := os.Stat(livePath); !errors.Is(statErr, os.ErrNotExist) {
+		t.Errorf("OLD live record still exists at %s; retire must proceed", livePath)
+	}
+	// NEW is NOT rolled back: every old rollback path returned an error, so
+	// err==nil + OldArchived above already proves the swap kept NEW and retired
+	// OLD despite the reserve failure.
+	// Surface-don't-silo: the failure is logged, not swallowed.
+	if !strings.Contains(stderr.String(), "reserve handoff") {
+		t.Errorf("expected a stderr warning about the failed reserve; got %q", stderr.String())
+	}
+}
+
 // TestAtomicCoordSwap_HappyPath_DeadOld covers case 4 — operator
 // invoked dead-coord resume via TUI [a]. oldIsDead=true: kill + archive
 // are SKIPPED; OLD record stays on disk for operator [x] cleanup.
