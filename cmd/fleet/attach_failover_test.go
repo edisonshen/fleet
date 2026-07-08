@@ -26,6 +26,8 @@ import (
 	"testing"
 
 	"github.com/edisonshen/fleet/internal/agent"
+	"github.com/edisonshen/fleet/internal/coordlock"
+	"github.com/edisonshen/fleet/internal/coordreconcile"
 	"github.com/edisonshen/fleet/internal/projectlookup"
 )
 
@@ -129,6 +131,40 @@ func (s *failoverSetup) installStubs(t *testing.T) {
 	}
 	prevTmuxAvailable := tmuxAvailableFnVar
 	tmuxAvailableFnVar = func() error { return nil }
+	prevResolve := attachResolveFnVar
+	attachResolveFnVar = func(project, agentID string) (coordreconcile.Verdict, error) {
+		records, _, _ := agent.ListStrict()
+		for _, r := range records {
+			if r == nil || r.Project != project || r.TaskID != projectlookup.CoordTaskID(project) {
+				continue
+			}
+			session := r.TmuxSession
+			if session == "" {
+				session = "fleet-" + r.ID
+			}
+			if s.aliveSessions[session] {
+				return coordreconcile.Verdict{
+					Decision: coordreconcile.Attach,
+					Owner:    coordlock.Owner{AgentID: r.ID, PID: 1},
+					Reason:   "test live owner",
+				}, nil
+			}
+		}
+		if agentID == "" {
+			return coordreconcile.Verdict{Decision: coordreconcile.Wait, Reason: "test read-only wait"}, nil
+		}
+		return coordreconcile.Verdict{Decision: coordreconcile.Spawn, Reason: "test spawn"}, nil
+	}
+	prevCurrentOwner := attachCurrentOwnerFnVar
+	attachCurrentOwnerFnVar = func(project string) (coordlock.Owner, bool) {
+		verdict, _ := attachResolveFnVar(project, "")
+		if verdict.Decision != coordreconcile.Attach {
+			return coordlock.Owner{}, false
+		}
+		return verdict.Owner, true
+	}
+	prevNewID := attachNewAgentIDFnVar
+	attachNewAgentIDFnVar = func() string { return "claimtok" }
 	// projectlookup has its own session-probe seams (different
 	// package); the failover paths route through them, so stub both
 	// the cmd/fleet seam (for direct tmux.Attach calls) and the
@@ -154,6 +190,9 @@ func (s *failoverSetup) installStubs(t *testing.T) {
 		sessionProbeFnVar = prevSessionProbe
 		listSessionsFnVar = prevListSessions
 		tmuxAvailableFnVar = prevTmuxAvailable
+		attachResolveFnVar = prevResolve
+		attachCurrentOwnerFnVar = prevCurrentOwner
+		attachNewAgentIDFnVar = prevNewID
 		restorePL()
 	})
 }
@@ -407,7 +446,8 @@ func TestF6_ProjectFlag_StaleCoord_ReapsAndRespawns(t *testing.T) {
 	// stays on disk for dispatch to inherit cwd/engine from. NO gc
 	// invocation here — dispatch archives it after writing the synth
 	// handoff doc.
-	if !strings.Contains(got, "foo: recovered staleeee; spawned newcoord for projects-fleet; attaching") {
+	if !strings.Contains(got, "foo: lease resolved spawn for projects-fleet") ||
+		!strings.Contains(got, "spawned newcoord; attaching") {
 		t.Errorf("F6 stderr: %q", got)
 	}
 	if len(s.gcCalls) != 0 {
@@ -631,8 +671,8 @@ func TestF7b_CrossProjectOrphan_DoesNotReap(t *testing.T) {
 	if strings.Contains(got, "reaped stale otherbbb") {
 		t.Errorf("F7b: must NOT reap cross-project orphan; stderr: %q", got)
 	}
-	if !strings.Contains(got, "no coord for projects-fleet; spawned newcoord") {
-		t.Errorf("F7b: must fall through to spawn-fresh; stderr: %q", got)
+	if !strings.Contains(got, "lease resolved spawn for projects-fleet") {
+		t.Errorf("F7b: must fall through to resolver spawn; stderr: %q", got)
 	}
 	// GC must NOT have fired against projects-fleet — there's nothing
 	// for that project to reap (the orphan isn't ours).
@@ -652,7 +692,8 @@ func TestF8_ProjectFlag_NoCoord_SpawnsFresh(t *testing.T) {
 		t.Fatalf("F8: expected no error, got %v", err)
 	}
 	got := stderr.String()
-	if !strings.Contains(got, "foo: no coord for projects-fleet; spawned newcoord; attaching") {
+	if !strings.Contains(got, "foo: lease resolved spawn for projects-fleet") ||
+		!strings.Contains(got, "spawned newcoord; attaching") {
 		t.Errorf("F8 stderr: %q", got)
 	}
 	if len(s.gcCalls) != 0 {
@@ -675,7 +716,8 @@ func TestF9_TokenMatchesProjectName_AttachesToLiveCoord(t *testing.T) {
 		t.Fatalf("F9: expected no error, got %v", err)
 	}
 	got := stderr.String()
-	if !strings.Contains(got, "projects-fleet: token matched project name; attached to current coord xxxxxxxx") {
+	if !strings.Contains(got, "projects-fleet: token matched project name; resolving coord for projects-fleet via lease") ||
+		!strings.Contains(got, "projects-fleet: attached to current coord xxxxxxxx for projects-fleet") {
 		t.Errorf("F9 stderr: %q", got)
 	}
 }
@@ -858,9 +900,6 @@ func TestF19_StaleLiveRecord_FailsOverToProjectRecovery(t *testing.T) {
 		t.Fatalf("F19: expected no error (must fail over, not dead-end), got %v", err)
 	}
 	got := stderr.String()
-	if !strings.Contains(got, "live record present but tmux session") {
-		t.Errorf("F19 stderr missing stale-live-record failover line: %q", got)
-	}
 	if !strings.Contains(got, "staleabc: attached to current coord xxxxxxxx for projects-fleet") {
 		t.Errorf("F19 stderr missing Tier-3 attached line: %q", got)
 	}
@@ -937,8 +976,8 @@ func TestSystemFailure_CorruptLiveRecord_VetoesTier3(t *testing.T) {
 	if !strings.Contains(err.Error(), "unparseable") || !strings.Contains(err.Error(), "corruptv") {
 		t.Errorf("err must name the bad record IDs: %q", err.Error())
 	}
-	if !strings.Contains(err.Error(), "split-brain") {
-		t.Errorf("err must explain why we refuse to spawn (split-brain risk): %q", err.Error())
+	if !strings.Contains(err.Error(), "orphan cleanup failed") {
+		t.Errorf("err must explain the pre-spawn cleanup refusal: %q", err.Error())
 	}
 	if ec := ExitCodeFor(err); ec != 70 {
 		t.Errorf("ExitCodeFor(corrupt live record): got %d want 70", ec)
@@ -1084,8 +1123,8 @@ func TestTier12_AttachRaceCoord_FailsOverToTier3(t *testing.T) {
 		t.Fatalf("expected Tier 3 to recover the race, got %v", err)
 	}
 	got := stderr.String()
-	if !strings.Contains(got, "died between probe and attach") {
-		t.Errorf("stderr must surface the race fallover: %q", got)
+	if !strings.Contains(got, "lease resolved spawn for projects-fleet") {
+		t.Errorf("stderr must surface resolver spawn after attach race: %q", got)
 	}
 	// Tier 3 Path C should fire: StaleCoordRecord (probe says dead) →
 	// dispatch (no pre-archive after iter-8) → spawn fresh → attach.
@@ -1250,8 +1289,8 @@ func TestF20_EmptySessionCoord_RoutesToPathD(t *testing.T) {
 		t.Fatalf("F20: expected no error, got %v", err)
 	}
 	got := stderr.String()
-	if !strings.Contains(got, "foo: no coord for projects-fleet; spawned newcoord; attaching") {
-		t.Errorf("F20: want Path-D wording, got %q", got)
+	if !strings.Contains(got, "foo: lease resolved spawn for projects-fleet") {
+		t.Errorf("F20: want resolver spawn wording, got %q", got)
 	}
 	if strings.Contains(got, "reaped stale") || strings.Contains(got, "recovered emptyse5") {
 		t.Errorf("F20: must NOT print a bogus reap/recover line for empty-session record; got %q", got)
@@ -1398,8 +1437,8 @@ func TestF26_PathB_StaleLockBody_DoesNotKill(t *testing.T) {
 		t.Fatalf("F26: expected no error (spawn-fresh proceeds), got %v", err)
 	}
 	got := stderr.String()
-	if !strings.Contains(got, "foo: stale lock-body coord 1ace0b0d (session dead); spawned newcoord for projects-fleet; attaching") {
-		t.Errorf("F26: want Path-B wording, got %q", got)
+	if !strings.Contains(got, "foo: lease resolved spawn for projects-fleet") {
+		t.Errorf("F26: want resolver spawn wording, got %q", got)
 	}
 	if len(s.killedSessions) != 0 {
 		t.Errorf("F26: must NOT kill; got %v", s.killedSessions)

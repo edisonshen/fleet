@@ -1,8 +1,10 @@
 package main
 
 // coord_owner.go — `fleet coord-owner --project <p> [--json]`. A thin READ-ONLY
-// window onto the coordinator LEASE identity for the skill-side Python tick
-// (skills/coordinator/loop.py).
+// diagnostics window onto the coordinator LEASE identity for the skill-side
+// Python tick (skills/coordinator/loop.py). It is NOT an attach source of truth:
+// CLI/TUI attach must call coordreconcile.Resolve, which understands starting,
+// fencing, handoff reservations, and claim tokens atomically.
 //
 // WHY THIS EXISTS: the coord-spawn marker used to be Python's identity reader —
 // `_read_coord_spawn_marker(project_dir) == coord_id` answered "is THIS session
@@ -56,7 +58,8 @@ func newCoordOwnerCmd() *cobra.Command {
 			"TTL-gated active owner (owner_id), and any in-flight handoff " +
 			"successor reservation (handoff_successor_id). Each is empty when the " +
 			"lease has no such state (free lease / no reservation / unsupported " +
-			"platform). Read-only; never mutates the lease.",
+			"platform). Read-only; never mutates the lease. Diagnostics only; " +
+			"attach paths use coordreconcile.Resolve instead.",
 		SilenceUsage:  true,
 		SilenceErrors: true,
 		RunE: func(cmd *cobra.Command, _ []string) error {

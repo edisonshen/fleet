@@ -12,10 +12,13 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/spf13/cobra"
 
 	"github.com/edisonshen/fleet/internal/agent"
+	"github.com/edisonshen/fleet/internal/coordlock"
+	"github.com/edisonshen/fleet/internal/coordreconcile"
 	"github.com/edisonshen/fleet/internal/coordrepo"
 	"github.com/edisonshen/fleet/internal/fleetlog"
 	"github.com/edisonshen/fleet/internal/projectlookup"
@@ -107,13 +110,20 @@ Exit codes:
 // substitute stdin/stdout/stderr + the cwd derivation; production
 // wires real os.Stdin / cmd.OutOrStdout / git-toplevel.
 type AttachOpts struct {
-	Project     string    // --project flag value (may be empty)
-	CwdBasename string    // git-toplevel basename (may be empty)
-	IsTty       bool      // is stdin a tty? gates the picker
-	Stdin       io.Reader // picker input
-	Stdout      io.Writer // picker prompt + numbered list
-	Stderr      io.Writer // every failover diagnostic
+	Project             string        // --project flag value (may be empty)
+	CwdBasename         string        // git-toplevel basename (may be empty)
+	IsTty               bool          // is stdin a tty? gates the picker
+	Stdin               io.Reader     // picker input
+	Stdout              io.Writer     // picker prompt + numbered list
+	Stderr              io.Writer     // every failover diagnostic
+	ResolveWaitInterval time.Duration // zero with ResolveMaxAttempts set means no sleep (tests)
+	ResolveMaxAttempts  int           // zero uses the production default
 }
+
+const (
+	defaultAttachResolveWaitInterval = time.Second
+	defaultAttachResolveMaxAttempts  = 30
+)
 
 // UsageError signals "non-interactive shell with no derivable project."
 // Distinct from system errors so the cobra wrapper can exit with the
@@ -177,6 +187,18 @@ func runAttachFailover(token string, opts AttachOpts) error {
 	// THROUGH to Tier 3 with the appropriate diagnostic on stderr.
 	rec, hops, rerr := agent.ResolveChain(token)
 	if rerr == nil {
+		if project, ok := coordTargetProject(rec); ok {
+			if hops > 0 {
+				hopWord := "hops"
+				if hops == 1 {
+					hopWord = "hop"
+				}
+				_, _ = fmt.Fprintf(opts.Stderr,
+					"%s handed off → %s (rotated through %d %s); resolving current coord for %s via lease\n",
+					token, rec.ID, hops, hopWord, project)
+			}
+			return resolveAndAttachCoord(token, project, opts)
+		}
 		session := rec.TmuxSession
 		if session == "" {
 			session = tmux.SessionName(rec.ID)
@@ -395,139 +417,171 @@ func tier3ProjectRecovery(token string, tier2err error, opts AttachOpts) error {
 	// which project the resolver bound.
 	emitDerivationLine(token, project, src, opts.Stderr)
 
-	// Codex review iter-5 P2: use the strict lister. agent.List silently
-	// skips unparseable JSON, which here could mean the project's actual
-	// live coord becomes invisible — Path A misses, Path D spawns a
-	// replacement, and we end up with split-brain (operator's "coord"
-	// in the dashboard is the new spawn while the unparseable one keeps
-	// running off the side). Same split-brain veto pattern dispatch
-	// --coord-spawn applies via ListStrict.
+	if src == derivTokenAsProject {
+		_, _ = fmt.Fprintf(opts.Stderr,
+			"%s: token matched project name; resolving coord for %s via lease\n",
+			token, project)
+	}
+	return resolveAndAttachCoord(token, project, opts)
+}
+
+func coordTargetProject(rec *agent.Record) (string, bool) {
+	if rec == nil || rec.Project == "" {
+		return "", false
+	}
+	if rec.IsCoord || rec.TaskID == projectlookup.CoordTaskID(rec.Project) {
+		return rec.Project, true
+	}
+	return "", false
+}
+
+func resolveAndAttachCoord(token, project string, opts AttachOpts) error {
+	if err := tmuxAvailableFnVar(); err != nil {
+		return newSystemError(127, fmt.Sprintf(
+			"tmux not available: %v — install tmux (https://github.com/tmux/tmux) and ensure it is on PATH",
+			err))
+	}
+	agentID := attachNewAgentIDFnVar()
+	if agentID == "" {
+		return newSystemError(70, fmt.Sprintf(
+			"cannot preallocate a coord id for project %s — re-run `fleet attach %s --project %s` to retry",
+			project, token, project))
+	}
+	interval, attempts := attachResolvePolicy(opts)
+	for {
+		verdict, err := attachResolveFnVar(project, agentID)
+		if err != nil {
+			return newSystemError(70, fmt.Sprintf(
+				"%s: cannot resolve coordinator lease for %s: %v — re-run `fleet attach %s --project %s`; if it persists, run `fleet doctor` and inspect ~/.fleet/projects/%s/.locks/",
+				token, project, err, token, project, project))
+		}
+		if verdict.Decision != coordreconcile.Wait {
+			return consumeResolvedCoord(token, project, opts, verdict)
+		}
+		if attempts <= 0 {
+			return newSystemError(dispatchVetoExitCode, fmt.Sprintf(
+				"%s: coord for %s is still not attachable after bounded lease wait (%s: %s). Re-run `fleet attach %s --project %s`; if it persists, check `fleet status` / FLEET_TMUX_SOCKET or run `fleet doctor`",
+				token, project, verdict.Decision, verdict.Reason, token, project))
+		}
+		if interval > 0 {
+			time.Sleep(interval)
+		}
+		attempts--
+	}
+}
+
+func attachResolvePolicy(opts AttachOpts) (time.Duration, int) {
+	attempts := opts.ResolveMaxAttempts
+	if attempts <= 0 {
+		attempts = defaultAttachResolveMaxAttempts
+	}
+	interval := opts.ResolveWaitInterval
+	if interval == 0 && opts.ResolveMaxAttempts == 0 {
+		interval = defaultAttachResolveWaitInterval
+	}
+	if interval < 0 {
+		interval = 0
+	}
+	return interval, attempts
+}
+
+func consumeResolvedCoord(token, project string, opts AttachOpts, verdict coordreconcile.Verdict) error {
+	switch verdict.Decision {
+	case coordreconcile.Attach:
+		return attachResolvedOwner(token, project, opts, verdict)
+	case coordreconcile.Spawn:
+		killedID, err := killCollidingOrphanTmux(project)
+		if err != nil {
+			return newSystemError(70, fmt.Sprintf(
+				"%s: lease resolved Spawn for %s but pre-spawn orphan cleanup failed: %v — re-run `fleet attach %s --project %s`; the temporary starting claim will self-heal after its TTL",
+				token, project, err, token, project))
+		}
+		return spawnAndAttachRecovered(token, project, opts,
+			func(stderr io.Writer, res coordSpawnResult) {
+				if killedID != "" {
+					_, _ = fmt.Fprintf(stderr,
+						"%s: reaped stale %s (live orphan session); spawned %s for %s; attaching\n",
+						token, killedID, res.ID, project)
+					return
+				}
+				_, _ = fmt.Fprintf(stderr,
+					"%s: lease resolved spawn for %s (%s); spawned %s; attaching\n",
+					token, project, verdict.Reason, res.ID)
+			})
+	case coordreconcile.SpawnStandby:
+		return spawnAndAttachRecovered(token, project, opts,
+			func(stderr io.Writer, res coordSpawnResult) {
+				_, _ = fmt.Fprintf(stderr,
+					"%s: lease resolved standby for %s (%s); spawned %s; attaching\n",
+					token, project, verdict.Reason, res.ID)
+			})
+	case coordreconcile.Wait:
+		return newSystemError(dispatchVetoExitCode, fmt.Sprintf(
+			"%s: coord for %s still waiting (%s) — re-run `fleet attach %s --project %s` shortly",
+			token, project, verdict.Reason, token, project))
+	default:
+		return newSystemError(70, fmt.Sprintf(
+			"%s: coord resolver returned unknown decision %s for %s — re-run `fleet attach %s --project %s`; if it persists, run `fleet doctor`",
+			token, verdict.Decision, project, token, project))
+	}
+}
+
+func attachResolvedOwner(token, project string, opts AttachOpts, verdict coordreconcile.Verdict) error {
+	ownerID := verdict.Owner.AgentID
+	if ownerID == "" {
+		return newSystemError(dispatchVetoExitCode, fmt.Sprintf(
+			"%s: coord lease for %s resolved an empty owner id — re-run `fleet attach %s --project %s` shortly",
+			token, project, token, project))
+	}
+	rec, err := agent.Load(ownerID)
+	if err != nil {
+		return newSystemError(dispatchVetoExitCode, fmt.Sprintf(
+			"%s: coord lease for %s is held by %s but its agent record is not readable (%v). Do not respawn beside a process-live owner; check `fleet status` / FLEET_TMUX_SOCKET, then re-run `fleet attach %s --project %s`",
+			token, project, ownerID, err, token, project))
+	}
+	session := rec.TmuxSession
+	if session == "" {
+		session = tmux.SessionName(rec.ID)
+	}
+	alive, probeErr := sessionProbeFnVar(session)
+	if probeErr != nil {
+		return newSystemError(dispatchVetoExitCode, fmt.Sprintf(
+			"%s: coord %s for %s is process-live but tmux session %s is unreachable (%v). Do not respawn beside it; check FLEET_TMUX_SOCKET / `fleet status`, then re-run `fleet attach %s --project %s`",
+			token, ownerID, project, session, probeErr, token, project))
+	}
+	if !alive {
+		return newSystemError(dispatchVetoExitCode, fmt.Sprintf(
+			"%s: coord %s for %s is process-live in the lease but tmux session %s is gone. Do not respawn beside it; run `fleet doctor` or inspect `fleet status`, then re-run `fleet attach %s --project %s`",
+			token, ownerID, project, session, token, project))
+	}
+	if _, ok := attachCurrentOwnerFnVar(project); !ok {
+		_, _ = fmt.Fprintf(opts.Stderr,
+			"warning: coord %s for %s is process-live but lease heartbeat is stale; attaching anyway. If it is hung, run `fleet doctor`.\n",
+			ownerID, project)
+	}
+	_, _ = fmt.Fprintf(opts.Stderr,
+		"%s: attached to current coord %s for %s\n",
+		token, ownerID, project)
+	return attachExistingCoord(token, project, ownerID, session)
+}
+
+func killCollidingOrphanTmux(project string) (string, error) {
 	records, badIDs, err := agent.ListStrict()
 	if err != nil {
-		return newSystemError(70, fmt.Sprintf(
-			"agent.ListStrict failed: %v — check ~/.fleet/agents/ readability", err))
+		return "", fmt.Errorf("agent.ListStrict failed: %w", err)
 	}
 	if len(badIDs) > 0 {
-		return newSystemError(70, fmt.Sprintf(
-			"agent listing has %d unparseable record(s) %v — refusing Tier 3 recovery (a corrupt record may be %s's live coord; spawning a replacement would split-brain). Inspect ~/.fleet/agents/<id>.json for each bad ID, fix or rm, then retry attach",
-			len(badIDs), badIDs, project))
+		return "", fmt.Errorf("%d unparseable agent record(s) %v; refusing orphan cleanup before spawn", len(badIDs), badIDs)
 	}
-
-	// Path A: live coord exists → attach (no spawn, no reap).
-	if rec, ok := projectlookup.FindLiveCoord(records, project); ok {
-		// F9 specifically requires the "token matched project name"
-		// surface when the source was tokenAsProject. Other sources
-		// share the "attached to current coord" wording.
-		if src == derivTokenAsProject {
-			_, _ = fmt.Fprintf(opts.Stderr,
-				"%s: token matched project name; attached to current coord %s for %s\n",
-				token, rec.ID, project)
-		} else {
-			_, _ = fmt.Fprintf(opts.Stderr,
-				"%s: attached to current coord %s for %s\n",
-				token, rec.ID, project)
-		}
-		session := rec.TmuxSession
-		if session == "" {
-			session = tmux.SessionName(rec.ID)
-		}
-		return attachExistingCoord(token, project, rec.ID, session)
+	id, ok := projectlookup.OrphanTmuxForProject(records, project)
+	if !ok {
+		return "", nil
 	}
-	// Path B: try lock-body fallback (issue #63 follow-on: marker may
-	// be absent on a prompt-delivery-failed dispatch; the lock body is
-	// still authoritative).
-	if rec, ok := projectlookup.FindCoordByLockBody(records, project); ok {
-		_, _ = fmt.Fprintf(opts.Stderr,
-			"%s: attached to current coord %s for %s\n",
-			token, rec.ID, project)
-		session := rec.TmuxSession
-		if session == "" {
-			session = tmux.SessionName(rec.ID)
-		}
-		return attachExistingCoord(token, project, rec.ID, session)
+	session := tmux.SessionName(id)
+	if err := killTmuxSessionFnVar(session); err != nil {
+		return "", fmt.Errorf("tmux kill-session %s failed: %w; re-run `tmux kill-session -t %s` manually then retry attach", session, err, session)
 	}
-	// Three recovery classes, in priority order. The KILL decision is
-	// the load-bearing safety split (attach-failover MAJOR / F26 / F27):
-	//
-	//   Path C   StaleCoordRecord     tagged record (task_id=coord-<p>),
-	//            (recover, NO kill)   session DEFINITIVELY dead. dispatch's
-	//                                 findRecoveryCandidate inherits its
-	//                                 cwd/engine — so we DON'T pre-reap.
-	//                                 Verb "recovered".
-	//   Path B   StaleLockBodyCoord   lock-body holder record, session
-	//            (spawn, NO kill)     PROVEN dead. The session is already
-	//                                 dead → calling tmux kill-session on
-	//                                 it can ERROR and turn recovery into
-	//                                 a false exit 70. So Path B must NOT
-	//                                 kill. dispatch's recovery won't match
-	//                                 an untagged lock-body record, so it's
-	//                                 a fresh spawn; the dead record stays
-	//                                 on disk for the operator. Verb
-	//                                 "stale lock-body coord X (session
-	//                                 dead)".
-	//   Path C'  OrphanTmuxForProject a LIVE leftover fleet-<id> session
-	//            (KILL, then spawn)   with no record (project-scoped via
-	//                                 the archive guard). It's genuinely
-	//                                 alive and would COLLIDE with the new
-	//                                 coord's session name → kill that one
-	//                                 session first. Kill-failure here is a
-	//                                 real failure (exit 70). Verb "reaped
-	//                                 stale X (live orphan session)".
-	//
-	// Reap discipline (codex iter-5 P1): kills are surgical single-session
-	// tmux.Kill, never `fleet gc --aggressive` (whose orphan-tmux pass is
-	// NOT project-scoped and could nuke other projects' sessions).
-	if stale, ok := projectlookup.StaleCoordRecord(records, project); ok {
-		// Path C: recover, no kill, no pre-archive (codex iter-8 P1 —
-		// dispatch needs the live record on disk to synth the handoff
-		// doc that inherits cwd/engine/command).
-		return spawnAndAttachRecovered(token, project, opts,
-			func(stderr io.Writer, res coordSpawnResult) {
-				_, _ = fmt.Fprintf(stderr,
-					"%s: recovered %s; spawned %s for %s; attaching\n",
-					token, stale.ID, res.ID, project)
-			})
-	}
-	if stale, ok := projectlookup.StaleLockBodyCoord(records, project); ok {
-		// Path B: PROVEN-dead lock-body coord. Do NOT kill its session —
-		// it's already dead and killing a dead session can error → false
-		// exit 70 (attach-failover MAJOR / F26). Spawn fresh; the dead
-		// record stays on disk for the operator to archive manually
-		// (dispatch's findRecoveryCandidate won't match an untagged
-		// lock-body record, so there's no recovery context to preserve
-		// — but there's also nothing to kill).
-		return spawnAndAttachRecovered(token, project, opts,
-			func(stderr io.Writer, res coordSpawnResult) {
-				_, _ = fmt.Fprintf(stderr,
-					"%s: stale lock-body coord %s (session dead); spawned %s for %s; attaching\n",
-					token, stale.ID, res.ID, project)
-			})
-	}
-	if id, ok := projectlookup.OrphanTmuxForProject(records, project); ok {
-		// Path C': LIVE orphan session, no record. Kill that one session
-		// first so the new coord's fleet-<newID> doesn't collide in
-		// tmux's session list. Kill-failure IS a real failure here
-		// (exit 70) — the session is live, so the kill should succeed;
-		// if it doesn't, spawning over it would split-brain tmux.
-		if err := killTmuxSessionFnVar(tmux.SessionName(id)); err != nil {
-			return newSystemError(70, fmt.Sprintf(
-				"tmux kill-session %s failed: %v — re-run `tmux kill-session -t %s` manually then retry attach",
-				tmux.SessionName(id), err, tmux.SessionName(id)))
-		}
-		return spawnAndAttachRecovered(token, project, opts,
-			func(stderr io.Writer, res coordSpawnResult) {
-				_, _ = fmt.Fprintf(stderr,
-					"%s: reaped stale %s (live orphan session); spawned %s for %s; attaching\n",
-					token, id, res.ID, project)
-			})
-	}
-	// Path D: no coord at all → spawn fresh.
-	return spawnAndAttachRecovered(token, project, opts,
-		func(stderr io.Writer, res coordSpawnResult) {
-			_, _ = fmt.Fprintf(stderr,
-				"%s: no coord for %s; spawned %s; attaching\n",
-				token, project, res.ID)
-		})
+	return id, nil
 }
 
 // spawnAndAttachRecovered is the SHARED coord-spawn wrapper for Tier 3
@@ -579,41 +633,19 @@ func spawnAndAttachRecovered(token, project string, opts AttachOpts, emitSuccess
 //	else            → stderr wait-and-retry naming BOTH causes + the
 //	                  cross-socket next step → *SystemError(75).
 func handleCoordSpawnVeto(token, project string, opts AttachOpts) error {
-	// Scan-only re-resolve: re-read records + probe for a live coord.
-	// ListStrict (not List) so an unparseable record that might BE the
-	// vetoing coord doesn't silently vanish into a Path-D-style respawn
-	// — but here we never spawn anyway, so a list error just degrades to
-	// the wait-retry message rather than masking a live coord.
-	records, _, lerr := agent.ListStrict()
-	if lerr == nil {
-		if rec, ok := projectlookup.FindLiveCoord(records, project); ok {
-			_, _ = fmt.Fprintf(opts.Stderr,
-				"%s: attached to current coord %s for %s\n",
-				token, rec.ID, project)
-			session := rec.TmuxSession
-			if session == "" {
-				session = tmux.SessionName(rec.ID)
-			}
-			return attachExistingCoord(token, project, rec.ID, session)
-		}
-		// Lock-body fallback: the marker may be absent on a prompt-
-		// delivery-failed dispatch, but a live coord's ID can still be in
-		// the lock body. Same Path-B treatment as the primary resolve.
-		if rec, ok := projectlookup.FindCoordByLockBody(records, project); ok {
-			_, _ = fmt.Fprintf(opts.Stderr,
-				"%s: attached to current coord %s for %s\n",
-				token, rec.ID, project)
-			session := rec.TmuxSession
-			if session == "" {
-				session = tmux.SessionName(rec.ID)
-			}
-			return attachExistingCoord(token, project, rec.ID, session)
-		}
+	verdict, err := attachResolveFnVar(project, "")
+	if err == nil && verdict.Decision == coordreconcile.Attach {
+		return attachResolvedOwner(token, project, opts, verdict)
 	}
-	// No live coord on re-resolve → wait-and-retry. Exit 75 (not 70):
-	// 75 means "something is alive/restarting elsewhere — don't pile on,
-	// re-run shortly (or check your socket)". Name BOTH veto causes per
-	// the plan's F21 contract + the cross-socket next-step command.
+	if err != nil {
+		_, _ = fmt.Fprintf(opts.Stderr,
+			"%s: coord-spawn vetoed for %s; lease re-resolve failed: %v\n",
+			token, project, err)
+	} else {
+		_, _ = fmt.Fprintf(opts.Stderr,
+			"%s: coord-spawn vetoed for %s; lease re-resolve returned %s (%s)\n",
+			token, project, verdict.Decision, verdict.Reason)
+	}
 	return newSystemError(dispatchVetoExitCode, fmt.Sprintf(
 		"%s: coord-spawn for %s vetoed — likely (1) a live coord on a different tmux socket, or (2) a coord crashed within the freshness window and is restarting. "+
 			"Re-run `fleet attach %s --project %s` shortly; if it persists, check `fleet status` / your FLEET_TMUX_SOCKET for a coord on another socket",
@@ -647,17 +679,15 @@ func emitPromptDeliveryWarning(res coordSpawnResult, stderr io.Writer) {
 // — a flaky tmux socket shouldn't force a re-spawn loop when the real
 // session may well be live. Same discipline as runAttachFailover's Tier
 // 1/2 stale-live-record gate (codex review iter-1 P1).
-// attachExistingCoord wraps tmux.Attach for Tier 3 Path A (FindLiveCoord)
-// and Path B (FindCoordByLockBody) attachments. Codex review iter-12 P2:
-// a live coord can die between the FindLiveCoord probe and the actual
-// tmux.Attach exec, leaving the operator on the generic exit-1 path
-// instead of the Tier 3 retry diagnostic.
+// attachExistingCoord wraps tmux.Attach for a Resolve Attach verdict.
+// A live coord can die between the holder probe and the actual tmux.Attach
+// exec, leaving the operator on the generic exit-1 path instead of the
+// Tier 3 retry diagnostic.
 //
 // Symmetric to attachSpawnedSession but the retry advice differs:
 // existing-coord races mean dispatch isn't needed; the operator just
-// re-runs attach and Tier 3 picks a different recovery path (lock-body
-// fallback, stale reap, fresh spawn). retry shape is just
-// `fleet attach <token> --project <p>`.
+// re-runs attach and Resolve picks the current lease verdict. Retry shape
+// is just `fleet attach <token> --project <p>`.
 func attachExistingCoord(token, project, coordID, session string) error {
 	if err := attachFnVar(session); err != nil {
 		return newSystemError(70, fmt.Sprintf(
@@ -869,14 +899,19 @@ func filterValidNames(names []string) []string {
 // test seams. Production binds them at init time to the real tmux /
 // CLI shell-outs.
 var (
-	attachFnVar          = tmux.Attach
-	sessionAliveFnVar    = tmux.HasSession
-	sessionProbeFnVar    = tmux.SessionAlive
-	listSessionsFnVar    = tmux.ListSessions
-	tmuxAvailableFnVar   = tmux.Available
-	coordSpawnFnVar      = shellCoordSpawnID // backward-compat thin wrapper for existing test stubs
-	coordSpawnFullFnVar  = shellCoordSpawn   // codex iter-14 P2: carries promptDelivered through to attach diagnostic
-	killTmuxSessionFnVar = tmux.Kill
+	attachFnVar             = tmux.Attach
+	sessionAliveFnVar       = tmux.HasSession
+	sessionProbeFnVar       = tmux.SessionAlive
+	listSessionsFnVar       = tmux.ListSessions
+	tmuxAvailableFnVar      = tmux.Available
+	coordSpawnFnVar         = shellCoordSpawnID // backward-compat thin wrapper for existing test stubs
+	coordSpawnFullFnVar     = shellCoordSpawn   // codex iter-14 P2: carries promptDelivered through to attach diagnostic
+	killTmuxSessionFnVar    = tmux.Kill
+	attachNewAgentIDFnVar   = agent.NewID
+	attachCurrentOwnerFnVar = coordlock.CurrentOwner
+	attachResolveFnVar      = func(project, agentID string) (coordreconcile.Verdict, error) {
+		return coordreconcile.Resolve(coordreconcile.DefaultDeps(), project, agentID)
+	}
 )
 
 // shellCoordSpawnID is the legacy (string, error) shim around
