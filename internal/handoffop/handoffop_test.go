@@ -15,6 +15,7 @@ import (
 	"github.com/edisonshen/fleet/internal/coordlock"
 	"github.com/edisonshen/fleet/internal/handoffdelivery"
 	"github.com/edisonshen/fleet/internal/queue"
+	"github.com/edisonshen/fleet/internal/rc"
 	"github.com/edisonshen/fleet/internal/spawn"
 	"github.com/edisonshen/fleet/internal/state"
 	"github.com/edisonshen/fleet/internal/testutil/tmuxfake"
@@ -229,6 +230,34 @@ func spawnSeedCoord(t *testing.T, project, wrongCwd string) *agent.Record {
 	rec.LastActivityTS = now
 	rec.Cwd = wrongCwd
 	rec.Command = []string{"sleep", "60"}
+	rec.TmuxSession = tmux.SessionName(rec.ID)
+	if err := tmux.Spawn(rec.TmuxSession, rec.Cwd, rec.Command,
+		[]string{"FLEET_AGENT_ID=" + rec.ID}); err != nil {
+		t.Fatalf("tmux.Spawn: %v", err)
+	}
+	if err := rec.Write(); err != nil {
+		_ = tmux.Kill(rec.TmuxSession)
+		t.Fatalf("agent.Write: %v", err)
+	}
+	t.Cleanup(func() { _ = tmux.Kill(rec.TmuxSession) })
+	return rec
+}
+
+// spawnSeedCoordWithCommand is spawnSeedCoord with a caller-supplied command
+// (e.g. the shell-wrapped `sh -c "claude ..."` shape the RC injector rewrites),
+// used to prove the coord-drain replacement carries --remote-control. The
+// default spawnSeedCoord command (`sleep 60`) does NOT match the injector's
+// wrapper shape, so it cannot exercise the positive RC path.
+func spawnSeedCoordWithCommand(t *testing.T, project, cwd string, command []string) *agent.Record {
+	t.Helper()
+	now := time.Now().UTC()
+	rec := agent.New(agent.NewID())
+	rec.TaskID = "coord-" + project
+	rec.Project = project
+	rec.SpawnedAt = now
+	rec.LastActivityTS = now
+	rec.Cwd = cwd
+	rec.Command = append([]string(nil), command...)
 	rec.TmuxSession = tmux.SessionName(rec.ID)
 	if err := tmux.Spawn(rec.TmuxSession, rec.Cwd, rec.Command,
 		[]string{"FLEET_AGENT_ID=" + rec.ID}); err != nil {
@@ -1338,6 +1367,73 @@ func TestDrain_WorkerHandoff_NeverCarriesRemoteControl(t *testing.T) {
 		if strings.Contains(el, "--remote-control") {
 			t.Fatalf("persisted Command must stay clean; argv=%v", newRec.Command)
 		}
+	}
+}
+
+// TestResume_CoordDrain_ReplacementCarriesRemoteControl is plan test T4: a
+// COORD drain that flows through Resume → spawnAndRetire (the production entry
+// point T4 names) must produce a replacement whose per-spawn exec argv carries
+// --remote-control. It is the POSITIVE coord counterpart to
+// TestDrain_WorkerHandoff_NeverCarriesRemoteControl (the worker carve-out): RC
+// injection is centralized in spawn.Spawn, so a coord successor inherits it
+// while a worker never does.
+//
+// Mirrors cmd/fleet TestProductionRecoverSpawn_CoordGetsCentralRemoteControl —
+// same tmuxfake.SessionCommand capture — but drives the drain/Resume entry
+// point instead of productionRecoverSpawn. The spawn.CoordRCInjector seam is
+// nil in the handoffop test binary (cmd/fleet's init() never runs here), so the
+// test wires it exactly as wireCoordRCInjector does — through the real rc gate
+// (rc.GateAttachFlag: env-gate + rc-disabled marker + spawn.InjectRemoteControlFlag).
+func TestResume_CoordDrain_ReplacementCarriesRemoteControl(t *testing.T) {
+	fakeTmux := requireFakeTmux(t) // recognized fake isolation marker for lint-test-isolation.sh
+	setupFleetHome(t)
+	t.Setenv("FLEET_RC_BOOTSTRAP_DISABLED", "")
+
+	prevInjector := spawn.CoordRCInjector
+	spawn.CoordRCInjector = func(project, agentID string, argv []string) []string {
+		return rc.GateAttachFlag(project, argv,
+			spawn.CoordRemoteControlSessionName(agentID, project))
+	}
+	t.Cleanup(func() { spawn.CoordRCInjector = prevInjector })
+
+	const project = "rainier"
+	seedCoordRepoMeta(t, project) // resolver binding for the coord drain (+ rc.Enabled project dir)
+
+	// Shell-wrapped claude Command — the shape the RC injector rewrites.
+	oldRec := spawnSeedCoordWithCommand(t, project, t.TempDir(),
+		[]string{"sh", "-c", "claude --dangerously-skip-permissions; cat"})
+	req, qp := writeCoordSkillQueue(t, oldRec)
+
+	out := &bytes.Buffer{}
+	if err := Resume(req, qp, 1, out, out); err != nil {
+		t.Fatalf("Resume: %v\n%s", err, out.String())
+	}
+	t.Cleanup(func() { _ = tmux.Kill(tmux.SessionName(req.NewAgentID)) })
+
+	// The replacement coord's captured exec argv must carry --remote-control
+	// with the canonical coord session name. SessionCommand returns whatever
+	// spawn.Spawn handed tmux (coord-run-wrapped or raw); either way the inner
+	// claude carries exactly one RC flag.
+	execArgv := fakeTmux.SessionCommand(tmux.SessionName(req.NewAgentID))
+	if execArgv == nil {
+		t.Fatalf("no session captured for replacement %s", req.NewAgentID)
+	}
+	joined := strings.Join(execArgv, " ")
+	want := `--remote-control "` +
+		spawn.CoordRemoteControlSessionName(req.NewAgentID, project) + `"`
+	if !strings.Contains(joined, want) {
+		t.Fatalf("coord drain replacement exec argv missing %q; got: %v", want, execArgv)
+	}
+
+	// Persisted Command stays clean — the flag rides only on the per-spawn exec
+	// argv, never the record (a stale flag would poison the next handoff's
+	// session name). Mirrors the mirror test's lineage check.
+	newRec, err := agent.Load(req.NewAgentID)
+	if err != nil {
+		t.Fatalf("load replacement record: %v", err)
+	}
+	if strings.Contains(strings.Join(newRec.Command, " "), "--remote-control") {
+		t.Fatalf("persisted Command must stay clean; got %v", newRec.Command)
 	}
 }
 

@@ -11,7 +11,7 @@ import (
 // TestMain is the package-shared test entrypoint for cmd/fleet.
 //
 // Sets FLEET_RC_BOOTSTRAP_DISABLED=1 BEFORE any test runs so that the
-// cmd/fleet wrapper `injectRemoteControlFlag` (and through it the
+// cmd/fleet wrapper `spawn.CoordRCInjector` (and through it the
 // coord-spawn + handoff replacement paths) returns the input command
 // unchanged. Without this gate, tests that exercise runDispatch /
 // runHandoff with the default claude wrapper would spawn a real

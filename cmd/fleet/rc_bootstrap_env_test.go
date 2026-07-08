@@ -24,7 +24,7 @@ func enableRCBootstrapForTest(t *testing.T) {
 
 // TestRCBootstrap_Disabled_OmitsListenerSpawn pins the regression for
 // rc-listener-bootstrap-sk-3e98: when FLEET_RC_BOOTSTRAP_DISABLED=1 is
-// set in the process env, the cmd/fleet wrapper `injectRemoteControlFlag`
+// set in the process env, the cmd/fleet wrapper `spawn.CoordRCInjector`
 // MUST return the input command unchanged — no `--remote-control` flag
 // injected. The wrapper is the single gate point for the three cmd/fleet
 // call sites (dispatch coord-spawn, dispatch recovery, handoff
@@ -62,12 +62,12 @@ func TestRCBootstrap_Disabled_OmitsListenerSpawn(t *testing.T) {
 	// contain `--remote-control` (the substring the relaxed matcher
 	// would have inserted).
 	if len(got) != len(input) {
-		t.Fatalf("injectRemoteControlFlag with env-disabled returned len=%d, want %d (slice should be unchanged): got=%v",
+		t.Fatalf("spawn.CoordRCInjector with env-disabled returned len=%d, want %d (slice should be unchanged): got=%v",
 			len(got), len(input), got)
 	}
 	for i := range got {
 		if got[i] != input[i] {
-			t.Errorf("injectRemoteControlFlag[%d] = %q, want %q (env-disabled must return slice unchanged)",
+			t.Errorf("spawn.CoordRCInjector[%d] = %q, want %q (env-disabled must return slice unchanged)",
 				i, got[i], input[i])
 		}
 	}
@@ -77,7 +77,7 @@ func TestRCBootstrap_Disabled_OmitsListenerSpawn(t *testing.T) {
 }
 
 // TestRCBootstrap_Enabled_EmitsListenerSpawn is the positive branch:
-// with the env var cleared, `injectRemoteControlFlag` rewrites the
+// with the env var cleared, `spawn.CoordRCInjector` rewrites the
 // wrapper body to inject `--remote-control "<sessionName>"` (production
 // behaviour). This pins that the env-gate is opt-in and does NOT
 // regress the default rewrite behaviour relied on by coord and handoff
@@ -91,7 +91,7 @@ func TestRCBootstrap_Enabled_EmitsListenerSpawn(t *testing.T) {
 	got := spawn.CoordRCInjector("rainier", "deadbeef", input)
 
 	if len(got) != 3 {
-		t.Fatalf("injectRemoteControlFlag returned len=%d, want 3: got=%v", len(got), got)
+		t.Fatalf("spawn.CoordRCInjector returned len=%d, want 3: got=%v", len(got), got)
 	}
 	if got[0] != "sh" || got[1] != "-c" {
 		t.Errorf("argv[0:2] mutated: got=%v, want sh -c prefix", got[:2])

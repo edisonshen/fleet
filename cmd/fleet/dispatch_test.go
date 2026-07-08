@@ -559,7 +559,7 @@ func TestInjectRemoteControlFlag_StrictShapeMatch(t *testing.T) {
 // TestDefaultClaudeWrapperScript_MatchesFlagDefault pins the
 // byte-equality between the defaultClaudeWrapperScript constant and
 // the actual --command default registered by newDispatchCmd. The
-// strict-shape match in injectRemoteControlFlag (codex review #73
+// strict-shape match in spawn.InjectRemoteControlFlag (codex review #73
 // iter-3 P2) depends on this equality — drift would silently disable
 // the rewrite for legitimate fresh dispatches.
 func TestDefaultClaudeWrapperScript_MatchesFlagDefault(t *testing.T) {
@@ -578,7 +578,7 @@ func TestDefaultClaudeWrapperScript_MatchesFlagDefault(t *testing.T) {
 	}
 	if parts[2] != defaultClaudeWrapperScript {
 		t.Errorf("--command default's script element drifted from defaultClaudeWrapperScript "+
-			"— the strict-shape match in injectRemoteControlFlag would silently no-op for "+
+			"— the strict-shape match in spawn.InjectRemoteControlFlag would silently no-op for "+
 			"legitimate fresh dispatches.\n\ngot:  %q\nwant: %q",
 			parts[2], defaultClaudeWrapperScript)
 	}
@@ -772,11 +772,11 @@ func TestDispatch_CoordSpawn_AlwaysInjectsRemoteControl(t *testing.T) {
 
 	// Sanity: the rewrite produced a different argv. If this fails,
 	// either the default --command shape changed (update the helper's
-	// strict-shape match in injectRemoteControlFlag) or the helper
+	// strict-shape match in spawn.InjectRemoteControlFlag) or the helper
 	// itself regressed.
 	if sameCommand(rewritten, defaultCmd) {
 		t.Fatal("default command's rewrite should differ from input — " +
-			"injectRemoteControlFlag's strict-shape match may have drifted")
+			"spawn.InjectRemoteControlFlag's strict-shape match may have drifted")
 	}
 	if !strings.Contains(rewritten[2], `--remote-control "`+rcSession+`"`) {
 		t.Errorf("rewritten command should embed --remote-control with the "+
@@ -798,7 +798,7 @@ func TestDispatch_CoordSpawn_AlwaysInjectsRemoteControl(t *testing.T) {
 // contract.
 //
 // We exercise this at the helper level directly — the production
-// code path skips injectRemoteControlFlag entirely when
+// code path skips spawn.CoordRCInjector entirely when
 // opts.coordSpawn is false (so opts.command is passed through to
 // spawn.Spawn unchanged). This test pins that "skip means literally
 // no rewrite" invariant: even if a future refactor moves the call

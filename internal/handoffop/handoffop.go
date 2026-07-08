@@ -650,7 +650,6 @@ func spawnAndRetire(req queue.SpawnFresh, queuePath string,
 				oldRec.Project, lockErr)
 		}
 		defer release()
-
 	}
 
 	// COORD drain handoffs resolve the repo binding via the shared
