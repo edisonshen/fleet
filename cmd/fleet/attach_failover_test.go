@@ -168,8 +168,7 @@ func (s *failoverSetup) installStubs(t *testing.T) {
 	// projectlookup has its own session-probe seams (different
 	// package); the failover paths route through them, so stub both
 	// the cmd/fleet seam (for direct tmux.Attach calls) and the
-	// projectlookup seams (for FindLiveCoord / FindCoordByLockBody /
-	// StaleCoordRecord / OrphanTmuxForProject lookups).
+	// projectlookup seams (for live coord and orphan-tmux lookups).
 	restorePL := projectlookup.SetTestStubs(
 		func(session string) bool { return s.aliveSessions[session] },
 		func(session string) (bool, error) { return s.aliveSessions[session], nil },
@@ -254,8 +253,8 @@ func (s *failoverSetup) addProjectDir(t *testing.T, project string) {
 }
 
 // addEmptySessionCoord writes a coord-<project>-tagged record with an
-// EMPTY TmuxSession (the BUG #1 case): unprobeable, so StaleCoordRecord
-// must return (nil,false) and Tier 3 falls through to Path D.
+// EMPTY TmuxSession (the BUG #1 case): unprobeable records must not be
+// treated as killable orphans before Resolve's Spawn path runs.
 func (s *failoverSetup) addEmptySessionCoord(t *testing.T, project, id string) {
 	t.Helper()
 	r := agent.New(id)
@@ -267,12 +266,12 @@ func (s *failoverSetup) addEmptySessionCoord(t *testing.T, project, id string) {
 	}
 }
 
-// addStaleLockBodyCoord writes an UNTAGGED record (task_id ≠
+// addDeadLockBodyCoord writes an UNTAGGED record (task_id !=
 // coord-<project>) whose ID is the project's coordinator.lock body, with
-// a DEFINITIVELY-dead tmux session (not in aliveSessions). This is the
-// Path B case: StaleCoordRecord skips it (untagged), StaleLockBodyCoord
-// catches it, and attach must NOT kill the already-dead session.
-func (s *failoverSetup) addStaleLockBodyCoord(t *testing.T, project, id string) {
+// a DEFINITIVELY-dead tmux session (not in aliveSessions). Resolve owns
+// target selection now; this fixture ensures spawn recovery does not
+// kill already-dead lock-body sessions as orphan cleanup.
+func (s *failoverSetup) addDeadLockBodyCoord(t *testing.T, project, id string) {
 	t.Helper()
 	r := agent.New(id)
 	r.Project = project
@@ -1076,9 +1075,8 @@ func TestSystemFailure_SpawnSessionDead_ReturnsSystemErr(t *testing.T) {
 // The trick: the SAME session must look alive to the probe (so Tier 1
 // fires) AND dead by the time attach runs (the race). Once Tier 3 kicks
 // in, the probe for the dead session is now consistent with the attach
-// failure → Path A FindLiveCoord skips it, Path B lock-body misses,
-// Path C StaleCoordRecord catches it (probe now reports dead) → Path C
-// runs dispatch which spawns the successor.
+// failure → Resolve sees no process-live owner and returns Spawn, so the
+// recovery path dispatches a successor.
 func TestTier12_AttachRaceCoord_FailsOverToTier3(t *testing.T) {
 	s := newFailoverSetup(t)
 	s.installStubs(t)
@@ -1126,8 +1124,8 @@ func TestTier12_AttachRaceCoord_FailsOverToTier3(t *testing.T) {
 	if !strings.Contains(got, "lease resolved spawn for projects-fleet") {
 		t.Errorf("stderr must surface resolver spawn after attach race: %q", got)
 	}
-	// Tier 3 Path C should fire: StaleCoordRecord (probe says dead) →
-	// dispatch (no pre-archive after iter-8) → spawn fresh → attach.
+	// Resolve-driven recovery should dispatch once, then attach the fresh
+	// coord.
 	if len(s.dispatched) != 1 || s.dispatched[0] != "projects-fleet" {
 		t.Errorf("expected Tier 3 to dispatch coord-spawn; got dispatched=%v", s.dispatched)
 	}
@@ -1273,12 +1271,8 @@ func TestSystemFailure_DispatchFailed_ReturnsSystemErr(t *testing.T) {
 
 // TestF20_EmptySessionCoord_RoutesToPathD pins the attach-failover BUG #1
 // invariant end-to-end: a coord-<project> record with an EMPTY
-// TmuxSession is unprobeable, so StaleCoordRecord returns (nil,false),
-// Tier 3 falls through to Path D (fresh spawn), and the operator sees
-// the Path-D "no coord" wording — NOT a bogus "reaped/recovered stale X"
-// line. dispatch's own recovery still matches the empty-session record
-// (it guards its alive probe with TmuxSession != ""), so recovery
-// context is preserved without attach printing a false reap.
+// TmuxSession is unprobeable, so attach must go through Resolve's Spawn
+// path and must NOT print a bogus "reaped/recovered stale X" line.
 func TestF20_EmptySessionCoord_RoutesToPathD(t *testing.T) {
 	s := newFailoverSetup(t)
 	s.installStubs(t)
@@ -1415,14 +1409,14 @@ func TestF23c_PathD_Veto_Exit75(t *testing.T) {
 	}
 }
 
-// --- F26: MAJOR — Path B (proven-dead lock-body) does NOT kill ---
+// --- F26: MAJOR — proven-dead lock-body session does NOT kill ---
 
-// TestF26_PathB_StaleLockBody_DoesNotKill pins the safety split: a
+// TestF26_DeadLockBody_DoesNotKill pins the safety split: a
 // proven-dead lock-body coord (session already dead) must spawn fresh
 // WITHOUT calling tmux kill-session — killing a dead session can error
 // and turn recovery into a false exit 70. The kill stub fails loudly if
 // invoked.
-func TestF26_PathB_StaleLockBody_DoesNotKill(t *testing.T) {
+func TestF26_DeadLockBody_DoesNotKill(t *testing.T) {
 	s := newFailoverSetup(t)
 	s.installStubs(t)
 	// Override the kill stub to FAIL the test if Path B ever kills.
@@ -1431,7 +1425,7 @@ func TestF26_PathB_StaleLockBody_DoesNotKill(t *testing.T) {
 		return errors.New("kill should not be called")
 	}
 	s.addProjectDir(t, "projects-fleet")
-	s.addStaleLockBodyCoord(t, "projects-fleet", "1ace0b0d") // untagged record + lock body, session dead
+	s.addDeadLockBodyCoord(t, "projects-fleet", "1ace0b0d") // untagged record + lock body, session dead
 	stderr, err := s.run(t, "foo", AttachOpts{Project: "projects-fleet"})
 	if err != nil {
 		t.Fatalf("F26: expected no error (spawn-fresh proceeds), got %v", err)

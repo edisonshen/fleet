@@ -1894,8 +1894,8 @@ def test_idle_agent_archive_pass_exempts_coord_via_lock_holder(
     task_id is NOT "coord-<project>" and which carries NO is_coord stamp
     (both derive from the same coord-<project> predicate, so both are false)
     is STILL exempt when it is the project's coordinator.lock holder. Before
-    this signal such a coord — the exact lineage internal/projectlookup.
-    StaleLockBodyCoord exists to recover — would be `fleet rm`'d out from
+    this signal such a coord — the exact lineage Resolve-driven attach
+    recovery must preserve — would be `fleet rm`'d out from
     under the operator after the idle TTL, re-opening the data-loss bug."""
     project = "fleet"
     holder = "abcd1234"

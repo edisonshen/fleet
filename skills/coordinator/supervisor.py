@@ -506,8 +506,8 @@ def _read_coord_lock_holder(home: Path, project: str) -> str:
     surface. flock(2) does not truncate the body on release, so a stale
     body can name a DEAD coord — that is intentionally fine for THIS use:
     a dead coord's record has no fresh last_activity_ts, so the sweep's
-    TTL gate already keeps it (and recovery, not idle-archive, owns the
-    dead-coord case via projectlookup.StaleLockBodyCoord)."""
+    TTL gate already keeps it (and Resolve-driven attach recovery owns
+    dead-coord replacement)."""
     if not project:
         return ""
     path = home / "projects" / project / ".locks" / "coordinator.lock"
@@ -1907,8 +1907,7 @@ def _run_idle_agent_archive_pass(
         #     same coord-<project> predicate (spawn.isCoordSpawn stamps
         #     is_coord exactly when task_id == coord-<project>), so a
         #     legacy / manually-spawned coord whose task_id is something
-        #     else (the case internal/projectlookup.StaleLockBodyCoord
-        #     exists to recover) has BOTH false — yet still owns the
+        #     else has BOTH false — yet still owns the
         #     project via the lock. Exempting the lock holder closes that
         #     gap; it mirrors the Go recovery path's authority signal.
         #     The lock BODY is coord-exclusive by construction: the ONLY

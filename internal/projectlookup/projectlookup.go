@@ -244,8 +244,8 @@ func FindCoordByLockBody(records []*agent.Record, projectName string) (*agent.Re
 		// project. Without this guard `fleet attach --project A` could
 		// attach to project B's live coord. Require the record's project
 		// to match before treating it as A's coord. Mirrors the
-		// project-match the FindLiveCoord / StaleCoordRecord paths already
-		// enforce via CoordTaskID(projectName)+Project checks.
+		// project-match the FindLiveCoord path already enforces via
+		// CoordTaskID(projectName)+Project checks.
 		if r.Project != projectName {
 			continue
 		}
@@ -260,101 +260,6 @@ func FindCoordByLockBody(records []*agent.Record, projectName string) (*agent.Re
 			cp := *r
 			cp.TmuxSession = session
 			return &cp, true
-		}
-		return r, true
-	}
-	return nil, false
-}
-
-// StaleCoordRecord returns the first record tagged as the coord for
-// projectName whose tmux session is DEFINITIVELY dead (probe returns
-// alive=false with no error). Drives the Tier 3 "record alive but
-// tmux missing" branch — pass the returned ID to
-// `fleet gc --apply --aggressive --project <p>` before respawning.
-//
-// Definitive-dead semantics (not "any false from HasSession"): a
-// transport error from tmux means the probe is ambiguous; we must
-// NOT mark a live coord stale just because the socket hiccupped.
-// Matches the discipline in feedback_fleet_owns_its_resources.md.
-func StaleCoordRecord(records []*agent.Record, projectName string) (*agent.Record, bool) {
-	want := CoordTaskID(projectName)
-	for _, r := range records {
-		if r == nil || r.TaskID != want || r.Project != projectName {
-			continue
-		}
-		// BUG #1 (attach-failover INVARIANT 2): an empty-TmuxSession
-		// record is UNPROBEABLE, not "stale". Synthesizing
-		// tmux.SessionName(r.ID) and probing it is a FALSE signal — it
-		// checks a fleet-<id> session that was never the real one, so
-		// the probe trivially returns dead and attach would print a
-		// bogus "reaped stale <id>" line. gc's reconcileOrphanAgents
-		// already SKIPS empty-TmuxSession records (gc.go), so the
-		// classifier and the reaper must agree: skip it here too. Tier 3
-		// falls through to Path D (fresh spawn); dispatch's own recovery
-		// still matches the empty-session record (it guards its alive
-		// probe with r.TmuxSession != "", so empty ⇒ "not alive" ⇒
-		// recovery candidate) — recovery context is preserved WITHOUT
-		// attach printing a false reap line.
-		if r.TmuxSession == "" {
-			continue
-		}
-		alive, err := sessionProbeFn(r.TmuxSession)
-		if err != nil {
-			continue // transport error — don't classify as stale
-		}
-		if alive {
-			continue
-		}
-		return r, true
-	}
-	return nil, false
-}
-
-// StaleLockBodyCoord returns a record whose ID matches the project's
-// coordinator.lock body AND whose tmux session is DEFINITIVELY dead.
-// Covers the legacy / manually-spawned coord case (codex review iter-11
-// P2): such records are tagged with task_id ≠ coord-<project>, so
-// StaleCoordRecord skips them and Tier 3 would fall through to Path D
-// (fresh spawn) — losing the dead coord's recovery context (cwd /
-// engine / workers state). The lock body is authoritative ("this is
-// the coord for this project"); if its tmux session is dead, the
-// record is the right recovery candidate even without the task_id tag.
-//
-// Returns (nil, false) when the lock body is missing/empty/malformed,
-// when no record has the matching ID, or when the matching record's
-// session is alive or its liveness is ambiguous (transport-error
-// conservatism — same discipline as StaleCoordRecord).
-func StaleLockBodyCoord(records []*agent.Record, projectName string) (*agent.Record, bool) {
-	root, err := state.Root()
-	if err != nil {
-		return nil, false
-	}
-	holderID := readCoordHolder(filepath.Join(root, "projects"), projectName)
-	if holderID == "" {
-		return nil, false
-	}
-	for _, r := range records {
-		if r == nil || r.ID != holderID {
-			continue
-		}
-		// Cross-project safety (codex P2, mirrors FindCoordByLockBody): a
-		// stale/copied lock-body ID could resolve to a record tagged for
-		// a DIFFERENT project; treating it as projectName's recovery
-		// candidate would spawn/kill against the wrong lineage. Require
-		// the project to match.
-		if r.Project != projectName {
-			continue
-		}
-		session := r.TmuxSession
-		if session == "" {
-			session = tmux.SessionName(r.ID)
-		}
-		alive, perr := sessionProbeFn(session)
-		if perr != nil {
-			continue // transport error → conservative
-		}
-		if alive {
-			continue
 		}
 		return r, true
 	}
