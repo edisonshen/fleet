@@ -2,6 +2,7 @@ package tmux
 
 import (
 	"sync"
+	"sync/atomic"
 	"testing"
 )
 
@@ -37,6 +38,12 @@ type Backend interface {
 // install helper documents this.
 var installMu sync.Mutex
 
+var realBackendInstalled atomic.Bool
+
+func init() {
+	realBackendInstalled.Store(true)
+}
+
 // Install swaps the package function table to route every shelling op
 // through b, and returns a restore func that puts the real backend back.
 // It panics if called outside `go test` (the seam is a test-only swap
@@ -67,11 +74,12 @@ func Install(b Backend) (restore func()) {
 		kill                    func(string) error
 		listSessions            func() ([]string, error)
 		listSessionsWithCreated func() ([]SessionInfo, error)
+		isReal                  bool
 	}{
 		available: availableFn, hasSession: hasSessionFn, sessionAlive: sessionAliveFn,
 		spawn: spawnFn, attach: attachFn, sendKeys: sendKeysFn, capturePane: capturePaneFn,
 		setStatusHint: setStatusHintFn, kill: killFn, listSessions: listSessionsFn,
-		listSessionsWithCreated: listSessionsWithCreatedFn,
+		listSessionsWithCreated: listSessionsWithCreatedFn, isReal: realBackendInstalled.Load(),
 	}
 
 	availableFn = b.Available
@@ -85,6 +93,7 @@ func Install(b Backend) (restore func()) {
 	killFn = b.Kill
 	listSessionsFn = b.ListSessions
 	listSessionsWithCreatedFn = b.ListSessionsWithCreated
+	realBackendInstalled.Store(isRealBackend(b))
 
 	var once sync.Once
 	return func() {
@@ -100,9 +109,21 @@ func Install(b Backend) (restore func()) {
 			killFn = prev.kill
 			listSessionsFn = prev.listSessions
 			listSessionsWithCreatedFn = prev.listSessionsWithCreated
+			realBackendInstalled.Store(prev.isReal)
 			installMu.Unlock()
 		})
 	}
+}
+
+// IsRealBackend reports whether the package-level tmux function table is
+// currently routed to the real tmux subprocess backend. It deliberately avoids
+// taking installMu because tests hold that mutex for the duration of a fake
+// install while production code under test calls back into tmux.
+func IsRealBackend() bool { return realBackendInstalled.Load() }
+
+func isRealBackend(b Backend) bool {
+	_, ok := b.(realBackend)
+	return ok
 }
 
 // Compile-time drift guard: if a realXxx signature changes, realBackend

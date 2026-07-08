@@ -223,6 +223,9 @@ func TestFake_SetStatusHint(t *testing.T) {
 func TestFake_RestoresRealBackend(t *testing.T) {
 	t.Run("first", func(t *testing.T) {
 		f := InstallFake(t)
+		if tmux.IsRealBackend() {
+			t.Fatal("fake install reported real backend")
+		}
 		_ = tmux.Spawn("fleet-leak", "", []string{"sh"}, nil)
 		if f.Count() != 1 {
 			t.Fatal("expected 1 session in first fake")
@@ -230,6 +233,9 @@ func TestFake_RestoresRealBackend(t *testing.T) {
 	})
 	t.Run("second", func(t *testing.T) {
 		f := InstallFake(t)
+		if tmux.IsRealBackend() {
+			t.Fatal("fake install reported real backend")
+		}
 		if f.Count() != 0 {
 			t.Fatalf("second fake leaked %d sessions from first", f.Count())
 		}
@@ -237,6 +243,9 @@ func TestFake_RestoresRealBackend(t *testing.T) {
 			t.Fatal("session from first subtest leaked into second")
 		}
 	})
+	if !tmux.IsRealBackend() {
+		t.Fatal("fake cleanup did not restore real backend")
+	}
 }
 
 // TestFake_FailSpawn exercises the injected spawn-failure path.

@@ -1143,8 +1143,11 @@ func Spawn(opts Options) (*agent.Record, error) {
 	if leaseWrapped {
 		// Authoritative fork-bomb gate (test-only read): a real standby pane is
 		// now live. Non-integration TestMains assert this stays zero, catching a
-		// standby-spawning test left in the default lane. No-op in production.
-		recordStandbyLaunch()
+		// standby-spawning test left in the default lane. Fake-backed default-lane
+		// spawns must not count as real panes.
+		if tmux.IsRealBackend() {
+			recordStandbyLaunch()
+		}
 	}
 	// Best-effort: pin a "Ctrl-b d to detach" hint into this session's
 	// status bar so operators see it persistently while attached.
