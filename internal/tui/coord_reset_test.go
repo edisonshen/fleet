@@ -10,6 +10,8 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 
 	"github.com/edisonshen/fleet/internal/agent"
+	"github.com/edisonshen/fleet/internal/coordlock"
+	"github.com/edisonshen/fleet/internal/coordreconcile"
 )
 
 // stubCoordArchived replaces coordArchivedFn for tests so we can mark a
@@ -102,39 +104,26 @@ func TestKeyA_StaleCoordID_Table(t *testing.T) {
 	const liveID = "68c6db50"  // the live successor coord
 
 	tests := []struct {
-		name            string
-		archived        bool
-		successor       *agent.Record // loaded into m.records as a coord, if non-nil
-		wantAttach      string        // expected pendingAttach session ("" = none)
-		wantFlashHas    string        // substring the flash must contain ("" = no flash required)
-		wantFlashNotHas string        // substring the flash must NOT contain
-		wantCmd         bool
+		name      string
+		archived  bool
+		successor *agent.Record // loaded into m.records as a coord, if non-nil
+		outcome   string
 	}{
 		{
-			name:            "transient-race-keeps-pending-refresh",
-			archived:        false,
-			successor:       nil,
-			wantAttach:      "",
-			wantFlashHas:    "pending refresh",
-			wantFlashNotHas: "reset",
-			wantCmd:         false,
+			name:     "transient-race-keeps-pending-refresh",
+			archived: false,
+			outcome:  "pending-refresh",
 		},
 		{
-			name:         "terminal-stale-with-successor-attaches",
-			archived:     true,
-			successor:    coordRecord(liveID, project),
-			wantAttach:   "fleet-" + liveID,
-			wantFlashHas: "",
-			wantCmd:      true, // tea.Quit
+			name:      "terminal-stale-with-successor-attaches",
+			archived:  true,
+			successor: coordRecord(liveID, project),
+			outcome:   "attach-successor",
 		},
 		{
-			name:            "terminal-stale-no-successor-surfaces-reset",
-			archived:        true,
-			successor:       nil,
-			wantAttach:      "",
-			wantFlashHas:    "press [r] to reset",
-			wantFlashNotHas: "pending refresh",
-			wantCmd:         false,
+			name:     "terminal-stale-no-successor-surfaces-reset",
+			archived: true,
+			outcome:  "reset-hint",
 		},
 	}
 
@@ -147,16 +136,40 @@ func TestKeyA_StaleCoordID_Table(t *testing.T) {
 			stubCmd := &stubFleetCmd{}
 			stubCmd.install(t)
 
-			// The successor is resolved via the marker scan
-			// (findExistingCoordForProject), which requires a coord-spawn
-			// marker matching the record ID. Install it for the successor.
-			markers := map[string]string{}
 			var records []*agent.Record
 			if tc.successor != nil {
 				records = append(records, tc.successor)
-				markers[project] = tc.successor.ID
 			}
-			(&stubCoordLeaseIdentity{markers: markers}).install(t)
+			resolveCalls := 0
+			prevResolve := tuiCoordResolveFn
+			prevOwner := tuiCoordCurrentOwnerFn
+			tuiCoordResolveFn = func(gotProject, agentID string) (coordreconcile.Verdict, error) {
+				resolveCalls++
+				if gotProject != project {
+					t.Fatalf("Resolve project = %q, want %q", gotProject, project)
+				}
+				if agentID != "" {
+					t.Fatalf("stale CoordID preflight must re-Resolve read-only; agentID=%q", agentID)
+				}
+				if tc.successor != nil {
+					return coordreconcile.Verdict{
+						Decision: coordreconcile.Attach,
+						Owner:    coordlock.Owner{AgentID: tc.successor.ID, PID: 1},
+						Reason:   "successor published",
+					}, nil
+				}
+				return coordreconcile.Verdict{Decision: coordreconcile.Wait, Reason: "coord unavailable"}, nil
+			}
+			tuiCoordCurrentOwnerFn = func(string) (coordlock.Owner, bool) {
+				if tc.successor == nil {
+					return coordlock.Owner{}, false
+				}
+				return coordlock.Owner{AgentID: tc.successor.ID, PID: 1}, true
+			}
+			t.Cleanup(func() {
+				tuiCoordResolveFn = prevResolve
+				tuiCoordCurrentOwnerFn = prevOwner
+			})
 
 			m := New("test")
 			m.records = records
@@ -173,26 +186,51 @@ func TestKeyA_StaleCoordID_Table(t *testing.T) {
 			updated, cmd := m.Update(keyMsg("a"))
 			mm := updated.(Model)
 
-			if mm.pendingAttach != tc.wantAttach {
-				t.Errorf("pendingAttach = %q; want %q", mm.pendingAttach, tc.wantAttach)
-			}
-			if tc.wantCmd && cmd == nil {
-				t.Errorf("expected a cmd; got nil")
-			}
-			if !tc.wantCmd && cmd != nil {
-				// A nil-attach + no-successor path must not shell out
-				// (would dup-spawn). The successor-attach path returns
-				// tea.Quit (a cmd) which is expected.
-				t.Errorf("expected no cmd; got one")
-			}
-			if tc.wantFlashHas != "" {
-				if mm.flash == nil || !strings.Contains(mm.flash.text, tc.wantFlashHas) {
-					t.Errorf("flash = %+v; want substring %q", mm.flash, tc.wantFlashHas)
+			switch tc.outcome {
+			case "pending-refresh":
+				if resolveCalls != 0 {
+					t.Fatalf("transient refresh race must not re-resolve; calls=%d", resolveCalls)
 				}
-			}
-			if tc.wantFlashNotHas != "" && mm.flash != nil &&
-				strings.Contains(mm.flash.text, tc.wantFlashNotHas) {
-				t.Errorf("flash %q must NOT contain %q", mm.flash.text, tc.wantFlashNotHas)
+				if cmd != nil {
+					t.Fatalf("pending-refresh path must not quit or dispatch; cmd=%T", cmd())
+				}
+				if mm.pendingAttach != "" {
+					t.Fatalf("pendingAttach = %q; want empty", mm.pendingAttach)
+				}
+				if mm.flash == nil || !mm.flash.isErr || !strings.Contains(mm.flash.text, "pending refresh") {
+					t.Fatalf("flash = %+v; want pending refresh error", mm.flash)
+				}
+				if strings.Contains(mm.flash.text, "reset") {
+					t.Fatalf("pending-refresh flash must not suggest reset; got %q", mm.flash.text)
+				}
+			case "attach-successor":
+				if resolveCalls != 1 {
+					t.Fatalf("successor path Resolve calls = %d, want 1", resolveCalls)
+				}
+				if cmd == nil {
+					t.Fatal("successor attach must return tea.Quit cmd")
+				}
+				if mm.pendingAttach != "fleet-"+liveID {
+					t.Fatalf("pendingAttach = %q; want fleet-%s", mm.pendingAttach, liveID)
+				}
+			case "reset-hint":
+				if resolveCalls != 1 {
+					t.Fatalf("reset path Resolve calls = %d, want 1", resolveCalls)
+				}
+				if cmd != nil {
+					t.Fatalf("reset-hint path must not quit or dispatch; cmd=%T", cmd())
+				}
+				if mm.pendingAttach != "" {
+					t.Fatalf("pendingAttach = %q; want empty", mm.pendingAttach)
+				}
+				if mm.flash == nil || !mm.flash.isErr || !strings.Contains(mm.flash.text, "press [r] to reset") {
+					t.Fatalf("flash = %+v; want press [r] reset hint", mm.flash)
+				}
+				if strings.Contains(mm.flash.text, "pending refresh") {
+					t.Fatalf("reset flash must not collapse to pending refresh; got %q", mm.flash.text)
+				}
+			default:
+				t.Fatalf("unknown outcome %q", tc.outcome)
 			}
 			// Never shell out on these paths (no dispatch).
 			if len(stubCmd.calls) != 0 {
@@ -773,6 +811,7 @@ func TestIntegration_StaleCoordLock_DeadEndRecovery_AndReset(t *testing.T) {
 	(&stubSessionAlive{}).install(t)
 	(&stubSessionProbe{}).install(t)
 	(&stubCoordLeaseIdentity{markers: map[string]string{project: liveID}}).install(t)
+	stubTUIResolveAttach(t, project, liveID)
 
 	// Stub the reset reap so we don't fork real `fleet rm`/`fleet gc`,
 	// but assert the exact shell-out intent (project + coord IDs).

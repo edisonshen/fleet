@@ -14,6 +14,7 @@ import (
 
 	"github.com/edisonshen/fleet/internal/agent"
 	"github.com/edisonshen/fleet/internal/coordlock"
+	"github.com/edisonshen/fleet/internal/coordreconcile"
 	"github.com/edisonshen/fleet/internal/coordrepo"
 	"github.com/edisonshen/fleet/internal/gc"
 	"github.com/edisonshen/fleet/internal/projectlookup"
@@ -180,9 +181,8 @@ type addProjectDoneMsg struct {
 //     --cwd <repo> --prompt <coordSpawnPrompt(name)>`. The prompt
 //     body (issue #80) hard-constrains the coord agent to discuss-
 //     and-dispatch — never inline implementation. The task_id is
-//     STABLE per project (issue #63): a duplicate [a] press during
-//     the skill-boot window finds the in-flight record via
-//     findExistingCoordForProject and attaches instead of respawning.
+//     STABLE per project (issue #63): duplicate [a] presses are gated by
+//     the in-flight lifecycle guard and the lease Resolve Wait verdict.
 //  3. Parse the new agent's ID from dispatch stdout ("agent <id>
 //     spawned" first line). Compute the tmux session name from the
 //     ID (tmux.SessionName).
@@ -600,8 +600,8 @@ func (m Model) actionHandoff() (Model, tea.Cmd, bool) {
 // coord link (CoordID) races the agents refresh, so a live-but-unlinked
 // coord made [h] flash "no coord" while the agents panel clearly showed
 // it (live repro 2026-05-28: projects-fengshen-site coord 129c9824).
-// resolveCoordRecord adds the same records-scan fallback that
-// actionAttachProject already used, so [h] finds the in-flight coord.
+// resolveCoordRecord keeps [h] on a read-only record lookup path, while
+// [a] now uses coordreconcile.Resolve for lease-authoritative attach.
 //
 // The gate logic mirrors what used to live on the rowAgent branch:
 //
@@ -837,6 +837,15 @@ func (m Model) actionAttach() (Model, tea.Cmd, bool) {
 		// from the resolver fall back to the existing live-record-only
 		// flow so this enhancement never makes the existing UX worse.
 		if tail, hops, rerr := chainResolveFn(cur.ID); rerr == nil && hops > 0 && tail != nil {
+			if project, ok := coordTargetProject(tail); ok {
+				m.flash = &flashMsg{
+					text: fmt.Sprintf(
+						"agent %s handed off → %s (rotated through %d hop%s) — resolving current coord for %s",
+						cur.ID, tail.ID, hops, pluralizeHops(hops), project),
+				}
+				next, cmd := m.beginResolvedCoordAttach(project, "agent-chain")
+				return next, cmd, true
+			}
 			session := tail.TmuxSession
 			if session == "" {
 				session = "fleet-" + tail.ID
@@ -851,56 +860,18 @@ func (m Model) actionAttach() (Model, tea.Cmd, bool) {
 				return m, tea.Quit, true
 			}
 		}
+		if project, ok := coordTargetProject(cur); ok {
+			next, cmd := m.beginResolvedCoordAttach(project, "agent")
+			return next, cmd, true
+		}
 		// Pre-flight liveness check (same behavior as v0.1 [a] flow):
 		// tmux's `attach -t <session>` on a dead session prints "no
 		// sessions" and the operator drops back to their shell with
 		// no idea why. Surface the diagnosis in-TUI.
 		if !sessionAliveFn(cur.TmuxSession) {
-			// F18 — attach-failover-59db: agent-row [a] on a dead-
-			// session COORD agent must NOT dead-end. Use the same
-			// projectlookup.FindLiveCoord resolver the CLI Tier 3
-			// uses; if a different live coord for the project exists
-			// (e.g. successor spawned after a handoff archived this
-			// record), attach to it. The TUI flashes a status so the
-			// operator sees the rotation before exec attach lands.
-			//
-			// Non-coord dead agents (workers, manual dispatches) have
-			// no resume path — keep the archive suggestion.
-			if cur.Project != "" && cur.TaskID == coordTaskID(cur.Project) {
-				if live, ok := projectlookup.FindLiveCoord(m.records, cur.Project); ok && live.ID != cur.ID {
-					m.flash = &flashMsg{
-						text: fmt.Sprintf(
-							"agent %s session is dead — attaching to live coord %s for %s",
-							cur.ID, live.ID, cur.Project),
-					}
-					m.pendingAttach = live.TmuxSession
-					return m, tea.Quit, true
-				}
-				// Codex review iter-7 P2: legacy / manually-spawned coords
-				// may not carry task_id == coord-<project> on disk; the CLI
-				// Tier 3 + project-row [a] paths cover them via the
-				// lock-body fallback. The dead-row [a] resolver advertises
-				// "shared with the CLI" — wire the same fallback here so
-				// it doesn't dead-end on legacy state the other paths can
-				// recover. FindCoordByLockBody returns a record with a
-				// populated TmuxSession (iter-3 P2 normalization).
-				if live, ok := projectlookup.FindCoordByLockBody(m.records, cur.Project); ok && live.ID != cur.ID {
-					m.flash = &flashMsg{
-						text: fmt.Sprintf(
-							"agent %s session is dead — attaching to lock-body coord %s for %s",
-							cur.ID, live.ID, cur.Project),
-					}
-					m.pendingAttach = live.TmuxSession
-					return m, tea.Quit, true
-				}
-				m.flash = &flashMsg{
-					text: fmt.Sprintf(
-						"coord %s session is dead — claude likely exited inside it. Press [a] on project %s to resume from last checkpoint (or [x] here to archive the orphan record).",
-						cur.ID, cur.Project),
-					isErr: true,
-				}
-				return m, nil, true
-			}
+			// Coord rows return through beginResolvedCoordAttach above before
+			// any session liveness check. Reaching this branch means the row
+			// is a genuinely non-coord agent with no coord recovery path.
 			m.flash = &flashMsg{
 				text: fmt.Sprintf(
 					"agent %s session is dead — claude likely exited inside it. Press [x] to archive the orphan record.",
@@ -922,46 +893,26 @@ func (m Model) actionAttach() (Model, tea.Cmd, bool) {
 		// "N local agents" indicator). So [a] on a worker row routes to
 		// the COORD's tmux session, not a per-worker session.
 		//
-		// Routing decision tree (in order):
-		//
-		//   coord found (alive)    → attach to coord (the place where
-		//                             the operator can actually interact
-		//                             with the worker subagent)
-		//   no live coord found    → flash "no attachable session for
-		//                             <slug>" — the worker is orphaned
-		//                             (its parent coord exited or its
-		//                             session is dead). [⏎] still opens
-		//                             the peek panel as before.
-		//
-		// findExistingCoordForProject already gates on a live tmux
-		// session via sessionProbeOrAliveFn, so the dead-session case
-		// folds into the same orphan flash — no separate branch.
+		// The coord target is resolved through the lease-authoritative
+		// helper; Wait/Spawn/Attach diagnostics are shared with project-row
+		// coord attach rather than record scans.
 		//
 		// The peek panel ([⏎]) path is preserved untouched — operators
 		// who want state.json + output.log tail still get it via Enter.
 		// [a] is now consistently "attach to a live session" across
 		// agent / project / worker rows (no tmux means no attach).
 		w := row.worker
-		coord, ok := findExistingCoordForProject(m.records, w.Project)
-		if !ok {
+		if w.Project == "" {
 			m.flash = &flashMsg{
 				text: fmt.Sprintf(
-					"no attachable session for worker %s — its coord exited or its session is dead; press [⏎] for the worker peek panel",
+					"no attachable session for worker %s — it is not associated with a project; press [⏎] for the worker peek panel",
 					w.Slug),
 				isErr: true,
 			}
 			return m, nil, true
 		}
-		// Successful coord attach — surface the routing so the operator
-		// knows they're landing in the coord chat (where the worker's
-		// Agent-tool output renders), not in a per-worker session.
-		m.flash = &flashMsg{
-			text: fmt.Sprintf(
-				"viewing coord chat for project %s (worker %s renders as a local agent there)",
-				w.Project, w.Slug),
-		}
-		m.pendingAttach = coord.TmuxSession
-		return m, tea.Quit, true
+		next, cmd := m.beginResolvedCoordAttach(w.Project, "worker")
+		return next, cmd, true
 	case rowProject:
 		return m.actionAttachProject(row.project)
 	case rowTask:
@@ -1270,29 +1221,13 @@ var taskWorkerArchiveExists = func(project, slug string) bool {
 
 // actionAttachProject is the project-row branch of [a] (issues #60, #63).
 //
-// Three paths, in order:
-//
-//  1. Lock-body match: project.CoordID is set (dashboard freshness gate
-//     passed: lock body + coord-state.json mtime within
-//     coordActiveWindow). Find the matching agent.Record by ID, attach.
-//
-//  2. Task_id fallback: even when CoordID is empty, an agent record
-//     tagged task_id == coord-<project> AND project == <project> with
-//     an alive tmux session is the project's coord by intent — the
-//     skill just hasn't ticked yet (10-30s boot window). Attach to it
-//     instead of spawning a duplicate. This is the primary issue-#63
-//     idempotency mechanism: a second [a] press during the boot window
-//     finds the in-flight record here.
-//
-//  3. No coord: pre-init the project tree, then spawn one. Stable
-//     task_id ("coord-<name>") so subsequent [a] presses route into
-//     path 2 instead of stacking duplicates. Attach immediately after
-//     dispatch returns — no lock-poll (PR #62's 2s budget fired the
-//     spawn-timeout banner under normal operation).
-//
-// Single-coord-per-project enforcement remains upstream: the coord
-// skill NB-flocks coordinator.lock at first tick and exits cleanly if
-// another coord beats it.
+// The active attach path is lease-authoritative: after the in-flight
+// lifecycle guard, beginResolvedCoordAttach delegates to coordreconcile.
+// Resolve and consumes Attach / Wait / Spawn / SpawnStandby. The small
+// CoordID preflight only preserves the dashboard refresh distinction:
+// an unloaded non-archived link is a refresh race, while an archived link
+// gets a read-only Resolve chance to attach a successor before surfacing
+// the [r] reset hint.
 func (m Model) actionAttachProject(p *ProjectRow) (Model, tea.Cmd, bool) {
 	if p == nil {
 		return m, nil, true
@@ -1319,182 +1254,33 @@ func (m Model) actionAttachProject(p *ProjectRow) (Model, tea.Cmd, bool) {
 		}
 		return m, nil, true
 	}
-	// Path 1: fresh coord exists (lock body + freshness gate). Resolve
-	// the record via the shared resolveCoordRecord helper (CoordID link
-	// first, then the records-scan fallback — tui-nav-handoff-regressions
-	// Fix 2) so attach benefits from the same fallback [h] now uses when
-	// CoordID points at an unloaded record. Verify the session is alive
-	// before committing to attach. A coord whose tmux session died but
-	// whose lock body wasn't yet stale would get dispatched to a dead
-	// session otherwise — same UX bug as the agent-row branch's "no
-	// sessions" failure mode. Downstream dead-session recovery + the
-	// "pending refresh" race flash are unchanged; only the lookup that
-	// produces `rec` swapped to the shared helper.
-	if p.CoordID != "" {
-		if rec := m.resolveCoordRecord(p); rec != nil && rec.TmuxSession != "" {
-			// Probe with sessionProbeOrAliveFn (codex review iter-6 P1):
-			// the bare sessionAliveFn returns false on transport errors
-			// (bad FLEET_TMUX_SOCKET, restarting tmux server, etc.),
-			// which would falsely trigger the recovery spawn against a
-			// still-live coord on a different socket. The
-			// sessionProbeOrAliveFn helper distinguishes definitive
-			// "no such session" from probe-error: the latter is treated
-			// as alive (conservative) so we don't dispatch a duplicate
-			// over a transport hiccup.
-			if !sessionProbeOrAliveFn(rec.TmuxSession) {
-				// Dead tmux session: re-dispatch the coord under the
-				// same stable task_id ("coord-<project>"). The dispatch
-				// CLI's dead-coord detection (see
-				// cmd/fleet/dispatch_recovery.go) writes a synth-handoff
-				// doc from on-disk state and points the successor at it,
-				// so the resume picks up where the dead coord left
-				// off without throwing state away. Previously this
-				// case flashed "press [x] to archive, then [a] to
-				// respawn" — which threw state away by archiving the
-				// only link the dispatch path has back to the dead
-				// coord's worker state. Flash the resume so the
-				// operator knows we're not silently respawning.
-				if _, err := state.EnsureProjectInitialized(p.Name); err != nil {
-					m.flash = &flashMsg{
-						text:  fmt.Sprintf("project %s: init failed: %v", p.Name, err),
-						isErr: true,
-					}
-					return m, nil, true
-				}
-				// Resolve the repo binding via the shared resolver, NOT
-				// the dead coord's stored rec.Cwd (DESIGN-coord-repo-
-				// binding-from-project.md PR3). A live/stored cwd proves
-				// the dead coord once ran SOMEWHERE; it does not prove
-				// that SOMEWHERE was the correct checkout — if the dead
-				// coord was itself a victim of the cwd bug, rec.Cwd is
-				// the wrong tree and reusing it would perpetuate the
-				// corruption across the resume. Resolve fresh; refuse
-				// (flash, no respawn) when the resolver cannot bind.
-				cwd, rerr := coordRepoForProject(p.Name)
-				if rerr != nil {
-					m.flash = &flashMsg{text: rerr.Error(), isErr: true}
-					return m, nil, true
-				}
-				// In-flight ops are already refused at Path 0 (top of
-				// this func), so reaching here means no spawn/handoff is
-				// in flight — safe to arm the recovery spawn's guard.
-				m.setOpInFlight(p.Name, coordOpSpawn)
-				m.flash = &flashMsg{
-					text: fmt.Sprintf(
-						"resuming coord %s for project %s from last checkpoint (dead tmux session — synth handoff)",
-						rec.ID, p.Name),
-				}
-				return m, m.startCoordSpawn(p.Name, cwd), true
-			}
-			m.pendingAttach = rec.TmuxSession
-			return m, tea.Quit, true
-		}
-		// CoordID set but resolveCoordRecord returned nil. Two distinct
-		// causes, and they need OPPOSITE handling (dead-end-recovery
-		// -r-8559):
-		//
-		//   A. Transient snapshot-race — the dashboard picked up the
-		//      lock body before agentsMsg refreshed m.records, and the
-		//      holder is NOT archived. The record will appear next
-		//      tick. Keep the iter-1 P2 guard: flash "pending refresh"
-		//      and DO NOT scan (the scan keys off the marker and could
-		//      bind a different stale coord). The operator re-presses
-		//      [a] after the next refresh.
-		//
-		//   B. Terminally-stale link — the holder was archived (handoff
-		//      / crash reaped it) yet coordinator.lock still names it.
-		//      Re-pressing [a] would loop "pending refresh" FOREVER
-		//      because the record will NEVER load (it's gone). This is
-		//      the operator's hard dead-end (2026-05-28: projects-
-		//      fengshen-site coord 129c9824). Fall through to the SAME
-		//      scan fallbacks Path 2/2.5 use to resolve the LIVE
-		//      successor coord; if a successor is found, attach to it.
-		//      If no successor resolves either, surface the stale-lock
-		//      diagnosis with the concrete next step ([r] reset) rather
-		//      than the misleading "try again" flash.
-		if coordArchivedFn(p.CoordID) {
-			// Terminal stale: the linked holder is in the archive.
-			// Resolve the live successor via the read-only scan
-			// fallbacks (marker scan, then lock body). These are the
-			// same tiers actionAttachProject's empty-CoordID path uses;
-			// reaching them here is safe because the CoordID link is
-			// known-dead, so the iter-1 P2 "don't bind a stale coord"
-			// concern doesn't apply (the linked coord is already gone).
-			if rec, ok := findExistingCoordForProject(m.records, p.Name); ok {
-				m.pendingAttach = rec.TmuxSession
-				return m, tea.Quit, true
-			}
-			if rec, ok := findCoordByLockBody(m.records, p.Name); ok {
-				m.pendingAttach = rec.TmuxSession
-				return m, tea.Quit, true
-			}
-			// No live successor reachable. Surface the stale-lock
-			// diagnosis + the [r] reset escape hatch (feedback_surface
-			// _dont_silo: name the concrete next command, never loop a
-			// dead-end flash).
+	if p.CoordID != "" && findRecordByID(m.records, p.CoordID) == nil {
+		if !coordArchivedFn(p.CoordID) {
 			m.flash = &flashMsg{
-				text: fmt.Sprintf(
-					"coord %s for project %s is stale (archived holder still in coordinator.lock) — press [r] to reset and respawn",
-					p.CoordID, p.Name),
+				text:  fmt.Sprintf("project %s: coord %s is pending refresh — wait for the next dashboard tick, then press [a] again", p.Name, p.CoordID),
 				isErr: true,
 			}
 			return m, nil, true
 		}
-		// Transient race: holder not archived, record just not loaded
-		// yet. Keep the retry hint + the no-scan guard.
+		verdict, err := tuiCoordResolveFn(p.Name, "")
+		if err == nil && verdict.Decision == coordreconcile.Attach {
+			next, cmd := m.attachResolvedCoordOwner(p.Name, "project", verdict)
+			return next, cmd, true
+		}
+		reason := "no successor is attachable"
+		if err != nil {
+			reason = fmt.Sprintf("lease resolve failed: %v", err)
+		} else if verdict.Reason != "" {
+			reason = verdict.Reason
+		}
 		m.flash = &flashMsg{
-			text: fmt.Sprintf(
-				"coord %s for project %s pending refresh — try [a] again in a moment",
-				p.CoordID, p.Name),
+			text:  fmt.Sprintf("project %s: coord link %s is stale (%s) — press [r] to reset", p.Name, p.CoordID, reason),
 			isErr: true,
 		}
 		return m, nil, true
 	}
-	// Path 2: task_id fallback. Idempotency for [a] during the
-	// skill-boot window — find the alive in-flight record by task_id
-	// and attach instead of spawning a duplicate (issue #63).
-	if rec, ok := findExistingCoordForProject(m.records, p.Name); ok {
-		m.pendingAttach = rec.TmuxSession
-		return m, tea.Quit, true
-	}
-	// Path 2.5: lock-body fallback (codex iter-7 P2). Recovery case
-	// after a prompt-delivery failure: the operator attached and
-	// manually typed /coordinator; the skill ran and wrote the lock
-	// body — but the TUI never claimed a starting lease record (D3:
-	// the coord-spawn marker is deleted; we deliberately skipped the
-	// claim on the failed dispatch). The dashboard's freshness gate
-	// may also lag if coord-state.json hasn't ticked yet.
-	// Reading the lock body directly bridges that gap: an ID written
-	// into coordinator.lock came from a coord that successfully
-	// acquired LOCK_EX, so it's authoritative regardless of marker
-	// state.
-	if rec, ok := findCoordByLockBody(m.records, p.Name); ok {
-		m.pendingAttach = rec.TmuxSession
-		return m, tea.Quit, true
-	}
-	// In-flight ops (spawn OR handoff) are refused at Path 0 (top of this
-	// func), so reaching Path 3 means none is in flight — the agent
-	// record + marker simply don't exist yet, so a fresh spawn is correct.
-	// Path 3: no coord. Pre-init the project tree (so the skill's first
-	// tick can write coord-state.json and acquire the flock), then spawn.
-	if _, err := state.EnsureProjectInitialized(p.Name); err != nil {
-		m.flash = &flashMsg{
-			text:  fmt.Sprintf("project %s: init failed: %v", p.Name, err),
-			isErr: true,
-		}
-		return m, nil, true
-	}
-	// Resolve the repo binding via the shared resolver BEFORE arming the
-	// spawn guard (DESIGN-coord-repo-binding-from-project.md PR3). On an
-	// unresolvable project, refuse: flash the surfaced hint and do NOT
-	// spawn a wrong-repo coord. cwd is never a binding tier.
-	cwd, rerr := coordRepoForProject(p.Name)
-	if rerr != nil {
-		m.flash = &flashMsg{text: rerr.Error(), isErr: true}
-		return m, nil, true
-	}
-	m.setOpInFlight(p.Name, coordOpSpawn)
-	return m, m.startCoordSpawn(p.Name, cwd), true
+	next, cmd := m.beginResolvedCoordAttach(p.Name, "project")
+	return next, cmd, true
 }
 
 // actionReset dispatches [r] for the row under the cursor
@@ -1853,19 +1639,17 @@ func coordLockRefusal(gcOutput string) string {
 	return ""
 }
 
-// resolveCoordRecord finds the live coord record for a project row,
-// trying the dashboard-linked CoordID first, then the records scan that
-// actionAttachProject already relies on (findExistingCoordForProject:
-// an agent tagged task_id=coord-<project>, project matching, named by the
-// coordinator lease, alive tmux session). Read-only — no spawn, no dead-session
-// recovery; callers handle the not-found (nil) case.
+// resolveCoordRecord finds the live coord record for project-row [h],
+// trying the dashboard-linked CoordID first, then read-only fallbacks:
+// an alive coord-<project> record named by the coordinator lease, and
+// finally the lock-body match. It does not spawn, reap, or perform
+// dead-session recovery; callers handle the not-found (nil) case.
 //
 // tui-nav-handoff-regressions Fix 2: shared by actionHandoffProject and
-// actionAttachProject's initial coord lookup so [h] and [a] resolve the
-// project's coord through the SAME chain. Previously only [a] had the
-// scan fallback, so [h] flashed "no coord" when the dashboard's
-// CoordID link hadn't published yet but a coord was demonstrably live
-// in the agents panel.
+// the older [a] lookup path so [h] could find a coord when the dashboard's
+// CoordID link had not published yet but a coord was demonstrably live in
+// the agents panel. Post-D2, only [h] uses this helper; [a] goes through
+// coordreconcile.Resolve.
 //
 // codex review iter-1 [P2]: the scan fallbacks fire ONLY when CoordID
 // is empty. A non-empty CoordID is the dashboard's authoritative lock-
@@ -1878,15 +1662,12 @@ func coordLockRefusal(gcOutput string) string {
 // "pending refresh — try again" flash for the CoordID-set race; the
 // operator re-presses after the next tick binds the record.
 //
-// codex review iter-2 [P2]: when CoordID is empty, mirror BOTH of
-// actionAttachProject's read-only fallbacks in order — the lease scan
-// (findExistingCoordForProject, path 2) THEN the lock-body fallback
-// (findCoordByLockBody, path 2.5). Without the lock-body tier, the
+// codex review iter-2 [P2]: when CoordID is empty, try BOTH read-only
+// fallbacks in order — the lease scan (findExistingCoordForProject) THEN
+// the lock-body fallback (findCoordByLockBody). Without the lock-body tier, the
 // prompt-delivery-recovery state (operator attached + manually typed
 // /coordinator, so coordinator.lock names an alive coord but no marker
-// was written) let [a] attach while [h] still flashed "no coord". The
-// design's G2 — "[h] resolves via the SAME chain [a] uses" — requires
-// the lock-body tier here too.
+// was written) let [a] attach while [h] still flashed "no coord".
 func (m Model) resolveCoordRecord(p *ProjectRow) *agent.Record {
 	if p == nil {
 		return nil
@@ -1968,12 +1749,12 @@ func coordTaskID(projectName string) string {
 //   - no record has the matching ID,
 //   - the matching record's tmux session is not alive.
 //
-// Used by actionAttachProject's path 2.5 to handle the prompt-
-// delivery-recovery case (codex iter-7 P2): operator attached after
-// a prompt-failed dispatch, typed /coordinator manually, the skill
-// acquired LOCK_EX and wrote its ID into the lock body. The marker
-// file is absent (we skipped writing it), but the lock body is
-// authoritative — re-attach instead of spawning a duplicate.
+// Used by resolveCoordRecord's [h] fallback to handle the prompt-
+// delivery-recovery case (codex iter-7 P2): operator attached after a
+// prompt-failed dispatch, typed /coordinator manually, the skill acquired
+// LOCK_EX and wrote its ID into the lock body. The marker file is absent
+// (we skipped writing it), but the lock body is authoritative for this
+// read-only handoff lookup.
 //
 // Differs from path 1 (project.CoordID-driven) in that it does NOT
 // require coord-state.json freshness. Lock body is set via LOCK_EX
@@ -2178,11 +1959,10 @@ const dispatchPromptFailedMarker = "initial prompt not delivered"
 // tmux attach and the operator watches Claude boot live.
 //
 // task ID format: "coord-<projectName>" — stable + deterministic per
-// project. A duplicate [a] press during the skill-boot window finds
-// the existing record via findExistingCoordForProject and attaches
-// without re-dispatching (idempotency). Project names pass through
-// state.ValidateProjectName upstream, so embedding the name is path-
-// safe.
+// project. Duplicate [a] presses are serialized by the in-flight guard
+// before dispatch and by coordreconcile.Resolve's Wait verdict while the
+// lease is publishing. Project names pass through state.ValidateProjectName
+// upstream, so embedding the name is path-safe.
 func (m Model) startCoordSpawn(projectName, cwd string) tea.Cmd {
 	taskID := coordTaskID(projectName)
 	prompt := coordSpawnPrompt(projectName)
@@ -2227,75 +2007,12 @@ func (m Model) startCoordSpawn(projectName, cwd string) tea.Cmd {
 			// operator's [a] must land them in the existing coord, never
 			// a fatal banner ("fleet attach never exits"). Mirror the CLI
 			// veto path (cmd/fleet/attach.go handleCoordSpawnVeto): re-
-			// read records FROM DISK here in the callback goroutine (the
-			// Update handler only sees the cached m.records, which can
-			// false-negative a winner already on disk) and resolve the
-			// leader with the markerless projectlookup pair. Do NOT use
-			// findExistingCoordForProject — it is marker-gated by design
-			// and would drop a live coord started outside the TUI.
+			// resolve the lease read-only in the callback goroutine (the
+			// Update handler only sees cached records, which can false-
+			// negative a winner already on disk).
 			var ee *exec.ExitError
 			if errors.As(err, &ee) && ee.ExitCode() == tuiCoordVetoExitCode {
-				records, badIDs, lerr := agent.ListStrict()
-				// FindLiveCoord FIRST, FindCoordByLockBody as fallback. This
-				// is the order used by BOTH (a) cmd/fleet/attach.go's
-				// handleCoordSpawnVeto (the exact path the plan mandates
-				// mirroring, attach.go FindLiveCoord→FindCoordByLockBody) AND
-				// (b) the TUI's own existing [a] resolution — Path 1 and Path
-				// 2/2.5 resolve the live coord (findExistingCoordForProject)
-				// first and consult the lock body only as a fallback. So this
-				// veto path stays consistent with the rest of the codebase,
-				// not divergent. The lock body is NOT authoritative during a
-				// handoff/rotation window:
-				// skills/coordinator/loop.py:_try_lock writes the body only
-				// after LOCK_EX and the body is explicitly allowed to stay
-				// stale, so a still-live PREDECESSOR can linger in
-				// coordinator.lock while a newer coord is the one that
-				// actually vetoed. Trusting the lock body first would
-				// deterministically attach the operator to that stale
-				// predecessor (codex iter-9). FindLiveCoord (a live
-				// coord-<project> record) is the better primary signal; the
-				// lock body resolves only legacy/manual coords FindLiveCoord
-				// can't see (no coord-<project> task_id tag).
-				if rec, ok := projectlookup.FindLiveCoord(records, projectName); ok {
-					return coordSpawnDoneMsg{
-						projectName:      projectName,
-						agentID:          rec.ID,
-						session:          rec.TmuxSession,
-						attachedExisting: true,
-					}
-				}
-				if rec, ok := projectlookup.FindCoordByLockBody(records, projectName); ok {
-					return coordSpawnDoneMsg{
-						projectName:      projectName,
-						agentID:          rec.ID,
-						session:          rec.TmuxSession,
-						attachedExisting: true,
-					}
-				}
-				// Lease held but no live record resolved from THIS process.
-				// RECOVERABLE (non-error) — exit 75 already told us a live
-				// coord exists, so a fatal banner here would dead-end an
-				// operator who just needs to retry or fix their environment
-				// (codex iter-5 P2; same retryable treatment
-				// cmd/fleet/attach.go's handleCoordSpawnVeto gives). ALWAYS
-				// LEAD with the actionable retry/socket guidance
-				// (coordVetoRetryFlash) — never let a disk diagnostic SUPPRESS
-				// it (codex iter-8 P2: badIDs is global across all projects,
-				// so an unrelated project's corrupt file must not hijack the
-				// message and send the operator chasing irrelevant records).
-				// Append the disk diagnostic only as a secondary note so the
-				// real fault is still surfaced (don't silo).
-				flash := coordVetoRetryFlash(projectName)
-				switch {
-				case lerr != nil:
-					flash += fmt.Sprintf(" — note: reading ~/.fleet/agents failed (%v), which may be hiding the leader", lerr)
-				case len(badIDs) > 0:
-					flash += fmt.Sprintf(" — note: %d corrupt agent record(s) present (%s); the leader may be among them if retries keep failing", len(badIDs), summarizeBadIDs(badIDs))
-				}
-				return coordSpawnDoneMsg{
-					projectName: projectName,
-					recoverable: flash,
-				}
+				return resolveCoordSpawnVeto(projectName)
 			}
 			return coordSpawnDoneMsg{
 				projectName: projectName,

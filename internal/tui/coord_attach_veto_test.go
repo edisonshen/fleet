@@ -2,16 +2,14 @@
 // leader path. When `fleet dispatch --coord-spawn` stands down because a
 // healthy coord already holds the project's lease, dispatch exits 75 —
 // the "attach the live one" signal, NOT a failure. The startCoordSpawn
-// callback must re-resolve the live leader from disk (markerless
-// FindLiveCoord + FindCoordByLockBody fallback, exactly like the CLI
-// veto path) and attach, never render a fatal banner ("fleet attach
-// never exits").
+// callback must re-resolve the live leader through coordreconcile.Resolve
+// and attach, never render a fatal banner ("fleet attach never exits").
 //
 // These tests exercise the REAL production callback by stubbing
 // runFleetCmd to invoke msgFn with a genuine *exec.ExitError (sh -c
 // "exit 75"), then feed the resulting coordSpawnDoneMsg through Update.
 // Records are seeded ON DISK (FLEET_HOME tmpdir) so the callback's
-// agent.ListStrict() sees them — the cached m.records slice is
+// agent.Load() sees them — the cached m.records slice is
 // intentionally NOT used (codex round-1 P1-B).
 package tui
 
@@ -65,8 +63,7 @@ func stubFleetCmdInvokesCallback(t *testing.T, out string, err error) {
 
 // seedDiskCoord writes ~/.fleet/agents/<id>.json (via the production
 // Record.Write path) tagged as the coord for project, so the callback's
-// agent.ListStrict() picks it up. taskID controls whether FindLiveCoord
-// matches (coordTaskID(project)) or only the lock-body fallback can.
+// agent.Load() can attach the Resolve owner.
 func seedDiskCoord(t *testing.T, id, project, taskID string) {
 	t.Helper()
 	if dir, err := state.AgentDir(); err == nil {
@@ -81,11 +78,11 @@ func seedDiskCoord(t *testing.T, id, project, taskID string) {
 	}
 }
 
-// seedLockBody writes <agentID> into the project's coordinator.lock so
-// projectlookup.FindCoordByLockBody resolves it. Resolves the root via
-// state.Root() (honors FLEET_HOME) rather than taking a path arg — the
-// tui withFleetHome returns the projects/ subdir, not the root, so a
-// caller-supplied path would double-nest.
+// seedLockBody writes <agentID> into the project's coordinator.lock for
+// legacy fixture shapes. Resolves the root via state.Root() (honors
+// FLEET_HOME) rather than taking a path arg — the tui withFleetHome
+// returns the projects/ subdir, not the root, so a caller-supplied path
+// would double-nest.
 func seedLockBody(t *testing.T, project, agentID string) {
 	t.Helper()
 	root, err := state.Root()
@@ -148,12 +145,13 @@ func driveSpawn(t *testing.T, m Model) (coordSpawnDoneMsg, Model) {
 	return msg, updated.(Model)
 }
 
-// TestVeto_MarkerBackedLiveLeader_Attaches — exit 75 + an on-disk live
-// coord tagged coord-<project> (the marker-backed shape) → FindLiveCoord
-// resolves it and the TUI attaches; no error flash.
+// TestVeto_MarkerBackedLiveLeader_Attaches — exit 75 + Resolve names an
+// on-disk coord tagged coord-<project> (the marker-backed shape) → the TUI
+// attaches; no error flash.
 func TestVeto_MarkerBackedLiveLeader_Attaches(t *testing.T) {
 	withFleetHome(t)
 	seedProjectMeta(t, "demo", t.TempDir())
+	stubTUIResolveSpawnThenVetoAttach(t, "demo", "livecord")
 	restorePL := projectlookup.SetTestStubs(
 		func(s string) bool { return s == "fleet-livecord" },
 		func(s string) (bool, error) { return s == "fleet-livecord", nil },
@@ -199,25 +197,23 @@ func TestVetoExitCode_MatchesDispatchContract(t *testing.T) {
 	}
 }
 
-// TestVeto_MarkerlessLiveLeader_Attaches — exit 75 + a live coord with
-// task_id+project but NO coord-spawn marker (e.g. started from the
-// shell). The markerless FindLiveCoord still matches (this is the case
-// codex round-1 P1-A proves the marker-gated findExistingCoordForProject
-// would have DROPPED). Also asserts the coord-spawn marker is NOT
-// written (codex round-2 P1).
+// TestVeto_MarkerlessLiveLeader_Attaches — exit 75 + Resolve names a live
+// coord with task_id+project but NO coord-spawn marker (e.g. started from
+// the shell). Also asserts the coord-spawn marker is NOT written (codex
+// round-2 P1).
 func TestVeto_MarkerlessLiveLeader_Attaches(t *testing.T) {
 	withFleetHome(t)
 	seedProjectMeta(t, "demo", t.TempDir())
+	stubTUIResolveSpawnThenVetoAttach(t, "demo", "nomarker")
 	restorePL := projectlookup.SetTestStubs(
 		func(s string) bool { return s == "fleet-nomarker" },
 		func(s string) (bool, error) { return s == "fleet-nomarker", nil },
 		nil,
 	)
 	t.Cleanup(restorePL)
-	// No lease-identity stub → coordSpawnIdentityFn returns "" for the
-	// project (no coord holds the lease in this fresh FLEET_HOME), so the
-	// lease-gated findExistingCoordForProject would have bailed. The record
-	// is still tagged coord-<project> so the markerless FindLiveCoord matches.
+	// No lease-identity stub: the record is still tagged coord-<project>,
+	// but the veto callback trusts Resolve's owner verdict rather than the
+	// dashboard marker.
 	seedDiskCoord(t, "nomarker", "demo", coordTaskID("demo"))
 	(&stubSessionProbe{}).install(t)
 	markerWrites := stubMarkerWrite(t)
@@ -235,21 +231,21 @@ func TestVeto_MarkerlessLiveLeader_Attaches(t *testing.T) {
 	}
 }
 
-// TestVeto_LockBodyOnlyLiveLeader_Attaches — exit 75 + a live coord
-// whose tie to the project is ONLY the coordinator.lock body (its
-// task_id is NOT coord-<project>, so FindLiveCoord misses). The
-// FindCoordByLockBody fallback must resolve + attach.
+// TestVeto_LockBodyOnlyLiveLeader_Attaches — exit 75 + Resolve names a
+// live coord whose legacy fixture tie to the project is ONLY the
+// coordinator.lock body (its task_id is NOT coord-<project>).
 func TestVeto_LockBodyOnlyLiveLeader_Attaches(t *testing.T) {
 	withFleetHome(t)
 	seedProjectMeta(t, "demo", t.TempDir())
+	stubTUIResolveSpawnThenVetoAttach(t, "demo", "1c00d001")
 	restorePL := projectlookup.SetTestStubs(
 		func(s string) bool { return s == "fleet-1c00d001" },
 		func(s string) (bool, error) { return s == "fleet-1c00d001", nil },
 		nil,
 	)
 	t.Cleanup(restorePL)
-	// task_id intentionally NOT coord-demo → FindLiveCoord misses; only
-	// the lock body knows about this coord (manual/legacy spawn shape).
+	// task_id intentionally NOT coord-demo; the lock body models a
+	// manual/legacy spawn shape.
 	seedDiskCoord(t, "1c00d001", "demo", "manual-spawn")
 	seedLockBody(t, "demo", "1c00d001")
 	(&stubSessionProbe{}).install(t)
@@ -258,7 +254,7 @@ func TestVeto_LockBodyOnlyLiveLeader_Attaches(t *testing.T) {
 
 	msg, mm := driveSpawn(t, projectRowModelForVeto("demo"))
 	if !msg.attachedExisting {
-		t.Fatalf("lock-body-only live leader must attach via FindCoordByLockBody; got %+v", msg)
+		t.Fatalf("lock-body-only live leader must attach via Resolve owner; got %+v", msg)
 	}
 	if mm.pendingAttach != "fleet-1c00d001" {
 		t.Errorf("pendingAttach = %q; want fleet-1c00d001", mm.pendingAttach)
@@ -271,16 +267,16 @@ func TestVeto_LockBodyOnlyLiveLeader_Attaches(t *testing.T) {
 	}
 }
 
-// TestVeto_LiveCoordPreferredOverStaleLockBody — codex iter-9 [P2]: the
+// TestVeto_ResolveOwnerPreferredOverLockBodyDecoy — codex iter-9 [P2]: the
 // coordinator.lock body is NOT authoritative during a rotation window —
 // loop.py writes it under LOCK_EX but it is allowed to stay stale, so a
-// live PREDECESSOR can linger there. The attach must prefer the live
-// coord-<project> record (FindLiveCoord) over whatever the lock body
-// says, mirroring the CLI veto path. Here the lock body points at a
-// different (stale) id; FindLiveCoord's live coord must win.
-func TestVeto_LiveCoordPreferredOverStaleLockBody(t *testing.T) {
+// live PREDECESSOR can linger there. The attach must prefer Resolve's
+// owner verdict over whatever the lock body says. Here the lock body
+// points at a different id; Resolve's owner must win.
+func TestVeto_ResolveOwnerPreferredOverLockBodyDecoy(t *testing.T) {
 	withFleetHome(t)
 	seedProjectMeta(t, "demo", t.TempDir())
+	stubTUIResolveSpawnThenVetoAttach(t, "demo", "1eade001")
 	restorePL := projectlookup.SetTestStubs(
 		func(s string) bool { return s == "fleet-1eade001" || s == "fleet-deadbeef" },
 		func(s string) (bool, error) {
@@ -289,11 +285,10 @@ func TestVeto_LiveCoordPreferredOverStaleLockBody(t *testing.T) {
 		nil,
 	)
 	t.Cleanup(restorePL)
-	// 1eade001 is the live coord-<project> record (FindLiveCoord target).
+	// 1eade001 is Resolve's owner verdict.
 	seedDiskCoord(t, "1eade001", "demo", coordTaskID("demo"))
-	// deadbeef is only known via the (stale) lock body — NOT a
-	// coord-<project> record, so FindLiveCoord never sees it. Lock-body-
-	// first would wrongly attach it; FindLiveCoord-first must win.
+	// deadbeef is only known via the stale lock body. Lock-body-first
+	// would wrongly attach it; Resolve's owner verdict must win.
 	seedDiskCoord(t, "deadbeef", "demo", "stale-predecessor")
 	seedLockBody(t, "demo", "deadbeef")
 	(&stubSessionProbe{}).install(t)
@@ -304,7 +299,7 @@ func TestVeto_LiveCoordPreferredOverStaleLockBody(t *testing.T) {
 		t.Fatalf("veto must still attach; got %+v", msg)
 	}
 	if mm.pendingAttach != "fleet-1eade001" {
-		t.Errorf("pendingAttach = %q; want fleet-1eade001 (live coord must win over stale lock-body holder fleet-deadbeef)", mm.pendingAttach)
+		t.Errorf("pendingAttach = %q; want fleet-1eade001 (Resolve owner must win over lock-body holder fleet-deadbeef)", mm.pendingAttach)
 	}
 }
 
@@ -314,6 +309,7 @@ func TestVeto_LiveCoordPreferredOverStaleLockBody(t *testing.T) {
 func TestVeto_NoLiveRecord_RecoverableFlash(t *testing.T) {
 	withFleetHome(t)
 	seedProjectMeta(t, "demo", t.TempDir())
+	stubTUIResolveSpawnThenVetoWait(t, "demo", "winner still publishing")
 	restorePL := projectlookup.SetTestStubs(
 		func(s string) bool { return false },
 		func(s string) (bool, error) { return false, nil },
@@ -373,54 +369,6 @@ func TestVeto_NonVetoExit_PreservesBanner(t *testing.T) {
 	}
 }
 
-// TestVeto_ListStrictError_RecoverableNamesFault — codex iter-1 + iter-5
-// [P2]: a disk read failure during the post-veto re-resolve (e.g.
-// ~/.fleet/agents unreadable / not a dir) must be RECOVERABLE (exit 75
-// already proved a live coord exists, so a fatal banner would dead-end
-// the operator) yet NAME the real fault (not a generic "not visible
-// yet"). We force ListStrict to fail by replacing FLEET_HOME/agents with
-// a regular FILE so os.ReadDir returns ENOTDIR.
-func TestVeto_ListStrictError_RecoverableNamesFault(t *testing.T) {
-	withFleetHome(t)
-	seedProjectMeta(t, "demo", t.TempDir())
-	root, err := state.Root()
-	if err != nil {
-		t.Fatal(err)
-	}
-	// agents must be a FILE, not a dir → os.ReadDir errors (not
-	// IsNotExist), so agent.ListStrict returns a real error.
-	if werr := os.WriteFile(filepath.Join(root, "agents"), []byte("x"), 0o644); werr != nil {
-		t.Fatal(werr)
-	}
-	stubFleetCmdInvokesCallback(t, "spawn vetoed\n", exitErr(t, tuiCoordVetoExitCode))
-
-	msg, mm := driveSpawn(t, projectRowModelForVeto("demo"))
-	if msg.err != nil {
-		t.Fatalf("ListStrict failure must NOT be a fatal banner (dead-end); got err=%v", msg.err)
-	}
-	if msg.recoverable == "" {
-		t.Fatal("ListStrict failure must emit a recoverable flash")
-	}
-	// Must LEAD with the actionable retry/socket guidance (codex iter-8
-	// P2 — never let the disk diagnostic suppress it) and APPEND the read
-	// fault as a note (don't silo).
-	if !strings.Contains(msg.recoverable, "FLEET_TMUX_SOCKET") {
-		t.Errorf("recoverable flash must lead with retry/socket guidance; got %q", msg.recoverable)
-	}
-	if !strings.Contains(msg.recoverable, "reading ~/.fleet/agents failed") {
-		t.Errorf("recoverable flash must name the read fault as a note; got %q", msg.recoverable)
-	}
-	if msg.attachedExisting {
-		t.Error("ListStrict failure must not attach")
-	}
-	if mm.flash == nil || mm.flash.isErr {
-		t.Fatalf("expected recoverable (non-err) flash on disk read failure; got %+v", mm.flash)
-	}
-	if mm.pendingAttach != "" {
-		t.Errorf("pendingAttach = %q; want empty", mm.pendingAttach)
-	}
-}
-
 // TestSummarizeBadIDs_CapsLongLists — the corrupt-record flash must not
 // blow out the TUI render when ~/.fleet/agents has many unparseable
 // files (the project has a leaked-file history). Cap at 3 + "(and N
@@ -438,49 +386,6 @@ func TestSummarizeBadIDs_CapsLongLists(t *testing.T) {
 	}
 }
 
-// TestVeto_CorruptRecord_RecoverableNamesBadID — codex iter-5 [P2]: when
-// ListStrict returns badIDs (unparseable agent JSON) and neither
-// resolver matched, the live leader may BE one of the corrupt records —
-// every retry re-hits exit 75 forever. The recoverable flash must name
-// the corrupt record so the operator knows to fix ~/.fleet/agents/<id>.json
-// rather than mash [a].
-func TestVeto_CorruptRecord_RecoverableNamesBadID(t *testing.T) {
-	withFleetHome(t)
-	seedProjectMeta(t, "demo", t.TempDir())
-	// Write a corrupt agent record so ListStrict reports it in badIDs.
-	dir, err := state.AgentDir()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if mkerr := os.MkdirAll(dir, 0o755); mkerr != nil {
-		t.Fatal(mkerr)
-	}
-	if werr := os.WriteFile(filepath.Join(dir, "badc0de1.json"), []byte("{not valid json"), 0o644); werr != nil {
-		t.Fatal(werr)
-	}
-	stubFleetCmdInvokesCallback(t, "spawn vetoed\n", exitErr(t, tuiCoordVetoExitCode))
-
-	msg, mm := driveSpawn(t, projectRowModelForVeto("demo"))
-	if msg.err != nil {
-		t.Fatalf("corrupt record must not be a fatal banner; got err=%v", msg.err)
-	}
-	if msg.attachedExisting {
-		t.Error("corrupt record (no resolvable live coord) must not attach")
-	}
-	if !strings.Contains(msg.recoverable, "FLEET_TMUX_SOCKET") {
-		t.Errorf("recoverable flash must lead with retry/socket guidance, not be hijacked by the corrupt-record note (codex iter-8 P2); got %q", msg.recoverable)
-	}
-	if !strings.Contains(msg.recoverable, "corrupt") || !strings.Contains(msg.recoverable, "badc0de1") {
-		t.Errorf("recoverable flash must name the corrupt record id as a note; got %q", msg.recoverable)
-	}
-	if mm.flash == nil || mm.flash.isErr {
-		t.Fatalf("expected recoverable (non-err) flash; got %+v", mm.flash)
-	}
-	if mm.pendingAttach != "" {
-		t.Errorf("pendingAttach = %q; want empty", mm.pendingAttach)
-	}
-}
-
 // TestVeto_LeaderDiesBeforeAttach_RecoverableNoQuit — codex round-4
 // [P2]: the callback resolves a live leader, but it dies in the window
 // before Update handles the message. The model.go re-probe must catch
@@ -490,6 +395,7 @@ func TestVeto_CorruptRecord_RecoverableNamesBadID(t *testing.T) {
 func TestVeto_LeaderDiesBeforeAttach_RecoverableNoQuit(t *testing.T) {
 	withFleetHome(t)
 	seedProjectMeta(t, "demo", t.TempDir())
+	stubTUIResolveSpawnThenVetoAttach(t, "demo", "dyingcrd")
 	// projectlookup probe (callback-side) sees the leader alive so the
 	// callback resolves it...
 	restorePL := projectlookup.SetTestStubs(
@@ -532,10 +438,8 @@ func TestVeto_LeaderDiesBeforeAttach_RecoverableNoQuit(t *testing.T) {
 
 // TestVeto_CrossSocketLeader_RecoverableNotDeadAttach — codex iter-3
 // [P1]: the live coord is on a DIFFERENT tmux socket (wrong
-// FLEET_TMUX_SOCKET). FindLiveCoord still matches because the
-// projectlookup probe treats a tmux transport ERROR as "alive" (don't
-// drop a live claim on a hiccup), so the callback returns
-// attachedExisting=true. But the model.go DEFINITIVE re-probe
+// FLEET_TMUX_SOCKET). Resolve still names that owner, so the callback
+// returns attachedExisting=true. But the model.go DEFINITIVE re-probe
 // (sessionProbeFn) returns a transport error for the unreachable
 // session — so the TUI must NOT quit into a doomed tmux attach. Instead
 // it surfaces the cross-socket guidance (FLEET_TMUX_SOCKET) and stays in
@@ -543,9 +447,9 @@ func TestVeto_LeaderDiesBeforeAttach_RecoverableNoQuit(t *testing.T) {
 func TestVeto_CrossSocketLeader_RecoverableNotDeadAttach(t *testing.T) {
 	withFleetHome(t)
 	seedProjectMeta(t, "demo", t.TempDir())
-	// Callback-side projectlookup probe: alive=false but probe ERRORS →
-	// projectlookup's sessionAliveOrProbe treats the error as alive, so
-	// FindLiveCoord resolves the cross-socket coord.
+	stubTUIResolveSpawnThenVetoAttach(t, "demo", "xsocket01")
+	// Legacy projectlookup stubs are inert for Resolve, but keep the old
+	// fixture shape from the cross-socket regression.
 	restorePL := projectlookup.SetTestStubs(
 		func(s string) bool { return false },
 		func(s string) (bool, error) {
