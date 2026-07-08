@@ -1094,21 +1094,6 @@ func stubTUIResolveSpawnThenVetoWait(t *testing.T, projectName, reason string) {
 	t.Cleanup(func() { tuiCoordResolveFn = prevResolve })
 }
 
-func stubTUIResolveStandbyThenVetoWait(t *testing.T, projectName, reason string) {
-	t.Helper()
-	prevResolve := tuiCoordResolveFn
-	tuiCoordResolveFn = func(project, agentID string) (coordreconcile.Verdict, error) {
-		if project != projectName {
-			return coordreconcile.Verdict{Decision: coordreconcile.Wait, Reason: "test project mismatch"}, nil
-		}
-		if agentID == "" {
-			return coordreconcile.Verdict{Decision: coordreconcile.Wait, Reason: reason}, nil
-		}
-		return coordreconcile.Verdict{Decision: coordreconcile.SpawnStandby, Reason: "test standby"}, nil
-	}
-	t.Cleanup(func() { tuiCoordResolveFn = prevResolve })
-}
-
 // stubProjectTreeExists replaces projectTreeExistsFn for tests so we
 // don't need to seed real directories under FLEET_HOME just to exercise
 // the dashboard task_id fallback signal. Default returnVal=true so
