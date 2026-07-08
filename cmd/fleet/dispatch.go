@@ -1214,7 +1214,7 @@ func runDispatch(opts *dispatchOpts, stdout io.Writer) error {
 		//     with the unsubmitted-warning that fired during dispatch.
 		submitted := false
 		var perr error
-		if opts.coordSpawn && newDocPath != "" && coordLeaseSupported() {
+		if opts.coordSpawn && newDocPath != "" && coordLeaseSupported() && rec.LeaseWrapped {
 			var ownerRec *agent.Record
 			ownerRec, perr = deliverToCurrentOwner(handoffdelivery.Options{
 				Project: rec.Project,

@@ -210,7 +210,7 @@ var propagatedRuntimeEnv = []string{
 	"FLEET_COORD_IN_TURN_SUPERVISOR",
 }
 
-// leaseSupported gates whether Spawn wraps a coord in the
+// leaseSupervisorAvailable gates whether Spawn wraps a coord in the
 // `fleet coord-run` lease supervisor. It is build-tagged:
 //
 //   - linux||darwin (spawn_lease_unix.go): true; the lease primitive is
@@ -220,10 +220,15 @@ var propagatedRuntimeEnv = []string{
 //     promises the legacy bare-child path, so Spawn must NOT lease-wrap
 //     (codex PR4 [P2]).
 //
-// Splitting by build tag keeps the all-platform spawn.go free of a hard
-// coordlock import (which would break non-unix builds) while preventing the
-// lease wrapper from wrapping coords on a platform where the supervisor
-// can't actually hold a lease.
+// Splitting platform support by build tag keeps the all-platform spawn.go free
+// of a hard coordlock import (which would break non-unix builds). The real-tmux
+// backend check keeps fake-backed tests on the bare path: the fake records the
+// argv but does not execute `fleet coord-run`, so a fake-wrapped coord would
+// never acquire/stamp the lease and downstream owner delivery would poll until
+// timeout.
+func leaseSupervisorAvailable() bool {
+	return leaseSupported() && tmux.IsRealBackend()
+}
 
 // DefaultStandbyTimeout is the single generous bound every lease-wrapped
 // coordinator spawn passes to `fleet coord-run --standby`.
@@ -1076,7 +1081,7 @@ func Spawn(opts Options) (*agent.Record, error) {
 	// opt out with DisableLeaseWrap because it must start a bare successor
 	// while the old leader is still live.
 	leaseWrapped := false
-	if shouldLeaseWrap(leaseSupported(), isCoordSpawn(rec.TaskID, rec.Project), opts.DisableLeaseWrap) {
+	if shouldLeaseWrap(leaseSupervisorAvailable(), isCoordSpawn(rec.TaskID, rec.Project), opts.DisableLeaseWrap) {
 		standbyTimeout := standbyTimeoutOrDefault(opts.StandbyTimeout)
 		switch {
 		case alreadyCoordRunWrapped(execArgv):

@@ -542,6 +542,9 @@ func TestRunDispatch_DeadCoord_Recovers(t *testing.T) {
 	if successor == nil {
 		t.Fatalf("expected a successor coord on disk; got %d live records (%+v)", len(live), live)
 	}
+	if successor.LeaseWrapped {
+		t.Fatal("fake-backed recovered coord recorded LeaseWrapped=true, want false")
+	}
 	t.Cleanup(func() {
 		// Best-effort cleanup of the successor's tmux session — the
 		// test launched a real sleep/60 inside it via spawn.Spawn.
