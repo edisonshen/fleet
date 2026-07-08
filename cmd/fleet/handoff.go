@@ -23,26 +23,9 @@ import (
 	"github.com/edisonshen/fleet/internal/tmux"
 )
 
-// handoffSessionPrefix is the literal session-name-prefix that
-// internal/handoff.FirstAction's bash bootstrap passes to the
-// `claude remote-control` daemon
-// (`--remote-control-session-name-prefix "fleet-handoff"`). The
-// handoff replacement spawn injects `--remote-control
-// "fleet-handoff-<new-id>"` so the freshly-spawned claude latches
-// onto that daemon at startup, skipping the round-trip through
-// FirstAction's manual `/remote-control` slash command.
-//
-// Why we still keep FirstAction's bash + slash-command instructions
-// in the handoff doc: belt-and-braces. The bash block bootstraps
-// the daemon if it isn't already running (handoff replacement is
-// often the FIRST process on the host to need that daemon) and the
-// slash command is a recovery path if for any reason the spawn-time
-// flag didn't latch. Both paths converge on the same daemon prefix.
-//
-// Keep byte-identical with the literal in
-// internal/handoff/handoff.go FirstAction's bash block — drift would
-// silently regress mobile pairing on handoff. A regression test in
-// the same package pins the equality.
+// handoffSessionPrefix is retained for the legacy handoff RC session-name
+// helper and its tests. Production coord handoffs now use the centralized
+// spawn.Spawn coord injector and therefore the fleet-coord session shape.
 const handoffSessionPrefix = "fleet-handoff"
 
 // handoffOpts captures cobra-parsed flags + positional arg.
@@ -853,67 +836,15 @@ func runHandoff(opts *handoffOpts, stdout, stderr io.Writer) error {
 	//    (codex review iter-13 P2). Operators who want a true
 	//    one-shot must re-pass the flag on the next handoff.
 	//
-	// Remote-control auto-attach for handoff replacements
-	// (fix/remote-control-coord-injection P0): the replacement spawn
-	// gets `--remote-control "fleet-handoff-<new-id>"` injected into
-	// its claude argv, parallel to the coord-spawn path in
-	// dispatch.go. The session prefix is `fleet-handoff` (not
-	// `fleet-coord`) so the replacement attaches to the handoff
-	// daemon that internal/handoff.FirstAction's bash block boots.
-	//
-	// The persisted rec.Command stays the clean `command` (so a
-	// subsequent handoff doesn't inherit a stale --remote-control
-	// "fleet-handoff-<old-id>"); ExecCommand carries the per-spawn
-	// rewrite. injectRemoteControlFlag returns the slice unchanged
-	// for non-default --command shapes so an operator-supplied
-	// scripted pipeline / alt engine isn't silently mutated.
-	// Project-first prefix (rc-session-name-include): the operator-
-	// visible handoff session name on claude.ai mobile / web is
-	// `fleet-handoff-<project>-<new-id>` so successor agents from
-	// different projects can be distinguished. The project comes
-	// BEFORE the id so the registered session name STARTS WITH the
-	// per-project daemon prefix `fleet-handoff-<project>` that
-	// internal/handoff.FirstAction renders into the bash bootstrap
-	// (the Claude remote-control daemon only attaches sessions whose
-	// name starts with its --remote-control-session-name-prefix).
-	//
-	// codex round-6 P1 (historical): session names use the coord shape
-	// (`fleet-coord-<id>-<project>`) so fresh-spawn and handoff
-	// replacements are uniform on claude.ai / mobile.
-	//
-	// Native model: the replacement coord gets `--remote-control` baked
-	// into its exec argv by DEFAULT — no marker write, no opt-in. The
-	// only suppressors inside injectRemoteControlFlagProject are the
-	// rc-disabled opt-out marker (`fleet rc down <project>`) and the
-	// FLEET_RC_BOOTSTRAP_DISABLED env-gate.
-	//
-	// codex review iter-1 [P1] + iter-5 [P1] (kept): gate the inject on
-	// isCoordHandoffForProject. `fleet handoff` runs for BOTH coord and
-	// worker handoffs (same code path; agent type comes from oldRec),
-	// and workers / Agent-tool subagents must NEVER carry
-	// --remote-control — the push-storm protection lives at this
-	// call-site gate, not in a marker.
-	//
-	// Detect coord via spawn.IsCoordSpawn (the task-based coord detector);
-	// skip on workers.
-	var rewrittenExecArgv []string
-	if isCoordHandoffForProject(oldRec) {
-		rcSessionName := buildCoordRemoteControlSessionName(newID, oldRec.Project)
-		rewritten := injectRemoteControlFlagProject(command, rcSessionName, oldRec.Project)
-		// Only set ExecCommand when the rewrite actually changed
-		// something — passing through an unchanged custom --command
-		// avoids a no-op Command/ExecCommand divergence in spawn.Options.
-		if !sameCommand(rewritten, command) {
-			rewrittenExecArgv = rewritten
-		}
-	}
+	// Native coord RC is centralized in spawn.Spawn. This call site passes the
+	// clean command for both coords and workers; spawn.Spawn gates injection on
+	// the successor's coord identity so worker handoffs never receive RC.
 
 	newRec, err := handoffSpawnFn(spawn.Options{
 		OldRecord:         oldRec,
 		NewDocPath:        docPath,
 		Cwd:               cwd,
 		Command:           command,
-		ExecCommand:       rewrittenExecArgv,
 		PreAllocatedID:    newID,
 		DisableAutoResume: thisHandoffDisableAutoResume,
 		StandbyTimeout:    spawn.DefaultStandbyTimeout,

@@ -21,6 +21,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/edisonshen/fleet/internal/spawn"
 	"github.com/spf13/pflag"
 )
 
@@ -154,7 +155,7 @@ func TestCoordSpawn_RemoteControlInjection_IncludesProjectInArgv(t *testing.T) {
 	const agentID = "1a2b3c4d"
 	const project = "tatoosh"
 	rcSessionName := buildCoordRemoteControlSessionName(agentID, project)
-	rewritten := injectRemoteControlFlag(defaultCmd, rcSessionName)
+	rewritten := spawn.InjectRemoteControlFlag(defaultCmd, rcSessionName)
 
 	want := `--remote-control "fleet-coord-1a2b3c4d-tatoosh"`
 	if !strings.Contains(rewritten[2], want) {
@@ -180,7 +181,7 @@ func TestHandoff_RemoteControlInjection_IncludesProjectInArgv(t *testing.T) {
 	const newID = "feedface"
 	const project = "fleet"
 	rcSessionName := buildHandoffRemoteControlSessionName(newID, project)
-	rewritten := injectRemoteControlFlag(defaultCmd, rcSessionName)
+	rewritten := spawn.InjectRemoteControlFlag(defaultCmd, rcSessionName)
 
 	want := `--remote-control "fleet-handoff-fleet-feedface"`
 	if !strings.Contains(rewritten[2], want) {

@@ -31,10 +31,10 @@
 //
 // The surfaces covered here:
 //
-//   - injectRemoteControlFlagProject (dispatch.go) — env-gate AND
-//     opt-out gate; used by coord-spawn, recovery, and handoff.
+//   - spawn.CoordRCInjector (wired by cmd/fleet) — env-gate AND
+//     opt-out gate; used by the centralized coord-spawn seam.
 //   - rc.GateAttachFlag (internal/rc) — same two-layer gate, the
-//     handoffop drain chokepoint.
+//     gate primitive underneath the wiring seam.
 //
 // Any new attach surface added without going through one of these
 // helpers MUST add a sibling test here.
@@ -47,6 +47,7 @@ import (
 	"testing"
 
 	"github.com/edisonshen/fleet/internal/rc"
+	"github.com/edisonshen/fleet/internal/spawn"
 )
 
 // TestRCInvariant_NativeDefaultOn_OptOutHonored_NoListenerSpawn is THE
@@ -74,8 +75,8 @@ func TestRCInvariant_NativeDefaultOn_OptOutHonored_NoListenerSpawn(t *testing.T)
 		name string
 		fn   func(project string) []string
 	}{
-		{"injectRemoteControlFlagProject", func(p string) []string {
-			return injectRemoteControlFlagProject(defaultArgv, sessionName, p)
+		{"spawn.CoordRCInjector", func(p string) []string {
+			return spawn.CoordRCInjector(p, "deadbeef", defaultArgv)
 		}},
 		{"rc.GateAttachFlag", func(p string) []string {
 			return rc.GateAttachFlag(p, defaultArgv, sessionName)
@@ -99,8 +100,8 @@ func TestRCInvariant_NativeDefaultOn_OptOutHonored_NoListenerSpawn(t *testing.T)
 	if err := rc.WriteDisabledMarker("demo"); err != nil {
 		t.Fatalf("WriteDisabledMarker: %v", err)
 	}
-	if got := injectRemoteControlFlagProject(defaultArgv, sessionName, "demo"); !sameArgvHelper(got, defaultArgv) {
-		t.Errorf("injectRemoteControlFlagProject(demo): rc-disabled marker MUST suppress inject; got %v", got)
+	if got := spawn.CoordRCInjector("demo", "deadbeef", defaultArgv); !sameArgvHelper(got, defaultArgv) {
+		t.Errorf("spawn.CoordRCInjector(demo): rc-disabled marker MUST suppress inject; got %v", got)
 	}
 	if got := rc.GateAttachFlag("demo", defaultArgv, sessionName); !sameArgvHelper(got, defaultArgv) {
 		t.Errorf("rc.GateAttachFlag(demo): rc-disabled marker MUST suppress inject; got %v", got)
@@ -112,8 +113,8 @@ func TestRCInvariant_NativeDefaultOn_OptOutHonored_NoListenerSpawn(t *testing.T)
 	// Invariant 4 — env-gate beats default-on (the test suite's global
 	// hygiene guarantee).
 	t.Setenv("FLEET_RC_BOOTSTRAP_DISABLED", "1")
-	if got := injectRemoteControlFlagProject(defaultArgv, sessionName, "demo"); !sameArgvHelper(got, defaultArgv) {
-		t.Errorf("injectRemoteControlFlagProject(demo): env-gate MUST suppress inject; got %v", got)
+	if got := spawn.CoordRCInjector("demo", "deadbeef", defaultArgv); !sameArgvHelper(got, defaultArgv) {
+		t.Errorf("spawn.CoordRCInjector(demo): env-gate MUST suppress inject; got %v", got)
 	}
 	if got := rc.GateAttachFlag("demo", defaultArgv, sessionName); !sameArgvHelper(got, defaultArgv) {
 		t.Errorf("rc.GateAttachFlag(demo): env-gate MUST suppress inject; got %v", got)

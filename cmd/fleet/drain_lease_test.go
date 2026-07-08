@@ -33,6 +33,7 @@ import (
 	"github.com/edisonshen/fleet/internal/coordlock"
 	"github.com/edisonshen/fleet/internal/queue"
 	"github.com/edisonshen/fleet/internal/state"
+	"github.com/edisonshen/fleet/internal/testutil/tmuxfake"
 	"github.com/edisonshen/fleet/internal/testutil/tmuxtest"
 )
 
@@ -1180,6 +1181,57 @@ func TestDrainLease_TakeoverDoesNotHoldLockAcrossKill(t *testing.T) {
 	}
 	if atomic.LoadInt32(&recovered) != 1 {
 		t.Errorf("RecoverSpawn ran %d times, want 1 (successor recovered under the SHORT post-takeover lock)", recovered)
+	}
+}
+
+func TestProductionRecoverSpawn_CoordGetsCentralRemoteControl(t *testing.T) {
+	fakeTmux := tmuxfake.InstallFake(t)
+	fleetHome := setupFleetHome(t)
+	t.Setenv("FLEET_RC_BOOTSTRAP_DISABLED", "")
+	wireCoordRCInjector()
+
+	const project = "rainier"
+	cwd := seedRecoveryRepo(t, fleetHome, project)
+	oldRec := agent.New("oldcoord1")
+	oldRec.Project = project
+	oldRec.TaskID = "coord-" + project
+	oldRec.Cwd = cwd
+	oldRec.Command = []string{"sh", "-c", "claude --print"}
+
+	origReady := recoverWaitForReadyFn
+	origAlive := recoverSessionAliveFn
+	origPrompt := recoverSendPromptVerifiedFn
+	origCurrentOwner := recoverCurrentOwnerFn
+	t.Cleanup(func() {
+		recoverWaitForReadyFn = origReady
+		recoverSessionAliveFn = origAlive
+		recoverSendPromptVerifiedFn = origPrompt
+		recoverCurrentOwnerFn = origCurrentOwner
+	})
+	recoverWaitForReadyFn = func(string) error { return nil }
+	recoverSessionAliveFn = func(string) (bool, error) { return true, nil }
+	recoverSendPromptVerifiedFn = func(string, string) (bool, error) { return true, nil }
+	recoverCurrentOwnerFn = func(string) (coordlock.Owner, bool) {
+		return coordlock.Owner{AgentID: "newrc123", PID: 4242, PidStart: 99}, true
+	}
+
+	if err := productionRecoverSpawn(oldRec, "/tmp/handoff.md", "newrc123", false, &bytes.Buffer{}, &bytes.Buffer{}); err != nil {
+		t.Fatalf("productionRecoverSpawn: %v", err)
+	}
+
+	execArgv := fakeTmux.SessionCommand("fleet-newrc123")
+	joined := strings.Join(execArgv, " ")
+	want := `--remote-control "fleet-coord-newrc123-rainier"`
+	if !strings.Contains(joined, want) {
+		t.Fatalf("productionRecoverSpawn exec argv missing %q: %v", want, execArgv)
+	}
+
+	rec, err := agent.Load("newrc123")
+	if err != nil {
+		t.Fatalf("load successor: %v", err)
+	}
+	if strings.Contains(strings.Join(rec.Command, " "), "--remote-control") {
+		t.Fatalf("persisted command must stay clean; got %v", rec.Command)
 	}
 }
 
