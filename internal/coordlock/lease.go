@@ -4,16 +4,13 @@
 // pid_start / monotonic-clock / boot-id reads. Gate the whole file (and
 // its tests) to those two GOOS values so non-linux/darwin Unix targets
 // (e.g. FreeBSD) don't compile a lease.go whose platform hooks are
-// undefined. PR1's failover path is dev-only behind FLEET_LEASE_FAILOVER;
-// adding more platforms is a later PR if ever needed.
+// undefined. Adding more platforms is a later PR if ever needed.
 
 package coordlock
 
 // lease.go — the three-file coordinator lease primitive (PR1 of the
 // DESIGN-handoff-drain-storm-leak stack). PRIMITIVE ONLY: nothing here is
 // wired into the live coord/handoff/drain paths (that is PR2-PR6).
-// Everything is gated behind FLEET_LEASE_FAILOVER (default OFF), so this
-// merge does not change production behavior.
 //
 // A lease = lock + TTL + heartbeat + fencing token. The current flock has
 // the lock but none of the other three, so it detects a *dead* holder
@@ -50,30 +47,12 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"strings"
 	"syscall"
 	"time"
 
 	"github.com/edisonshen/fleet/internal/fleetlog"
 	"github.com/edisonshen/fleet/internal/state"
 )
-
-// FailoverEnvVar gates the whole lease path. As of PR4 the default is ON:
-// the lease/STONITH/RPO machinery is live unless FLEET_LEASE_FAILOVER is
-// EXPLICITLY disabled (=0/false/off/no). PR1-PR3 kept it OFF-by-default
-// while the fencing + RPO coverage was incomplete; PR4 completes that
-// coverage and flips the default so the headline failover is supported.
-const FailoverEnvVar = "FLEET_LEASE_FAILOVER"
-
-// ErrFailoverDisabled is returned by lease entry points when
-// FLEET_LEASE_FAILOVER is EXPLICITLY disabled (=0/false/off/no). With the
-// PR4 flip this is now the reversibility escape hatch ("spawn exactly as
-// pre-lease"), not the default. Surface-don't-silo: callers get a typed
-// refusal so they take the legacy bare-child path rather than silently
-// no-op the lease.
-var ErrFailoverDisabled = errors.New(
-	"coordlock: lease failover is explicitly disabled (FLEET_LEASE_FAILOVER=0); " +
-		"running the legacy bare-child path")
 
 // Lease state machine. `active` is the only state in which a holder may
 // serve / heartbeat / hold the flock as owner. The two transient states
@@ -372,41 +351,20 @@ func resolvePaths(project string) (leasePaths, error) {
 	}, nil
 }
 
-// FailoverEnabled reports whether the lease/STONITH/RPO failover path is
-// selected. As of PR4 the default is ON: it is enabled unless
-// FLEET_LEASE_FAILOVER is EXPLICITLY one of the disable tokens
-// (0/false/off/no, case-insensitive). Unset/empty/any other value -> ON.
-//
-// This is the SINGLE source of truth for the flag's tri-state semantics —
-// the cmd/fleet + internal/spawn mirrors call this exported helper so the
-// "default ON, =0 still off, reversible" contract can never drift across
-// the four former copies (codex: drift between flag parsers reopens the
-// half-fenced window the flip is supposed to close).
+// FailoverEnabled reports whether this build supports the coordinator
+// lease/STONITH/RPO path. On linux/darwin the answer is always true; other
+// platforms compile lease_owner_other.go's false stub because the pid-start /
+// monotonic-clock primitives are not available there.
 func FailoverEnabled() bool {
-	return parseFailover(os.Getenv(FailoverEnvVar))
+	return true
 }
-
-// parseFailover is the pure tri-state parse: explicit disable token -> OFF;
-// everything else (including unset/empty) -> ON. Kept separate so a test
-// can drive it without touching the environment.
-func parseFailover(v string) bool {
-	switch strings.ToLower(strings.TrimSpace(v)) {
-	case "0", "false", "off", "no":
-		return false
-	default:
-		return true
-	}
-}
-
-// failoverEnabled is the unexported alias the lease internals use.
-func failoverEnabled() bool { return FailoverEnabled() }
 
 // AcquireLease tries to become the leader for project. It is the
-// production entry point and refuses unless FLEET_LEASE_FAILOVER is on.
+// production entry point on lease-capable platforms.
 //
 //	acquired=true,  lease!=nil  -> caller is the leader (start heartbeat)
 //	acquired=false, lease==nil  -> a healthy live leader exists; stand down
-//	err!=nil                    -> something went wrong (or failover off)
+//	err!=nil                    -> something went wrong
 //
 // AcquireLease uses the PR1 no-op kill stub for the takeover STONITH
 // step. PR2's coord-run supervisor calls AcquireLeaseWithKill instead so
@@ -459,8 +417,7 @@ type LiveHolder struct {
 // kill callback for the takeover STONITH step. kill==nil falls back to
 // the PR1 no-op stub (lock-only semantics; the takeover then relies on
 // the old holder dying on its own + the kernel flock release, which is
-// the correct behavior when no real kill primitive is wired). Refuses
-// unless FLEET_LEASE_FAILOVER is on.
+// the correct behavior when no real kill primitive is wired).
 //
 // Return shape (KP6): live is non-empty ONLY on the pre-fence stand-down
 // — a staleness-triggered takeover found a prospective kill target still
@@ -489,13 +446,10 @@ func AcquireLeaseTakeover(project, agentID string, kill func(KillTarget) error) 
 	return acquireLeaseWithKill(project, agentID, kill, false /* logLifecycle */)
 }
 
-// acquireLeaseWithKill is the shared failover-gated core. logLifecycle=true is
+// acquireLeaseWithKill is the shared lease-acquire core. logLifecycle=true is
 // the real-coordinator path (AcquireLeaseWithKill); false is the takeover-only
 // path (AcquireLeaseTakeover), which suppresses ownership-transition logs.
 func acquireLeaseWithKill(project, agentID string, kill func(KillTarget) error, logLifecycle bool) (*Lease, bool, []LiveHolder, error) {
-	if !failoverEnabled() {
-		return nil, false, nil, ErrFailoverDisabled
-	}
 	cfg := defaultLeaseConfig()
 	cfg.logLifecycle = logLifecycle
 	// The real-coordinator acquire (logLifecycle=true) starts in `starting`
@@ -521,7 +475,7 @@ func acquireLeaseWithKill(project, agentID string, kill func(KillTarget) error, 
 	return acquireLeaseDetect(project, agentID, cfg)
 }
 
-// acquireLease is the failover-gate-free core with the legacy 3-value
+// acquireLease is the internal core with the legacy 3-value
 // shape (the internal test-suite entry point). Detection is dropped —
 // callers that need the KP6 live-holder result use acquireLeaseDetect.
 func acquireLease(project, agentID string, cfg leaseConfig) (*Lease, bool, error) {
@@ -529,7 +483,7 @@ func acquireLease(project, agentID string, cfg leaseConfig) (*Lease, bool, error
 	return l, acquired, err
 }
 
-// acquireLeaseDetect is the failover-gate-free core, parameterized by
+// acquireLeaseDetect is the core acquisition path, parameterized by
 // config so tests inject deterministic seams. See AcquireLease for the
 // base contract and AcquireLeaseWithKill for the live-holder detection
 // contract (KP6).

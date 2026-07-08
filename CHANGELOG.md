@@ -26,7 +26,7 @@ of `claude --remote-control` baked into the spawn argv), an
 append-safe watcher→coord message channel (`watchchan`) is added, and
 graceful handoff gains a real completion phase. CI hardening continues:
 the test hang is killed, the suite is fenced and de-heavied to run in
-under three minutes, and the lease-failover fork-bomb is fixed.
+under three minutes, and the lease-supervisor fork-bomb is fixed.
 
 ### Added
 
@@ -69,7 +69,7 @@ under three minutes, and the lease-failover fork-bomb is fixed.
   (#232).
 - CI test hang killed and runtime capped (#233); the suite is moved
   in-process with a fake tmux and `cmd/fleet` de-heavied to land CI
-  under three minutes (#234); lease-failover coord-spawn tests are
+  under three minutes (#234); lease-supervisor coord-spawn tests are
   fenced out of the default lane to fix the fork-bomb (#235).
 
 ## [0.13.0] - 2026-06-08
@@ -81,8 +81,8 @@ fence so exactly one coordinator owns a project at a time. The whole
 handoff path moves behind a `*WithLease` boundary with a recovery-point
 objective and producer back-off, warm-standby graceful handoff
 collapses the old drain army into a single successor, and
-`FLEET_LEASE_FAILOVER` flips ON by default. Coordinator repo binding is
-rebuilt around one shared resolver (Design 3): a `fleet project
+lease-capable platforms always run through the coordinator lease path.
+Coordinator repo binding is rebuilt around one shared resolver (Design 3): a `fleet project
 resolve-repo` CLI with an explicit `--project` flag and fingerprint
 stamp, every call site routed through the resolver with the cwd
 fallbacks deleted, and the Python repo-binding ladder retired in favor
@@ -99,8 +99,8 @@ gains continuous ~1-minute auto-remediation.
 - Three-file coordinator lease primitive with bounded acquire, wired
   into `fleet coord-run` with lease hold, heartbeat, and STONITH fence
   (#218, #219). The handoff path moves behind a `*WithLease` boundary
-  with an RPO and producer back-off, and `FLEET_LEASE_FAILOVER` flips
-  ON by default (#222).
+  with an RPO and producer back-off, and lease-capable platforms always
+  run through the coordinator lease path (#222).
 - Warm-standby graceful handoff that collapses the multi-process drain
   army into a single live successor (#221).
 - `fleet project resolve-repo` CLI with an explicit `--project` flag

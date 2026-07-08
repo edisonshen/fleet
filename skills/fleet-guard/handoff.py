@@ -544,8 +544,8 @@ def _do_handoff(record: dict[str, Any], session: str,
     prev_path: str | None = prev_raw if isinstance(prev_raw, str) and prev_raw else None
 
     # (a) FENCE (correctness — DESIGN-handoff-drain-storm-leak PR4 item 10a).
-    # Under FLEET_LEASE_FAILOVER, a COORD that was FENCED (a successor took
-    # over its lease) must NOT write a handoff doc / enqueue — that would be
+    # A COORD that was FENCED (a successor took over its lease) must NOT write
+    # a handoff doc / enqueue — that would be
     # a zombie producer write the new leader's state would have to reconcile.
     # Prove parent-lease ownership exactly as the supervisor tick does
     # (via `fleet lease-check`); a fenced producer is REFUSED, not merely
@@ -1312,14 +1312,6 @@ _LEASE_CHECK_NOT_OWNER_EXIT = 3
 _LEASE_CHECK_TIMEOUT_S = 5.0
 
 
-def _lease_failover_enabled() -> bool:
-    """Mirror coordlock.FailoverEnabled's tri-state gate (PR4 default ON):
-    enabled unless FLEET_LEASE_FAILOVER is EXPLICITLY 0/false/off/no
-    (case-insensitive)."""
-    return (os.environ.get("FLEET_LEASE_FAILOVER", "") or "").strip().lower() \
-        not in ("0", "false", "off", "no")
-
-
 def _lease_check_unknown_command(stderr_text: str) -> bool:
     """True if a `fleet lease-check` exit-1 was an UNKNOWN-COMMAND error (the
     installed binary is too old to have the subcommand) vs a genuine internal
@@ -1338,10 +1330,10 @@ def _producer_fenced(project: str) -> bool:
       - exit 1 that is a genuine INTERNAL error (e.g. corrupt coordinator.epoch)
         — "cannot prove ownership" -> fail CLOSED (codex PR4 [P1]).
     Fails OPEN (returns False) only when there is no lease machinery to fence
-    against: failover off, the binary absent (FileNotFoundError), a too-old
-    binary lacking the subcommand (exit-1 unknown-command), or a timeout. A
-    transient/legacy environment must not wedge a healthy coord."""
-    if not _lease_failover_enabled() or not project:
+    against: the binary absent (FileNotFoundError), a too-old binary lacking the
+    subcommand (exit-1 unknown-command), or a timeout. A transient/legacy
+    environment must not wedge a healthy coord."""
+    if not project:
         return False
     env = dict(os.environ)
     env["FLEET_HOME"] = str(health.fleet_home())

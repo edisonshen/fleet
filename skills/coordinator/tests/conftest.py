@@ -92,8 +92,8 @@ def _stub_lease_check(monkeypatch):
     """Default: the parent-lease ownership proof returns "owner".
 
     DESIGN-handoff-drain-storm-leak PR4 made `loop.tick` prove parent-lease
-    ownership by shelling out to `fleet lease-check` (FLEET_LEASE_FAILOVER
-    defaults ON). The vast majority of coordinator tests exercise UNRELATED
+    ownership by shelling out to `fleet lease-check`. The vast majority of
+    coordinator tests exercise UNRELATED
     tick behavior and don't model a coord-run lease supervisor parent — they
     must not shell out for the proof, nor pay for a real epoch read. This
     autouse fixture substitutes the seam with a stub that returns "owner"

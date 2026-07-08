@@ -23,7 +23,7 @@ func assertNoStandbyLaunches(code int) {
 		fmt.Fprintf(os.Stderr,
 			"FORK-BOMB GATE: default test lane launched %d lease-wrapped standby "+
 				"coordinator(s); a standby-spawning test must move to the integration "+
-				"lane (//go:build integration + t.Setenv(\"FLEET_LEASE_FAILOVER\",\"1\")). "+
+				"lane (//go:build integration). "+
 				"See docs/DESIGN-spawn-test-fork-bomb-root-fix.md.\n", n)
 		if code == 0 {
 			code = 1

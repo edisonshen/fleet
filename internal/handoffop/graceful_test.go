@@ -520,19 +520,13 @@ func TestGracefulHandoff_PrepareOnly_NoCompletionSeams_StopsAtBarrier(t *testing
 
 // ---------------------------------------------------------------------------
 // GracefulSwapEligible — the route gate for converging the live-coord
-// handoff paths onto the barrier (§6 PR3). True only when failover is on,
-// OLD is the project's CURRENT healthy lease owner (a live-coord handoff,
-// not a dead-coord recovery) and the doc will be auto-delivered.
+// handoff paths onto the barrier (§6 PR3). True only when this platform
+// supports leases, OLD is the project's CURRENT healthy lease owner
+// (a live-coord handoff, not a dead-coord recovery), and the doc will be
+// auto-delivered.
 // ---------------------------------------------------------------------------
 
 func TestGracefulSwapEligible(t *testing.T) {
-	// GracefulSwapEligible gates on leaseFailoverEnabled(). PR-A's TestMain now
-	// forces FLEET_LEASE_FAILOVER=0 package-wide (fork-bomb guard), so pin =1
-	// here to exercise the failover-ON eligibility logic. This test stubs the
-	// owner lookup and never spawns — the guard's =0 default only matters for
-	// tests that would lease-wrap a coord into a standby, which this is not.
-	// The "failover off -> not eligible" sub-case sets =0 itself, overriding this.
-	t.Setenv("FLEET_LEASE_FAILOVER", "1")
 	old := oldRecForGraceful()
 	swapOwner := func(t *testing.T, fn func(string) (coordlock.Owner, bool)) {
 		t.Helper()
@@ -571,13 +565,6 @@ func TestGracefulSwapEligible(t *testing.T) {
 		swapOwner(t, ownerIsOld)
 		if GracefulSwapEligible(old, false) {
 			t.Fatal("want not-eligible when auto-resume is off")
-		}
-	})
-	t.Run("failover off -> not eligible", func(t *testing.T) {
-		swapOwner(t, ownerIsOld)
-		t.Setenv("FLEET_LEASE_FAILOVER", "0")
-		if GracefulSwapEligible(old, true) {
-			t.Fatal("want not-eligible with FLEET_LEASE_FAILOVER=0")
 		}
 	})
 	t.Run("nil / projectless record -> not eligible", func(t *testing.T) {

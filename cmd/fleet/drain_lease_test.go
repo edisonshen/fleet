@@ -831,7 +831,7 @@ func TestDrainLease_TakeoverNotAcquired_NoRecoverSpawn(t *testing.T) {
 	}
 }
 
-// codex PR3 iter-1 [P2]: failover on, NO lease epoch for the project (stealable
+// codex PR3 iter-1 [P2]: lease-capable path, NO lease epoch for the project (stealable
 // / cold) -> cold-spawn the successor via a bounded Resume (NOT a takeover
 // loop that never spawns a replacement).
 func TestDrainLease_NoEpochColdSpawnsViaResume(t *testing.T) {

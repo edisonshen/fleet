@@ -20,7 +20,7 @@ import (
 // ---- test harness ----
 //
 // The lease primitive is exercised through acquireLease (the
-// failover-gate-free core) with an injected leaseConfig. All seams are
+// internal core) with an injected leaseConfig. All seams are
 // deterministic: a fake monotonic clock the test advances, a fake
 // pid-liveness map, a fixed boot-id, and a controllable kill-stub. No
 // time.Sleep-based timing assertions.
@@ -1021,39 +1021,13 @@ func TestIdleLeaderHeartbeatRenewsAcrossIntervals(t *testing.T) {
 	}
 }
 
-// ---- Failover gate ----
-
-// TestAcquireLeaseRefusesWhenFailoverDisabled: T41 — with the PR4 flip the
-// flag is ON by default, so the ONLY way to get the legacy bare-child path
-// is to EXPLICITLY disable it (=0). The entry point then refuses with
-// ErrFailoverDisabled so the caller runs as pre-lease. Proves the flip is
-// reversible.
-func TestAcquireLeaseRefusesWhenFailoverDisabled(t *testing.T) {
+// TestAcquireLeasePublicEntryStartsLease: the public real-coordinator entry
+// point always uses the lease on supported platforms.
+func TestAcquireLeasePublicEntryStartsLease(t *testing.T) {
 	setupHome(t)
-	for _, off := range []string{"0", "false", "off", "no", "FALSE", "Off"} {
-		t.Run(off, func(t *testing.T) {
-			t.Setenv(FailoverEnvVar, off)
-			_, _, err := AcquireLease("rainier", "cand")
-			if err == nil {
-				t.Fatalf("AcquireLease must refuse when FLEET_LEASE_FAILOVER=%q", off)
-			}
-			if err.Error() != ErrFailoverDisabled.Error() {
-				t.Fatalf("expected ErrFailoverDisabled, got %v", err)
-			}
-		})
-	}
-}
-
-// TestAcquireLeaseDefaultsOnWhenUnset: T40 — with no FLEET_LEASE_FAILOVER
-// set (the PR4 default), the lease path is LIVE: the first-ever leader
-// acquires epoch 1 rather than getting ErrFailoverDisabled. The "not yet
-// supported" refusal is gone for the default case.
-func TestAcquireLeaseDefaultsOnWhenUnset(t *testing.T) {
-	setupHome(t)
-	os.Unsetenv(FailoverEnvVar) //nolint:errcheck // ensure truly unset
 	lease, acquired, err := AcquireLease("rainier", "cand")
 	if err != nil {
-		t.Fatalf("AcquireLease with flag UNSET must run the live path (default ON), got err=%v", err)
+		t.Fatalf("AcquireLease: %v", err)
 	}
 	if !acquired || lease == nil {
 		t.Fatalf("first-ever leader should acquire; acquired=%v lease=%v", acquired, lease)
@@ -1064,29 +1038,11 @@ func TestAcquireLeaseDefaultsOnWhenUnset(t *testing.T) {
 	}
 }
 
-// TestParseFailoverTriState exercises the single source-of-truth parser
-// directly: explicit disable tokens -> OFF; everything else -> ON.
-func TestParseFailoverTriState(t *testing.T) {
-	off := []string{"0", "false", "off", "no", " 0 ", "FALSE", "Off", "NO"}
-	on := []string{"", "1", "true", "yes", "on", "anything", " 1 ", "enabled"}
-	for _, v := range off {
-		if parseFailover(v) {
-			t.Errorf("parseFailover(%q) = true, want false", v)
-		}
-	}
-	for _, v := range on {
-		if !parseFailover(v) {
-			t.Errorf("parseFailover(%q) = false, want true", v)
-		}
-	}
-}
-
-// TestAcquireLeaseEnabledByEnv: with the flag on, the public real-coordinator
+// TestAcquireLeasePublicEntryStartsAsStarting: the public real-coordinator
 // entry point acquires epoch 1 in `starting` (D2 two-phase startup), then
 // Activate flips it to `active`.
-func TestAcquireLeaseEnabledByEnv(t *testing.T) {
+func TestAcquireLeasePublicEntryStartsAsStarting(t *testing.T) {
 	setupHome(t)
-	t.Setenv(FailoverEnvVar, "1")
 	lease, acquired, err := AcquireLease("rainier", "cand")
 	if err != nil {
 		t.Fatalf("AcquireLease: %v", err)
@@ -1836,7 +1792,6 @@ func TestFencedNotAcquired_LiveHoldersQuarantined(t *testing.T) {
 // before TTL/successor.
 func TestReleaseInvalidatesOutstandingToken(t *testing.T) {
 	setupHome(t)
-	t.Setenv(FailoverEnvVar, "1")
 	const project = "rainier"
 
 	lease, acquired, err := acquireLease(project, "me", testCfg(&fakeClock{}, newFakeLiveness()))
@@ -2028,7 +1983,6 @@ func TestAcquireResumesOwnFencingAfterSerializerBusy(t *testing.T) {
 // the record demoted and the token invalidated.
 func TestReleaseDemoteRetriesPastSerializerContention(t *testing.T) {
 	setupHome(t)
-	t.Setenv(FailoverEnvVar, "1")
 	const project = "rainier"
 
 	cfg := defaultLeaseConfig()
@@ -2095,7 +2049,6 @@ func TestReleaseDemoteRetriesPastSerializerContention(t *testing.T) {
 // operator-visible signal.
 func TestReleaseSurfacesDemoteFaultOnCorruptEpoch(t *testing.T) {
 	setupHome(t)
-	t.Setenv(FailoverEnvVar, "1")
 	const project = "rainier"
 
 	lease, acquired, err := acquireLease(project, "me", defaultLeaseConfig())

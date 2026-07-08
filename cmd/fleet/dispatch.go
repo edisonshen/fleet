@@ -668,9 +668,9 @@ func runDispatch(opts *dispatchOpts, stdout io.Writer) error {
 	// record disjunct fails and — if the claim is stale and coord-state
 	// is stale — the dispatch proceeds.
 	//
-	// DEFENSE-IN-DEPTH (DESIGN-handoff-drain-storm-leak PR2). With
-	// FLEET_LEASE_FAILOVER on, the PRIMARY singleton guarantee is the
-	// coordinator lease: the coord-run supervisor takes a kernel LOCK_NB
+	// DEFENSE-IN-DEPTH (DESIGN-handoff-drain-storm-leak PR2). The PRIMARY
+	// singleton guarantee is the coordinator lease: the coord-run supervisor
+	// takes a kernel LOCK_NB
 	// on coordinator.flock, so a second supervisor for the same project
 	// physically cannot acquire it and stands down (exit 0). This
 	// freshness veto is no longer the load-bearing gate — it stays as a
@@ -987,11 +987,11 @@ func runDispatch(opts *dispatchOpts, stdout io.Writer) error {
 		}
 	}
 
-	// Lease-failover supervisor wrap (DESIGN-handoff-drain-storm-leak
+	// The coordinator lease supervisor wrap (DESIGN-handoff-drain-storm-leak
 	// PR2) is applied inside spawn.Spawn — NOT here — so it covers EVERY
 	// coord spawn (fresh dispatch AND the handoff/drain replacements that
 	// bypass dispatch by inheriting oldRec.Command). See spawn.Spawn's
-	// "Lease-failover supervisor wrap" block. The persisted rec.Command
+	// coordinator lease wrap block. The persisted rec.Command
 	// stays the clean engine argv; only the EXECUTION argv is wrapped, so
 	// each handoff re-wraps from the clean argv without nesting.
 
@@ -1004,7 +1004,7 @@ func runDispatch(opts *dispatchOpts, stdout io.Writer) error {
 	// tick clears it (skills/coordinator/loop.py). Atomic .tmp+rename
 	// so a contending veto never reads a torn claim.
 	//
-	// Sits after the lease-failover note above on purpose: the lease
+	// Sits after the lease-wrap note above on purpose: the lease
 	// wrapping is inside spawn.Spawn and only rewrites the execution argv;
 	// it does not refuse the spawn before this claim lands.
 	//
@@ -1072,7 +1072,7 @@ func runDispatch(opts *dispatchOpts, stdout io.Writer) error {
 		// durable doc-inbox makes this idempotent + lock-coupled, identical to
 		// the post-spawn delivery on the success path. Gated on
 		// !disableAutoResume to honor --no-auto-resume.
-		if opts.coordSpawn && newDocPath != "" && !disableAutoResume && leaseFailoverEnabled() {
+		if opts.coordSpawn && newDocPath != "" && !disableAutoResume && coordLeaseSupported() {
 			ownerRec, derr := deliverToCurrentOwner(handoffdelivery.Options{
 				Project: opts.project,
 				Prompt:  handoff.ResumePrompt(newDocPath),
@@ -1214,7 +1214,7 @@ func runDispatch(opts *dispatchOpts, stdout io.Writer) error {
 		//     with the unsubmitted-warning that fired during dispatch.
 		submitted := false
 		var perr error
-		if opts.coordSpawn && newDocPath != "" && leaseFailoverEnabled() {
+		if opts.coordSpawn && newDocPath != "" && coordLeaseSupported() {
 			var ownerRec *agent.Record
 			ownerRec, perr = deliverToCurrentOwner(handoffdelivery.Options{
 				Project: rec.Project,

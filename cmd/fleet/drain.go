@@ -41,10 +41,10 @@ var ErrEscalatedToTakeOver = errors.New("fleet drain: escalated to safety-net ta
 var ErrResumeBackgrounded = errors.New("fleet drain: resume exceeded the budget; handoff completing in the background")
 
 // defaultResumeTimeoutMillis bounds a single per-queue-file Resume on the
-// lease-failover drain path (FLEET_LEASE_FAILOVER on). It is the wall-clock
+// lease-aware drain path. It is the wall-clock
 // budget after which the drain STOPS waiting on a slow handoff and escalates
 // to the safety-net takeover instead of blocking forever — the structural
-// fix for the 81-drain leak. Legacy (flag-off) drains ignore it.
+// fix for the 81-drain leak. Non-lease platforms ignore it.
 //
 // 120s, not 30s (DESIGN-handoff-lifecycle-hardening bug A, operator: "wait
 // at least 2 mins"): a real coord resume — tmux spawn + readiness waits —
@@ -78,7 +78,7 @@ catch up.
 Per-agent flocking keeps two concurrent drains (e.g. cron + TUI) from
 double-spawning the same replacement.
 
-Under FLEET_LEASE_FAILOVER the drain is BOUNDED + lease-aware: it stands
+On lease-capable platforms the drain is BOUNDED + lease-aware: it stands
 down when a healthy leader holds the lease, verifies the handoff-complete
 barrier before a graceful kill, and escalates a slow/hung handoff to the
 safety-net takeover after --resume-timeout-ms instead of blocking.`,
@@ -92,7 +92,7 @@ safety-net takeover after --resume-timeout-ms instead of blocking.`,
 	cmd.Flags().IntVar(&graceMillis, "grace-ms", handoffop.DefaultGraceMillis,
 		"milliseconds between /exit and Kill on each retired session")
 	cmd.Flags().IntVar(&resumeTimeoutMilli, "resume-timeout-ms", defaultResumeTimeoutMillis,
-		"FLEET_LEASE_FAILOVER only: wall-clock budget for one handoff before escalating to the safety-net takeover")
+		"lease-aware drain only: wall-clock budget for one handoff before escalating to the safety-net takeover")
 	return cmd
 }
 
@@ -229,16 +229,15 @@ func runDrain(stdout, stderr io.Writer, graceMillis, resumeTimeoutMillis int) er
 
 // drainOne handles a single queue file.
 //
-// FLEET_LEASE_FAILOVER + the COORD-vs-WORKER classification route the
-// behavior (DESIGN-handoff-drain-storm-leak §3(D), PR3):
+// The lease-aware COORD-vs-WORKER classification routes the behavior
+// (DESIGN-handoff-drain-storm-leak §3(D), PR3):
 //
-//   - flag OFF (default): the LEGACY path — take the per-agent flock and run
-//     handoffop.Resume under it. Byte-identical to pre-PR3 behavior.
-//   - flag ON + a COORD handoff: the BOUNDED, lease-aware path
+//   - COORD handoff on a lease-capable platform: the BOUNDED, lease-aware path
 //     (drainOneLeaseAware) — the lease is the single-flight guarantee, so the
 //     graceful/hung path holds NO lock across kill/escalate (the structural
 //     fix for the forever-held lock + 81-drain leak).
-//   - flag ON + a WORKER (non-coord) handoff: the LEGACY path. A worker
+//   - WORKER (non-coord) handoff, or any handoff on a non-lease platform:
+//     the LEGACY path. A worker
 //     handoff carries a Project but is NOT the project coord, so the coord
 //     lease says nothing about it; routing it through the coord lease
 //     stand-down would strand it forever (codex PR3 iter-4 [P1]). Workers
@@ -256,8 +255,8 @@ func drainOne(req queue.SpawnFresh, path string, graceMillis, resumeTimeoutMilli
 }
 
 // drainOneLegacy is the pre-PR3 drain: take the per-agent flock and run
-// Resume under it. Retained verbatim for the FLEET_LEASE_FAILOVER-off path
-// so production behavior is unchanged this PR.
+// Resume under it. Retained verbatim for worker handoffs and platforms
+// without the coordinator lease primitive.
 //
 // KNOWN ROOT CAUSE (the reason the lease-aware path exists): this holds the
 // per-agent flock across the ENTIRE Resume — tmux probes, AtomicCoordSwap's

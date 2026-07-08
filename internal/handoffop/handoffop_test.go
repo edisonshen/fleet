@@ -42,7 +42,6 @@ func setupFleetHome(t *testing.T) string {
 func requireTmux(t *testing.T) {
 	t.Helper()
 	tmuxtest.RequireTmux(t)
-	t.Setenv("FLEET_LEASE_FAILOVER", "0")
 	// retireOldAgent calls spawn.SendInitialPrompt, which polls the
 	// pane for stability. Production windows (500 ms stable / 30 s
 	// max) would balloon the suite; tests pin small values that
@@ -80,7 +79,6 @@ func requireTmux(t *testing.T) {
 func requireFakeTmux(t *testing.T) *tmuxfake.Fake {
 	t.Helper()
 	f := tmuxfake.InstallFake(t)
-	t.Setenv("FLEET_LEASE_FAILOVER", "0")
 	t.Setenv("FLEET_INITIAL_PROMPT_STABLE_MS", "0")
 	t.Setenv("FLEET_INITIAL_PROMPT_MAX_MS", "100")
 	t.Setenv("FLEET_POST_READY_BUFFER_MS", "0")
@@ -983,7 +981,6 @@ func TestCoordDrainExecArgv_CustomCommandPassesThrough(t *testing.T) {
 
 func TestDrain_LeaseFailoverCoordHandoff_ResumeFallbackCompletes(t *testing.T) {
 	requireFakeTmux(t)
-	t.Setenv("FLEET_LEASE_FAILOVER", "1")
 	setupFleetHome(t)
 
 	const project = "rainier"
@@ -1051,7 +1048,6 @@ func TestDrain_LeaseFailoverCoordHandoff_ResumeFallbackCompletes(t *testing.T) {
 
 func TestDrain_LeaseFailoverCoordHandoff_FinalizesDeliveredLockOwner(t *testing.T) {
 	requireFakeTmux(t)
-	t.Setenv("FLEET_LEASE_FAILOVER", "1")
 	setupFleetHome(t)
 
 	// D3: coord-swap detection is now the task_id (coord-<project>), so the
@@ -1131,7 +1127,6 @@ func TestDrain_LeaseFailoverCoordHandoff_FinalizesDeliveredLockOwner(t *testing.
 
 func TestDrain_LeaseFailoverCoordStaleQueue_UsesLockOwnerForCapApprovedCoord(t *testing.T) {
 	requireFakeTmux(t)
-	t.Setenv("FLEET_LEASE_FAILOVER", "1")
 	setupFleetHome(t)
 
 	const project = "rainier"
@@ -1256,7 +1251,6 @@ func TestDrain_LeaseFailoverCoordStaleQueue_UsesLockOwnerForCapApprovedCoord(t *
 // and the queue is consumed, instead of being stranded pending forever.
 func TestDrain_LeaseFailoverCoord_DeadLoserSession_StillDeliversToLockOwner(t *testing.T) {
 	requireFakeTmux(t)
-	t.Setenv("FLEET_LEASE_FAILOVER", "1")
 	setupFleetHome(t)
 
 	const project = "rainier"
@@ -1598,7 +1592,6 @@ func TestDrain_ContentionPreservesQueueFile(t *testing.T) {
 // forever even though the replacement session was live. Mirrors the
 // cmd/fleet/handoff.go fallback.
 func TestDeliverResumePrompt_LeaseWrapped_NoOwner_FallsBackToDirectSend(t *testing.T) {
-	t.Setenv("FLEET_LEASE_FAILOVER", "1")
 	setupFleetHome(t)
 
 	rec := agent.New("legacynew1")
@@ -1651,13 +1644,12 @@ func TestDeliverResumePrompt_LeaseWrapped_NoOwner_FallsBackToDirectSend(t *testi
 
 // codex iter-18 [P1] REGRESSION: the case-3 Resume path (old record still live,
 // replacement already spawned) routes through retireOldAgent. For a CapApproved
-// coord handoff under FLEET_LEASE_FAILOVER=1 the resume prompt MUST go to the
-// lock WINNER (DeliverToCurrentOwner), not the queued session which may have
+// coord handoff the resume prompt MUST go to the lock WINNER
+// (DeliverToCurrentOwner), not the queued session which may have
 // lost the lease. Before the leaseWrappedSuccessor threading, retireOldAgent
 // derived lease-wrapping from TaskID alone and direct-sent to the loser.
 func TestResume_Case3_CapApprovedCoord_DeliversToLockOwner(t *testing.T) {
 	requireFakeTmux(t)
-	t.Setenv("FLEET_LEASE_FAILOVER", "1")
 	setupFleetHome(t)
 
 	const project = "rainier"
@@ -1753,7 +1745,6 @@ func TestResume_Case3_CapApprovedCoord_DeliversToLockOwner(t *testing.T) {
 // target the old/dead owner and strand recovery. CurrentOwner must NOT be polled.
 func TestDrain_CoordColdSpawn_CapApproved_DeliversDirectNotLockOwner(t *testing.T) {
 	requireFakeTmux(t)
-	t.Setenv("FLEET_LEASE_FAILOVER", "1")
 	setupFleetHome(t)
 
 	const project = "rainier"
@@ -1880,7 +1871,6 @@ func forbidSeparateDelivery(t *testing.T) {
 
 func TestResume_Case3_GracefulRoute_SwapsViaBarrier(t *testing.T) {
 	requireFakeTmux(t)
-	t.Setenv("FLEET_LEASE_FAILOVER", "1")
 	setupFleetHome(t)
 
 	oldRec, newRec, req, qp := seedGracefulRouteCase3(t)
@@ -1963,7 +1953,6 @@ func TestResume_Case3_GracefulRoute_SwapsViaBarrier(t *testing.T) {
 
 func TestResume_Case3_GracefulRouteError_PreservesQueue(t *testing.T) {
 	requireFakeTmux(t)
-	t.Setenv("FLEET_LEASE_FAILOVER", "1")
 	setupFleetHome(t)
 
 	oldRec, newRec, req, qp := seedGracefulRouteCase3(t)
@@ -2000,7 +1989,6 @@ func TestResume_Case3_GracefulRouteError_PreservesQueue(t *testing.T) {
 
 func TestResume_Case3_GracefulNotEligible_BespokePathRuns(t *testing.T) {
 	requireFakeTmux(t)
-	t.Setenv("FLEET_LEASE_FAILOVER", "1")
 	setupFleetHome(t)
 
 	oldRec, newRec, req, qp := seedGracefulRouteCase3(t)
@@ -2101,7 +2089,6 @@ func TestLiveCoordGracefulSpawn_DecidesLeaseWrap(t *testing.T) {
 // durable queue with the doc undelivered. requireOwner=true (what the
 // graceful deliver closure passes) must propagate the error instead.
 func TestDeliverResumePrompt_RequireOwner_NoOwner_NoFallback(t *testing.T) {
-	t.Setenv("FLEET_LEASE_FAILOVER", "1")
 	setupFleetHome(t)
 
 	rec := agent.New("standby02")

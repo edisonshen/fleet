@@ -1840,9 +1840,6 @@ func TestRunDispatch_CoordSpawn_FailsClosedOnAgentListError(t *testing.T) {
 func TestRunDispatch_DeadCoordRecovery_StandDownDeliversRecoveryDoc(t *testing.T) {
 	requireFakeTmux(t)
 	setupFleetHome(t)
-	t.Setenv("FLEET_LEASE_FAILOVER", "1")
-
-	// Stub spawn to stand down (a racing standby won the lease first).
 	prevSpawn := dispatchSpawnFn
 	dispatchSpawnFn = func(spawn.Options) (*agent.Record, error) {
 		return nil, spawn.ErrCoordStoodDown

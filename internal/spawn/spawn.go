@@ -190,17 +190,6 @@ var propagatedRuntimeEnv = []string{
 	// reviewer-subagent-arch builders to decide which engine the
 	// reviewer subagent runs (claude pinch-hits when coord=codex).
 	"FLEET_ENGINE",
-	// FLEET_LEASE_FAILOVER must reach the agent's tmux session so the
-	// wrapped `fleet coord-run` supervisor sees the same flag the
-	// operator's fleet was started with (DESIGN-handoff-drain-storm-leak
-	// PR2). tmux strips non-`-e` vars against an already-running server,
-	// so without this the supervisor would read the flag as OFF, return
-	// ErrFailoverDisabled, and run the child WITHOUT acquiring or
-	// heartbeating the lease — the failover path would silently no-op in
-	// the common case (codex PR2 iter-1 [P1]). It also propagates so a
-	// `fleet drain` / handoff-spawned replacement launched from inside
-	// the pane inherits the same failover state.
-	"FLEET_LEASE_FAILOVER",
 	// FLEET_STANDBY_TIMEOUT (PR-A fork-bomb fence, test-only) must reach the
 	// session so a NESTED coord spawn from inside a pane (e.g. a coord that
 	// runs `fleet drain`/handoff and lease-wraps a successor) inherits the
@@ -221,11 +210,11 @@ var propagatedRuntimeEnv = []string{
 	"FLEET_COORD_IN_TURN_SUPERVISOR",
 }
 
-// leaseFailoverEnabled gates whether Spawn wraps a coord in the
+// leaseSupported gates whether Spawn wraps a coord in the
 // `fleet coord-run` lease supervisor. It is build-tagged:
 //
-//   - linux||darwin (spawn_lease_unix.go): mirror coordlock.FailoverEnabled's
-//     tri-state (PR4 default ON; 0/false/off/no disables).
+//   - linux||darwin (spawn_lease_unix.go): true; the lease primitive is
+//     supported.
 //   - other GOOS (spawn_lease_other.go): ALWAYS false — the lease primitive
 //     (coordlock) is unsupported there, and the cmd-side coord-run stub
 //     promises the legacy bare-child path, so Spawn must NOT lease-wrap
@@ -233,7 +222,7 @@ var propagatedRuntimeEnv = []string{
 //
 // Splitting by build tag keeps the all-platform spawn.go free of a hard
 // coordlock import (which would break non-unix builds) while preventing the
-// default-ON flag from wrapping coords on a platform where the supervisor
+// lease wrapper from wrapping coords on a platform where the supervisor
 // can't actually hold a lease.
 
 // DefaultStandbyTimeout is the single generous bound every lease-wrapped
@@ -241,14 +230,14 @@ var propagatedRuntimeEnv = []string{
 const DefaultStandbyTimeout = 10 * time.Minute
 
 // shouldLeaseWrap decides whether this spawn wraps the coord in the
-// `fleet coord-run` lease supervisor. PR1 collapses fresh dispatch and
-// dead-coord recovery onto coord-run --standby when failover is enabled, while
+// `fleet coord-run` lease supervisor. On lease-capable platforms, fresh
+// dispatch and dead-coord recovery collapse onto coord-run --standby, while
 // workers, unsupported platforms, and explicit legacy fallbacks stay bare.
-func shouldLeaseWrap(failoverOn, isCoord, disable bool) bool {
-	return failoverOn && isCoord && !disable
+func shouldLeaseWrap(leaseSupported, isCoord, disable bool) bool {
+	return leaseSupported && isCoord && !disable
 }
 
-// coordRunWrap builds the lease-failover exec argv: the engine argv
+// coordRunWrap builds the lease-supervised exec argv: the engine argv
 // supervised by `fleet coord-run --standby`.
 // Pure + does not mutate argv. The persisted rec.Command stays clean;
 // only the EXECUTION argv is wrapped. `--standby` polls a busy healthy
@@ -793,7 +782,7 @@ type Options struct {
 	// PR2 iter-6 [P2]): a healthy leader present -> stand-down (return
 	// ErrCoordStoodDown); none -> the supervisor failed and left no leader
 	// -> surface a real error instead of a false "already running". nil
-	// (off-flag / non-coord callers) collapses to the conservative
+	// (non-coord callers / unsupported platforms) collapses to the conservative
 	// stand-down report. Production wires this to
 	// coordlock.CurrentActiveOwnerPID via cmd/fleet (spawn cannot import
 	// coordlock — it is build-tagged to linux/darwin while spawn is
@@ -803,14 +792,14 @@ type Options struct {
 
 	// StandbyTimeout bounds how long a lease-wrapped coord-run --standby
 	// polls behind a healthy leader before self-exiting cleanly. 0 uses
-	// DefaultStandbyTimeout. Ignored when failover is off or this is not a
-	// coord spawn.
+	// DefaultStandbyTimeout. Ignored on unsupported platforms and non-coord
+	// spawns.
 	StandbyTimeout time.Duration
 
 	// DisableLeaseWrap keeps a coord spawn on the legacy bare-engine path even
-	// when lease failover is enabled. It is reserved for handoffop's drain
-	// cold-resume fallback, where the existing contract requires the successor
-	// to start immediately instead of waiting behind the still-live leader.
+	// on lease-capable platforms. It is reserved for handoffop's drain cold-
+	// resume fallback, where the existing contract requires the successor to
+	// start immediately instead of waiting behind the still-live leader.
 	DisableLeaseWrap bool
 }
 
@@ -1077,17 +1066,17 @@ func Spawn(opts Options) (*agent.Record, error) {
 		execArgv = opts.ExecCommand
 	}
 
-	// Lease-failover supervisor wrap (DESIGN-handoff-drain-storm-leak
+	// Coordinator lease supervisor wrap (DESIGN-handoff-drain-storm-leak
 	// PR1 spawn-collapse: every coord spawn runs under
-	// `fleet coord-run --standby --standby-timeout T` when lease failover
-	// is enabled. Applied HERE — not at individual call sites — so fresh
+	// `fleet coord-run --standby --standby-timeout T` on lease-capable
+	// platforms. Applied HERE — not at individual call sites — so fresh
 	// dispatch and dead-coord recovery share the same heartbeat-owning
 	// supervisor path. Wrapping the EXECUTION argv only keeps the persisted
 	// rec.Command clean. Handoffop's documented drain cold-resume fallback can
 	// opt out with DisableLeaseWrap because it must start a bare successor
 	// while the old leader is still live.
 	leaseWrapped := false
-	if shouldLeaseWrap(leaseFailoverEnabled(), isCoordSpawn(rec.TaskID, rec.Project), opts.DisableLeaseWrap) {
+	if shouldLeaseWrap(leaseSupported(), isCoordSpawn(rec.TaskID, rec.Project), opts.DisableLeaseWrap) {
 		standbyTimeout := standbyTimeoutOrDefault(opts.StandbyTimeout)
 		switch {
 		case alreadyCoordRunWrapped(execArgv):
@@ -1099,7 +1088,7 @@ func Spawn(opts Options) (*agent.Record, error) {
 				leaseWrapped = true
 			} else {
 				_, _ = fmt.Fprintf(os.Stderr,
-					"warning: FLEET_LEASE_FAILOVER set but os.Executable() failed (%v); "+
+					"warning: coordinator lease supported but os.Executable() failed (%v); "+
 						"spawning coord %s WITHOUT the coord-run lease supervisor\n", exeErr, id)
 			}
 		}

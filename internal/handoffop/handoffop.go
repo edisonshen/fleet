@@ -429,9 +429,9 @@ func cleanUpStaleQueue(req queue.SpawnFresh, queuePath string,
 	autoResume := !disableAutoResume && req.SchemaVersion >= 2
 
 	// Coord lock-owner delivery (PR2 §5a): when this is a lease-wrapped coord
-	// swap with failover on, the resume prompt is delivered to the project's
-	// CURRENT LOCK OWNER (discovered via coordlock.CurrentOwner) — NOT into
-	// newRec's session. newRec may be a racing standby that LOST the lock and
+	// swap on a lease-capable platform, the resume prompt is delivered to the
+	// project's CURRENT LOCK OWNER (discovered via coordlock.CurrentOwner), NOT
+	// into newRec's session. newRec may be a racing standby that LOST the lock and
 	// has since exited; the live coord is the winner. So the queued-replacement
 	// session-liveness aborts below must NOT fire for this case — they would
 	// strand the queue pending even though CurrentOwner can identify the live

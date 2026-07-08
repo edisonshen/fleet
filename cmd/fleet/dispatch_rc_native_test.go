@@ -25,6 +25,7 @@ import (
 
 	"github.com/edisonshen/fleet/internal/agent"
 	"github.com/edisonshen/fleet/internal/rc"
+	"github.com/edisonshen/fleet/internal/spawn"
 	"github.com/edisonshen/fleet/internal/state"
 )
 
@@ -36,6 +37,12 @@ import (
 func runDispatchIgnoringSpawnErr(t *testing.T, opts *dispatchOpts) {
 	t.Helper()
 	isolateTmuxSocket(t)
+	prevSpawn := dispatchSpawnFn
+	dispatchSpawnFn = func(opts spawn.Options) (*agent.Record, error) {
+		opts.DisableLeaseWrap = true
+		return spawn.Spawn(opts)
+	}
+	t.Cleanup(func() { dispatchSpawnFn = prevSpawn })
 	var out bytes.Buffer
 	_ = runDispatch(opts, &out)
 }

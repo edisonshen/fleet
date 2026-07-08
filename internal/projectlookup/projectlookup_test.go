@@ -10,9 +10,9 @@
 //   - FindLiveCoord: scan records for task_id == coord-<project>
 //     AND project == <project> AND tmux session alive. Returns the
 //     match. NO marker requirement (unlike the TUI's actionAttach-
-//     Project [a]-dedup helper) because Tier 3 is failover, not
-//     duplicate-spawn protection — when failover lands, ANY live
-//     coord for the project is acceptable.
+//     Project [a]-dedup helper) because Tier 3 is project recovery, not
+//     duplicate-spawn protection — any live coord for the project is
+//     acceptable.
 //   - FindCoordByLockBody: extract the ID from
 //     ~/.fleet/projects/<name>/.locks/coordinator.lock and match
 //     against records with a live tmux session.

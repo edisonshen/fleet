@@ -5,7 +5,7 @@
 // lane by PR-A's fork-bomb fix: an orphaned default-lane run of these used to
 // leave 10-minute standby panes piling up forks until the box couldn't fork().
 // Here each sets FLEET_STANDBY_TIMEOUT=3s so even an orphaned run self-reaps in
-// seconds, and FLEET_LEASE_FAILOVER=1 to override the TestMain default-OFF guard.
+// seconds.
 // See docs/DESIGN-spawn-test-fork-bomb-root-fix.md.
 package spawn
 
@@ -26,7 +26,6 @@ import (
 func TestSpawn_StandbyFinalMergePreservesStampedEnginePID(t *testing.T) {
 	requireTmux(t)
 	setupFleetHome(t)
-	t.Setenv("FLEET_LEASE_FAILOVER", "1")
 	t.Setenv("FLEET_STANDBY_TIMEOUT", "3s")
 
 	const id = "sbmerge1"
@@ -92,7 +91,6 @@ func TestSpawn_StandbyFinalMergePreservesStampedEnginePID(t *testing.T) {
 func TestSpawn_PersistsLeaseWrappedState(t *testing.T) {
 	requireTmux(t)
 	setupFleetHome(t)
-	t.Setenv("FLEET_LEASE_FAILOVER", "1")
 	t.Setenv("FLEET_STANDBY_TIMEOUT", "3s")
 
 	// Test #1b (counter mechanics, POSITIVE half): a real lease-wrapped coord

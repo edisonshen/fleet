@@ -10,8 +10,8 @@ package main
 // Exit codes (the skill branches on these):
 //
 //	0  — the calling process descends from the live ACTIVE lease owner.
-//	     The mutation may proceed. (Also exit 0 when FLEET_LEASE_FAILOVER=0:
-//	     no lease in play, behave exactly as pre-lease — reversibility.)
+//	     The mutation may proceed. On unsupported platforms there is no lease
+//	     primitive, so the build-tagged stub also returns 0.
 //	3  — NOT the lease owner (fenced/stale/no-leader). The skill aborts the
 //	     mutation and the coord self-demotes.
 //	1  — usage / internal error (the skill treats this conservatively as
@@ -42,8 +42,7 @@ func newLeaseCheckCmd() *cobra.Command {
 		Short: "Prove the caller descends from the active coordinator lease owner",
 		Long: "Exit 0 if the calling process tree descends from the live active " +
 			"coordinator lease owner for --project; exit 3 if it does not " +
-			"(fenced/stale coord); exit 1 on usage/internal error. With " +
-			"FLEET_LEASE_FAILOVER=0 the check is a no-op success. " +
+			"(fenced/stale coord); exit 1 on usage/internal error. " +
 			"--reacquire (coordinator tick only) renews an own expired lease " +
 			"in place when no rival takeover exists; without it the check is " +
 			"strictly read-only.",
@@ -75,11 +74,6 @@ func runLeaseCheck(project string, pid int, reacquire bool, stdout, stderr io.Wr
 	// valid for the caller's own ancestry (the default ppid flow).
 	if reacquire && pid != 0 {
 		return fmt.Errorf("lease-check: --reacquire cannot be combined with --pid (renewal is only valid for the caller's own ancestry)")
-	}
-	// Reversibility: flag explicitly off -> no lease -> no-op success.
-	if !leaseFailoverEnabled() {
-		_, _ = fmt.Fprintln(stdout, "lease-check: failover disabled; no lease to check (ok)")
-		return nil
 	}
 	// Default to the CALLER'S PARENT — the skill runs `fleet lease-check` as
 	// a child, so the supervisor it must prove ownership for is the skill's

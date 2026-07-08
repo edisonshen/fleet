@@ -47,7 +47,7 @@ def _producer_not_fenced_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
     """Default: the handoff producer is NOT fenced.
 
     DESIGN-handoff-drain-storm-leak PR4 made `_do_handoff` prove parent-lease
-    ownership via `fleet lease-check` (FLEET_LEASE_FAILOVER defaults ON). In
+    ownership via `fleet lease-check`. In
     dev / CI / homebrew the real `fleet` binary IS on PATH, so a test that
     seeds no lease record would get exit-3 "fenced" and the producer would
     refuse to write — breaking every unrelated handoff-write test. This

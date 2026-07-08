@@ -380,7 +380,7 @@ def tick(
             )
 
     # 0.5. Parent-lease ownership proof (DESIGN-handoff-drain-storm-leak
-    # PR4). Under FLEET_LEASE_FAILOVER the Go `fleet coord-run` supervisor
+    # PR4). The Go `fleet coord-run` supervisor
     # that PARENTS this tick holds coordinator.flock + heartbeats the
     # coordinator.epoch fencing record. If a candidate fenced our parent
     # (bumped the epoch), every disk-mutating thing this tick does would be
@@ -391,7 +391,7 @@ def tick(
     # re-reads coordinator.epoch in Go and confirms the active lease owner
     # is an ANCESTOR of this process (epoch + pid + pid_start, PID-reuse
     # safe). Exit 3 = definitively fenced/not-owner → abort the tick WITHOUT
-    # writing and self-demote. Exit 0 = proven owner (or failover off — a
+    # writing and self-demote. Exit 0 = proven owner (or unsupported platform
     # no-op success) → proceed. An inconclusive result (binary missing /
     # internal error / timeout) is surfaced but does NOT abort: a legacy
     # install without the new subcommand, or a transient fault, must not
@@ -2881,7 +2881,7 @@ def _read_coord_lease_identity(
                         (either field may be "" = that lease slot is genuinely
                         free). Gate 5 keys on this.
       ("", "")          CONCLUSIVE-EMPTY: the CLI ran fine and the lease names
-                        NOBODY (free lease / no reservation / failover disabled).
+                        NOBODY (free lease / no reservation / unsupported platform).
       (None, None)      INCONCLUSIVE: the read FAILED — a stale ``FLEET_BIN``
                         that predates the ``coord-owner`` subcommand (exit!=0,
                         the #182 stale-binary class fleet's symlinked-skill /
@@ -3127,15 +3127,6 @@ _LEASE_CHECK_NOT_OWNER_EXIT = 3
 _LEASE_CHECK_TIMEOUT_S = 5.0
 
 
-def _lease_failover_enabled() -> bool:
-    """Mirror coordlock.FailoverEnabled's tri-state gate (PR4 default ON):
-    enabled unless FLEET_LEASE_FAILOVER is EXPLICITLY one of 0/false/off/no
-    (case-insensitive). Unset/empty/anything-else → ON. Kept consistent
-    with internal/coordlock.parseFailover + the Go mirrors."""
-    return (os.environ.get("FLEET_LEASE_FAILOVER", "") or "").strip().lower() \
-        not in ("0", "false", "off", "no")
-
-
 class LeaseCheckResult(str):
     """The `_lease_check_fn` verdict — "owner" | "fenced" | "unknown" —
     carrying optional fence detail (DESIGN-coord-lease-false-fence-prevention
@@ -3201,7 +3192,7 @@ def _prove_parent_lease_ownership(
     LeaseCheckResult (a str subclass, so `== "fenced"` still works) whose
     value is one of:
 
-      "owner"   — proven owner, OR failover disabled (no lease in play).
+      "owner"   — proven owner, OR unsupported platform (no lease in play).
                   The tick may mutate.
       "fenced"  — the Go check returned exit 3: NOT under the active owner
                   (a rival takeover is live, or ownership could not be
@@ -3213,11 +3204,9 @@ def _prove_parent_lease_ownership(
                   transient fault must not wedge a healthy coord (the
                   coordinator.lock + #171 guard remain the defense).
 
-    When failover is OFF this returns "owner" without shelling out — the
-    legacy bare-child path has no lease, so there is nothing to fence.
+    Unsupported platforms return "owner" from `fleet lease-check`; lease-capable
+    platforms always run the ownership proof.
     """
-    if not _lease_failover_enabled():
-        return LeaseCheckResult("owner")
     # Resolve the binary the SAME way the producer/kick paths do: prefer the
     # FLEET_BIN the spawn stamped into the coord's env over a bare `fleet` on
     # PATH (codex PR4 [P2]). main() calls tick() without fleet_bin, so without

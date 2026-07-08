@@ -50,7 +50,6 @@ func setupFleetHome(t *testing.T) string {
 func requireTmux(t *testing.T) {
 	t.Helper()
 	tmuxtest.RequireTmux(t)
-	t.Setenv("FLEET_LEASE_FAILOVER", "0")
 	// runHandoff calls spawn.SendInitialPrompt between step 8a and
 	// step 9; the helper polls pane stability before typing. Pin
 	// small windows so tests don't pay the production 30 s cap on
@@ -97,7 +96,6 @@ func requireTmux(t *testing.T) {
 func requireFakeTmux(t *testing.T) *tmuxfake.Fake {
 	t.Helper()
 	f := tmuxfake.InstallFake(t)
-	t.Setenv("FLEET_LEASE_FAILOVER", "0")
 	t.Setenv("FLEET_INITIAL_PROMPT_STABLE_MS", "0")
 	t.Setenv("FLEET_INITIAL_PROMPT_MAX_MS", "100")
 	t.Setenv("FLEET_POST_READY_BUFFER_MS", "0")
@@ -522,10 +520,11 @@ func TestHandoff_PreservesCwdAndCommandFromOldRecord(t *testing.T) {
 func agentSpawnForTest(t *testing.T, cwd string, command []string, project, taskID string) (*agent.Record, error) {
 	t.Helper()
 	return spawn.Spawn(spawn.Options{
-		TaskID:  taskID,
-		Project: project,
-		Cwd:     cwd,
-		Command: command,
+		TaskID:           taskID,
+		Project:          project,
+		Cwd:              cwd,
+		Command:          command,
+		DisableLeaseWrap: true,
 	})
 }
 
@@ -601,7 +600,6 @@ func TestHandoff_CoordRefusesWhenUnresolvable(t *testing.T) {
 }
 
 func TestHandoff_ShouldRefuseLeaseWrappedCoordHandoffRetire_RequiresLiveOld(t *testing.T) {
-	t.Setenv("FLEET_LEASE_FAILOVER", "1")
 	oldRec := &agent.Record{ID: "oldcoord", Project: "rainier", SupervisorPID: 4242}
 
 	origOwner := handoffLeaseActiveOwnerPIDFn
@@ -804,7 +802,6 @@ func TestHandoff_RecoveryProbe_DeadReplacement_ForceRespawns(t *testing.T) {
 // --force-replacement once OLD is confirmed dead.
 func TestHandoff_RecoveryProbe_OldCoordAlive_RefusesRespawn(t *testing.T) {
 	requireFakeTmux(t)
-	t.Setenv("FLEET_LEASE_FAILOVER", "1") // override requireFakeTmux's OFF: AcquireLease needs it
 	tmp := setupFleetHome(t)
 
 	old := seedAgent(t)
@@ -1371,6 +1368,12 @@ func TestHandoff_ReplacementSpawnedWithRemoteControlFlag(t *testing.T) {
 	// test process env). The new tmux session inherits PATH; the
 	// `sh -c` body finds our shim before any system claude.
 	t.Setenv("PATH", shimDir+":"+os.Getenv("PATH"))
+	prevSpawn := handoffSpawnFn
+	handoffSpawnFn = func(opts spawn.Options) (*agent.Record, error) {
+		opts.DisableLeaseWrap = true
+		return spawn.Spawn(opts)
+	}
+	t.Cleanup(func() { handoffSpawnFn = prevSpawn })
 
 	// v0.12.1 (codex review iter-5 [P1]): the handoff inject is gated on
 	// isCoordHandoffForProject so worker handoffs in RC-enabled projects
@@ -1651,7 +1654,6 @@ func forbidHandoffDeliveryOutsideBarrier(t *testing.T) {
 
 func TestResumeHandoff_GracefulRoute_SwapsViaBarrier(t *testing.T) {
 	requireFakeTmux(t)
-	t.Setenv("FLEET_LEASE_FAILOVER", "1")
 	root := setupFleetHome(t)
 
 	const project = "rainier"
@@ -1767,7 +1769,6 @@ func TestResumeHandoff_GracefulRoute_SwapsViaBarrier(t *testing.T) {
 // into the lease-wrapped successor's supervisor pane.
 func TestDeliverHandoffResumePrompt_RequireOwner_NoOwner_NoFallback(t *testing.T) {
 	setupFleetHome(t)
-	t.Setenv("FLEET_LEASE_FAILOVER", "1")
 
 	rep := agent.New(agent.NewID())
 	rep.Project = "rainier"
@@ -1815,7 +1816,6 @@ func TestDeliverHandoffResumePrompt_RequireOwner_NoOwner_NoFallback(t *testing.T
 // supervisor pane, report success, and consume the only durable inbox.
 func TestHandoff_ArchivedOldRecovery_LeaseWrapped_NoOwner_PreservesQueue(t *testing.T) {
 	requireFakeTmux(t)
-	t.Setenv("FLEET_LEASE_FAILOVER", "1")
 	root := setupFleetHome(t)
 
 	const project = "rainier"
@@ -1912,7 +1912,6 @@ func TestHandoff_ArchivedOldRecovery_LeaseWrapped_NoOwner_PreservesQueue(t *test
 // is consumed.
 func TestHandoff_ArchivedOldRecovery_DeadQueuedStandby_DeliversToWinner(t *testing.T) {
 	requireFakeTmux(t)
-	t.Setenv("FLEET_LEASE_FAILOVER", "1")
 	root := setupFleetHome(t)
 
 	const project = "rainier"

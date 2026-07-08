@@ -241,7 +241,7 @@ func TestCoordRun_Lease_ReleaseOnPanic(t *testing.T) {
 	t.Fatal("expected panic from panicAfterStart hook")
 }
 
-// A real acquire fault (not the failover-disabled sentinel) must abort —
+// A real acquire fault must abort —
 // runCoordRun refuses to start an unsupervised child.
 func TestCoordRun_Lease_AcquireFaultAborts(t *testing.T) {
 	const (

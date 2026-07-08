@@ -7,8 +7,7 @@
 // platform pid-start / monotonic-clock reads), so on other Unix targets
 // (e.g. FreeBSD) those symbols don't exist. This stub keeps cmd/fleet
 // building there by reporting the lease as UNSUPPORTED — runCoordRun then
-// runs the legacy bare-child path, exactly as if FLEET_LEASE_FAILOVER were
-// off (codex PR2 iter-2 [P2]).
+// runs the legacy bare-child path (codex PR2 iter-2 [P2]).
 package main
 
 import (
@@ -43,13 +42,11 @@ func leaseDisabledOrUnsupported(err error) bool {
 // coord-run and never consults this.
 func coordLeaderCheck(string) bool { return false }
 
-// leaseFailoverEnabled is the non-linux/darwin stub. The lease primitive is
-// unsupported here (coordlock is build-tagged linux||darwin), so failover is
-// always OFF regardless of FLEET_LEASE_FAILOVER — `fleet lease-check` is a
-// no-op success and the legacy bare-child path always runs. The
-// linux||darwin definition lives in coord_lease_unix.go (delegates to
-// coordlock.FailoverEnabled).
-func leaseFailoverEnabled() bool { return false }
+// coordLeaseSupported is the non-linux/darwin stub. The lease primitive is
+// unsupported here (coordlock is build-tagged linux||darwin), so `fleet
+// lease-check` is a no-op success and the legacy bare-child path always runs.
+// The linux||darwin definition lives in coord_lease_unix.go.
+func coordLeaseSupported() bool { return false }
 
 func leaseActiveOwnerPID(string) (int, bool) { return 0, false }
 

@@ -17,8 +17,7 @@
 // Flow (no time.Sleep ASSERTIONS — we poll for a condition with a bound):
 //
 //  1. isolated FLEET_HOME; pre-write the coord agent record.
-//  2. launch `fleet coord-run --agent <id> --project <p> -- sleep 600`
-//     with FLEET_LEASE_FAILOVER=1.
+//  2. launch `fleet coord-run --agent <id> --project <p> -- sleep 600`.
 //  3. poll until a from-test AcquireLease returns acquired=false (the
 //     supervisor holds the flock) AND the epoch names the supervisor as
 //     the active owner with a fresh renewed_at (heartbeat established).
@@ -52,7 +51,6 @@ func TestCoordRun_Lease_Integration_RealFlockHeldThenReleased(t *testing.T) {
 	)
 	fleetHome := t.TempDir()
 	t.Setenv("FLEET_HOME", fleetHome)
-	t.Setenv("FLEET_LEASE_FAILOVER", "1")
 	if _, err := state.Bootstrap(); err != nil {
 		t.Fatalf("bootstrap: %v", err)
 	}
@@ -73,7 +71,6 @@ func TestCoordRun_Lease_Integration_RealFlockHeldThenReleased(t *testing.T) {
 	cmd := exec.Command(bin, "coord-run", "--agent", agentID, "--project", project, "--", "sleep", "600")
 	cmd.Env = append(os.Environ(),
 		"FLEET_HOME="+fleetHome,
-		"FLEET_LEASE_FAILOVER=1",
 		"FLEET_STANDBY_TIMEOUT=3s", // PR-A: bound any standby to seconds, not 10m
 	)
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
@@ -215,7 +212,6 @@ func TestCoordRun_Lease_Integration_StandDownArchivesRecord(t *testing.T) {
 	)
 	fleetHome := t.TempDir()
 	t.Setenv("FLEET_HOME", fleetHome)
-	t.Setenv("FLEET_LEASE_FAILOVER", "1")
 	if _, err := state.Bootstrap(); err != nil {
 		t.Fatalf("bootstrap: %v", err)
 	}
@@ -242,7 +238,7 @@ func TestCoordRun_Lease_Integration_StandDownArchivesRecord(t *testing.T) {
 	sentinel := filepath.Join(t.TempDir(), "child-ran")
 	cmd := exec.Command(bin, "coord-run", "--agent", agentID, "--project", project,
 		"--", "sh", "-c", "touch "+sentinel)
-	cmd.Env = append(os.Environ(), "FLEET_HOME="+fleetHome, "FLEET_LEASE_FAILOVER=1",
+	cmd.Env = append(os.Environ(), "FLEET_HOME="+fleetHome,
 		"FLEET_STANDBY_TIMEOUT=3s") // PR-A: bound any standby to seconds, not 10m
 	out, runErr := cmd.CombinedOutput()
 	if runErr != nil {
@@ -261,8 +257,8 @@ func TestCoordRun_Lease_Integration_StandDownArchivesRecord(t *testing.T) {
 }
 
 // coordLeaderCheck disambiguates stand-down from failure for spawn (codex
-// PR2 iter-6 [P2]): false when the flag is off OR no active leader; true
-// when a healthy leader holds the lease.
+// PR2 iter-6 [P2]): false when no active leader exists; true when a healthy
+// leader holds the lease.
 func TestCoordLeaderCheck(t *testing.T) {
 	const project = "clc-test"
 	fleetHome := t.TempDir()
@@ -274,19 +270,12 @@ func TestCoordLeaderCheck(t *testing.T) {
 		t.Fatalf("ensure project: %v", err)
 	}
 
-	// Flag OFF -> always false (no lease in play).
-	t.Setenv("FLEET_LEASE_FAILOVER", "")
-	if coordLeaderCheck(project) {
-		t.Error("coordLeaderCheck must be false when failover is off")
-	}
-
-	// Flag ON, no leader -> false.
-	t.Setenv("FLEET_LEASE_FAILOVER", "1")
+	// No leader -> false.
 	if coordLeaderCheck(project) {
 		t.Error("coordLeaderCheck must be false when no leader holds the lease")
 	}
 
-	// Flag ON, a live leader -> true.
+	// A live leader -> true.
 	lease, acquired, err := coordlock.AcquireLease(project, "clc-leader")
 	if err != nil || !acquired || lease == nil {
 		t.Fatalf("pre-acquire lease failed (acquired=%v err=%v)", acquired, err)

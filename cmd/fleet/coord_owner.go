@@ -19,7 +19,7 @@ package main
 //	{"project":"p","live_owner_id":"<id|>","owner_id":"<id|>","handoff_successor_id":"<id|>"}
 //
 // Every ID is "" when the lease has no such state (free lease, no handoff
-// reservation, FLEET_LEASE_FAILOVER disabled, or an unsupported platform). The
+// reservation, or an unsupported platform). The
 // coordlock reads live in coord_owner_unix.go / coord_owner_other.go
 // (build-tagged) because the lease primitive is linux||darwin only.
 
@@ -55,8 +55,8 @@ func newCoordOwnerCmd() *cobra.Command {
 			"--project: the process-live active owner (live_owner_id), the " +
 			"TTL-gated active owner (owner_id), and any in-flight handoff " +
 			"successor reservation (handoff_successor_id). Each is empty when the " +
-			"lease has no such state (free lease / no reservation / failover " +
-			"disabled / unsupported platform). Read-only; never mutates the lease.",
+			"lease has no such state (free lease / no reservation / unsupported " +
+			"platform). Read-only; never mutates the lease.",
 		SilenceUsage:  true,
 		SilenceErrors: true,
 		RunE: func(cmd *cobra.Command, _ []string) error {

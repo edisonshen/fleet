@@ -193,6 +193,7 @@ var (
 	handoffDeliveryDepsFn        = handoffdelivery.DefaultDeps
 	handoffDeliveryTimeout       = 30 * time.Second
 	handoffDeliveryPoll          = 100 * time.Millisecond
+	handoffSpawnFn               = spawn.Spawn
 	// PR3 graceful-route seams (DESIGN-coord-spawn-unified-standby §6): a
 	// LIVE-coord manual handoff routes through the GracefulHandoff barrier
 	// (barrier → AtomicCoordSwap → deliver-to-lock-winner) instead of the
@@ -216,7 +217,7 @@ func deliverHandoffResumePrompt(project string, isCoordSwap, requireOwner bool, 
 	// this CLI recovery path may name a BARE coord successor (DisableLeaseWrap)
 	// that never becomes CurrentOwner; polling it would time out / misroute, so
 	// such a successor takes the direct-send path below.
-	if leaseFailoverEnabled() && isCoordSwap && rec.LeaseWrapped && project != "" {
+	if coordLeaseSupported() && isCoordSwap && rec.LeaseWrapped && project != "" {
 		delivered, err := handoffdelivery.DeliverToCurrentOwner(handoffdelivery.Options{
 			Project: project,
 			Prompt:  prompt,
@@ -290,7 +291,7 @@ func retargetArchivedHandoffSuccessor(agentID, successorID string) error {
 }
 
 func shouldRefuseLeaseWrappedCoordHandoffRetire(oldRec *agent.Record) (bool, error) {
-	if !leaseFailoverEnabled() {
+	if !coordLeaseSupported() {
 		return false, nil
 	}
 	if oldRec.Project == "" || oldRec.SupervisorPID <= 0 {
@@ -404,7 +405,7 @@ func runHandoff(opts *handoffOpts, stdout, stderr io.Writer) error {
 			// aborts must NOT fire then — they would strand the queue
 			// pending even though DeliverToCurrentOwner can reach the live
 			// winner.
-			coordOwnerDelivery := autoResume && leaseFailoverEnabled() && newRec.LeaseWrapped &&
+			coordOwnerDelivery := autoResume && coordLeaseSupported() && newRec.LeaseWrapped &&
 				(spawn.IsCoordSpawn(newRec.TaskID, newRec.Project) ||
 					leaseNamesCoord(newRec.Project, newRec.ID))
 			if !tmux.HasSession(newRec.TmuxSession) && !coordOwnerDelivery {
@@ -932,7 +933,7 @@ func runHandoff(opts *handoffOpts, stdout, stderr io.Writer) error {
 		}
 	}
 
-	newRec, err := spawn.Spawn(spawn.Options{
+	newRec, err := handoffSpawnFn(spawn.Options{
 		OldRecord:         oldRec,
 		NewDocPath:        docPath,
 		Cwd:               cwd,
