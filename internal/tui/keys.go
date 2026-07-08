@@ -1226,8 +1226,9 @@ var taskWorkerArchiveExists = func(project, slug string) bool {
 // Resolve and consumes Attach / Wait / Spawn / SpawnStandby. The small
 // CoordID preflight only preserves the dashboard refresh distinction:
 // an unloaded non-archived link is a refresh race, while an archived link
-// gets a read-only Resolve chance to attach a successor before surfacing
-// the [r] reset hint.
+// gets a real pre-allocated Resolve chance so live boot/handoff states
+// return Wait and flow into the bounded retry path instead of surfacing
+// the destructive [r] reset hint.
 func (m Model) actionAttachProject(p *ProjectRow) (Model, tea.Cmd, bool) {
 	if p == nil {
 		return m, nil, true
@@ -1262,22 +1263,52 @@ func (m Model) actionAttachProject(p *ProjectRow) (Model, tea.Cmd, bool) {
 			}
 			return m, nil, true
 		}
-		verdict, err := tuiCoordResolveFn(p.Name, "")
-		if err == nil && verdict.Decision == coordreconcile.Attach {
+		agentID := tuiCoordNewAgentIDFn()
+		if agentID == "" {
+			m.flash = &flashMsg{
+				text:  fmt.Sprintf("project %s: could not preallocate coord id — press [a] again", p.Name),
+				isErr: true,
+			}
+			return m, nil, true
+		}
+		verdict, err := tuiCoordResolveFn(p.Name, agentID)
+		if err != nil {
+			m.flash = &flashMsg{
+				text: fmt.Sprintf(
+					"project %s: cannot resolve coord lease (%v) — press [a] again; if it persists run `fleet doctor`",
+					p.Name, err),
+				isErr: true,
+			}
+			return m, loadAgentsCmd(), true
+		}
+		switch verdict.Decision {
+		case coordreconcile.Attach:
 			next, cmd := m.attachResolvedCoordOwner(p.Name, "project", verdict)
 			return next, cmd, true
+		case coordreconcile.Wait, coordreconcile.SpawnStandby:
+			next, cmd := m.consumeResolvedCoordVerdict(p.Name, agentID, "project", tuiCoordResolveMaxAttempts, verdict)
+			return next, cmd, true
+		case coordreconcile.Spawn:
+			reason := "no successor is attachable"
+			if verdict.Reason != "" {
+				reason = verdict.Reason
+			}
+			m.flash = &flashMsg{
+				text:  fmt.Sprintf("project %s: coord link %s is stale (%s) — press [r] to reset", p.Name, p.CoordID, reason),
+				isErr: true,
+			}
+			return m, nil, true
+		default:
+			reason := "unknown coord lease decision"
+			if verdict.Reason != "" {
+				reason = verdict.Reason
+			}
+			m.flash = &flashMsg{
+				text:  fmt.Sprintf("project %s: coord resolver returned %s (%s) — press [a] again", p.Name, verdict.Decision, reason),
+				isErr: true,
+			}
+			return m, nil, true
 		}
-		reason := "no successor is attachable"
-		if err != nil {
-			reason = fmt.Sprintf("lease resolve failed: %v", err)
-		} else if verdict.Reason != "" {
-			reason = verdict.Reason
-		}
-		m.flash = &flashMsg{
-			text:  fmt.Sprintf("project %s: coord link %s is stale (%s) — press [r] to reset", p.Name, p.CoordID, reason),
-			isErr: true,
-		}
-		return m, nil, true
 	}
 	next, cmd := m.beginResolvedCoordAttach(p.Name, "project")
 	return next, cmd, true

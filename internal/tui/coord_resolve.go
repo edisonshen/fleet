@@ -84,6 +84,10 @@ func (m Model) consumeResolvedCoord(projectName, agentID, context string, attemp
 		}
 		return m, loadAgentsCmd()
 	}
+	return m.consumeResolvedCoordVerdict(projectName, agentID, context, attemptsLeft, verdict)
+}
+
+func (m Model) consumeResolvedCoordVerdict(projectName, agentID, context string, attemptsLeft int, verdict coordreconcile.Verdict) (Model, tea.Cmd) {
 	switch verdict.Decision {
 	case coordreconcile.Attach:
 		return m.attachResolvedCoordOwner(projectName, context, verdict)

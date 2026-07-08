@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 
@@ -81,6 +82,20 @@ func coordRecord(id, project string) *agent.Record {
 // D3 — stale-CoordID fall-through (actionAttachProject Path 1)
 // ---------------------------------------------------------------------
 
+func buggyArchivedCoordIDPreflightWouldOfferReset(t *testing.T, project string, resolve func(string, string) (coordreconcile.Verdict, error)) bool {
+	t.Helper()
+	verdict, err := resolve(project, "")
+	return err != nil || verdict.Decision != coordreconcile.Attach
+}
+
+func flashSuggestsReset(f *flashMsg) bool {
+	if f == nil {
+		return false
+	}
+	text := strings.ToLower(f.text)
+	return strings.Contains(text, "[r]") || strings.Contains(text, "reset")
+}
+
 // TestKeyA_StaleCoordID_Table is the core regression for the
 // dead-end-recovery root cause (2026-05-28): a coordinator.lock body
 // named an ARCHIVED coord, the dashboard derived CoordID from it, and
@@ -95,6 +110,9 @@ func coordRecord(id, project string) *agent.Record {
 //   - terminal-stale-with-successor: holder archived, a live successor
 //     coord exists → MUST attach to the successor (pendingAttach set),
 //     NOT loop pending-refresh.
+//   - boot/handoff-wait: holder archived, but the lease names a live
+//     in-progress coord → MUST enter the safe [a] retry path with no
+//     destructive [r] hint.
 //   - terminal-stale-no-successor: holder archived, no successor → MUST
 //     surface the stale-lock diagnosis + [r] reset hint, NOT pending-
 //     refresh.
@@ -102,12 +120,15 @@ func TestKeyA_StaleCoordID_Table(t *testing.T) {
 	const project = "demo"
 	const staleID = "129c9824" // the archived holder named in the lock body
 	const liveID = "68c6db50"  // the live successor coord
+	const preallocID = "prea110c"
 
 	tests := []struct {
-		name      string
-		archived  bool
-		successor *agent.Record // loaded into m.records as a coord, if non-nil
-		outcome   string
+		name                    string
+		archived                bool
+		successor               *agent.Record // loaded into m.records as a coord, if non-nil
+		verdict                 coordreconcile.Verdict
+		outcome                 string
+		assertOldWouldShowReset bool
 	}{
 		{
 			name:     "transient-race-keeps-pending-refresh",
@@ -118,12 +139,40 @@ func TestKeyA_StaleCoordID_Table(t *testing.T) {
 			name:      "terminal-stale-with-successor-attaches",
 			archived:  true,
 			successor: coordRecord(liveID, project),
-			outcome:   "attach-successor",
+			verdict: coordreconcile.Verdict{
+				Decision: coordreconcile.Attach,
+				Owner:    coordlock.Owner{AgentID: liveID, PID: 1},
+				Reason:   "successor published",
+			},
+			outcome: "attach-successor",
+		},
+		{
+			name:     "boot-in-flight-waits-without-reset",
+			archived: true,
+			verdict: coordreconcile.Verdict{
+				Decision: coordreconcile.Wait,
+				Reason:   "coord boot in flight (starting within TTL)",
+			},
+			outcome:                 "safe-retry",
+			assertOldWouldShowReset: true,
+		},
+		{
+			name:     "handoff-reservation-waits-without-reset",
+			archived: true,
+			verdict: coordreconcile.Verdict{
+				Decision: coordreconcile.Wait,
+				Reason:   "handoff reservation naming successor succ7788",
+			},
+			outcome: "safe-retry",
 		},
 		{
 			name:     "terminal-stale-no-successor-surfaces-reset",
 			archived: true,
-			outcome:  "reset-hint",
+			verdict: coordreconcile.Verdict{
+				Decision: coordreconcile.Spawn,
+				Reason:   "free lease claimed (starting record written)",
+			},
+			outcome: "reset-hint",
 		},
 	}
 
@@ -143,22 +192,24 @@ func TestKeyA_StaleCoordID_Table(t *testing.T) {
 			resolveCalls := 0
 			prevResolve := tuiCoordResolveFn
 			prevOwner := tuiCoordCurrentOwnerFn
+			prevNewID := tuiCoordNewAgentIDFn
+			prevTick := tuiCoordResolveWaitTickFn
+			tuiCoordNewAgentIDFn = func() string { return preallocID }
+			tuiCoordResolveWaitTickFn = func(d time.Duration, f func(time.Time) tea.Msg) tea.Cmd {
+				return func() tea.Msg { return f(time.Unix(0, 0)) }
+			}
 			tuiCoordResolveFn = func(gotProject, agentID string) (coordreconcile.Verdict, error) {
-				resolveCalls++
 				if gotProject != project {
 					t.Fatalf("Resolve project = %q, want %q", gotProject, project)
 				}
-				if agentID != "" {
-					t.Fatalf("stale CoordID preflight must re-Resolve read-only; agentID=%q", agentID)
+				if agentID == "" {
+					return coordreconcile.Verdict{Decision: coordreconcile.Wait, Reason: "lease free but caller has no id to claim"}, nil
 				}
-				if tc.successor != nil {
-					return coordreconcile.Verdict{
-						Decision: coordreconcile.Attach,
-						Owner:    coordlock.Owner{AgentID: tc.successor.ID, PID: 1},
-						Reason:   "successor published",
-					}, nil
+				resolveCalls++
+				if agentID != preallocID {
+					t.Fatalf("stale CoordID preflight must use preallocated id %q; got %q", preallocID, agentID)
 				}
-				return coordreconcile.Verdict{Decision: coordreconcile.Wait, Reason: "coord unavailable"}, nil
+				return tc.verdict, nil
 			}
 			tuiCoordCurrentOwnerFn = func(string) (coordlock.Owner, bool) {
 				if tc.successor == nil {
@@ -169,7 +220,12 @@ func TestKeyA_StaleCoordID_Table(t *testing.T) {
 			t.Cleanup(func() {
 				tuiCoordResolveFn = prevResolve
 				tuiCoordCurrentOwnerFn = prevOwner
+				tuiCoordNewAgentIDFn = prevNewID
+				tuiCoordResolveWaitTickFn = prevTick
 			})
+			if tc.assertOldWouldShowReset && !buggyArchivedCoordIDPreflightWouldOfferReset(t, project, tuiCoordResolveFn) {
+				t.Fatal("adversarial guard failed: old empty-agentID preflight would not have offered reset")
+			}
 
 			m := New("test")
 			m.records = records
@@ -200,7 +256,7 @@ func TestKeyA_StaleCoordID_Table(t *testing.T) {
 				if mm.flash == nil || !mm.flash.isErr || !strings.Contains(mm.flash.text, "pending refresh") {
 					t.Fatalf("flash = %+v; want pending refresh error", mm.flash)
 				}
-				if strings.Contains(mm.flash.text, "reset") {
+				if flashSuggestsReset(mm.flash) {
 					t.Fatalf("pending-refresh flash must not suggest reset; got %q", mm.flash.text)
 				}
 			case "attach-successor":
@@ -212,6 +268,26 @@ func TestKeyA_StaleCoordID_Table(t *testing.T) {
 				}
 				if mm.pendingAttach != "fleet-"+liveID {
 					t.Fatalf("pendingAttach = %q; want fleet-%s", mm.pendingAttach, liveID)
+				}
+			case "safe-retry":
+				if resolveCalls != 1 {
+					t.Fatalf("safe-retry path Resolve calls = %d, want 1", resolveCalls)
+				}
+				if cmd == nil {
+					t.Fatal("safe-retry path must return bounded retry tick")
+				}
+				msg, ok := cmd().(coordResolveRetryMsg)
+				if !ok {
+					t.Fatalf("safe-retry cmd produced %T, want coordResolveRetryMsg", cmd())
+				}
+				if msg.projectName != project || msg.agentID != preallocID || msg.context != "project" {
+					t.Fatalf("retry msg = %+v; want project=%q agent=%q context=project", msg, project, preallocID)
+				}
+				if mm.pendingAttach != "" {
+					t.Fatalf("pendingAttach = %q; want empty during safe retry", mm.pendingAttach)
+				}
+				if flashSuggestsReset(mm.flash) {
+					t.Fatalf("live Wait flash must not suggest reset; got %q", mm.flash.text)
 				}
 			case "reset-hint":
 				if resolveCalls != 1 {

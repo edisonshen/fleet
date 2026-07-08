@@ -456,6 +456,32 @@ func TestTA12_TUISpawnVetoCallbackReResolvesLease(t *testing.T) {
 		}
 	})
 
+	t.Run("Attach holder record load failure", func(t *testing.T) {
+		withFleetHome(t)
+		owner := "missveto"
+		prevResolve := tuiCoordResolveFn
+		tuiCoordResolveFn = func(project, agentID string) (coordreconcile.Verdict, error) {
+			if agentID != "" {
+				t.Fatalf("veto callback must re-Resolve read-only; agentID=%q", agentID)
+			}
+			return coordreconcile.Verdict{
+				Decision: coordreconcile.Attach,
+				Owner:    coordlock.Owner{AgentID: owner, PID: 12},
+				Reason:   "veto winner record missing",
+			}, nil
+		}
+		t.Cleanup(func() { tuiCoordResolveFn = prevResolve })
+
+		msg := resolveCoordSpawnVeto("demo")
+		if msg.attachedExisting {
+			t.Fatalf("record-load failure must not attach; msg=%+v", msg)
+		}
+		if !strings.Contains(msg.recoverable, "lease owner "+owner+" record is not readable") ||
+			!strings.Contains(msg.recoverable, "coord lease for demo is held by a live leader not reachable from this TUI") {
+			t.Fatalf("recoverable veto message did not include load failure; got %q", msg.recoverable)
+		}
+	})
+
 	t.Run("Wait recovery", func(t *testing.T) {
 		withFleetHome(t)
 		prevResolve := tuiCoordResolveFn
