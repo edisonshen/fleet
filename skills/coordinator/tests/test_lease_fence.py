@@ -1,8 +1,8 @@
 """Parent-lease ownership fence for loop.tick() — DESIGN-handoff-drain-
 storm-leak PR4 (T7 + T30).
 
-Under FLEET_LEASE_FAILOVER (default ON as of PR4) the Go `fleet coord-run`
-supervisor that PARENTS the Python tick holds coordinator.flock + heartbeats
+The Go `fleet coord-run` supervisor that PARENTS the Python tick holds
+coordinator.flock + heartbeats
 the coordinator.epoch fencing record. Before any disk mutation the tick must
 prove it still descends from the ACTIVE lease owner — a FENCED old coord
 (its parent's lease was stolen by a successor) must abort the tick WITHOUT
@@ -214,7 +214,6 @@ def _fake_completed(returncode: int, stderr: str = ""):
 def test_prove_helper_exit_code_mapping(
     fleet_home: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setenv("FLEET_LEASE_FAILOVER", "1")
     # exit 0 -> owner; exit 3 -> fenced; exit 1/2 with a genuine internal
     # error -> FENCED (cannot prove ownership, codex PR4 [P1]).
     cases = {0: "owner", 3: "fenced", 1: "fenced", 2: "fenced"}
@@ -234,7 +233,6 @@ def test_prove_helper_too_old_binary_fails_open(
 ) -> None:
     # A binary too old to have `lease-check` -> cobra "unknown command" +
     # exit 1 -> fail OPEN ("unknown"), don't wedge a pre-lease coord.
-    monkeypatch.setenv("FLEET_LEASE_FAILOVER", "1")
     monkeypatch.setattr(
         loop.subprocess, "run",
         lambda *a, **k: _fake_completed(1, 'unknown command "lease-check" for "fleet"'),
@@ -243,20 +241,19 @@ def test_prove_helper_too_old_binary_fails_open(
     assert got == "unknown", "a too-old binary (unknown command) must fail open"
 
 
-def test_prove_helper_failover_off_is_noop(
+def test_prove_helper_empty_project_still_uses_go_verdict(
     fleet_home: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setenv("FLEET_LEASE_FAILOVER", "0")
     called = []
     monkeypatch.setattr(
         loop.subprocess, "run",
         lambda *a, **k: called.append(1) or _fake_completed(0),
     )
     got = loop._prove_parent_lease_ownership(
-        "fleet", home=fleet_home, fleet_bin="fleet",
+        "", home=fleet_home, fleet_bin="fleet",
     )
     assert got == "owner"
-    assert called == [], "failover off must NOT shell out to lease-check"
+    assert called == [1], "lease proof delegates to Go even without the old env gate"
 
 
 def test_prove_helper_prefers_fleet_bin_env(
@@ -264,7 +261,6 @@ def test_prove_helper_prefers_fleet_bin_env(
 ) -> None:
     # codex PR4 [P2]: when fleet_bin is the default sentinel, the FLEET_BIN
     # the spawn stamped must be used (not a bare `fleet` on PATH).
-    monkeypatch.setenv("FLEET_LEASE_FAILOVER", "1")
     monkeypatch.setenv("FLEET_BIN", "/stamped/fleet")
     seen = {}
 
@@ -280,7 +276,6 @@ def test_prove_helper_prefers_fleet_bin_env(
 def test_prove_helper_binary_missing_is_unknown(
     fleet_home: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setenv("FLEET_LEASE_FAILOVER", "1")
 
     def _boom(*a, **k):
         raise FileNotFoundError("no fleet")
@@ -300,7 +295,6 @@ def test_prove_helper_passes_reacquire_flag(
 ) -> None:
     """The TICK's proof is the only lease-check caller allowed to renew, so
     its argv must carry --reacquire (fleet-guard's producer fence does not)."""
-    monkeypatch.setenv("FLEET_LEASE_FAILOVER", "1")
     seen: dict = {}
 
     def _capture(cmd, **k):
@@ -321,7 +315,6 @@ def test_prove_helper_unknown_flag_degrades_to_readonly(
     """Mid-vintage binary (has lease-check, predates --reacquire): the helper
     retries ONCE without the flag — read-only fence semantics, not fail-open,
     not a wedge."""
-    monkeypatch.setenv("FLEET_LEASE_FAILOVER", "1")
     calls: list = []
 
     def _skewed(cmd, **k):
@@ -341,7 +334,6 @@ def test_prove_helper_unknown_flag_retry_fence_maps_fenced(
     fleet_home: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The degraded read-only retry still maps exit 3 to fenced."""
-    monkeypatch.setenv("FLEET_LEASE_FAILOVER", "1")
 
     def _skewed(cmd, **k):
         if "--reacquire" in cmd:
@@ -361,7 +353,6 @@ def test_prove_helper_skew_old_active_fence_fails_open(
     expired ACTIVE lease (frozen message, rival-free by construction) must
     fail OPEN ("unknown") — honoring it would idle the coord until the
     binary upgrade. Any other exit-3 stays fenced."""
-    monkeypatch.setenv("FLEET_LEASE_FAILOVER", "1")
     old_msg = (
         "lease-check: REFUSE: coordlock: caller is not under the active "
         "lease owner (fenced/stale coord) — refuse mutation: our lease is "
@@ -397,7 +388,6 @@ def test_prove_helper_new_binary_exit3_not_treated_as_skew(
     """A NEW binary's exit-3 (no degrade) maps to fenced even if the message
     mentions state=active — the fail-open shim applies ONLY after the
     unknown-flag downgrade."""
-    monkeypatch.setenv("FLEET_LEASE_FAILOVER", "1")
     monkeypatch.setattr(
         loop.subprocess, "run",
         lambda *a, **k: _fake_completed(

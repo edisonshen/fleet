@@ -122,6 +122,21 @@ def _replay(home: Path, fleet_bin: str, *, now_unix: float | None = None,
     )
 
 
+def test_parse_iso_utc_accepts_go_trimmed_fractional_seconds() -> None:
+    """Go RFC3339Nano can emit 1..9 fractional digits after trimming
+    zeroes; Python 3.9's fromisoformat rejects some of those widths."""
+    whole = loop._parse_iso_utc("2026-07-08T14:40:16Z")
+    assert whole is not None
+    for stamp in (
+        "2026-07-08T14:40:16.21778Z",
+        "2026-07-08T14:40:16.21778+00:00",
+        "2026-07-08T14:40:16.217780000Z",
+    ):
+        got = loop._parse_iso_utc(stamp)
+        assert got is not None, stamp
+        assert 0.21777 < got - whole < 0.21779
+
+
 # ---------------------------------------------------------------------------
 # Case (c) — phantom recovery: ExecPending → replay reclaims next tick.
 # ---------------------------------------------------------------------------

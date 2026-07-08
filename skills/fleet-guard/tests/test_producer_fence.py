@@ -183,7 +183,6 @@ def _completed_err(rc: int, stderr: str):
 def test_producer_fenced_exit_code_mapping(
     fleet_home_tmp: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setenv("FLEET_LEASE_FAILOVER", "1")
     # exit 0 -> not fenced; exit 3 -> fenced; exit 1/2 INTERNAL error ->
     # FENCED (cannot prove ownership, codex PR4 [P1]).
     for rc, want in {0: False, 3: True, 1: True, 2: True}.items():
@@ -196,27 +195,24 @@ def test_producer_fenced_too_old_binary_fails_open(
     fleet_home_tmp: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     # too-old binary -> "unknown command" + exit 1 -> fail OPEN (not fenced).
-    monkeypatch.setenv("FLEET_LEASE_FAILOVER", "1")
     monkeypatch.setattr(handoff.subprocess, "run",
                         lambda *a, **k: _completed_err(1, 'unknown command "lease-check"'))
     assert _REAL_PRODUCER_FENCED("myproj") is False, "too-old binary must fail open"
 
 
-def test_producer_fenced_failover_off_is_noop(
+def test_producer_fenced_without_project_is_noop(
     fleet_home_tmp: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setenv("FLEET_LEASE_FAILOVER", "0")
     called = []
     monkeypatch.setattr(handoff.subprocess, "run",
                         lambda *a, **k: called.append(1) or _completed(3))
-    assert _REAL_PRODUCER_FENCED("myproj") is False
-    assert called == [], "failover off must not shell out"
+    assert _REAL_PRODUCER_FENCED("") is False
+    assert called == [], "missing project must not shell out"
 
 
 def test_producer_fenced_binary_missing_fail_open(
     fleet_home_tmp: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setenv("FLEET_LEASE_FAILOVER", "1")
 
     def _boom(*a, **k):
         raise FileNotFoundError("no fleet")
@@ -230,7 +226,6 @@ def test_producer_fenced_oserror_fail_open(
 ) -> None:
     # A non-executable FLEET_BIN raises OSError (PermissionError) -> fail open
     # (codex PR4 [P2]); must NOT escape _producer_fenced.
-    monkeypatch.setenv("FLEET_LEASE_FAILOVER", "1")
 
     def _perm(*a, **k):
         raise PermissionError("not executable")

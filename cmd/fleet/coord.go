@@ -9,27 +9,18 @@
 //
 //	fleet coord-run --agent <id> --project <p> -- <child-cmd> [args...]
 //
-// Production wiring:
-//
-//   - FLEET_LEASE_FAILOVER OFF (default): the dispatch path
-//     (cmd/fleet/dispatch.go) builds the default --command argv as
-//     ["sh","-c","claude --dangerously-skip-permissions; ..."] — a bare
-//     engine, NOT routed through this supervisor (byte-identical to
-//     pre-PR2 behavior).
-//
-//   - FLEET_LEASE_FAILOVER ON (DESIGN-handoff-drain-storm-leak PR2):
-//     dispatch wraps that engine argv in this supervisor:
-//     ["fleet","coord-run","--agent",<id>,"--project",<p>,"--",
-//     "sh","-c","claude ..."]. The supervisor then ACQUIRES + HEARTBEATS
-//     the coordinator lease for the coord's whole life, stands down
-//     (exit 0) if a healthy leader already holds it, releases the lease
-//     on EVERY exit path (alongside coord.Cleanup), and — on a contested
-//     acquire — reaps the stale holder via the authenticated
-//     internal/coord.KillCoordIfIdentityMatches STONITH.
+// Production wiring: on lease-capable platforms dispatch wraps the engine
+// argv in this supervisor:
+// ["fleet","coord-run","--agent",<id>,"--project",<p>,"--",
+// "sh","-c","claude ..."]. The supervisor then ACQUIRES + HEARTBEATS the
+// coordinator lease for the coord's whole life, stands down (exit 0) if a
+// healthy leader already holds it, releases the lease on EVERY exit path
+// (alongside coord.Cleanup), and — on a contested acquire — reaps the stale
+// holder via the authenticated internal/coord.KillCoordIfIdentityMatches
+// STONITH.
 //
 // PR-C originally introduced this subcommand without wiring it in; PR2
-// closes that gap behind the failover flag so the lease has a real
-// lifetime holder.
+// closed that gap so the lease has a real lifetime holder.
 //
 // Exit-path matrix (per task plan acceptance criteria):
 //
@@ -133,8 +124,8 @@ type coordRunOpts struct {
 	//
 	// acquireLease is the lease-acquire seam. nil = production
 	// (productionAcquireLease, which calls coordlock.AcquireLeaseWithKill
-	// + stamps the supervisor identity + runs the new-leader sweep, all
-	// gated on FLEET_LEASE_FAILOVER). Tests inject a stub that returns a
+	// + stamps the supervisor identity + runs the new-leader sweep). Tests
+	// inject a stub that returns a
 	// fakeLease + an acquired flag without touching a real flock.
 	//
 	// Contract (mirrors coordlock.AcquireLease):
@@ -144,8 +135,8 @@ type coordRunOpts struct {
 	//   acquired=false              -> a healthy live leader exists;
 	//       runCoordRun stands down (prints, returns nil, NEVER starts
 	//       the child).
-	//   err!=nil with failover-disabled sentinel -> off-flag: runCoordRun
-	//       skips all lease behavior and runs the legacy bare-child path.
+	//   err!=nil with unsupported-platform sentinel -> runCoordRun skips all
+	//       lease behavior and runs the legacy bare-child path.
 	//
 	// The []liveHolderInfo return is the KP6 detection outcome
 	// (DESIGN-coord-no-auto-kill): non-empty ONLY when acquired==false
@@ -418,8 +409,8 @@ func runCoordRun(ctx context.Context, opts coordRunOpts, stdout, stderr io.Write
 	//     (runs on EVERY exit path alongside coord.Cleanup —
 	//     fleet-owns-its-resources), start the heartbeat, then start the
 	//     child.
-	//   - failover OFF/unsupported -> skip all lease behavior; run the
-	//     legacy bare-child path (byte-identical to today).
+	//   - unsupported platform -> skip all lease behavior; run the legacy
+	//     bare-child path (byte-identical to today).
 	acquire := opts.acquireLease
 	if acquire == nil {
 		acquire = defaultAcquireLease(opts, stderr)
@@ -427,8 +418,8 @@ func runCoordRun(ctx context.Context, opts coordRunOpts, stdout, stderr io.Write
 	lease, acquired, liveHolders, lerr := acquire()
 	switch {
 	case leaseDisabledOrUnsupported(lerr):
-		// Flag OFF (or platform without the lease primitive) — no lease,
-		// legacy path. Fall through to child start.
+		// Platform without the lease primitive — no lease, legacy path.
+		// Fall through to child start.
 	case lerr != nil:
 		// A real acquire/takeover fault. Surface-don't-silo: refuse to
 		// start a child that would have no lease holder rather than
@@ -496,11 +487,8 @@ func runCoordRun(ctx context.Context, opts coordRunOpts, stdout, stderr io.Write
 		//   - a WEDGED-but-alive engine -> detected by the central
 		//     lease-gated mutation API rejecting its stale token (PR4) and
 		//     by the warm-standby progress poll (PR3), NOT by PR2.
-		// This is why FLEET_LEASE_FAILOVER ships OFF + unsupported until
-		// the PR3/PR4 progress layer lands (see internal/coordlock/
-		// lease.go FailoverEnvVar). Tying the heartbeat to coord-state.json
-		// freshness is PR3's job; doing it here would duplicate the
-		// progress-tracking the warm-standby owns.
+		// Tying the heartbeat to coord-state.json freshness would duplicate
+		// the progress-tracking the warm-standby owns.
 		defer lease.Release()
 		// Heartbeat starts AFTER the starting->active flip (below): a
 		// `starting` record self-demotes the heartbeat (state != active).
@@ -532,7 +520,7 @@ func runCoordRun(ctx context.Context, opts coordRunOpts, stdout, stderr io.Write
 	// epoch, T6f), Activate refuses and we self-demote + exit BEFORE any tick —
 	// two owners can never coexist. Only AFTER a successful flip do we start
 	// the heartbeat (a `starting` record self-demotes it). Guarded on lease !=
-	// nil so the failover-OFF legacy path is byte-identical.
+	// nil for unsupported-platform/test seams that run without a lease.
 	if lease != nil {
 		activated, aerr := lease.Activate()
 		switch {

@@ -2,6 +2,7 @@ package tmux
 
 import (
 	"sync"
+	"sync/atomic"
 	"testing"
 )
 
@@ -35,7 +36,16 @@ type Backend interface {
 // duration. Tests that install the fake are therefore NOT parallel-safe
 // against each other within a package unless they coordinate — the
 // install helper documents this.
-var installMu sync.Mutex
+var (
+	installMu      sync.Mutex
+	backendStateMu sync.RWMutex
+)
+
+var realBackendInstalled atomic.Bool
+
+func init() {
+	realBackendInstalled.Store(true)
+}
 
 // Install swaps the package function table to route every shelling op
 // through b, and returns a restore func that puts the real backend back.
@@ -55,6 +65,7 @@ func Install(b Backend) (restore func()) {
 		panic("tmux.Install: nil backend")
 	}
 	installMu.Lock()
+	backendStateMu.Lock()
 	prev := struct {
 		available               func() error
 		hasSession              func(string) bool
@@ -67,11 +78,12 @@ func Install(b Backend) (restore func()) {
 		kill                    func(string) error
 		listSessions            func() ([]string, error)
 		listSessionsWithCreated func() ([]SessionInfo, error)
+		isReal                  bool
 	}{
 		available: availableFn, hasSession: hasSessionFn, sessionAlive: sessionAliveFn,
 		spawn: spawnFn, attach: attachFn, sendKeys: sendKeysFn, capturePane: capturePaneFn,
 		setStatusHint: setStatusHintFn, kill: killFn, listSessions: listSessionsFn,
-		listSessionsWithCreated: listSessionsWithCreatedFn,
+		listSessionsWithCreated: listSessionsWithCreatedFn, isReal: realBackendInstalled.Load(),
 	}
 
 	availableFn = b.Available
@@ -85,10 +97,13 @@ func Install(b Backend) (restore func()) {
 	killFn = b.Kill
 	listSessionsFn = b.ListSessions
 	listSessionsWithCreatedFn = b.ListSessionsWithCreated
+	realBackendInstalled.Store(isRealBackend(b))
+	backendStateMu.Unlock()
 
 	var once sync.Once
 	return func() {
 		once.Do(func() {
+			backendStateMu.Lock()
 			availableFn = prev.available
 			hasSessionFn = prev.hasSession
 			sessionAliveFn = prev.sessionAlive
@@ -100,9 +115,28 @@ func Install(b Backend) (restore func()) {
 			killFn = prev.kill
 			listSessionsFn = prev.listSessions
 			listSessionsWithCreatedFn = prev.listSessionsWithCreated
+			realBackendInstalled.Store(prev.isReal)
+			backendStateMu.Unlock()
 			installMu.Unlock()
 		})
 	}
+}
+
+// IsRealBackend reports whether the package-level tmux function table is
+// currently routed to the real tmux subprocess backend. It deliberately avoids
+// taking installMu because tests hold that mutex for the duration of a fake
+// install while production code under test calls back into tmux. It does take
+// the short-lived backend-state lock so callers never observe the is-real bit
+// mid-swap.
+func IsRealBackend() bool {
+	backendStateMu.RLock()
+	defer backendStateMu.RUnlock()
+	return realBackendInstalled.Load()
+}
+
+func isRealBackend(b Backend) bool {
+	_, ok := b.(realBackend)
+	return ok
 }
 
 // Compile-time drift guard: if a realXxx signature changes, realBackend

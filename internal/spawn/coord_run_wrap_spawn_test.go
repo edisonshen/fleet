@@ -1,4 +1,4 @@
-// Lifecycle regression tests for the lease-failover pre-launch record
+// Lifecycle regression tests for the lease-supervised pre-launch record
 // write in spawn.Spawn (codex PR2 iter-3 [P2]):
 //
 //	#1  tmux.Spawn fails after the pre-launch write -> the pre-launch
@@ -25,8 +25,6 @@ import (
 func TestSpawn_LeaseCoord_RollsBackPrelaunchRecordOnTmuxFailure(t *testing.T) {
 	requireTmux(t)
 	setupFleetHome(t)
-	t.Setenv("FLEET_LEASE_FAILOVER", "1")
-	// Force tmux.Spawn to fail by pointing the socket at an over-long path
 	// (exceeds the UNIX socket limit). Canonical fleet-test-* prefix so
 	// the runtime sink guard lets us through (mirrors
 	// TestSpawn_FailsWhenSocketUnusable). This fails tmux.Spawn AFTER our

@@ -27,7 +27,7 @@
 //	└──────────────────────────────────────────────────────────────────┘
 //
 // Build-tagged linux||darwin (the lease + STONITH primitives are). Other
-// Unix targets compile drain_lease_other.go's stub (lease always "off").
+// Unix targets compile drain_lease_other.go's stub (lease unsupported).
 
 package main
 
@@ -55,11 +55,10 @@ import (
 	"github.com/edisonshen/fleet/internal/tmux"
 )
 
-// leaseDrainEnabled reports whether the lease-aware drain path is selected.
-// Delegates to coordlock's single source of truth (PR4 default ON;
-// =0/false/off/no disables).
+// leaseDrainEnabled reports whether this platform supports the lease-aware
+// drain path.
 func leaseDrainEnabled() bool {
-	return coordlock.FailoverEnabled()
+	return coordlock.LeaseSupported()
 }
 
 // drainLeaseDeps are the injectable seams that keep drainOneLeaseAware
@@ -503,11 +502,18 @@ func drainOneLeaseAwareWith(req queue.SpawnFresh, path string, graceMillis, resu
 	//     supervisor identity to authenticate a kill) -> queue stranded forever;
 	//   - default  -> safety-net takeover acquires the orphan flock + spawns a
 	//     successor WITHOUT killing the live bare OLD -> TWO coordinators.
-	// A bare coord (SupervisorPID==0) holds NO lease and is NEVER the recorded
-	// lease owner (the owner is always a coord-run with a SupervisorPID). So a
-	// bare OLD's handoff must ALWAYS complete via the legacy coldResume (loads
-	// OLD by id, retires/kills it via Resume) — regardless of whether some
-	// OTHER coord-run currently holds the project lease (codex PR4 [P1]/[P2]).
+	// A bare coord (!LeaseWrapped, SupervisorPID==0) holds NO lease and is
+	// NEVER the recorded lease owner (the owner is always a coord-run with a
+	// SupervisorPID). So a bare OLD's handoff must ALWAYS complete via the
+	// legacy coldResume (loads OLD by id, retires/kills it via Resume) —
+	// regardless of whether some OTHER coord-run currently holds the project
+	// lease (codex PR4 [P1]/[P2]).
+	//
+	// Do NOT route LeaseWrapped && SupervisorPID==0 here. That is an
+	// unstamped coord-run supervisor whose identity could not be recorded; it
+	// may still hold the lease. It must fall through to the lease-aware path,
+	// where drainReapOld/takeoverAndRecover fail closed because STONITH cannot
+	// authenticate the target.
 	// Routing it through the lease branches is wrong in every case:
 	//   - leaderHealthy (a different coord-run leads) -> drainLiveLeaderFallback
 	//     polls a barrier OLD will never write, then legacy-Resumes anyway
@@ -517,7 +523,7 @@ func drainOneLeaseAwareWith(req queue.SpawnFresh, path string, graceMillis, resu
 	//   - default -> safety-net takeover acquires the orphan flock + RecoverSpawn
 	//     without killing the live bare OLD -> TWO coordinators.
 	if oldRec, lerr := d.LoadAgent(req.OldAgentID); lerr == nil &&
-		oldRec != nil && oldRec.SupervisorPID == 0 {
+		oldRec != nil && oldRec.SupervisorPID == 0 && !oldRec.LeaseWrapped {
 		_, _ = fmt.Fprintf(stderr,
 			"fleet drain: %s is a bare (non-lease-wrapped) coord; completing via legacy resume "+
 				"(holds no lease — no takeover/graceful-reap/standby-wait)\n", req.OldAgentID)
@@ -556,7 +562,7 @@ func drainOneLeaseAwareWith(req queue.SpawnFresh, path string, graceMillis, resu
 		return drainLiveLeaderFallback(req, path, deadline, graceMillis, resumeTimeoutMillis, stdout, stderr, d)
 
 	case !hasEpoch:
-		// COLD recovery: failover is on but there is NO lease epoch for this
+		// COLD recovery: there is NO lease epoch for this
 		// project (no coord ever held the lease here, or the record is gone)
 		// — the lease is stealable and nothing to fence/kill. Spawn the
 		// successor via coldResume (codex PR3 iter-1 [P2]). coldResume holds a
@@ -1178,14 +1184,13 @@ func drainLiveLeaderFallback(req queue.SpawnFresh, path string, deadline time.Ti
 		}
 	}
 	// OLD still present and still the leader -> complete the handoff the proven
-	// way. Delegate to the LEGACY drain (LockAgent + handoffop.Resume), which
-	// is byte-identical to the flag-off path: it spawns + retires the
-	// successor exactly as production does today.
+	// way. Delegate to the LEGACY drain (LockAgent + handoffop.Resume): it
+	// spawns + retires the successor exactly as production does today.
 	//
 	// SCOPE NOTE (codex PR4 [P1], accepted limitation): the successor spawned
 	// here is NOT lease-wrapped — it is the legacy `claude` shape. Under the
-	// PR4 flag flip (failover default ON) that means a live `fleet handoff`
-	// completed via THIS fallback yields a successor that coordinates but does
+	// lease-supported path that means a live `fleet handoff` completed via THIS
+	// fallback yields a successor that coordinates but does
 	// not hold/heartbeat the coordinator lease. This is SAFE, not a
 	// correctness break: the successor's `/coordinator` tick reads "no healthy
 	// active owner" (OLD released the lease on retire) and PROCEEDS (the

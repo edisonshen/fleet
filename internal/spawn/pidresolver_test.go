@@ -63,8 +63,8 @@ func TestResolveEnginePid_PrefersDisambiguatorMatch(t *testing.T) {
 }
 
 // TestResolveEnginePid_SkipsCoordRunWrapper (codex PR2 iter-4 [P2]):
-// under FLEET_LEASE_FAILOVER the pane's top process is the `fleet
-// coord-run` supervisor, whose argv CONTAINS the disambiguator + engine
+// the pane's top process is the `fleet coord-run` supervisor, whose argv
+// CONTAINS the disambiguator + engine
 // name in its tail. The resolver must record the ENGINE child pid, NOT
 // the supervisor pid (PID==engine / SupervisorPID==lease-holder split).
 //
@@ -361,8 +361,8 @@ func TestResolveEnginePid_RawShellLeafFastReturns(t *testing.T) {
 }
 
 // TestResolveEnginePid_RawShellUnderCoordRun (codex PR2 iter-14 [P2]):
-// a RAW-SHELL coord command (`--command sh`) wrapped by coord-run under
-// FLEET_LEASE_FAILOVER. The pane is the coord-run SUPERVISOR; its only
+// a RAW-SHELL coord command (`--command sh`) wrapped by coord-run. The pane
+// is the coord-run SUPERVISOR; its only
 // child is the bare shell engine (no deeper child). The resolver must
 // record the SHELL pid (the engine), NOT the coord-run supervisor pid —
 // else PID == SupervisorPID breaks liveness.

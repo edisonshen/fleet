@@ -121,15 +121,13 @@ func TestDrain_ProcessesSkillWrittenQueue(t *testing.T) {
 	}
 }
 
-// codex PR3 iter-4 [P1]: with FLEET_LEASE_FAILOVER on, a WORKER (non-coord)
-// handoff must NOT be routed through the coord lease stand-down — it carries a
+// codex PR3 iter-4 [P1]: a WORKER (non-coord) handoff must NOT be routed
+// through the coord lease stand-down — it carries a
 // Project but is not the project coord, so the coord lease says nothing about
 // it. It must drain via the LEGACY path (spawn + retire), not get stranded.
 func TestDrain_FailoverOn_WorkerHandoffUsesLegacyPath(t *testing.T) {
 	requireFakeTmux(t)
 	setupFleetHome(t)
-	t.Setenv("FLEET_LEASE_FAILOVER", "1")
-	// seedAgent's TaskID is a worker task (not "coord-<project>").
 	oldRec := seedAgent(t)
 	qp, req := writeSkillQueueFile(t, oldRec)
 

@@ -44,8 +44,8 @@ func readFleetlogEvents(t *testing.T, evt string) []map[string]any {
 }
 
 // Test 4: a child exiting nonzero logs supervisor.exit with the child's rc.
-// A clean exit logs supervisor.exit rc=0. Lease machinery is disabled so the
-// test isolates the supervisor lifecycle emit.
+// A clean exit logs supervisor.exit rc=0. A fake lease isolates the supervisor
+// lifecycle emit without touching the real coordinator lease.
 func TestCoordRun_SupervisorExitLogged(t *testing.T) {
 	cases := []struct {
 		name    string
@@ -58,16 +58,19 @@ func TestCoordRun_SupervisorExitLogged(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			t.Setenv("FLEET_LEASE_FAILOVER", "0") // no lease: isolate supervisor.exit
-			t.Setenv("XDG_STATE_HOME", "")        // logs under FLEET_HOME
+			t.Setenv("XDG_STATE_HOME", "") // logs under FLEET_HOME
 			markerPath := coordRunTestHome(t, "obs11111", "obs-exit", "fleet-obs11111")
 			_ = markerPath
 
+			lease := &fakeLease{}
 			opts := coordRunOpts{
-				agentID:  "obs11111",
-				project:  "obs-exit",
-				session:  "fleet-obs11111",
-				argv:     tc.argv,
+				agentID: "obs11111",
+				project: "obs-exit",
+				session: "fleet-obs11111",
+				argv:    tc.argv,
+				acquireLease: func() (coordLease, bool, []liveHolderInfo, error) {
+					return lease, true, nil, nil
+				},
 				killTmux: func(string) error { return nil },
 			}
 			err := runCoordRun(context.Background(), opts, os.Stdout, os.Stderr)
@@ -104,15 +107,16 @@ func TestCoordRun_SupervisorExitLogged(t *testing.T) {
 // defer must recover() to record reason=panic:... rc=2 — and re-panic so
 // cleanup still runs and the operator sees the stack.
 func TestCoordRun_SupervisorExitLogsPanic(t *testing.T) {
-	t.Setenv("FLEET_LEASE_FAILOVER", "0") // no lease: isolate supervisor.exit
-	t.Setenv("XDG_STATE_HOME", "")        // logs under FLEET_HOME
+	t.Setenv("XDG_STATE_HOME", "") // logs under FLEET_HOME
 	_ = coordRunTestHome(t, "obs22222", "obs-panic", "fleet-obs22222")
 
+	lease := &fakeLease{}
 	opts := coordRunOpts{
 		agentID:         "obs22222",
 		project:         "obs-panic",
 		session:         "fleet-obs22222",
 		argv:            []string{"true"},
+		acquireLease:    func() (coordLease, bool, []liveHolderInfo, error) { return lease, true, nil, nil },
 		killTmux:        func(string) error { return nil },
 		panicAfterStart: true,
 	}

@@ -1569,10 +1569,11 @@ func TestSpawn_WritesCoordConfigRepo_OnFreshProject(t *testing.T) {
 
 	myCwd := t.TempDir()
 	rec, err := Spawn(Options{
-		TaskID:  "coord-projects-rainier",
-		Project: "projects-rainier",
-		Cwd:     myCwd,
-		Command: []string{"sleep", "30"},
+		TaskID:           "coord-projects-rainier",
+		Project:          "projects-rainier",
+		Cwd:              myCwd,
+		Command:          []string{"sleep", "30"},
+		DisableLeaseWrap: true,
 	})
 	if err != nil {
 		t.Fatalf("Spawn: %v", err)
@@ -1602,10 +1603,11 @@ func TestSpawn_WritesCoordConfigRepo_PreservesParallelism(t *testing.T) {
 
 	myCwd := t.TempDir()
 	rec, err := Spawn(Options{
-		TaskID:  "coord-projects-rainier",
-		Project: "projects-rainier",
-		Cwd:     myCwd,
-		Command: []string{"sleep", "30"},
+		TaskID:           "coord-projects-rainier",
+		Project:          "projects-rainier",
+		Cwd:              myCwd,
+		Command:          []string{"sleep", "30"},
+		DisableLeaseWrap: true,
 	})
 	if err != nil {
 		t.Fatalf("Spawn: %v", err)
@@ -1654,10 +1656,11 @@ func TestSpawn_OverwritesExistingRepoWithRespawnCwd(t *testing.T) {
 
 	myCwd := t.TempDir() // the NEW respawn cwd
 	rec, err := Spawn(Options{
-		TaskID:  "coord-projects-rainier",
-		Project: "projects-rainier",
-		Cwd:     myCwd,
-		Command: []string{"sleep", "30"},
+		TaskID:           "coord-projects-rainier",
+		Project:          "projects-rainier",
+		Cwd:              myCwd,
+		Command:          []string{"sleep", "30"},
+		DisableLeaseWrap: true,
 	})
 	if err != nil {
 		t.Fatalf("Spawn: %v", err)
@@ -1702,10 +1705,11 @@ func TestSpawn_OverwritesStaleRepoOnRespawn(t *testing.T) {
 
 	myCwd := t.TempDir() // the new live checkout
 	rec, err := Spawn(Options{
-		TaskID:  "coord-projects-rainier",
-		Project: "projects-rainier",
-		Cwd:     myCwd,
-		Command: []string{"sleep", "30"},
+		TaskID:           "coord-projects-rainier",
+		Project:          "projects-rainier",
+		Cwd:              myCwd,
+		Command:          []string{"sleep", "30"},
+		DisableLeaseWrap: true,
 	})
 	if err != nil {
 		t.Fatalf("Spawn: %v", err)
@@ -1763,10 +1767,11 @@ func TestSpawn_ResolvesRelativeCwdToAbsoluteInCoordConfig(t *testing.T) {
 	}
 
 	rec, err := Spawn(Options{
-		TaskID:  "coord-projects-rainier",
-		Project: "projects-rainier",
-		Cwd:     rel,
-		Command: []string{"sleep", "30"},
+		TaskID:           "coord-projects-rainier",
+		Project:          "projects-rainier",
+		Cwd:              rel,
+		Command:          []string{"sleep", "30"},
+		DisableLeaseWrap: true,
 	})
 	if err != nil {
 		t.Fatalf("Spawn: %v", err)
@@ -1826,10 +1831,11 @@ func TestSpawn_HandoffInheritedCwdAlwaysRestampsCoordConfig(t *testing.T) {
 	docPath := "/some/handoffs/aaaa1111-20260427-184807.md"
 
 	rec, err := Spawn(Options{
-		OldRecord:  old,
-		NewDocPath: docPath,
-		Cwd:        inheritedCwd, // EQUALS OldRecord.Cwd → inheritance
-		Command:    []string{"sleep", "30"},
+		OldRecord:        old,
+		NewDocPath:       docPath,
+		Cwd:              inheritedCwd, // EQUALS OldRecord.Cwd → inheritance
+		Command:          []string{"sleep", "30"},
+		DisableLeaseWrap: true,
 	})
 	if err != nil {
 		t.Fatalf("Spawn: %v", err)
@@ -1884,10 +1890,11 @@ func TestSpawn_RecoveryWithExplicitCwdRestampsCoordConfig(t *testing.T) {
 	// Operator runs `fleet dispatch --coord-spawn --cwd /correct/path`:
 	correctCwd := t.TempDir()
 	rec, err := Spawn(Options{
-		OldRecord:  dead,
-		NewDocPath: "/some/handoffs/aaaa1111-20260427-184807.md",
-		Cwd:        correctCwd, // DIFFERS from dead.Cwd → operator override
-		Command:    []string{"sleep", "30"},
+		OldRecord:        dead,
+		NewDocPath:       "/some/handoffs/aaaa1111-20260427-184807.md",
+		Cwd:              correctCwd, // DIFFERS from dead.Cwd → operator override
+		Command:          []string{"sleep", "30"},
+		DisableLeaseWrap: true,
 	})
 	if err != nil {
 		t.Fatalf("Spawn: %v", err)

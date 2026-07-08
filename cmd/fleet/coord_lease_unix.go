@@ -33,11 +33,11 @@ func defaultAcquireLease(opts coordRunOpts, stderr io.Writer) func() (coordLease
 }
 
 // leaseDisabledOrUnsupported reports whether err means "no lease, run the
-// legacy path": the failover flag is off on this (lease-capable)
-// platform. On non-linux/darwin the other-file variant also returns true
-// for its unsupported sentinel.
+// legacy path". On lease-capable platforms that is never true: a coord that
+// cannot acquire/prove the lease must not start a bare child. The
+// non-linux/darwin variant returns true for its unsupported sentinel.
 func leaseDisabledOrUnsupported(err error) bool {
-	return errors.Is(err, coordlock.ErrFailoverDisabled)
+	return false
 }
 
 // coordLeaderCheck reports whether a HEALTHY coordinator lease leader (or
@@ -51,11 +51,8 @@ func leaseDisabledOrUnsupported(err error) bool {
 // record (dead/hung owner past TTL) must NOT read as "leader present"
 // (that would hide a recoverable coord as "already running"), and a fresh
 // fencing takeover MUST read as present (a legitimate successor is
-// acquiring). Off-flag it returns false (no lease in play).
+// acquiring).
 func coordLeaderCheck(project string) bool {
-	if !leaseFailoverEnabled() {
-		return false
-	}
 	return coordlock.LeaderPresent(project)
 }
 
@@ -78,32 +75,24 @@ func coordLeaderCheck(project string) bool {
 //     DESIGN-coord-no-auto-kill): the flock is the singleton; reaping is
 //     operator-gated (`fleet gc --apply` for corpses, `fleet rm` /
 //     `fleet handoff` for live ones).
-//
-// All of this is behind FLEET_LEASE_FAILOVER inside coordlock (Acquire-
-// LeaseWithKill returns ErrFailoverDisabled when off), so off-flag the
-// closure is a cheap no-op that signals "legacy path" to runCoordRun.
 func productionAcquireLease(opts coordRunOpts, stderr io.Writer) func() (coordLease, bool, []liveHolderInfo, error) {
 	return func() (coordLease, bool, []liveHolderInfo, error) {
-		// Step 1: stamp supervisor identity (best-effort, only when the
-		// flag is on — off-flag we skip to keep records byte-identical).
-		// spawn.Spawn writes the record BEFORE launching us, but we RETRY
-		// briefly on ErrNotFound to be robust against any ordering skew
-		// (codex PR2 iter-2 [P1]). The identity is what STONITH
-		// authenticates a takeover against, so getting it onto the record
-		// is load-bearing, not cosmetic.
-		if leaseFailoverEnabled() {
-			pid := os.Getpid()
-			pidStart, ok := coordlock.PidStartNanos(pid)
-			exe, exeErr := os.Executable()
-			if !ok || exeErr != nil {
-				_, _ = fmt.Fprintf(stderr,
-					"coord-run: WARNING: could not read supervisor identity (pid_start ok=%v exe err=%v); "+
-						"STONITH of this coord will refuse until re-stamped\n", ok, exeErr)
-			} else if serr := stampSupervisorWithRetry(opts.agentID, pid, pidStart, exe); serr != nil {
-				_, _ = fmt.Fprintf(stderr,
-					"coord-run: WARNING: stamp supervisor identity for agent %s failed: %v "+
-						"(continuing; STONITH may refuse on the unstamped record)\n", opts.agentID, serr)
-			}
+		// Step 1: stamp supervisor identity (best-effort). spawn.Spawn writes
+		// the record BEFORE launching us, but we RETRY briefly on ErrNotFound
+		// to be robust against any ordering skew (codex PR2 iter-2 [P1]).
+		// The identity is what STONITH authenticates a takeover against, so
+		// getting it onto the record is load-bearing, not cosmetic.
+		pid := os.Getpid()
+		pidStart, ok := coordlock.PidStartNanos(pid)
+		exe, exeErr := os.Executable()
+		if !ok || exeErr != nil {
+			_, _ = fmt.Fprintf(stderr,
+				"coord-run: WARNING: could not read supervisor identity (pid_start ok=%v exe err=%v); "+
+					"STONITH of this coord will refuse until re-stamped\n", ok, exeErr)
+		} else if serr := stampSupervisorWithRetry(opts.agentID, pid, pidStart, exe); serr != nil {
+			_, _ = fmt.Fprintf(stderr,
+				"coord-run: WARNING: stamp supervisor identity for agent %s failed: %v "+
+					"(continuing; STONITH may refuse on the unstamped record)\n", opts.agentID, serr)
 		}
 
 		// Step 2: acquire with the authenticated kill injected. The KP6
@@ -176,11 +165,10 @@ func stampSupervisorWithRetry(agentID string, pid int, pidStart int64, exe strin
 	return lastErr
 }
 
-// leaseFailoverEnabled delegates to coordlock's single source of truth for
-// the failover flag (PR4 flipped the default to ON; =0/false/off/no still
-// disables). Kept as a thin wrapper so call sites read naturally.
-func leaseFailoverEnabled() bool {
-	return coordlock.FailoverEnabled()
+// coordLeaseSupported reports platform support for the coordinator lease.
+// Kept as a thin wrapper so call sites read naturally.
+func coordLeaseSupported() bool {
+	return coordlock.LeaseSupported()
 }
 
 func leaseActiveOwnerPID(project string) (int, bool) {

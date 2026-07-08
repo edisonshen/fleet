@@ -152,8 +152,8 @@ func Cleanup(agentID, project string, deps Deps) error {
 // on a missing live record (Cleanup may be invoked twice — once from
 // the signal handler, once from defer in main).
 //
-// CONCURRENCY (codex PR2 iter-10 [P2]): under FLEET_LEASE_FAILOVER a
-// lease-wrapped coord's record is also written by spawn.Spawn's final
+// CONCURRENCY (codex PR2 iter-10 [P2]): a lease-wrapped coord's record is
+// also written by spawn.Spawn's final
 // locked merge (engine PID) and by agent.StampSupervisorIdentity
 // (supervisor identity). If this archive raced spawn's merge — archiving
 // AFTER spawn's locked Load but BEFORE its rec.Write — the final write

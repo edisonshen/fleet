@@ -5,7 +5,6 @@
 // live in the integration lane and are excluded from the default `go test ./...`
 // gate. Each sets FLEET_STANDBY_TIMEOUT=3s so an orphaned run self-reaps the
 // standby in seconds instead of looping 10m and fork-bombing the box.
-// FLEET_LEASE_FAILOVER=1 overrides the TestMain default-OFF guard.
 // See docs/DESIGN-spawn-test-fork-bomb-root-fix.md.
 package main
 
@@ -27,15 +26,14 @@ import (
 	"github.com/edisonshen/fleet/internal/tmux"
 )
 
-// Codex P1 regression: a coord handoff with FLEET_LEASE_FAILOVER=1 against a
-// LEGACY/bare coord (no lease record, so CurrentOwner never resolves an owner)
+// Codex P1 regression: a coord handoff against a LEGACY/bare coord (no lease
+// record, so CurrentOwner never resolves an owner)
 // must NOT loop the owner-poll until timeout and fail. deliverHandoffResumePrompt
 // detects ErrNoOwnerObserved and falls back to a direct send into the live
 // replacement's session — the pre-PR2 delivery path.
 func TestDeliverHandoffResumePrompt_NoLeaseOwner_FallsBackToDirectSend(t *testing.T) {
 	requireTmux(t)
 	setupFleetHome(t)
-	t.Setenv("FLEET_LEASE_FAILOVER", "1")
 	t.Setenv("FLEET_STANDBY_TIMEOUT", "3s")
 
 	const project = "rainier"
@@ -75,7 +73,7 @@ func TestDeliverHandoffResumePrompt_NoLeaseOwner_FallsBackToDirectSend(t *testin
 	}
 
 	out := &bytes.Buffer{}
-	delivered, err := deliverHandoffResumePrompt(project, true, false, rep, docPath, out, out)
+	delivered, err := deliverHandoffResumePrompt(project, true, rep, docPath, out, out)
 	if err != nil {
 		t.Fatalf("expected direct-send fallback, got error: %v\n%s", err, out.String())
 	}
@@ -103,7 +101,6 @@ func TestDeliverHandoffResumePrompt_NoLeaseOwner_FallsBackToDirectSend(t *testin
 
 func TestHandoff_GracefulRoute_SwapsViaBarrier(t *testing.T) {
 	requireTmux(t)
-	t.Setenv("FLEET_LEASE_FAILOVER", "1")
 	t.Setenv("FLEET_STANDBY_TIMEOUT", "3s")
 	root := setupFleetHome(t)
 
@@ -196,7 +193,6 @@ func TestHandoff_GracefulRoute_SwapsViaBarrier(t *testing.T) {
 
 func TestHandoff_GracefulRouteError_PreservesQueueAndOld(t *testing.T) {
 	requireTmux(t)
-	t.Setenv("FLEET_LEASE_FAILOVER", "1")
 	t.Setenv("FLEET_STANDBY_TIMEOUT", "3s")
 	root := setupFleetHome(t)
 
@@ -242,7 +238,6 @@ func TestHandoff_GracefulRouteError_PreservesQueueAndOld(t *testing.T) {
 
 func TestHandoff_LeaseFailoverCoordHandoffRefusesBeforeRetiringOld(t *testing.T) {
 	requireTmux(t)
-	t.Setenv("FLEET_LEASE_FAILOVER", "1")
 	t.Setenv("FLEET_STANDBY_TIMEOUT", "3s")
 	root := setupFleetHome(t)
 
@@ -344,7 +339,6 @@ func TestHandoff_LeaseFailoverCoordHandoffRefusesBeforeRetiringOld(t *testing.T)
 
 func TestHandoff_LeaseFailoverCoordHandoffFinalizesDeliveredLockOwner(t *testing.T) {
 	requireTmux(t)
-	t.Setenv("FLEET_LEASE_FAILOVER", "1")
 	t.Setenv("FLEET_STANDBY_TIMEOUT", "3s")
 	root := setupFleetHome(t)
 

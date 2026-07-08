@@ -380,7 +380,7 @@ def tick(
             )
 
     # 0.5. Parent-lease ownership proof (DESIGN-handoff-drain-storm-leak
-    # PR4). Under FLEET_LEASE_FAILOVER the Go `fleet coord-run` supervisor
+    # PR4). The Go `fleet coord-run` supervisor
     # that PARENTS this tick holds coordinator.flock + heartbeats the
     # coordinator.epoch fencing record. If a candidate fenced our parent
     # (bumped the epoch), every disk-mutating thing this tick does would be
@@ -391,7 +391,7 @@ def tick(
     # re-reads coordinator.epoch in Go and confirms the active lease owner
     # is an ANCESTOR of this process (epoch + pid + pid_start, PID-reuse
     # safe). Exit 3 = definitively fenced/not-owner → abort the tick WITHOUT
-    # writing and self-demote. Exit 0 = proven owner (or failover off — a
+    # writing and self-demote. Exit 0 = proven owner (or unsupported platform
     # no-op success) → proceed. An inconclusive result (binary missing /
     # internal error / timeout) is surfaced but does NOT abort: a legacy
     # install without the new subcommand, or a transient fault, must not
@@ -2881,7 +2881,7 @@ def _read_coord_lease_identity(
                         (either field may be "" = that lease slot is genuinely
                         free). Gate 5 keys on this.
       ("", "")          CONCLUSIVE-EMPTY: the CLI ran fine and the lease names
-                        NOBODY (free lease / no reservation / failover disabled).
+                        NOBODY (free lease / no reservation / unsupported platform).
       (None, None)      INCONCLUSIVE: the read FAILED — a stale ``FLEET_BIN``
                         that predates the ``coord-owner`` subcommand (exit!=0,
                         the #182 stale-binary class fleet's symlinked-skill /
@@ -3127,15 +3127,6 @@ _LEASE_CHECK_NOT_OWNER_EXIT = 3
 _LEASE_CHECK_TIMEOUT_S = 5.0
 
 
-def _lease_failover_enabled() -> bool:
-    """Mirror coordlock.FailoverEnabled's tri-state gate (PR4 default ON):
-    enabled unless FLEET_LEASE_FAILOVER is EXPLICITLY one of 0/false/off/no
-    (case-insensitive). Unset/empty/anything-else → ON. Kept consistent
-    with internal/coordlock.parseFailover + the Go mirrors."""
-    return (os.environ.get("FLEET_LEASE_FAILOVER", "") or "").strip().lower() \
-        not in ("0", "false", "off", "no")
-
-
 class LeaseCheckResult(str):
     """The `_lease_check_fn` verdict — "owner" | "fenced" | "unknown" —
     carrying optional fence detail (DESIGN-coord-lease-false-fence-prevention
@@ -3201,7 +3192,7 @@ def _prove_parent_lease_ownership(
     LeaseCheckResult (a str subclass, so `== "fenced"` still works) whose
     value is one of:
 
-      "owner"   — proven owner, OR failover disabled (no lease in play).
+      "owner"   — proven owner, OR unsupported platform (no lease in play).
                   The tick may mutate.
       "fenced"  — the Go check returned exit 3: NOT under the active owner
                   (a rival takeover is live, or ownership could not be
@@ -3213,11 +3204,9 @@ def _prove_parent_lease_ownership(
                   transient fault must not wedge a healthy coord (the
                   coordinator.lock + #171 guard remain the defense).
 
-    When failover is OFF this returns "owner" without shelling out — the
-    legacy bare-child path has no lease, so there is nothing to fence.
+    Unsupported platforms return "owner" from `fleet lease-check`; lease-capable
+    platforms always run the ownership proof.
     """
-    if not _lease_failover_enabled():
-        return LeaseCheckResult("owner")
     # Resolve the binary the SAME way the producer/kick paths do: prefer the
     # FLEET_BIN the spawn stamped into the coord's env over a bare `fleet` on
     # PATH (codex PR4 [P2]). main() calls tick() without fleet_bin, so without
@@ -3938,18 +3927,10 @@ def _worker_state_fresh(
         # Bootstrapped state (just dispatched, no first tick yet).
         # Treat as alive so the worker has a chance to run.
         return True
-    try:
-        # Workers serialize updated_at via Go time.Time JSON, which is
-        # RFC3339 with nanos. Python's fromisoformat handles RFC3339
-        # since 3.11; for older interpreters we fall back to a regex
-        # strip of the trailing fractional seconds.
-        from datetime import datetime, timezone
-        ts = datetime.fromisoformat(updated_at.replace("Z", "+00:00"))
-        if ts.tzinfo is None:
-            ts = ts.replace(tzinfo=timezone.utc)
-        age_s = (datetime.now(tz=timezone.utc) - ts).total_seconds()
-    except ValueError:
+    updated_unix = _parse_iso_utc(updated_at)
+    if updated_unix is None:
         return False
+    age_s = time.time() - updated_unix
     return age_s <= _WORKER_STATE_FRESH_S
 
 
@@ -6845,9 +6826,18 @@ def _parse_iso_utc(s: str) -> float | None:
     if not s or not isinstance(s, str):
         return None
     try:
-        # Python's fromisoformat handles the trailing 'Z' from 3.11+.
+        # Go's RFC3339Nano formatter trims trailing fractional zeroes, so
+        # timestamps can have 1..9 fractional digits. Python 3.9's
+        # fromisoformat is stricter around UTC offsets and fractional widths;
+        # normalize to microsecond precision before parsing.
         from datetime import datetime, timezone
-        t = s.replace("Z", "+00:00") if s.endswith("Z") else s
+        t = s.strip()
+        if t.endswith("Z"):
+            t = t[:-1] + "+00:00"
+        m = re.match(r"^(.*T\d{2}:\d{2}:\d{2})\.(\d+)(.*)$", t)
+        if m:
+            prefix, frac, suffix = m.groups()
+            t = f"{prefix}.{(frac + '000000')[:6]}{suffix}"
         dt = datetime.fromisoformat(t)
         if dt.tzinfo is None:
             dt = dt.replace(tzinfo=timezone.utc)

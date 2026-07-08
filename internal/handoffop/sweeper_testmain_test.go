@@ -1,7 +1,6 @@
 package handoffop
 
 import (
-	"os"
 	"testing"
 	"time"
 
@@ -31,14 +30,6 @@ import (
 //     until the test fleet is idle; that gate (classifying on argv[0], not
 //     the macOS-truncated comm) is what makes the teardown force-kill safe.
 func TestMain(m *testing.M) {
-	// Fork-bomb guard (PR-A): force lease-failover OFF for the whole default
-	// test lane (the package's requireTmux helper already sets =0 per-test; this
-	// makes it the package default too). The genuine standby-spawning cases
-	// (TestDrain_LeaseFailover*) opt back in via t.Setenv("FLEET_LEASE_FAILOVER",
-	// "1") in the integration lane. See docs/DESIGN-spawn-test-fork-bomb-root-fix.md.
-	if err := os.Setenv("FLEET_LEASE_FAILOVER", "0"); err != nil {
-		panic("TestMain: os.Setenv FLEET_LEASE_FAILOVER failed: " + err.Error())
-	}
 	cleanup := testutil.IsolateSweepDir()
 	_ = testutil.Sweep(time.Hour)
 	code := m.Run()

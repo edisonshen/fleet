@@ -83,7 +83,6 @@ func TestLeaseCheck_StalledRenewalReacquiresSameEpoch(t *testing.T) {
 	const project = "stall-reacquire"
 	fleetHome := t.TempDir()
 	t.Setenv("FLEET_HOME", fleetHome)
-	t.Setenv("FLEET_LEASE_FAILOVER", "1")
 	if _, err := state.Bootstrap(); err != nil {
 		t.Fatalf("bootstrap: %v", err)
 	}
@@ -115,7 +114,6 @@ func TestLeaseCheck_StalledRenewalReacquiresSameEpoch(t *testing.T) {
 		"--pid", strconv.Itoa(os.Getpid()))
 	roCmd.Env = append(os.Environ(),
 		"FLEET_HOME="+fleetHome,
-		"FLEET_LEASE_FAILOVER=1",
 	)
 	roOut, roErr := roCmd.CombinedOutput()
 	var roExit *exec.ExitError
@@ -133,7 +131,6 @@ func TestLeaseCheck_StalledRenewalReacquiresSameEpoch(t *testing.T) {
 		"--pid", strconv.Itoa(os.Getpid()), "--reacquire")
 	rejCmd.Env = append(os.Environ(),
 		"FLEET_HOME="+fleetHome,
-		"FLEET_LEASE_FAILOVER=1",
 	)
 	rejOut, rejErr := rejCmd.CombinedOutput()
 	var rejExit *exec.ExitError
@@ -148,7 +145,6 @@ func TestLeaseCheck_StalledRenewalReacquiresSameEpoch(t *testing.T) {
 	cmd := exec.Command(bin, "lease-check", "--project", project, "--reacquire")
 	cmd.Env = append(os.Environ(),
 		"FLEET_HOME="+fleetHome,
-		"FLEET_LEASE_FAILOVER=1",
 	)
 	out, runErr := cmd.CombinedOutput()
 	if runErr != nil {
@@ -184,8 +180,6 @@ func TestCoordIntegration_StalledLeaseTickReacquiresAndProceeds(t *testing.T) {
 	env.plantCoord(t)
 	initGitRepo(t, env.repoCwd)
 	env.bindRepo(t)
-
-	t.Setenv("FLEET_LEASE_FAILOVER", "1")
 	lease, acquired, err := coordlock.AcquireLease(env.project, "stall-tick-sup")
 	if err != nil || !acquired || lease == nil {
 		t.Fatalf("pre-acquire lease failed (acquired=%v err=%v)", acquired, err)
@@ -255,7 +249,6 @@ func TestLeaseCheck_LiveRivalStillFencesExit3(t *testing.T) {
 	const project = "rival-fence"
 	fleetHome := t.TempDir()
 	t.Setenv("FLEET_HOME", fleetHome)
-	t.Setenv("FLEET_LEASE_FAILOVER", "1")
 	if _, err := state.Bootstrap(); err != nil {
 		t.Fatalf("bootstrap: %v", err)
 	}
@@ -275,7 +268,6 @@ func TestLeaseCheck_LiveRivalStillFencesExit3(t *testing.T) {
 		"--pid", strconv.Itoa(os.Getpid()))
 	cmd.Env = append(os.Environ(),
 		"FLEET_HOME="+fleetHome,
-		"FLEET_LEASE_FAILOVER=1",
 	)
 	out, runErr := cmd.CombinedOutput()
 	var exitErr *exec.ExitError
@@ -302,8 +294,6 @@ func TestCoordIntegration_LiveRivalTickSkipsAndStaysAlive(t *testing.T) {
 	env.plantCoord(t)
 	initGitRepo(t, env.repoCwd)
 	env.bindRepo(t)
-
-	t.Setenv("FLEET_LEASE_FAILOVER", "1")
 	lease, acquired, err := coordlock.AcquireLease(env.project, "rival-tick-sup")
 	if err != nil || !acquired || lease == nil {
 		t.Fatalf("pre-acquire lease failed (acquired=%v err=%v)", acquired, err)

@@ -187,23 +187,19 @@ type Record struct {
 	// before signaling.
 	//
 	// Stamped by `fleet coord-run` at supervisor startup (the supervisor
-	// is the only process that knows its own identity). Empty on:
-	//   - records spawned with FLEET_LEASE_FAILOVER off (coord-run not
-	//     wired) — the kill primitive refuses (no supervisor to target),
-	//   - legacy/worker records — never coords, never killed by STONITH.
-	// All three behind FLEET_LEASE_FAILOVER; omitempty keeps off-flag
-	// records byte-identical to today.
+	// is the only process that knows its own identity). Empty on
+	// legacy/worker records — never coords, never killed by STONITH.
 	SupervisorPID      int    `json:"supervisor_pid,omitempty"`
 	SupervisorPidStart int64  `json:"supervisor_pid_start,omitempty"`
 	SupervisorExePath  string `json:"supervisor_exe_path,omitempty"`
 	// LeaseWrapped records whether THIS spawn actually wrapped the engine in
 	// the `fleet coord-run --standby` lease supervisor. It is the authoritative
 	// "is this a lease-wrapped successor" signal for handoff resume delivery on
-	// crash-recovery retry paths (codex iter-24 [P2]): the drain cold-resume
-	// fallback spawns a coord BARE (DisableLeaseWrap) even for a CapApproved
-	// queue, so the producer's cap-approval bit must NOT be reused to infer
-	// wrapping — read this persisted truth instead. Empty/false for legacy
-	// records and bare/direct successors.
+	// crash-recovery retry paths (codex iter-24 [P2]): legacy/test bare
+	// successors can exist even for a CapApproved queue, so the producer's
+	// cap-approval bit must NOT be reused to infer wrapping — read this
+	// persisted truth instead. Empty/false for legacy records and bare/direct
+	// successors.
 	LeaseWrapped bool `json:"lease_wrapped,omitempty"`
 	// IsCoord marks a coordinator record. Stamped at spawn, derived from
 	// spawn.IsCoordSpawn(taskID, project) at the single record-build
@@ -275,8 +271,8 @@ func New(id string) *Record {
 //
 // A missing record returns state.ErrNotFound for the caller to retry/
 // surface (the supervisor may start before spawn's record write lands;
-// coord-run retries — see stampSupervisorWithRetry). Off-flag coords
-// never call this, so off-flag records keep the fields empty (omitempty).
+// coord-run retries — see stampSupervisorWithRetry). Legacy/worker records
+// never call this, so the fields stay empty (omitempty).
 func StampSupervisorIdentity(id string, pid int, pidStart int64, exePath string) error {
 	unlock, err := state.LockAgent(id)
 	if err != nil {

@@ -315,8 +315,8 @@ func findEngineDescendant(
 		queue = queue[1:]
 		p := f.entry
 		// A WRAPPER process is transport, not the engine: a shell
-		// (`sh -c "claude ..."`) OR — under FLEET_LEASE_FAILOVER — the
-		// `fleet coord-run` supervisor (DESIGN-handoff-drain-storm-leak
+		// (`sh -c "claude ..."`) OR the `fleet coord-run` supervisor
+		// (DESIGN-handoff-drain-storm-leak
 		// PR2), whose argv CONTAINS the engine argv (and therefore the
 		// disambiguator + engine-hint) as its tail. Matching the
 		// supervisor would record SupervisorPID as Record.PID, violating
@@ -392,7 +392,7 @@ func paneIsRawShellLeaf(procs []procEntry, panePID int) bool {
 //
 //   - UNWRAPPED pane: the pane process itself is a shell with no children
 //     → record the pane pid (the original raw-shell-leaf case).
-//   - COORD-RUN WRAPPED pane (FLEET_LEASE_FAILOVER): the pane is `fleet
+//   - COORD-RUN WRAPPED pane: the pane is `fleet
 //     coord-run`, whose intended engine is a shell child. The supervisor
 //     argv is a WRAPPER (excluded from the normal match), so without this
 //     the resolver would fall back to the pane pid = the SUPERVISOR pid,
@@ -476,9 +476,9 @@ func isShellArgv(argv string) bool {
 }
 
 // isCoordRunArgv reports whether argv is the `fleet coord-run`
-// supervisor (DESIGN-handoff-drain-storm-leak PR2). Under
-// FLEET_LEASE_FAILOVER the supervisor wraps the engine, so it is the
-// pane's top process and its argv CONTAINS the engine argv (disambiguator
+// supervisor (DESIGN-handoff-drain-storm-leak PR2). The supervisor wraps
+// the engine, so it is the pane's top process and its argv CONTAINS the
+// engine argv (disambiguator
 // + engine name) as its tail. The pid resolver must treat it as a
 // wrapper, not the engine — argv[0] basename contains "fleet" AND the
 // second token is "coord-run". Conservative: both conditions required so

@@ -27,10 +27,11 @@ func TestSpawn_StampsIsCoordForCoordSpawn(t *testing.T) {
 	// dir.
 	cwd := t.TempDir()
 	coord, err := Spawn(Options{
-		TaskID:  "coord-myproj",
-		Project: "myproj",
-		Cwd:     cwd,
-		Command: []string{"sleep", "30"},
+		TaskID:           "coord-myproj",
+		Project:          "myproj",
+		Cwd:              cwd,
+		Command:          []string{"sleep", "30"},
+		DisableLeaseWrap: true,
 	})
 	if err != nil {
 		t.Fatalf("Spawn coord: %v", err)

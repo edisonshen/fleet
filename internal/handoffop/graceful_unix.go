@@ -39,8 +39,7 @@
 // Build-tagged linux||darwin because the lease primitive it reads
 // (coordlock.CurrentEpoch / BarrierPath) is itself gated to those GOOS
 // values. Other Unix targets compile graceful_other.go's stub, which
-// refuses (the whole lease path is unsupported there). All gated behind
-// FLEET_LEASE_FAILOVER (default OFF) — the caller passes the flag check in.
+// refuses (the whole lease path is unsupported there).
 
 package handoffop
 
@@ -278,10 +277,11 @@ func GracefulHandoff(in GracefulHandoffInputs, d GracefulHandoffDeps) error {
 var gracefulEligibleOwnerFn = coordlock.CurrentOwner
 
 // GracefulSwapEligible reports whether a coord swap should route through the
-// GracefulHandoff barrier (DESIGN-coord-spawn-unified-standby §6 PR3): lease
-// failover is on, OLD is the project's CURRENT healthy lease owner (a
-// live-coord handoff — a dead-coord recovery has no live releaser and keeps
-// the proven cold/bespoke path), and the resume prompt will be auto-delivered
+// GracefulHandoff barrier (DESIGN-coord-spawn-unified-standby §6 PR3): this
+// platform supports coordinator leases, OLD is the project's CURRENT healthy
+// lease owner (a live-coord handoff — a dead-coord recovery has no live
+// releaser and keeps the proven cold/bespoke path), and the resume prompt will
+// be auto-delivered
 // (completion IS delivery; an opt-out handoff has nothing to inject).
 //
 // Callers additionally gate on the successor being lease-wrapped
@@ -292,7 +292,7 @@ func GracefulSwapEligible(oldRec *agent.Record, autoResume bool) bool {
 	if oldRec == nil || oldRec.Project == "" || !autoResume {
 		return false
 	}
-	if !coordlock.FailoverEnabled() {
+	if !coordlock.LeaseSupported() {
 		return false
 	}
 	owner, ok := gracefulEligibleOwnerFn(oldRec.Project)

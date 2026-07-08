@@ -1,8 +1,8 @@
 //go:build integration
 
 // PR-A fork-bomb fence: this dispatch recovery test drives runDispatch on a
-// coord (coordSpawn=true) under FLEET_LEASE_FAILOVER=1, which lease-wraps the
-// replacement into a REAL `coord-run --standby` tmux pane. It lives in the
+// coord (coordSpawn=true), which lease-wraps the replacement into a REAL
+// `coord-run --standby` tmux pane. It lives in the
 // integration lane (excluded from the default `go test ./...` gate) and sets
 // FLEET_STANDBY_TIMEOUT=3s so an orphaned run self-reaps the standby in seconds.
 // See docs/DESIGN-spawn-test-fork-bomb-root-fix.md.
@@ -40,7 +40,6 @@ import (
 func TestRunDispatch_DeadCoordRecovery_AdvertisesLockWinner(t *testing.T) {
 	requireTmux(t)
 	setupFleetHome(t)
-	t.Setenv("FLEET_LEASE_FAILOVER", "1")   // delivery branch only fires with failover on
 	t.Setenv("FLEET_STANDBY_TIMEOUT", "3s") // PR-A: self-bound the standby this dispatch spawns
 
 	// Stub the lock-owner delivery so we deterministically model "a racing

@@ -11,8 +11,7 @@ import (
 
 // Test #4 — production default is unchanged when the env seam is unset.
 func TestStandbyTimeoutOrDefault_ProductionDefault(t *testing.T) {
-	// The TestMain default-OFF guard does not touch FLEET_STANDBY_TIMEOUT;
-	// pin it empty here so a host-exported value can't perturb the assert.
+	// Pin it empty here so a host-exported value can't perturb the assert.
 	t.Setenv("FLEET_STANDBY_TIMEOUT", "")
 	if got := standbyTimeoutOrDefault(0); got != DefaultStandbyTimeout {
 		t.Fatalf("standbyTimeoutOrDefault(0) with seam unset = %v, want %v (production default)",
@@ -67,8 +66,6 @@ func TestStandbyTimeoutOrDefault_InvalidSeamIgnored(t *testing.T) {
 func TestSpawn_RollbackDoesNotIncrementStandbyCounter(t *testing.T) {
 	requireTmux(t)
 	setupFleetHome(t)
-	t.Setenv("FLEET_LEASE_FAILOVER", "1")
-	// Over-long socket path -> tmux.Spawn fails AFTER lease-wrap but BEFORE the
 	// counter bump (which is gated on tmux.Spawn success). Canonical fleet-test-
 	// prefix so the runtime sink guard admits it.
 	t.Setenv("FLEET_TMUX_SOCKET", "/tmp/fleet-test-"+strings.Repeat("a", 200)+".sock")

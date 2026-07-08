@@ -5,7 +5,7 @@
 // lane by PR-A's fork-bomb fix: an orphaned default-lane run of these used to
 // leave 10-minute standby panes piling up forks until the box couldn't fork().
 // Here each sets FLEET_STANDBY_TIMEOUT=3s so even an orphaned run self-reaps in
-// seconds, and FLEET_LEASE_FAILOVER=1 to override the TestMain default-OFF guard.
+// seconds.
 // See docs/DESIGN-spawn-test-fork-bomb-root-fix.md.
 package spawn
 
@@ -26,7 +26,6 @@ import (
 func TestSpawn_StandbyFinalMergePreservesStampedEnginePID(t *testing.T) {
 	requireTmux(t)
 	setupFleetHome(t)
-	t.Setenv("FLEET_LEASE_FAILOVER", "1")
 	t.Setenv("FLEET_STANDBY_TIMEOUT", "3s")
 
 	const id = "sbmerge1"
@@ -87,12 +86,11 @@ func TestSpawn_StandbyFinalMergePreservesStampedEnginePID(t *testing.T) {
 
 // codex iter-24 [P2]: Spawn must persist the ACTUAL lease-wrap state on the
 // record so crash-recovery retry paths read the truth (not the producer's
-// cap-approval bit). A lease-wrapped coord records LeaseWrapped=true; a coord
-// spawned with DisableLeaseWrap (the drain cold-resume path) records false.
+// cap-approval bit). A lease-wrapped coord records LeaseWrapped=true; an
+// explicit legacy/test DisableLeaseWrap coord records false.
 func TestSpawn_PersistsLeaseWrappedState(t *testing.T) {
 	requireTmux(t)
 	setupFleetHome(t)
-	t.Setenv("FLEET_LEASE_FAILOVER", "1")
 	t.Setenv("FLEET_STANDBY_TIMEOUT", "3s")
 
 	// Test #1b (counter mechanics, POSITIVE half): a real lease-wrapped coord
@@ -123,7 +121,7 @@ func TestSpawn_PersistsLeaseWrappedState(t *testing.T) {
 		t.Fatalf("persisted LeaseWrapped=%v (err=%v), want true", got.LeaseWrapped, lerr)
 	}
 
-	// DisableLeaseWrap (drain cold-resume) coord -> LeaseWrapped false.
+	// Explicit DisableLeaseWrap coord -> LeaseWrapped false.
 	beforeBare := StandbyLaunchCount()
 	bare, err := Spawn(Options{
 		TaskID:           "coord-lwp",

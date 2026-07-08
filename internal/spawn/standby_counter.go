@@ -7,8 +7,8 @@ import "sync/atomic"
 // SUCCESSFUL tmux.Spawn. It is the authoritative gate for the test fork-bomb
 // fix: each non-integration TestMain asserts this is zero after m.Run() (see
 // assertNoStandbyLaunches), so a genuine standby-spawning test accidentally
-// left in the default lane fails the suite loudly — regardless of how it set
-// FLEET_LEASE_FAILOVER — instead of silently piling up 10-minute panes.
+// left in the default lane fails the suite loudly instead of silently piling
+// up 10-minute panes.
 //
 // It is incremented ONLY after tmux.Spawn of the wrapped coord returns nil, so
 // the rollback case (TestSpawn_LeaseCoord_RollsBackPrelaunchRecordOnTmuxFailure,
