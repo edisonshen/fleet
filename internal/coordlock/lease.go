@@ -351,11 +351,11 @@ func resolvePaths(project string) (leasePaths, error) {
 	}, nil
 }
 
-// FailoverEnabled reports whether this build supports the coordinator
+// LeaseSupported reports whether this build supports the coordinator
 // lease/STONITH/RPO path. On linux/darwin the answer is always true; other
 // platforms compile lease_owner_other.go's false stub because the pid-start /
 // monotonic-clock primitives are not available there.
-func FailoverEnabled() bool {
+func LeaseSupported() bool {
 	return true
 }
 

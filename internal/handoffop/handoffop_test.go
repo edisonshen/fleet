@@ -1072,11 +1072,9 @@ func TestDrain_LeaseFailoverCoordHandoff_FinalizesDeliveredLockOwner(t *testing.
 	}
 
 	req, qp, _ := writeSkillQueue(t, oldRec)
-	// codex iter-24 [P2]: spawnAndRetire COLD-SPAWNS the successor (bare for
-	// coords via DisableLeaseWrap; a worker is never lease-wrapped). Such a
-	// successor records LeaseWrapped=false, so delivery must go DIRECTLY to it,
-	// never poll the lock owner — polling would target the old/dead owner. So
-	// CurrentOwner must NOT be consulted here.
+	// Fake-backed spawnAndRetire records LeaseWrapped=false because the fake tmux
+	// backend cannot execute coord-run. Such a successor must go through the
+	// legacy direct-send branch; CurrentOwner must not be consulted.
 	_ = winner
 	origDeliveryDeps := handoffDeliveryDepsFn
 	origSend := sendPromptKeysVerified
@@ -1087,7 +1085,7 @@ func TestDrain_LeaseFailoverCoordHandoff_FinalizesDeliveredLockOwner(t *testing.
 	handoffDeliveryDepsFn = func() handoffdelivery.Deps {
 		deps := handoffdelivery.DefaultDeps()
 		deps.CurrentOwner = func(string) (coordlock.Owner, bool) {
-			t.Fatalf("cold-spawned (bare) successor must NOT poll the lock owner")
+			t.Fatalf("fake-backed bare successor must NOT poll the lock owner")
 			return coordlock.Owner{}, false
 		}
 		return deps
@@ -1585,13 +1583,11 @@ func TestDrain_ContentionPreservesQueueFile(t *testing.T) {
 	}
 }
 
-// codex iter-16 [P2] REGRESSION: deliverResumePrompt's lock-owner branch must
-// fall back to a direct send when the successor is a legacy/bare coord whose
-// lease epoch is never stamped (CurrentOwner returns ErrNoOwnerObserved). The
-// drain helper previously propagated the sentinel, leaving the queue pending
-// forever even though the replacement session was live. Mirrors the
-// cmd/fleet/handoff.go fallback.
-func TestDeliverResumePrompt_LeaseWrapped_NoOwner_FallsBackToDirectSend(t *testing.T) {
+// T7: a successor stamped LeaseWrapped=true is owner-only by construction. If
+// no owner is observed yet, delivery stays pending; direct-sending would type
+// into the coord-run supervisor pane and could consume the queue without
+// delivering the handoff doc to the eventual owner.
+func TestDeliverResumePrompt_LeaseWrapped_NoOwner_StaysPending(t *testing.T) {
 	setupFleetHome(t)
 
 	rec := agent.New("legacynew1")
@@ -1611,7 +1607,7 @@ func TestDeliverResumePrompt_LeaseWrapped_NoOwner_FallsBackToDirectSend(t *testi
 	handoffDeliveryTimeout = 100 * time.Millisecond
 	handoffDeliveryPoll = time.Millisecond
 	// Lock-owner branch entered (leaseWrappedSuccessor=true) but no owner ever
-	// resolves -> ErrNoOwnerObserved -> direct-send fallback.
+	// resolves -> ErrNoOwnerObserved must propagate.
 	handoffDeliveryDepsFn = func() handoffdelivery.Deps {
 		deps := handoffdelivery.DefaultDeps()
 		deps.CurrentOwner = func(string) (coordlock.Owner, bool) {
@@ -1620,25 +1616,23 @@ func TestDeliverResumePrompt_LeaseWrapped_NoOwner_FallsBackToDirectSend(t *testi
 		deps.Sleep = func(time.Duration) {}
 		return deps
 	}
-	var sentSession, sentPrompt string
+	var sentSession string
 	sendPromptKeysVerified = func(session, prompt string) (bool, error) {
-		sentSession, sentPrompt = session, prompt
+		sentSession = session
 		return true, nil
 	}
 
 	out := &bytes.Buffer{}
 	delivered, err := deliverResumePrompt(rec.Project, true, true, false, rec, "/tmp/handoff.md", out, out)
-	if err != nil {
-		t.Fatalf("expected direct-send fallback, got error: %v\n%s", err, out.String())
+	if !errors.Is(err, handoffdelivery.ErrNoOwnerObserved) {
+		t.Fatalf("want ErrNoOwnerObserved so queue stays pending, got delivered=%+v err=%v\n%s",
+			delivered, err, out.String())
 	}
-	if delivered == nil || delivered.ID != rec.ID {
-		t.Fatalf("fallback delivered = %+v, want replacement %s", delivered, rec.ID)
+	if delivered != nil {
+		t.Fatalf("delivered = %+v, want nil while owner is unobserved", delivered)
 	}
-	if sentSession != rec.TmuxSession {
-		t.Fatalf("resume prompt sent to %q, want direct successor session %q", sentSession, rec.TmuxSession)
-	}
-	if !strings.Contains(sentPrompt, "/tmp/handoff.md") {
-		t.Fatalf("resume prompt %q must reference the handoff doc", sentPrompt)
+	if sentSession != "" {
+		t.Fatalf("lease-wrapped no-owner path direct-sent to %q; must stay pending", sentSession)
 	}
 }
 
@@ -1738,17 +1732,16 @@ func TestResume_Case3_CapApprovedCoord_DeliversToLockOwner(t *testing.T) {
 	}
 }
 
-// codex iter-20 [P2] REGRESSION: spawnAndRetire COLD-spawns a coord successor
-// with DisableLeaseWrap (a bare/direct successor). Even with req.CapApproved=true
-// the resume prompt MUST be delivered DIRECTLY to that freshly-spawned successor,
-// not routed through DeliverToCurrentOwner — polling the lock owner here would
-// target the old/dead owner and strand recovery. CurrentOwner must NOT be polled.
-func TestDrain_CoordColdSpawn_CapApproved_DeliversDirectNotLockOwner(t *testing.T) {
+// T3/T7: spawnAndRetire COLD-spawns a coord successor without opting out of the
+// lease wrapper. Because the successor record is stamped LeaseWrapped=true, the
+// resume prompt must route through DeliverToCurrentOwner rather than direct-send
+// to the queued session.
+func TestDrain_CoordColdSpawn_CapApproved_LeaseWrapsAndDeliversToOwner(t *testing.T) {
 	requireFakeTmux(t)
 	setupFleetHome(t)
 
 	const project = "rainier"
-	seedCoordRepoMeta(t, project)
+	resolvedRepo := seedCoordRepoMeta(t, project)
 	// Old coord (taskID coord-<project> → legacyCoordResume=true), NOT archived,
 	// NO pre-spawned replacement → Resume routes to spawnAndRetire (cold spawn).
 	oldRec := spawnSeedCoord(t, project, t.TempDir())
@@ -1759,37 +1752,78 @@ func TestDrain_CoordColdSpawn_CapApproved_DeliversDirectNotLockOwner(t *testing.
 		t.Fatalf("rewrite queue: %v", err)
 	}
 
+	origSpawn := spawnAgentFn
 	origDeliveryDeps := handoffDeliveryDepsFn
 	origSend := sendPromptKeysVerified
 	t.Cleanup(func() {
+		spawnAgentFn = origSpawn
 		handoffDeliveryDepsFn = origDeliveryDeps
 		sendPromptKeysVerified = origSend
 	})
+	var gotSpawnOpts spawn.Options
+	var spawnedRec *agent.Record
+	var sentSession, sentPrompt string
+	spawnAgentFn = func(opts spawn.Options) (*agent.Record, error) {
+		gotSpawnOpts = opts
+		rec := agent.New(opts.PreAllocatedID)
+		rec.TaskID = opts.OldRecord.TaskID
+		rec.Project = opts.OldRecord.Project
+		rec.Cwd = opts.Cwd
+		rec.Command = append([]string(nil), opts.Command...)
+		rec.TmuxSession = tmux.SessionName(rec.ID)
+		rec.SpawnedAt = time.Now().UTC()
+		rec.LastActivityTS = rec.SpawnedAt
+		rec.HandoffNumber = opts.OldRecord.HandoffNumber + 1
+		rec.PredecessorID = opts.OldRecord.ID
+		rec.LeaseWrapped = true
+		if err := tmux.Spawn(rec.TmuxSession, rec.Cwd, rec.Command, []string{"FLEET_AGENT_ID=" + rec.ID}); err != nil {
+			return nil, err
+		}
+		if err := rec.Write(); err != nil {
+			return nil, err
+		}
+		spawnedRec = rec
+		return rec, nil
+	}
 	handoffDeliveryDepsFn = func() handoffdelivery.Deps {
 		deps := handoffdelivery.DefaultDeps()
 		deps.CurrentOwner = func(string) (coordlock.Owner, bool) {
-			t.Fatalf("cold-spawned coord must NOT poll the lock owner (direct send expected)")
-			return coordlock.Owner{}, false
+			return coordlock.Owner{AgentID: spawnedRec.ID, PID: 9001, PidStart: 99}, true
 		}
+		deps.WaitReady = func(string) error { return nil }
+		deps.SessionAlive = func(string) (bool, error) { return true, nil }
+		deps.SendVerified = func(session, prompt string) (bool, error) {
+			sentSession, sentPrompt = session, prompt
+			return true, nil
+		}
+		deps.Sleep = func(time.Duration) {}
 		return deps
 	}
-	var sentSession, sentPrompt string
 	sendPromptKeysVerified = func(session, prompt string) (bool, error) {
-		sentSession, sentPrompt = session, prompt
+		t.Fatalf("cold-spawned lease-wrapped coord must not direct-send to %q", session)
 		return true, nil
 	}
 
 	out := &bytes.Buffer{}
 	if err := Resume(req, qp, 1, out, out); err != nil {
-		t.Fatalf("Resume cold-spawn coord should deliver directly: %v\n%s", err, out.String())
+		t.Fatalf("Resume cold-spawn coord should deliver to lock owner: %v\n%s", err, out.String())
+	}
+	if gotSpawnOpts.DisableLeaseWrap {
+		t.Fatal("cold coord resume passed DisableLeaseWrap=true; want lease-wrapped successor")
+	}
+	if gotSpawnOpts.Cwd != resolvedRepo {
+		t.Fatalf("spawn cwd = %q, want resolved repo %q", gotSpawnOpts.Cwd, resolvedRepo)
 	}
 	newRec, lerr := agent.Load(req.NewAgentID)
 	if lerr != nil {
 		t.Fatalf("cold-spawned successor record should exist: %v", lerr)
 	}
 	t.Cleanup(func() { _ = tmux.Kill(newRec.TmuxSession) })
+	if !newRec.LeaseWrapped {
+		t.Fatal("cold-spawned successor LeaseWrapped=false, want true")
+	}
 	if sentSession != newRec.TmuxSession {
-		t.Fatalf("resume prompt sent to %q, want freshly-spawned successor %q", sentSession, newRec.TmuxSession)
+		t.Fatalf("resume prompt sent to %q, want owner session %q", sentSession, newRec.TmuxSession)
 	}
 	if !strings.Contains(sentPrompt, "Read your handoff doc at ") {
 		t.Fatalf("resume prompt has wrong shape: %q", sentPrompt)
@@ -2043,11 +2077,11 @@ func TestResume_Case3_GracefulNotEligible_BespokePathRuns(t *testing.T) {
 	}
 }
 
-// The drain/auto path's coord successor spawns LEASE-WRAPPED exactly when
-// the live-coord graceful route will complete the handoff; dead-coord
-// recovery keeps the bare cold-resume shape (a standby polling a dead
-// owner's lease has no live releaser to wait on).
-func TestLiveCoordGracefulSpawn_DecidesLeaseWrap(t *testing.T) {
+// The drain/auto path's live-coord successor completes through the graceful
+// route exactly when OLD is still the eligible lease owner and auto-resume is
+// enabled. Dead-coord cold resume takes the bespoke tail, but still lease-wraps
+// at spawn.Spawn.
+func TestLiveCoordGracefulSpawn_DecidesGracefulRoute(t *testing.T) {
 	setupFleetHome(t)
 	oldRec := agent.New("oldcoord1")
 	oldRec.Project = "rainier"

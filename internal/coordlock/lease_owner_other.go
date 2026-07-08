@@ -34,5 +34,5 @@ func ReserveHandoff(string, string, time.Duration) (bool, error) { return false,
 // legacy/bare coord and direct-sends — matching the never-wrapped spawn path.
 func LeaseRecordActive(string) bool { return false }
 
-// FailoverEnabled is false on platforms without the lease primitive.
-func FailoverEnabled() bool { return false }
+// LeaseSupported is false on platforms without the lease primitive.
+func LeaseSupported() bool { return false }

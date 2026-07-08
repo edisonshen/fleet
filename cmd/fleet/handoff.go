@@ -202,21 +202,17 @@ var (
 	handoffGracefulSwapFn     = handoffop.GracefulCoordSwap
 )
 
-// requireOwner suppresses the legacy ErrNoOwnerObserved direct-send fallback
-// (codex PR3-completion iter-7 [P1]): the GRACEFUL route's successor is
-// lease-wrapped by construction, so "no owner observed" means the standby has
-// not acquired YET, never a legacy bare coord — a direct send would type into
-// the coord-run supervisor pane and could falsely report success, consuming
-// the durable queue with the doc undelivered. Owner-only callers keep the
-// queue pending for the next drain/attach re-delivery.
+// requireOwner is retained for older call sites, but any rec stamped
+// LeaseWrapped=true is owner-only by construction: "no owner observed" means
+// the standby has not acquired YET, never a legacy bare coord. Bare legacy
+// successors stay out of the owner-poll branch and use the direct send below.
 func deliverHandoffResumePrompt(project string, isCoordSwap, requireOwner bool, rec *agent.Record,
 	docPath string, stdout, stderr io.Writer) (*agent.Record, error) {
 	prompt := handoff.ResumePrompt(docPath)
 	// Route through the lock owner ONLY when the successor was actually
-	// lease-wrapped (codex iter-24 [P2]). A drain cold-resume queue picked up by
-	// this CLI recovery path may name a BARE coord successor (DisableLeaseWrap)
-	// that never becomes CurrentOwner; polling it would time out / misroute, so
-	// such a successor takes the direct-send path below.
+	// lease-wrapped (codex iter-24 [P2]). Legacy bare successors stay out of
+	// this branch and take the direct-send path below; a wrapped successor with
+	// no observed owner is still pending, not safe to direct-send into.
 	if coordLeaseSupported() && isCoordSwap && rec.LeaseWrapped && project != "" {
 		delivered, err := handoffdelivery.DeliverToCurrentOwner(handoffdelivery.Options{
 			Project: project,
@@ -227,25 +223,6 @@ func deliverHandoffResumePrompt(project string, isCoordSwap, requireOwner bool, 
 			Stderr:  stderr,
 		}, handoffDeliveryDepsFn())
 		if err != nil {
-			// Legacy/bare coord: no lease owner was ever stamped, so the
-			// owner-poll cannot converge and would time out on every retry.
-			// The replacement (rec) is already live, so fall back to a direct
-			// send to its session — the pre-PR2 delivery path. A genuine
-			// owner-was-seen-but-undeliverable error is NOT this sentinel, so
-			// it still propagates and stays pending for a real-owner retry.
-			if errors.Is(err, handoffdelivery.ErrNoOwnerObserved) && !requireOwner {
-				_, _ = fmt.Fprintf(stderr,
-					"warning: no lease owner for project %s (legacy coord?); delivering resume prompt directly to %s\n",
-					project, rec.TmuxSession)
-				submitted, serr := spawn.SendPromptKeysVerified(rec.TmuxSession, prompt)
-				if serr != nil {
-					return nil, serr
-				}
-				if !submitted {
-					return nil, fmt.Errorf("resume prompt to %s was typed but not submitted", rec.TmuxSession)
-				}
-				return rec, nil
-			}
 			return nil, err
 		}
 		if delivered != nil {

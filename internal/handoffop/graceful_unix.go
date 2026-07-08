@@ -292,7 +292,7 @@ func GracefulSwapEligible(oldRec *agent.Record, autoResume bool) bool {
 	if oldRec == nil || oldRec.Project == "" || !autoResume {
 		return false
 	}
-	if !coordlock.FailoverEnabled() {
+	if !coordlock.LeaseSupported() {
 		return false
 	}
 	owner, ok := gracefulEligibleOwnerFn(oldRec.Project)

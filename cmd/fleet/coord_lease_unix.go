@@ -168,7 +168,7 @@ func stampSupervisorWithRetry(agentID string, pid int, pidStart int64, exe strin
 // coordLeaseSupported reports platform support for the coordinator lease.
 // Kept as a thin wrapper so call sites read naturally.
 func coordLeaseSupported() bool {
-	return coordlock.FailoverEnabled()
+	return coordlock.LeaseSupported()
 }
 
 func leaseActiveOwnerPID(project string) (int, bool) {

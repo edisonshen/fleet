@@ -36,7 +36,10 @@ type Backend interface {
 // duration. Tests that install the fake are therefore NOT parallel-safe
 // against each other within a package unless they coordinate — the
 // install helper documents this.
-var installMu sync.Mutex
+var (
+	installMu      sync.Mutex
+	backendStateMu sync.RWMutex
+)
 
 var realBackendInstalled atomic.Bool
 
@@ -62,6 +65,7 @@ func Install(b Backend) (restore func()) {
 		panic("tmux.Install: nil backend")
 	}
 	installMu.Lock()
+	backendStateMu.Lock()
 	prev := struct {
 		available               func() error
 		hasSession              func(string) bool
@@ -94,10 +98,12 @@ func Install(b Backend) (restore func()) {
 	listSessionsFn = b.ListSessions
 	listSessionsWithCreatedFn = b.ListSessionsWithCreated
 	realBackendInstalled.Store(isRealBackend(b))
+	backendStateMu.Unlock()
 
 	var once sync.Once
 	return func() {
 		once.Do(func() {
+			backendStateMu.Lock()
 			availableFn = prev.available
 			hasSessionFn = prev.hasSession
 			sessionAliveFn = prev.sessionAlive
@@ -110,6 +116,7 @@ func Install(b Backend) (restore func()) {
 			listSessionsFn = prev.listSessions
 			listSessionsWithCreatedFn = prev.listSessionsWithCreated
 			realBackendInstalled.Store(prev.isReal)
+			backendStateMu.Unlock()
 			installMu.Unlock()
 		})
 	}
@@ -118,8 +125,14 @@ func Install(b Backend) (restore func()) {
 // IsRealBackend reports whether the package-level tmux function table is
 // currently routed to the real tmux subprocess backend. It deliberately avoids
 // taking installMu because tests hold that mutex for the duration of a fake
-// install while production code under test calls back into tmux.
-func IsRealBackend() bool { return realBackendInstalled.Load() }
+// install while production code under test calls back into tmux. It does take
+// the short-lived backend-state lock so callers never observe the is-real bit
+// mid-swap.
+func IsRealBackend() bool {
+	backendStateMu.RLock()
+	defer backendStateMu.RUnlock()
+	return realBackendInstalled.Load()
+}
 
 func isRealBackend(b Backend) bool {
 	_, ok := b.(realBackend)

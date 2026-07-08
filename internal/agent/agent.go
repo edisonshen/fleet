@@ -195,11 +195,11 @@ type Record struct {
 	// LeaseWrapped records whether THIS spawn actually wrapped the engine in
 	// the `fleet coord-run --standby` lease supervisor. It is the authoritative
 	// "is this a lease-wrapped successor" signal for handoff resume delivery on
-	// crash-recovery retry paths (codex iter-24 [P2]): the drain cold-resume
-	// fallback spawns a coord BARE (DisableLeaseWrap) even for a CapApproved
-	// queue, so the producer's cap-approval bit must NOT be reused to infer
-	// wrapping — read this persisted truth instead. Empty/false for legacy
-	// records and bare/direct successors.
+	// crash-recovery retry paths (codex iter-24 [P2]): legacy/test bare
+	// successors can exist even for a CapApproved queue, so the producer's
+	// cap-approval bit must NOT be reused to infer wrapping — read this
+	// persisted truth instead. Empty/false for legacy records and bare/direct
+	// successors.
 	LeaseWrapped bool `json:"lease_wrapped,omitempty"`
 	// IsCoord marks a coordinator record. Stamped at spawn, derived from
 	// spawn.IsCoordSpawn(taskID, project) at the single record-build

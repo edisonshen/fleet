@@ -86,8 +86,8 @@ func TestSpawn_StandbyFinalMergePreservesStampedEnginePID(t *testing.T) {
 
 // codex iter-24 [P2]: Spawn must persist the ACTUAL lease-wrap state on the
 // record so crash-recovery retry paths read the truth (not the producer's
-// cap-approval bit). A lease-wrapped coord records LeaseWrapped=true; a coord
-// spawned with DisableLeaseWrap (the drain cold-resume path) records false.
+// cap-approval bit). A lease-wrapped coord records LeaseWrapped=true; an
+// explicit legacy/test DisableLeaseWrap coord records false.
 func TestSpawn_PersistsLeaseWrappedState(t *testing.T) {
 	requireTmux(t)
 	setupFleetHome(t)
@@ -121,7 +121,7 @@ func TestSpawn_PersistsLeaseWrappedState(t *testing.T) {
 		t.Fatalf("persisted LeaseWrapped=%v (err=%v), want true", got.LeaseWrapped, lerr)
 	}
 
-	// DisableLeaseWrap (drain cold-resume) coord -> LeaseWrapped false.
+	// Explicit DisableLeaseWrap coord -> LeaseWrapped false.
 	beforeBare := StandbyLaunchCount()
 	bare, err := Spawn(Options{
 		TaskID:           "coord-lwp",

@@ -58,7 +58,7 @@ import (
 // leaseDrainEnabled reports whether this platform supports the lease-aware
 // drain path.
 func leaseDrainEnabled() bool {
-	return coordlock.FailoverEnabled()
+	return coordlock.LeaseSupported()
 }
 
 // drainLeaseDeps are the injectable seams that keep drainOneLeaseAware

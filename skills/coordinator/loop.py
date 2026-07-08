@@ -3927,18 +3927,10 @@ def _worker_state_fresh(
         # Bootstrapped state (just dispatched, no first tick yet).
         # Treat as alive so the worker has a chance to run.
         return True
-    try:
-        # Workers serialize updated_at via Go time.Time JSON, which is
-        # RFC3339 with nanos. Python's fromisoformat handles RFC3339
-        # since 3.11; for older interpreters we fall back to a regex
-        # strip of the trailing fractional seconds.
-        from datetime import datetime, timezone
-        ts = datetime.fromisoformat(updated_at.replace("Z", "+00:00"))
-        if ts.tzinfo is None:
-            ts = ts.replace(tzinfo=timezone.utc)
-        age_s = (datetime.now(tz=timezone.utc) - ts).total_seconds()
-    except ValueError:
+    updated_unix = _parse_iso_utc(updated_at)
+    if updated_unix is None:
         return False
+    age_s = time.time() - updated_unix
     return age_s <= _WORKER_STATE_FRESH_S
 
 
@@ -6834,9 +6826,18 @@ def _parse_iso_utc(s: str) -> float | None:
     if not s or not isinstance(s, str):
         return None
     try:
-        # Python's fromisoformat handles the trailing 'Z' from 3.11+.
+        # Go's RFC3339Nano formatter trims trailing fractional zeroes, so
+        # timestamps can have 1..9 fractional digits. Python 3.9's
+        # fromisoformat is stricter around UTC offsets and fractional widths;
+        # normalize to microsecond precision before parsing.
         from datetime import datetime, timezone
-        t = s.replace("Z", "+00:00") if s.endswith("Z") else s
+        t = s.strip()
+        if t.endswith("Z"):
+            t = t[:-1] + "+00:00"
+        m = re.match(r"^(.*T\d{2}:\d{2}:\d{2})\.(\d+)(.*)$", t)
+        if m:
+            prefix, frac, suffix = m.groups()
+            t = f"{prefix}.{(frac + '000000')[:6]}{suffix}"
         dt = datetime.fromisoformat(t)
         if dt.tzinfo is None:
             dt = dt.replace(tzinfo=timezone.utc)

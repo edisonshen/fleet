@@ -117,6 +117,10 @@ const (
 var (
 	supervisorStampWaitAttempts = 25
 	supervisorStampWaitDelay    = 100 * time.Millisecond
+
+	executablePath       = os.Executable
+	leaseSupportedProbe  = leaseSupported
+	realTmuxBackendProbe = tmux.IsRealBackend
 )
 
 func waitForSupervisorStamp(agentID string) {
@@ -210,8 +214,8 @@ var propagatedRuntimeEnv = []string{
 	"FLEET_COORD_IN_TURN_SUPERVISOR",
 }
 
-// leaseSupervisorAvailable gates whether Spawn wraps a coord in the
-// `fleet coord-run` lease supervisor. It is build-tagged:
+// leaseSupervisorAvailable gates whether Spawn can wrap a coord in the
+// `fleet coord-run` lease supervisor:
 //
 //   - linux||darwin (spawn_lease_unix.go): true; the lease primitive is
 //     supported.
@@ -222,12 +226,12 @@ var propagatedRuntimeEnv = []string{
 //
 // Splitting platform support by build tag keeps the all-platform spawn.go free
 // of a hard coordlock import (which would break non-unix builds). The real-tmux
-// backend check keeps fake-backed tests on the bare path: the fake records the
-// argv but does not execute `fleet coord-run`, so a fake-wrapped coord would
+// backend snapshot keeps fake-backed tests on the bare path: the fake records
+// the argv but does not execute `fleet coord-run`, so a fake-wrapped coord would
 // never acquire/stamp the lease and downstream owner delivery would poll until
 // timeout.
-func leaseSupervisorAvailable() bool {
-	return leaseSupported() && tmux.IsRealBackend()
+func leaseSupervisorAvailable(leaseSupported, realTmuxBackend bool) bool {
+	return leaseSupported && realTmuxBackend
 }
 
 // DefaultStandbyTimeout is the single generous bound every lease-wrapped
@@ -802,9 +806,9 @@ type Options struct {
 	StandbyTimeout time.Duration
 
 	// DisableLeaseWrap keeps a coord spawn on the legacy bare-engine path even
-	// on lease-capable platforms. It is reserved for handoffop's drain cold-
-	// resume fallback, where the existing contract requires the successor to
-	// start immediately instead of waiting behind the still-live leader.
+	// on lease-capable platforms. Production coord-start paths should leave it
+	// false; it remains for explicit legacy/test seams that intentionally
+	// exercise bare successor behavior.
 	DisableLeaseWrap bool
 }
 
@@ -910,6 +914,29 @@ func Spawn(opts Options) (*agent.Record, error) {
 	// custom engine/wrapper the operator dispatched with.
 	rec.Command = append([]string(nil), opts.Command...)
 
+	spawnTaskID := opts.TaskID
+	spawnProject := opts.Project
+	if opts.OldRecord != nil {
+		if opts.OldRecord.TaskID != "" {
+			spawnTaskID = opts.OldRecord.TaskID
+		}
+		if opts.OldRecord.Project != "" {
+			spawnProject = opts.OldRecord.Project
+		}
+	}
+	spawnIsCoord := isCoordSpawn(spawnTaskID, spawnProject)
+	coordLeaseSupported := leaseSupportedProbe()
+	if spawnIsCoord && !coordLeaseSupported {
+		return nil, fmt.Errorf(
+			"spawn: coordinator lease is unsupported on this platform; refusing bare coord spawn for project %q",
+			spawnProject)
+	}
+	// Snapshot once and reuse for both the wrap decision and the standby counter
+	// increment. A test-only tmux.Install/restore racing this path must not make
+	// Spawn decide "real backend" for wrapping but "fake backend" for counting.
+	realTmuxBackend := realTmuxBackendProbe()
+	coordSupervisorAvailable := leaseSupervisorAvailable(coordLeaseSupported, realTmuxBackend)
+
 	// FLEET_AGENT_ID is propagated into the agent's process env so
 	// fleet-guard (4b/c) can identify which agent record to update
 	// without round-tripping via tmux session name parsing.
@@ -922,7 +949,7 @@ func Spawn(opts Options) (*agent.Record, error) {
 	// `go run` is partial coverage: works while the parent process
 	// is alive (the temp build artifact lives with it), drops to
 	// the skill's `which("fleet")` fallback after the parent exits.
-	// os.Executable() failure is rare and non-fatal.
+	// os.Executable() failure is rare and non-fatal for ordinary workers.
 	//
 	// propagatedRuntimeEnv carries the operator's FLEET_* knobs into
 	// the agent's session. Necessary because tmux strips non-`-e`
@@ -935,7 +962,7 @@ func Spawn(opts Options) (*agent.Record, error) {
 	// agent at all), and slow-wrapper prompt-timing overrides regress
 	// to defaults so resume-prompt delivery races.
 	extraEnv := []string{"FLEET_AGENT_ID=" + id}
-	if exe, err := os.Executable(); err == nil {
+	if exe, err := executablePath(); err == nil && exe != "" {
 		extraEnv = append(extraEnv, "FLEET_BIN="+exe)
 	}
 	// FLEET_PROJECT is stamped from the agent's intrinsic project
@@ -950,12 +977,8 @@ func Spawn(opts Options) (*agent.Record, error) {
 	// dispatch) skips emission so the skill's "no project" branch still
 	// fires; an explicit FLEET_PROJECT= entry with an empty value would
 	// override the unset-check and break that path. Regresses fleet#170.
-	effectiveProject := opts.Project
-	if opts.OldRecord != nil && opts.OldRecord.Project != "" {
-		effectiveProject = opts.OldRecord.Project
-	}
-	if effectiveProject != "" {
-		extraEnv = append(extraEnv, "FLEET_PROJECT="+effectiveProject)
+	if spawnProject != "" {
+		extraEnv = append(extraEnv, "FLEET_PROJECT="+spawnProject)
 	}
 	// Propagate operator-set FLEET_* knobs. FLEET_ENGINE is a special
 	// case on the handoff branch: the replacement agent inherits
@@ -1051,7 +1074,7 @@ func Spawn(opts Options) (*agent.Record, error) {
 	// from the intrinsic task_id convention (DESIGN-coord-idle-exempt §4).
 	// Handoff successors carry the coord task_id, so isCoordSpawn stays
 	// true and the successor inherits the coord flag automatically.
-	rec.IsCoord = isCoordSpawn(rec.TaskID, rec.Project)
+	rec.IsCoord = spawnIsCoord
 
 	// Pass the canonicalized cwd (not opts.Cwd) so the tmux session
 	// actually starts in the directory we recorded on rec.Cwd.
@@ -1077,31 +1100,35 @@ func Spawn(opts Options) (*agent.Record, error) {
 	// platforms. Applied HERE — not at individual call sites — so fresh
 	// dispatch and dead-coord recovery share the same heartbeat-owning
 	// supervisor path. Wrapping the EXECUTION argv only keeps the persisted
-	// rec.Command clean. Handoffop's documented drain cold-resume fallback can
-	// opt out with DisableLeaseWrap because it must start a bare successor
-	// while the old leader is still live.
+	// rec.Command clean. Tests that install the fake tmux backend stay on the
+	// bare path because the fake cannot execute the supervisor.
 	leaseWrapped := false
-	if shouldLeaseWrap(leaseSupervisorAvailable(), isCoordSpawn(rec.TaskID, rec.Project), opts.DisableLeaseWrap) {
+	if shouldLeaseWrap(coordSupervisorAvailable, rec.IsCoord, opts.DisableLeaseWrap) {
 		standbyTimeout := standbyTimeoutOrDefault(opts.StandbyTimeout)
 		switch {
 		case alreadyCoordRunWrapped(execArgv):
 			execArgv = augmentCoordRunWrap(execArgv, standbyTimeout)
 			leaseWrapped = true // a supervisor will run; apply lifecycle handling
 		default:
-			if fleetBin, exeErr := os.Executable(); exeErr == nil && fleetBin != "" {
-				execArgv = coordRunWrap(fleetBin, id, rec.Project, standbyTimeout, execArgv)
-				leaseWrapped = true
-			} else {
-				_, _ = fmt.Fprintf(os.Stderr,
-					"warning: coordinator lease supported but os.Executable() failed (%v); "+
-						"spawning coord %s WITHOUT the coord-run lease supervisor\n", exeErr, id)
+			fleetBin, exeErr := executablePath()
+			if exeErr != nil {
+				return nil, fmt.Errorf(
+					"spawn: coordinator lease supervisor required for coord %s in project %q, but resolving fleet executable failed: %w",
+					id, rec.Project, exeErr)
 			}
+			if fleetBin == "" {
+				return nil, fmt.Errorf(
+					"spawn: coordinator lease supervisor required for coord %s in project %q, but resolving fleet executable returned an empty path",
+					id, rec.Project)
+			}
+			execArgv = coordRunWrap(fleetBin, id, rec.Project, standbyTimeout, execArgv)
+			leaseWrapped = true
 		}
 	}
 	// Persist the ACTUAL wrap state (codex iter-24 [P2]) so crash-recovery retry
 	// paths read the truth instead of inferring it from the producer's
-	// cap-approval bit. A bare drain cold-resume coord (DisableLeaseWrap) records
-	// false even on a CapApproved queue.
+	// cap-approval bit. A legacy/test bare coord (DisableLeaseWrap) records false
+	// even on a CapApproved queue.
 	rec.LeaseWrapped = leaseWrapped
 
 	// PRE-LAUNCH record write for lease-wrapped coords (codex PR2 iter-2
@@ -1139,7 +1166,7 @@ func Spawn(opts Options) (*agent.Record, error) {
 		// now live. Non-integration TestMains assert this stays zero, catching a
 		// standby-spawning test left in the default lane. Fake-backed default-lane
 		// spawns must not count as real panes.
-		if tmux.IsRealBackend() {
+		if realTmuxBackend {
 			recordStandbyLaunch()
 		}
 	}
