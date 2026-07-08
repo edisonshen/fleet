@@ -490,6 +490,55 @@ func TestDrainLease_BareCoordRoutesToLegacyResume_NoDuplicate(t *testing.T) {
 	}
 }
 
+func TestDrainLease_UnstampedLeaseWrappedCoordPreservesQueue(t *testing.T) {
+	var resumed, recovered, tookOver int32
+	out := &bytes.Buffer{}
+	path := existingQueuePath(t)
+	oldRec := agent.New("oldcoord1")
+	oldRec.Project = "projects-fleet"
+	oldRec.TaskID = "coord"
+	oldRec.LeaseWrapped = true
+	// SupervisorPID intentionally 0: coord-run may still be live/owning the
+	// lease, but STONITH cannot authenticate it.
+	d := drainLeaseDeps{
+		DeliverPending: func(queue.SpawnFresh, *agent.Record, io.Writer, io.Writer) error { return nil },
+		LeaderPresent:  func(string) bool { return false },
+		CurrentEpoch:   func(string) (int64, bool) { return 9, true },
+		BarrierExists:  func(string, int64) bool { return false },
+		LoadAgent:      func(string) (*agent.Record, error) { return oldRec, nil },
+		LockAgent:      func(string) (func(), error) { return func() {}, nil },
+		Resume: func(queue.SpawnFresh, string, int, io.Writer, io.Writer) error {
+			atomic.AddInt32(&resumed, 1)
+			return nil
+		},
+		TakeOver: func(string, string) (bool, []liveHolderInfo, error) {
+			atomic.AddInt32(&tookOver, 1)
+			return true, nil, nil
+		},
+		RecoverSpawn: func(*agent.Record, string, string, bool, io.Writer, io.Writer) error {
+			atomic.AddInt32(&recovered, 1)
+			return nil
+		},
+		BarrierPoll: time.Millisecond,
+	}
+	err := drainOneLeaseAwareWith(leaseDrainReq(), path, 0, 0, out, out, d)
+	if err == nil || !strings.Contains(err.Error(), "no recorded supervisor identity") {
+		t.Fatalf("unstamped lease-wrapped coord error = %v, want supervisor-identity refusal", err)
+	}
+	if _, statErr := os.Stat(path); statErr != nil {
+		t.Fatalf("queue must be preserved on unstamped lease-wrapped coord refusal: %v", statErr)
+	}
+	if atomic.LoadInt32(&resumed) != 0 {
+		t.Errorf("legacy Resume ran %d times, want 0", resumed)
+	}
+	if atomic.LoadInt32(&tookOver) != 0 {
+		t.Errorf("TakeOver ran %d times, want 0", tookOver)
+	}
+	if atomic.LoadInt32(&recovered) != 0 {
+		t.Errorf("RecoverSpawn ran %d times, want 0", recovered)
+	}
+}
+
 // T42: the graceful kill routes through KillCoordIfIdentityMatches. A refusal
 // (e.g. PID reuse / start-time mismatch) is surfaced; the drain does not
 // claim success and does not delete the queue.

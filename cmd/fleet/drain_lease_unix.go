@@ -502,11 +502,18 @@ func drainOneLeaseAwareWith(req queue.SpawnFresh, path string, graceMillis, resu
 	//     supervisor identity to authenticate a kill) -> queue stranded forever;
 	//   - default  -> safety-net takeover acquires the orphan flock + spawns a
 	//     successor WITHOUT killing the live bare OLD -> TWO coordinators.
-	// A bare coord (SupervisorPID==0) holds NO lease and is NEVER the recorded
-	// lease owner (the owner is always a coord-run with a SupervisorPID). So a
-	// bare OLD's handoff must ALWAYS complete via the legacy coldResume (loads
-	// OLD by id, retires/kills it via Resume) — regardless of whether some
-	// OTHER coord-run currently holds the project lease (codex PR4 [P1]/[P2]).
+	// A bare coord (!LeaseWrapped, SupervisorPID==0) holds NO lease and is
+	// NEVER the recorded lease owner (the owner is always a coord-run with a
+	// SupervisorPID). So a bare OLD's handoff must ALWAYS complete via the
+	// legacy coldResume (loads OLD by id, retires/kills it via Resume) —
+	// regardless of whether some OTHER coord-run currently holds the project
+	// lease (codex PR4 [P1]/[P2]).
+	//
+	// Do NOT route LeaseWrapped && SupervisorPID==0 here. That is an
+	// unstamped coord-run supervisor whose identity could not be recorded; it
+	// may still hold the lease. It must fall through to the lease-aware path,
+	// where drainReapOld/takeoverAndRecover fail closed because STONITH cannot
+	// authenticate the target.
 	// Routing it through the lease branches is wrong in every case:
 	//   - leaderHealthy (a different coord-run leads) -> drainLiveLeaderFallback
 	//     polls a barrier OLD will never write, then legacy-Resumes anyway
@@ -516,7 +523,7 @@ func drainOneLeaseAwareWith(req queue.SpawnFresh, path string, graceMillis, resu
 	//   - default -> safety-net takeover acquires the orphan flock + RecoverSpawn
 	//     without killing the live bare OLD -> TWO coordinators.
 	if oldRec, lerr := d.LoadAgent(req.OldAgentID); lerr == nil &&
-		oldRec != nil && oldRec.SupervisorPID == 0 {
+		oldRec != nil && oldRec.SupervisorPID == 0 && !oldRec.LeaseWrapped {
 		_, _ = fmt.Fprintf(stderr,
 			"fleet drain: %s is a bare (non-lease-wrapped) coord; completing via legacy resume "+
 				"(holds no lease — no takeover/graceful-reap/standby-wait)\n", req.OldAgentID)
