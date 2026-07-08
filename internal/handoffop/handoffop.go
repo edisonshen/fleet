@@ -29,7 +29,6 @@ import (
 	"github.com/edisonshen/fleet/internal/handoff"
 	"github.com/edisonshen/fleet/internal/handoffdelivery"
 	"github.com/edisonshen/fleet/internal/queue"
-	"github.com/edisonshen/fleet/internal/rc"
 	"github.com/edisonshen/fleet/internal/spawn"
 	"github.com/edisonshen/fleet/internal/state"
 	"github.com/edisonshen/fleet/internal/tmux"
@@ -154,31 +153,12 @@ func retargetArchivedHandoffSuccessor(agentID, successorID string) error {
 	return nil
 }
 
-// coordDrainExecArgv computes the per-spawn exec argv for a COORD
-// drain replacement: routes the clean persisted Command through
-// rc.GateAttachFlag (native default-on; suppressed by the rc-disabled
-// opt-out marker or the FLEET_RC_BOOTSTRAP_DISABLED env-gate) and
-// returns nil when the rewrite is a no-op so spawn.Spawn doesn't see a
-// pointless Command/ExecCommand divergence. Workers never reach this —
-// the isCoordHandoffForAgent call-site gate is the push-storm
-// protection.
-//
-// Extracted for unit-testable coverage without driving a full
-// spawnAndRetire (which would exec the rewritten argv for real).
-func coordDrainExecArgv(project string, command []string, rcSessionName string) []string {
-	rewritten := rc.GateAttachFlag(project, command, rcSessionName)
-	if spawn.SameCommand(rewritten, command) {
-		return nil
-	}
-	return rewritten
-}
-
 // isCoordHandoffForAgent reports whether rec is a COORD (not a worker /
 // Agent-tool subagent) being handed off. spawnAndRetire calls this to gate the
-// v0.12.1 RC inject (codex review iter-7 [P1]) AND the coord-spawn lock
-// acquisition (duplicate-coord prevention): worker handoffs during fleet drain /
-// crash recovery must NOT silently inherit --remote-control (which would reopen
-// the v0.12 push-storm class) and must NOT contend on the coord-spawn lock.
+// coord-spawn lock acquisition (duplicate-coord prevention): worker handoffs
+// during fleet drain / crash recovery must NOT contend on the coord-spawn lock.
+// RC injection is centralized inside spawn.Spawn and uses the same coord
+// predicate there, so workers also remain flag-free.
 //
 // The coord-spawn marker (D3, deleted) is replaced by spawn.IsCoordSpawn — the
 // primary task-based coord detector (task_id == coord-<project>). It is
@@ -635,44 +615,9 @@ func spawnAndRetire(req queue.SpawnFresh, queuePath string,
 		thisHandoffDisableAutoResume = true
 	}
 
-	// Auto-handoff replacements get `--remote-control
-	// "fleet-handoff-<new-id>"` injected into the spawned claude argv
-	// so mobile / claude.ai pairing carries through automatically —
-	// matching the operator-triggered cmd/fleet/handoff.go path
-	// (fix/remote-control-coord-injection P0). Without this the
-	// auto-drained replacement only pairs after the agent runs the
-	// `/remote-control` slash command from FirstAction's manual
-	// instructions, which may never happen on a busy session.
-	//
-	// Persisted Command stays the clean `oldRec.Command` so a
-	// subsequent handoff doesn't inherit a stale session name; the
-	// rewrite goes via ExecCommand (per-spawn argv only). For
-	// operator-overridden custom --commands, InjectRemoteControlFlag
-	// returns the slice unchanged — we then pass nil as ExecCommand
-	// so spawn.Spawn doesn't see a no-op divergence.
-	// Session names use the coord shape (`fleet-coord-<id>-<project>`)
-	// so fresh-spawn and handoff replacements are uniform on
-	// claude.ai / mobile (codex round-6 P1, historical).
-	rcSessionName := spawn.CoordRemoteControlSessionName(req.NewAgentID, oldRec.Project)
-	// Native model: use the project-aware rc.GateAttachFlag helper.
-	// Auto-handoff drain hits this code path without going through
-	// cmd/fleet's wrapper, so the dedicated helper carries the same
-	// rc-disabled opt-out + FLEET_RC_BOOTSTRAP_DISABLED two-layer gate
-	// (rather than re-implementing it here).
-	//
-	// v0.12.1 codex review iter-7 [P1] (kept): ALSO gate on
-	// isCoordHandoff — RC is default-on project-wide, so worker
-	// handoffs resumed via fleet drain / crash recovery would silently
-	// inherit --remote-control without this call-site gate. Workers /
-	// Agent-tool subagents must NEVER carry the flag (push-storm
-	// protection). Mirrors cmd/fleet/handoff.go and dispatch.go.
-	//
-	// The predicate matches the post-spawn isCoordSwap detector below —
-	// same fact (spawn.IsCoordSpawn: task_id == coord-<project>), used
-	// at two points (pre-inject + post-spawn). Extracted as
-	// isCoordHandoffForAgent for unit-testable gate coverage without
-	// driving full spawnAndRetire.
-	var rewrittenExecArgv []string
+	// Native coord RC is centralized in spawn.Spawn. The drain path still
+	// gates the coord-spawn lock here, but it passes oldRec.Command cleanly;
+	// spawn.Spawn injects RC only for coord successors, never workers.
 	if isCoordHandoffForAgent(oldRec) {
 		// v0.12.2 P0 v3 (DESIGN-coord-spawn-atomic-gate.md §Change 7;
 		// codex iter-1 [P1] from the v2 reviewer + v3 reviewer codex
@@ -706,11 +651,6 @@ func spawnAndRetire(req queue.SpawnFresh, queuePath string,
 		}
 		defer release()
 
-		// Native model: no marker backfill needed — rc.Enabled is
-		// default-on; coordDrainExecArgv bakes the flag unless the
-		// operator opted the project out (rc-disabled) or the test
-		// env-gate is set.
-		rewrittenExecArgv = coordDrainExecArgv(oldRec.Project, oldRec.Command, rcSessionName)
 	}
 
 	// COORD drain handoffs resolve the repo binding via the shared
@@ -735,7 +675,6 @@ func spawnAndRetire(req queue.SpawnFresh, queuePath string,
 		NewDocPath:     req.HandoffDoc,
 		Cwd:            spawnCwd,
 		Command:        oldRec.Command,
-		ExecCommand:    rewrittenExecArgv,
 		PreAllocatedID: req.NewAgentID,
 		// Use disableAutoResume (explicit opt-out only), not
 		// thisHandoffDisableAutoResume (which includes the v1

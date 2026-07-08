@@ -15,7 +15,6 @@ import (
 	"github.com/edisonshen/fleet/internal/coordlock"
 	"github.com/edisonshen/fleet/internal/handoffdelivery"
 	"github.com/edisonshen/fleet/internal/queue"
-	"github.com/edisonshen/fleet/internal/rc"
 	"github.com/edisonshen/fleet/internal/spawn"
 	"github.com/edisonshen/fleet/internal/state"
 	"github.com/edisonshen/fleet/internal/testutil/tmuxfake"
@@ -864,19 +863,15 @@ func TestResume_Case3_DefinitiveDeadStillEntersCleanup(t *testing.T) {
 	t.Cleanup(func() { _ = tmux.Kill(freshRec.TmuxSession) })
 }
 
-// TestIsCoordHandoffForAgent_GatesOnCoordTask is the codex review iter-7
-// [P1] regression: spawnAndRetire's --remote-control inject
-// (rc.GateAttachFlag) MUST gate on whether the OLD agent is the project's
-// coord, not just on the project-wide rc-enabled marker. Without this, a
-// worker handoff resumed via fleet drain / crash recovery would silently
-// inherit RC attach — defeating the strict opt-in carve-out for workers /
-// subagents.
+// TestIsCoordHandoffForAgent_GatesOnCoordTask pins the drain coord predicate.
+// spawnAndRetire uses it for the coord-spawn lock, and spawn.Spawn uses the
+// same task/project convention for centralized RC injection. Worker handoffs
+// resumed via fleet drain / crash recovery must not contend on the coord lock
+// and must not inherit RC attach.
 //
 // The coord-spawn marker is gone (D3): isCoordHandoffForAgent now takes an
 // *agent.Record and returns spawn.IsCoordSpawn(rec.TaskID, rec.Project) —
-// true iff the task_id is coord-<project>. The table exercises the
-// task-based predicate directly (the inject site is a 1-line gated
-// expression, so the predicate's correctness IS the gate's correctness).
+// true iff the task_id is coord-<project>.
 func TestIsCoordHandoffForAgent_GatesOnCoordTask(t *testing.T) {
 	const project = "test-drain-gate"
 
@@ -900,82 +895,6 @@ func TestIsCoordHandoffForAgent_GatesOnCoordTask(t *testing.T) {
 					tc.taskID, tc.project, got, tc.want)
 			}
 		})
-	}
-}
-
-// -- v0.12.2 P0: drain-path RC marker backfill ------------------------------
-//
-// Native-RC drain coverage: a COORD drain replacement gets
-// `--remote-control` baked into its exec argv by default — no marker
-// write, no opt-in step. coordDrainExecArgv is the extracted decision
-// helper (unit-tested below so the suite never execs a rewritten
-// claude argv for real); the isCoordHandoffForAgent call-site gate is
-// the worker carve-out (push-storm protection), pinned by
-// TestIsCoordHandoffForAgent_GatesOnCoordTask above and the
-// worker integration test below.
-
-// TestCoordDrainExecArgv_DefaultInjects: native default-on — the
-// default claude wrapper shape gets the flag baked in.
-func TestCoordDrainExecArgv_DefaultInjects(t *testing.T) {
-	setupFleetHome(t)
-	t.Setenv("FLEET_RC_BOOTSTRAP_DISABLED", "")
-
-	command := []string{"sh", "-c", "claude --dangerously-skip-permissions; exec bash"}
-	got := coordDrainExecArgv("rainier", command, "fleet-coord-abcd1234-rainier")
-	if got == nil {
-		t.Fatalf("coord drain exec argv must carry --remote-control by default; got nil (pass-through)")
-	}
-	joined := strings.Join(got, " ")
-	if !strings.Contains(joined, `--remote-control "fleet-coord-abcd1234-rainier"`) {
-		t.Fatalf("rewritten argv missing --remote-control session name; got %v", got)
-	}
-	// No marker side effects.
-	if rc.MarkerPresent("rainier") {
-		t.Errorf("inject must not write the legacy rc-enabled marker")
-	}
-	if !rc.Enabled("rainier") {
-		t.Errorf("inject must not opt the project out")
-	}
-}
-
-// TestCoordDrainExecArgv_OptOutSuppresses: the rc-disabled marker wins.
-func TestCoordDrainExecArgv_OptOutSuppresses(t *testing.T) {
-	setupFleetHome(t)
-	t.Setenv("FLEET_RC_BOOTSTRAP_DISABLED", "")
-	if err := rc.WriteDisabledMarker("rainier"); err != nil {
-		t.Fatalf("WriteDisabledMarker: %v", err)
-	}
-
-	command := []string{"sh", "-c", "claude --dangerously-skip-permissions; exec bash"}
-	got := coordDrainExecArgv("rainier", command, "fleet-coord-abcd1234-rainier")
-	if got != nil {
-		t.Fatalf("opted-out project must yield nil exec argv (plain spawn); got %v", got)
-	}
-}
-
-// TestCoordDrainExecArgv_EnvGateSuppresses: FLEET_RC_BOOTSTRAP_DISABLED
-// keeps test paths flag-free even though the default is on.
-func TestCoordDrainExecArgv_EnvGateSuppresses(t *testing.T) {
-	setupFleetHome(t)
-	t.Setenv("FLEET_RC_BOOTSTRAP_DISABLED", "1")
-
-	command := []string{"sh", "-c", "claude --dangerously-skip-permissions; exec bash"}
-	got := coordDrainExecArgv("rainier", command, "fleet-coord-abcd1234-rainier")
-	if got != nil {
-		t.Fatalf("env-gate must suppress the inject; got %v", got)
-	}
-}
-
-// TestCoordDrainExecArgv_CustomCommandPassesThrough: non-wrapper argv
-// shapes (operator-overridden --command) are never mutated; the helper
-// returns nil so spawn.Spawn sees no Command/ExecCommand divergence.
-func TestCoordDrainExecArgv_CustomCommandPassesThrough(t *testing.T) {
-	setupFleetHome(t)
-	t.Setenv("FLEET_RC_BOOTSTRAP_DISABLED", "")
-
-	got := coordDrainExecArgv("rainier", []string{"sleep", "60"}, "fleet-coord-abcd1234-rainier")
-	if got != nil {
-		t.Fatalf("custom command must pass through (nil exec argv); got %v", got)
 	}
 }
 

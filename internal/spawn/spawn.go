@@ -246,6 +246,53 @@ func shouldLeaseWrap(leaseSupported, isCoord, disable bool) bool {
 	return leaseSupported && isCoord && !disable
 }
 
+// CoordRCInjector is wired by cmd/fleet to the rc package's project gate. It
+// lives in spawn to keep --remote-control injection at the single coord-spawn
+// seam without importing internal/rc here (internal/rc already imports spawn
+// for the argv primitive). Nil is a no-op so spawn package tests can install
+// only the behavior they exercise; cmd/fleet asserts the production binary
+// wires it before startup.
+var CoordRCInjector func(project, agentID string, argv []string) []string
+
+func coordRCArgv(execArgv []string, project, agentID string, isCoord bool) []string {
+	if !isCoord || CoordRCInjector == nil || containsRemoteControlFlag(execArgv) {
+		return execArgv
+	}
+	if alreadyCoordRunWrapped(execArgv) {
+		sep := coordRunSeparator(execArgv)
+		if sep < 0 || sep == len(execArgv)-1 {
+			return execArgv
+		}
+		inner := execArgv[sep+1:]
+		rewrittenInner := CoordRCInjector(project, agentID, inner)
+		if SameCommand(rewrittenInner, inner) {
+			return execArgv
+		}
+		out := make([]string, 0, sep+1+len(rewrittenInner))
+		out = append(out, execArgv[:sep+1]...)
+		return append(out, rewrittenInner...)
+	}
+	return CoordRCInjector(project, agentID, execArgv)
+}
+
+func coordRunSeparator(argv []string) int {
+	for i, arg := range argv {
+		if arg == "--" {
+			return i
+		}
+	}
+	return -1
+}
+
+func containsRemoteControlFlag(argv []string) bool {
+	for _, arg := range argv {
+		if strings.Contains(arg, "--remote-control") {
+			return true
+		}
+	}
+	return false
+}
+
 // coordRunWrap builds the lease-supervised exec argv: the engine argv
 // supervised by `fleet coord-run --standby`.
 // Pure + does not mutate argv. The persisted rec.Command stays clean;
@@ -770,16 +817,6 @@ type Options struct {
 	// don't inherit per-spawn substitutions like a session-bound
 	// `--remote-control "fleet-<id>"` flag.
 	//
-	// Populated by the dispatch coord-spawn path: opts.Command stays
-	// the operator's --command default (or override), and ExecCommand
-	// carries the same argv with `--remote-control "fleet-<id>"`
-	// injected into the shell wrapper. A subsequent handoff that
-	// reads oldRec.Command → spawn.Options.Command sees the clean
-	// form; the replacement starts WITHOUT auto-attach until/unless
-	// the caller opts back in by setting ExecCommand again. This
-	// keeps the v0.1 contract (coord auto-spawn = remote-control;
-	// handoff = manual /remote-control) explicit at the call site.
-	//
 	// Empty (the common case) means tmux runs Command verbatim.
 	ExecCommand []string
 
@@ -1083,16 +1120,15 @@ func Spawn(opts Options) (*agent.Record, error) {
 	// existing tmux server), and a future handoff would land the
 	// replacement in the wrong checkout.
 	//
-	// ExecCommand (when non-empty) is the per-spawn substituted argv
-	// — used by the dispatch coord-spawn path to inject
-	// `--remote-control "fleet-<id>"` for THIS spawn only. The
-	// persisted record at rec.Command above stays the clean Command,
-	// so a later handoff that reads oldRec.Command doesn't inherit
-	// the stale session-name flag (codex review #73 iter-1 P1).
+	// ExecCommand (when non-empty) is the per-spawn substituted argv.
+	// The persisted record at rec.Command above stays the clean Command,
+	// so a later handoff that reads oldRec.Command doesn't inherit a
+	// stale per-spawn flag.
 	execArgv := opts.Command
 	if len(opts.ExecCommand) > 0 {
 		execArgv = opts.ExecCommand
 	}
+	execArgv = coordRCArgv(execArgv, rec.Project, id, rec.IsCoord)
 
 	// Coordinator lease supervisor wrap (DESIGN-handoff-drain-storm-leak
 	// PR1 spawn-collapse: every coord spawn runs under
@@ -1177,11 +1213,11 @@ func Spawn(opts Options) (*agent.Record, error) {
 	_ = tmux.SetStatusHint(session, "[Ctrl-b d to detach]")
 
 	// Resolve the real engine pid via the tmux pane child tree (P0
-	// bug fix 2026-05-13). For coord-spawn dispatches, the
-	// disambiguator is the per-agent --remote-control session name
-	// injected by cmd/fleet/dispatch.go (fleet-coord-<id>). For
-	// other dispatches we fall back to engineHint matching ("claude"
-	// for the default engine; empty for custom-command spawns).
+	// bug fix 2026-05-13). For coord spawns, the disambiguator is the
+	// per-agent --remote-control session name injected above
+	// (fleet-coord-<id>). For other dispatches we fall back to engineHint
+	// matching ("claude" for the default engine; empty for custom-command
+	// spawns).
 	// resolveEnginePid blocks up to pidResolveTimeout; on timeout it
 	// returns the pane pid as a best-effort fallback (wrong-but-live
 	// beats os.Getpid which is dead by construction).

@@ -18,7 +18,6 @@ import (
 	"github.com/edisonshen/fleet/internal/gc"
 	"github.com/edisonshen/fleet/internal/handoff"
 	"github.com/edisonshen/fleet/internal/handoffdelivery"
-	"github.com/edisonshen/fleet/internal/rc"
 	"github.com/edisonshen/fleet/internal/spawn"
 	"github.com/edisonshen/fleet/internal/state"
 	"github.com/edisonshen/fleet/internal/tmux"
@@ -150,17 +149,11 @@ type dispatchOpts struct {
 // prefix are rejected by runDispatch unless --coord-spawn is set.
 const CoordTaskIDPrefix = "coord-"
 
-// remoteControlSessionPrefix is the literal prefix that
-// `skills/coordinator/remote_control.py:spawn_daemon_if_needed`
-// passes to `claude remote-control --remote-control-session-name-prefix`.
-// Coord-spawn dispatches inject `--remote-control "<prefix>-<agent_id>"`
-// at session start (issue #73) so the agent registers under a name
-// the daemon will actually accept; any other prefix wouldn't match
-// the daemon's filter (codex review #73 iter-2 P1).
-//
-// Keep byte-identical with the Python side. There's no shared schema
-// file yet (the Python skill doesn't import Go); a string-equality
-// test pins the contract.
+// remoteControlSessionPrefix is the literal coord RC prefix. spawn.Spawn
+// injects `--remote-control "fleet-coord-<agent_id>-<project>"` for coord
+// spawns, and the pidresolver / skill health checks match the
+// "fleet-coord-<agent_id>" superstring. Keep byte-identical with the Python
+// side; a string-equality test pins the contract.
 const remoteControlSessionPrefix = "fleet-coord"
 
 func newDispatchCmd() *cobra.Command {
@@ -497,17 +490,10 @@ func runDispatch(opts *dispatchOpts, stdout io.Writer) error {
 	// (`fleet-coord-<id>-<project>`) so the operator can distinguish
 	// coords across projects on claude.ai / mobile.
 	//
-	// Pre-allocate the agent ID HERE (instead of letting spawn.Spawn
-	// call agent.NewID()) so we can interpolate it into the shell
-	// wrapper's claude argv. Spawn already supports this surface via
-	// Options.PreAllocatedID — used by the handoff path for the same
-	// "ID needed before spawn" reason.
-	//
-	// We pass the rewritten argv via Options.ExecCommand (used for
-	// THIS tmux exec only); the persisted agent.Record.Command stays
-	// the clean opts.command so a future handoff that reads
-	// oldRec.Command doesn't inherit a stale `--remote-control
-	// "fleet-coord-<old-id>"` flag (codex review #73 iter-1 P1).
+	// Pre-allocate the agent ID HERE so coord-spawn claims, recovery docs,
+	// and spawn.Spawn's centralized coord RC injector all refer to the same
+	// successor identity. The execution argv remains clean at this layer;
+	// spawn.Spawn owns per-spawn `--remote-control` injection.
 	//
 	// HISTORY — the standalone listener daemon + the Python skill's
 	// per-tick respawn (spawn_daemon_if_needed) + the daemon-presence
@@ -520,17 +506,11 @@ func runDispatch(opts *dispatchOpts, stdout io.Writer) error {
 	// matching v0.1's manual-attach contract.
 	//
 	// If the operator overrode --command (scripted pipeline, alt
-	// engine), injectRemoteControlFlag returns the slice unchanged —
-	// we only rewrite the documented default shell-wrapped claude
-	// shape. Custom argvs are out of scope.
+	// engine), spawn's injector leaves the argv unchanged — only the
+	// documented shell-wrapped claude shape is rewritten.
 	preAllocatedID := ""
-	var rewrittenExecArgv []string
 	if opts.coordSpawn {
 		preAllocatedID = agent.NewID()
-		// The fresh-spawn --remote-control inject runs AFTER the
-		// early-refusal gates (ListStrict, live-coord veto,
-		// FLEET_MAX_SESSIONS, dead-coord recovery), immediately before
-		// spawn.Spawn — see the "Native RC at coord spawn" block below.
 	}
 
 	// Pre-fetch the agent record list ONCE so the live-coord veto AND
@@ -885,21 +865,6 @@ func runDispatch(opts *dispatchOpts, stdout io.Writer) error {
 				legacyRecord := preClampEngine == ""
 				if !opts.commandExplicit && !legacyRecord && preClampEngine == engineName && len(oldRecord.Command) > 0 {
 					opts.command = append([]string(nil), oldRecord.Command...)
-					if opts.coordSpawn && preAllocatedID != "" {
-						// Project-suffixed name for the recovered coord
-						// — same shape as the fresh-spawn branch above.
-						rcSessionName := buildCoordRemoteControlSessionName(preAllocatedID, opts.project)
-						rewritten := injectRemoteControlFlagProject(opts.command, rcSessionName, opts.project)
-						if !sameCommand(rewritten, opts.command) {
-							rewrittenExecArgv = rewritten
-						} else {
-							// Custom command (non-default shape) — pass
-							// nil so the tmux exec uses opts.command
-							// untouched and the persisted Command on
-							// the record stays clean.
-							rewrittenExecArgv = nil
-						}
-					}
 				}
 				_, _ = fmt.Fprintf(stdout,
 					"recovering dead coord %s for project %s: synth handoff written to %s\n",
@@ -959,41 +924,10 @@ func runDispatch(opts *dispatchOpts, stdout io.Writer) error {
 		disableAutoResume = true
 	}
 
-	// Native RC at coord spawn (rc-default-native-startup, operator
-	// directive 2026-05-29): bake `--remote-control
-	// "fleet-coord-<id>-<project>"` into the coord's own claude argv.
-	// DEFAULT-ON — no marker write, no opt-in step; the only
-	// suppressors inside injectRemoteControlFlagProject are the
-	// per-project rc-disabled opt-out marker (`fleet rc down`) and the
-	// FLEET_RC_BOOTSTRAP_DISABLED env-gate (test hygiene).
-	//
-	// Scope carve-out: workers / Agent-tool subagents
-	// (opts.coordSpawn=false) do NOT enter this branch — reviewer
-	// loops and worker dispatches never get the flag, preserving the
-	// v0.12 push-storm protection at the call-site level.
-	//
-	// Only inject when the recovery path didn't already set
-	// rewrittenExecArgv (skips wasted work + avoids double-rewriting
-	// a custom command). The recovery-spawn inject inside the
-	// findRecoveryCandidate block above runs first; if it fired,
-	// rewrittenExecArgv is set and we honor it as-is.
-	if opts.coordSpawn && opts.project != "" {
-		if rewrittenExecArgv == nil {
-			rcSessionName := buildCoordRemoteControlSessionName(preAllocatedID, opts.project)
-			rewritten := injectRemoteControlFlagProject(opts.command, rcSessionName, opts.project)
-			if !sameCommand(rewritten, opts.command) {
-				rewrittenExecArgv = rewritten
-			}
-		}
-	}
-
 	// The coordinator lease supervisor wrap (DESIGN-handoff-drain-storm-leak
-	// PR2) is applied inside spawn.Spawn — NOT here — so it covers EVERY
-	// coord spawn (fresh dispatch AND the handoff/drain replacements that
-	// bypass dispatch by inheriting oldRec.Command). See spawn.Spawn's
-	// coordinator lease wrap block. The persisted rec.Command
-	// stays the clean engine argv; only the EXECUTION argv is wrapped, so
-	// each handoff re-wraps from the clean argv without nesting.
+	// PR2) and coord remote-control injection are applied inside spawn.Spawn
+	// — NOT here — so every coord spawn path shares the same execution argv
+	// seam while persisted rec.Command stays clean.
 
 	// Durable pending-spawn claim (leak-coord-spawn-idempot). Written
 	// HERE — under the coord-spawn flock (held via `defer release()`
@@ -1028,7 +962,6 @@ func runDispatch(opts *dispatchOpts, stdout io.Writer) error {
 		Project:           opts.project,
 		Cwd:               spawnCwd,
 		Command:           opts.command,
-		ExecCommand:       rewrittenExecArgv,
 		PreAllocatedID:    preAllocatedID,
 		DisableAutoResume: disableAutoResume,
 		Engine:            engineName,
@@ -1296,58 +1229,6 @@ const defaultClaudeWrapperScript = spawn.DefaultClaudeWrapperScript
 // through" so the engine→wrapper swap can fire for non-claude engines
 // without stomping a caller-supplied command.
 var defaultClaudeCommand = []string{"sh", "-c", defaultClaudeWrapperScript}
-
-// injectRemoteControlFlag is a thin local wrapper around
-// spawn.InjectRemoteControlFlag so the dispatch + handoff call sites
-// in this package read with identical signatures. Lifted to
-// internal/spawn so internal/handoffop (the auto-handoff drain) can
-// use the same rewrite without a cross-package import-cycle through
-// cmd/fleet.
-//
-// FLEET_RC_BOOTSTRAP_DISABLED gate (rc-listener-bootstrap-sk-3e98):
-// when the env var is set to any non-empty value, this wrapper
-// returns the input slice unchanged — no `--remote-control "<name>"`
-// injection. Kept through v0.12 as a belt-and-suspenders gate for
-// test paths that might somehow set a marker; v0.13 retires it once
-// the marker-gate (rc-enabled) is field-proven via the v0.12
-// CI-invariant test (rc_invariant_test.go).
-//
-// NB: this signature stays 2-arg for backwards-compat with the
-// existing dispatch_test.go / rc_bootstrap_env_test.go pinning the
-// env-gate contract. Project-aware callers use
-// injectRemoteControlFlagProject below.
-func injectRemoteControlFlag(command []string, sessionName string) []string {
-	if os.Getenv("FLEET_RC_BOOTSTRAP_DISABLED") != "" {
-		return command
-	}
-	return spawn.InjectRemoteControlFlag(command, sessionName)
-}
-
-// injectRemoteControlFlagProject is the project-aware variant. Adds
-// an rc.Enabled(project) check on top of the existing env-gate. Used
-// by coord-spawn + dispatch-recovery (handoff replacement uses the
-// same gate at cmd/fleet/handoff.go).
-//
-// Two-layer gate (native model — default ON):
-//
-//  1. PRIMARY: rc.Enabled(project) — opt-OUT semantics. False only
-//     for an empty/invalid project or when the operator wrote the
-//     rc-disabled marker via `fleet rc down <project>`.
-//  2. SECONDARY (defense-in-depth from PR #157): the
-//     FLEET_RC_BOOTSTRAP_DISABLED env var, set by the test suite so
-//     no test-spawned argv ever carries the flag.
-//
-// Empty project (legacy / untargeted dispatch) returns false from
-// rc.Enabled, so those spawns stay flag-free.
-func injectRemoteControlFlagProject(command []string, sessionName, project string) []string {
-	if os.Getenv("FLEET_RC_BOOTSTRAP_DISABLED") != "" {
-		return command
-	}
-	if !rc.Enabled(project) {
-		return command
-	}
-	return spawn.InjectRemoteControlFlag(command, sessionName)
-}
 
 // sameCommand mirrors the spawn.SameCommand helper. See doc there.
 func sameCommand(a, b []string) bool {

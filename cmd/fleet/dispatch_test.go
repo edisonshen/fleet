@@ -12,6 +12,7 @@ import (
 	"github.com/edisonshen/fleet/internal/agent"
 	"github.com/edisonshen/fleet/internal/gc"
 	"github.com/edisonshen/fleet/internal/handoff"
+	"github.com/edisonshen/fleet/internal/spawn"
 	"github.com/edisonshen/fleet/internal/tmux"
 )
 
@@ -397,7 +398,7 @@ func TestInjectRemoteControlFlag_RewritesDefaultShellWrapper(t *testing.T) {
 	}
 	original := slice.GetSlice()
 
-	got := injectRemoteControlFlag(original, "fleet-coord-abcd1234")
+	got := spawn.InjectRemoteControlFlag(original, "fleet-coord-abcd1234")
 
 	if len(got) != 3 {
 		t.Fatalf("rewritten command should still be [sh -c <script>]; got len=%d", len(got))
@@ -446,7 +447,7 @@ func TestInjectRemoteControlFlag_AnchoredInsertion(t *testing.T) {
 	original := slice.GetSlice()
 	const sessionName = "fleet-coord-cafebabe"
 
-	got := injectRemoteControlFlag(original, sessionName)
+	got := spawn.InjectRemoteControlFlag(original, sessionName)
 
 	// Sanity: original wrapper has TWO occurrences of the literal
 	// claude invocation (the launch command and the rerun banner).
@@ -493,7 +494,7 @@ func TestInjectRemoteControlFlag_NoOpForCustomCommand(t *testing.T) {
 		{},
 	}
 	for _, c := range cases {
-		got := injectRemoteControlFlag(c, "fleet-coord-deadbeef")
+		got := spawn.InjectRemoteControlFlag(c, "fleet-coord-deadbeef")
 		if len(got) != len(c) {
 			t.Errorf("custom command %v should be returned unchanged; got %v", c, got)
 			continue
@@ -541,7 +542,7 @@ func TestInjectRemoteControlFlag_StrictShapeMatch(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			got := injectRemoteControlFlag(tc.argv, "fleet-coord-cafef00d")
+			got := spawn.InjectRemoteControlFlag(tc.argv, "fleet-coord-cafef00d")
 			if len(got) != len(tc.argv) {
 				t.Fatalf("custom command should be returned unchanged; got %v", got)
 			}
@@ -599,7 +600,7 @@ func TestInjectRemoteControlFlag_DoesNotMutateInput(t *testing.T) {
 	original := append([]string(nil), in...)
 	originalScript := in[2]
 
-	_ = injectRemoteControlFlag(in, "fleet-coord-abcd1234")
+	_ = spawn.InjectRemoteControlFlag(in, "fleet-coord-abcd1234")
 
 	if len(in) != len(original) {
 		t.Fatalf("input slice length mutated: %d → %d", len(original), len(in))
@@ -628,7 +629,7 @@ func TestInjectRemoteControlFlag_SessionNameMatchesAgentID(t *testing.T) {
 	cmd := newDispatchCmd()
 	flag := cmd.Flag("command")
 	slice := flag.Value.(pflag.SliceValue)
-	got := injectRemoteControlFlag(slice.GetSlice(), sessionName)
+	got := spawn.InjectRemoteControlFlag(slice.GetSlice(), sessionName)
 
 	want := `--remote-control "fleet-coord-1a2b3c4d"`
 	if !strings.Contains(got[2], want) {
@@ -721,7 +722,7 @@ func TestHandoffReplacement_InjectsRemoteControlFlag(t *testing.T) {
 
 	const newID = "deadbeef"
 	rcSession := handoffSessionPrefix + "-" + newID
-	rewritten := injectRemoteControlFlag(defaultCmd, rcSession)
+	rewritten := spawn.InjectRemoteControlFlag(defaultCmd, rcSession)
 
 	if sameCommand(rewritten, defaultCmd) {
 		t.Fatal("default command's rewrite should differ from input " +
@@ -767,7 +768,7 @@ func TestDispatch_CoordSpawn_AlwaysInjectsRemoteControl(t *testing.T) {
 
 	const fakeID = "feed1234"
 	rcSession := remoteControlSessionPrefix + "-" + fakeID
-	rewritten := injectRemoteControlFlag(defaultCmd, rcSession)
+	rewritten := spawn.InjectRemoteControlFlag(defaultCmd, rcSession)
 
 	// Sanity: the rewrite produced a different argv. If this fails,
 	// either the default --command shape changed (update the helper's
@@ -829,7 +830,7 @@ func TestDispatch_NonCoordSpawn_CommandHasNoRemoteControlFlag(t *testing.T) {
 // real tmux) so instead we exercise the rewrite logic directly with
 // the same default --command shape the dispatch CLI registers.
 // The helper-level test plus the wiring snippet in runDispatch (one
-// `if opts.coordSpawn { ... command = injectRemoteControlFlag(...) }`)
+// `if opts.coordSpawn { ... command = spawn.InjectRemoteControlFlag(...) }`)
 // gives us mechanical coverage of the contract.
 func TestDispatch_CoordSpawn_CommandIncludesRemoteControlFlag(t *testing.T) {
 	enableRCBootstrapForTest(t)
@@ -844,7 +845,7 @@ func TestDispatch_CoordSpawn_CommandIncludesRemoteControlFlag(t *testing.T) {
 	// rewrite the command.
 	const fakeID = "0123abcd"
 	rcSession := remoteControlSessionPrefix + "-" + fakeID
-	rewritten := injectRemoteControlFlag(defaultCmd, rcSession)
+	rewritten := spawn.InjectRemoteControlFlag(defaultCmd, rcSession)
 
 	if !strings.Contains(rewritten[2], "--remote-control") {
 		t.Errorf("coord-spawn command should include --remote-control; got %q", rewritten[2])

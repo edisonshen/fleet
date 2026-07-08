@@ -72,10 +72,8 @@ const claudeToken = "claude "
 // Source: Claude Code remote-control CLI flag, documented at
 // https://code.claude.com/docs/en/remote-control.md (issue #73).
 //
-// Used by THREE call sites — dispatch (coord-spawn), operator-triggered
-// handoff replacement, and internal/handoffop (auto-handoff drain) —
-// each picking its own session-name prefix (`fleet-coord` /
-// `fleet-handoff`).
+// Used by the centralized coord RC injector in spawn.Spawn, plus tests and
+// legacy helper contracts that still exercise the primitive directly.
 func InjectRemoteControlFlag(command []string, sessionName string) []string {
 	if len(command) != 3 || command[0] != "sh" || command[1] != "-c" {
 		return command

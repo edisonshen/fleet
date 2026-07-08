@@ -241,6 +241,10 @@ func main() {
 	if len(os.Args) > 1 {
 		os.Args = append([]string{os.Args[0]}, rewriteEngineShorthand(os.Args[1:])...)
 	}
+	if err := assertCoordRCInjectorWired(); err != nil {
+		fmt.Fprintln(os.Stderr, "error:", err)
+		os.Exit(1)
+	}
 	if err := newRootCmd().Execute(); err != nil {
 		// `fleet claims` carries stable exit codes via an errClaimsError
 		// sentinel that wraps the outcome string. Non-claims errors

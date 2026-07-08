@@ -4,6 +4,8 @@ import (
 	"os"
 	"strings"
 	"testing"
+
+	"github.com/edisonshen/fleet/internal/spawn"
 )
 
 // enableRCBootstrapForTest clears the FLEET_RC_BOOTSTRAP_DISABLED env
@@ -53,7 +55,7 @@ func TestRCBootstrap_Disabled_OmitsListenerSpawn(t *testing.T) {
 	}
 
 	input := []string{"sh", "-c", "claude --dangerously-skip-permissions; exit"}
-	got := injectRemoteControlFlag(input, "fleet-coord-deadbeef-rainier")
+	got := spawn.CoordRCInjector("rainier", "deadbeef", input)
 
 	// Must return the slice unchanged. We assert (a) length match and
 	// (b) element-by-element equality. We also check the body does NOT
@@ -86,7 +88,7 @@ func TestRCBootstrap_Enabled_EmitsListenerSpawn(t *testing.T) {
 
 	input := []string{"sh", "-c", "claude --dangerously-skip-permissions; exit"}
 	sessionName := "fleet-coord-deadbeef-rainier"
-	got := injectRemoteControlFlag(input, sessionName)
+	got := spawn.CoordRCInjector("rainier", "deadbeef", input)
 
 	if len(got) != 3 {
 		t.Fatalf("injectRemoteControlFlag returned len=%d, want 3: got=%v", len(got), got)

@@ -91,9 +91,9 @@ func TestCoordSpawn_NativeDefault_InjectsWithoutMarkers(t *testing.T) {
 	// The production inject helper rewrites the default claude wrapper
 	// BY DEFAULT (no marker required).
 	rcSessionName := buildCoordRemoteControlSessionName("abcdef12", project)
-	rewritten := injectRemoteControlFlagProject(defaultClaudeCommand, rcSessionName, project)
+	rewritten := spawn.CoordRCInjector(project, "abcdef12", defaultClaudeCommand)
 	if sameCommand(rewritten, defaultClaudeCommand) {
-		t.Fatalf("injectRemoteControlFlagProject MUST rewrite the default argv by default (native model); got pass-through")
+		t.Fatalf("spawn.CoordRCInjector MUST rewrite the default argv by default (native model); got pass-through")
 	}
 	if len(rewritten) < 3 {
 		t.Fatalf("rewritten argv truncated; got len=%d want >=3: %v", len(rewritten), rewritten)
@@ -135,8 +135,7 @@ func TestCoordSpawn_OptOutSuppressesInject(t *testing.T) {
 		t.Fatalf("coord dispatch must NOT remove the operator's rc-disabled opt-out marker")
 	}
 	// And the inject helper respects it.
-	rcSessionName := buildCoordRemoteControlSessionName("abcdef12", project)
-	rewritten := injectRemoteControlFlagProject(defaultClaudeCommand, rcSessionName, project)
+	rewritten := spawn.CoordRCInjector(project, "abcdef12", defaultClaudeCommand)
 	if !sameCommand(rewritten, defaultClaudeCommand) {
 		t.Fatalf("opted-out project must NOT get --remote-control; got rewrite %v", rewritten)
 	}
@@ -179,10 +178,9 @@ func TestCoordSpawn_EnvGateOverridesDefault(t *testing.T) {
 	if !rc.Enabled(project) {
 		t.Fatalf("precondition: project must be default-enabled")
 	}
-	rcSessionName := buildCoordRemoteControlSessionName("cafebabe", project)
-	rewritten := injectRemoteControlFlagProject(defaultClaudeCommand, rcSessionName, project)
+	rewritten := spawn.CoordRCInjector(project, "cafebabe", defaultClaudeCommand)
 	if !sameCommand(rewritten, defaultClaudeCommand) {
-		t.Fatalf("FLEET_RC_BOOTSTRAP_DISABLED MUST keep precedence over default-on; injectRemoteControlFlagProject rewrote argv anyway")
+		t.Fatalf("FLEET_RC_BOOTSTRAP_DISABLED MUST keep precedence over default-on; spawn.CoordRCInjector rewrote argv anyway")
 	}
 }
 

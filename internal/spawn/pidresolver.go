@@ -543,17 +543,17 @@ func PidResolveTimeout() time.Duration {
 // identifies THIS spawn's engine among potentially many sibling engines
 // on the host.
 //
-// For coord-spawn dispatches, dispatch.go injects `--remote-control
-// "fleet-coord-<id>"` into the wrapper script. We extract that exact
-// string from execArgv when present — matching against execArgv (not
-// opts.Command) catches the injection even though the persisted
-// rec.Command stays the clean form. Returns empty when no
-// disambiguator is found; the resolver then falls back to the engine
-// hint priority.
+// For coord spawns, spawn.Spawn injects `--remote-control
+// "fleet-coord-<id>-<project>"` into the wrapper script. We extract the
+// stable `fleet-coord-<id>` substring from execArgv when present — matching
+// against execArgv (not opts.Command) catches the injection even though the
+// persisted rec.Command stays the clean form. Returns empty when no
+// disambiguator is found; the resolver then falls back to the engine hint
+// priority.
 //
 // Match strategy: scan execArgv for any token containing "fleet-coord-"
 // + the agent id. We accept the substring rather than equality because
-// the dispatch-side injector wraps the name in quotes inside the shell
+// the spawn-side injector wraps the name in quotes inside the shell
 // wrapper string, so the argv token in the persisted execArgv is
 // `"fleet-coord-<id>"` (literal quotes) but the running claude's argv
 // in ps has it bare as `fleet-coord-<id>`. We strip quotes when
