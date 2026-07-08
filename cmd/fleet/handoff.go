@@ -202,11 +202,11 @@ var (
 	handoffGracefulSwapFn     = handoffop.GracefulCoordSwap
 )
 
-// requireOwner is retained for older call sites, but any rec stamped
-// LeaseWrapped=true is owner-only by construction: "no owner observed" means
-// the standby has not acquired YET, never a legacy bare coord. Bare legacy
-// successors stay out of the owner-poll branch and use the direct send below.
-func deliverHandoffResumePrompt(project string, isCoordSwap, requireOwner bool, rec *agent.Record,
+// Any rec stamped LeaseWrapped=true is owner-only by construction: "no owner
+// observed" means the standby has not acquired YET, never a legacy bare coord.
+// Bare legacy successors stay out of the owner-poll branch and use the direct
+// send below.
+func deliverHandoffResumePrompt(project string, isCoordSwap bool, rec *agent.Record,
 	docPath string, stdout, stderr io.Writer) (*agent.Record, error) {
 	prompt := handoff.ResumePrompt(docPath)
 	// Route through the lock owner ONLY when the successor was actually
@@ -430,13 +430,11 @@ func runHandoff(opts *handoffOpts, stdout, stderr io.Writer) error {
 			if autoResume {
 				coordDelivery := spawn.IsCoordSpawn(newRec.TaskID, newRec.Project) ||
 					leaseNamesCoord(newRec.Project, newRec.ID)
-				// requireOwner = newRec.LeaseWrapped (codex PR3-completion
-				// iter-8 [P1]): a graceful swap that retired OLD but timed
-				// out on delivery retries through THIS archived-OLD branch.
-				// For a lease-wrapped replacement, no-owner means
-				// mid-acquire — the direct-send fallback would type into the
-				// coord-run supervisor pane and falsely consume the queue.
-				deliveredRec, err := deliverHandoffResumePrompt(newRec.Project, coordDelivery, newRec.LeaseWrapped,
+				// A graceful swap that retired OLD but timed out on delivery
+				// retries through THIS archived-OLD branch. For a lease-wrapped
+				// replacement, no-owner means mid-acquire; bare replacements
+				// direct-send below.
+				deliveredRec, err := deliverHandoffResumePrompt(newRec.Project, coordDelivery,
 					newRec, pending.HandoffDoc, stdout, stderr)
 				if err != nil {
 					return fmt.Errorf(
@@ -1042,7 +1040,7 @@ func runHandoff(opts *handoffOpts, stdout, stderr io.Writer) error {
 		winner, gerr := handoffGracefulSwapFn(oldRec, newRec, docPath,
 			time.Duration(opts.graceMillis)*time.Millisecond,
 			func() (*agent.Record, error) {
-				return deliverHandoffResumePrompt(oldRec.Project, isCoordSwap, true,
+				return deliverHandoffResumePrompt(oldRec.Project, isCoordSwap,
 					newRec, docPath, stdout, stderr)
 			}, stderr)
 		if gerr != nil {
@@ -1193,7 +1191,7 @@ func runHandoff(opts *handoffOpts, stdout, stderr io.Writer) error {
 			deliveredRec = gracefulWinner
 		} else {
 			var err error
-			deliveredRec, err = deliverHandoffResumePrompt(oldRec.Project, isCoordSwap, false,
+			deliveredRec, err = deliverHandoffResumePrompt(oldRec.Project, isCoordSwap,
 				newRec, docPath, stdout, stderr)
 			if err != nil {
 				return fmt.Errorf("resume prompt delivery pending for %s: %w (queue preserved at %s)",
@@ -1350,7 +1348,7 @@ func resumeHandoff(opts *handoffOpts, stdout, stderr io.Writer,
 		winner, gerr := handoffGracefulSwapFn(oldRec, newRec, docPath,
 			time.Duration(opts.graceMillis)*time.Millisecond,
 			func() (*agent.Record, error) {
-				return deliverHandoffResumePrompt(oldRec.Project, isCoordSwap, true,
+				return deliverHandoffResumePrompt(oldRec.Project, isCoordSwap,
 					newRec, docPath, stdout, stderr)
 			}, stderr)
 		if gerr != nil {
@@ -1421,7 +1419,7 @@ func resumeHandoff(opts *handoffOpts, stdout, stderr io.Writer,
 			deliveredRec = gracefulWinner
 		} else {
 			var err error
-			deliveredRec, err = deliverHandoffResumePrompt(oldRec.Project, isCoordSwap, false,
+			deliveredRec, err = deliverHandoffResumePrompt(oldRec.Project, isCoordSwap,
 				newRec, docPath, stdout, stderr)
 			if err != nil {
 				return fmt.Errorf("resume handoff: prompt delivery pending for %s: %w (queue preserved at %s)",

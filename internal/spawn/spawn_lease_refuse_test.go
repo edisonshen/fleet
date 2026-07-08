@@ -7,6 +7,7 @@ import (
 
 	"github.com/edisonshen/fleet/internal/agent"
 	"github.com/edisonshen/fleet/internal/state"
+	"github.com/edisonshen/fleet/internal/testutil/tmuxtest"
 	"github.com/edisonshen/fleet/internal/tmux"
 )
 
@@ -20,6 +21,11 @@ func installRefuseBackend(t *testing.T) *refuseBackend {
 	restore := tmux.Install(b)
 	t.Cleanup(restore)
 	return b
+}
+
+func isolateTmuxSocket(t *testing.T) string {
+	t.Helper()
+	return tmuxtest.IsolateSocket(t)
 }
 
 func (b *refuseBackend) Available() error { return nil }
@@ -62,6 +68,7 @@ func restoreSpawnLeaseSeams(t *testing.T) {
 }
 
 func TestSpawn_CoordLeaseUnsupportedRefusesBeforeTmux(t *testing.T) {
+	isolateTmuxSocket(t)
 	restoreSpawnLeaseSeams(t)
 	f := installRefuseBackend(t)
 	setupFleetHome(t)
@@ -99,6 +106,7 @@ func TestSpawn_CoordLeaseUnsupportedRefusesBeforeTmux(t *testing.T) {
 }
 
 func TestSpawn_CoordExecutableFailureRefusesWithoutBareSession(t *testing.T) {
+	isolateTmuxSocket(t)
 	restoreSpawnLeaseSeams(t)
 	f := installRefuseBackend(t)
 	setupFleetHome(t)

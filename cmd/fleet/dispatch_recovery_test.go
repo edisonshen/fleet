@@ -572,6 +572,145 @@ func TestRunDispatch_DeadCoord_Recovers(t *testing.T) {
 	}
 }
 
+// TestRunDispatch_DeadCoord_LeaseWrappedNoOwnerDoesNotDirectSend pins #261:
+// when recovery spawned a lease-wrapped coord standby but no lock owner is
+// observed yet, rec.TmuxSession names the coord-run supervisor. Dispatch must
+// not direct-send the resume prompt there and falsely report delivery.
+func TestRunDispatch_DeadCoord_LeaseWrappedNoOwnerDoesNotDirectSend(t *testing.T) {
+	if !coordLeaseSupported() {
+		t.Skip("coordinator lease unsupported on this platform")
+	}
+	requireFakeTmux(t)
+	setupFleetHome(t)
+
+	prevSpawn := dispatchSpawnFn
+	dispatchSpawnFn = func(opts spawn.Options) (*agent.Record, error) {
+		if opts.OldRecord == nil {
+			t.Fatal("expected recovery spawn to pass OldRecord")
+		}
+		if opts.NewDocPath == "" {
+			t.Fatal("expected recovery spawn to pass NewDocPath")
+		}
+		id := opts.PreAllocatedID
+		if id == "" {
+			id = "wrapno01"
+		}
+		rec := agent.New(id)
+		rec.TaskID = opts.OldRecord.TaskID
+		rec.Project = opts.OldRecord.Project
+		rec.Cwd = opts.Cwd
+		rec.Command = opts.Command
+		rec.TmuxSession = "fleet-" + id
+		rec.LeaseWrapped = true
+		rec.LastHandoffPath = &opts.NewDocPath
+		rec.PredecessorID = opts.OldRecord.ID
+		rec.HandoffNumber = opts.OldRecord.HandoffNumber + 1
+		if err := rec.Write(); err != nil {
+			t.Fatalf("write successor: %v", err)
+		}
+		return rec, nil
+	}
+	t.Cleanup(func() { dispatchSpawnFn = prevSpawn })
+
+	var deliveredPrompt string
+	prevDeliver := deliverToCurrentOwner
+	deliverToCurrentOwner = func(opts handoffdelivery.Options) (*agent.Record, error) {
+		deliveredPrompt = opts.Prompt
+		if opts.Project != "myproj" {
+			t.Errorf("delivery project = %q, want myproj", opts.Project)
+		}
+		return nil, handoffdelivery.ErrNoOwnerObserved
+	}
+	t.Cleanup(func() { deliverToCurrentOwner = prevDeliver })
+
+	prevSend := sendInitialPrompt
+	var directSendCalled bool
+	sendInitialPrompt = func(session, prompt string) (bool, error) {
+		directSendCalled = true
+		t.Fatalf("lease-wrapped no-owner path direct-sent to %q with prompt %q", session, prompt)
+		return true, nil
+	}
+	t.Cleanup(func() { sendInitialPrompt = prevSend })
+
+	deadRec := agent.New("deadno01")
+	deadRec.TaskID = "coord-myproj"
+	deadRec.Project = "myproj"
+	deadRec.PID = 99999
+	deadRec.TmuxSession = "fleet-deadno01"
+	if err := deadRec.Write(); err != nil {
+		t.Fatalf("seed dead record: %v", err)
+	}
+	root := os.Getenv("FLEET_HOME")
+	seedRecoveryRepo(t, root, "myproj")
+	pdir := filepath.Join(root, "projects", "myproj")
+	if err := os.MkdirAll(pdir, 0o755); err != nil {
+		t.Fatalf("mkdir project dir: %v", err)
+	}
+	csData, _ := json.Marshal(map[string]any{"worker_agent_ids": map[string]string{}})
+	csPath := filepath.Join(pdir, "coord-state.json")
+	if err := os.WriteFile(csPath, csData, 0o644); err != nil {
+		t.Fatalf("write coord-state: %v", err)
+	}
+	stale := time.Now().Add(-2 * coordFreshnessWindow)
+	if err := os.Chtimes(csPath, stale, stale); err != nil {
+		t.Fatalf("chtimes coord-state: %v", err)
+	}
+
+	opts := &dispatchOpts{
+		taskID:          "coord-myproj",
+		project:         "myproj",
+		projectExplicit: true,
+		coordSpawn:      true,
+		command:         []string{"sleep", "60"},
+		commandExplicit: true,
+		prompt:          "fresh coord prompt must be replaced by recovery prompt",
+	}
+	var out bytes.Buffer
+	if err := runDispatch(opts, &out); err != nil {
+		t.Fatalf("runDispatch: %v\n%s", err, out.String())
+	}
+	if directSendCalled {
+		t.Fatal("sendInitialPrompt was called on the lease-wrapped no-owner path")
+	}
+	if !strings.Contains(deliveredPrompt, "Read your handoff doc at ") {
+		t.Fatalf("DeliverToCurrentOwner prompt = %q, want recovery ResumePrompt", deliveredPrompt)
+	}
+	stdout := out.String()
+	if !strings.Contains(stdout, "initial prompt not delivered") {
+		t.Fatalf("no-owner delivery must surface as not delivered; got:\n%s", stdout)
+	}
+	if strings.Contains(stdout, "prompt:  delivered") {
+		t.Fatalf("no-owner delivery must not be reported delivered; got:\n%s", stdout)
+	}
+	if strings.Contains(stdout, "delivering initial prompt directly") {
+		t.Fatalf("no-owner delivery must not fall back to direct send; got:\n%s", stdout)
+	}
+
+	live, err := agent.List()
+	if err != nil {
+		t.Fatalf("agent.List: %v", err)
+	}
+	var successor *agent.Record
+	for _, r := range live {
+		if r.TaskID == "coord-myproj" && r.Project == "myproj" && r.ID != "deadno01" {
+			successor = r
+			break
+		}
+	}
+	if successor == nil {
+		t.Fatalf("expected lease-wrapped recovery successor; got records %+v", live)
+	}
+	if !successor.LeaseWrapped {
+		t.Fatalf("successor LeaseWrapped=false, want true to exercise owner-only path")
+	}
+	if successor.LastHandoffPath == nil {
+		t.Fatalf("successor LastHandoffPath nil; recovery doc must remain discoverable")
+	}
+	if _, err := os.Stat(*successor.LastHandoffPath); err != nil {
+		t.Fatalf("recovery doc not readable at %s: %v", *successor.LastHandoffPath, err)
+	}
+}
+
 // TestRunDispatch_DeadCoord_SendsResumePromptToSuccessor pins codex
 // iter-2 P1: when the recovery path fires AND opts.prompt is non-empty,
 // the successor receives `handoff.ResumePrompt(newDocPath)` — NOT the

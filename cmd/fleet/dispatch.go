@@ -1243,13 +1243,12 @@ func runDispatch(opts *dispatchOpts, stdout io.Writer) error {
 				}
 			}
 			if errors.Is(perr, handoffdelivery.ErrNoOwnerObserved) {
-				// Legacy/bare coord with no lease record: the owner-poll never
-				// converges. The freshly-spawned coord (rec) is live, so fall
-				// back to a direct send (matches the handoff/drain callers).
-				_, _ = fmt.Fprintf(stdout,
-					"warning: no lease owner for project %s (legacy coord?); delivering initial prompt directly to %s\n",
-					rec.Project, rec.TmuxSession)
-				submitted, perr = sendInitialPrompt(rec.TmuxSession, opts.prompt)
+				// This branch is gated on rec.LeaseWrapped=true, so
+				// rec.TmuxSession is the coord-run supervisor pane, not the
+				// engine. No owner observed means the standby has not acquired
+				// yet; leave delivery failed so the recovery doc stays pending
+				// for the next retry instead of direct-sending into supervisor.
+				submitted = false
 			} else {
 				submitted = perr == nil
 			}

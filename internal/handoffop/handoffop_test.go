@@ -1623,7 +1623,7 @@ func TestDeliverResumePrompt_LeaseWrapped_NoOwner_StaysPending(t *testing.T) {
 	}
 
 	out := &bytes.Buffer{}
-	delivered, err := deliverResumePrompt(rec.Project, true, true, false, rec, "/tmp/handoff.md", out, out)
+	delivered, err := deliverResumePrompt(rec.Project, true, true, rec, "/tmp/handoff.md", out, out)
 	if !errors.Is(err, handoffdelivery.ErrNoOwnerObserved) {
 		t.Fatalf("want ErrNoOwnerObserved so queue stays pending, got delivered=%+v err=%v\n%s",
 			delivered, err, out.String())
@@ -2120,9 +2120,9 @@ func TestLiveCoordGracefulSpawn_DecidesGracefulRoute(t *testing.T) {
 // lease-wrapped by construction, so ErrNoOwnerObserved means "standby has not
 // acquired YET" — the legacy direct-send fallback would type into the
 // coord-run supervisor pane and could falsely report success, consuming the
-// durable queue with the doc undelivered. requireOwner=true (what the
-// graceful deliver closure passes) must propagate the error instead.
-func TestDeliverResumePrompt_RequireOwner_NoOwner_NoFallback(t *testing.T) {
+// durable queue with the doc undelivered. The lease-wrapped delivery path must
+// propagate the error instead.
+func TestDeliverResumePrompt_LeaseWrappedGraceful_NoOwner_NoFallback(t *testing.T) {
 	setupFleetHome(t)
 
 	rec := agent.New("standby02")
@@ -2150,12 +2150,12 @@ func TestDeliverResumePrompt_RequireOwner_NoOwner_NoFallback(t *testing.T) {
 		return deps
 	}
 	sendPromptKeysVerified = func(session, _ string) (bool, error) {
-		t.Errorf("requireOwner delivery direct-sent to %q — must stay pending", session)
+		t.Errorf("lease-wrapped delivery direct-sent to %q; must stay pending", session)
 		return true, nil
 	}
 
 	out := &bytes.Buffer{}
-	delivered, err := deliverResumePrompt(rec.Project, true, true, true, rec, "/tmp/handoff.md", out, out)
+	delivered, err := deliverResumePrompt(rec.Project, true, true, rec, "/tmp/handoff.md", out, out)
 	if !errors.Is(err, handoffdelivery.ErrNoOwnerObserved) {
 		t.Fatalf("want ErrNoOwnerObserved propagated (queue stays pending), got %v", err)
 	}

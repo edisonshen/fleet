@@ -1763,11 +1763,11 @@ func TestResumeHandoff_GracefulRoute_SwapsViaBarrier(t *testing.T) {
 	}
 }
 
-// codex PR3-completion iter-7 [P1]: the graceful route's deliver closure
-// passes requireOwner=true — ErrNoOwnerObserved must propagate (queue stays
-// pending for the next drain/attach), never the legacy direct-send fallback
-// into the lease-wrapped successor's supervisor pane.
-func TestDeliverHandoffResumePrompt_RequireOwner_NoOwner_NoFallback(t *testing.T) {
+// codex PR3-completion iter-7 [P1]: the graceful route's lease-wrapped
+// successor must propagate ErrNoOwnerObserved (queue stays pending for the next
+// drain/attach), never the legacy direct-send fallback into the successor's
+// supervisor pane.
+func TestDeliverHandoffResumePrompt_LeaseWrapped_NoOwner_NoFallback(t *testing.T) {
 	setupFleetHome(t)
 
 	rep := agent.New(agent.NewID())
@@ -1791,7 +1791,7 @@ func TestDeliverHandoffResumePrompt_RequireOwner_NoOwner_NoFallback(t *testing.T
 			return coordlock.Owner{}, false
 		}
 		deps.SendVerified = func(session, _ string) (bool, error) {
-			t.Errorf("requireOwner delivery sent to %q — must stay pending", session)
+			t.Errorf("lease-wrapped delivery sent to %q; must stay pending", session)
 			return true, nil
 		}
 		deps.Sleep = func(time.Duration) {}
@@ -1799,7 +1799,7 @@ func TestDeliverHandoffResumePrompt_RequireOwner_NoOwner_NoFallback(t *testing.T
 	}
 
 	out := &bytes.Buffer{}
-	delivered, err := deliverHandoffResumePrompt(rep.Project, true, true, rep, "/tmp/handoff.md", out, out)
+	delivered, err := deliverHandoffResumePrompt(rep.Project, true, rep, "/tmp/handoff.md", out, out)
 	if !errors.Is(err, handoffdelivery.ErrNoOwnerObserved) {
 		t.Fatalf("want ErrNoOwnerObserved propagated (queue stays pending), got %v", err)
 	}
