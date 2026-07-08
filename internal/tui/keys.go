@@ -14,6 +14,7 @@ import (
 
 	"github.com/edisonshen/fleet/internal/agent"
 	"github.com/edisonshen/fleet/internal/coordlock"
+	"github.com/edisonshen/fleet/internal/coordreconcile"
 	"github.com/edisonshen/fleet/internal/coordrepo"
 	"github.com/edisonshen/fleet/internal/gc"
 	"github.com/edisonshen/fleet/internal/projectlookup"
@@ -599,8 +600,8 @@ func (m Model) actionHandoff() (Model, tea.Cmd, bool) {
 // coord link (CoordID) races the agents refresh, so a live-but-unlinked
 // coord made [h] flash "no coord" while the agents panel clearly showed
 // it (live repro 2026-05-28: projects-fengshen-site coord 129c9824).
-// resolveCoordRecord adds the same records-scan fallback that
-// actionAttachProject already used, so [h] finds the in-flight coord.
+// resolveCoordRecord keeps [h] on a read-only record lookup path, while
+// [a] now uses coordreconcile.Resolve for lease-authoritative attach.
 //
 // The gate logic mirrors what used to live on the rowAgent branch:
 //
@@ -1220,29 +1221,13 @@ var taskWorkerArchiveExists = func(project, slug string) bool {
 
 // actionAttachProject is the project-row branch of [a] (issues #60, #63).
 //
-// Three paths, in order:
-//
-//  1. Lock-body match: project.CoordID is set (dashboard freshness gate
-//     passed: lock body + coord-state.json mtime within
-//     coordActiveWindow). Find the matching agent.Record by ID, attach.
-//
-//  2. Task_id fallback: even when CoordID is empty, an agent record
-//     tagged task_id == coord-<project> AND project == <project> with
-//     an alive tmux session is the project's coord by intent — the
-//     skill just hasn't ticked yet (10-30s boot window). Attach to it
-//     instead of spawning a duplicate. This is the primary issue-#63
-//     idempotency mechanism: a second [a] press during the boot window
-//     finds the in-flight record here.
-//
-//  3. No coord: pre-init the project tree, then spawn one. Stable
-//     task_id ("coord-<name>") so subsequent [a] presses route into
-//     path 2 instead of stacking duplicates. Attach immediately after
-//     dispatch returns — no lock-poll (PR #62's 2s budget fired the
-//     spawn-timeout banner under normal operation).
-//
-// Single-coord-per-project enforcement remains upstream: the coord
-// skill NB-flocks coordinator.lock at first tick and exits cleanly if
-// another coord beats it.
+// The active attach path is lease-authoritative: after the in-flight
+// lifecycle guard, beginResolvedCoordAttach delegates to coordreconcile.
+// Resolve and consumes Attach / Wait / Spawn / SpawnStandby. The small
+// CoordID preflight only preserves the dashboard refresh distinction:
+// an unloaded non-archived link is a refresh race, while an archived link
+// gets a read-only Resolve chance to attach a successor before surfacing
+// the [r] reset hint.
 func (m Model) actionAttachProject(p *ProjectRow) (Model, tea.Cmd, bool) {
 	if p == nil {
 		return m, nil, true
@@ -1265,6 +1250,31 @@ func (m Model) actionAttachProject(p *ProjectRow) (Model, tea.Cmd, bool) {
 			text: fmt.Sprintf(
 				"coord %s for project %s is in flight — wait a moment then re-press [a]",
 				coordOpVerb(op), p.Name),
+			isErr: true,
+		}
+		return m, nil, true
+	}
+	if p.CoordID != "" && findRecordByID(m.records, p.CoordID) == nil {
+		if !coordArchivedFn(p.CoordID) {
+			m.flash = &flashMsg{
+				text:  fmt.Sprintf("project %s: coord %s is pending refresh — wait for the next dashboard tick, then press [a] again", p.Name, p.CoordID),
+				isErr: true,
+			}
+			return m, nil, true
+		}
+		verdict, err := tuiCoordResolveFn(p.Name, "")
+		if err == nil && verdict.Decision == coordreconcile.Attach {
+			next, cmd := m.attachResolvedCoordOwner(p.Name, "project", verdict)
+			return next, cmd, true
+		}
+		reason := "no successor is attachable"
+		if err != nil {
+			reason = fmt.Sprintf("lease resolve failed: %v", err)
+		} else if verdict.Reason != "" {
+			reason = verdict.Reason
+		}
+		m.flash = &flashMsg{
+			text:  fmt.Sprintf("project %s: coord link %s is stale (%s) — press [r] to reset", p.Name, p.CoordID, reason),
 			isErr: true,
 		}
 		return m, nil, true
@@ -1629,19 +1639,17 @@ func coordLockRefusal(gcOutput string) string {
 	return ""
 }
 
-// resolveCoordRecord finds the live coord record for a project row,
-// trying the dashboard-linked CoordID first, then the records scan that
-// actionAttachProject already relies on (findExistingCoordForProject:
-// an agent tagged task_id=coord-<project>, project matching, named by the
-// coordinator lease, alive tmux session). Read-only — no spawn, no dead-session
-// recovery; callers handle the not-found (nil) case.
+// resolveCoordRecord finds the live coord record for project-row [h],
+// trying the dashboard-linked CoordID first, then read-only fallbacks:
+// an alive coord-<project> record named by the coordinator lease, and
+// finally the lock-body match. It does not spawn, reap, or perform
+// dead-session recovery; callers handle the not-found (nil) case.
 //
 // tui-nav-handoff-regressions Fix 2: shared by actionHandoffProject and
-// actionAttachProject's initial coord lookup so [h] and [a] resolve the
-// project's coord through the SAME chain. Previously only [a] had the
-// scan fallback, so [h] flashed "no coord" when the dashboard's
-// CoordID link hadn't published yet but a coord was demonstrably live
-// in the agents panel.
+// the older [a] lookup path so [h] could find a coord when the dashboard's
+// CoordID link had not published yet but a coord was demonstrably live in
+// the agents panel. Post-D2, only [h] uses this helper; [a] goes through
+// coordreconcile.Resolve.
 //
 // codex review iter-1 [P2]: the scan fallbacks fire ONLY when CoordID
 // is empty. A non-empty CoordID is the dashboard's authoritative lock-
@@ -1654,15 +1662,12 @@ func coordLockRefusal(gcOutput string) string {
 // "pending refresh — try again" flash for the CoordID-set race; the
 // operator re-presses after the next tick binds the record.
 //
-// codex review iter-2 [P2]: when CoordID is empty, mirror BOTH of
-// actionAttachProject's read-only fallbacks in order — the lease scan
-// (findExistingCoordForProject, path 2) THEN the lock-body fallback
-// (findCoordByLockBody, path 2.5). Without the lock-body tier, the
+// codex review iter-2 [P2]: when CoordID is empty, try BOTH read-only
+// fallbacks in order — the lease scan (findExistingCoordForProject) THEN
+// the lock-body fallback (findCoordByLockBody). Without the lock-body tier, the
 // prompt-delivery-recovery state (operator attached + manually typed
 // /coordinator, so coordinator.lock names an alive coord but no marker
-// was written) let [a] attach while [h] still flashed "no coord". The
-// design's G2 — "[h] resolves via the SAME chain [a] uses" — requires
-// the lock-body tier here too.
+// was written) let [a] attach while [h] still flashed "no coord".
 func (m Model) resolveCoordRecord(p *ProjectRow) *agent.Record {
 	if p == nil {
 		return nil
@@ -1744,12 +1749,12 @@ func coordTaskID(projectName string) string {
 //   - no record has the matching ID,
 //   - the matching record's tmux session is not alive.
 //
-// Used by actionAttachProject's path 2.5 to handle the prompt-
-// delivery-recovery case (codex iter-7 P2): operator attached after
-// a prompt-failed dispatch, typed /coordinator manually, the skill
-// acquired LOCK_EX and wrote its ID into the lock body. The marker
-// file is absent (we skipped writing it), but the lock body is
-// authoritative — re-attach instead of spawning a duplicate.
+// Used by resolveCoordRecord's [h] fallback to handle the prompt-
+// delivery-recovery case (codex iter-7 P2): operator attached after a
+// prompt-failed dispatch, typed /coordinator manually, the skill acquired
+// LOCK_EX and wrote its ID into the lock body. The marker file is absent
+// (we skipped writing it), but the lock body is authoritative for this
+// read-only handoff lookup.
 //
 // Differs from path 1 (project.CoordID-driven) in that it does NOT
 // require coord-state.json freshness. Lock body is set via LOCK_EX

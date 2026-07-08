@@ -1301,7 +1301,6 @@ func TestKeyA_ProjectRow_AttachesToExistingFreshCoord(t *testing.T) {
 // a bug.
 func TestKeyA_ProjectRow_CoordIDSetButRecordNotLoaded_FlashesRetry(t *testing.T) {
 	(&stubSessionAlive{}).install(t)
-	stubTUIResolveWait(t, "demo", "coord boot in flight")
 	stub := &stubFleetCmd{}
 	stub.install(t)
 
@@ -1323,8 +1322,8 @@ func TestKeyA_ProjectRow_CoordIDSetButRecordNotLoaded_FlashesRetry(t *testing.T)
 	if mm.flash == nil || !mm.flash.isErr {
 		t.Fatalf("expected error flash for wait budget exhaustion; got %+v", mm.flash)
 	}
-	if !strings.Contains(mm.flash.text, "still waiting") {
-		t.Errorf("flash should mention wait exhaustion; got %q", mm.flash.text)
+	if !strings.Contains(mm.flash.text, "pending refresh") {
+		t.Errorf("flash should mention pending refresh; got %q", mm.flash.text)
 	}
 	if mm.pendingAttach != "" {
 		t.Errorf("pendingAttach must NOT be set; got %q", mm.pendingAttach)
@@ -2553,15 +2552,18 @@ func TestModel_CoordSpawnDoneMsg_PromptFailed_SkipsMarker(t *testing.T) {
 // on parent dir), [a] must NOT shell out to dispatch — surface the
 // error as a banner so the operator sees what to fix.
 func TestKeyA_ProjectRow_InitErrShowsBanner(t *testing.T) {
-	// Force EnsureProjectInitialized to fail by pointing FLEET_HOME at
-	// a path where MkdirAll cannot succeed. A regular file as parent
-	// triggers ENOTDIR.
 	tmp := t.TempDir()
-	notDirPath := filepath.Join(tmp, "fleet-as-file")
-	if err := os.WriteFile(notDirPath, []byte("not a dir"), 0o644); err != nil {
+	root := filepath.Join(tmp, "fleet")
+	t.Setenv("FLEET_HOME", root)
+	if err := os.MkdirAll(filepath.Join(root, "agents"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	t.Setenv("FLEET_HOME", notDirPath)
+	// Force EnsureProjectInitialized to fail while leaving agent.ListStrict
+	// readable, so this test reaches coord_resolve.go's init-failure branch
+	// instead of the earlier orphan-cleanup branch.
+	if err := os.WriteFile(filepath.Join(root, "projects"), []byte("not a dir"), 0o644); err != nil {
+		t.Fatal(err)
+	}
 
 	(&stubSessionAlive{}).install(t)
 	stubTUIResolveSpawn(t, "demo")
@@ -2582,8 +2584,8 @@ func TestKeyA_ProjectRow_InitErrShowsBanner(t *testing.T) {
 	if mm.flash == nil || !mm.flash.isErr {
 		t.Fatalf("init failure should flash; got %+v", mm.flash)
 	}
-	if !strings.Contains(mm.flash.text, "orphan cleanup failed") {
-		t.Errorf("flash should mention orphan cleanup failure; got %q", mm.flash.text)
+	if !strings.Contains(mm.flash.text, "init failed") {
+		t.Errorf("flash should mention init failure; got %q", mm.flash.text)
 	}
 	if len(stub.calls) != 0 {
 		t.Errorf("init failure must NOT shell out to dispatch; got %v", stub.calls)

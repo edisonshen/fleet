@@ -106,9 +106,9 @@ func (m Model) consumeResolvedCoord(projectName, agentID, context string, attemp
 			}
 		})
 	case coordreconcile.Spawn:
-		return m.startResolvedCoordSpawn(projectName, context, false)
+		return m.startResolvedCoordSpawn(projectName, false)
 	case coordreconcile.SpawnStandby:
-		return m.startResolvedCoordSpawn(projectName, context, true)
+		return m.startResolvedCoordSpawn(projectName, true)
 	default:
 		m.flash = &flashMsg{
 			text:  fmt.Sprintf("project %s: coord resolver returned unknown decision %s — press [a] again", projectName, verdict.Decision),
@@ -179,7 +179,7 @@ func (m Model) attachResolvedCoordOwner(projectName, context string, verdict coo
 	return m, tea.Quit
 }
 
-func (m Model) startResolvedCoordSpawn(projectName, context string, standby bool) (Model, tea.Cmd) {
+func (m Model) startResolvedCoordSpawn(projectName string, standby bool) (Model, tea.Cmd) {
 	if !standby {
 		if killedID, err := tuiKillCollidingOrphanTmux(projectName); err != nil {
 			m.flash = &flashMsg{
@@ -215,7 +215,6 @@ func (m Model) startResolvedCoordSpawn(projectName, context string, standby bool
 		}
 		m.flash = &flashMsg{text: fmt.Sprintf("%s for project %s via lease resolve", action, projectName)}
 	}
-	_ = context
 	return m, m.startCoordSpawn(projectName, cwd)
 }
 

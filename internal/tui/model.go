@@ -949,14 +949,13 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// future [a] dedup. The in-flight gate is already cleared above.
 		if msg.attachedExisting {
 			// DEFINITIVE re-probe before quitting into tmux attach. The
-			// callback resolved the leader via FindLiveCoord /
-			// FindCoordByLockBody, which treat a tmux PROBE ERROR as
-			// "alive" (a transient hiccup must not drop a live claim). But
-			// a wrong FLEET_TMUX_SOCKET is a PERSISTENT probe error: the
-			// session is real yet unreachable from this process. If we
-			// trusted the error-tolerant probe and quit, Run() would
-			// tmux-attach to an unreachable session and dead-end the
-			// operator on tmux's raw error (codex iter-3 P1). So commit to
+			// callback resolved the leader via coordreconcile.Resolve and
+			// loaded its record; it does not scan records or probe tmux.
+			// A wrong FLEET_TMUX_SOCKET is a persistent probe error: the
+			// session is real yet unreachable from this process. If we quit
+			// without this probe, Run() would tmux-attach to an unreachable
+			// session and dead-end the operator on tmux's raw error (codex
+			// iter-3 P1). So commit to
 			// the attach ONLY when sessionProbeFn confirms the session is
 			// reachable AND alive (err==nil && alive). Any other outcome —
 			// definitively dead (died/rotated in the race) or unreachable

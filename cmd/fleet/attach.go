@@ -447,6 +447,9 @@ func resolveAndAttachCoord(token, project string, opts AttachOpts) error {
 			"cannot preallocate a coord id for project %s — re-run `fleet attach %s --project %s` to retry",
 			project, token, project))
 	}
+	// This ID is only Resolve's spawn-serialization token. dispatch mints
+	// the real coord ID; the free-flock fast path is identity-blind, so
+	// discarding this preallocation after Resolve is intentional.
 	interval, attempts := attachResolvePolicy(opts)
 	for {
 		verdict, err := attachResolveFnVar(project, agentID)
@@ -515,10 +518,6 @@ func consumeResolvedCoord(token, project string, opts AttachOpts, verdict coordr
 					"%s: lease resolved standby for %s (%s); spawned %s; attaching\n",
 					token, project, verdict.Reason, res.ID)
 			})
-	case coordreconcile.Wait:
-		return newSystemError(dispatchVetoExitCode, fmt.Sprintf(
-			"%s: coord for %s still waiting (%s) — re-run `fleet attach %s --project %s` shortly",
-			token, project, verdict.Reason, token, project))
 	default:
 		return newSystemError(70, fmt.Sprintf(
 			"%s: coord resolver returned unknown decision %s for %s — re-run `fleet attach %s --project %s`; if it persists, run `fleet doctor`",

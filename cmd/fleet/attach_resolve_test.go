@@ -99,6 +99,33 @@ func TestTA1_CLIVerdictMatrixConsumesResolveActions(t *testing.T) {
 			wantResolveMin: 1,
 		},
 		{
+			name:           "Attach-empty-owner-id-no-respawn",
+			state:          reconciletest.State{LiveOwner: &coordlock.Owner{AgentID: "", PID: 104}},
+			wantErr:        true,
+			wantExit:       dispatchVetoExitCode,
+			wantDiagnostic: "empty owner id",
+			wantResolveMin: 1,
+		},
+		{
+			name:           "Attach-owner-record-load-failure-no-respawn",
+			state:          reconciletest.State{LiveOwner: &coordlock.Owner{AgentID: "missing1", PID: 105}},
+			wantErr:        true,
+			wantExit:       dispatchVetoExitCode,
+			wantDiagnostic: "agent record is not readable",
+			wantResolveMin: 1,
+		},
+		{
+			name:           "Attach-definitively-dead-session-no-respawn",
+			state:          reconciletest.State{LiveOwner: &coordlock.Owner{AgentID: "deadlv01", PID: 106}},
+			seedOwner:      "deadlv01",
+			ownerReachable: false,
+			currentOwnerOK: true,
+			wantErr:        true,
+			wantExit:       dispatchVetoExitCode,
+			wantDiagnostic: "session fleet-deadlv01 is gone",
+			wantResolveMin: 1,
+		},
+		{
 			name: "Wait-starting",
 			state: reconciletest.State{Starting: &coordlock.StartingStatus{
 				Owner: coordlock.Owner{AgentID: "bootaaaa", PID: 201}, OwnerLive: true, WithinTTL: true, Epoch: 3,

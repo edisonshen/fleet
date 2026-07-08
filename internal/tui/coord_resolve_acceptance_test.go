@@ -145,6 +145,76 @@ func TestTA5_TUIUsesSharedResolveStateToAttachHolder(t *testing.T) {
 	}
 }
 
+func TestTA1_TUIAttachGuardMatrixNoRespawn(t *testing.T) {
+	cases := []struct {
+		name        string
+		ownerID     string
+		seedRecord  bool
+		deadSession bool
+		wantFlash   string
+	}{
+		{
+			name:      "empty owner id",
+			ownerID:   "",
+			wantFlash: "empty owner",
+		},
+		{
+			name:      "owner record load failure",
+			ownerID:   "missing1",
+			wantFlash: "agent record is not readable",
+		},
+		{
+			name:        "definitively dead session",
+			ownerID:     "deadlv01",
+			seedRecord:  true,
+			deadSession: true,
+			wantFlash:   "process-live in the lease but session fleet-deadlv01 is unreachable",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			withFleetHome(t)
+			stub := &stubFleetCmd{}
+			stub.install(t)
+			probe := &stubSessionProbe{}
+			var records []*agent.Record
+			if tc.seedRecord {
+				owner := tuiCoordRecord(tc.ownerID, "demo")
+				records = []*agent.Record{owner}
+				if tc.deadSession {
+					probe.dead = map[string]bool{owner.TmuxSession: true}
+				}
+			}
+			probe.install(t)
+			st := reconciletest.State{LiveOwner: &coordlock.Owner{AgentID: tc.ownerID, PID: 501}}
+			resolveCalls := installTUIResolveFromState(t, &st)
+
+			m := New("test")
+			m.records = records
+			updated, cmd := m.beginResolvedCoordAttach("demo", "project")
+			mm := updated
+
+			if mm.pendingAttach != "" {
+				t.Fatalf("pendingAttach = %q; want empty so [a] does not attach beside a guarded owner", mm.pendingAttach)
+			}
+			if len(stub.calls) != 0 {
+				t.Fatalf("guard branch must not spawn; dispatch calls=%v", stub.calls)
+			}
+			if *resolveCalls != 1 {
+				t.Fatalf("Resolve calls = %d, want 1", *resolveCalls)
+			}
+			if mm.flash == nil || !mm.flash.isErr || !strings.Contains(mm.flash.text, tc.wantFlash) {
+				t.Fatalf("flash = %+v; want error containing %q", mm.flash, tc.wantFlash)
+			}
+			if tc.deadSession && !strings.Contains(mm.flash.text, "Do not respawn beside it") {
+				t.Fatalf("dead-session guard flash must forbid respawn; got %q", mm.flash.text)
+			}
+			_ = cmd
+		})
+	}
+}
+
 func TestTA6_TUISpawnKillsOrphanBeforeDispatch(t *testing.T) {
 	withFleetHome(t)
 	seedProjectMeta(t, "demo", t.TempDir())
@@ -167,6 +237,68 @@ func TestTA6_TUISpawnKillsOrphanBeforeDispatch(t *testing.T) {
 	}
 	if updated.flash == nil || !strings.Contains(updated.flash.text, "reaped stale deadbeef") {
 		t.Fatalf("spawn should surface orphan reap before dispatch; flash=%+v", updated.flash)
+	}
+}
+
+func TestTA6_TUIOrphanCleanupListStrictFaultsSurface(t *testing.T) {
+	cases := []struct {
+		name  string
+		setup func(t *testing.T, root string)
+		want  string
+	}{
+		{
+			name: "ListStrict read error",
+			setup: func(t *testing.T, root string) {
+				t.Helper()
+				if err := os.WriteFile(filepath.Join(root, "agents"), []byte("not a dir"), 0o644); err != nil {
+					t.Fatal(err)
+				}
+			},
+			want: "agent.ListStrict failed",
+		},
+		{
+			name: "corrupt agent record",
+			setup: func(t *testing.T, root string) {
+				t.Helper()
+				dir := filepath.Join(root, "agents")
+				if err := os.MkdirAll(dir, 0o755); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(filepath.Join(dir, "badc0de1.json"), []byte("{not valid json"), 0o644); err != nil {
+					t.Fatal(err)
+				}
+			},
+			want: "unparseable agent record(s) [badc0de1]",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			projectsRoot := withFleetHome(t)
+			root := filepath.Dir(projectsRoot)
+			tc.setup(t, root)
+			stub := &stubFleetCmd{}
+			stub.install(t)
+			st := reconciletest.State{ClaimOK: true}
+			installTUIResolveFromState(t, &st)
+
+			updated, cmd := New("test").beginResolvedCoordAttach("demo", "project")
+			if len(stub.calls) != 0 {
+				t.Fatalf("ListStrict fault must abort before dispatch; calls=%v", stub.calls)
+			}
+			if st.ClaimCalls != 1 || st.ClaimedID != "claimtui" {
+				t.Fatalf("Spawn verdict must pre-claim before fallible cleanup; calls=%d id=%q", st.ClaimCalls, st.ClaimedID)
+			}
+			if updated.flash == nil || !updated.flash.isErr {
+				t.Fatalf("ListStrict fault should flash an error; got %+v", updated.flash)
+			}
+			for _, want := range []string{"orphan cleanup failed", tc.want, "self-heal after its TTL"} {
+				if !strings.Contains(updated.flash.text, want) {
+					t.Fatalf("flash missing %q; got %q", want, updated.flash.text)
+				}
+			}
+			_ = cmd
+		})
 	}
 }
 
