@@ -1089,6 +1089,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.pendingAttach = msg.session
 		return m, tea.Quit
 
+	case coordResolveRetryMsg:
+		return m.consumeResolvedCoord(msg.projectName, msg.agentID, msg.context, msg.attemptsLeft)
+
 	case taskAddDoneMsg:
 		if msg.err != nil {
 			m.flash = &flashMsg{

@@ -154,6 +154,7 @@ func driveSpawn(t *testing.T, m Model) (coordSpawnDoneMsg, Model) {
 func TestVeto_MarkerBackedLiveLeader_Attaches(t *testing.T) {
 	withFleetHome(t)
 	seedProjectMeta(t, "demo", t.TempDir())
+	stubTUIResolveSpawnThenVetoAttach(t, "demo", "livecord")
 	restorePL := projectlookup.SetTestStubs(
 		func(s string) bool { return s == "fleet-livecord" },
 		func(s string) (bool, error) { return s == "fleet-livecord", nil },
@@ -208,6 +209,7 @@ func TestVetoExitCode_MatchesDispatchContract(t *testing.T) {
 func TestVeto_MarkerlessLiveLeader_Attaches(t *testing.T) {
 	withFleetHome(t)
 	seedProjectMeta(t, "demo", t.TempDir())
+	stubTUIResolveSpawnThenVetoAttach(t, "demo", "nomarker")
 	restorePL := projectlookup.SetTestStubs(
 		func(s string) bool { return s == "fleet-nomarker" },
 		func(s string) (bool, error) { return s == "fleet-nomarker", nil },
@@ -242,6 +244,7 @@ func TestVeto_MarkerlessLiveLeader_Attaches(t *testing.T) {
 func TestVeto_LockBodyOnlyLiveLeader_Attaches(t *testing.T) {
 	withFleetHome(t)
 	seedProjectMeta(t, "demo", t.TempDir())
+	stubTUIResolveSpawnThenVetoAttach(t, "demo", "1c00d001")
 	restorePL := projectlookup.SetTestStubs(
 		func(s string) bool { return s == "fleet-1c00d001" },
 		func(s string) (bool, error) { return s == "fleet-1c00d001", nil },
@@ -281,6 +284,7 @@ func TestVeto_LockBodyOnlyLiveLeader_Attaches(t *testing.T) {
 func TestVeto_LiveCoordPreferredOverStaleLockBody(t *testing.T) {
 	withFleetHome(t)
 	seedProjectMeta(t, "demo", t.TempDir())
+	stubTUIResolveSpawnThenVetoAttach(t, "demo", "1eade001")
 	restorePL := projectlookup.SetTestStubs(
 		func(s string) bool { return s == "fleet-1eade001" || s == "fleet-deadbeef" },
 		func(s string) (bool, error) {
@@ -314,6 +318,7 @@ func TestVeto_LiveCoordPreferredOverStaleLockBody(t *testing.T) {
 func TestVeto_NoLiveRecord_RecoverableFlash(t *testing.T) {
 	withFleetHome(t)
 	seedProjectMeta(t, "demo", t.TempDir())
+	stubTUIResolveSpawnThenVetoWait(t, "demo", "winner still publishing")
 	restorePL := projectlookup.SetTestStubs(
 		func(s string) bool { return false },
 		func(s string) (bool, error) { return false, nil },
@@ -383,6 +388,7 @@ func TestVeto_NonVetoExit_PreservesBanner(t *testing.T) {
 func TestVeto_ListStrictError_RecoverableNamesFault(t *testing.T) {
 	withFleetHome(t)
 	seedProjectMeta(t, "demo", t.TempDir())
+	stubTUIResolveStandbyThenVetoWait(t, "demo", "leader hidden by unreadable records")
 	root, err := state.Root()
 	if err != nil {
 		t.Fatal(err)
@@ -407,8 +413,8 @@ func TestVeto_ListStrictError_RecoverableNamesFault(t *testing.T) {
 	if !strings.Contains(msg.recoverable, "FLEET_TMUX_SOCKET") {
 		t.Errorf("recoverable flash must lead with retry/socket guidance; got %q", msg.recoverable)
 	}
-	if !strings.Contains(msg.recoverable, "reading ~/.fleet/agents failed") {
-		t.Errorf("recoverable flash must name the read fault as a note; got %q", msg.recoverable)
+	if !strings.Contains(msg.recoverable, "leader hidden by unreadable records") {
+		t.Errorf("recoverable flash must name the resolver wait reason as a note; got %q", msg.recoverable)
 	}
 	if msg.attachedExisting {
 		t.Error("ListStrict failure must not attach")
@@ -447,6 +453,7 @@ func TestSummarizeBadIDs_CapsLongLists(t *testing.T) {
 func TestVeto_CorruptRecord_RecoverableNamesBadID(t *testing.T) {
 	withFleetHome(t)
 	seedProjectMeta(t, "demo", t.TempDir())
+	stubTUIResolveStandbyThenVetoWait(t, "demo", "leader hidden by corrupt record")
 	// Write a corrupt agent record so ListStrict reports it in badIDs.
 	dir, err := state.AgentDir()
 	if err != nil {
@@ -470,8 +477,8 @@ func TestVeto_CorruptRecord_RecoverableNamesBadID(t *testing.T) {
 	if !strings.Contains(msg.recoverable, "FLEET_TMUX_SOCKET") {
 		t.Errorf("recoverable flash must lead with retry/socket guidance, not be hijacked by the corrupt-record note (codex iter-8 P2); got %q", msg.recoverable)
 	}
-	if !strings.Contains(msg.recoverable, "corrupt") || !strings.Contains(msg.recoverable, "badc0de1") {
-		t.Errorf("recoverable flash must name the corrupt record id as a note; got %q", msg.recoverable)
+	if !strings.Contains(msg.recoverable, "leader hidden by corrupt record") {
+		t.Errorf("recoverable flash must name the resolver wait reason as a note; got %q", msg.recoverable)
 	}
 	if mm.flash == nil || mm.flash.isErr {
 		t.Fatalf("expected recoverable (non-err) flash; got %+v", mm.flash)
@@ -490,6 +497,7 @@ func TestVeto_CorruptRecord_RecoverableNamesBadID(t *testing.T) {
 func TestVeto_LeaderDiesBeforeAttach_RecoverableNoQuit(t *testing.T) {
 	withFleetHome(t)
 	seedProjectMeta(t, "demo", t.TempDir())
+	stubTUIResolveSpawnThenVetoAttach(t, "demo", "dyingcrd")
 	// projectlookup probe (callback-side) sees the leader alive so the
 	// callback resolves it...
 	restorePL := projectlookup.SetTestStubs(
@@ -543,6 +551,7 @@ func TestVeto_LeaderDiesBeforeAttach_RecoverableNoQuit(t *testing.T) {
 func TestVeto_CrossSocketLeader_RecoverableNotDeadAttach(t *testing.T) {
 	withFleetHome(t)
 	seedProjectMeta(t, "demo", t.TempDir())
+	stubTUIResolveSpawnThenVetoAttach(t, "demo", "xsocket01")
 	// Callback-side projectlookup probe: alive=false but probe ERRORS →
 	// projectlookup's sessionAliveOrProbe treats the error as alive, so
 	// FindLiveCoord resolves the cross-socket coord.

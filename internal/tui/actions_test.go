@@ -251,6 +251,7 @@ func TestKeyA_AttachAgent_NotApplicableOnTaskRow(t *testing.T) {
 	pdir := withFleetHome(t)
 	seedTasks(t, pdir, "fleet", TaskCounts{Todo: 1})
 	(&stubSessionAlive{}).install(t)
+	stubTUIResolveAttach(t, "fleet", "c0fdc0ff")
 
 	m := New("test")
 	m.width = 130
@@ -552,6 +553,7 @@ func TestOverlay_DismissedKeyAbsorbed(t *testing.T) {
 // output renders as a "local agent" indicator.
 func TestKeyA_WorkerRow_RoutesToCoordTmux(t *testing.T) {
 	(&stubSessionAlive{}).install(t)
+	stubTUIResolveAttach(t, "fleet", "c0fdc0ff")
 	// findExistingCoordForProject also requires a coord-spawn marker
 	// on disk. Stub the marker so the test doesn't need to seed real
 	// marker files.
@@ -613,6 +615,14 @@ func TestKeyA_WorkerRow_RoutesToCoordTmux(t *testing.T) {
 func TestKeyA_WorkerRow_OrphanFlashesHint(t *testing.T) {
 	(&stubSessionAlive{}).install(t)
 	pdir := withFleetHome(t)
+	seedProjectMeta(t, "fleet", t.TempDir())
+	stubTUIResolveSpawn(t, "fleet")
+	stub := &stubFleetCmd{
+		stubbed: func(args []string) tea.Msg {
+			return coordSpawnDoneMsgFromArgs(args, "agent abcd1234 spawned\n", nil)
+		},
+	}
+	stub.install(t)
 	seedTasks(t, pdir, "fleet", TaskCounts{Todo: 1})
 	seedWorker(t, pdir, "fleet", "orphan-9999", workers.State{
 		Phase: workers.PhaseTDDGreen,
@@ -639,20 +649,17 @@ func TestKeyA_WorkerRow_OrphanFlashesHint(t *testing.T) {
 
 	updated, cmd := m.Update(keyMsg("a"))
 	mm := updated.(Model)
-	if cmd != nil {
-		t.Errorf("[a] on orphan worker should NOT produce a cmd, got non-nil")
+	if cmd == nil {
+		t.Fatalf("[a] on orphan worker should start the project coord")
 	}
 	if mm.pendingAttach != "" {
 		t.Errorf("[a] on orphan worker should not set pendingAttach, got %q", mm.pendingAttach)
 	}
-	if mm.flash == nil || !mm.flash.isErr {
-		t.Fatalf("[a] on orphan worker should flash error, got %+v", mm.flash)
+	if mm.flash == nil || mm.flash.isErr {
+		t.Fatalf("[a] on orphan worker should flash non-error spawn status, got %+v", mm.flash)
 	}
-	if !strings.Contains(mm.flash.text, "no attachable session") {
-		t.Errorf("flash should mention 'no attachable session', got %q", mm.flash.text)
-	}
-	if !strings.Contains(mm.flash.text, "orphan-9999") {
-		t.Errorf("flash should embed worker slug 'orphan-9999', got %q", mm.flash.text)
+	if !strings.Contains(mm.flash.text, "starting coord") {
+		t.Errorf("flash should mention coord start, got %q", mm.flash.text)
 	}
 }
 
@@ -1246,6 +1253,7 @@ func TestRepoRootForCwd_StopsAtHome(t *testing.T) {
 // No dispatch shells out.
 func TestKeyA_ProjectRow_AttachesToExistingFreshCoord(t *testing.T) {
 	(&stubSessionAlive{}).install(t)
+	stubTUIResolveAttach(t, "demo", "coord001")
 	stub := &stubFleetCmd{}
 	stub.install(t)
 
@@ -1293,6 +1301,7 @@ func TestKeyA_ProjectRow_AttachesToExistingFreshCoord(t *testing.T) {
 // a bug.
 func TestKeyA_ProjectRow_CoordIDSetButRecordNotLoaded_FlashesRetry(t *testing.T) {
 	(&stubSessionAlive{}).install(t)
+	stubTUIResolveWait(t, "demo", "coord boot in flight")
 	stub := &stubFleetCmd{}
 	stub.install(t)
 
@@ -1308,17 +1317,14 @@ func TestKeyA_ProjectRow_CoordIDSetButRecordNotLoaded_FlashesRetry(t *testing.T)
 			break
 		}
 	}
-	updated, cmd := m.Update(keyMsg("a"))
+	updated, _ := m.Update(keyMsg("a"))
 	mm := updated.(Model)
 
 	if mm.flash == nil || !mm.flash.isErr {
-		t.Fatalf("expected error flash for refresh-race; got %+v", mm.flash)
+		t.Fatalf("expected error flash for wait budget exhaustion; got %+v", mm.flash)
 	}
-	if !strings.Contains(mm.flash.text, "pending refresh") {
-		t.Errorf("flash should mention 'pending refresh'; got %q", mm.flash.text)
-	}
-	if cmd != nil {
-		t.Error("refresh-race must NOT produce a cmd (no spawn)")
+	if !strings.Contains(mm.flash.text, "still waiting") {
+		t.Errorf("flash should mention wait exhaustion; got %q", mm.flash.text)
 	}
 	if mm.pendingAttach != "" {
 		t.Errorf("pendingAttach must NOT be set; got %q", mm.pendingAttach)
@@ -1339,6 +1345,7 @@ func TestKeyA_ProjectRow_CoordIDSetButRecordNotLoaded_FlashesRetry(t *testing.T)
 func TestKeyA_ProjectRow_DeadCoordSession_ResumesViaDispatch(t *testing.T) {
 	withFleetHome(t)
 	(&stubSessionAlive{dead: map[string]bool{"fleet-coord001": true}}).install(t)
+	stubTUIResolveSpawn(t, "demo")
 	// sessionProbeFn defaults to tmux.SessionAlive; in tests with no
 	// tmux server, it returns alive=false err=nil (definitive dead),
 	// matching the stub above. Pin that explicitly via stubSessionProbe
@@ -1404,14 +1411,12 @@ func TestKeyA_ProjectRow_DeadCoordSession_ResumesViaDispatch(t *testing.T) {
 	if doneMsg.projectName != "demo" {
 		t.Errorf("projectName = %q; want demo", doneMsg.projectName)
 	}
-	// Flash must point at the resume, not at archive — the operator
-	// should know we're picking up where the dead coord left off.
+	// Flash must point at the resolver-driven coord start, not at archive.
 	if mm.flash == nil {
-		t.Fatalf("expected resume flash; got nil")
+		t.Fatalf("expected spawn flash; got nil")
 	}
-	if !strings.Contains(mm.flash.text, "resuming coord") ||
-		!strings.Contains(mm.flash.text, "coord001") {
-		t.Errorf("flash should mention resume + the dead coord id; got %q", mm.flash.text)
+	if !strings.Contains(mm.flash.text, "starting coord") {
+		t.Errorf("flash should mention resolver-driven start; got %q", mm.flash.text)
 	}
 	if strings.Contains(mm.flash.text, "archive") {
 		t.Errorf("flash must NOT suggest archive on the resume path; got %q", mm.flash.text)
@@ -1440,6 +1445,7 @@ func TestKeyA_ProjectRow_DeadCoordSession_RefusesWhenUnresolvable(t *testing.T) 
 	withFleetHome(t)
 	(&stubSessionAlive{dead: map[string]bool{"fleet-coord001": true}}).install(t)
 	(&stubSessionProbe{dead: map[string]bool{"fleet-coord001": true}}).install(t)
+	stubTUIResolveSpawn(t, "demo")
 	stub := &stubFleetCmd{}
 	stub.install(t)
 
@@ -1486,6 +1492,7 @@ func TestKeyA_ProjectRow_DeadCoordSession_ResolverWinsOverRecCwd(t *testing.T) {
 	withFleetHome(t)
 	(&stubSessionAlive{dead: map[string]bool{"fleet-coord001": true}}).install(t)
 	(&stubSessionProbe{dead: map[string]bool{"fleet-coord001": true}}).install(t)
+	stubTUIResolveSpawn(t, "demo")
 
 	stub := &stubFleetCmd{
 		stubbed: func(args []string) tea.Msg {
@@ -1555,6 +1562,7 @@ func TestKeyA_ProjectRow_DeadCoordSession_ResolverWinsOverRecCwd(t *testing.T) {
 // explicit operator action, but it's no longer the default suggestion.
 func TestKeyA_AgentRow_DeadCoordSession_SuggestsResume(t *testing.T) {
 	(&stubSessionAlive{dead: map[string]bool{"fleet-coord001": true}}).install(t)
+	stubTUIResolveWait(t, "demo", "coord boot in flight")
 
 	coord := sampleAgent("coord001")
 	coord.Project = "demo"
@@ -1572,11 +1580,8 @@ func TestKeyA_AgentRow_DeadCoordSession_SuggestsResume(t *testing.T) {
 	if mm.flash == nil || !mm.flash.isErr {
 		t.Fatalf("expected error flash; got %+v", mm.flash)
 	}
-	if !strings.Contains(mm.flash.text, "resume") {
-		t.Errorf("dead-coord flash should suggest resume; got %q", mm.flash.text)
-	}
-	if strings.Contains(mm.flash.text, "[x] to archive") {
-		t.Errorf("dead-coord flash should NOT lead with archive; got %q", mm.flash.text)
+	if !strings.Contains(mm.flash.text, "still waiting") {
+		t.Errorf("dead-coord flash should surface resolve wait; got %q", mm.flash.text)
 	}
 }
 
@@ -1618,6 +1623,7 @@ func TestKeyA_AgentRow_DeadNonCoordSession_StillSuggestsArchive(t *testing.T) {
 func TestKeyA_ProjectRow_DeadCoord_TmuxProbeErrorStaysLive(t *testing.T) {
 	withFleetHome(t)
 	(&stubSessionAlive{dead: map[string]bool{"fleet-coord001": true}}).install(t)
+	stubTUIResolveAttach(t, "demo", "coord001")
 	// HasSession=false (the bare probe), but the tristate probe
 	// reports a transport error — sessionProbeOrAliveFn must keep
 	// the session classed alive and NOT trigger the recovery flow.
@@ -1641,16 +1647,13 @@ func TestKeyA_ProjectRow_DeadCoord_TmuxProbeErrorStaysLive(t *testing.T) {
 		}
 	}
 
-	updated, cmd := m.Update(keyMsg("a"))
+	updated, _ := m.Update(keyMsg("a"))
 	mm := updated.(Model)
-	// With probe-error treated as alive, [a] takes the live-coord
-	// attach branch — pendingAttach is set and tea.Quit fires. No
-	// dispatch shells out.
-	if mm.pendingAttach == "" {
-		t.Errorf("transport-error probe must NOT trigger recovery; pendingAttach should be set for alive path")
+	if mm.pendingAttach != "" {
+		t.Errorf("transport-error probe must not attach; pendingAttach=%q", mm.pendingAttach)
 	}
-	if cmd == nil {
-		t.Fatal("expected tea.Quit cmd on alive-attach path")
+	if mm.flash == nil || !mm.flash.isErr {
+		t.Fatalf("transport-error probe should surface recoverable flash; got %+v", mm.flash)
 	}
 	if len(stub.calls) != 0 {
 		t.Errorf("transport-error must NOT dispatch a recovery spawn; got %d calls (%v)", len(stub.calls), stub.calls)
@@ -2323,6 +2326,7 @@ func TestKeyA_ProjectRow_FindsExistingCoordByTaskID(t *testing.T) {
 	(&stubSessionAlive{}).install(t)
 	(&stubProjectTreeExists{}).install(t)
 	(&stubCoordLeaseIdentity{markers: map[string]string{"demo": "c00bf001"}}).install(t)
+	stubTUIResolveAttach(t, "demo", "c00bf001")
 	stub := &stubFleetCmd{}
 	stub.install(t)
 
@@ -2366,6 +2370,7 @@ func TestKeyA_ProjectRow_AttachesImmediatelyAfterDispatch(t *testing.T) {
 	withFleetHome(t)
 	seedProjectMeta(t, "demo", t.TempDir()) // resolver binds via meta (PR3)
 	(&stubSessionAlive{}).install(t)
+	stubTUIResolveSpawn(t, "demo")
 
 	stub := &stubFleetCmd{
 		stubbed: func(args []string) tea.Msg {
@@ -2416,6 +2421,7 @@ func TestKeyA_ProjectRow_InFlightSpawn_RejectsDuplicate(t *testing.T) {
 	seedProjectMeta(t, "demo", t.TempDir()) // resolver binds via meta (PR3)
 	(&stubSessionAlive{}).install(t)
 	(&stubProjectTreeExists{}).install(t)
+	stubTUIResolveSpawn(t, "demo")
 
 	stub := &stubFleetCmd{
 		stubbed: func(args []string) tea.Msg {
@@ -2558,6 +2564,7 @@ func TestKeyA_ProjectRow_InitErrShowsBanner(t *testing.T) {
 	t.Setenv("FLEET_HOME", notDirPath)
 
 	(&stubSessionAlive{}).install(t)
+	stubTUIResolveSpawn(t, "demo")
 	stub := &stubFleetCmd{}
 	stub.install(t)
 
@@ -2569,17 +2576,14 @@ func TestKeyA_ProjectRow_InitErrShowsBanner(t *testing.T) {
 			break
 		}
 	}
-	updated, cmd := m.Update(keyMsg("a"))
+	updated, _ := m.Update(keyMsg("a"))
 	mm := updated.(Model)
 
 	if mm.flash == nil || !mm.flash.isErr {
 		t.Fatalf("init failure should flash; got %+v", mm.flash)
 	}
-	if !strings.Contains(mm.flash.text, "init failed") {
-		t.Errorf("flash should mention 'init failed'; got %q", mm.flash.text)
-	}
-	if cmd != nil {
-		t.Error("init failure should not produce a cmd")
+	if !strings.Contains(mm.flash.text, "orphan cleanup failed") {
+		t.Errorf("flash should mention orphan cleanup failure; got %q", mm.flash.text)
 	}
 	if len(stub.calls) != 0 {
 		t.Errorf("init failure must NOT shell out to dispatch; got %v", stub.calls)
@@ -2599,6 +2603,7 @@ func TestKeyA_ProjectRow_DeadSessionAfterSpawn_FlashesNoAttach(t *testing.T) {
 	// already dead — claude exited between dispatch returning and the
 	// coordSpawnDoneMsg arriving in Update.
 	(&stubSessionAlive{dead: map[string]bool{"fleet-deadbeef": true}}).install(t)
+	stubTUIResolveSpawn(t, "demo")
 
 	stub := &stubFleetCmd{
 		stubbed: func(args []string) tea.Msg {
@@ -2663,6 +2668,7 @@ func TestKeyA_ProjectRow_DeadSessionAfterSpawn_FlashesNoAttach(t *testing.T) {
 // instead of double-spawning.
 func TestKeyA_ProjectRow_PromptRecoveryDoesNotDuplicateSpawn(t *testing.T) {
 	(&stubSessionAlive{}).install(t)
+	stubTUIResolveAttach(t, "demo", "recovrd1")
 	stub := &stubFleetCmd{}
 	stub.install(t)
 

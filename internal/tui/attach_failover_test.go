@@ -34,6 +34,7 @@ func TestF18_AgentRowDeadCoord_AttachesToLiveCoord(t *testing.T) {
 	// Dead session for the dead-row coord, alive for the successor.
 	(&stubSessionAlive{dead: map[string]bool{"fleet-deadcoor": true}}).install(t)
 	(&stubSessionProbe{dead: map[string]bool{"fleet-deadcoor": true}}).install(t)
+	stubTUIResolveAttach(t, "demo", "1234abcd")
 	// projectlookup has its own seam vars; stub them so FindLiveCoord
 	// reports the successor alive without spinning up a real tmux.
 	restorePL := projectlookup.SetTestStubs(
@@ -99,6 +100,7 @@ func TestF18b_AgentRowDeadCoord_LockBodyFallback_Attaches(t *testing.T) {
 
 	(&stubSessionAlive{dead: map[string]bool{"fleet-deadcoor": true}}).install(t)
 	(&stubSessionProbe{dead: map[string]bool{"fleet-deadcoor": true}}).install(t)
+	stubTUIResolveAttach(t, "demo", "1234abcd")
 	// projectlookup stubs: FindLiveCoord misses (no task-id tag on live);
 	// FindCoordByLockBody finds 1234abcd via the lock body.
 	restorePL := projectlookup.SetTestStubs(
@@ -135,8 +137,8 @@ func TestF18b_AgentRowDeadCoord_LockBodyFallback_Attaches(t *testing.T) {
 	if mm.flash == nil || mm.flash.isErr {
 		t.Fatalf("expected informational flash, got %+v", mm.flash)
 	}
-	if !strings.Contains(mm.flash.text, "lock-body") || !strings.Contains(mm.flash.text, "1234abcd") {
-		t.Errorf("flash should name the lock-body rotation + live coord: %q", mm.flash.text)
+	if !strings.Contains(mm.flash.text, "1234abcd") || !strings.Contains(mm.flash.text, "demo") {
+		t.Errorf("flash should name the lease holder + project: %q", mm.flash.text)
 	}
 }
 
@@ -148,6 +150,7 @@ func TestF18b_AgentRowDeadCoord_LockBodyFallback_Attaches(t *testing.T) {
 func TestF18_AgentRowDeadCoord_NoLiveSuccessor_PreservesArchiveHint(t *testing.T) {
 	(&stubSessionAlive{dead: map[string]bool{"fleet-deadcoor": true}}).install(t)
 	(&stubSessionProbe{dead: map[string]bool{"fleet-deadcoor": true}}).install(t)
+	stubTUIResolveWait(t, "demo", "no live successor")
 	restorePL := projectlookup.SetTestStubs(
 		func(s string) bool { return false },
 		func(s string) (bool, error) { return false, nil },
@@ -166,19 +169,16 @@ func TestF18_AgentRowDeadCoord_NoLiveSuccessor_PreservesArchiveHint(t *testing.T
 		}
 	}
 
-	updated, cmd := m.Update(keyMsg("a"))
+	updated, _ := m.Update(keyMsg("a"))
 	mm := updated.(Model)
 	if mm.pendingAttach != "" {
 		t.Errorf("pendingAttach = %q; want empty (no live successor → no auto-attach)", mm.pendingAttach)
 	}
-	if cmd != nil {
-		t.Errorf("expected no tea.Cmd when no successor; got %v", cmd)
-	}
 	if mm.flash == nil || !mm.flash.isErr {
 		t.Fatalf("expected error flash with archive hint; got %+v", mm.flash)
 	}
-	if !strings.Contains(mm.flash.text, "project") {
-		t.Errorf("flash should redirect to project row; got %q", mm.flash.text)
+	if !strings.Contains(mm.flash.text, "still waiting") {
+		t.Errorf("flash should surface resolve wait; got %q", mm.flash.text)
 	}
 
 	// agent package import keeps the file honest if test changes drop

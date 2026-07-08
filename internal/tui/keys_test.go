@@ -11,6 +11,8 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 
 	"github.com/edisonshen/fleet/internal/agent"
+	"github.com/edisonshen/fleet/internal/coordlock"
+	"github.com/edisonshen/fleet/internal/coordreconcile"
 	"github.com/edisonshen/fleet/internal/workers"
 )
 
@@ -952,6 +954,7 @@ func TestResolveCoordRecord_FallsBackToLockBody(t *testing.T) {
 func TestActionAttachProject_StillResolvesViaSharedHelper(t *testing.T) {
 	(&stubSessionAlive{}).install(t)
 	(&stubProjectTreeExists{}).install(t)
+	stubTUIResolveAttach(t, "demo", "coord001")
 
 	coord := sampleAgent("coord001")
 	coord.Project = "demo"
@@ -979,10 +982,131 @@ type stubSessionAlive struct {
 func (s *stubSessionAlive) install(t *testing.T) {
 	t.Helper()
 	prev := sessionAliveFn
+	prevProbe := sessionProbeFn
 	sessionAliveFn = func(session string) bool {
 		return !s.dead[session]
 	}
-	t.Cleanup(func() { sessionAliveFn = prev })
+	sessionProbeFn = func(session string) (bool, error) {
+		return !s.dead[session], nil
+	}
+	t.Cleanup(func() {
+		sessionAliveFn = prev
+		sessionProbeFn = prevProbe
+	})
+}
+
+func stubTUIResolveAttach(t *testing.T, projectName, ownerID string) {
+	t.Helper()
+	prevResolve := tuiCoordResolveFn
+	prevOwner := tuiCoordCurrentOwnerFn
+	tuiCoordResolveFn = func(project, agentID string) (coordreconcile.Verdict, error) {
+		if project != projectName {
+			return coordreconcile.Verdict{Decision: coordreconcile.Wait, Reason: "test project mismatch"}, nil
+		}
+		return coordreconcile.Verdict{
+			Decision: coordreconcile.Attach,
+			Owner:    coordlock.Owner{AgentID: ownerID, PID: 1},
+			Reason:   "test attach",
+		}, nil
+	}
+	tuiCoordCurrentOwnerFn = func(project string) (coordlock.Owner, bool) {
+		if project != projectName {
+			return coordlock.Owner{}, false
+		}
+		return coordlock.Owner{AgentID: ownerID, PID: 1}, true
+	}
+	t.Cleanup(func() {
+		tuiCoordResolveFn = prevResolve
+		tuiCoordCurrentOwnerFn = prevOwner
+	})
+}
+
+func stubTUIResolveSpawn(t *testing.T, projectName string) {
+	t.Helper()
+	prevResolve := tuiCoordResolveFn
+	tuiCoordResolveFn = func(project, agentID string) (coordreconcile.Verdict, error) {
+		if project != projectName {
+			return coordreconcile.Verdict{Decision: coordreconcile.Wait, Reason: "test project mismatch"}, nil
+		}
+		return coordreconcile.Verdict{Decision: coordreconcile.Spawn, Reason: "test spawn"}, nil
+	}
+	t.Cleanup(func() { tuiCoordResolveFn = prevResolve })
+}
+
+func stubTUIResolveWait(t *testing.T, projectName, reason string) {
+	t.Helper()
+	prevResolve := tuiCoordResolveFn
+	prevAttempts := tuiCoordResolveMaxAttempts
+	tuiCoordResolveFn = func(project, agentID string) (coordreconcile.Verdict, error) {
+		if project != projectName {
+			return coordreconcile.Verdict{Decision: coordreconcile.Wait, Reason: "test project mismatch"}, nil
+		}
+		return coordreconcile.Verdict{Decision: coordreconcile.Wait, Reason: reason}, nil
+	}
+	tuiCoordResolveMaxAttempts = 0
+	t.Cleanup(func() {
+		tuiCoordResolveFn = prevResolve
+		tuiCoordResolveMaxAttempts = prevAttempts
+	})
+}
+
+func stubTUIResolveSpawnThenVetoAttach(t *testing.T, projectName, ownerID string) {
+	t.Helper()
+	prevResolve := tuiCoordResolveFn
+	prevOwner := tuiCoordCurrentOwnerFn
+	tuiCoordResolveFn = func(project, agentID string) (coordreconcile.Verdict, error) {
+		if project != projectName {
+			return coordreconcile.Verdict{Decision: coordreconcile.Wait, Reason: "test project mismatch"}, nil
+		}
+		if agentID == "" {
+			return coordreconcile.Verdict{
+				Decision: coordreconcile.Attach,
+				Owner:    coordlock.Owner{AgentID: ownerID, PID: 1},
+				Reason:   "test veto attach",
+			}, nil
+		}
+		return coordreconcile.Verdict{Decision: coordreconcile.Spawn, Reason: "test spawn"}, nil
+	}
+	tuiCoordCurrentOwnerFn = func(project string) (coordlock.Owner, bool) {
+		if project != projectName {
+			return coordlock.Owner{}, false
+		}
+		return coordlock.Owner{AgentID: ownerID, PID: 1}, true
+	}
+	t.Cleanup(func() {
+		tuiCoordResolveFn = prevResolve
+		tuiCoordCurrentOwnerFn = prevOwner
+	})
+}
+
+func stubTUIResolveSpawnThenVetoWait(t *testing.T, projectName, reason string) {
+	t.Helper()
+	prevResolve := tuiCoordResolveFn
+	tuiCoordResolveFn = func(project, agentID string) (coordreconcile.Verdict, error) {
+		if project != projectName {
+			return coordreconcile.Verdict{Decision: coordreconcile.Wait, Reason: "test project mismatch"}, nil
+		}
+		if agentID == "" {
+			return coordreconcile.Verdict{Decision: coordreconcile.Wait, Reason: reason}, nil
+		}
+		return coordreconcile.Verdict{Decision: coordreconcile.Spawn, Reason: "test spawn"}, nil
+	}
+	t.Cleanup(func() { tuiCoordResolveFn = prevResolve })
+}
+
+func stubTUIResolveStandbyThenVetoWait(t *testing.T, projectName, reason string) {
+	t.Helper()
+	prevResolve := tuiCoordResolveFn
+	tuiCoordResolveFn = func(project, agentID string) (coordreconcile.Verdict, error) {
+		if project != projectName {
+			return coordreconcile.Verdict{Decision: coordreconcile.Wait, Reason: "test project mismatch"}, nil
+		}
+		if agentID == "" {
+			return coordreconcile.Verdict{Decision: coordreconcile.Wait, Reason: reason}, nil
+		}
+		return coordreconcile.Verdict{Decision: coordreconcile.SpawnStandby, Reason: "test standby"}, nil
+	}
+	t.Cleanup(func() { tuiCoordResolveFn = prevResolve })
 }
 
 // stubProjectTreeExists replaces projectTreeExistsFn for tests so we

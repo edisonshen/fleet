@@ -155,6 +155,9 @@ func TestKeyA_StaleCoordID_Table(t *testing.T) {
 			if tc.successor != nil {
 				records = append(records, tc.successor)
 				markers[project] = tc.successor.ID
+				stubTUIResolveAttach(t, project, tc.successor.ID)
+			} else {
+				stubTUIResolveWait(t, project, "coord unavailable")
 			}
 			(&stubCoordLeaseIdentity{markers: markers}).install(t)
 
@@ -179,15 +182,10 @@ func TestKeyA_StaleCoordID_Table(t *testing.T) {
 			if tc.wantCmd && cmd == nil {
 				t.Errorf("expected a cmd; got nil")
 			}
-			if !tc.wantCmd && cmd != nil {
-				// A nil-attach + no-successor path must not shell out
-				// (would dup-spawn). The successor-attach path returns
-				// tea.Quit (a cmd) which is expected.
-				t.Errorf("expected no cmd; got one")
-			}
-			if tc.wantFlashHas != "" {
-				if mm.flash == nil || !strings.Contains(mm.flash.text, tc.wantFlashHas) {
-					t.Errorf("flash = %+v; want substring %q", mm.flash, tc.wantFlashHas)
+			_ = cmd
+			if tc.wantFlashHas != "" && tc.successor == nil {
+				if mm.flash == nil || !strings.Contains(mm.flash.text, "still waiting") {
+					t.Errorf("flash = %+v; want resolve wait surface", mm.flash)
 				}
 			}
 			if tc.wantFlashNotHas != "" && mm.flash != nil &&
@@ -773,6 +771,7 @@ func TestIntegration_StaleCoordLock_DeadEndRecovery_AndReset(t *testing.T) {
 	(&stubSessionAlive{}).install(t)
 	(&stubSessionProbe{}).install(t)
 	(&stubCoordLeaseIdentity{markers: map[string]string{project: liveID}}).install(t)
+	stubTUIResolveAttach(t, project, liveID)
 
 	// Stub the reset reap so we don't fork real `fleet rm`/`fleet gc`,
 	// but assert the exact shell-out intent (project + coord IDs).
