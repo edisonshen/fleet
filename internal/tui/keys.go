@@ -1320,7 +1320,14 @@ func (m Model) actionAttachProject(p *ProjectRow) (Model, tea.Cmd, bool) {
 				text:  fmt.Sprintf("project %s: coord resolver returned %s (%s) — press [a] again", p.Name, verdict.Decision, reason),
 				isErr: true,
 			}
-			return m, nil, true
+			// loadAgentsCmd(), not nil (review-army [maintainability] iter-2):
+			// Decision is a closed 4-value enum so this is unreachable in
+			// practice, but every failure flash on this preflight must honor
+			// the rule startResolvedCoordSpawn already encodes — refresh the
+			// dashboard rather than leaving cmd nil — for defensive
+			// consistency, not because a claim could be abandoned here (no
+			// Resolve call landing in `default` ever reaches ClaimStarting).
+			return m, loadAgentsCmd(), true
 		}
 	}
 	next, cmd := m.beginResolvedCoordAttach(p.Name, "project")

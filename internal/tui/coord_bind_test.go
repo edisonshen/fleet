@@ -125,7 +125,10 @@ func TestAttachProject_RefusesWhenUnresolvable_NoSpawn(t *testing.T) {
 	// refresh and no self-heal note. It is NOT a spawn: `stub.calls` below
 	// is the actual "did we dispatch" assertion.
 	if cmd == nil {
-		t.Error("refused attach should still return the dashboard-refresh cmd")
+		t.Fatal("refused attach should still return the dashboard-refresh cmd")
+	}
+	if msg, ok := cmd().(agentsMsg); !ok {
+		t.Errorf("refused attach cmd produced %T, want agentsMsg (loadAgentsCmd)", msg)
 	}
 	if len(stub.calls) != 0 {
 		t.Errorf("refused attach must NOT shell out; got %v", stub.calls)

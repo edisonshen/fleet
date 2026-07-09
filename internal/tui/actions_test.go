@@ -1473,7 +1473,10 @@ func TestKeyA_ProjectRow_DeadCoordSession_RefusesWhenUnresolvable(t *testing.T) 
 	// comment in TestAttachProject_RefusesWhenUnresolvable_NoSpawn.
 	// `stub.calls` below is the actual "did we dispatch/respawn" check.
 	if cmd == nil {
-		t.Error("dead-session recovery refusal should still return the dashboard-refresh cmd")
+		t.Fatal("dead-session recovery refusal should still return the dashboard-refresh cmd")
+	}
+	if msg, ok := cmd().(agentsMsg); !ok {
+		t.Errorf("dead-session recovery refusal cmd produced %T, want agentsMsg (loadAgentsCmd)", msg)
 	}
 	if len(stub.calls) != 0 {
 		t.Errorf("refused recovery must NOT shell out; got %v", stub.calls)

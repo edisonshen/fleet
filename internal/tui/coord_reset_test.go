@@ -181,6 +181,22 @@ func TestKeyA_StaleCoordID_Table(t *testing.T) {
 			},
 			outcome: "auto-spawn",
 		},
+		{
+			// review-army [testing] iter-2 (2026-07-08): the production
+			// switch at keys.go groups Wait/SpawnStandby/Spawn together,
+			// but SpawnStandby drives a materially different
+			// startResolvedCoordSpawn(standby=true) path (skips the
+			// orphan-tmux-kill step Spawn runs) — pin that a SpawnStandby
+			// verdict reaching THIS entry point still fulfills the claim
+			// via dispatch, not just Spawn.
+			name:     "terminal-stale-wedged-live-starter-spawns-standby",
+			archived: true,
+			verdict: coordreconcile.Verdict{
+				Decision: coordreconcile.SpawnStandby,
+				Reason:   "wedged starting lease superseded; spawn standby behind held flock",
+			},
+			outcome: "auto-spawn",
+		},
 	}
 
 	for _, tc := range tests {
@@ -352,6 +368,85 @@ func TestKeyA_StaleCoordID_Table(t *testing.T) {
 				t.Errorf("[a] non-spawn stale-CoordID paths must not shell out; got %v", stubCmd.calls)
 			}
 		})
+	}
+}
+
+// TestKeyA_StaleCoordID_ResolveErrorSurfacesFlashAndRefresh pins the
+// archived-CoordID preflight's tuiCoordResolveFn error branch (codex 265b
+// review-army [testing], previously untested): when the real-agentID
+// Resolve call itself errors (e.g. a coordlock file I/O failure), the
+// preflight must surface an actionable error flash naming `fleet doctor`
+// AND return the dashboard-refresh cmd (loadAgentsCmd) — never a bare nil
+// cmd or a "[r] to reset" hint (no claim could have been written since
+// Resolve never returned a verdict, but the caller still needs the
+// refresh to pick up any concurrent lease change).
+func TestKeyA_StaleCoordID_ResolveErrorSurfacesFlashAndRefresh(t *testing.T) {
+	withFleetHome(t)
+	const project = "resolveerrproj"
+	const staleID = "bbbb1111"
+	const preallocID = "prea220d"
+	(&stubSessionAlive{}).install(t)
+	(&stubSessionProbe{}).install(t)
+	(&stubCoordArchived{archived: map[string]bool{staleID: true}}).install(t)
+	stubCmd := &stubFleetCmd{}
+	stubCmd.install(t)
+
+	resolveErr := errors.New("coordlock: read epoch: permission denied")
+	resolveCalls := 0
+	prevResolve := tuiCoordResolveFn
+	prevNewID := tuiCoordNewAgentIDFn
+	tuiCoordNewAgentIDFn = func() string { return preallocID }
+	tuiCoordResolveFn = func(gotProject, agentID string) (coordreconcile.Verdict, error) {
+		if gotProject != project || agentID != preallocID {
+			t.Fatalf("Resolve(%q, %q); want (%q, %q)", gotProject, agentID, project, preallocID)
+		}
+		resolveCalls++
+		return coordreconcile.Verdict{}, resolveErr
+	}
+	t.Cleanup(func() {
+		tuiCoordResolveFn = prevResolve
+		tuiCoordNewAgentIDFn = prevNewID
+	})
+
+	m := New("test")
+	m.dashboard = &Snapshot{
+		Projects: []*ProjectRow{{Name: project, CoordID: staleID}},
+	}
+	for i, r := range m.dashboardRows() {
+		if r.kind == rowProject && r.project != nil && r.project.Name == project {
+			m.dashCursor = i
+			break
+		}
+	}
+
+	updated, cmd := m.Update(keyMsg("a"))
+	mm := updated.(Model)
+
+	if resolveCalls != 1 {
+		t.Fatalf("Resolve calls = %d, want 1", resolveCalls)
+	}
+	if cmd == nil {
+		t.Fatal("resolve-error path must still return the dashboard-refresh cmd")
+	}
+	if msg, ok := cmd().(agentsMsg); !ok {
+		t.Fatalf("resolve-error cmd produced %T, want agentsMsg (loadAgentsCmd)", msg)
+	}
+	if mm.pendingAttach != "" {
+		t.Fatalf("pendingAttach = %q; want empty on resolve error", mm.pendingAttach)
+	}
+	if mm.flash == nil || !mm.flash.isErr {
+		t.Fatalf("expected error flash on resolve error, got %+v", mm.flash)
+	}
+	for _, want := range []string{"cannot resolve coord lease", "fleet doctor"} {
+		if !strings.Contains(mm.flash.text, want) {
+			t.Errorf("flash missing %q; got %q", want, mm.flash.text)
+		}
+	}
+	if flashSuggestsReset(mm.flash) {
+		t.Fatalf("resolve-error flash must not suggest [r] reset; got %q", mm.flash.text)
+	}
+	if len(stubCmd.calls) != 0 {
+		t.Errorf("resolve-error path must not shell out; got %v", stubCmd.calls)
 	}
 }
 
