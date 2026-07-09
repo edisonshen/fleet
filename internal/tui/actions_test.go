@@ -1468,8 +1468,15 @@ func TestKeyA_ProjectRow_DeadCoordSession_RefusesWhenUnresolvable(t *testing.T) 
 
 	updated, cmd := m.Update(keyMsg("a"))
 	mm := updated.(Model)
-	if cmd != nil {
-		t.Error("dead-session recovery must NOT respawn when the resolver refuses")
+	// cmd is expected to be loadAgentsCmd() (a read-only dashboard
+	// refresh), not a respawn — codex 265b iter-1 [P1]: see the matching
+	// comment in TestAttachProject_RefusesWhenUnresolvable_NoSpawn.
+	// `stub.calls` below is the actual "did we dispatch/respawn" check.
+	if cmd == nil {
+		t.Fatal("dead-session recovery refusal should still return the dashboard-refresh cmd")
+	}
+	if msg, ok := cmd().(agentsMsg); !ok {
+		t.Errorf("dead-session recovery refusal cmd produced %T, want agentsMsg (loadAgentsCmd)", msg)
 	}
 	if len(stub.calls) != 0 {
 		t.Errorf("refused recovery must NOT shell out; got %v", stub.calls)
@@ -2584,8 +2591,10 @@ func TestKeyA_ProjectRow_InitErrShowsBanner(t *testing.T) {
 	if mm.flash == nil || !mm.flash.isErr {
 		t.Fatalf("init failure should flash; got %+v", mm.flash)
 	}
-	if !strings.Contains(mm.flash.text, "init failed") {
-		t.Errorf("flash should mention init failure; got %q", mm.flash.text)
+	for _, want := range []string{"init failed", "self-heal after its TTL"} {
+		if !strings.Contains(mm.flash.text, want) {
+			t.Errorf("flash missing %q; got %q", want, mm.flash.text)
+		}
 	}
 	if len(stub.calls) != 0 {
 		t.Errorf("init failure must NOT shell out to dispatch; got %v", stub.calls)

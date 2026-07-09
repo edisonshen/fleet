@@ -1226,8 +1226,26 @@ var taskWorkerArchiveExists = func(project, slug string) bool {
 // Resolve and consumes Attach / Wait / Spawn / SpawnStandby. The small
 // CoordID preflight only preserves the dashboard refresh distinction:
 // an unloaded non-archived link is a refresh race, while an archived link
-// gets a read-only Resolve chance to attach a successor before surfacing
-// the [r] reset hint.
+// gets a real pre-allocated Resolve chance so live boot/handoff states
+// return Wait and flow into the bounded retry path instead of surfacing
+// the destructive [r] reset hint.
+//
+// Spawn/SpawnStandby verdicts are routed through the SAME
+// consumeResolvedCoordVerdict auto-spawn path beginResolvedCoordAttach
+// uses (never a manual "[r] to reset" flash): a real agentID Resolve call
+// that lands on Spawn has ALREADY performed the mutating
+// ClaimStartingRecord CAS as a side effect (coordlock has no "release an
+// unfulfilled starting claim" primitive), so showing a flash and
+// dropping the returned Cmd — instead of following through with the
+// spawn that claim exists for — would abandon that claim: the project's
+// lease reads as a phantom "coord boot in flight" to every OTHER
+// resolver call (any [a] press, `fleet attach`, or the [r]-reset flow's
+// own respawn step) for up to the starting-record TTL, self-inflicting
+// exactly the "can't reach a coord" outage this preflight exists to
+// avoid. Fulfilling the claim immediately is the only safe option; it is
+// also explicitly free of the never-kill-a-live-coord invariant this
+// preflight protects, because Spawn/SpawnStandby only fire when Resolve
+// has already proven no live/booting coord exists.
 func (m Model) actionAttachProject(p *ProjectRow) (Model, tea.Cmd, bool) {
 	if p == nil {
 		return m, nil, true
@@ -1262,22 +1280,55 @@ func (m Model) actionAttachProject(p *ProjectRow) (Model, tea.Cmd, bool) {
 			}
 			return m, nil, true
 		}
-		verdict, err := tuiCoordResolveFn(p.Name, "")
-		if err == nil && verdict.Decision == coordreconcile.Attach {
+		agentID := tuiCoordNewAgentIDFn()
+		if agentID == "" {
+			m.flash = &flashMsg{
+				text:  fmt.Sprintf("project %s: could not preallocate coord id — press [a] again", p.Name),
+				isErr: true,
+			}
+			return m, nil, true
+		}
+		verdict, err := tuiCoordResolveFn(p.Name, agentID)
+		if err != nil {
+			m.flash = &flashMsg{
+				text: fmt.Sprintf(
+					"project %s: cannot resolve coord lease (%v) — press [a] again; if it persists run `fleet doctor`",
+					p.Name, err),
+				isErr: true,
+			}
+			return m, loadAgentsCmd(), true
+		}
+		switch verdict.Decision {
+		case coordreconcile.Attach:
 			next, cmd := m.attachResolvedCoordOwner(p.Name, "project", verdict)
 			return next, cmd, true
+		case coordreconcile.Wait, coordreconcile.SpawnStandby, coordreconcile.Spawn:
+			// Spawn must flow through the SAME auto-spawn consumer as
+			// Wait/SpawnStandby (see the func-level comment above): a
+			// real-agentID Resolve landing on Spawn has already claimed
+			// the starting record via ClaimStartingRecord, and there is
+			// no way to release that claim, so it must be fulfilled, not
+			// shown as a manual "[r] to reset" hint.
+			next, cmd := m.consumeResolvedCoordVerdict(p.Name, agentID, "project", tuiCoordResolveMaxAttempts, verdict)
+			return next, cmd, true
+		default:
+			reason := "unknown coord lease decision"
+			if verdict.Reason != "" {
+				reason = verdict.Reason
+			}
+			m.flash = &flashMsg{
+				text:  fmt.Sprintf("project %s: coord resolver returned %s (%s) — press [a] again", p.Name, verdict.Decision, reason),
+				isErr: true,
+			}
+			// loadAgentsCmd(), not nil (review-army [maintainability] iter-2):
+			// Decision is a closed 4-value enum so this is unreachable in
+			// practice, but every failure flash on this preflight must honor
+			// the rule startResolvedCoordSpawn already encodes — refresh the
+			// dashboard rather than leaving cmd nil — for defensive
+			// consistency, not because a claim could be abandoned here (no
+			// Resolve call landing in `default` ever reaches ClaimStarting).
+			return m, loadAgentsCmd(), true
 		}
-		reason := "no successor is attachable"
-		if err != nil {
-			reason = fmt.Sprintf("lease resolve failed: %v", err)
-		} else if verdict.Reason != "" {
-			reason = verdict.Reason
-		}
-		m.flash = &flashMsg{
-			text:  fmt.Sprintf("project %s: coord link %s is stale (%s) — press [r] to reset", p.Name, p.CoordID, reason),
-			isErr: true,
-		}
-		return m, nil, true
 	}
 	next, cmd := m.beginResolvedCoordAttach(p.Name, "project")
 	return next, cmd, true

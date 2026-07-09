@@ -84,6 +84,10 @@ func (m Model) consumeResolvedCoord(projectName, agentID, context string, attemp
 		}
 		return m, loadAgentsCmd()
 	}
+	return m.consumeResolvedCoordVerdict(projectName, agentID, context, attemptsLeft, verdict)
+}
+
+func (m Model) consumeResolvedCoordVerdict(projectName, agentID, context string, attemptsLeft int, verdict coordreconcile.Verdict) (Model, tea.Cmd) {
 	switch verdict.Decision {
 	case coordreconcile.Attach:
 		return m.attachResolvedCoordOwner(projectName, context, verdict)
@@ -179,6 +183,17 @@ func (m Model) attachResolvedCoordOwner(projectName, context string, verdict coo
 	return m, tea.Quit
 }
 
+// startResolvedCoordSpawn dispatches the actual spawn AFTER a Spawn/
+// SpawnStandby verdict has already claimed the starting record (see the
+// actionAttachProject doc comment: that claim has no release primitive).
+// Every early-return branch below therefore leaves an unfulfilled claim
+// behind — self-heal is the ONLY recovery (coordreconcile: a pre-spawn
+// claim, pid unset, becomes claimable again once the starting-record TTL
+// elapses). Every failure flash in this function must say so and return
+// loadAgentsCmd() (never nil) so the dashboard refresh path stays
+// consistent (codex 265b iter-1 [P1]: the init/repo branches used to omit
+// this, matching neither the orphan-cleanup branch above nor the operator's
+// need to know the outage is bounded, not stuck).
 func (m Model) startResolvedCoordSpawn(projectName string, standby bool) (Model, tea.Cmd) {
 	if !standby {
 		if killedID, err := tuiKillCollidingOrphanTmux(projectName); err != nil {
@@ -197,15 +212,22 @@ func (m Model) startResolvedCoordSpawn(projectName string, standby bool) (Model,
 	}
 	if _, err := state.EnsureProjectInitialized(projectName); err != nil {
 		m.flash = &flashMsg{
-			text:  fmt.Sprintf("project %s: init failed: %v", projectName, err),
+			text: fmt.Sprintf(
+				"project %s: init failed: %v — the temporary starting claim will self-heal after its TTL; fix and press [a] again",
+				projectName, err),
 			isErr: true,
 		}
-		return m, nil
+		return m, loadAgentsCmd()
 	}
 	cwd, rerr := coordRepoForProject(projectName)
 	if rerr != nil {
-		m.flash = &flashMsg{text: rerr.Error(), isErr: true}
-		return m, nil
+		m.flash = &flashMsg{
+			text: fmt.Sprintf(
+				"%s — the temporary starting claim will self-heal after its TTL; fix and press [a] again",
+				rerr.Error()),
+			isErr: true,
+		}
+		return m, loadAgentsCmd()
 	}
 	m.setOpInFlight(projectName, coordOpSpawn)
 	if m.flash == nil {

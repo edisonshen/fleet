@@ -6,12 +6,14 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 
 	"github.com/edisonshen/fleet/internal/agent"
 	"github.com/edisonshen/fleet/internal/coordlock"
 	"github.com/edisonshen/fleet/internal/coordreconcile"
+	"github.com/edisonshen/fleet/internal/projects"
 )
 
 // stubCoordArchived replaces coordArchivedFn for tests so we can mark a
@@ -81,6 +83,20 @@ func coordRecord(id, project string) *agent.Record {
 // D3 — stale-CoordID fall-through (actionAttachProject Path 1)
 // ---------------------------------------------------------------------
 
+func buggyArchivedCoordIDPreflightWouldOfferReset(t *testing.T, project string, resolve func(string, string) (coordreconcile.Verdict, error)) bool {
+	t.Helper()
+	verdict, err := resolve(project, "")
+	return err != nil || verdict.Decision != coordreconcile.Attach
+}
+
+func flashSuggestsReset(f *flashMsg) bool {
+	if f == nil {
+		return false
+	}
+	text := strings.ToLower(f.text)
+	return strings.Contains(text, "[r]") || strings.Contains(text, "reset")
+}
+
 // TestKeyA_StaleCoordID_Table is the core regression for the
 // dead-end-recovery root cause (2026-05-28): a coordinator.lock body
 // named an ARCHIVED coord, the dashboard derived CoordID from it, and
@@ -95,19 +111,31 @@ func coordRecord(id, project string) *agent.Record {
 //   - terminal-stale-with-successor: holder archived, a live successor
 //     coord exists → MUST attach to the successor (pendingAttach set),
 //     NOT loop pending-refresh.
-//   - terminal-stale-no-successor: holder archived, no successor → MUST
-//     surface the stale-lock diagnosis + [r] reset hint, NOT pending-
-//     refresh.
+//   - boot/handoff-wait: holder archived, but the lease names a live
+//     in-progress coord → MUST enter the safe [a] retry path with no
+//     destructive [r] hint.
+//   - terminal-stale-no-successor: holder archived, lease genuinely free
+//     (Spawn verdict) → MUST auto-spawn a fresh coord via the SAME
+//     consumer Wait/SpawnStandby use (never a manual "[r] to reset"
+//     hint): the real-agentID Resolve call has ALREADY claimed the
+//     starting record as a side effect (coordreconcile.ClaimStarting),
+//     and coordlock has no way to release an unfulfilled claim, so
+//     showing a hint and dropping the cmd would abandon that claim and
+//     block every other resolve for the project (including the [r]
+//     reset flow's own respawn) for up to the starting-record TTL.
 func TestKeyA_StaleCoordID_Table(t *testing.T) {
 	const project = "demo"
 	const staleID = "129c9824" // the archived holder named in the lock body
 	const liveID = "68c6db50"  // the live successor coord
+	const preallocID = "prea110c"
 
 	tests := []struct {
-		name      string
-		archived  bool
-		successor *agent.Record // loaded into m.records as a coord, if non-nil
-		outcome   string
+		name                    string
+		archived                bool
+		successor               *agent.Record // loaded into m.records as a coord, if non-nil
+		verdict                 coordreconcile.Verdict
+		outcome                 string
+		assertOldWouldShowReset bool
 	}{
 		{
 			name:     "transient-race-keeps-pending-refresh",
@@ -118,12 +146,56 @@ func TestKeyA_StaleCoordID_Table(t *testing.T) {
 			name:      "terminal-stale-with-successor-attaches",
 			archived:  true,
 			successor: coordRecord(liveID, project),
-			outcome:   "attach-successor",
+			verdict: coordreconcile.Verdict{
+				Decision: coordreconcile.Attach,
+				Owner:    coordlock.Owner{AgentID: liveID, PID: 1},
+				Reason:   "successor published",
+			},
+			outcome: "attach-successor",
 		},
 		{
-			name:     "terminal-stale-no-successor-surfaces-reset",
+			name:     "boot-in-flight-waits-without-reset",
 			archived: true,
-			outcome:  "reset-hint",
+			verdict: coordreconcile.Verdict{
+				Decision: coordreconcile.Wait,
+				Reason:   "coord boot in flight (starting within TTL)",
+			},
+			outcome:                 "safe-retry",
+			assertOldWouldShowReset: true,
+		},
+		{
+			name:     "handoff-reservation-waits-without-reset",
+			archived: true,
+			verdict: coordreconcile.Verdict{
+				Decision: coordreconcile.Wait,
+				Reason:   "handoff reservation naming successor succ7788",
+			},
+			outcome: "safe-retry",
+		},
+		{
+			name:     "terminal-stale-no-successor-auto-spawns",
+			archived: true,
+			verdict: coordreconcile.Verdict{
+				Decision: coordreconcile.Spawn,
+				Reason:   "free lease claimed (starting record written)",
+			},
+			outcome: "auto-spawn",
+		},
+		{
+			// review-army [testing] iter-2 (2026-07-08): the production
+			// switch at keys.go groups Wait/SpawnStandby/Spawn together,
+			// but SpawnStandby drives a materially different
+			// startResolvedCoordSpawn(standby=true) path (skips the
+			// orphan-tmux-kill step Spawn runs) — pin that a SpawnStandby
+			// verdict reaching THIS entry point still fulfills the claim
+			// via dispatch, not just Spawn.
+			name:     "terminal-stale-wedged-live-starter-spawns-standby",
+			archived: true,
+			verdict: coordreconcile.Verdict{
+				Decision: coordreconcile.SpawnStandby,
+				Reason:   "wedged starting lease superseded; spawn standby behind held flock",
+			},
+			outcome: "auto-spawn",
 		},
 	}
 
@@ -135,6 +207,18 @@ func TestKeyA_StaleCoordID_Table(t *testing.T) {
 			(&stubCoordArchived{archived: map[string]bool{staleID: tc.archived}}).install(t)
 			stubCmd := &stubFleetCmd{}
 			stubCmd.install(t)
+			// auto-spawn case resolves the coord repo binding via
+			// coordRepoForProject before dispatching; seed project meta
+			// unconditionally (harmless for the other sub-tests, which
+			// never reach that call).
+			if err := projects.Write(project, projects.Meta{
+				Schema:   projects.SchemaVersion,
+				RepoPath: t.TempDir(),
+				AddedAt:  time.Now().UTC(),
+				IsGit:    projects.BoolPtr(false),
+			}); err != nil {
+				t.Fatalf("write project meta: %v", err)
+			}
 
 			var records []*agent.Record
 			if tc.successor != nil {
@@ -143,22 +227,24 @@ func TestKeyA_StaleCoordID_Table(t *testing.T) {
 			resolveCalls := 0
 			prevResolve := tuiCoordResolveFn
 			prevOwner := tuiCoordCurrentOwnerFn
+			prevNewID := tuiCoordNewAgentIDFn
+			prevTick := tuiCoordResolveWaitTickFn
+			tuiCoordNewAgentIDFn = func() string { return preallocID }
+			tuiCoordResolveWaitTickFn = func(d time.Duration, f func(time.Time) tea.Msg) tea.Cmd {
+				return func() tea.Msg { return f(time.Unix(0, 0)) }
+			}
 			tuiCoordResolveFn = func(gotProject, agentID string) (coordreconcile.Verdict, error) {
-				resolveCalls++
 				if gotProject != project {
 					t.Fatalf("Resolve project = %q, want %q", gotProject, project)
 				}
-				if agentID != "" {
-					t.Fatalf("stale CoordID preflight must re-Resolve read-only; agentID=%q", agentID)
+				if agentID == "" {
+					return coordreconcile.Verdict{Decision: coordreconcile.Wait, Reason: "lease free but caller has no id to claim"}, nil
 				}
-				if tc.successor != nil {
-					return coordreconcile.Verdict{
-						Decision: coordreconcile.Attach,
-						Owner:    coordlock.Owner{AgentID: tc.successor.ID, PID: 1},
-						Reason:   "successor published",
-					}, nil
+				resolveCalls++
+				if agentID != preallocID {
+					t.Fatalf("stale CoordID preflight must use preallocated id %q; got %q", preallocID, agentID)
 				}
-				return coordreconcile.Verdict{Decision: coordreconcile.Wait, Reason: "coord unavailable"}, nil
+				return tc.verdict, nil
 			}
 			tuiCoordCurrentOwnerFn = func(string) (coordlock.Owner, bool) {
 				if tc.successor == nil {
@@ -169,7 +255,12 @@ func TestKeyA_StaleCoordID_Table(t *testing.T) {
 			t.Cleanup(func() {
 				tuiCoordResolveFn = prevResolve
 				tuiCoordCurrentOwnerFn = prevOwner
+				tuiCoordNewAgentIDFn = prevNewID
+				tuiCoordResolveWaitTickFn = prevTick
 			})
+			if tc.assertOldWouldShowReset && !buggyArchivedCoordIDPreflightWouldOfferReset(t, project, tuiCoordResolveFn) {
+				t.Fatal("adversarial guard failed: old empty-agentID preflight would not have offered reset")
+			}
 
 			m := New("test")
 			m.records = records
@@ -200,7 +291,7 @@ func TestKeyA_StaleCoordID_Table(t *testing.T) {
 				if mm.flash == nil || !mm.flash.isErr || !strings.Contains(mm.flash.text, "pending refresh") {
 					t.Fatalf("flash = %+v; want pending refresh error", mm.flash)
 				}
-				if strings.Contains(mm.flash.text, "reset") {
+				if flashSuggestsReset(mm.flash) {
 					t.Fatalf("pending-refresh flash must not suggest reset; got %q", mm.flash.text)
 				}
 			case "attach-successor":
@@ -213,30 +304,223 @@ func TestKeyA_StaleCoordID_Table(t *testing.T) {
 				if mm.pendingAttach != "fleet-"+liveID {
 					t.Fatalf("pendingAttach = %q; want fleet-%s", mm.pendingAttach, liveID)
 				}
-			case "reset-hint":
+			case "safe-retry":
 				if resolveCalls != 1 {
-					t.Fatalf("reset path Resolve calls = %d, want 1", resolveCalls)
+					t.Fatalf("safe-retry path Resolve calls = %d, want 1", resolveCalls)
 				}
-				if cmd != nil {
-					t.Fatalf("reset-hint path must not quit or dispatch; cmd=%T", cmd())
+				if cmd == nil {
+					t.Fatal("safe-retry path must return bounded retry tick")
+				}
+				msg, ok := cmd().(coordResolveRetryMsg)
+				if !ok {
+					t.Fatalf("safe-retry cmd produced %T, want coordResolveRetryMsg", cmd())
+				}
+				if msg.projectName != project || msg.agentID != preallocID || msg.context != "project" {
+					t.Fatalf("retry msg = %+v; want project=%q agent=%q context=project", msg, project, preallocID)
 				}
 				if mm.pendingAttach != "" {
-					t.Fatalf("pendingAttach = %q; want empty", mm.pendingAttach)
+					t.Fatalf("pendingAttach = %q; want empty during safe retry", mm.pendingAttach)
 				}
-				if mm.flash == nil || !mm.flash.isErr || !strings.Contains(mm.flash.text, "press [r] to reset") {
-					t.Fatalf("flash = %+v; want press [r] reset hint", mm.flash)
+				if flashSuggestsReset(mm.flash) {
+					t.Fatalf("live Wait flash must not suggest reset; got %q", mm.flash.text)
 				}
-				if strings.Contains(mm.flash.text, "pending refresh") {
-					t.Fatalf("reset flash must not collapse to pending refresh; got %q", mm.flash.text)
+			case "auto-spawn":
+				// A genuinely-free lease (Spawn verdict) must be
+				// fulfilled immediately via the same auto-spawn consumer
+				// Wait/SpawnStandby use — NEVER a manual "[r] to reset"
+				// hint (that would abandon the starting-record claim
+				// Resolve just wrote, see the func-level comment on
+				// actionAttachProject).
+				if resolveCalls != 1 {
+					t.Fatalf("auto-spawn path Resolve calls = %d, want 1", resolveCalls)
+				}
+				if cmd == nil {
+					t.Fatal("auto-spawn path must return a dispatch cmd")
+				}
+				if mm.pendingAttach != "" {
+					t.Fatalf("pendingAttach = %q; want empty (auto-spawn attaches later via coordSpawnDoneMsg)", mm.pendingAttach)
+				}
+				if flashSuggestsReset(mm.flash) {
+					t.Fatalf("auto-spawn flash must not suggest [r] reset; got %+v", mm.flash)
+				}
+				if len(stubCmd.calls) != 1 {
+					t.Fatalf("auto-spawn must shell out exactly once; got %v", stubCmd.calls)
+				}
+				args := stubCmd.calls[0]
+				if len(args) < 2 || args[0] != "dispatch" || args[1] != coordTaskID(project) {
+					t.Fatalf("auto-spawn dispatch args = %v; want dispatch %s ...", args, coordTaskID(project))
+				}
+				foundCoordSpawn := false
+				for _, a := range args {
+					if a == "--coord-spawn" {
+						foundCoordSpawn = true
+					}
+				}
+				if !foundCoordSpawn {
+					t.Fatalf("auto-spawn dispatch args = %v; want --coord-spawn", args)
 				}
 			default:
 				t.Fatalf("unknown outcome %q", tc.outcome)
 			}
-			// Never shell out on these paths (no dispatch).
-			if len(stubCmd.calls) != 0 {
-				t.Errorf("[a] stale-CoordID paths must not shell out; got %v", stubCmd.calls)
+			// The non-spawn stale-CoordID paths must never shell out
+			// (no dispatch) — only "auto-spawn" is expected to.
+			if tc.outcome != "auto-spawn" && len(stubCmd.calls) != 0 {
+				t.Errorf("[a] non-spawn stale-CoordID paths must not shell out; got %v", stubCmd.calls)
 			}
 		})
+	}
+}
+
+// TestKeyA_StaleCoordID_ResolveErrorSurfacesFlashAndRefresh pins the
+// archived-CoordID preflight's tuiCoordResolveFn error branch (codex 265b
+// review-army [testing], previously untested): when the real-agentID
+// Resolve call itself errors (e.g. a coordlock file I/O failure), the
+// preflight must surface an actionable error flash naming `fleet doctor`
+// AND return the dashboard-refresh cmd (loadAgentsCmd) — never a bare nil
+// cmd or a "[r] to reset" hint (no claim could have been written since
+// Resolve never returned a verdict, but the caller still needs the
+// refresh to pick up any concurrent lease change).
+func TestKeyA_StaleCoordID_ResolveErrorSurfacesFlashAndRefresh(t *testing.T) {
+	withFleetHome(t)
+	const project = "resolveerrproj"
+	const staleID = "bbbb1111"
+	const preallocID = "prea220d"
+	(&stubSessionAlive{}).install(t)
+	(&stubSessionProbe{}).install(t)
+	(&stubCoordArchived{archived: map[string]bool{staleID: true}}).install(t)
+	stubCmd := &stubFleetCmd{}
+	stubCmd.install(t)
+
+	resolveErr := errors.New("coordlock: read epoch: permission denied")
+	resolveCalls := 0
+	prevResolve := tuiCoordResolveFn
+	prevNewID := tuiCoordNewAgentIDFn
+	tuiCoordNewAgentIDFn = func() string { return preallocID }
+	tuiCoordResolveFn = func(gotProject, agentID string) (coordreconcile.Verdict, error) {
+		if gotProject != project || agentID != preallocID {
+			t.Fatalf("Resolve(%q, %q); want (%q, %q)", gotProject, agentID, project, preallocID)
+		}
+		resolveCalls++
+		return coordreconcile.Verdict{}, resolveErr
+	}
+	t.Cleanup(func() {
+		tuiCoordResolveFn = prevResolve
+		tuiCoordNewAgentIDFn = prevNewID
+	})
+
+	m := New("test")
+	m.dashboard = &Snapshot{
+		Projects: []*ProjectRow{{Name: project, CoordID: staleID}},
+	}
+	for i, r := range m.dashboardRows() {
+		if r.kind == rowProject && r.project != nil && r.project.Name == project {
+			m.dashCursor = i
+			break
+		}
+	}
+
+	updated, cmd := m.Update(keyMsg("a"))
+	mm := updated.(Model)
+
+	if resolveCalls != 1 {
+		t.Fatalf("Resolve calls = %d, want 1", resolveCalls)
+	}
+	if cmd == nil {
+		t.Fatal("resolve-error path must still return the dashboard-refresh cmd")
+	}
+	if msg, ok := cmd().(agentsMsg); !ok {
+		t.Fatalf("resolve-error cmd produced %T, want agentsMsg (loadAgentsCmd)", msg)
+	}
+	if mm.pendingAttach != "" {
+		t.Fatalf("pendingAttach = %q; want empty on resolve error", mm.pendingAttach)
+	}
+	if mm.flash == nil || !mm.flash.isErr {
+		t.Fatalf("expected error flash on resolve error, got %+v", mm.flash)
+	}
+	for _, want := range []string{"cannot resolve coord lease", "fleet doctor"} {
+		if !strings.Contains(mm.flash.text, want) {
+			t.Errorf("flash missing %q; got %q", want, mm.flash.text)
+		}
+	}
+	if flashSuggestsReset(mm.flash) {
+		t.Fatalf("resolve-error flash must not suggest [r] reset; got %q", mm.flash.text)
+	}
+	if len(stubCmd.calls) != 0 {
+		t.Errorf("resolve-error path must not shell out; got %v", stubCmd.calls)
+	}
+}
+
+// TestKeyA_StaleCoordID_SpawnDecisionNeverAbandonsClaim pins the P1 lease
+// leak fixed alongside the [r]-reset regression: a real-agentID
+// coordreconcile.Resolve call landing on Spawn has ALREADY performed the
+// mutating ClaimStartingRecord CAS as a side effect (coordlock exposes no
+// way to release an unfulfilled starting claim). If actionAttachProject
+// showed a hint and dropped the returned cmd instead of following
+// through with an actual spawn dispatch, that claim would dangle and
+// every other resolver call for the project (any [a] press, `fleet
+// attach`, or even the [r]-reset flow's own respawn step) would
+// misreport "coord boot in flight" for up to the starting-record TTL —
+// self-inflicting exactly the "can't reach a coord" outage this
+// preflight exists to avoid. Exercises the REAL coordreconcile.Resolve
+// (not a stub) so the real coordlock.ClaimStartingRecord side effect is
+// in play, only stubbing the `fleet` shell-out itself.
+func TestKeyA_StaleCoordID_SpawnDecisionNeverAbandonsClaim(t *testing.T) {
+	withFleetHome(t)
+	const project = "leakproj"
+	const staleID = "aaaa0000"
+	(&stubSessionAlive{}).install(t)
+	(&stubSessionProbe{}).install(t)
+	(&stubCoordArchived{archived: map[string]bool{staleID: true}}).install(t)
+	if err := projects.Write(project, projects.Meta{
+		Schema:   projects.SchemaVersion,
+		RepoPath: t.TempDir(),
+		AddedAt:  time.Now().UTC(),
+		IsGit:    projects.BoolPtr(false),
+	}); err != nil {
+		t.Fatalf("write project meta: %v", err)
+	}
+	stubCmd := &stubFleetCmd{}
+	stubCmd.install(t)
+
+	prevResolve := tuiCoordResolveFn
+	tuiCoordResolveFn = func(project, agentID string) (coordreconcile.Verdict, error) {
+		return coordreconcile.Resolve(coordreconcile.DefaultDeps(), project, agentID)
+	}
+	t.Cleanup(func() { tuiCoordResolveFn = prevResolve })
+
+	m := New("test")
+	m.dashboard = &Snapshot{
+		Projects: []*ProjectRow{{Name: project, CoordID: staleID}},
+	}
+	for i, r := range m.dashboardRows() {
+		if r.kind == rowProject && r.project != nil && r.project.Name == project {
+			m.dashCursor = i
+			break
+		}
+	}
+
+	updated, cmd := m.Update(keyMsg("a"))
+	mm := updated.(Model)
+
+	if cmd == nil {
+		t.Fatal("Spawn verdict must return a non-nil cmd — the ClaimStartingRecord claim it just made must be fulfilled, never abandoned")
+	}
+	if len(stubCmd.calls) != 1 {
+		t.Fatalf("Spawn verdict must dispatch exactly once to fulfill its claim; got %v", stubCmd.calls)
+	}
+	if flashSuggestsReset(mm.flash) {
+		t.Fatalf("Spawn verdict flash must not suggest [r] reset (that path is the one that abandons the claim); got %+v", mm.flash)
+	}
+
+	// Sanity: confirm this test really did exercise the mutating
+	// coordlock path (not an accidental no-op) — a second resolve for
+	// the same project must now observe the claim that was written.
+	v2, err := coordreconcile.Resolve(coordreconcile.DefaultDeps(), project, "cccc3333")
+	if err != nil {
+		t.Fatalf("second resolve: %v", err)
+	}
+	if v2.Decision != coordreconcile.Wait || !strings.Contains(v2.Reason, "boot in flight") {
+		t.Fatalf("second resolve = %+v; want Wait/boot-in-flight (proves the real ClaimStartingRecord CAS fired)", v2)
 	}
 }
 
