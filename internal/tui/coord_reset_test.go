@@ -13,6 +13,7 @@ import (
 	"github.com/edisonshen/fleet/internal/agent"
 	"github.com/edisonshen/fleet/internal/coordlock"
 	"github.com/edisonshen/fleet/internal/coordreconcile"
+	"github.com/edisonshen/fleet/internal/projects"
 )
 
 // stubCoordArchived replaces coordArchivedFn for tests so we can mark a
@@ -113,9 +114,15 @@ func flashSuggestsReset(f *flashMsg) bool {
 //   - boot/handoff-wait: holder archived, but the lease names a live
 //     in-progress coord → MUST enter the safe [a] retry path with no
 //     destructive [r] hint.
-//   - terminal-stale-no-successor: holder archived, no successor → MUST
-//     surface the stale-lock diagnosis + [r] reset hint, NOT pending-
-//     refresh.
+//   - terminal-stale-no-successor: holder archived, lease genuinely free
+//     (Spawn verdict) → MUST auto-spawn a fresh coord via the SAME
+//     consumer Wait/SpawnStandby use (never a manual "[r] to reset"
+//     hint): the real-agentID Resolve call has ALREADY claimed the
+//     starting record as a side effect (coordreconcile.ClaimStarting),
+//     and coordlock has no way to release an unfulfilled claim, so
+//     showing a hint and dropping the cmd would abandon that claim and
+//     block every other resolve for the project (including the [r]
+//     reset flow's own respawn) for up to the starting-record TTL.
 func TestKeyA_StaleCoordID_Table(t *testing.T) {
 	const project = "demo"
 	const staleID = "129c9824" // the archived holder named in the lock body
@@ -166,13 +173,13 @@ func TestKeyA_StaleCoordID_Table(t *testing.T) {
 			outcome: "safe-retry",
 		},
 		{
-			name:     "terminal-stale-no-successor-surfaces-reset",
+			name:     "terminal-stale-no-successor-auto-spawns",
 			archived: true,
 			verdict: coordreconcile.Verdict{
 				Decision: coordreconcile.Spawn,
 				Reason:   "free lease claimed (starting record written)",
 			},
-			outcome: "reset-hint",
+			outcome: "auto-spawn",
 		},
 	}
 
@@ -184,6 +191,18 @@ func TestKeyA_StaleCoordID_Table(t *testing.T) {
 			(&stubCoordArchived{archived: map[string]bool{staleID: tc.archived}}).install(t)
 			stubCmd := &stubFleetCmd{}
 			stubCmd.install(t)
+			// auto-spawn case resolves the coord repo binding via
+			// coordRepoForProject before dispatching; seed project meta
+			// unconditionally (harmless for the other sub-tests, which
+			// never reach that call).
+			if err := projects.Write(project, projects.Meta{
+				Schema:   projects.SchemaVersion,
+				RepoPath: t.TempDir(),
+				AddedAt:  time.Now().UTC(),
+				IsGit:    projects.BoolPtr(false),
+			}); err != nil {
+				t.Fatalf("write project meta: %v", err)
+			}
 
 			var records []*agent.Record
 			if tc.successor != nil {
@@ -289,30 +308,124 @@ func TestKeyA_StaleCoordID_Table(t *testing.T) {
 				if flashSuggestsReset(mm.flash) {
 					t.Fatalf("live Wait flash must not suggest reset; got %q", mm.flash.text)
 				}
-			case "reset-hint":
+			case "auto-spawn":
+				// A genuinely-free lease (Spawn verdict) must be
+				// fulfilled immediately via the same auto-spawn consumer
+				// Wait/SpawnStandby use — NEVER a manual "[r] to reset"
+				// hint (that would abandon the starting-record claim
+				// Resolve just wrote, see the func-level comment on
+				// actionAttachProject).
 				if resolveCalls != 1 {
-					t.Fatalf("reset path Resolve calls = %d, want 1", resolveCalls)
+					t.Fatalf("auto-spawn path Resolve calls = %d, want 1", resolveCalls)
 				}
-				if cmd != nil {
-					t.Fatalf("reset-hint path must not quit or dispatch; cmd=%T", cmd())
+				if cmd == nil {
+					t.Fatal("auto-spawn path must return a dispatch cmd")
 				}
 				if mm.pendingAttach != "" {
-					t.Fatalf("pendingAttach = %q; want empty", mm.pendingAttach)
+					t.Fatalf("pendingAttach = %q; want empty (auto-spawn attaches later via coordSpawnDoneMsg)", mm.pendingAttach)
 				}
-				if mm.flash == nil || !mm.flash.isErr || !strings.Contains(mm.flash.text, "press [r] to reset") {
-					t.Fatalf("flash = %+v; want press [r] reset hint", mm.flash)
+				if flashSuggestsReset(mm.flash) {
+					t.Fatalf("auto-spawn flash must not suggest [r] reset; got %+v", mm.flash)
 				}
-				if strings.Contains(mm.flash.text, "pending refresh") {
-					t.Fatalf("reset flash must not collapse to pending refresh; got %q", mm.flash.text)
+				if len(stubCmd.calls) != 1 {
+					t.Fatalf("auto-spawn must shell out exactly once; got %v", stubCmd.calls)
+				}
+				args := stubCmd.calls[0]
+				if len(args) < 2 || args[0] != "dispatch" || args[1] != coordTaskID(project) {
+					t.Fatalf("auto-spawn dispatch args = %v; want dispatch %s ...", args, coordTaskID(project))
+				}
+				foundCoordSpawn := false
+				for _, a := range args {
+					if a == "--coord-spawn" {
+						foundCoordSpawn = true
+					}
+				}
+				if !foundCoordSpawn {
+					t.Fatalf("auto-spawn dispatch args = %v; want --coord-spawn", args)
 				}
 			default:
 				t.Fatalf("unknown outcome %q", tc.outcome)
 			}
-			// Never shell out on these paths (no dispatch).
-			if len(stubCmd.calls) != 0 {
-				t.Errorf("[a] stale-CoordID paths must not shell out; got %v", stubCmd.calls)
+			// The non-spawn stale-CoordID paths must never shell out
+			// (no dispatch) — only "auto-spawn" is expected to.
+			if tc.outcome != "auto-spawn" && len(stubCmd.calls) != 0 {
+				t.Errorf("[a] non-spawn stale-CoordID paths must not shell out; got %v", stubCmd.calls)
 			}
 		})
+	}
+}
+
+// TestKeyA_StaleCoordID_SpawnDecisionNeverAbandonsClaim pins the P1 lease
+// leak fixed alongside the [r]-reset regression: a real-agentID
+// coordreconcile.Resolve call landing on Spawn has ALREADY performed the
+// mutating ClaimStartingRecord CAS as a side effect (coordlock exposes no
+// way to release an unfulfilled starting claim). If actionAttachProject
+// showed a hint and dropped the returned cmd instead of following
+// through with an actual spawn dispatch, that claim would dangle and
+// every other resolver call for the project (any [a] press, `fleet
+// attach`, or even the [r]-reset flow's own respawn step) would
+// misreport "coord boot in flight" for up to the starting-record TTL —
+// self-inflicting exactly the "can't reach a coord" outage this
+// preflight exists to avoid. Exercises the REAL coordreconcile.Resolve
+// (not a stub) so the real coordlock.ClaimStartingRecord side effect is
+// in play, only stubbing the `fleet` shell-out itself.
+func TestKeyA_StaleCoordID_SpawnDecisionNeverAbandonsClaim(t *testing.T) {
+	withFleetHome(t)
+	const project = "leakproj"
+	const staleID = "aaaa0000"
+	(&stubSessionAlive{}).install(t)
+	(&stubSessionProbe{}).install(t)
+	(&stubCoordArchived{archived: map[string]bool{staleID: true}}).install(t)
+	if err := projects.Write(project, projects.Meta{
+		Schema:   projects.SchemaVersion,
+		RepoPath: t.TempDir(),
+		AddedAt:  time.Now().UTC(),
+		IsGit:    projects.BoolPtr(false),
+	}); err != nil {
+		t.Fatalf("write project meta: %v", err)
+	}
+	stubCmd := &stubFleetCmd{}
+	stubCmd.install(t)
+
+	prevResolve := tuiCoordResolveFn
+	tuiCoordResolveFn = func(project, agentID string) (coordreconcile.Verdict, error) {
+		return coordreconcile.Resolve(coordreconcile.DefaultDeps(), project, agentID)
+	}
+	t.Cleanup(func() { tuiCoordResolveFn = prevResolve })
+
+	m := New("test")
+	m.dashboard = &Snapshot{
+		Projects: []*ProjectRow{{Name: project, CoordID: staleID}},
+	}
+	for i, r := range m.dashboardRows() {
+		if r.kind == rowProject && r.project != nil && r.project.Name == project {
+			m.dashCursor = i
+			break
+		}
+	}
+
+	updated, cmd := m.Update(keyMsg("a"))
+	mm := updated.(Model)
+
+	if cmd == nil {
+		t.Fatal("Spawn verdict must return a non-nil cmd — the ClaimStartingRecord claim it just made must be fulfilled, never abandoned")
+	}
+	if len(stubCmd.calls) != 1 {
+		t.Fatalf("Spawn verdict must dispatch exactly once to fulfill its claim; got %v", stubCmd.calls)
+	}
+	if flashSuggestsReset(mm.flash) {
+		t.Fatalf("Spawn verdict flash must not suggest [r] reset (that path is the one that abandons the claim); got %+v", mm.flash)
+	}
+
+	// Sanity: confirm this test really did exercise the mutating
+	// coordlock path (not an accidental no-op) — a second resolve for
+	// the same project must now observe the claim that was written.
+	v2, err := coordreconcile.Resolve(coordreconcile.DefaultDeps(), project, "cccc3333")
+	if err != nil {
+		t.Fatalf("second resolve: %v", err)
+	}
+	if v2.Decision != coordreconcile.Wait || !strings.Contains(v2.Reason, "boot in flight") {
+		t.Fatalf("second resolve = %+v; want Wait/boot-in-flight (proves the real ClaimStartingRecord CAS fired)", v2)
 	}
 }
 
