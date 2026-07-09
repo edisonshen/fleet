@@ -424,6 +424,82 @@ func TestTA11_TUISpawnFailureAfterPreClaimSurfacesSelfHeal(t *testing.T) {
 	}
 }
 
+// TestTA11b_TUISpawnInitFailureAfterPreClaimSurfacesSelfHeal mirrors TA11
+// but for the state.EnsureProjectInitialized failure branch (codex 265b
+// iter-1 [P1]): a Spawn verdict has ALREADY claimed the starting record
+// (no release primitive) before this branch runs, so a silent "init
+// failed" flash with no self-heal note left the operator unable to tell
+// a bounded (TTL-limited) phantom-boot outage from a wedged one.
+func TestTA11b_TUISpawnInitFailureAfterPreClaimSurfacesSelfHeal(t *testing.T) {
+	tmp := t.TempDir()
+	fleetRoot := filepath.Join(tmp, "fleet")
+	t.Setenv("FLEET_HOME", fleetRoot)
+	// agents/ must exist and be readable so tuiKillCollidingOrphanTmux's
+	// agent.ListStrict() falls through cleanly into the init-failure
+	// branch under test (same setup as
+	// TestKeyA_ProjectRow_InitErrShowsBanner in actions_test.go).
+	if err := os.MkdirAll(filepath.Join(fleetRoot, "agents"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// Force state.EnsureProjectInitialized to fail: "projects" exists as a
+	// regular file, not a directory.
+	if err := os.WriteFile(filepath.Join(fleetRoot, "projects"), []byte("not a dir"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	stub := &stubFleetCmd{}
+	stub.install(t)
+	st := reconciletest.State{ClaimOK: true}
+	installTUIResolveFromState(t, &st)
+
+	updated, _ := New("test").beginResolvedCoordAttach("demo", "project")
+	if st.ClaimCalls != 1 || st.ClaimedID != "claimtui" {
+		t.Fatalf("Spawn verdict must pre-claim before the fallible init check; calls=%d id=%q", st.ClaimCalls, st.ClaimedID)
+	}
+	if len(stub.calls) != 0 {
+		t.Fatalf("init failure must not dispatch; calls=%v", stub.calls)
+	}
+	if updated.flash == nil || !updated.flash.isErr {
+		t.Fatalf("init failure should flash error; got %+v", updated.flash)
+	}
+	for _, want := range []string{"init failed", "self-heal after its TTL"} {
+		if !strings.Contains(updated.flash.text, want) {
+			t.Fatalf("flash missing %q; got %q", want, updated.flash.text)
+		}
+	}
+}
+
+// TestTA11c_TUISpawnRepoUnresolvedAfterPreClaimSurfacesSelfHeal mirrors
+// TA11/TA11b for the coordRepoForProject failure branch (codex 265b
+// iter-1 [P1]): an unresolvable repo binding (no project meta) is
+// discovered AFTER the Spawn verdict already claimed the starting record.
+func TestTA11c_TUISpawnRepoUnresolvedAfterPreClaimSurfacesSelfHeal(t *testing.T) {
+	withFleetHome(t)
+	// No seedProjectMeta call: "ghost-project" has no meta.json, so
+	// coordRepoForProject refuses (TestCoordRepoForProject_RefusesWhenUnresolvable
+	// pins the same refusal). state.EnsureProjectInitialized only needs a
+	// writable FLEET_HOME, so it succeeds and control reaches this branch.
+	stub := &stubFleetCmd{}
+	stub.install(t)
+	st := reconciletest.State{ClaimOK: true}
+	installTUIResolveFromState(t, &st)
+
+	updated, _ := New("test").beginResolvedCoordAttach("ghost-project", "project")
+	if st.ClaimCalls != 1 || st.ClaimedID != "claimtui" {
+		t.Fatalf("Spawn verdict must pre-claim before the fallible repo resolve; calls=%d id=%q", st.ClaimCalls, st.ClaimedID)
+	}
+	if len(stub.calls) != 0 {
+		t.Fatalf("repo-unresolved failure must not dispatch; calls=%v", stub.calls)
+	}
+	if updated.flash == nil || !updated.flash.isErr {
+		t.Fatalf("repo-unresolved failure should flash error; got %+v", updated.flash)
+	}
+	for _, want := range []string{"no usable checkout", "self-heal after its TTL"} {
+		if !strings.Contains(updated.flash.text, want) {
+			t.Fatalf("flash missing %q; got %q", want, updated.flash.text)
+		}
+	}
+}
+
 func TestTA12_TUISpawnVetoCallbackReResolvesLease(t *testing.T) {
 	t.Run("Attach holder", func(t *testing.T) {
 		withFleetHome(t)

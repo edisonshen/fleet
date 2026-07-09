@@ -118,8 +118,14 @@ func TestAttachProject_RefusesWhenUnresolvable_NoSpawn(t *testing.T) {
 
 	updated, cmd := m.Update(keyMsg("a"))
 	mm := updated.(Model)
-	if cmd != nil {
-		t.Error("refused attach must NOT produce a spawn cmd")
+	// cmd is expected to be loadAgentsCmd() (a read-only dashboard
+	// refresh) — codex 265b iter-1 [P1]: the coordRepoForProject-failure
+	// branch used to drop the returned cmd (nil) after a Spawn verdict had
+	// already claimed the starting record, leaving the operator with no
+	// refresh and no self-heal note. It is NOT a spawn: `stub.calls` below
+	// is the actual "did we dispatch" assertion.
+	if cmd == nil {
+		t.Error("refused attach should still return the dashboard-refresh cmd")
 	}
 	if len(stub.calls) != 0 {
 		t.Errorf("refused attach must NOT shell out; got %v", stub.calls)
