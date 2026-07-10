@@ -260,19 +260,6 @@ func (l *Lease) tryAcquireOnce() (done, acquired bool, err error) {
 	return true, true, nil
 }
 
-// pidAlive reports whether id's process is the same live process recorded at
-// acquire — pid AND pid_start together (kill(pid,0) alone is PID-reuse-unsafe).
-func (l *Lease) pidAlive(id identity) bool {
-	if id.Pid <= 0 {
-		return false
-	}
-	st, ok := l.cfg.pidStart(id.Pid)
-	if !ok {
-		return false // pid gone
-	}
-	return st == id.PidStart // recycled pid -> start-time mismatch -> dead
-}
-
 // Release drops the flock fd (the kernel also releases it on process death) and
 // emits lease.release. Idempotent. Cleanup-as-last-step: callers
 // `defer lease.Release()` so it runs on every exit path. Under the flock-only

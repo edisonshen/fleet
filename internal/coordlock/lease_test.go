@@ -39,12 +39,6 @@ func (c *fakeClock) now() int64 {
 	return c.ns
 }
 
-func (c *fakeClock) advance(d time.Duration) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.ns += int64(d)
-}
-
 // fakeLiveness models pid -> pid_start for live processes. A pid absent from
 // the map is "dead". The real self pid is always kept live (acquire reads its
 // own pid_start via selfIdentity).
@@ -72,12 +66,6 @@ func (l *fakeLiveness) set(pid int, start int64) {
 	l.live[pid] = start
 }
 
-func (l *fakeLiveness) kill(pid int) {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	delete(l.live, pid)
-}
-
 // testCfg builds a flock-only leaseConfig wired to the fakes. ttl bounds only
 // the dormant StillOwned self-expiry clause; the fake clock controls it, not
 // the wall clock.
@@ -98,14 +86,6 @@ func setupHome(t *testing.T) {
 	if _, err := state.Bootstrap(); err != nil {
 		t.Fatalf("bootstrap: %v", err)
 	}
-}
-
-// holdFlock opens + LOCK_EX-holds coordinator.flock for project via a separate
-// fd, simulating a live holder still owning the flock (empty body). Returns a
-// release func. Thin wrapper over heldFlock(nil).
-func holdFlock(t *testing.T, project string) func() {
-	t.Helper()
-	return heldFlock(t, project, nil)
 }
 
 // heldFlock is the flock-only reader-test primitive: it takes a real LOCK_EX on
