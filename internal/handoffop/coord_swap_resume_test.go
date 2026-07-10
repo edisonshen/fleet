@@ -18,6 +18,7 @@ import (
 // leaseCell is one committed/reserved/free lease configuration.
 type leaseCell struct {
 	owner       string // active lease owner AgentID; "" == no active owner
+	flockLive   bool   // flock HELD by a live process (independent of owner identity readability)
 	handoffSucc string // handoff reservation successor; "" == none
 	oldAlive    bool   // defensive OLD-session probe result
 	oldProbeErr error  // defensive OLD-session probe error
@@ -41,6 +42,11 @@ func (c leaseCell) deps() CoordSwapResumeDeps {
 		},
 		OldSessionAlive: func(string) (bool, error) {
 			return c.oldAlive, c.oldProbeErr
+		},
+		FlockLive: func(string) bool {
+			// A named owner always implies a live flock; flockLive lets a case
+			// model "busy but identity-pending" (owner=="" yet flock IS held).
+			return c.owner != "" || c.flockLive
 		},
 	}
 }
@@ -130,6 +136,20 @@ func TestClassifyCoordSwapResume_Matrix(t *testing.T) {
 			name:       "owner==NEW with stale handoff → refuse (owner wins)",
 			cell:       leaseCell{owner: newID, handoffSucc: newID},
 			wantAction: ResumeRefuse,
+		},
+		{
+			// Review adversarial-subagent finding: CurrentOwner's ok=false covers
+			// BOTH "flock genuinely free" and "flock BUSY with an
+			// identity-pending/torn body" (old-binary straggler, or the narrow
+			// stampFlockBody stamp window) — ClassifyFreeFlockHandoff requires the
+			// caller to have already established the flock is free. A busy-but-
+			// unreadable flock with a leftover journal naming NEW must NOT be
+			// misread as "swap in flight" (telling the caller not to respawn) —
+			// it must fall through to case (3) and respawn; flock-exclusivity is
+			// what actually protects against a duplicate here.
+			name:       "busy/identity-pending with stale handoff → respawn (not wait)",
+			cell:       leaseCell{owner: "", flockLive: true, handoffSucc: newID},
+			wantAction: ResumeRespawn,
 		},
 	}
 

@@ -78,6 +78,17 @@ type CoordSwapResumeDeps struct {
 	// process alive) / abandoned (successor dead). Replaces the deleted epoch
 	// CurrentHandoff reservation. Production: coordlock.ClassifyFreeFlockHandoff.
 	ClassifyHandoff func(project string) (coordlock.HandoffDisposition, coordlock.HandoffJournal, error)
+	// FlockLive reports whether the coordinator flock is currently HELD by a
+	// live process, regardless of whether its body identity is readable.
+	// coordlock.ClassifyFreeFlockHandoff's own contract requires the caller to
+	// have ALREADY established the flock is free before calling it — but
+	// CurrentOwner's ok=false conflates two distinct states (genuinely free,
+	// vs busy with an identity-pending/torn body), so case (2) below must not
+	// infer "free" from !ownerOK alone (review adversarial-subagent finding).
+	// nil defaults to "not free" (the safe direction: falls through to case
+	// (3)'s respawn, which flock-exclusivity stands down on any real
+	// collision — never the reverse).
+	FlockLive func(project string) bool
 	// OldSessionAlive is the DEFENSIVE cross-socket OLD-liveness probe, used
 	// only on the committed (refuse) arm. It NEVER drives a kill — only shapes
 	// the refusal diagnostic.
@@ -92,6 +103,10 @@ func DefaultCoordSwapResumeDeps() CoordSwapResumeDeps {
 		CurrentOwner:    coordlock.CurrentOwner,
 		ClassifyHandoff: coordlock.ClassifyFreeFlockHandoff,
 		OldSessionAlive: tmux.SessionAlive,
+		FlockLive: func(project string) bool {
+			_, ok := coordlock.LiveOwner(project) // ok=true iff busy⇒owner; false ONLY when free.
+			return ok
+		},
 	}
 }
 
@@ -148,7 +163,13 @@ func ClassifyCoordSwapResume(project, oldID, oldSession, newID string, force boo
 	// in-flight (fall through to respawn — flock-exclusivity bounds a duplicate
 	// to one transient stand-down; the alternative, stranding on an unreadable
 	// journal, is worse).
-	if !ownerOK {
+	//
+	// !ownerOK alone is NOT sufficient to establish "flock free" — CurrentOwner
+	// also reports ok=false for a BUSY flock with an identity-pending/torn body
+	// (old-binary straggler, or the narrow stampFlockBody stamp window). Gate
+	// on FlockLive too, so a busy-but-unreadable flock never routes through the
+	// free-flock handoff classifier.
+	if !ownerOK && d.FlockLive != nil && !d.FlockLive(project) {
 		if disp, j, herr := d.ClassifyHandoff(project); herr == nil &&
 			disp == coordlock.HandoffInFlight && j.SuccessorID == newID {
 			return CoordSwapResume{
