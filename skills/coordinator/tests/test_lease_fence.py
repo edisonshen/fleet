@@ -287,111 +287,37 @@ def test_prove_helper_binary_missing_is_unknown(
     assert got == "unknown", "a missing binary must be fail-open, not a fence"
 
 
-# ---------- codex iter-2 [P1]: tick opts into --reacquire; skew degrades ----------
+# ---------- PR-2 D7: the tick proof is a single READ-ONLY flock check ----------
 
 
-def test_prove_helper_passes_reacquire_flag(
+def test_prove_helper_drops_reacquire_flag(
     fleet_home: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The TICK's proof is the only lease-check caller allowed to renew, so
-    its argv must carry --reacquire (fleet-guard's producer fence does not)."""
-    seen: dict = {}
+    """PR-2 (D7) deleted --reacquire: holding the flock IS ownership, so the
+    tick's proof is a single READ-ONLY lease-check with no renew flag. argv must
+    NOT carry --reacquire, and the helper makes exactly ONE subprocess call (no
+    degrade retry loop)."""
+    calls: list = []
 
     def _capture(cmd, **k):
-        seen["argv"] = list(cmd)
+        calls.append(list(cmd))
         return _fake_completed(0)
 
     monkeypatch.setattr(loop.subprocess, "run", _capture)
     got = loop._prove_parent_lease_ownership("fleet", home=fleet_home, fleet_bin="fleet")
     assert got == "owner"
-    assert seen["argv"][-1] == "--reacquire", (
-        f"tick proof must opt into renewal; argv={seen['argv']}"
-    )
+    assert len(calls) == 1, f"tick proof must be a single call, got {calls}"
+    assert "--reacquire" not in calls[0], f"tick proof must not renew; argv={calls[0]}"
 
 
-def test_prove_helper_unknown_flag_degrades_to_readonly(
+def test_prove_helper_exit3_maps_fenced(
     fleet_home: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Mid-vintage binary (has lease-check, predates --reacquire): the helper
-    retries ONCE without the flag — read-only fence semantics, not fail-open,
-    not a wedge."""
-    calls: list = []
-
-    def _skewed(cmd, **k):
-        calls.append(list(cmd))
-        if "--reacquire" in cmd:
-            return _fake_completed(1, "Error: unknown flag: --reacquire")
-        return _fake_completed(0)
-
-    monkeypatch.setattr(loop.subprocess, "run", _skewed)
-    got = loop._prove_parent_lease_ownership("fleet", home=fleet_home, fleet_bin="fleet")
-    assert got == "owner", "the read-only retry's verdict must be used"
-    assert len(calls) == 2, f"exactly one retry without the flag, got {calls}"
-    assert "--reacquire" not in calls[1], f"retry must drop the flag: {calls[1]}"
-
-
-def test_prove_helper_unknown_flag_retry_fence_maps_fenced(
-    fleet_home: Path, monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """The degraded read-only retry still maps exit 3 to fenced."""
-
-    def _skewed(cmd, **k):
-        if "--reacquire" in cmd:
-            return _fake_completed(1, "Error: unknown flag: --reacquire")
-        return _fake_completed(3, "lease-check: REFUSE")
-
-    monkeypatch.setattr(loop.subprocess, "run", _skewed)
-    got = loop._prove_parent_lease_ownership("fleet", home=fleet_home, fleet_bin="fleet")
-    assert got == "fenced"
-
-
-def test_prove_helper_skew_old_active_fence_fails_open(
-    fleet_home: Path, monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    """codex iter-3 [P1]: the degraded (old-binary) retry fencing our OWN
-    expired ACTIVE lease (frozen message, rival-free by construction) must
-    fail OPEN ("unknown") — honoring it would idle the coord until the
-    binary upgrade. Any other exit-3 stays fenced."""
-    old_msg = (
-        "lease-check: REFUSE: coordlock: caller is not under the active "
-        "lease owner (fenced/stale coord) — refuse mutation: our lease is "
-        "no longer active (state=active, possibly self-expired)"
-    )
-
-    def _skewed(cmd, **k):
-        if "--reacquire" in cmd:
-            return _fake_completed(1, "Error: unknown flag: --reacquire")
-        return _fake_completed(3, old_msg)
-
-    monkeypatch.setattr(loop.subprocess, "run", _skewed)
-    got = loop._prove_parent_lease_ownership("fleet", home=fleet_home, fleet_bin="fleet")
-    assert got == "unknown", "old-binary own-expired-ACTIVE fence must fail open"
-    assert "predates --reacquire" in capsys.readouterr().err
-
-    # state=fencing in the old message = possible rival -> stays fenced.
-    fencing_msg = old_msg.replace("state=active", "state=fencing")
-
-    def _skewed2(cmd, **k):
-        if "--reacquire" in cmd:
-            return _fake_completed(1, "Error: unknown flag: --reacquire")
-        return _fake_completed(3, fencing_msg)
-
-    monkeypatch.setattr(loop.subprocess, "run", _skewed2)
-    got = loop._prove_parent_lease_ownership("fleet", home=fleet_home, fleet_bin="fleet")
-    assert got == "fenced", "a possibly-rival old fence must stay fenced"
-
-
-def test_prove_helper_new_binary_exit3_not_treated_as_skew(
-    fleet_home: Path, monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A NEW binary's exit-3 (no degrade) maps to fenced even if the message
-    mentions state=active — the fail-open shim applies ONLY after the
-    unknown-flag downgrade."""
+    """A plain exit-3 (not the flock holder's descendant) maps to fenced — no
+    degrade shim, no fail-open on state=active messages any more."""
     monkeypatch.setattr(
         loop.subprocess, "run",
-        lambda *a, **k: _fake_completed(
-            3, "REFUSE: own-expired-readonly-fenced: state=active possibly self-expired"),
+        lambda *a, **k: _fake_completed(3, "lease-check: REFUSE: different-owner-fenced"),
     )
     got = loop._prove_parent_lease_ownership("fleet", home=fleet_home, fleet_bin="fleet")
     assert got == "fenced"

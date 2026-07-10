@@ -2863,8 +2863,16 @@ def _read_lock_holder(lock_path: Path) -> str:
 
 def _read_coord_lease_identity(
     project: str, *, home: Path, fleet_bin: str = "fleet",
-) -> tuple[str | None, str | None]:
-    """Return (live_owner_id, handoff_successor_id) from the coordinator LEASE.
+) -> tuple[str | None, str | None, bool, bool]:
+    """Return (live_owner_id, handoff_successor_id, present, identity_pending).
+
+    live_owner_id / handoff_successor_id are the lease's two identity slots;
+    present / identity_pending are the D9d flock-state fields: present=true when a
+    live process HOLDS the flock, identity_pending=true when that holder's body is
+    not yet name-readable (old-binary straggler / torn / mid-stamp). Gate 5 uses
+    them to skip a self-exit against a live-but-UNNAMED holder without treating a
+    NAMED different coord as anything but a duplicate.
+
 
     Shells out to ``fleet coord-owner --project <p> --json`` — the read-only
     window onto the lease that REPLACES the deleted coord-spawn marker as the
@@ -2875,27 +2883,27 @@ def _read_coord_lease_identity(
     never self-exit even while a stale predecessor still holds the flock for one
     more tick (``_classify_lock_busy`` gate 5).
 
-    THREE outcomes — the read is tri-state, NOT boolean:
+    THREE outcomes — the read is tri-state, NOT boolean (present/identity_pending
+    are False in the INCONCLUSIVE case):
 
-      ("<id>", "<id>")  CONCLUSIVE: the CLI ran and the lease names these ids
-                        (either field may be "" = that lease slot is genuinely
-                        free). Gate 5 keys on this.
-      ("", "")          CONCLUSIVE-EMPTY: the CLI ran fine and the lease names
-                        NOBODY (free lease / no reservation / unsupported platform).
-      (None, None)      INCONCLUSIVE: the read FAILED — a stale ``FLEET_BIN``
-                        that predates the ``coord-owner`` subcommand (exit!=0,
-                        the #182 stale-binary class fleet's symlinked-skill /
-                        copied-binary split makes reachable), a timeout, empty
+      ("<id>", "<id>", present, pending)  CONCLUSIVE: the CLI ran and the lease
+                        names these ids (either field may be "" = that lease slot
+                        is genuinely free). Gate 5 keys on this.
+      ("", "", False, False)  CONCLUSIVE-EMPTY: the CLI ran fine and the lease
+                        names NOBODY (free lease / no reservation / unsupported).
+      (None, None, False, False)  INCONCLUSIVE: the read FAILED — a stale
+                        ``FLEET_BIN`` that predates the ``coord-owner`` subcommand
+                        (exit!=0, the #182 stale-binary class), a timeout, empty
                         output (the CLI always emits a JSON object on success),
                         or unparseable/non-object JSON.
 
     The old marker was a LOCAL FILE read (no subprocess, never "unavailable").
     Shelling to a possibly-stale binary reintroduces an unavailable path, so the
     caller MUST NOT treat "read failed" as "lease empty": an INCONCLUSIVE result
-    (None, None) means gate 5 cannot prove the successor's identity either way,
-    and self-exiting on an unknowable identity would neuter the mid-handoff guard
-    into an over-eager self-exit (no-auto-kill invariant; D5 "bare mismatch →
-    skip, never exit"). Gate 5 treats (None, None) as skip.
+    (live_owner is None) means gate 5 cannot prove the successor's identity either
+    way, and self-exiting on an unknowable identity would neuter the mid-handoff
+    guard into an over-eager self-exit (no-auto-kill invariant; D5 "bare mismatch →
+    skip, never exit"). Gate 5 treats live_owner=None as skip.
 
     Resolves the binary the same way the lease-check path does (prefer the
     spawn-stamped FLEET_BIN over a bare ``fleet`` on PATH).
@@ -2912,26 +2920,31 @@ def _read_coord_lease_identity(
             timeout=_LEASE_CHECK_TIMEOUT_S, check=False, env=env,
         )
     except (subprocess.TimeoutExpired, OSError):
-        return None, None  # INCONCLUSIVE: binary missing / hung — cannot prove identity
+        return None, None, False, False  # INCONCLUSIVE: binary missing / hung
     if proc.returncode != 0:
         # Binary too old (no `coord-owner` subcommand → exit 1), usage fault, or
         # internal error: INCONCLUSIVE, NOT empty. A stale binary must never let
         # gate 5 self-exit a legit successor (#182 stale-binary class).
-        return None, None
+        return None, None, False, False
     out = (proc.stdout or "").strip()
     if not out:
         # returncode 0 but no output violates the CLI contract (it always emits a
         # JSON object on success) — the read did not really happen. INCONCLUSIVE.
-        return None, None
+        return None, None, False, False
     try:
         data = json.loads(out)
     except (ValueError, TypeError):
-        return None, None  # INCONCLUSIVE: unparseable
+        return None, None, False, False  # INCONCLUSIVE: unparseable
     if not isinstance(data, dict):
-        return None, None  # INCONCLUSIVE: not a JSON object
+        return None, None, False, False  # INCONCLUSIVE: not a JSON object
     live = str(data.get("live_owner_id", "") or "")
     succ = str(data.get("handoff_successor_id", "") or "")
-    return live, succ  # CONCLUSIVE (either field may be "" = that slot is free)
+    # D9d flock-state fields. .get() defaults keep an OLD binary that omits them
+    # safe: present/pending default False, so gate 5 falls through to the normal
+    # named-holder path (no behavior change on a pre-D9d coord-owner).
+    present = bool(data.get("live_owner_present", False))
+    pending = bool(data.get("identity_pending", False))
+    return live, succ, present, pending  # CONCLUSIVE
 
 
 # _coord_lease_identity_fn is the injectable seam _classify_lock_busy calls for
@@ -3079,7 +3092,9 @@ def _classify_lock_busy(
     # WE are the live active owner, or an in-flight handoff reservation names us
     # as the successor (mid-handoff, the stale predecessor still holds the flock
     # for one more tick).
-    live_owner, handoff_succ = _coord_lease_identity_fn(project_dir.name, home=home)
+    live_owner, handoff_succ, present, identity_pending = _coord_lease_identity_fn(
+        project_dir.name, home=home,
+    )
     if live_owner is None:
         # INCONCLUSIVE identity read: the `fleet coord-owner` shell-out failed
         # (stale FLEET_BIN without the subcommand — the #182 class — timeout, or
@@ -3089,9 +3104,19 @@ def _classify_lock_busy(
         # mid-handoff successor. Cannot prove identity → skip, never exit
         # (no-auto-kill invariant; D5 "bare mismatch → skip, never exit").
         return "skip", ""
-    # Fail-soft CONCLUSIVE-empty ("", "") falls through to gate 6.
     if live_owner == coord_id or handoff_succ == coord_id:
         return "skip", ""
+    # D9d: a live-but-UNNAMED flock holder (present && identity_pending, so
+    # live_owner_id="") is NOT provably a different coord — it may be a booting
+    # coord (possibly us) whose body isn't stamped yet, or an old-binary
+    # straggler. Do NOT self-exit against it (that would neuter recovery). This
+    # is DELIBERATELY narrow: a present && !identity_pending holder is a NAMED
+    # different live coord (live_owner_id != coord_id) — the genuine duplicate —
+    # and MUST still fall through to gate 6's self-exit. A blanket "present ⇒
+    # skip" would leave two coords running.
+    if present and identity_pending:
+        return "skip", ""
+    # Fail-soft CONCLUSIVE-empty ("", "") falls through to gate 6.
     # The holder must be a genuinely live coord FOR THIS PROJECT, not a
     # stale lock body, a hijacking same-project worker, or a cross-
     # project agent whose ID leaked into the body (codex review [P2]).
@@ -3185,12 +3210,13 @@ def _lease_check_unknown_command(stderr_text: str) -> bool:
 def _prove_parent_lease_ownership(
     project: str, *, home: Path, fleet_bin: str = "fleet",
 ) -> LeaseCheckResult:
-    """Prove this tick descends from the active coordinator lease owner.
+    """Prove this tick descends from the coordinator FLOCK holder.
 
-    Routes through `fleet lease-check --project <p>` so the epoch re-read +
-    ancestor proof happen in Go (one source of truth). Returns a
-    LeaseCheckResult (a str subclass, so `== "fenced"` still works) whose
-    value is one of:
+    Routes through `fleet lease-check --project <p>` so the flock busy-probe +
+    ppid-to-holder ancestor proof happen in Go (one source of truth; PR-2 D7
+    moved this off the deleted epoch onto the flock, and it is READ-ONLY — there
+    is no `--reacquire` renew any more). Returns a LeaseCheckResult (a str
+    subclass, so `== "fenced"` still works) whose value is one of:
 
       "owner"   — proven owner, OR unsupported platform (no lease in play).
                   The tick may mutate.
@@ -3220,65 +3246,29 @@ def _prove_parent_lease_ownership(
         bin_path = os.environ.get("FLEET_BIN", "") or "fleet"
     env = dict(os.environ)
     env["FLEET_HOME"] = str(home)
-    # --reacquire: the TICK is the coord's liveness signal, so it may renew
-    # an own expired no-rival lease in place (the false-fence fix). Every
-    # other lease-check caller (fleet-guard's per-turn producer fence,
-    # diagnostics) stays read-only — a check must never keep a wedged
-    # coord's lease fresh as a side effect (codex iter-2 [P1]).
-    argv = [bin_path, "lease-check", "--project", project, "--reacquire"]
-    degraded = False
-    for attempt in (0, 1):
-        try:
-            proc = subprocess.run(
-                argv,
-                capture_output=True, text=True,
-                timeout=_LEASE_CHECK_TIMEOUT_S, check=False, env=env,
-            )
-        except subprocess.TimeoutExpired:
-            sys.stderr.write(
-                f"[coord] lease-check for {project!r} timed out "
-                f"(>{_LEASE_CHECK_TIMEOUT_S}s); proceeding without the proof\n"
-            )
-            return LeaseCheckResult("unknown")
-        except OSError:
-            # OSError covers FileNotFoundError (no `fleet` on PATH) AND a
-            # non-executable / permission-denied FLEET_BIN (codex PR4 [P2]).
-            # Lease-check unavailable -> inconclusive; don't wedge the tick
-            # (the coordinator.lock + #171 guard remain the defense).
-            return LeaseCheckResult("unknown")
-        if attempt == 0 and proc.returncode not in (0, _LEASE_CHECK_NOT_OWNER_EXIT):
-            skew = (proc.stderr or proc.stdout or "").lower()
-            if "unknown flag" in skew:
-                # Mid-vintage binary: has `lease-check` but predates
-                # --reacquire. Degrade to the READ-ONLY check (same fence
-                # semantics, no renewal) instead of failing open/closed on
-                # a version skew.
-                argv = argv[:-1]
-                degraded = True
-                continue
-        break
-    if degraded and proc.returncode == _LEASE_CHECK_NOT_OWNER_EXIT:
-        # codex iter-3 [P1]: the OLD binary fences our OWN expired ACTIVE
-        # lease (its pre-reacquire own-ancestor branch; frozen message
-        # "our lease is no longer active (state=active, possibly
-        # self-expired)"). state=active on the own-ancestor branch means NO
-        # rival (any takeover flips the record to fencing first), i.e. the
-        # exact false-fence this design fixes — and with the kill route
-        # deleted, honoring it would skip EVERY tick until the binary is
-        # upgraded (a permanently idle coord holding coordinator.lock).
-        # Fail OPEN loudly instead: proceed un-renewed, exactly pre-lease
-        # behavior. Any other exit-3 (rival takeover, different owner,
-        # released) still fences.
-        skew_detail = proc.stderr or proc.stdout or ""
-        if "possibly self-expired" in skew_detail and "state=active" in skew_detail:
-            sys.stderr.write(
-                f"[coord] lease-check for {project!r}: installed fleet binary "
-                f"predates --reacquire and fenced our own expired ACTIVE "
-                f"(rival-free) lease; proceeding WITHOUT renewal. Upgrade the "
-                f"fleet binary and run `fleet skills status` to clear this "
-                f"skew.\n"
-            )
-            return LeaseCheckResult("unknown")
+    # PR-2 (D7): `--reacquire` is GONE. Holding the flock IS ownership — there is
+    # no epoch to renew, so the tick's ownership proof is a single READ-ONLY
+    # flock ppid-walk (identical to every other lease-check caller). A single
+    # subprocess call, no renew-vs-read degrade loop.
+    argv = [bin_path, "lease-check", "--project", project]
+    try:
+        proc = subprocess.run(
+            argv,
+            capture_output=True, text=True,
+            timeout=_LEASE_CHECK_TIMEOUT_S, check=False, env=env,
+        )
+    except subprocess.TimeoutExpired:
+        sys.stderr.write(
+            f"[coord] lease-check for {project!r} timed out "
+            f"(>{_LEASE_CHECK_TIMEOUT_S}s); proceeding without the proof\n"
+        )
+        return LeaseCheckResult("unknown")
+    except OSError:
+        # OSError covers FileNotFoundError (no `fleet` on PATH) AND a
+        # non-executable / permission-denied FLEET_BIN (codex PR4 [P2]).
+        # Lease-check unavailable -> inconclusive; don't wedge the tick
+        # (the coordinator.lock + #171 guard remain the defense).
+        return LeaseCheckResult("unknown")
     if proc.returncode == 0:
         return LeaseCheckResult("owner")
     if proc.returncode == _LEASE_CHECK_NOT_OWNER_EXIT:

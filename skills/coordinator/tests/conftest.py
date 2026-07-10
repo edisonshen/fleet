@@ -128,7 +128,7 @@ def _stub_coord_lease_identity(monkeypatch):
     import loop
 
     def _no_lease_identity(project, *, home, fleet_bin="fleet"):
-        return "", ""
+        return "", "", False, False
 
     monkeypatch.setattr(loop, "_coord_lease_identity_fn", _no_lease_identity)
 
