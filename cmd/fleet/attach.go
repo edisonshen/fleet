@@ -471,8 +471,18 @@ func resolveAndAttachCoord(token, project string, opts AttachOpts) error {
 			// flock). Recover via the AGENT RECORD instead: FindLiveCoord names a
 			// live coord by project + is_coord + a live tmux session, and we
 			// ATTACH into it (land inside the live session). NEVER a reap.
+			//
+			// Prefer the record that actually matches the flock holder's PID
+			// (coordlock.CurrentActiveOwnerPID reads the body's pid even when its
+			// AgentID is unreadable — that's this exact "identity unreadable"
+			// case) over a bare first-match: a botched non-graceful swap can
+			// leave an ORPHANED OLD record with a still-alive session coexisting
+			// with the real live holder (review adversarial-subagent finding);
+			// without the PID cross-check, landing on whichever record sorts
+			// first could attach into the dead-end orphan instead.
+			holderPID, _ := coordlock.CurrentActiveOwnerPID(project)
 			if records, lerr := agent.List(); lerr == nil {
-				if rec, ok := projectlookup.FindLiveCoord(records, project); ok {
+				if rec, ok := projectlookup.FindLiveCoordPreferPID(records, project, holderPID); ok {
 					session := rec.TmuxSession
 					if session == "" {
 						session = tmux.SessionName(rec.ID)

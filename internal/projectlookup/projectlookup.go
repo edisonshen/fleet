@@ -187,7 +187,30 @@ func KnownProjects() ([]string, error) {
 // TmuxSession set. Callers that assign `pendingAttach = rec.TmuxSession`
 // (notably the TUI F18 path) would otherwise quit with nothing to attach.
 func FindLiveCoord(records []*agent.Record, projectName string) (*agent.Record, bool) {
+	return FindLiveCoordPreferPID(records, projectName, 0)
+}
+
+// FindLiveCoordPreferPID is FindLiveCoord's disambiguation variant for when a
+// SPECIFIC process is already known to be the live flock holder (e.g.
+// attach's D9e bounded-Wait recovery, which has
+// coordlock.CurrentActiveOwnerPID(project) available even when the flock
+// body's AgentID itself is unreadable). Plain FindLiveCoord returns the
+// FIRST project+coord-task+alive-session match in agent.List() order — fine
+// when at most one such record can exist, but the non-graceful swap path
+// (atomic_coord_swap.go) can deliberately leave an ORPHANED OLD record with a
+// still-alive tmux session behind a botched kill (ErrOrphanSurvived /
+// ErrOldKillProbeAmbiguous), coexisting with NEW. Landing on whichever
+// happens to sort first would attach the operator into a dead-end orphan
+// instead of the real live coordinator (review adversarial-subagent finding).
+//
+// preferredPID<=0 (no cross-check available) behaves EXACTLY like
+// FindLiveCoord — scans every candidate and returns the first alive match.
+// preferredPID>0: return the candidate whose SupervisorPID matches it, if
+// any does; otherwise fall back to the first-match behavior (never worse
+// than today).
+func FindLiveCoordPreferPID(records []*agent.Record, projectName string, preferredPID int) (*agent.Record, bool) {
 	want := CoordTaskID(projectName)
+	var first *agent.Record
 	for _, r := range records {
 		if r == nil || r.TaskID != want || r.Project != projectName {
 			continue
@@ -199,12 +222,21 @@ func FindLiveCoord(records []*agent.Record, projectName string) (*agent.Record, 
 		if !sessionAliveOrProbe(session) {
 			continue
 		}
+		cand := r
 		if r.TmuxSession == "" {
 			cp := *r
 			cp.TmuxSession = session
-			return &cp, true
+			cand = &cp
 		}
-		return r, true
+		if preferredPID > 0 && cand.SupervisorPID == preferredPID {
+			return cand, true
+		}
+		if first == nil {
+			first = cand
+		}
+	}
+	if first != nil {
+		return first, true
 	}
 	return nil, false
 }
