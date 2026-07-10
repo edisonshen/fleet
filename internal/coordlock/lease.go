@@ -1676,15 +1676,19 @@ func (t LeaseToken) StillOwned() bool {
 // ownership readers probe the flock with LOCK_SH and, when busy, read this
 // body for the owner's agent_id + pid. AgentID + Project were added in PR-1
 // (D2). A holder whose pid is dead / from another boot marks a holder hung
-// in the acquire-to-epoch window, recoverable via takeover
-// (flockHolderRecoverable). Mono is retained for schema stability but is no
-// longer read for a TTL decision (PR-1 D4 deleted that clause — a live
-// same-boot holder is never "recoverable" on staleness). Best-effort: flock
-// exclusion is kernel-enforced; the body is only for identity, never the lock.
+// in the acquire-to-epoch window, recoverable via takeover. PR-1 D4 removed the
+// TTL clause from the ACQUIRE-path flockHolderRecoverable only (a live same-boot
+// holder is never "recoverable" on staleness there), but Mono is STILL read for
+// a TTL decision by the retained flockHolderRecoverableTTL helper — the deferred
+// LeaderPresent reader's epoch-missing fallback (byte-for-byte unchanged in PR-1;
+// PR-2 deletes it). So Mono must NOT be dropped from this schema until PR-2.
+// Best-effort: flock exclusion is kernel-enforced; the body is only for identity,
+// never the lock.
 //
 // Of the two fields PR-1 added, AgentID is the read identity (flockBodyOwner);
 // Project is stamped but not yet read here — retained for schema completeness /
-// diagnostics and a future cross-project reader, write-only in PR-1 like Mono.
+// diagnostics and a future cross-project reader (write-only in PR-1, unlike Mono
+// which flockHolderRecoverableTTL still reads).
 type flockBody struct {
 	Pid      int    `json:"pid"`
 	PidStart int64  `json:"pid_start"`

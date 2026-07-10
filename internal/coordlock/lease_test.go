@@ -475,6 +475,54 @@ func TestFlockOwner_ReleasedButAliveIsFree(t *testing.T) {
 	}
 }
 
+// TestFlockOwner_SharedProbesCoexist is the regression test for D1's "load-
+// bearing" LOCK_SH choice — the OTHER half of the LOCK_SH rationale from
+// TestFlockOwner_ReleasedButAliveIsFree (which covers the released-but-alive
+// half). The probe uses a SHARED lock so concurrent readers coexist and never
+// make each other misread "busy". On a FREE flock, N readers probing at once
+// must ALL read owner=false: with LOCK_SH they all acquire the shared lock
+// together; a regression to an EXCLUSIVE probe (LOCK_EX) would let one reader
+// win and the rest see EWOULDBLOCK ⇒ false-positive owner=true on a free flock
+// (a spawn-gate misread). A start barrier maximizes overlap so a LOCK_EX
+// regression trips. Deterministic for the correct impl (always all-false); no
+// time.Sleep.
+func TestFlockOwner_SharedProbesCoexist(t *testing.T) {
+	setupHome(t)
+	const project = "flock-shared-probes"
+	paths, err := resolvePaths(project)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Dir(paths.flock), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// Create the flock file but do NOT hold it -> free.
+	if err := os.WriteFile(paths.flock, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	const readers = 16
+	for round := 0; round < 8; round++ {
+		start := make(chan struct{})
+		var wg sync.WaitGroup
+		var busyCount atomic.Int32
+		for i := 0; i < readers; i++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				<-start // barrier: all readers probe simultaneously
+				if _, present := flockBodyOwner(project); present {
+					busyCount.Add(1)
+				}
+			}()
+		}
+		close(start)
+		wg.Wait()
+		if n := busyCount.Load(); n != 0 {
+			t.Fatalf("round %d: %d/%d concurrent readers misread a FREE flock as busy (LOCK_SH regression?)", round, n, readers)
+		}
+	}
+}
+
 // TestLeaderPresent (codex PR2 iter-11 [P2]): LeaderPresent is a DEFERRED reader
 // in PR-1 — it stays EPOCH-based (repointed onto the flock in PR-2 with its
 // drain/gc consumer rework). This test pins its unchanged epoch behavior: it
