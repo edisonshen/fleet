@@ -7,19 +7,7 @@ import (
 	"github.com/edisonshen/fleet/internal/coordlock"
 	"github.com/edisonshen/fleet/internal/coordreconcile"
 	"github.com/edisonshen/fleet/internal/coordreconcile/reconciletest"
-	"github.com/edisonshen/fleet/internal/state"
 )
-
-// setupReconcileHome points FLEET_HOME at a temp dir + bootstraps it so the real
-// coordlock lease primitives (AcquireLease / the flock readers) resolve a
-// per-project .locks dir. Used by the integration test below.
-func setupReconcileHome(t *testing.T) {
-	t.Helper()
-	t.Setenv("FLEET_HOME", t.TempDir())
-	if _, err := state.Bootstrap(); err != nil {
-		t.Fatalf("bootstrap: %v", err)
-	}
-}
 
 func TestResolveMatrix(t *testing.T) {
 	const project = "projects-fleet"
@@ -159,58 +147,7 @@ func TestResolveOrdering(t *testing.T) {
 	}
 }
 
-// TestResolve_RealFlockReaders is the flock-only INTEGRATION test: it drives
-// coordreconcile.Resolve with the REAL coordlock readers (DefaultDeps) against a
-// REAL held flock (via coordlock.AcquireLease), crossing the
-// coordlock→coordreconcile boundary the unit table fakes. Covers T1 (busy coord
-// with identity ⇒ Attach; freed ⇒ Spawn) and T13 (identity-less body ⇒ Wait).
-func TestResolve_RealFlockReaders(t *testing.T) {
-	t.Run("T1_busy_coord_with_identity_attaches_then_freed_spawns", func(t *testing.T) {
-		setupReconcileHome(t)
-		const project = "resolve-integ-attach"
-		lease, acquired, err := coordlock.AcquireLease(project, "holder01")
-		if err != nil || !acquired {
-			t.Fatalf("AcquireLease: acquired=%v err=%v", acquired, err)
-		}
-		t.Cleanup(lease.Release)
-
-		// Busy flock with a stamped identity ⇒ Attach — never spawn beside it
-		// (the incident regression), even though the epoch is only `starting`.
-		v, err := coordreconcile.Resolve(coordreconcile.DefaultDeps(), project, "newcaller")
-		if err != nil {
-			t.Fatalf("Resolve: %v", err)
-		}
-		if v.Decision != coordreconcile.Attach || v.Owner.AgentID != "holder01" {
-			t.Fatalf("busy coord ⇒ Attach holder01; got %s owner=%q", v.Decision, v.Owner.AgentID)
-		}
-
-		// Release frees the flock ⇒ a fresh Resolve now Spawns.
-		lease.Release()
-		v, err = coordreconcile.Resolve(coordreconcile.DefaultDeps(), project, "newcaller")
-		if err != nil {
-			t.Fatalf("Resolve after release: %v", err)
-		}
-		if v.Decision != coordreconcile.Spawn {
-			t.Fatalf("freed lease ⇒ Spawn; got %s (reason=%q)", v.Decision, v.Reason)
-		}
-	})
-
-	t.Run("T13_identity_less_flock_waits", func(t *testing.T) {
-		setupReconcileHome(t)
-		const project = "resolve-integ-wait"
-		// An empty agentID stamps an identity-less body (the old-binary / torn
-		// body case) — the flock is held but names no agent.
-		lease, acquired, err := coordlock.AcquireLease(project, "")
-		if err != nil || !acquired {
-			t.Fatalf("AcquireLease: acquired=%v err=%v", acquired, err)
-		}
-		t.Cleanup(lease.Release)
-		v, err := coordreconcile.Resolve(coordreconcile.DefaultDeps(), project, "newcaller")
-		if err != nil {
-			t.Fatalf("Resolve: %v", err)
-		}
-		if v.Decision != coordreconcile.Wait {
-			t.Fatalf("flock held with identity-less body ⇒ Wait; got %s owner=%q", v.Decision, v.Owner.AgentID)
-		}
-	})
-}
+// TestResolve_RealFlockReaders (the flock-only INTEGRATION test driving the
+// REAL coordlock.AcquireLease) moved to coordreconcile_unix_test.go
+// (//go:build linux || darwin) — codex PR2-review iter-2 [P2]: AcquireLease
+// is itself gated to those GOOS values, so it doesn't compile here.
