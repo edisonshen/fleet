@@ -268,19 +268,22 @@ func TestFindLiveCoordPreferPID_PicksMatchingSupervisor(t *testing.T) {
 	}
 }
 
-// TestFindLiveCoordPreferPID_NoMatchFallsBackToFirst — a preferredPID that
-// matches no candidate's SupervisorPID (or preferredPID<=0, the "no
-// cross-check available" case) must still return the first-match — never
-// worse than plain FindLiveCoord.
-func TestFindLiveCoordPreferPID_NoMatchFallsBackToFirst(t *testing.T) {
+// TestFindLiveCoordPreferPID_NoMatchIsStrict — a preferredPID>0 that matches
+// no candidate's SupervisorPID must return ok=false (codex confirm round
+// [P2]: a confirmed PID is real evidence and must never degrade into a
+// guess at an unrelated record — that reproduces the exact orphan-attach
+// hazard this function exists to close). preferredPID<=0 (no cross-check
+// available) is the one case that still falls back to first-match —
+// identical to plain FindLiveCoord.
+func TestFindLiveCoordPreferPID_NoMatchIsStrict(t *testing.T) {
 	withFleetHome(t)
 	writeAgentRec(t, "aaaaaaaa", "fleet", "coord-fleet")
 	records := recordsFromList(t)
 	restore := stubSessionAlive(t, map[string]bool{"fleet-aaaaaaaa": true})
 	defer restore()
 
-	if got, ok := FindLiveCoordPreferPID(records, "fleet", 999999); !ok || got.ID != "aaaaaaaa" {
-		t.Fatalf("FindLiveCoordPreferPID with no matching PID = %v ok=%v, want aaaaaaaa (fallback)", got, ok)
+	if got, ok := FindLiveCoordPreferPID(records, "fleet", 999999); ok {
+		t.Fatalf("FindLiveCoordPreferPID with no matching PID = %v ok=%v, want ok=false (no guessing)", got, ok)
 	}
 	if got, ok := FindLiveCoordPreferPID(records, "fleet", 0); !ok || got.ID != "aaaaaaaa" {
 		t.Fatalf("FindLiveCoordPreferPID with preferredPID<=0 = %v ok=%v, want aaaaaaaa (identical to FindLiveCoord)", got, ok)

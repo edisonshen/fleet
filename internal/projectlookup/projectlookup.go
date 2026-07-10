@@ -205,9 +205,14 @@ func FindLiveCoord(records []*agent.Record, projectName string) (*agent.Record, 
 //
 // preferredPID<=0 (no cross-check available) behaves EXACTLY like
 // FindLiveCoord — scans every candidate and returns the first alive match.
-// preferredPID>0: return the candidate whose SupervisorPID matches it, if
-// any does; otherwise fall back to the first-match behavior (never worse
-// than today).
+// preferredPID>0: a known PID is real evidence, so it is trusted STRICTLY —
+// return the candidate whose SupervisorPID matches it, or ok=false if none
+// does. It does NOT fall back to a first-match guess (codex confirm round
+// [P2]): a confirmed flock-holder PID with no matching record means no
+// record on disk can be trusted as that holder, so guessing at an unrelated
+// project-matching record would reproduce the exact orphan-attach hazard
+// this function exists to prevent. The caller surfaces "not attachable"
+// instead.
 func FindLiveCoordPreferPID(records []*agent.Record, projectName string, preferredPID int) (*agent.Record, bool) {
 	want := CoordTaskID(projectName)
 	var first *agent.Record
@@ -228,12 +233,18 @@ func FindLiveCoordPreferPID(records []*agent.Record, projectName string, preferr
 			cp.TmuxSession = session
 			cand = &cp
 		}
-		if preferredPID > 0 && cand.SupervisorPID == preferredPID {
-			return cand, true
+		if preferredPID > 0 {
+			if cand.SupervisorPID == preferredPID {
+				return cand, true
+			}
+			continue // a confirmed PID demands an exact match, never a guess
 		}
 		if first == nil {
 			first = cand
 		}
+	}
+	if preferredPID > 0 {
+		return nil, false // no candidate matched the confirmed holder PID
 	}
 	if first != nil {
 		return first, true

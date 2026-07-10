@@ -81,10 +81,23 @@ func installD9eStubs(t *testing.T, aliveSessions map[string]bool) *int {
 
 func writeD9eRecord(t *testing.T, id, project string) {
 	t.Helper()
+	writeD9eRecordWithPID(t, id, project, 0)
+}
+
+// writeD9eRecordWithPID writes a coord-tagged record for id/project, also
+// stamping SupervisorPID so FindLiveCoordPreferPID's strict PID match (codex
+// confirm round [P2] #3) can recognize it as the confirmed flock holder's
+// record. pid<=0 leaves SupervisorPID unset (the "unrelated orphan record"
+// shape most D9e tests want).
+func writeD9eRecordWithPID(t *testing.T, id, project string, pid int) {
+	t.Helper()
 	r := agent.New(id)
 	r.Project = project
 	r.TaskID = projectlookup.CoordTaskID(project)
 	r.TmuxSession = "fleet-" + id
+	if pid > 0 {
+		r.SupervisorPID = pid
+	}
 	if err := r.Write(); err != nil {
 		t.Fatalf("write agent record %s: %v", id, err)
 	}
@@ -209,7 +222,11 @@ func TestResolveAndAttachCoord_D9e_BusyFlock_UsesRecordFallback(t *testing.T) {
 	}
 	t.Cleanup(lease.Release)
 
-	writeD9eRecord(t, "realholder", project)
+	// AcquireLease stamps THIS test process's real pid into the flock body
+	// (no subprocess involved) — the record must carry that SAME pid as its
+	// SupervisorPID to be recognized as the confirmed holder's record under
+	// the strict PID match (codex confirm round [P2] #3).
+	writeD9eRecordWithPID(t, "realholder", project, os.Getpid())
 	attachCalls := installD9eStubs(t, map[string]bool{"fleet-realholder": true})
 
 	err := resolveAndAttachCoord("tok", project, AttachOpts{ResolveMaxAttempts: 1, Stderr: &bytes.Buffer{}})
@@ -218,5 +235,48 @@ func TestResolveAndAttachCoord_D9e_BusyFlock_UsesRecordFallback(t *testing.T) {
 	}
 	if *attachCalls != 1 {
 		t.Fatalf("attachFnVar called %d times; want exactly 1 (attach into the real flock holder's record)", *attachCalls)
+	}
+}
+
+// TestResolveAndAttachCoord_D9e_KnownPID_NoMatchingRecord_SkipsRecordFallback
+// is the THIRD codex confirm-round [P2]: a CONFIRMED holder PID (the flock
+// is genuinely busy, identity readable) with NO on-disk record claiming that
+// SupervisorPID must still refuse to guess — even when an unrelated, alive,
+// project-matching orphan record exists. FindLiveCoordPreferPID must return
+// ok=false rather than degrading into a first-match guess.
+func TestResolveAndAttachCoord_D9e_KnownPID_NoMatchingRecord_SkipsRecordFallback(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("FLEET_HOME", tmp)
+	if _, err := state.Bootstrap(); err != nil {
+		t.Fatalf("Bootstrap: %v", err)
+	}
+	const project = "d9e-nomatch"
+	if _, err := state.EnsureProjectInitialized(project); err != nil {
+		t.Fatalf("EnsureProjectInitialized: %v", err)
+	}
+
+	// A REAL held flock naming a specific holder identity ("realholder2") —
+	// CurrentActiveOwnerPID will report THIS process's pid.
+	lease, acquired, lerr := coordlock.AcquireLease(project, "realholder2")
+	if lerr != nil || !acquired || lease == nil {
+		t.Fatalf("AcquireLease: acquired=%v err=%v", acquired, lerr)
+	}
+	t.Cleanup(lease.Release)
+
+	// Deliberately do NOT write a record for "realholder2" — the true holder
+	// has no matching on-disk record. Only an UNRELATED orphan record exists
+	// for the project, which a first-match guess would wrongly pick.
+	writeD9eRecord(t, "unrelatedorphan", project)
+	attachCalls := installD9eStubs(t, map[string]bool{"fleet-unrelatedorphan": true})
+
+	err := resolveAndAttachCoord("tok", project, AttachOpts{ResolveMaxAttempts: 1, Stderr: &bytes.Buffer{}})
+	if err == nil {
+		t.Fatal("resolveAndAttachCoord: err=nil, want the bounded-wait-exhausted diagnostic")
+	}
+	if *attachCalls != 0 {
+		t.Fatalf("attachFnVar called %d times; want 0 — a confirmed PID with no matching record must never fall back to an unrelated orphan", *attachCalls)
+	}
+	if got := err.Error(); !strings.Contains(got, "no live coord record is derivable") {
+		t.Fatalf("error = %q, want the \"no live coord record is derivable\" diagnostic", got)
 	}
 }
