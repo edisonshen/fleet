@@ -2307,25 +2307,42 @@ func TestReleaseSurfacesDemoteFaultOnCorruptEpoch(t *testing.T) {
 	}
 }
 
-// TestLeaseRecordActive (flock-only): a live lease generation exists iff a live
-// process HOLDS the flock (busy⇒owner), regardless of agent_id or any epoch
-// state. Delivery keeps a doc pending while a coord holds the flock and
-// direct-sends (legacy fallback) only when the flock is genuinely FREE.
+// TestLeaseRecordActive: a live lease generation exists iff a live process HOLDS
+// the flock (busy⇒owner) OR the epoch records a non-terminal generation whose
+// flock is momentarily FREE (PR-1 transitional bridge — a ClaimStartingRecord
+// starting pre-acquire / a fencing takeover gap). Delivery keeps a doc pending
+// for the eventual owner in all those cases; only a genuinely free flock with no
+// (or a terminal) epoch record is a bare coord (direct-send).
 func TestLeaseRecordActive(t *testing.T) {
 	setupHome(t)
 	const project = "lra-test"
 
 	if LeaseRecordActive(project) {
-		t.Fatal("no flock -> LeaseRecordActive should be false")
+		t.Fatal("no flock, no epoch -> LeaseRecordActive should be false")
 	}
 	// Busy flock, even with an identity-less body -> a real lease generation.
 	rel := heldFlock(t, project, nil)
 	if !LeaseRecordActive(project) {
 		t.Fatal("busy flock -> LeaseRecordActive should be true")
 	}
-	// Released flock -> no lease.
-	rel()
-	if LeaseRecordActive(project) {
-		t.Fatal("released flock -> LeaseRecordActive should be false")
+	rel() // release the flock; the coordinator.flock file now exists but is free
+
+	// Free flock + epoch-only NON-TERMINAL generations -> still a real lease
+	// (the codex regression: pure-flock would wrongly direct-send here).
+	owner := identity{Pid: 4242, PidStart: 222222, AgentID: "owner1", Project: project}
+	for _, tc := range []struct {
+		state string
+		want  bool
+	}{
+		{stateStarting, true},          // ClaimStartingRecord before flock acquire
+		{stateFencing, true},           // takeover gap
+		{stateFencedNotAcquired, true}, // failed takeover awaiting doctor
+		{stateActive, true},            // released flock + stale active (mid-reclaim)
+		{stateReleased, false},         // terminal -> bare coord
+	} {
+		writeEpochRaw(t, project, epochRecord{Epoch: 5, State: tc.state, Owner: owner, BootID: "test-boot-1"})
+		if got := LeaseRecordActive(project); got != tc.want {
+			t.Fatalf("free flock + epoch state=%q: LeaseRecordActive = %v, want %v", tc.state, got, tc.want)
+		}
 	}
 }

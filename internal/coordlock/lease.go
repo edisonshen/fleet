@@ -2336,13 +2336,34 @@ func CurrentEpoch(project string) (epoch int64, ok bool) {
 // for the booting owner. Read-only; a missing/torn/terminal record degrades to
 // false.
 func LeaseRecordActive(project string) bool {
-	// Flock-only (D5): a live lease generation exists iff the flock is HELD by a
-	// live process. Delivery keeps a doc PENDING while a coord holds the flock
-	// (busy) — a healthy holder or one still booting — and direct-sends (legacy
-	// fallback) only when the flock is genuinely FREE (no owner). Kernel-proven
-	// liveness replaces the epoch-state enumeration; agent_id is not required.
-	_, present := flockBodyOwner(project)
-	return present
+	// A live lease generation exists iff the flock is HELD by a live process
+	// (busy⇒owner — a healthy holder or one still booting before it writes the
+	// epoch) OR — during PR-1's mixed window, while the epoch is still written —
+	// the epoch records a NON-TERMINAL generation whose flock is momentarily
+	// FREE: a ClaimStartingRecord `starting` written before coord-run acquires
+	// the flock, or a `fencing` takeover gap. Delivery (DeliverToCurrentOwner)
+	// uses this to keep the handoff doc PENDING for the eventual owner rather
+	// than direct-send to a bare coord (codex iter-22 [P1]). This reader is
+	// delivery-only and NEVER drives a spawn, so the epoch clause cannot reopen
+	// the duplicate-spawn incident; unlike the ownership readers, the original
+	// LeaseRecordActive was state-based (no TTL), so it never lapsed and the
+	// epoch clause is retained here as a transitional bridge — PR-2 deletes the
+	// epoch and this collapses to the pure flock-busy read.
+	if _, present := flockBodyOwner(project); present {
+		return true
+	}
+	paths, err := resolvePaths(project)
+	if err != nil {
+		return false
+	}
+	rec, err := readEpoch(paths.epoch)
+	if err != nil {
+		return false
+	}
+	return rec.State == stateActive ||
+		rec.State == stateStarting ||
+		rec.State == stateFencing ||
+		rec.State == stateFencedNotAcquired
 }
 
 // BarrierPath returns the absolute path of the graceful-handoff completion
