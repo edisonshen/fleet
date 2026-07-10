@@ -94,9 +94,6 @@ func TestCoordRun_Standby_PollsThenAcquiresAndStartsChild(t *testing.T) {
 	if _, err := os.Stat(sentinel); err != nil {
 		t.Errorf("child sentinel %s missing — standby did not start the child after acquire: %v", sentinel, err)
 	}
-	if got := lease.heartbeats(); got != 1 {
-		t.Errorf("Heartbeat starts = %d, want 1 (once, after acquire)", got)
-	}
 	if got := lease.releases(); got != 1 {
 		t.Errorf("Release runs = %d, want 1 (after clean child exit)", got)
 	}
@@ -150,9 +147,6 @@ func TestCoordRun_Standby_CancelBeforeAcquire_NeverStartsChild(t *testing.T) {
 
 	if _, err := os.Stat(sentinel); !errors.Is(err, os.ErrNotExist) {
 		t.Errorf("child sentinel %s exists — standby MUST NOT start the child without the lease", sentinel)
-	}
-	if got := lease.heartbeats(); got != 0 {
-		t.Errorf("Heartbeat starts = %d, want 0 (never led)", got)
 	}
 	if got := lease.releases(); got != 0 {
 		t.Errorf("Release runs = %d, want 0 (never acquired)", got)

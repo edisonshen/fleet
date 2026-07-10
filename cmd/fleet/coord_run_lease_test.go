@@ -23,33 +23,13 @@ import (
 	"time"
 )
 
-// fakeLease records Heartbeat + Release calls so a test can assert the
-// every-exit-path lifecycle without a kernel flock.
+// fakeLease records Release calls so a test can assert the every-exit-path
+// lifecycle without a kernel flock. PR-2 (D1) collapsed the lease surface to
+// Release() only — acquiring the flock IS becoming the coordinator, so there is
+// no Activate flip and no Heartbeat to renew.
 type fakeLease struct {
-	mu            sync.Mutex
-	heartbeatRuns int
-	releaseRuns   int
-	activateRuns  int
-	// activateFail exercises the superseded self-demote path: zero value
-	// (false) means the starting->active flip SUCCEEDS (the normal two-phase
-	// startup), so existing &fakeLease{} literals are unaffected. A test sets
-	// it true to make Activate return ok=false. activateErr, when set, is
-	// returned from Activate.
-	activateFail bool
-	activateErr  error
-}
-
-func (f *fakeLease) Activate() (bool, error) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	f.activateRuns++
-	return !f.activateFail, f.activateErr
-}
-
-func (f *fakeLease) Heartbeat() {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	f.heartbeatRuns++
+	mu          sync.Mutex
+	releaseRuns int
 }
 
 func (f *fakeLease) Release() {
@@ -62,12 +42,6 @@ func (f *fakeLease) releases() int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.releaseRuns
-}
-
-func (f *fakeLease) heartbeats() int {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	return f.heartbeatRuns
 }
 
 // childSentinelArgv returns an argv that touches `path` when the child
@@ -121,12 +95,9 @@ func TestCoordRun_Lease_AcquireBeforeChild_ReleaseOnCleanExit(t *testing.T) {
 	if _, err := os.Stat(sentinel); err != nil {
 		t.Errorf("child sentinel %s missing — child did not run: %v", sentinel, err)
 	}
-	// W5: Release ran exactly once; heartbeat was started.
+	// W5: Release ran exactly once (no heartbeat exists post-PR-2).
 	if got := lease.releases(); got != 1 {
 		t.Errorf("Release runs = %d, want 1", got)
-	}
-	if got := lease.heartbeats(); got != 1 {
-		t.Errorf("Heartbeat starts = %d, want 1", got)
 	}
 	// coord.Cleanup also ran (record archived, marker cleared).
 	assertCleanupRan(t, agentID, markerPath)
@@ -164,9 +135,6 @@ func TestCoordRun_Lease_StandDownDoesNotStartChild(t *testing.T) {
 	}
 	if _, err := os.Stat(sentinel); !errors.Is(err, os.ErrNotExist) {
 		t.Errorf("child sentinel %s exists — child MUST NOT start on stand-down", sentinel)
-	}
-	if got := lease.heartbeats(); got != 0 {
-		t.Errorf("Heartbeat starts = %d, want 0 (no leadership)", got)
 	}
 	if got := lease.releases(); got != 0 {
 		t.Errorf("Release runs = %d, want 0 (we never acquired)", got)
@@ -267,101 +235,4 @@ func TestCoordRun_Lease_AcquireFaultAborts(t *testing.T) {
 	if _, serr := os.Stat(sentinel); !errors.Is(serr, os.ErrNotExist) {
 		t.Errorf("child must NOT start on acquire fault")
 	}
-}
-
-// D2 two-phase startup fail-closed flip: `activateFail=true` simulates a
-// resolver superseding us while we were a wedged `starting` owner
-// (SupersedeStartingLease bumped the epoch, T6f). Activate must refuse
-// (ok=false), and the supervisor must self-demote — kill the never-ticked
-// child, return nil (exit 0, NOT an error: being superseded before our
-// first tick is not a failure), and never start the heartbeat. This is
-// the "two owners can never coexist" mechanism the whole PR is built on;
-// the fakeLease scaffolding (activateFail/activateErr) existed but no
-// test ever drove it until now.
-func TestCoordRun_Lease_ActivateSupersededSelfDemotes(t *testing.T) {
-	const (
-		agentID = "lwactsup"
-		project = "lw-activate-superseded"
-		session = "fleet-lwactsup"
-	)
-	markerPath := coordRunTestHome(t, agentID, project, session)
-
-	lease := &fakeLease{activateFail: true}
-	opts := coordRunOpts{
-		agentID:  agentID,
-		project:  project,
-		session:  session,
-		argv:     []string{"sleep", "30"}, // long-running: proves Kill actually cuts it short
-		killTmux: func(string) error { return nil },
-		acquireLease: func() (coordLease, bool, []liveHolderInfo, error) {
-			return lease, true, nil, nil
-		},
-	}
-	done := make(chan error, 1)
-	go func() { done <- runCoordRun(context.Background(), opts, os.Stdout, os.Stderr) }()
-	select {
-	case err := <-done:
-		if err != nil {
-			t.Errorf("superseded-while-starting self-demote must return nil (exit 0), got %v", err)
-		}
-	case <-time.After(10 * time.Second):
-		t.Fatal("runCoordRun did not return within 10s — the `sleep 30` child was not killed on Activate ok=false")
-	}
-	if got := lease.activateRuns; got != 1 {
-		t.Errorf("Activate calls = %d, want 1", got)
-	}
-	if got := lease.heartbeats(); got != 0 {
-		t.Errorf("Heartbeat starts = %d, want 0 (never activated -> no tick, no heartbeat)", got)
-	}
-	if got := lease.releases(); got != 1 {
-		t.Errorf("Release runs = %d, want 1 (deferred release still runs on self-demote)", got)
-	}
-	assertCleanupRan(t, agentID, markerPath)
-}
-
-// The Activate() write-fault path (aerr != nil, e.g. a corrupt/unwritable
-// epoch record): surface-don't-silo — refuse to run a coord whose
-// ownership record could not be committed. The child (never ticked) is
-// killed and the error is returned (NOT collapsed to a clean exit, unlike
-// the superseded case above).
-func TestCoordRun_Lease_ActivateWriteFaultAborts(t *testing.T) {
-	const (
-		agentID = "lwactfault"
-		project = "lw-activate-fault"
-		session = "fleet-lwactfault"
-	)
-	markerPath := coordRunTestHome(t, agentID, project, session)
-
-	wantErr := errors.New("epoch.lock: disk full")
-	lease := &fakeLease{activateErr: wantErr}
-	opts := coordRunOpts{
-		agentID:  agentID,
-		project:  project,
-		session:  session,
-		argv:     []string{"sleep", "30"},
-		killTmux: func(string) error { return nil },
-		acquireLease: func() (coordLease, bool, []liveHolderInfo, error) {
-			return lease, true, nil, nil
-		},
-	}
-	done := make(chan error, 1)
-	go func() { done <- runCoordRun(context.Background(), opts, os.Stdout, os.Stderr) }()
-	select {
-	case err := <-done:
-		if err == nil {
-			t.Fatal("Activate write fault must surface as an error, not a clean exit")
-		}
-		if !errors.Is(err, wantErr) {
-			t.Errorf("returned error must wrap the Activate fault: got %v, want wrapping %v", err, wantErr)
-		}
-	case <-time.After(10 * time.Second):
-		t.Fatal("runCoordRun did not return within 10s — the `sleep 30` child was not killed on Activate fault")
-	}
-	if got := lease.heartbeats(); got != 0 {
-		t.Errorf("Heartbeat starts = %d, want 0 (activate faulted -> no tick, no heartbeat)", got)
-	}
-	if got := lease.releases(); got != 1 {
-		t.Errorf("Release runs = %d, want 1 (deferred release still runs on the fault path)", got)
-	}
-	assertCleanupRan(t, agentID, markerPath)
 }
