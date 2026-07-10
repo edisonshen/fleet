@@ -254,10 +254,12 @@ func TestFlockBodyOwnerReaders(t *testing.T) {
 		// STILL the owner — the reader never reads Mono (busy⇒owner, D4).
 		{name: "T5_stale_mono_still_owner", hold: true, wantPresent: true, wantAgentID: "holder01", wantPID: holderPID,
 			body: &flockBody{Pid: holderPID, PidStart: 222222, AgentID: "holder01", Project: "p", BootID: "b", Mono: -999999999999}},
-		// T8: version skew — old-schema body has a pid but NO agent_id. Spawn gate
-		// still owner (busy); CurrentActiveOwnerPID names the pid; CurrentOwner is
-		// identity-pending (ok=false) — never "no owner", never a duplicate spawn.
-		{name: "T8_old_schema_no_agentid", hold: true, wantPresent: true, wantAgentID: "", wantPID: holderPID,
+		// T8: old-schema body (pid, NO agent_id) with NO epoch to borrow from.
+		// Spawn gate still owner (busy); CurrentActiveOwnerPID names the pid;
+		// CurrentOwner is identity-pending (ok=false) — never "no owner", never a
+		// duplicate spawn. (The version-skew case WITH a matching epoch resolves
+		// via the fallback — see TestFlockOwner_OldBinaryEpochIdentityFallback.)
+		{name: "T8_old_schema_no_agentid_no_epoch", hold: true, wantPresent: true, wantAgentID: "", wantPID: holderPID,
 			body: &flockBody{Pid: holderPID, PidStart: 222222, BootID: "b"}},
 		// T9: torn/empty body (mid-stamp). Busy⇒owner; no pid/id ⇒ delivery + pid
 		// readers degrade to identity-pending, NOT "no owner".
@@ -301,9 +303,11 @@ func TestFlockBodyOwnerReaders(t *testing.T) {
 	}
 }
 
-// TestFlockOwner_EpochIgnored (T7): a busy flock whose body names holder A while
-// a STALE epoch names a DIFFERENT owner B. The repointed readers must return the
-// FLOCK holder A — the epoch is no longer read for ownership.
+// TestFlockOwner_EpochIgnored (T7): a busy flock whose body names holder A (full
+// identity) while a STALE epoch names a DIFFERENT owner B. The repointed readers
+// must return the FLOCK holder A — a full flock body wins outright, so the epoch
+// identity fallback never fires (it only bridges an identity-LESS body, and B's
+// pid differs anyway). The epoch does not govern ownership.
 func TestFlockOwner_EpochIgnored(t *testing.T) {
 	setupHome(t)
 	const project = "flock-epoch-ignored"
@@ -321,6 +325,68 @@ func TestFlockOwner_EpochIgnored(t *testing.T) {
 	}
 	if o, ok := CurrentOwner(project); !ok || o.AgentID != "flockA" {
 		t.Fatalf("CurrentOwner = %+v ok=%v, want flockA", o, ok)
+	}
+}
+
+// TestFlockOwner_OldBinaryEpochIdentityFallback (version-skew rollout bridge,
+// codex P1): a coord started by a PRE-PR-1 binary holds the flock with an
+// old-schema body (pid, NO agent_id) but its agent_id still lives in the epoch
+// it wrote. The reader borrows the epoch's agent_id — cross-checked by
+// pid+pid_start+boot — so attach/delivery reach the healthy coord across the
+// old->new rollout window instead of Wait-timing-out. A mismatched or cross-boot
+// epoch identity is NEVER adopted (stays identity-pending). Ownership is still
+// the held flock (busy⇒owner); the epoch only supplies the identity string.
+func TestFlockOwner_OldBinaryEpochIdentityFallback(t *testing.T) {
+	setupHome(t)
+	clk := &fakeClock{}
+	live := newFakeLiveness()
+	cfg := testCfg(clk, live) // cfg.boot() == "test-boot-1"
+	const pid, start = 4242, int64(222222)
+	live.set(pid, start)
+	oldBody := func() *flockBody {
+		return &flockBody{Pid: pid, PidStart: start, BootID: "test-boot-1"} // NO agent_id
+	}
+
+	// Match: old-schema body + same-boot epoch naming the SAME pid tuple with an
+	// agent_id -> identity borrowed -> deliverable + attachable.
+	const match = "skew-match"
+	heldFlock(t, match, oldBody())
+	writeEpochRaw(t, match, epochRecord{
+		Epoch: 5, State: stateActive, BootID: "test-boot-1",
+		Owner:         identity{Pid: pid, PidStart: start, AgentID: "oldcoord", Project: match},
+		RenewedAtMono: clk.now(),
+	})
+	if o, ok := liveOwnerWithCfg(match, cfg); !ok || o.AgentID != "oldcoord" {
+		t.Fatalf("LiveOwner = %+v ok=%v, want oldcoord (epoch identity fallback)", o, ok)
+	}
+	if o, ok := currentOwnerWithCfg(match, cfg); !ok || o.AgentID != "oldcoord" || o.PID != pid {
+		t.Fatalf("CurrentOwner = %+v ok=%v, want oldcoord deliverable", o, ok)
+	}
+
+	// Mismatched epoch pid -> NOT adopted (a foreign/stale record must never
+	// lend its identity to this flock holder).
+	const mismatch = "skew-mismatch"
+	heldFlock(t, mismatch, oldBody())
+	writeEpochRaw(t, mismatch, epochRecord{
+		Epoch: 5, State: stateActive, BootID: "test-boot-1",
+		Owner:         identity{Pid: 9999, PidStart: 8888, AgentID: "foreign", Project: mismatch},
+		RenewedAtMono: clk.now(),
+	})
+	if o, ok := currentOwnerWithCfg(mismatch, cfg); ok {
+		t.Fatalf("mismatched epoch pid must NOT be adopted; got %+v", o)
+	}
+
+	// Cross-boot epoch identity -> NOT adopted (pid_start is only comparable
+	// within a boot).
+	const xboot = "skew-xboot"
+	heldFlock(t, xboot, oldBody())
+	writeEpochRaw(t, xboot, epochRecord{
+		Epoch: 5, State: stateActive, BootID: "stale-boot",
+		Owner:         identity{Pid: pid, PidStart: start, AgentID: "oldcoord", Project: xboot},
+		RenewedAtMono: clk.now(),
+	})
+	if o, ok := currentOwnerWithCfg(xboot, cfg); ok {
+		t.Fatalf("cross-boot epoch identity must NOT be adopted; got %+v", o)
 	}
 }
 

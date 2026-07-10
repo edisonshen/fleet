@@ -2067,9 +2067,10 @@ func flockBodyOwner(project string) (Owner, bool) {
 //     proven liveness: a held LOCK_EX means the holder process is alive (the
 //     kernel frees the flock on death; fleet's flock fd is O_CLOEXEC so exec'd
 //     children can't keep it held). Identity comes from the body's agent_id +
-//     pid when parseable; a torn / empty / old-schema (no agent_id) body is
-//     STILL owner=true with AgentID="" — never downgraded (busy is the truth;
-//     the body is only for identity).
+//     pid when parseable; an old-schema (pid, no agent_id) body borrows its
+//     agent_id from the epoch as a rollout bridge (see the fallback below); a
+//     torn / empty / no-pid body is STILL owner=true with AgentID="" — never
+//     downgraded (busy is the truth; the body is only for identity).
 //   - acquired (no LOCK_EX holder) ⇒ owner=false; release the shared probe
 //     immediately. This correctly reads a released-but-alive holder (graceful
 //     handoff Release() drops the LOCK_EX though the process lives) AND a dead
@@ -2077,10 +2078,9 @@ func flockBodyOwner(project string) (Owner, bool) {
 //   - ENOENT / unreadable ⇒ owner=false (free) — never created, no crash.
 //
 // LOCK_SH (not LOCK_EX) so concurrent readers coexist and never make each
-// other misread "busy"; the shared probe releases in microseconds. cfg is
-// accepted for parity with the sibling *WithCfg readers so callers thread the
-// same seam — the probe itself needs no clock/boot/pid seam because the kernel
-// is the liveness oracle.
+// other misread "busy"; the shared probe releases in microseconds. cfg supplies
+// the boot id for the epoch-identity fallback's cross-boot guard (below);
+// liveness itself needs no clock/pid seam because the kernel is the oracle.
 //
 // Identity is BEST-EFFORT. There is a sub-millisecond acquire-before-stamp
 // window — a new holder N has taken LOCK_EX but has not yet reached
@@ -2094,7 +2094,6 @@ func flockBodyOwner(project string) (Owner, bool) {
 // pid, never fires. Consistent with D1 ("the body is only for identity") and
 // D3's minimized-not-eliminated flicker.
 func flockBodyOwnerWithCfg(project string, cfg leaseConfig) (Owner, bool) {
-	_ = cfg
 	paths, err := resolvePaths(project)
 	if err != nil {
 		return Owner{}, false
@@ -2132,6 +2131,29 @@ func flockBodyOwnerWithCfg(project string, cfg leaseConfig) (Owner, bool) {
 				PID:           body.Pid,
 				PidStart:      body.PidStart,
 				EngineStamped: body.AgentID != "" && body.PidStart > 0,
+			}
+			// TRANSITIONAL epoch-identity fallback (PR-1 rollout bridge). A coord
+			// started by a PRE-PR-1 binary stamped an old-schema body with a pid
+			// but NO agent_id (the old stamp predates D2) — yet its agent_id still
+			// lives in the epoch record it wrote. Without this, after deploying
+			// PR-1 every already-running old-binary coord reads identity-less
+			// (agent_id=""), so attach ⇒ Wait-timeout and handoff delivery strands
+			// PENDING on a HEALTHY coord until it restarts — reintroducing
+			// un-attachability, the exact incident this stack fixes. Borrow the
+			// agent_id from the epoch, cross-checked by the (pid,pid_start,boot)
+			// tuple so a stale/foreign/cross-boot record is never adopted.
+			// Ownership stays flock-based (busy⇒owner above); this only supplies
+			// the identity string for a CONFIRMED-live flock holder, so the
+			// lapse/spawn-beside bug cannot recur. Fires ONLY for an identity-less
+			// body (a full body wins outright; a torn/no-pid body has nothing to
+			// cross-check ⇒ stays identity-pending). Removed in PR-2 with the epoch.
+			if owner.AgentID == "" && owner.PID > 0 {
+				if rec, eerr := readEpoch(paths.epoch); eerr == nil &&
+					rec.Owner.AgentID != "" && rec.BootID == cfg.boot() &&
+					rec.Owner.Pid == body.Pid && rec.Owner.PidStart == body.PidStart {
+					owner.AgentID = rec.Owner.AgentID
+					owner.EngineStamped = owner.PidStart > 0
+				}
 			}
 		}
 	}
