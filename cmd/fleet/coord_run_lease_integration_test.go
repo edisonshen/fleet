@@ -102,20 +102,11 @@ func TestCoordRun_Lease_Integration_RealFlockHeldThenReleased(t *testing.T) {
 	heldDeadline := time.Now().Add(15 * time.Second)
 	held := false
 	for time.Now().Before(heldDeadline) {
-		busy, ferr := flockBusy(flockPath)
-		if ferr == nil && busy {
-			// Busy: a live holder owns the flock. Wait until it has ALSO flipped
-			// the epoch to active naming our supervisor. Under the flock-only
-			// readers, CurrentActiveOwnerPID reports the holder as soon as the
-			// flock body is stamped (during `starting`, before Activate), so the
-			// poll must read the epoch directly to observe the active flip this
-			// test asserts below (else it races the starting->active transition).
-			var ep struct {
-				State string            `json:"state"`
-				Owner struct{ Pid int } `json:"owner"`
-			}
-			if b, rerr := os.ReadFile(epochPath); rerr == nil && json.Unmarshal(b, &ep) == nil &&
-				ep.State == "active" && ep.Owner.Pid == supPid {
+		busy, err := flockBusy(flockPath)
+		if err == nil && busy {
+			// Busy: a live holder owns the flock. Confirm it is OUR supervisor
+			// via the epoch's active owner pid.
+			if ownerPid, ok := coordlock.CurrentActiveOwnerPID(project); ok && ownerPid == supPid {
 				held = true
 				break
 			}
@@ -124,11 +115,6 @@ func TestCoordRun_Lease_Integration_RealFlockHeldThenReleased(t *testing.T) {
 	}
 	if !held {
 		t.Fatalf("supervisor pid %d did not hold the lease within 15s", supPid)
-	}
-	// The flock-only owner reader names our supervisor once the flock is busy
-	// (end-to-end coverage of the repointed CurrentActiveOwnerPID).
-	if ownerPid, ok := coordlock.CurrentActiveOwnerPID(project); !ok || ownerPid != supPid {
-		t.Fatalf("CurrentActiveOwnerPID = %d ok=%v, want supervisor %d", ownerPid, ok, supPid)
 	}
 
 	// W8-lite: the epoch record is active, names the supervisor, and has a

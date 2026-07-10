@@ -1893,6 +1893,38 @@ func (l *Lease) flockHolderRecoverable() bool {
 	return false // live same-boot holder -> NOT recoverable (D4: no TTL clause)
 }
 
+// flockHolderRecoverableTTL is the PRE-PR-1 recoverable check, WITH the TTL
+// clause the acquire-path flockHolderRecoverable dropped in D4. It exists for
+// exactly ONE caller: LeaderPresent's epoch-missing fallback (leaderPresentWith-
+// Cfg). LeaderPresent is a DEFERRED reader in PR-1 (it stays epoch-based; it
+// repoints onto the flock in PR-2 with its drain/gc consumer rework), so its
+// fallback must stay BYTE-FOR-BYTE unchanged vs origin/main — including the
+// "hung past TTL -> recoverable" clause. If the acquire-path helper were reused
+// here, the D4 clause deletion would leak into LeaderPresent: a live-but-quiet
+// holder in the acquire-to-epoch window would flip false->true, and drain's
+// healthySuccessorPresent (which routes on LeaderPresent) would treat that
+// not-yet-active starter as a healthy successor and delete the handoff queue —
+// the exact R4/B hazard the PR-1 re-boundary defers. PR-2 deletes this helper
+// when it repoints LeaderPresent. Recoverable iff the body is missing/
+// unparseable, cross-boot, pid-dead, OR its Mono is older than the TTL.
+func (l *Lease) flockHolderRecoverableTTL() bool {
+	b, err := os.ReadFile(l.paths.flock)
+	if err != nil || len(b) == 0 {
+		return true // no body to vouch for the holder -> recoverable
+	}
+	var body flockBody
+	if json.Unmarshal(b, &body) != nil {
+		return true // unparseable stamp -> recoverable
+	}
+	if body.BootID != l.boot {
+		return true // previous boot
+	}
+	if !l.pidAlive(identity{Pid: body.Pid, PidStart: body.PidStart}) {
+		return true // holder pid dead
+	}
+	return l.cfg.nowMono()-body.Mono > int64(l.cfg.ttl) // hung past TTL
+}
+
 // retryFlock polls LOCK_NB on coordinator.flock until acquired or the
 // retry budget elapses (old holder slow to die after the kill).
 func (l *Lease) retryFlock() (*os.File, bool, error) {
@@ -2160,20 +2192,33 @@ func flockBodyOwnerWithCfg(project string, cfg leaseConfig) (Owner, bool) {
 	return owner, true
 }
 
-// CurrentActiveOwnerPID reports the supervisor PID of the current coordinator
-// lease owner for project, or (0,false) if the flock is free / its body has no
-// pid. It is a SPAWN-GATE reader (D5): it reads the flock body (busy⇒owner),
-// NOT the epoch, and does NOT gate on agent_id. The authenticated kill
-// primitive (internal/coord) uses it as the "never shoot the live leader"
-// gate: a STONITH target is refused if it IS the current owner. A torn body
-// (no pid) degrades to (0,false), which makes the kill primitive refuse rather
-// than fire on stale data. Best-effort + read-only.
+// CurrentActiveOwnerPID reports the supervisor PID recorded as the
+// current ACTIVE lease owner for project, or (0,false) if there is no
+// active owner (no epoch file, or its state != active). The
+// authenticated kill primitive (internal/coord) uses it as the epoch
+// gate's executable form: a STONITH target is refused if it IS the
+// current active owner (never shoot the live leader); any other coord
+// for this project is stale by construction once we hold the lease.
+// Best-effort + read-only — it takes no lock (a torn read degrades to
+// (0,false), i.e. "no active owner", which makes the kill primitive
+// refuse rather than fire on stale data).
+//
+// DEFERRED reader (PR-1): stays epoch-based here. It feeds the gc dead/live
+// split + the kill gate, which need active-HEALTHY (not merely busy⇒owner);
+// PR-2 repoints it onto the flock together with that consumer rework (D5).
 func CurrentActiveOwnerPID(project string) (pid int, ok bool) {
-	owner, present := flockBodyOwner(project)
-	if !present || owner.PID <= 0 {
+	paths, err := resolvePaths(project)
+	if err != nil {
 		return 0, false
 	}
-	return owner.PID, true
+	rec, err := readEpoch(paths.epoch)
+	if err != nil {
+		return 0, false
+	}
+	if rec.State != stateActive || rec.Owner.Pid <= 0 {
+		return 0, false
+	}
+	return rec.Owner.Pid, true
 }
 
 // CurrentOwner reports the full active lease owner tuple for project, or
@@ -2381,29 +2426,90 @@ func BarrierPath(project string, epoch int64) (string, error) {
 		fmt.Sprintf("handoff-complete-%d.json", epoch)), nil
 }
 
-// LeaderPresent reports whether a coordinator lease is currently held by a
-// live process for project — i.e. whether a duplicate spawn should stand down.
-// Flock-only (D5): present iff the flock is HELD (busy⇒owner, kernel-proven
-// liveness), regardless of agent_id or epoch state. A free flock ⇒ no leader.
+// LeaderPresent reports whether a coordinator lease is currently held by
+// a HEALTHY leader OR is mid a FRESH in-progress takeover for project —
+// i.e. whether a duplicate spawn should stand down. It applies the SAME
+// predicate AcquireLease uses (codex PR2 iter-11 [P2]), not a bare
+// state==active check:
+//   - state==active AND same boot AND within TTL AND owner pid+pid_start
+//     alive  -> healthy leader present, true;
+//   - state==fencing AND the candidate is fresh (live, in-budget) -> a
+//     legitimate takeover is in progress, true (the new leader is coming);
+//   - otherwise (no record, stale/expired active, dead owner, abandoned
+//     fencing, fenced_not_acquired, released) -> false (stealable / no
+//     leader).
 //
-// Accepted P2 (see task plan): collapsing onto flock-busy drops the old
-// stateFencing special case, so during a takeover (old released, new not yet
-// acquired) LeaderPresent can read a transient free flock ⇒ false for a few ms.
-// This fails CONSERVATIVE (a brief "no leader" during a handoff, which fleet
-// drain already tolerates) and is the correct flock-only reading.
+// Read-only, takes no lock; a torn/missing read degrades to false. Used by
+// cmd/fleet's coordLeaderCheck to disambiguate a clean stand-down from a
+// real supervisor failure.
 //
-// Read-only; a free/unreadable flock degrades to false. Used by cmd/fleet's
-// coordLeaderCheck to disambiguate a clean stand-down from a supervisor failure.
+// DEFERRED reader (PR-1): stays epoch-based here — byte-for-byte unchanged vs
+// origin/main, including its epoch-missing fallback's TTL-gated recoverable
+// check (via flockHolderRecoverableTTL, D4). It feeds drain's
+// healthySuccessorPresent + the spawn gate, whose liveness needs conflict with
+// busy⇒owner; PR-2 repoints it onto the flock with that consumer rework and
+// deletes the retained TTL helper.
 func LeaderPresent(project string) bool {
 	return leaderPresentWithCfg(project, defaultLeaseConfig())
 }
 
-// leaderPresentWithCfg is the seam-threaded core of LeaderPresent. cfg is
-// passed through to the flock probe for sibling-reader parity (the probe needs
-// no seam — the kernel is the liveness oracle).
+// leaderPresentWithCfg is the seam-injected core of LeaderPresent so
+// tests drive a deterministic clock / pid-liveness / boot id.
 func leaderPresentWithCfg(project string, cfg leaseConfig) bool {
-	_, present := flockBodyOwnerWithCfg(project, cfg)
-	return present
+	paths, err := resolvePaths(project)
+	if err != nil {
+		return false
+	}
+	// Throwaway lease carrying the seams so holderHealthy /
+	// transientResumable / flockHolderRecoverableTTL apply the same logic the
+	// acquire path does. self is zero (we only read foreign records);
+	// transientResumable's "is this MY fencing record" short-circuit can
+	// never fire on a zero self vs a real candidate.
+	l := &Lease{cfg: cfg, paths: paths, boot: cfg.boot()}
+
+	rec, err := readEpoch(paths.epoch)
+	if err != nil {
+		// MISSING epoch — mirror the acquire path's busy-flock booting check
+		// (codex PR3 iter-3 [P2]). A holder can grab coordinator.flock and not
+		// yet have written coordinator.epoch (it is still booting). Returning
+		// false here would misclassify that fresh booting leader as "no leader"
+		// — making a duplicate spawn report a failure instead of a clean
+		// stand-down. So: if the flock is BUSY and its body vouches for a
+		// FRESH same-boot live holder (flockHolderRecoverableTTL == false), a
+		// leader is present. A free flock, or a stale/dead/hung body, is no
+		// healthy leader. This fallback keeps the D4 TTL clause (via the
+		// -TTL helper) so LeaderPresent is unchanged in PR-1 (deferred reader).
+		if !errors.Is(err, os.ErrNotExist) {
+			return false // unreadable epoch (not just "absent") -> conservative
+		}
+		f, gotFlock, ferr := tryFlock(paths.flock)
+		if ferr != nil {
+			return false
+		}
+		if gotFlock {
+			// We acquired it -> nobody holds it -> no leader. Release at once.
+			_ = releaseFlock(f)
+			return false
+		}
+		// Busy flock, no epoch yet: present iff the holder is a fresh booting
+		// one (not recoverable/stealable).
+		return !l.flockHolderRecoverableTTL()
+	}
+	switch rec.State {
+	case stateActive:
+		return l.holderHealthy(rec)
+	case stateStarting:
+		// A live starting holder is a leader mid-boot (D2) — present, so a
+		// duplicate spawn stands down. A dead starting owner is stealable.
+		return l.pidAlive(rec.Owner)
+	case stateFencing:
+		// A fresh, live, in-budget takeover (NOT resumable by a newcomer)
+		// means a legitimate successor is mid-acquire -> treat as present.
+		return !l.transientResumable(rec)
+	default:
+		// fenced_not_acquired / released / unknown -> no live leader.
+		return false
+	}
 }
 
 // PidStartNanos exports the platform pid-start reader so the
