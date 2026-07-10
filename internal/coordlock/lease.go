@@ -1681,6 +1681,10 @@ func (t LeaseToken) StillOwned() bool {
 // longer read for a TTL decision (PR-1 D4 deleted that clause — a live
 // same-boot holder is never "recoverable" on staleness). Best-effort: flock
 // exclusion is kernel-enforced; the body is only for identity, never the lock.
+//
+// Of the two fields PR-1 added, AgentID is the read identity (flockBodyOwner);
+// Project is stamped but not yet read here — retained for schema completeness /
+// diagnostics and a future cross-project reader, write-only in PR-1 like Mono.
 type flockBody struct {
 	Pid      int    `json:"pid"`
 	PidStart int64  `json:"pid_start"`
@@ -2108,7 +2112,14 @@ func flockBodyOwnerWithCfg(project string, cfg leaseConfig) (Owner, bool) {
 		return Owner{}, false
 	}
 	if lerr != syscall.EWOULDBLOCK { //nolint:errorlint // bare errno from syscall.Flock.
-		return Owner{}, false // unexpected flock fault -> conservative "free"
+		// An unexpected flock errno (e.g. ENOLCK, EINTR) reads as "free". For a
+		// spawn gate that is the fail-OPEN direction, but it cannot produce a
+		// duplicate coordinator: the real acquire (tryFlock's LOCK_EX|LOCK_NB)
+		// hits the same errno and fails-closed too, so a spuriously-triggered
+		// spawn stands down at the kernel lock — worst case is one wasted
+		// stand-down, never split-brain. Extremely unlikely on a local
+		// LOCK_SH|LOCK_NB anyway.
+		return Owner{}, false
 	}
 	// Busy: a live LOCK_EX holder exists ⇒ owner=true regardless of the body.
 	// Read the body best-effort for identity (agent_id + pid tuple).
@@ -2224,10 +2235,12 @@ func currentHandoffWithCfg(project string, cfg leaseConfig) (Handoff, bool) {
 // CurrentStarting reports whether project's lease is currently in `starting`
 // state and, if so, the owner tuple + liveness + whether it is within its
 // startingTTL. ok=false when the record is missing/unreadable or its state
-// is not `starting`. OwnerLive is same-boot-gated (see liveOwnerWithCfg):
+// is not `starting`. OwnerLive is same-boot-gated (the `sameBoot` check below):
 // pid+pid_start equality alone is only reuse-safe within the SAME boot, so a
 // cross-boot record's owner is reported dead regardless of the raw pidAlive
-// result. Read-only; a torn read degrades to ok=false.
+// result. (CurrentStarting still reads the epoch — it is NOT one of the readers
+// PR-1 repointed onto the flock; it is deleted with the starting state in PR-2.)
+// Read-only; a torn read degrades to ok=false.
 func CurrentStarting(project string) (StartingStatus, bool) {
 	return currentStartingWithCfg(project, defaultLeaseConfig())
 }
@@ -2257,8 +2270,8 @@ func currentStartingWithCfg(project string, cfg leaseConfig) (StartingStatus, bo
 		// Cross-boot record -> the owner is provably dead (a reboot kills
 		// every process), regardless of what a bare pid+pid_start equality
 		// on Linux's boot-relative starttime might coincidentally match
-		// (codex-adversarial review finding, same root cause as
-		// liveOwnerWithCfg above).
+		// (codex-adversarial review finding; the `sameBoot &&` guard below is
+		// the gate).
 		OwnerLive: sameBoot && l.pidAlive(rec.Owner),
 		WithinTTL: withinTTL,
 		Epoch:     rec.Epoch,

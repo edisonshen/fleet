@@ -243,6 +243,7 @@ func TestFlockBodyOwnerReaders(t *testing.T) {
 		hold        bool
 		createFree  bool // create coordinator.flock but do NOT hold it (free)
 		body        *flockBody
+		rawBody     string // when set, overwrite the held flock with these raw bytes (unparseable)
 		wantPresent bool
 		wantAgentID string
 		wantPID     int
@@ -261,6 +262,10 @@ func TestFlockBodyOwnerReaders(t *testing.T) {
 		// T9: torn/empty body (mid-stamp). Busy⇒owner; no pid/id ⇒ delivery + pid
 		// readers degrade to identity-pending, NOT "no owner".
 		{name: "T9_torn_empty_body", hold: true, body: nil, wantPresent: true, wantAgentID: "", wantPID: 0},
+		// T9b: torn NON-empty body (unparseable JSON mid-write). Exercises the
+		// json.Unmarshal-fails branch the empty-body case short-circuits past;
+		// busy⇒owner still holds, identity degrades to pending (not "no owner").
+		{name: "T9b_torn_unparseable_body", hold: true, rawBody: "{not valid json", wantPresent: true, wantAgentID: "", wantPID: 0},
 		// T3: flock file exists but is FREE (no holder) ⇒ no owner.
 		{name: "T3_free_flock", createFree: true, wantPresent: false},
 		// T12: flock file never created (ENOENT) ⇒ no owner, no crash.
@@ -273,6 +278,15 @@ func TestFlockBodyOwnerReaders(t *testing.T) {
 			switch {
 			case tc.hold:
 				heldFlock(t, project, tc.body)
+				if tc.rawBody != "" {
+					// Overwrite the (empty) held body with raw unparseable bytes.
+					// os.WriteFile uses its own fd — flock is advisory, so the
+					// held LOCK_EX still makes the probe read BUSY.
+					paths, _ := resolvePaths(project)
+					if err := os.WriteFile(paths.flock, []byte(tc.rawBody), 0o644); err != nil {
+						t.Fatal(err)
+					}
+				}
 			case tc.createFree:
 				paths, _ := resolvePaths(project)
 				if err := os.MkdirAll(filepath.Dir(paths.flock), 0o755); err != nil {
@@ -1430,9 +1444,9 @@ func TestIntegration_BusyCoordReadersNameHolder(t *testing.T) {
 // TestStampFlockBody_FailClosed (T4): a failed flock-body stamp must fail the
 // acquire and RELEASE the flock at EVERY call site (D3) — never leave a
 // body-less held flock a reader would see as identity-pending forever. Exercised
-// at the free-acquire (:573), released-retry (:691), and takeover (:999) sites
-// via the stampErr fault seam. The invariant proved per site: acquire returns
-// an error, no lease, and a subsequent tryFlock SUCCEEDS (the flock was freed).
+// at the free-acquire, released-retry, and takeover stamp sites via the stampErr
+// fault seam. The invariant proved per site: acquire fails with the injected
+// fault, returns no lease, and a subsequent tryFlock SUCCEEDS (the flock freed).
 func TestStampFlockBody_FailClosed(t *testing.T) {
 	stampFault := errors.New("injected stamp fault")
 	assertFreed := func(t *testing.T, project string) {
@@ -1445,19 +1459,34 @@ func TestStampFlockBody_FailClosed(t *testing.T) {
 		_ = releaseFlock(f)
 	}
 
-	t.Run("site573_free_acquire", func(t *testing.T) {
+	// assertStampFault confirms the acquire failed via the INJECTED stamp fault
+	// (not some other error exit on the released-retry/takeover paths), so the
+	// test can't false-green if a refactor stops reaching the stamp site. The
+	// fault propagates through stampFlockBody's %w wrap and the call-site wrap.
+	assertStampFault := func(t *testing.T, acquired bool, err error) {
+		t.Helper()
+		if acquired || err == nil {
+			t.Fatalf("fail-closed acquire: acquired=%v err=%v", acquired, err)
+		}
+		if !errors.Is(err, stampFault) {
+			t.Fatalf("acquire must fail via the injected stamp fault; got %v", err)
+		}
+	}
+
+	t.Run("free_acquire", func(t *testing.T) {
 		setupHome(t)
 		const project = "stampfail-free"
 		cfg := testCfg(&fakeClock{}, newFakeLiveness())
 		cfg.stampErr = stampFault
 		lease, acquired, err := acquireLease(project, "cand", cfg)
-		if acquired || lease != nil || err == nil {
-			t.Fatalf("fail-closed free acquire: acquired=%v lease=%v err=%v", acquired, lease, err)
+		assertStampFault(t, acquired, err)
+		if lease != nil {
+			t.Fatalf("fail-closed free acquire returned a lease: %v", lease)
 		}
 		assertFreed(t, project)
 	})
 
-	t.Run("site691_released_retry", func(t *testing.T) {
+	t.Run("released_retry", func(t *testing.T) {
 		setupHome(t)
 		const project = "stampfail-released"
 		clk := &fakeClock{}
@@ -1473,19 +1502,18 @@ func TestStampFlockBody_FailClosed(t *testing.T) {
 		})
 		releaseHeld := holdFlock(t, project)
 		// The releaser drops the flock mid-cleanup; retryFlock then acquires and
-		// reaches the :691 stamp (mirrors TestReleasedHolderBusyFlock_RetriesNotFenced).
+		// reaches the released-retry stamp (mirrors
+		// TestReleasedHolderBusyFlock_RetriesNotFenced).
 		go func() {
 			time.Sleep(40 * time.Millisecond)
 			releaseHeld()
 		}()
 		_, acquired, err := acquireLease(project, "cand", cfg)
-		if acquired || err == nil {
-			t.Fatalf("fail-closed released-retry: acquired=%v err=%v", acquired, err)
-		}
+		assertStampFault(t, acquired, err)
 		assertFreed(t, project)
 	})
 
-	t.Run("site999_takeover", func(t *testing.T) {
+	t.Run("takeover", func(t *testing.T) {
 		setupHome(t)
 		const project = "stampfail-takeover"
 		clk := &fakeClock{}
@@ -1493,7 +1521,7 @@ func TestStampFlockBody_FailClosed(t *testing.T) {
 		cfg := testCfg(clk, live)
 		cfg.stampErr = stampFault
 		// All prospective holders DEAD so the takeover proceeds to acquire the
-		// flock after the kill frees it, then reaches the :999 stamp.
+		// flock after the kill frees it, then reaches the takeover stamp.
 		writeFlockBodyRaw(t, project, flockBody{Pid: 6666, PidStart: 555555, BootID: "test-boot-1", Mono: 0})
 		releaseHolder := holdFlock(t, project)
 		writeEpochRaw(t, project, epochRecord{
@@ -1505,9 +1533,7 @@ func TestStampFlockBody_FailClosed(t *testing.T) {
 		cfg.killStub = func(identity, int64) error { releaseHolder(); return nil }
 		clk.advance(31 * time.Second)
 		_, acquired, err := acquireLease(project, "cand", cfg)
-		if acquired || err == nil {
-			t.Fatalf("fail-closed takeover: acquired=%v err=%v", acquired, err)
-		}
+		assertStampFault(t, acquired, err)
 		assertFreed(t, project)
 	})
 }
