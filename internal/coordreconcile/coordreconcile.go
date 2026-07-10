@@ -1,41 +1,32 @@
 // Package coordreconcile is the ONE lease-owner resolver that both
 // `fleet attach` (Tier 3 PROJECT RECOVERY) and the TUI `[a]` handler call
-// to answer "who is project P's coord, and what should I do to reach
-// exactly one?" — WITHOUT a coord-spawn marker. The lease
-// (coordinator.epoch) is the sole source of truth
-// (DESIGN-coord-lifecycle-crash-recovery §2A; TASK-PLAN-coord-lease-sole-identity
-// D4). Sharing one resolver across the CLI and the TUI closes the exact
-// CLI/TUI asymmetry that caused the 2026-06-18 incident, where `[a]` trusted
-// a stale marker over the live lease and spawned a duplicate beside a healthy
-// coord.
+// to answer "who is project P's coord, and what should I do to reach exactly
+// one?" — WITHOUT a coord-spawn marker. Under the FLOCK-ONLY lease
+// (DESIGN-coord-lease-flock-only) the flock is the sole source of truth:
+// a live process holding coordinator.flock IS the coord.
 //
-// The resolver introduces NO new kill path (no-auto-kill invariant,
-// DESIGN-coord-no-auto-kill): every decision is either an ATTACH to a
-// process-live owner, a WAIT (poll + re-resolve), a fresh SPAWN into a
-// provably-free lease, or a SPAWN-STANDBY after a PURE RECORD CAS that
-// signals no process. It never fences or kills a live coordinator.
+// The resolver introduces NO kill path (no-auto-kill invariant): every
+// decision is an ATTACH to a live flock holder, a WAIT (poll + re-resolve),
+// or a fresh SPAWN into a provably-free lease. It never fences or kills.
 //
-// Decision matrix (evaluated top-to-bottom; first match wins):
+// Decision matrix (flock-only, PR-2 D4 — evaluated top-to-bottom):
 //
-//	LiveOwner  flock HELD + agent_id  -> ATTACH  (T1/T3/T7b/T10)
-//	LiveOwner  flock HELD + no id      -> WAIT    (T13: identity-pending, poll)
-//	starting, owner pid stamped + confirmed DEAD    -> claim   (falls to free branch)
-//	starting within TTL (owner unset/live)          -> WAIT    (T2: boot in flight)
-//	starting past TTL, owner LIVE                   -> SUPERSEDE + SPAWN-STANDBY (T6s)
-//	starting past TTL, owner unset                  -> claim   (falls to free branch)
-//	valid handoff reservation                       -> WAIT   (#247 gap-window rule a)
-//	free / dead-active lease                         -> CLAIM + SPAWN (T7a, T8)
+//	flock HELD + body agent_id     -> ATTACH  (a live coord leads)
+//	flock HELD + identity-less     -> WAIT    (poll for the identity; attach's
+//	                                           PROJECT-RECOVERY falls back to
+//	                                           FindLiveCoord, D9e — never spawns beside)
+//	flock FREE + journal, succ ALIVE -> WAIT   (a handoff is in flight; don't
+//	                                            spawn beside the booting successor)
+//	flock FREE + journal, succ DEAD  -> clear the stale journal+barrier THEN SPAWN
+//	flock FREE + no journal         -> SPAWN
 //
-// Flock-only note (PR-1, DESIGN-coord-lease-flock-only): step-1 LiveOwner is now
-// the LOCK_SH flock-busy probe, so ATTACH keys on "a live process holds the
-// flock" — a live/booting/version-skewed holder is never spawned beside (the
-// incident fix). Every CurrentStarting/Supersede/SpawnStandby row below it is
-// only reachable in the FLOCK-FREE pre-acquire window (a process wrote a
-// starting record but has not yet taken the flock — still epoch-based in PR-1);
-// once a live coord holds the flock, step-1 short-circuits. That whole
-// flock-free starting/handoff sub-matrix is deleted in PR-2. By the time control
-// reaches the free/dead branch the flock is free, so the ClaimStartingRecord
-// there can never clobber a live coord's lease.
+// PR-2 deleted the epoch `starting`/`Supersede`/`SpawnStandby` sub-matrix (no
+// starting state exists any more) and replaced the epoch's CurrentHandoff
+// reservation with the write-once handoff journal (Decision 7). The
+// clear-before-spawn on a dead successor is MANDATORY here (not only in
+// coord_swap_resume): an attach-spawned coord has a fresh identity, so a spawn
+// WITHOUT the preceding clear would leave a journal naming a now-dead successor
+// that no live holder matches — wedging every future O_EXCL handoff.
 package coordreconcile
 
 import (
@@ -45,32 +36,21 @@ import (
 )
 
 // Decision is the resolver's verdict — what the CALLER (attach exec-tmux /
-// TUI spawn Cmd) must do next. The resolver performs the lease-record CAS
-// side effects (Supersede / ClaimStarting) itself; the caller owns the
-// process-level side effects (attach, spawn, poll) because those differ
-// between the CLI and the TUI.
+// TUI spawn Cmd) must do next.
 type Decision int
 
 const (
-	// Attach: a process-live active lease owner exists — attach to it. The
-	// Verdict.Owner names the agent record whose tmux session to enter.
+	// Attach: a live flock holder with a readable identity exists — attach to
+	// it. Verdict.Owner names the agent record whose tmux session to enter.
 	Attach Decision = iota
-	// Wait: a healthy boot is in flight (starting within TTL) or a valid
-	// handoff reservation names a successor, or a benign CAS race lost — the
-	// caller polls (bounded) and re-resolves. NEVER spawns a duplicate.
+	// Wait: a live flock holder whose identity is not yet readable
+	// (identity-pending), or a handoff in flight (a booting successor), or a
+	// benign race — the caller polls (bounded) and re-resolves. NEVER spawns.
 	Wait
-	// Spawn: the lease was free / dead-owned — the resolver claimed a
-	// `starting` record naming the caller's agentID (spawn-serialization) and
-	// the caller should spawn a fresh coord that acquires the free flock.
+	// Spawn: the flock was FREE with no in-flight handoff (or an abandoned one
+	// the resolver just cleared) — the caller should spawn a fresh coord that
+	// acquires the free flock.
 	Spawn
-	// SpawnStandby: a `starting` owner was wedged past its TTL but its process
-	// is still LIVE (holding the flock). The resolver superseded the stale
-	// record (a PURE record CAS — NO process signalled, no-auto-kill) so the
-	// zombie's Activate flip fails closed; the caller should spawn a
-	// `coord-run --standby` that polls behind the still-held flock and wins
-	// when the zombie dies. The hung session is left as a visible zombie for
-	// `fleet gc`'s dead/live split.
-	SpawnStandby
 )
 
 func (d Decision) String() string {
@@ -81,8 +61,6 @@ func (d Decision) String() string {
 		return "wait"
 	case Spawn:
 		return "spawn"
-	case SpawnStandby:
-		return "spawn-standby"
 	default:
 		return fmt.Sprintf("decision(%d)", int(d))
 	}
@@ -91,8 +69,7 @@ func (d Decision) String() string {
 // Verdict is the resolver's answer.
 type Verdict struct {
 	Decision Decision
-	// Owner is set only for Decision == Attach: the process-live active lease
-	// owner to attach to.
+	// Owner is set only for Decision == Attach: the live flock holder to attach to.
 	Owner coordlock.Owner
 	// Reason is a short human-readable explanation for stderr/fleetlog
 	// surfacing (feedback_surface_dont_silo: never silently reconcile).
@@ -100,61 +77,45 @@ type Verdict struct {
 }
 
 // Deps are the injected lease seams. Production callers use DefaultDeps();
-// tests build a deterministic in-memory matrix. All reads are TTL/clock
-// pure via the underlying coordlock cfg, so a table-driven test drives every
-// branch without sleeps.
+// tests build a deterministic in-memory matrix.
 type Deps struct {
-	// LiveOwner reports a process-live active owner (TTL-independent).
+	// LiveOwner reports a live flock holder (busy⇒owner, D1). ok=false when the
+	// flock is FREE.
 	LiveOwner func(project string) (coordlock.Owner, bool)
-	// CurrentStarting reports a `starting` record + liveness + within-TTL.
-	CurrentStarting func(project string) (coordlock.StartingStatus, bool)
-	// CurrentHandoff reports a non-expired successor reservation.
-	CurrentHandoff func(project string) (coordlock.Handoff, bool)
-	// Supersede bumps the epoch of a wedged `starting` record (pure CAS).
-	Supersede func(project string, observedEpoch int64) (bool, error)
-	// ClaimStarting writes a `starting` record naming agentID iff the lease
-	// is claimable (free / dead / no live boot / no valid handoff).
-	ClaimStarting func(project, agentID string) (bool, error)
+	// ClassifyHandoff inspects the handoff journal for a FLOCK-FREE project
+	// (Decision 7 Abandon): none / in-flight (successor alive) / abandoned
+	// (successor dead). Production: coordlock.ClassifyFreeFlockHandoff.
+	ClassifyHandoff func(project string) (coordlock.HandoffDisposition, coordlock.HandoffJournal, error)
+	// ClearHandoff clears a stale journal + its barrier before an abandoned-
+	// successor respawn (clear-before-spawn). Production: coordlock.DeleteHandoffJournal.
+	ClearHandoff func(project string) error
 }
 
-// DefaultDeps wires the resolver to the real coordlock lease primitives.
+// DefaultDeps wires the resolver to the real coordlock flock/journal primitives.
 func DefaultDeps() Deps {
 	return Deps{
 		LiveOwner:       coordlock.LiveOwner,
-		CurrentStarting: coordlock.CurrentStarting,
-		CurrentHandoff:  coordlock.CurrentHandoff,
-		Supersede:       coordlock.SupersedeStartingLease,
-		ClaimStarting:   coordlock.ClaimStartingRecord,
+		ClassifyHandoff: coordlock.ClassifyFreeFlockHandoff,
+		ClearHandoff:    coordlock.DeleteHandoffJournal,
 	}
 }
 
 // Resolve answers "what should a caller do to reach project P's sole coord?"
 //
-// agentID is the caller's pre-allocated coord id, stamped into the `starting`
-// record on a fresh claim (Spawn / SpawnStandby) as the spawn-serialization
-// token. It MAY be "" for a pure read (a poll that only wants Attach/Wait);
-// a decision that would spawn with an empty agentID degrades to Wait, since
-// the caller cannot spawn without an id.
-//
-// Resolve performs the lease-record CAS side effects (Supersede / ClaimStarting)
-// but NOT the process side effects (attach / spawn) — the caller owns those.
-// A benign CAS race (another spawn won between our reads and our CAS) always
-// resolves to Wait, so the caller re-resolves rather than spawning a
-// duplicate — the "exactly one coord" guarantee (T8) under concurrent [a].
+// agentID is the caller's pre-allocated coord id (used only to gate Spawn — a
+// decision that would spawn with an empty agentID degrades to Wait since the
+// caller cannot spawn without an id). It MAY be "" for a pure read.
 func Resolve(d Deps, project, agentID string) (Verdict, error) {
-	// (1) The flock is HELD by a live process (LiveOwner is now the LOCK_SH
-	// busy probe — flock-only D1/D6). A live flock holder — busy, booting, or
-	// version-skewed — is the coord and is NEVER spawned beside (the incident
-	// fix; no-auto-kill). Two sub-cases by the body's identity:
-	//   - agent_id present  ⇒ Attach to it (T1/T10).
-	//   - identity-less body ⇒ Wait, NOT Attach (D6). The body is old-binary /
-	//     torn (agent_id==""), and the attach callers (cmd/fleet/attach.go,
-	//     internal/tui/coord_resolve.go) hard-error on an empty AgentID, so
-	//     Attach-with-empty-id would dead-end and violate attach-never-exits.
-	//     Wait reschedules until the identity appears (a re-stamp / the coord
-	//     finishing boot) or the holder dies — never a spawn-beside (T13).
+	// (1) The flock is HELD by a live process (busy⇒owner). A live holder —
+	// busy, booting, or version-skewed — is the coord and is NEVER spawned
+	// beside (the incident fix; no-auto-kill).
 	if owner, ok := d.LiveOwner(project); ok {
 		if owner.AgentID == "" {
+			// Identity-less body (old-binary straggler / torn). The attach
+			// callers hard-error on an empty AgentID, so Attach-with-empty-id
+			// would dead-end. Wait (poll for the identity); attach's
+			// PROJECT-RECOVERY chain falls back to projectlookup.FindLiveCoord
+			// (D9e) to Attach via the agent record — never a spawn-beside.
 			return Verdict{
 				Decision: Wait,
 				Reason:   "flock held by a live coord whose identity is not yet readable; polling",
@@ -163,117 +124,54 @@ func Resolve(d Deps, project, agentID string) (Verdict, error) {
 		return Verdict{
 			Decision: Attach,
 			Owner:    owner,
-			Reason:   "process-live active lease owner " + owner.AgentID,
+			Reason:   "live flock holder " + owner.AgentID,
 		}, nil
 	}
 
-	// (2) A `starting` owner: a coord acquired the flock and is booting its
-	// /coordinator loop but has not flipped to `active` yet.
-	if st, ok := d.CurrentStarting(project); ok {
-		// ownerConfirmedDead is true only when the pid WAS stamped (the
-		// pre-spawn ClaimStartingRecord window has closed — a real
-		// coord-run supervisor holds/held the flock) and that pid is
-		// PROVABLY dead (pid+pid_start reuse-safe). No-auto-kill protects
-		// LIVE processes only; a confirmed-dead owner has nothing left to
-		// protect, so it must NOT wait out the rest of startingTTL. Without
-		// this, a pre-activation crash (child.Start() failed, or the
-		// supervisor was killed before Activate) reads as WithinTTL for up
-		// to ~120s even though the flock is already free, turning attach/
-		// spawn recovery into a multi-minute outage (codex D4 iter-1 [P1]).
-		ownerConfirmedDead := st.Owner.PID > 0 && !st.OwnerLive
-		if st.WithinTTL && !ownerConfirmedDead {
-			// Healthy boot in flight -> WAIT: the owner pid is not stamped
-			// during the pre-spawn ClaimStartingRecord window, so a
-			// not-yet-live owner within TTL is still a legitimate boot, not
-			// a duplicate trigger (T2).
-			return Verdict{
-				Decision: Wait,
-				Reason:   "coord boot in flight (starting within TTL)",
-			}, nil
-		}
-		if st.Owner.PID > 0 && st.OwnerLive {
-			// Wedged past startingTTL but the process is LIVE and holding the
-			// flock (T6s). Supersede the stale record — a PURE record CAS that
-			// signals NO process (no-auto-kill) — so the zombie's Activate
-			// fails closed, then spawn a `--standby` that polls behind the
-			// held flock. A fresh (non-standby) coord-run would stand down on
-			// the live-starting holder and leave no coord.
-			//
-			// Note: a repeated [a] press while the zombie lingers re-bumps the
-			// epoch each pass (the resolver is stateless and cannot see the
-			// already-polling standby). That is bounded epoch inflation on
-			// rare manual presses, NOT a poll loop — acceptable.
-			if agentID == "" {
-				// A pure READ (agentID=="", documented at the top of Resolve)
-				// must not perform the mutating Supersede CAS: without an id
-				// to spawn a standby behind it, superseding here would
-				// permanently fence the wedged starter's Activate and then
-				// leave the project with NO recovery path until some LATER
-				// caller happens to probe with a real id (codex D4 iter-6
-				// [P2]) — a needless, one-way mutation from what the caller
-				// asked to be a read-only probe.
-				return Verdict{
-					Decision: Wait,
-					Reason:   "wedged starting lease observed; caller has no id to supersede+spawn a standby",
-				}, nil
-			}
-			bumped, err := d.Supersede(project, st.Epoch)
-			if err != nil {
-				return Verdict{}, fmt.Errorf("coordreconcile: supersede wedged starting lease (project=%q epoch=%d): %w", project, st.Epoch, err)
-			}
-			if !bumped {
-				// Benign race: the record flipped to active/released or moved
-				// to a newer epoch. Re-resolve.
-				return Verdict{
-					Decision: Wait,
-					Reason:   "wedged starting lease raced during supersede; re-resolve",
-				}, nil
-			}
-			return Verdict{
-				Decision: SpawnStandby,
-				Reason:   "wedged starting lease superseded (record CAS, no process signalled); spawn standby behind held flock",
-			}, nil
-		}
-		// A `starting` record whose owner is DEAD (or unset): the flock is
-		// (or will be) free. Fall through to the free/dead claim branch —
-		// ClaimStartingRecord overwrites a past-TTL starting record, which
-		// fences the dead starter (its Activate no longer names it).
-	}
-
-	// (3) A valid handoff reservation names a successor still within its TTL
-	// (#247 gap-window rule a): WAIT for that successor rather than spawning a
-	// duplicate. If the successor died mid-boot, CurrentHandoff already
-	// reports the reservation expired -> we fall through to spawn (#247 fix).
-	if h, ok := d.CurrentHandoff(project); ok {
+	// (2) The flock is FREE — consult the handoff journal (Decision 7 Abandon).
+	disp, _, err := d.ClassifyHandoff(project)
+	if err != nil {
+		// A torn/unreadable journal is ambiguous: a handoff may be in flight.
+		// Do NOT spawn beside a possibly-booting successor — Wait and re-resolve.
 		return Verdict{
 			Decision: Wait,
-			Reason:   "handoff reservation naming successor " + h.SuccessorID,
+			Reason:   fmt.Sprintf("handoff journal for %q unreadable (%v); polling before spawn", project, err),
 		}, nil
 	}
+	switch disp {
+	case coordlock.HandoffInFlight:
+		// A handoff is in flight and the recorded successor's process is ALIVE
+		// (booting, not yet holding the flock). Hold off — don't spawn beside it.
+		return Verdict{
+			Decision: Wait,
+			Reason:   "handoff in flight; successor process alive and acquiring the flock",
+		}, nil
+	case coordlock.HandoffAbandoned:
+		// The recorded successor died mid-boot. Clear the stale journal + barrier
+		// FIRST (clear-before-spawn — else the fixed-path O_EXCL wedges every
+		// future handoff), then spawn a fresh coord.
+		if d.ClearHandoff != nil {
+			if cerr := d.ClearHandoff(project); cerr != nil {
+				return Verdict{}, fmt.Errorf("coordreconcile: clear abandoned handoff journal (project=%q): %w", project, cerr)
+			}
+		}
+		// fall through to the spawn gate below
+	}
 
-	// (4) Free / dead-active lease. Step (1) already excluded every
-	// PROCESS-LIVE active owner, so any active record here has a provably-dead
-	// owner — the ClaimStartingRecord CAS can never clobber a live coord.
+	// (3) Free flock, no in-flight handoff (or an abandoned one just cleared) ->
+	// spawn a fresh coord that acquires the free flock.
 	if agentID == "" {
 		return Verdict{
 			Decision: Wait,
-			Reason:   "lease free but caller has no id to claim",
+			Reason:   "lease free but caller has no id to spawn",
 		}, nil
 	}
-	claimed, err := d.ClaimStarting(project, agentID)
-	if err != nil {
-		return Verdict{}, fmt.Errorf("coordreconcile: claim starting record (project=%q agent=%q): %w", project, agentID, err)
-	}
-	if !claimed {
-		// A concurrent spawn/owner claimed the lease between our reads and the
-		// CAS -> stand down and re-resolve (T8: exactly one coord wins).
-		return Verdict{
-			Decision: Wait,
-			Reason:   "lease claimed by a concurrent spawn; re-resolve",
-		}, nil
+	reason := "lease free; spawning a fresh coord"
+	if disp == coordlock.HandoffAbandoned {
+		reason = "handoff abandoned (successor process dead); cleared stale journal, spawning fresh"
 	}
 	return Verdict{
 		Decision: Spawn,
-		Reason:   "free lease claimed (starting record written)",
+		Reason:   reason,
 	}, nil
 }
