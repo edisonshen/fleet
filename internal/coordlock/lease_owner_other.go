@@ -10,6 +10,11 @@ func CurrentOwner(string) (Owner, bool) { return Owner{}, false }
 // primitive.
 func LiveOwner(string) (Owner, bool) { return Owner{}, false }
 
+// CurrentActiveOwnerPID is unsupported on platforms without the coordinator
+// lease primitive — there is never a flock to hold, so no PID is ever
+// reported.
+func CurrentActiveOwnerPID(string) (int, bool) { return 0, false }
+
 // LeaseRecordActive is false on platforms without the lease primitive (no
 // flock is ever held), so handoff delivery treats every coord as a
 // legacy/bare coord and direct-sends — matching the never-wrapped spawn path.
