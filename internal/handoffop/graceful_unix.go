@@ -10,25 +10,32 @@
 //	│ ORCHESTRATOR (fleet handoff / drain)       STANDBY coord (warm)    │
 //	│   GracefulHandoff():                                               │
 //	│     1. spawn ONE standby (coord-run --standby) ─────▶ poll loop    │
-//	│     2. write handoff doc        (atomic, fsync)      (busy: BUSY)  │
-//	│     3. write checkpoint         (atomic, fsync)                    │
-//	│     4. drain in-flight work safely (no crash)                      │
-//	│     5. write handoff-complete-<barrier_id>.json BARRIER            │
-//	│        (atomic, ONLY after 2+3 fsynced; barrier_id from the        │
-//	│         write-once handoff journal, PR-2 D3 — NOT the epoch)       │
+//	│     2. create handoff journal   (O_EXCL, fsync)      (busy: BUSY)  │
+//	│        (names barrier_id; MUST precede step 6 — BarrierExists      │
+//	│         resolves the barrier THROUGH this journal, so a barrier    │
+//	│         written before its journal entry is invisible to drain —   │
+//	│         codex PR2-review [P1])                                     │
+//	│     3. write handoff doc        (atomic, fsync)                    │
+//	│     4. write checkpoint         (atomic, fsync)                    │
+//	│     5. drain in-flight work safely (no crash)                      │
+//	│     6. write handoff-complete-<barrier_id>.json BARRIER            │
+//	│        (atomic, ONLY after 2+3+4+5 durable; barrier_id is the      │
+//	│         SAME id already durable in the journal from step 2)        │
 //	│   ── completion phase (only when the seams are wired) ──           │
-//	│     6. RetireOld: OLD releases lease + exits ──▶ poll ACQUIRES     │
+//	│     7. RetireOld: OLD releases lease + exits ──▶ poll ACQUIRES     │
 //	│                                                  (winner reaps     │
 //	│                                                  losing siblings)  │
-//	│     7. DeliverDocToWinner: poll lock owner ─────▶ inject doc       │
+//	│     8. DeliverDocToWinner: poll lock owner ─────▶ inject doc       │
 //	│        (mark-after-verified-send; §5c)                             │
 //	└───────────────────────────────────────────────────────────────────┘
 //
 // The barrier ordering is load-bearing: the barrier is the drain
 // verifier's "safe to graceful-kill OLD" signal, so it must NEVER appear on
-// disk before the doc + checkpoint are durable. If any earlier step fails,
-// GracefulHandoff returns WITHOUT writing the barrier (the drain path then
-// escalates to the safety net rather than seeing a false "all clean").
+// disk before the journal that names it (BarrierExists resolves the barrier
+// path THROUGH the journal's barrier_id) NOR before the doc + checkpoint are
+// durable. If any earlier step fails, GracefulHandoff returns WITHOUT
+// writing the barrier (the drain path then escalates to the safety net
+// rather than seeing a false "all clean").
 //
 // Completion-phase failure semantics are the inverse: once the barrier is
 // durable the standby is NEVER reaped — it (or the lazy [a]-attach recovery
@@ -105,6 +112,25 @@ type GracefulHandoffDeps struct {
 	// mid-flight. nil = nothing to drain (a no-op is valid). An error here
 	// aborts BEFORE the barrier so the safety net handles recovery.
 	DrainInFlight func() error
+	// CreateHandoffJournal durably creates the write-once handoff journal
+	// (coordlock's O_EXCL create + collision-resolve) BEFORE the completion
+	// barrier is written, naming barrierID as the journal's persisted
+	// barrier_id. This MUST run before the barrier write (D3; codex
+	// PR2-review [P1]): the drain verifier's BarrierExists resolves the
+	// barrier path THROUGH the journal's barrier_id, so a barrier durable on
+	// disk before its journal entry exists (or a crash in that window) is
+	// invisible to drain and can fall back to a legacy Resume that spawns a
+	// SECOND successor while the intended standby is already alive.
+	// Production (GracefulCoordSwap): a closure over the same
+	// createHandoffJournalResolving + buildHandoffJournal AtomicCoordSwap's
+	// own step 4 uses, so AtomicCoordSwap sees an already-durable matching
+	// entry and skips the redundant create. A create failure is SOFT (same
+	// philosophy as AtomicCoordSwap's step 4): logged, never aborts —
+	// flock-exclusivity remains the hard no-duplicate-coordinator guarantee;
+	// the journal only makes the common handoff window spawn-free without a
+	// timer. nil = no journal to create (a bespoke/prepare-only caller with
+	// nothing to journal; never nil on the GracefulCoordSwap route).
+	CreateHandoffJournal func(barrierID string) error
 	// BarrierPath resolves the handoff-complete-<barrierID>.json path (PR-2 D3:
 	// keyed by the per-cycle barrier id, not the deleted epoch).
 	// Production: coordlock.HandoffBarrierPath.
@@ -155,13 +181,15 @@ var newHandoffBarrierID = coordlock.NewBarrierID
 // the barrier so the drain path never reads a premature "all clean."
 //
 //  1. spawn ONE standby                       (background poller)
-//  2. write handoff doc      (atomic, fsync)  } durable BEFORE the
-//  3. write checkpoint       (atomic, fsync)  } barrier — load-bearing
-//  4. drain in-flight work safely (no crash)
-//  5. write handoff-complete-<barrier_id>.json (atomic; barrier — id from
-//     the write-once handoff journal, PR-2 D3, not the epoch)
-//  6. RetireOld    — OLD releases the lease + exits        } completion
-//  7. DeliverDocToWinner — poll lock winner, inject doc    } (PR3; only
+//  2. create the write-once handoff journal   (O_EXCL, fsync; MUST precede
+//     the barrier — CreateHandoffJournal, PR2-review [P1])
+//  3. write handoff doc      (atomic, fsync)  } durable BEFORE the
+//  4. write checkpoint       (atomic, fsync)  } barrier — load-bearing
+//  5. drain in-flight work safely (no crash)
+//  6. write handoff-complete-<barrier_id>.json (atomic; barrier_id is the
+//     SAME id already durable in the journal from step 2)
+//  7. RetireOld    — OLD releases the lease + exits        } completion
+//  8. DeliverDocToWinner — poll lock winner, inject doc    } (PR3; only
 //     } when wired)
 //
 // Prepare-only mode (nil completion seams): on success the OLD coord may
@@ -196,12 +224,11 @@ func GracefulHandoff(in GracefulHandoffInputs, d GracefulHandoffDeps) error {
 	}
 
 	// Allocate the per-cycle barrier id FIRST (PR-2 D3): it names BOTH the
-	// completion barrier this producer writes (step 5) AND the write-once
-	// handoff journal AtomicCoordSwap creates inside RetireOld (step 6), so the
+	// write-once handoff journal (created next, step 2, BEFORE the barrier)
+	// AND the completion barrier this producer writes (step 6), so the
 	// producer and the drain verifier resolve the SAME barrier file
-	// (coordlock.HandoffBarrierPath). Threading one allocated id closes the
-	// round-1 sequencing gap where the barrier was named before the journal
-	// allocated it. Never reused across cycles.
+	// (coordlock.HandoffBarrierPath) through the SAME journal entry. Never
+	// reused across cycles.
 	barrierID := newHandoffBarrierID()
 	if barrierID == "" {
 		return fmt.Errorf(
@@ -225,11 +252,29 @@ func GracefulHandoff(in GracefulHandoffInputs, d GracefulHandoffDeps) error {
 	// standby was already spawned by the caller and the seam is a no-op.
 	_, _ = fmt.Fprintf(stderr, "graceful-handoff: standby coord ready for %s (barrier %s)\n", project, barrierID)
 
-	// Steps 2-5 run AFTER the standby is alive. If ANY of them fails we must
-	// REAP the standby (codex PR3 iter-2 [P2]): a standby left polling after a
-	// half-done handoff could acquire the lease WITHOUT the completed
-	// checkpoint + barrier this flow guarantees. OLD stays leader and a
-	// retry / the safety net recovers cleanly with no orphan standby.
+	// Step 2: create the write-once handoff journal BEFORE the barrier
+	// (D3; codex PR2-review [P1]). This MUST precede gracefulDurableSteps's
+	// barrier write (step 6): the drain verifier's BarrierExists resolves the
+	// barrier path THROUGH the journal's persisted barrier_id, so a barrier
+	// written while the journal is still absent (or a crash in that exact
+	// window) is a durable barrier drain can never find. SOFT failure: a
+	// create error only logs — flock-exclusivity, not the journal, is the
+	// hard no-duplicate-coordinator guarantee.
+	if d.CreateHandoffJournal != nil {
+		if jerr := d.CreateHandoffJournal(barrierID); jerr != nil {
+			_, _ = fmt.Fprintf(stderr,
+				"graceful-handoff: WARNING — create handoff journal for %s failed: %v "+
+					"(proceeding; flock-exclusivity still bounds any duplicate to one transient stand-down)\n",
+				project, jerr)
+		}
+	}
+
+	// Steps 3-6 run AFTER the standby is alive and the journal is durable. If
+	// ANY of them fails we must REAP the standby (codex PR3 iter-2 [P2]): a
+	// standby left polling after a half-done handoff could acquire the lease
+	// WITHOUT the completed checkpoint + barrier this flow guarantees. OLD
+	// stays leader and a retry / the safety net recovers cleanly with no
+	// orphan standby.
 	if err := gracefulDurableSteps(in, d, project, barrierID, stderr); err != nil {
 		if d.ReapStandby != nil {
 			if rerr := d.ReapStandby(); rerr != nil {
@@ -251,7 +296,7 @@ func GracefulHandoff(in GracefulHandoffInputs, d GracefulHandoffDeps) error {
 		return nil
 	}
 
-	// Step 6: retire OLD. The barrier is durable, so OLD may now release the
+	// Step 7: retire OLD. The barrier is durable, so OLD may now release the
 	// lease and exit; the polling standby (or a duplicate-attach racer — the
 	// winner reaps the losers on acquire, PR2) wins the freed lock. On error
 	// the standby is NOT reaped: the barrier is up, so the drain verifier /
@@ -262,7 +307,7 @@ func GracefulHandoff(in GracefulHandoffInputs, d GracefulHandoffDeps) error {
 			in.OldRec.ID, project, err, barrierID)
 	}
 
-	// Step 7: deliver the doc to whoever WON the lock. On error the doc /
+	// Step 8: deliver the doc to whoever WON the lock. On error the doc /
 	// caller queue stays PENDING so a later drain/attach re-delivers (§5c) —
 	// again no standby reap (the winner may be the live coord by now).
 	winner, err := d.DeliverDocToWinner()
@@ -341,6 +386,13 @@ func GracefulCoordSwap(oldRec, newRec *agent.Record, docPath string,
 	var winner *agent.Record
 	deps := gracefulSwapDepsFn()
 	deps.SpawnStandby = func(time.Duration) error { return nil } // standby == newRec, already spawned
+	deps.CreateHandoffJournal = func(barrierID string) error {
+		// Create the journal BEFORE GracefulHandoff writes the barrier
+		// (D3; codex PR2-review [P1]) using the exact same builder
+		// AtomicCoordSwap's own step 4 uses, so that step recognizes this
+		// entry as already-durable and skips its redundant create.
+		return createHandoffJournalResolving(buildHandoffJournal(oldRec.Project, oldRec, newRec, barrierID))
+	}
 	deps.RetireOld = func(barrierID string) error {
 		_, err := atomicCoordSwapFn(AtomicCoordSwapInputs{
 			Project:              oldRec.Project,
@@ -384,14 +436,16 @@ func GracefulCoordSwap(oldRec, newRec *agent.Record, docPath string,
 	return winner, nil
 }
 
-// gracefulDurableSteps runs steps 2-5 (doc, checkpoint, drain, barrier) in
+// gracefulDurableSteps runs steps 3-6 (doc, checkpoint, drain, barrier) in
 // the fixed order. The barrier is the LAST side effect and is written ONLY
 // after doc + checkpoint + drain are durable. Any failure short-circuits
 // BEFORE the barrier (so the drain path never reads a premature "all clean").
+// The caller (GracefulHandoff) has already created the handoff journal
+// (step 2) naming barrierID before this runs.
 func gracefulDurableSteps(in GracefulHandoffInputs, d GracefulHandoffDeps,
 	project, barrierID string, stderr io.Writer) error {
 
-	// Step 2: write the handoff doc durably (atomic). Skipped when the
+	// Step 3: write the handoff doc durably (atomic). Skipped when the
 	// producer already wrote it (empty DocContent).
 	if in.HandoffDocPath != "" && len(in.HandoffDoc) > 0 {
 		if err := d.WriteAtomic(in.HandoffDocPath, in.HandoffDoc); err != nil {
@@ -399,7 +453,7 @@ func gracefulDurableSteps(in GracefulHandoffInputs, d GracefulHandoffDeps,
 		}
 	}
 
-	// Step 3: write the checkpoint durably (atomic). The barrier is written
+	// Step 4: write the checkpoint durably (atomic). The barrier is written
 	// ONLY after this returns, so a torn/failed checkpoint can never be
 	// followed by a barrier claiming completion.
 	if in.CheckpointPath != "" && len(in.Checkpoint) > 0 {
@@ -408,7 +462,7 @@ func gracefulDurableSteps(in GracefulHandoffInputs, d GracefulHandoffDeps,
 		}
 	}
 
-	// Step 4: drain in-flight work safely. Must NOT crash mid-flight — on
+	// Step 5: drain in-flight work safely. Must NOT crash mid-flight — on
 	// error we abort before the barrier so the safety net replays.
 	if d.DrainInFlight != nil {
 		if err := d.DrainInFlight(); err != nil {
@@ -416,10 +470,11 @@ func gracefulDurableSteps(in GracefulHandoffInputs, d GracefulHandoffDeps,
 		}
 	}
 
-	// Step 5: write the completion barrier — the LAST step, only now that
-	// doc + checkpoint + in-flight drain are all durable. Named by the
-	// per-cycle barrier id (PR-2 D3), so a prior-cycle leftover (a different id)
-	// is excluded. Atomic so a torn .tmp is never renamed into place (T43).
+	// Step 6: write the completion barrier — the LAST step, only now that
+	// the journal (step 2) + doc + checkpoint + in-flight drain are all
+	// durable. Named by the per-cycle barrier id (PR-2 D3), so a prior-cycle
+	// leftover (a different id) is excluded. Atomic so a torn .tmp is never
+	// renamed into place (T43).
 	barrierPath, err := d.BarrierPath(project, barrierID)
 	if err != nil {
 		return fmt.Errorf("handoffop.GracefulHandoff: resolve barrier path for project %q: %w", project, err)

@@ -153,6 +153,122 @@ func TestGracefulHandoff_EndToEnd_OneStandby_BarrierLast(t *testing.T) {
 	}
 }
 
+// codex PR2-review [P1]: CreateHandoffJournal MUST run BEFORE the barrier
+// write (D3 — BarrierExists resolves the barrier path THROUGH the journal's
+// barrier_id, so a barrier durable before its journal entry exists is
+// invisible to drain). This pins the ordering AND that the journal seam is
+// handed the exact same barrier id the barrier file ends up naming.
+func TestGracefulHandoff_CreateHandoffJournal_RunsBeforeBarrier(t *testing.T) {
+	orig := newHandoffBarrierID
+	newHandoffBarrierID = func() string { return "b-journal-first" }
+	t.Cleanup(func() { newHandoffBarrierID = orig })
+
+	rec := newGracefulRecorder()
+	var gotBarrierID string
+	in := GracefulHandoffInputs{
+		OldRec:         oldRecForGraceful(),
+		HandoffDocPath: gracefulDocPath,
+		HandoffDoc:     []byte("# doc\n"),
+		CheckpointPath: gracefulCheckpointPath,
+		Checkpoint:     []byte("{}"),
+	}
+	deps := GracefulHandoffDeps{
+		SpawnStandby: func(time.Duration) error { rec.note("spawn-standby"); return nil },
+		CreateHandoffJournal: func(barrierID string) error {
+			gotBarrierID = barrierID
+			rec.note("create-journal")
+			return nil
+		},
+		WriteAtomic:   rec.write,
+		DrainInFlight: func() error { rec.note("drain"); return nil },
+		BarrierPath:   func(_ string, _ string) (string, error) { return gracefulBarrierPath, nil },
+	}
+	if err := GracefulHandoff(in, deps); err != nil {
+		t.Fatalf("GracefulHandoff: %v", err)
+	}
+
+	order, writes, _ := rec.snapshot()
+	iSpawn := orderIdx(order, "spawn-standby")
+	iJournal := orderIdx(order, "create-journal")
+	iDoc := orderIdx(order, "write:"+gracefulDocPath)
+	iCkpt := orderIdx(order, "write:"+gracefulCheckpointPath)
+	iDrain := orderIdx(order, "drain")
+	iBarrier := orderIdx(order, "write:"+gracefulBarrierPath)
+	if iSpawn == -1 || iJournal == -1 || iDoc == -1 || iCkpt == -1 || iDrain == -1 || iBarrier == -1 {
+		t.Fatalf("missing expected step(s); order=%v", order)
+	}
+	if iSpawn > iJournal {
+		t.Errorf("journal created before the standby spawned; order=%v", order)
+	}
+	if iJournal >= iDoc || iJournal >= iCkpt || iJournal >= iDrain || iJournal >= iBarrier {
+		t.Errorf("journal must be created BEFORE doc/checkpoint/drain/barrier; order=%v", order)
+	}
+	if gotBarrierID != "b-journal-first" {
+		t.Errorf("journal seam got barrier id %q, want b-journal-first", gotBarrierID)
+	}
+	if b := string(writes[gracefulBarrierPath]); !strings.Contains(b, `"barrier_id":"b-journal-first"`) {
+		t.Errorf("barrier does not name the SAME id passed to the journal seam: %q", b)
+	}
+}
+
+// A CreateHandoffJournal failure is SOFT (same philosophy as AtomicCoordSwap's
+// own journal-create step): it must NOT abort the handoff. The barrier still
+// gets written — flock-exclusivity, not the journal, is the hard
+// no-duplicate-coordinator guarantee.
+func TestGracefulHandoff_CreateHandoffJournalError_Soft_StillWritesBarrier(t *testing.T) {
+	rec := newGracefulRecorder()
+	journalErr := errors.New("journal disk full")
+	var journalCalls int
+	in := GracefulHandoffInputs{
+		OldRec:         oldRecForGraceful(),
+		HandoffDocPath: gracefulDocPath,
+		HandoffDoc:     []byte("# doc\n"),
+	}
+	deps := GracefulHandoffDeps{
+		SpawnStandby: func(time.Duration) error { return nil },
+		CreateHandoffJournal: func(string) error {
+			journalCalls++
+			return journalErr
+		},
+		WriteAtomic: rec.write,
+		BarrierPath: func(_ string, _ string) (string, error) { return gracefulBarrierPath, nil },
+	}
+	if err := GracefulHandoff(in, deps); err != nil {
+		t.Fatalf("a journal-create failure must be soft (no hard error), got: %v", err)
+	}
+	if journalCalls != 1 {
+		t.Errorf("CreateHandoffJournal called %d times, want 1", journalCalls)
+	}
+	_, writes, _ := rec.snapshot()
+	if _, ok := writes[gracefulBarrierPath]; !ok {
+		t.Errorf("barrier not written despite a soft journal-create failure")
+	}
+}
+
+// nil CreateHandoffJournal is a valid legal state (bespoke/prepare-only
+// callers with nothing to journal) — GracefulHandoff must not panic or
+// misbehave when the seam is unset.
+func TestGracefulHandoff_NilCreateHandoffJournal_Skipped(t *testing.T) {
+	rec := newGracefulRecorder()
+	in := GracefulHandoffInputs{
+		OldRec:         oldRecForGraceful(),
+		HandoffDocPath: gracefulDocPath,
+		HandoffDoc:     []byte("# doc\n"),
+	}
+	deps := GracefulHandoffDeps{
+		SpawnStandby: func(time.Duration) error { return nil },
+		WriteAtomic:  rec.write,
+		BarrierPath:  func(_ string, _ string) (string, error) { return gracefulBarrierPath, nil },
+	}
+	if err := GracefulHandoff(in, deps); err != nil {
+		t.Fatalf("GracefulHandoff with nil CreateHandoffJournal: %v", err)
+	}
+	_, writes, _ := rec.snapshot()
+	if _, ok := writes[gracefulBarrierPath]; !ok {
+		t.Errorf("barrier not written with a nil journal seam")
+	}
+}
+
 // T43: a checkpoint write error aborts BEFORE the barrier — no barrier is
 // written. (The atomic .tmp->rename guarantee lives in state.WriteAtomic;
 // here we assert the ORDERING invariant: the barrier is never reached if an
@@ -583,6 +699,12 @@ func TestGracefulSwapEligible(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestGracefulCoordSwap_BarrierThenSwapThenDeliver_ReturnsWinner(t *testing.T) {
+	// GracefulCoordSwap now wires a REAL CreateHandoffJournal closure (D3;
+	// codex PR2-review [P1] fix) that touches real coordlock disk state via
+	// state.ProjectDir — isolate FLEET_HOME so this never writes under the
+	// developer/CI machine's actual ~/.fleet (oldRecForGraceful's project,
+	// "projects-fleet", is this very repo's real project name).
+	setupFleetHome(t)
 	rec := newGracefulRecorder()
 	oldRec := oldRecForGraceful()
 	newRec := agent.New("standby01")
@@ -639,6 +761,9 @@ func TestGracefulCoordSwap_BarrierThenSwapThenDeliver_ReturnsWinner(t *testing.T
 }
 
 func TestGracefulCoordSwap_SwapError_Propagates_NoDeliver(t *testing.T) {
+	// See isolation note in TestGracefulCoordSwap_BarrierThenSwapThenDeliver_ReturnsWinner:
+	// CreateHandoffJournal is real; sandbox FLEET_HOME.
+	setupFleetHome(t)
 	rec := newGracefulRecorder()
 	oldRec := oldRecForGraceful()
 	newRec := agent.New("standby01")

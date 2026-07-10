@@ -44,13 +44,16 @@ package handoffop
 //   step 2 ─────►  spawn.Spawn(newRecSpec) → NEW alive         (skipped when AlreadySpawnedNewRec)
 //   step 3.a ───►  WaitForReadyToPrompt(NEW)
 //   step 3.b ───►  SessionAlive(NEW)  ◄─ ambiguous-error: preserve; dead: drop + OLD keeps lease
-//   step 4 ─────►  ReserveHandoff(project, NEW.ID) on OLD's lease  (soft TTL guard; skipped if oldIsDead)
+//   step 4 ─────►  create the write-once handoff journal naming NEW +      (soft guard; skipped if
+//                  barrierID (PR-2 D3) — a no-op if the GRACEFUL producer    oldIsDead; a create
+//                  (graceful_unix's CreateHandoffJournal seam) already made  failure only logs)
+//                  this exact entry durable BEFORE this helper ran
 //   step 5.a ───►  SendKeys(OLD, "/exit"); sleep grace          (skipped if oldIsDead)
 //   step 5.b ───►  tmux.Kill(OLD)                               (skipped if oldIsDead)
 //   step 5.c ───►  SessionAlive(OLD)  ──── alive=true → FAILURE MODE 5 (surface, never re-kill)
 //   step 6 ─────►  oldRec.Archive()                             (skipped if oldIsDead)
 //   step 7 ─────►  release swap.lock; return
-//   (COMMIT is async: the winning standby's epoch bump when it acquires the freed flock)
+//   (COMMIT is the winning standby's first-tick journal+barrier delete once it acquires the freed flock)
 
 import (
 	"errors"
@@ -371,16 +374,35 @@ func AtomicCoordSwap(in AtomicCoordSwapInputs, stderr io.Writer) (AtomicCoordSwa
 	// common handoff window spawn-free without a timer. So a create failure
 	// never rolls back NEW or aborts the swap — it only logs. Skipped on
 	// OldIsDead (no live OLD; the dead-coord recovery has no successor to name).
+	//
+	// codex PR2-review [P1]: on the GRACEFUL route this journal is already
+	// durable by the time we get here — GracefulHandoff's CreateHandoffJournal
+	// seam creates it BEFORE the completion barrier is written (the barrier
+	// must never appear on disk before the journal entry that lets drain's
+	// BarrierExists (journal-first) find it). Re-running createHandoffJournalResolving
+	// against our OWN just-created entry would misreport it as a live
+	// in-flight collision (Decision 7's O_EXCL-collision arm has no
+	// "same successor, already mine" case) and log a spurious warning. Skip
+	// the redundant create when an existing journal already names this exact
+	// successor+barrier; the bespoke non-graceful callers never pre-create, so
+	// this is a normal create for them, unchanged.
 	if !in.OldIsDead {
 		barrierID := in.BarrierID
 		if barrierID == "" {
 			barrierID = coordlock.NewBarrierID()
 		}
-		if cerr := createHandoffJournalResolving(
-			buildHandoffJournal(in.Project, in.OldRec, newRec, barrierID)); cerr != nil && stderr != nil {
-			_, _ = fmt.Fprintf(stderr,
-				"warning: atomic coord swap: create handoff journal for project %s successor %s failed: %v (proceeding; flock-exclusivity + winner-delivery still hold)\n",
-				in.Project, newRec.ID, cerr)
+		want := buildHandoffJournal(in.Project, in.OldRec, newRec, barrierID)
+		alreadyDurable := false
+		if existing, ok, rerr := coordlock.ReadHandoffJournal(in.Project); rerr == nil && ok &&
+			existing.SuccessorID == want.SuccessorID && existing.BarrierID == want.BarrierID {
+			alreadyDurable = true
+		}
+		if !alreadyDurable {
+			if cerr := createHandoffJournalResolving(want); cerr != nil && stderr != nil {
+				_, _ = fmt.Fprintf(stderr,
+					"warning: atomic coord swap: create handoff journal for project %s successor %s failed: %v (proceeding; flock-exclusivity + winner-delivery still hold)\n",
+					in.Project, newRec.ID, cerr)
+			}
 		}
 	}
 

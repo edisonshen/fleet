@@ -275,6 +275,58 @@ func TestAtomicCoordSwap_JournalCollision_LiveSuccessor_SoftGuard(t *testing.T) 
 	}
 }
 
+// TestAtomicCoordSwap_JournalPreCreated_SkipsRedundantCreate is the codex
+// PR2-review [P1] regression guard: on the GRACEFUL route,
+// graceful_unix.go's CreateHandoffJournal seam now creates the journal
+// BEFORE AtomicCoordSwap ever runs (D3 fix — the journal must precede the
+// barrier so BarrierExists, which resolves the barrier path THROUGH the
+// journal, never misses an already-durable barrier). Step 4 here must
+// recognize its OWN just-created entry (same successor + same barrier id)
+// and skip the redundant create — the old code would otherwise call
+// createHandoffJournalResolving a second time, hit ErrHandoffJournalExists
+// against an entry that is neither committed-stale nor dead, and misreport a
+// spurious "live in-flight successor, not overwriting" collision.
+func TestAtomicCoordSwap_JournalPreCreated_SkipsRedundantCreate(t *testing.T) {
+	in, newRec := seedCoordSwap(t, "rainier", "oldcoord", "newcoord")
+	fake := &fakeSwap{
+		postReadyAlive: true,  // NEW alive
+		postKillAlive:  false, // OLD dead after kill
+	}
+	restore := fake.install(t, newRec)
+	defer restore()
+
+	const barrierID = "b-precreated"
+	in.BarrierID = barrierID
+	// Simulate GracefulHandoff's CreateHandoffJournal seam having ALREADY
+	// made this exact journal durable before AtomicCoordSwap ever runs.
+	if err := createHandoffJournalResolving(buildHandoffJournal(in.Project, in.OldRec, newRec, barrierID)); err != nil {
+		t.Fatalf("pre-create journal: %v", err)
+	}
+
+	var stderr bytes.Buffer
+	res, err := AtomicCoordSwap(in, &stderr)
+	if err != nil {
+		t.Fatalf("AtomicCoordSwap: %v (stderr=%s)", err, stderr.String())
+	}
+	if strings.Contains(stderr.String(), "create handoff journal") {
+		t.Errorf("spurious journal-create warning against an already-durable matching journal: %s", stderr.String())
+	}
+	assertHandoffJournalNames(t, in.Project, "newcoord")
+	j, ok, jerr := coordlock.ReadHandoffJournal(in.Project)
+	if jerr != nil || !ok {
+		t.Fatalf("read handoff journal: ok=%v err=%v", ok, jerr)
+	}
+	if j.BarrierID != barrierID {
+		t.Errorf("journal barrier_id = %q, want the pre-created %q (must not be regenerated)", j.BarrierID, barrierID)
+	}
+	if !fake.killCalled {
+		t.Errorf("Kill OLD must still run")
+	}
+	if !res.OldArchived {
+		t.Errorf("OldArchived = false; want true")
+	}
+}
+
 // TestAtomicCoordSwap_HappyPath_DeadOld covers case 4 — operator
 // invoked dead-coord resume via TUI [a]. oldIsDead=true: kill + archive
 // are SKIPPED; OLD record stays on disk for operator [x] cleanup.
