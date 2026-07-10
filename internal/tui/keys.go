@@ -13,7 +13,6 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 
 	"github.com/edisonshen/fleet/internal/agent"
-	"github.com/edisonshen/fleet/internal/coordlock"
 	"github.com/edisonshen/fleet/internal/coordreconcile"
 	"github.com/edisonshen/fleet/internal/coordrepo"
 	"github.com/edisonshen/fleet/internal/gc"
@@ -1302,13 +1301,11 @@ func (m Model) actionAttachProject(p *ProjectRow) (Model, tea.Cmd, bool) {
 		case coordreconcile.Attach:
 			next, cmd := m.attachResolvedCoordOwner(p.Name, "project", verdict)
 			return next, cmd, true
-		case coordreconcile.Wait, coordreconcile.SpawnStandby, coordreconcile.Spawn:
-			// Spawn must flow through the SAME auto-spawn consumer as
-			// Wait/SpawnStandby (see the func-level comment above): a
-			// real-agentID Resolve landing on Spawn has already claimed
-			// the starting record via ClaimStartingRecord, and there is
-			// no way to release that claim, so it must be fulfilled, not
-			// shown as a manual "[r] to reset" hint.
+		case coordreconcile.Wait, coordreconcile.Spawn:
+			// Spawn flows through the SAME auto-spawn consumer as Wait (PR-2 D4:
+			// the SpawnStandby verdict is gone — acquiring the flock IS becoming
+			// the coordinator). A real-agentID Resolve landing on Spawn should be
+			// fulfilled, not shown as a manual "[r] to reset" hint.
 			next, cmd := m.consumeResolvedCoordVerdict(p.Name, agentID, "project", tuiCoordResolveMaxAttempts, verdict)
 			return next, cmd, true
 		default:
@@ -1929,42 +1926,6 @@ func cwdGitCandidate() string {
 	}
 	return strings.TrimSpace(string(out))
 }
-
-// claimStartingRecordFn claims the coord's `starting` lease record after the
-// TUI's `[a]` auto-spawn — the D2 spawn-serialization primitive that replaced
-// the deleted coord-spawn marker as the identity signal (D3). See
-// claimCoordStartingRecord below for the semantics.
-//
-// var so tests can stub the lease claim (test helpers in
-// internal/tui/keys_test.go install a fake that records calls without
-// touching FLEET_HOME or the real lease).
-var claimStartingRecordFn = claimCoordStartingRecord
-
-// claimCoordStartingRecord is the production implementation of
-// claimStartingRecordFn. The coord-spawn marker is gone (D3); the coordinator
-// LEASE is the identity now. After `fleet dispatch` returns the coord's agent
-// ID, the TUI claims a `starting` lease record naming that agent
-// (coordlock.ClaimStartingRecord — the D2 spawn-serialization primitive) to
-// close the pre-boot window between dispatch returning and the coord-run
-// supervisor claiming the lease itself. That window is where a racing [a] could
-// otherwise spawn a duplicate.
-//
-// Best-effort by contract: ClaimStartingRecord returns ok=false (not an error)
-// when the lease is already owned / booting — e.g. the coord-run supervisor beat
-// us to it, or a racing standby is active. That is the expected, benign case
-// (the lease is already serialized by someone), so ok=false is NOT surfaced as a
-// failure; only a real error (unreadable epoch, mkdir failure) propagates so the
-// caller's flash message stays accurate.
-func claimCoordStartingRecord(projectName, agentID string) error {
-	if _, err := coordClaimStartingFn(projectName, agentID); err != nil {
-		return fmt.Errorf("claim coord starting record: %w", err)
-	}
-	return nil
-}
-
-// coordClaimStartingFn is the seam the unit test stubs to record the claim
-// without touching the real lease.
-var coordClaimStartingFn = coordlock.ClaimStartingRecord
 
 // dispatchAgentIDPattern matches an "agent <8-hex-id> spawned" line in
 // `fleet dispatch` stdout. We extract the ID so the follow-up lock-poll

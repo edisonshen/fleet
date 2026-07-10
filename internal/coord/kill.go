@@ -4,11 +4,12 @@ package coord
 
 // kill.go — KillCoordIfIdentityMatches: the ONE authenticated coord-kill
 // primitive (DESIGN-handoff-drain-storm-leak §B.5). Every path that
-// terminates a coord — the takeover STONITH (injected into the lease via
-// coordlock.AcquireLeaseWithKill), the new-leader competitor sweep, and
-// (in later PRs) the graceful drain killer / fleet doctor — funnels
-// through this function so the PID-reuse + exe-path + epoch + self gate is
-// enforced in exactly one place.
+// terminates a coord — the new-leader competitor sweep, `fleet rm`, and
+// `fleet gc` (corpse reaping) — funnels through this function so the
+// PID-reuse + exe-path + active-owner + self gate is enforced in exactly one
+// place. PR-2 retired the lease-injected takeover STONITH (the flock-only lease
+// never fences/kills: a hung-alive holder is cleared by `fleet rm`, a dead
+// holder already freed the flock).
 //
 // It targets the `fleet coord-run` SUPERVISOR pid (agent.Record.
 // SupervisorPID), NOT the engine child (agent.Record.PID). Killing the
@@ -33,7 +34,7 @@ package coord
 //	                              │
 //	   grace delay  →  SIGTERM  →  poll  →  SIGKILL
 //	                              │
-//	   stderr: "reaped coord pid=<n> agent=<id> epoch=<e>"
+//	   stderr: "reaped coord pid=<n> agent=<id>"
 
 import (
 	"errors"
@@ -54,11 +55,10 @@ import (
 // target. The supervisor wires the two together (coordlock.KillTarget ->
 // coord.KillTarget) in cmd/fleet/coord.go.
 type KillTarget struct {
-	Pid         int    // OLD coord-run supervisor pid to reap
-	PidStart    int64  // its start time at fence (PID-reuse guard)
-	AgentID     string // OLD coord's agent id (diagnostics + record match)
-	Project     string // scopes the kill to one project's coord
-	FencerEpoch int64  // the epoch the caller fenced TO (diagnostics + log)
+	Pid      int    // OLD coord-run supervisor pid to reap
+	PidStart int64  // its start time at fence (PID-reuse guard)
+	AgentID  string // OLD coord's agent id (diagnostics + record match)
+	Project  string // scopes the kill to one project's coord
 }
 
 // ErrKillRefused wraps every "do not signal" outcome so callers can
@@ -361,8 +361,8 @@ func killCoord(target KillTarget, d KillDeps) error {
 		}
 	}
 
-	_, _ = fmt.Fprintf(stderr, "reaped coord pid=%d agent=%s epoch=%d\n",
-		target.Pid, match.ID, target.FencerEpoch)
+	_, _ = fmt.Fprintf(stderr, "reaped coord pid=%d agent=%s\n",
+		target.Pid, match.ID)
 	return nil
 }
 

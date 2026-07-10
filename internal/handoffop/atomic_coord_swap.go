@@ -207,6 +207,15 @@ type AtomicCoordSwapInputs struct {
 	// OLD. Default DefaultSwapGraceWindow (10s) if zero. Ignored when
 	// OldIsDead=true.
 	GraceWindow time.Duration
+
+	// BarrierID names this handoff cycle's completion barrier + is stamped
+	// into the write-once handoff journal at step 4 (PR-2 D3, Decision 7).
+	// The graceful route (GracefulHandoff) allocates it up front and threads
+	// it here so the barrier file it already wrote and the journal name the
+	// SAME barrier (coordlock.HandoffBarrierPath). Empty => this helper mints
+	// a fresh id (the bespoke non-graceful branch, which has no separate
+	// barrier writer).
+	BarrierID string
 }
 
 // AtomicCoordSwapResult carries what the caller needs after a successful
@@ -349,25 +358,29 @@ func AtomicCoordSwap(in AtomicCoordSwapInputs, stderr io.Writer) (AtomicCoordSwa
 	}
 	res.NewRec = newRec
 
-	// Step 4 — RESERVE the handoff on OLD's still-owned lease (D3 identity
-	// commit path; replaces the deleted spawn-marker write). While OLD
-	// still owns the lease, stamp a successor reservation naming NEW so a
-	// contender that observes the freed lease after we retire OLD WAITS for NEW
-	// (coordreconcile rule (a)) instead of spawning a duplicate. The REAL commit
-	// is ASYNC — the winning standby bumps the epoch to NEW when it acquires the
-	// flock freed in step 5.
+	// Step 4 — CREATE the write-once handoff journal on OLD's still-held flock
+	// (PR-2 D3, Decision 7; replaces the deleted epoch ReserveHandoff). While
+	// OLD still holds the flock, O_EXCL-create coordinator.handoff.json naming
+	// NEW as the successor (+ NEW's process handle for the mid-boot-vs-abandoned
+	// liveness decision + the barrier id) so a contender that observes the freed
+	// flock after we retire OLD WAITS for the booting NEW (coordreconcile Resolve
+	// rule) instead of spawning a duplicate.
 	//
-	// Best-effort SOFT guard (record-only CAS, not a synchronous commit): ok=false
-	// (no readable lease record / bare coord) degrades benignly to the
-	// winner-delivery guarantee, and a reservation that NEW never claims expires
-	// on its TTL and discovery self-heals. So a reserve FAILURE never rolls back
-	// NEW or aborts the swap — it only logs. Skipped on OldIsDead (no live OLD
-	// lease to reserve against).
+	// SOFT guarantee: flock-exclusivity — never two coordinator.flock holders —
+	// is the REAL no-duplicate-coordinator guard; the journal only makes the
+	// common handoff window spawn-free without a timer. So a create failure
+	// never rolls back NEW or aborts the swap — it only logs. Skipped on
+	// OldIsDead (no live OLD; the dead-coord recovery has no successor to name).
 	if !in.OldIsDead {
-		if _, rerr := reserveHandoffFn(in.Project, newRec.ID, 0); rerr != nil && stderr != nil {
+		barrierID := in.BarrierID
+		if barrierID == "" {
+			barrierID = coordlock.NewBarrierID()
+		}
+		if cerr := createHandoffJournalResolving(
+			buildHandoffJournal(in.Project, in.OldRec, newRec, barrierID)); cerr != nil && stderr != nil {
 			_, _ = fmt.Fprintf(stderr,
-				"warning: atomic coord swap: reserve handoff for project %s successor %s failed: %v (proceeding; discovery falls back to winner-delivery)\n",
-				in.Project, newRec.ID, rerr)
+				"warning: atomic coord swap: create handoff journal for project %s successor %s failed: %v (proceeding; flock-exclusivity + winner-delivery still hold)\n",
+				in.Project, newRec.ID, cerr)
 		}
 	}
 
@@ -699,11 +712,72 @@ var (
 	spawnFn                = spawn.Spawn
 	waitForReadyToPromptFn = spawn.WaitForReadyToPrompt
 	sessionAliveFn         = tmux.SessionAlive
-	// reserveHandoffFn stamps a successor reservation on OLD's lease (D3
-	// identity commit; replaces the deleted spawn-marker write). Package
-	// var so tests inject a fake without a real lease.
-	reserveHandoffFn = coordlock.ReserveHandoff
-	tmuxSendKeysFn   = tmux.SendKeys
-	sleepFn          = time.Sleep
+	tmuxSendKeysFn         = tmux.SendKeys
+	sleepFn                = time.Sleep
 	// tmuxKillFn is declared in replacement_cleanup.go; we reuse it.
 )
+
+// buildHandoffJournal builds the write-once handoff journal body naming NEW as
+// the successor (PR-2 D3, Decision 7). The successor's coord-run SUPERVISOR is
+// the flock holder, so its stamped supervisor identity (pid + pid_start) is the
+// kernel liveness signal that decides mid-boot (alive) vs abandoned (dead) —
+// never a TTL. The respawn spec (Command/Cwd, primitive) lets an Abandon
+// recovery re-spawn from the journal alone. coordlock stamps the successor's
+// boot id at Create (same boot as the just-spawned successor).
+func buildHandoffJournal(project string, oldRec, newRec *agent.Record, barrierID string) coordlock.HandoffJournal {
+	j := coordlock.HandoffJournal{
+		Project:          project,
+		SuccessorID:      newRec.ID,
+		BarrierID:        barrierID,
+		SuccessorSession: newRec.TmuxSession,
+		RespawnCommand:   newRec.Command,
+		RespawnCwd:       newRec.Cwd,
+	}
+	if oldRec != nil {
+		j.OldAgentID = oldRec.ID
+	}
+	if newRec.SupervisorPID > 0 {
+		j.SuccessorPID = newRec.SupervisorPID
+		j.SuccessorPidStart = newRec.SupervisorPidStart
+	}
+	return j
+}
+
+// createHandoffJournalResolving creates the journal O_EXCL, resolving a
+// leftover from a prior cycle FIRST (Decision 7 Create — never a blind
+// overwrite). On ErrHandoffJournalExists it reads the leftover and:
+//
+//   - committed-stale (the leftover names the CURRENT live flock holder — a
+//     prior handoff that completed but never cleared its journal) -> delete + retry;
+//   - dead successor (process gone) -> delete per Abandon + retry;
+//   - live-not-holding (a real in-flight handoff to a DIFFERENT live successor)
+//     -> DO NOT clobber; return an error (the caller warns; flock-exclusivity
+//     still bounds any duplicate to one transient stand-down).
+func createHandoffJournalResolving(j coordlock.HandoffJournal) error {
+	err := coordlock.CreateHandoffJournal(j)
+	if !errors.Is(err, coordlock.ErrHandoffJournalExists) {
+		return err
+	}
+	existing, ok, rerr := coordlock.ReadHandoffJournal(j.Project)
+	if rerr != nil {
+		return fmt.Errorf("resolve leftover handoff journal: read: %w", rerr)
+	}
+	if !ok {
+		// Vanished between Create and Read — retry once.
+		return coordlock.CreateHandoffJournal(j)
+	}
+	committedStale := false
+	if owner, present := coordlock.LiveOwner(j.Project); present && owner.AgentID != "" &&
+		owner.AgentID == existing.SuccessorID {
+		committedStale = true
+	}
+	if committedStale || !coordlock.HandoffSuccessorAlive(existing) {
+		if derr := coordlock.DeleteHandoffJournal(j.Project); derr != nil {
+			return fmt.Errorf("resolve leftover handoff journal: delete: %w", derr)
+		}
+		return coordlock.CreateHandoffJournal(j)
+	}
+	return fmt.Errorf(
+		"resolve leftover handoff journal: names a live in-flight successor %s (not overwriting)",
+		existing.SuccessorID)
+}

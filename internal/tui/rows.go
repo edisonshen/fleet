@@ -319,65 +319,47 @@ func projectTreeExists(projectName string) bool {
 }
 
 // coordSpawnIdentityFn returns the agent ID the coordinator LEASE names as the
-// project's coord — the live active owner (coordlock.LiveOwner) or, during boot,
-// the current `starting` owner within its TTL (coordlock.CurrentStarting). Empty
-// when no coord holds or is booting the lease. It replaces the deleted
-// coord-spawn marker as the dashboard's + [a]-dedup's coord-identity signal
-// (D3): the lease IS the identity now. var so tests can stub the lease read.
+// project's coord — the live flock owner (coordlock.LiveOwner) or, mid-handoff,
+// the journal-named in-flight successor whose process is alive
+// (coordlock.CurrentHandoffSuccessor). Empty when no coord holds the flock and
+// no handoff is in flight. PR-2 (D4/D5) dropped the `starting` tier — acquiring
+// the flock IS becoming the coordinator, so there is no pre-activation starter
+// state any more. var so tests can stub the lease read.
 //
-// This also subsumes the marker's freshness gate: LiveOwner is process-live (no
-// staleness), and CurrentStarting is TTL-bounded, so a coord whose process died
-// no longer names an identity — the dashboard row flips to Idle automatically
-// without a marker-removal self-heal.
+// LiveOwner is process-live (kernel-proven — no staleness), so a coord whose
+// process died no longer holds the flock and no longer names an identity; the
+// dashboard row flips to Idle automatically.
 var coordSpawnIdentityFn = coordSpawnLeaseIdentity
 
 func coordSpawnLeaseIdentity(projectName string) string {
 	owner, ownerOK := coordlock.LiveOwner(projectName)
-	starting, startingOK := coordlock.CurrentStarting(projectName)
-	handoff, handoffOK := coordlock.CurrentHandoff(projectName)
-	return resolveCoordSpawnIdentity(owner, ownerOK, starting, startingOK, handoff, handoffOK)
+	successorID, successorOK := coordlock.CurrentHandoffSuccessor(projectName)
+	return resolveCoordSpawnIdentity(owner, ownerOK, successorID, successorOK)
 }
 
 // resolveCoordSpawnIdentity is the PURE identity decision (no I/O — the lease
-// reads are threaded in) so the branch ordering + liveness gates are unit
-// testable without a real lease. It mirrors the Python `fleet coord-owner`
-// path + loop.py gate-5, which treat BOTH the active owner AND the in-flight
-// handoff successor as coord identity — so the three signals must AGREE.
+// reads are threaded in) so the branch ordering is unit testable without a real
+// lease. It mirrors the Python `fleet coord-owner` path + loop.py gate-5, which
+// treat BOTH the live flock owner AND the in-flight handoff successor as coord
+// identity.
 //
-// Priority: a process-live active owner, else a booting starter (unless
-// CONFIRMED dead), else a named in-flight handoff successor.
+// Priority: a process-live flock owner, else the journal-named in-flight
+// successor (process alive).
 func resolveCoordSpawnIdentity(
 	owner coordlock.Owner, ownerOK bool,
-	st coordlock.StartingStatus, stOK bool,
-	h coordlock.Handoff, hOK bool,
+	successorID string, successorOK bool,
 ) string {
-	// (1) A process-live active owner is unambiguously the coord.
+	// (1) A process-live flock owner is unambiguously the coord.
 	if ownerOK && owner.AgentID != "" {
 		return owner.AgentID
 	}
-	// (2) Starting (pre-activation) owner — mirror coordreconcile.Resolve's exact
-	// gate (coordreconcile.go ~165): keep the starter as the identity only while
-	// it is within its TTL AND not CONFIRMED dead. "Confirmed dead" requires a
-	// RECORDED pid (PID>0) that is not live: a just-claimed record has an unknown
-	// pid pre-spawn (PID==0), so it is NOT confirmed dead and the boot-window
-	// [a]-dedup still holds. A crashed pre-activation starter (pid recorded,
-	// process since died) is dropped so [a] recovers by spawning a replacement
-	// instead of re-attaching to the dead starter for the whole starting TTL
-	// (WithinTTL alone would strand it — codex review [P2]).
-	if stOK && st.Owner.AgentID != "" {
-		ownerConfirmedDead := st.Owner.PID > 0 && !st.OwnerLive
-		if st.WithinTTL && !ownerConfirmedDead {
-			return st.Owner.AgentID
-		}
-	}
-	// (3) In-flight handoff successor: OLD released the flock and NEW is the
-	// named (non-expired, CurrentHandoff is TTL-gated) successor but has not yet
-	// claimed a starting record or activated. Mirror the coord-owner CLI +
-	// loop.py gate-5, which both treat CurrentHandoff.SuccessorID as coord
-	// identity — otherwise the dashboard flashes "no coord" mid-handoff and [a]
-	// dedup falls through to a duplicate fresh dispatch (codex review [P2]).
-	if hOK && h.SuccessorID != "" {
-		return h.SuccessorID
+	// (2) In-flight handoff successor: OLD released the flock and NEW is the
+	// journal-named successor whose process is alive (CurrentHandoffSuccessor is
+	// liveness-gated) but has not yet acquired the flock. Mirror the coord-owner
+	// CLI + loop.py gate-5 — otherwise the dashboard flashes "no coord"
+	// mid-handoff and [a] dedup falls through to a duplicate fresh dispatch.
+	if successorOK && successorID != "" {
+		return successorID
 	}
 	return ""
 }

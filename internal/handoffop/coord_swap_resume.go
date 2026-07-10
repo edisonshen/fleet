@@ -67,26 +67,30 @@ func (a ResumeAction) String() string {
 
 // CoordSwapResumeDeps are the injected lease/probe seams. Production wires
 // coordlock + tmux via DefaultCoordSwapResumeDeps; deterministic tests build
-// the committed/reserved/free × NEW-dead/live matrix in memory (no disk, no
+// the committed/in-flight/free × NEW-dead/live matrix in memory (no disk, no
 // clock).
 type CoordSwapResumeDeps struct {
-	// CurrentOwner reports the healthy active lease owner (TTL-gated).
+	// CurrentOwner reports the live flock holder WITH a readable identity
+	// (busy⇒owner + agent_id, PR-2 flock-only).
 	CurrentOwner func(project string) (coordlock.Owner, bool)
-	// CurrentHandoff reports a non-expired successor reservation.
-	CurrentHandoff func(project string) (coordlock.Handoff, bool)
+	// ClassifyHandoff inspects the write-once handoff journal for a FLOCK-FREE
+	// project (PR-2 D3/D4, Decision 7 Abandon): none / in-flight (successor
+	// process alive) / abandoned (successor dead). Replaces the deleted epoch
+	// CurrentHandoff reservation. Production: coordlock.ClassifyFreeFlockHandoff.
+	ClassifyHandoff func(project string) (coordlock.HandoffDisposition, coordlock.HandoffJournal, error)
 	// OldSessionAlive is the DEFENSIVE cross-socket OLD-liveness probe, used
 	// only on the committed (refuse) arm. It NEVER drives a kill — only shapes
 	// the refusal diagnostic.
 	OldSessionAlive func(session string) (bool, error)
 }
 
-// DefaultCoordSwapResumeDeps wires the classifier to the real lease + tmux
-// probe. The OLD-liveness probe routes through the package tmux seam so tests
-// of the call sites can fake it.
+// DefaultCoordSwapResumeDeps wires the classifier to the real flock/journal +
+// tmux probe. The OLD-liveness probe routes through the package tmux seam so
+// tests of the call sites can fake it.
 func DefaultCoordSwapResumeDeps() CoordSwapResumeDeps {
 	return CoordSwapResumeDeps{
 		CurrentOwner:    coordlock.CurrentOwner,
-		CurrentHandoff:  coordlock.CurrentHandoff,
+		ClassifyHandoff: coordlock.ClassifyFreeFlockHandoff,
 		OldSessionAlive: tmux.SessionAlive,
 	}
 }
@@ -137,23 +141,30 @@ func ClassifyCoordSwapResume(project, oldID, oldSession, newID string, force boo
 		return res
 	}
 
-	// (2) Swap in flight: a handoff reservation names NEW and there is no active
-	// owner (OLD released, the standby has not yet bumped the epoch). The
-	// standby IS the recovery vehicle — do NOT respawn a second replacement.
+	// (2) Swap in flight: the flock is free and the write-once journal names NEW
+	// as a successor whose process is still ALIVE (booting, not yet holding the
+	// flock). The standby IS the recovery vehicle — do NOT respawn a second
+	// replacement. A journal read error is treated conservatively as NOT
+	// in-flight (fall through to respawn — flock-exclusivity bounds a duplicate
+	// to one transient stand-down; the alternative, stranding on an unreadable
+	// journal, is worse).
 	if !ownerOK {
-		if h, ok := d.CurrentHandoff(project); ok && h.SuccessorID == newID {
+		if disp, j, herr := d.ClassifyHandoff(project); herr == nil &&
+			disp == coordlock.HandoffInFlight && j.SuccessorID == newID {
 			return CoordSwapResume{
 				Action: ResumeWait,
-				Reason: "handoff reservation names successor " + newID + "; standby is the recovery vehicle",
+				Reason: "handoff journal names successor " + newID + " (process alive); standby is the recovery vehicle",
 			}
 		}
 	}
 
-	// (3) Not committed: OLD still owns the lease, or a free lease with no
-	// handoff reservation (a pre-commit crash, or a clean free lease). Safe to
-	// drop the dead NEW and respawn a fresh replacement.
+	// (3) Not committed: the flock is held by OLD (or anyone that is not NEW),
+	// or free with no in-flight journal (a pre-commit crash, an abandoned
+	// successor, or a clean free flock). Safe to drop the dead NEW and respawn a
+	// fresh replacement — flock-exclusivity stands it down if a live holder
+	// races in.
 	return CoordSwapResume{
 		Action: ResumeRespawn,
-		Reason: "swap not committed (OLD owns lease, or free lease with no handoff reservation)",
+		Reason: "swap not committed (flock held by non-NEW, or free flock with no in-flight handoff journal)",
 	}
 }

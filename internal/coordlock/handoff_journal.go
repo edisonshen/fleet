@@ -159,6 +159,14 @@ func CreateHandoffJournal(j HandoffJournal) error {
 	if j.StampWall == 0 {
 		j.StampWall = time.Now().UnixNano()
 	}
+	// Stamp the successor's boot id (this boot — the successor was just spawned
+	// on this machine) when the producer recorded a pid but no boot: cross-boot
+	// liveness (HandoffSuccessorAlive) reads a reboot as provably-dead, and a
+	// bare pid_start alone is not reboot-safe. A pid-less journal leaves it empty
+	// (HandoffSuccessorAlive => dead => Abandoned, bounded by flock-exclusivity).
+	if j.SuccessorPID > 0 && j.SuccessorBootID == "" {
+		j.SuccessorBootID = bootID()
+	}
 	path, err := handoffJournalPath(j.Project)
 	if err != nil {
 		return err

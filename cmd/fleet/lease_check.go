@@ -36,26 +36,23 @@ const leaseCheckNotOwnerExit = 3
 func newLeaseCheckCmd() *cobra.Command {
 	var project string
 	var pid int
-	var reacquire bool
 	cmd := &cobra.Command{
 		Use:   "lease-check --project <project>",
-		Short: "Prove the caller descends from the active coordinator lease owner",
-		Long: "Exit 0 if the calling process tree descends from the live active " +
-			"coordinator lease owner for --project; exit 3 if it does not " +
-			"(fenced/stale coord); exit 1 on usage/internal error. " +
-			"--reacquire (coordinator tick only) renews an own expired lease " +
-			"in place when no rival takeover exists; without it the check is " +
-			"strictly read-only.",
+		Short: "Prove the caller descends from the coordinator flock holder",
+		Long: "Exit 0 if the calling process tree descends from the live " +
+			"coordinator flock holder for --project; exit 3 if it does not " +
+			"(a live successor holds the flock, or the flock is free with a stale " +
+			"body); exit 1 on usage/internal error. Strictly read-only — holding " +
+			"the flock IS ownership, so there is nothing to renew (PR-2 dropped the " +
+			"epoch-renewing --reacquire variant).",
 		SilenceUsage:  true,
 		SilenceErrors: true,
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			return runLeaseCheck(project, pid, reacquire, cmd.OutOrStdout(), cmd.ErrOrStderr())
+			return runLeaseCheck(project, pid, cmd.OutOrStdout(), cmd.ErrOrStderr())
 		},
 	}
 	cmd.Flags().StringVar(&project, "project", "", "project whose lease to check (required)")
 	cmd.Flags().IntVar(&pid, "pid", 0, "process to prove ownership for (default: this process's parent)")
-	cmd.Flags().BoolVar(&reacquire, "reacquire", false,
-		"renew an own expired no-rival lease in place (coordinator tick only; default read-only)")
 	return cmd
 }
 
@@ -63,28 +60,19 @@ func newLeaseCheckCmd() *cobra.Command {
 // usage faults (cobra maps to exit 1); for the definitive "not owner"
 // outcome it calls os.Exit(leaseCheckNotOwnerExit) directly so the skill
 // gets a distinct, scriptable signal.
-func runLeaseCheck(project string, pid int, reacquire bool, stdout, stderr io.Writer) error {
+func runLeaseCheck(project string, pid int, stdout, stderr io.Writer) error {
 	if project == "" {
 		return fmt.Errorf("lease-check: --project is required")
 	}
-	// --pid is a READ-ONLY test/diagnostic hook. Combined with --reacquire
-	// it would be a write primitive letting any local process renew someone
-	// else's lease by naming the owner pid — keeping a wedged leader alive
-	// and blocking standby takeover (codex iter-4 [P2]). Renewal is only
-	// valid for the caller's own ancestry (the default ppid flow).
-	if reacquire && pid != 0 {
-		return fmt.Errorf("lease-check: --reacquire cannot be combined with --pid (renewal is only valid for the caller's own ancestry)")
-	}
 	// Default to the CALLER'S PARENT — the skill runs `fleet lease-check` as
-	// a child, so the supervisor it must prove ownership for is the skill's
+	// a child, so the flock holder it must prove ownership for is the skill's
 	// own parent (this fleet process's parent). An explicit --pid overrides
-	// for tests / non-standard invocations (read-only; rejected above when
-	// combined with --reacquire).
+	// for tests / non-standard invocations (read-only).
 	target := pid
 	if target == 0 {
 		target = os.Getppid()
 	}
-	outcome, err := leaseCheckOwnership(project, target, reacquire)
+	outcome, err := leaseCheckOwnership(project, target)
 	switch outcome {
 	case leaseCheckOK:
 		_, _ = fmt.Fprintf(stdout, "lease-check: ok (pid=%d under active lease owner for %q)\n", target, project)

@@ -41,9 +41,8 @@ type GracefulHandoffDeps struct {
 	ReapStandby        func() error
 	WriteAtomic        func(path string, data []byte) error
 	DrainInFlight      func() error
-	CurrentEpoch       func(project string) (int64, bool)
-	BarrierPath        func(project string, epoch int64) (string, error)
-	RetireOld          func() error
+	BarrierPath        func(project, barrierID string) (string, error)
+	RetireOld          func(barrierID string) error
 	DeliverDocToWinner func() (*agent.Record, error)
 	Stderr             io.Writer
 }

@@ -110,9 +110,7 @@ func (m Model) consumeResolvedCoordVerdict(projectName, agentID, context string,
 			}
 		})
 	case coordreconcile.Spawn:
-		return m.startResolvedCoordSpawn(projectName, false)
-	case coordreconcile.SpawnStandby:
-		return m.startResolvedCoordSpawn(projectName, true)
+		return m.startResolvedCoordSpawn(projectName)
 	default:
 		m.flash = &flashMsg{
 			text:  fmt.Sprintf("project %s: coord resolver returned unknown decision %s — press [a] again", projectName, verdict.Decision),
@@ -183,31 +181,27 @@ func (m Model) attachResolvedCoordOwner(projectName, context string, verdict coo
 	return m, tea.Quit
 }
 
-// startResolvedCoordSpawn dispatches the actual spawn AFTER a Spawn/
-// SpawnStandby verdict has already claimed the starting record (see the
-// actionAttachProject doc comment: that claim has no release primitive).
-// Every early-return branch below therefore leaves an unfulfilled claim
-// behind — self-heal is the ONLY recovery (coordreconcile: a pre-spawn
-// claim, pid unset, becomes claimable again once the starting-record TTL
-// elapses). Every failure flash in this function must say so and return
-// loadAgentsCmd() (never nil) so the dashboard refresh path stays
-// consistent (codex 265b iter-1 [P1]: the init/repo branches used to omit
-// this, matching neither the orphan-cleanup branch above nor the operator's
-// need to know the outage is bounded, not stuck).
-func (m Model) startResolvedCoordSpawn(projectName string, standby bool) (Model, tea.Cmd) {
-	if !standby {
-		if killedID, err := tuiKillCollidingOrphanTmux(projectName); err != nil {
-			m.flash = &flashMsg{
-				text: fmt.Sprintf(
-					"project %s: lease resolved spawn but orphan cleanup failed: %v — press [a] again; the temporary starting claim will self-heal after its TTL",
-					projectName, err),
-				isErr: true,
-			}
-			return m, loadAgentsCmd()
-		} else if killedID != "" {
-			m.flash = &flashMsg{
-				text: fmt.Sprintf("reaped stale %s (live orphan session) before starting coord for %s", killedID, projectName),
-			}
+// startResolvedCoordSpawn dispatches the actual spawn AFTER a Spawn verdict
+// (PR-2 D4: the SpawnStandby verdict is gone — acquiring the flock IS becoming
+// the coordinator, so every fresh coord is spawned the same way and races for
+// the free flock). The resolver already ran the anti-double-spawn gate; every
+// early-return branch below leaves the temporary starting claim to self-heal
+// (coordreconcile: a pre-spawn claim, pid unset, becomes claimable again once
+// its TTL elapses). Every failure flash must say so and return loadAgentsCmd()
+// (never nil) so the dashboard refresh path stays consistent (codex 265b iter-1
+// [P1]).
+func (m Model) startResolvedCoordSpawn(projectName string) (Model, tea.Cmd) {
+	if killedID, err := tuiKillCollidingOrphanTmux(projectName); err != nil {
+		m.flash = &flashMsg{
+			text: fmt.Sprintf(
+				"project %s: lease resolved spawn but orphan cleanup failed: %v — press [a] again; the temporary starting claim will self-heal after its TTL",
+				projectName, err),
+			isErr: true,
+		}
+		return m, loadAgentsCmd()
+	} else if killedID != "" {
+		m.flash = &flashMsg{
+			text: fmt.Sprintf("reaped stale %s (live orphan session) before starting coord for %s", killedID, projectName),
 		}
 	}
 	if _, err := state.EnsureProjectInitialized(projectName); err != nil {
@@ -231,11 +225,7 @@ func (m Model) startResolvedCoordSpawn(projectName string, standby bool) (Model,
 	}
 	m.setOpInFlight(projectName, coordOpSpawn)
 	if m.flash == nil {
-		action := "starting coord"
-		if standby {
-			action = "starting standby coord"
-		}
-		m.flash = &flashMsg{text: fmt.Sprintf("%s for project %s via lease resolve", action, projectName)}
+		m.flash = &flashMsg{text: fmt.Sprintf("starting coord for project %s via lease resolve", projectName)}
 	}
 	return m, m.startCoordSpawn(projectName, cwd)
 }

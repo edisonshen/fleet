@@ -462,8 +462,31 @@ func resolveAndAttachCoord(token, project string, opts AttachOpts) error {
 			return consumeResolvedCoord(token, project, opts, verdict)
 		}
 		if attempts <= 0 {
+			// D9e (no-auto-kill, rainier straggler close): a bounded Wait means
+			// the flock is held by a LIVE coord whose identity Resolve can't read
+			// from the flock body (an old-binary straggler post-bridge-deletion,
+			// or a torn body). A busy flock is a live holder — the kernel frees it
+			// only on death — so reaping+respawning would either KILL a live coord
+			// (forbidden, Decision 3) or dead-end (the respawn can't take the held
+			// flock). Recover via the AGENT RECORD instead: FindLiveCoord names a
+			// live coord by project + is_coord + a live tmux session, and we
+			// ATTACH into it (land inside the live session). NEVER a reap.
+			if records, lerr := agent.List(); lerr == nil {
+				if rec, ok := projectlookup.FindLiveCoord(records, project); ok {
+					session := rec.TmuxSession
+					if session == "" {
+						session = tmux.SessionName(rec.ID)
+					}
+					_, _ = fmt.Fprintf(opts.Stderr,
+						"%s: coord for %s holds the flock but its identity is not readable from the lease body; recovered live coord %s via its agent record — attaching (no respawn, no reap)\n",
+						token, project, rec.ID)
+					return attachExistingCoord(token, project, rec.ID, session)
+				}
+			}
+			// No live coord record derivable — surface guidance (still no
+			// auto-reap of a live holder).
 			return newSystemError(dispatchVetoExitCode, fmt.Sprintf(
-				"%s: coord for %s is still not attachable after bounded lease wait (%s: %s). Re-run `fleet attach %s --project %s`; if it persists, check `fleet status` / FLEET_TMUX_SOCKET or run `fleet doctor`",
+				"%s: coord for %s is still not attachable after bounded lease wait (%s: %s) and no live coord record is derivable. Run `fleet status` to discover it, then `fleet handoff <id>` / `fleet rm <id>` — never an auto-reap of a live holder. Re-run `fleet attach %s --project %s` once resolved",
 				token, project, verdict.Decision, verdict.Reason, token, project))
 		}
 		if interval > 0 {
@@ -509,13 +532,6 @@ func consumeResolvedCoord(token, project string, opts AttachOpts, verdict coordr
 				}
 				_, _ = fmt.Fprintf(stderr,
 					"%s: lease resolved spawn for %s (%s); spawned %s; attaching\n",
-					token, project, verdict.Reason, res.ID)
-			})
-	case coordreconcile.SpawnStandby:
-		return spawnAndAttachRecovered(token, project, opts,
-			func(stderr io.Writer, res coordSpawnResult) {
-				_, _ = fmt.Fprintf(stderr,
-					"%s: lease resolved standby for %s (%s); spawned %s; attaching\n",
 					token, project, verdict.Reason, res.ID)
 			})
 	default:
