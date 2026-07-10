@@ -113,22 +113,6 @@ func projectRowModelForVeto(project string) Model {
 	return m
 }
 
-// stubMarkerWrite swaps claimStartingRecordFn (which replaced the deleted
-// coord-spawn marker write, D3) for a recording stub so tests can assert the
-// TUI claimed (or, on the attach-existing veto path, did NOT claim) the
-// coord's `starting` lease record. Returns a pointer to the call count.
-func stubMarkerWrite(t *testing.T) *int {
-	t.Helper()
-	prev := claimStartingRecordFn
-	calls := 0
-	claimStartingRecordFn = func(project, agentID string) error {
-		calls++
-		return nil
-	}
-	t.Cleanup(func() { claimStartingRecordFn = prev })
-	return &calls
-}
-
 // driveSpawn fires the [a] spawn cmd, drains the goroutine, and returns
 // the resulting message + the model after Update consumes it.
 func driveSpawn(t *testing.T, m Model) (coordSpawnDoneMsg, Model) {
@@ -163,7 +147,6 @@ func TestVeto_MarkerBackedLiveLeader_Attaches(t *testing.T) {
 	// attach; stub it so the resolved session reads reachable+alive
 	// (true, nil) without real tmux.
 	(&stubSessionProbe{}).install(t)
-	markerWrites := stubMarkerWrite(t)
 	// Seed the LITERAL 75 (not the tuiCoordVetoExitCode symbol) so this
 	// test pins the cross-PROCESS contract: dispatch.go returns the
 	// literal 75, and if the TUI's const ever drifts the classification
@@ -181,9 +164,6 @@ func TestVeto_MarkerBackedLiveLeader_Attaches(t *testing.T) {
 	if mm.flash == nil || mm.flash.isErr {
 		t.Fatalf("expected informational (non-err) flash; got %+v", mm.flash)
 	}
-	if *markerWrites != 0 {
-		t.Errorf("attach-existing must not write the coord-spawn marker; got %d writes", *markerWrites)
-	}
 }
 
 // TestVetoExitCode_MatchesDispatchContract pins the cross-process exit
@@ -199,8 +179,8 @@ func TestVetoExitCode_MatchesDispatchContract(t *testing.T) {
 
 // TestVeto_MarkerlessLiveLeader_Attaches — exit 75 + Resolve names a live
 // coord with task_id+project but NO coord-spawn marker (e.g. started from
-// the shell). Also asserts the coord-spawn marker is NOT written (codex
-// round-2 P1).
+// the shell). The veto callback trusts Resolve's owner verdict, not any
+// dashboard marker.
 func TestVeto_MarkerlessLiveLeader_Attaches(t *testing.T) {
 	withFleetHome(t)
 	seedProjectMeta(t, "demo", t.TempDir())
@@ -216,7 +196,6 @@ func TestVeto_MarkerlessLiveLeader_Attaches(t *testing.T) {
 	// dashboard marker.
 	seedDiskCoord(t, "nomarker", "demo", coordTaskID("demo"))
 	(&stubSessionProbe{}).install(t)
-	markerWrites := stubMarkerWrite(t)
 	stubFleetCmdInvokesCallback(t, "spawn vetoed\n", exitErr(t, tuiCoordVetoExitCode))
 
 	msg, mm := driveSpawn(t, projectRowModelForVeto("demo"))
@@ -225,9 +204,6 @@ func TestVeto_MarkerlessLiveLeader_Attaches(t *testing.T) {
 	}
 	if mm.pendingAttach != "fleet-nomarker" {
 		t.Errorf("pendingAttach = %q; want fleet-nomarker", mm.pendingAttach)
-	}
-	if *markerWrites != 0 {
-		t.Errorf("claimStartingRecordFn called %d times; want 0 (TUI did not spawn this coord — codex round-2 P1)", *markerWrites)
 	}
 }
 
@@ -249,7 +225,6 @@ func TestVeto_LockBodyOnlyLiveLeader_Attaches(t *testing.T) {
 	seedDiskCoord(t, "1c00d001", "demo", "manual-spawn")
 	seedLockBody(t, "demo", "1c00d001")
 	(&stubSessionProbe{}).install(t)
-	markerWrites := stubMarkerWrite(t)
 	stubFleetCmdInvokesCallback(t, "spawn vetoed\n", exitErr(t, tuiCoordVetoExitCode))
 
 	msg, mm := driveSpawn(t, projectRowModelForVeto("demo"))
@@ -261,9 +236,6 @@ func TestVeto_LockBodyOnlyLiveLeader_Attaches(t *testing.T) {
 	}
 	if mm.flash == nil || mm.flash.isErr {
 		t.Fatalf("expected informational flash; got %+v", mm.flash)
-	}
-	if *markerWrites != 0 {
-		t.Errorf("attach-existing must not write the coord-spawn marker; got %d writes", *markerWrites)
 	}
 }
 

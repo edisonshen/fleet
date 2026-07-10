@@ -2478,8 +2478,6 @@ func TestKeyA_ProjectRow_InFlightSpawn_RejectsDuplicate(t *testing.T) {
 // resolves, subsequent [a] presses go through the full lookup again.
 func TestModel_CoordSpawnDoneMsg_ClearsInFlight(t *testing.T) {
 	(&stubSessionAlive{}).install(t)
-	// Lease-claim stub so claimStartingRecordFn doesn't hit FLEET_HOME.
-	(&stubClaimStartingRecord{}).install(t)
 
 	m := New("test")
 	m.coordOpInFlight = map[string]string{"demo": coordOpSpawn}
@@ -2495,42 +2493,14 @@ func TestModel_CoordSpawnDoneMsg_ClearsInFlight(t *testing.T) {
 	}
 }
 
-// TestModel_CoordSpawnDoneMsg_WritesMarker pins that the success
-// path writes the coord-spawn marker before tea.Quit so the
-// dashboard's task_id fallback can validate the agent ID on its
-// next refresh. Requires promptDelivered=true (codex iter-5 P2).
-func TestModel_CoordSpawnDoneMsg_WritesMarker(t *testing.T) {
+// TestModel_CoordSpawnDoneMsg_PromptFailed_AttachesWithWarning pins the
+// prompt-delivery-failure path: when SendInitialPrompt failed (dispatch
+// warned, but exited 0), the coord skill never started. Under flock-only
+// there is no `starting` record to claim (PR-2 D2/D4) — the TUI still
+// attaches (so the operator can type /coordinator manually) but surfaces an
+// error flash so they know the project stays unowned until they retry.
+func TestModel_CoordSpawnDoneMsg_PromptFailed_AttachesWithWarning(t *testing.T) {
 	(&stubSessionAlive{}).install(t)
-	markerStub := &stubClaimStartingRecord{}
-	markerStub.install(t)
-
-	m := New("test")
-	updated, _ := m.Update(coordSpawnDoneMsg{
-		projectName:     "demo",
-		agentID:         "abcd1234",
-		session:         "fleet-abcd1234",
-		promptDelivered: true,
-	})
-	mm := updated.(Model)
-	if mm.pendingAttach != "fleet-abcd1234" {
-		t.Errorf("pendingAttach = %q; want fleet-abcd1234", mm.pendingAttach)
-	}
-	if got := markerStub.calls["demo"]; got != "abcd1234" {
-		t.Errorf("marker call for demo = %q; want abcd1234", got)
-	}
-}
-
-// TestModel_CoordSpawnDoneMsg_PromptFailed_SkipsMarker pins codex
-// iter-5 P2: when SendInitialPrompt failed (dispatch warned, but
-// exited 0), the coord skill never started — the TUI must NOT write
-// the marker, otherwise the dashboard would render a plain Claude
-// session as the project's verified coord. Operator still attaches
-// (so they can type the prompt manually) but the project stays
-// visibly unowned until they retry.
-func TestModel_CoordSpawnDoneMsg_PromptFailed_SkipsMarker(t *testing.T) {
-	(&stubSessionAlive{}).install(t)
-	markerStub := &stubClaimStartingRecord{}
-	markerStub.install(t)
 
 	m := New("test")
 	updated, _ := m.Update(coordSpawnDoneMsg{
@@ -2542,9 +2512,6 @@ func TestModel_CoordSpawnDoneMsg_PromptFailed_SkipsMarker(t *testing.T) {
 	mm := updated.(Model)
 	if mm.pendingAttach != "fleet-abcd1234" {
 		t.Errorf("pendingAttach = %q; want fleet-abcd1234 (still attach)", mm.pendingAttach)
-	}
-	if _, wrote := markerStub.calls["demo"]; wrote {
-		t.Errorf("prompt-failed dispatch must NOT write marker; got call %v", markerStub.calls)
 	}
 	if mm.flash == nil || !mm.flash.isErr {
 		t.Fatalf("flash should signal the prompt failure; got %+v", mm.flash)
@@ -2747,16 +2714,14 @@ func TestFindExistingCoordForProject_NoMarker_FallsThroughToSpawn(t *testing.T) 
 	}
 }
 
-// TestKeyA_ProjectRow_PromptFailedDispatch_NoMarker pins codex
-// iter-5 P2 end-to-end: when dispatch's stdout warns "initial prompt
+// TestKeyA_ProjectRow_PromptFailedDispatch_PropagatesAndAttaches pins
+// codex iter-5 P2 end-to-end: when dispatch's stdout warns "initial prompt
 // not delivered", the TUI must propagate promptDelivered=false in
-// coordSpawnDoneMsg, and the marker write must be skipped.
-func TestKeyA_ProjectRow_PromptFailedDispatch_NoMarker(t *testing.T) {
+// coordSpawnDoneMsg and still attach (so the operator can type it manually).
+func TestKeyA_ProjectRow_PromptFailedDispatch_PropagatesAndAttaches(t *testing.T) {
 	withFleetHome(t)
 	seedProjectMeta(t, "demo", t.TempDir()) // resolver binds via meta (PR3)
 	(&stubSessionAlive{}).install(t)
-	markerStub := &stubClaimStartingRecord{}
-	markerStub.install(t)
 
 	// Production-shaped stdout: dispatch returned 0 (no err), printed
 	// the agent line AND the prompt-failure warning line. The TUI's
@@ -2788,9 +2753,6 @@ func TestKeyA_ProjectRow_PromptFailedDispatch_NoMarker(t *testing.T) {
 	}
 	updated, _ := m.Update(doneMsg)
 	mm := updated.(Model)
-	if _, wrote := markerStub.calls["demo"]; wrote {
-		t.Errorf("prompt-failed dispatch must NOT write marker; got %v", markerStub.calls)
-	}
 	if mm.pendingAttach != "fleet-abcd1234" {
 		t.Errorf("operator must still attach (so they can type the prompt); pendingAttach = %q", mm.pendingAttach)
 	}

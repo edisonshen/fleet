@@ -115,14 +115,10 @@ func flashSuggestsReset(f *flashMsg) bool {
 //     in-progress coord → MUST enter the safe [a] retry path with no
 //     destructive [r] hint.
 //   - terminal-stale-no-successor: holder archived, lease genuinely free
-//     (Spawn verdict) → MUST auto-spawn a fresh coord via the SAME
-//     consumer Wait/SpawnStandby use (never a manual "[r] to reset"
-//     hint): the real-agentID Resolve call has ALREADY claimed the
-//     starting record as a side effect (coordreconcile.ClaimStarting),
-//     and coordlock has no way to release an unfulfilled claim, so
-//     showing a hint and dropping the cmd would abandon that claim and
-//     block every other resolve for the project (including the [r]
-//     reset flow's own respawn) for up to the starting-record TTL.
+//     (Spawn verdict) → MUST auto-spawn a fresh coord immediately (never a
+//     manual "[r] to reset" hint): under flock-only there is no starting
+//     reservation, so a free lease is unambiguously spawnable and the
+//     recovery is the same auto-spawn the [a] path always runs.
 func TestKeyA_StaleCoordID_Table(t *testing.T) {
 	const project = "demo"
 	const staleID = "129c9824" // the archived holder named in the lock body
@@ -158,7 +154,7 @@ func TestKeyA_StaleCoordID_Table(t *testing.T) {
 			archived: true,
 			verdict: coordreconcile.Verdict{
 				Decision: coordreconcile.Wait,
-				Reason:   "coord boot in flight (starting within TTL)",
+				Reason:   "handoff in flight; successor process alive and acquiring the flock",
 			},
 			outcome:                 "safe-retry",
 			assertOldWouldShowReset: true,
@@ -177,23 +173,7 @@ func TestKeyA_StaleCoordID_Table(t *testing.T) {
 			archived: true,
 			verdict: coordreconcile.Verdict{
 				Decision: coordreconcile.Spawn,
-				Reason:   "free lease claimed (starting record written)",
-			},
-			outcome: "auto-spawn",
-		},
-		{
-			// review-army [testing] iter-2 (2026-07-08): the production
-			// switch at keys.go groups Wait/SpawnStandby/Spawn together,
-			// but SpawnStandby drives a materially different
-			// startResolvedCoordSpawn(standby=true) path (skips the
-			// orphan-tmux-kill step Spawn runs) — pin that a SpawnStandby
-			// verdict reaching THIS entry point still fulfills the claim
-			// via dispatch, not just Spawn.
-			name:     "terminal-stale-wedged-live-starter-spawns-standby",
-			archived: true,
-			verdict: coordreconcile.Verdict{
-				Decision: coordreconcile.SpawnStandby,
-				Reason:   "wedged starting lease superseded; spawn standby behind held flock",
+				Reason:   "lease free; spawning a fresh coord",
 			},
 			outcome: "auto-spawn",
 		},
@@ -326,11 +306,9 @@ func TestKeyA_StaleCoordID_Table(t *testing.T) {
 				}
 			case "auto-spawn":
 				// A genuinely-free lease (Spawn verdict) must be
-				// fulfilled immediately via the same auto-spawn consumer
-				// Wait/SpawnStandby use — NEVER a manual "[r] to reset"
-				// hint (that would abandon the starting-record claim
-				// Resolve just wrote, see the func-level comment on
-				// actionAttachProject).
+				// fulfilled immediately via auto-spawn — NEVER a manual
+				// "[r] to reset" hint (flock-only: a free lease is
+				// unambiguously spawnable, see actionAttachProject).
 				if resolveCalls != 1 {
 					t.Fatalf("auto-spawn path Resolve calls = %d, want 1", resolveCalls)
 				}
@@ -447,80 +425,6 @@ func TestKeyA_StaleCoordID_ResolveErrorSurfacesFlashAndRefresh(t *testing.T) {
 	}
 	if len(stubCmd.calls) != 0 {
 		t.Errorf("resolve-error path must not shell out; got %v", stubCmd.calls)
-	}
-}
-
-// TestKeyA_StaleCoordID_SpawnDecisionNeverAbandonsClaim pins the P1 lease
-// leak fixed alongside the [r]-reset regression: a real-agentID
-// coordreconcile.Resolve call landing on Spawn has ALREADY performed the
-// mutating ClaimStartingRecord CAS as a side effect (coordlock exposes no
-// way to release an unfulfilled starting claim). If actionAttachProject
-// showed a hint and dropped the returned cmd instead of following
-// through with an actual spawn dispatch, that claim would dangle and
-// every other resolver call for the project (any [a] press, `fleet
-// attach`, or even the [r]-reset flow's own respawn step) would
-// misreport "coord boot in flight" for up to the starting-record TTL —
-// self-inflicting exactly the "can't reach a coord" outage this
-// preflight exists to avoid. Exercises the REAL coordreconcile.Resolve
-// (not a stub) so the real coordlock.ClaimStartingRecord side effect is
-// in play, only stubbing the `fleet` shell-out itself.
-func TestKeyA_StaleCoordID_SpawnDecisionNeverAbandonsClaim(t *testing.T) {
-	withFleetHome(t)
-	const project = "leakproj"
-	const staleID = "aaaa0000"
-	(&stubSessionAlive{}).install(t)
-	(&stubSessionProbe{}).install(t)
-	(&stubCoordArchived{archived: map[string]bool{staleID: true}}).install(t)
-	if err := projects.Write(project, projects.Meta{
-		Schema:   projects.SchemaVersion,
-		RepoPath: t.TempDir(),
-		AddedAt:  time.Now().UTC(),
-		IsGit:    projects.BoolPtr(false),
-	}); err != nil {
-		t.Fatalf("write project meta: %v", err)
-	}
-	stubCmd := &stubFleetCmd{}
-	stubCmd.install(t)
-
-	prevResolve := tuiCoordResolveFn
-	tuiCoordResolveFn = func(project, agentID string) (coordreconcile.Verdict, error) {
-		return coordreconcile.Resolve(coordreconcile.DefaultDeps(), project, agentID)
-	}
-	t.Cleanup(func() { tuiCoordResolveFn = prevResolve })
-
-	m := New("test")
-	m.dashboard = &Snapshot{
-		Projects: []*ProjectRow{{Name: project, CoordID: staleID}},
-	}
-	for i, r := range m.dashboardRows() {
-		if r.kind == rowProject && r.project != nil && r.project.Name == project {
-			m.dashCursor = i
-			break
-		}
-	}
-
-	updated, cmd := m.Update(keyMsg("a"))
-	mm := updated.(Model)
-
-	if cmd == nil {
-		t.Fatal("Spawn verdict must return a non-nil cmd — the ClaimStartingRecord claim it just made must be fulfilled, never abandoned")
-	}
-	if len(stubCmd.calls) != 1 {
-		t.Fatalf("Spawn verdict must dispatch exactly once to fulfill its claim; got %v", stubCmd.calls)
-	}
-	if flashSuggestsReset(mm.flash) {
-		t.Fatalf("Spawn verdict flash must not suggest [r] reset (that path is the one that abandons the claim); got %+v", mm.flash)
-	}
-
-	// Sanity: confirm this test really did exercise the mutating
-	// coordlock path (not an accidental no-op) — a second resolve for
-	// the same project must now observe the claim that was written.
-	v2, err := coordreconcile.Resolve(coordreconcile.DefaultDeps(), project, "cccc3333")
-	if err != nil {
-		t.Fatalf("second resolve: %v", err)
-	}
-	if v2.Decision != coordreconcile.Wait || !strings.Contains(v2.Reason, "boot in flight") {
-		t.Fatalf("second resolve = %+v; want Wait/boot-in-flight (proves the real ClaimStartingRecord CAS fired)", v2)
 	}
 }
 
