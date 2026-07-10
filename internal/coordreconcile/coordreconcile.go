@@ -137,11 +137,24 @@ func DefaultDeps() Deps {
 // resolves to Wait, so the caller re-resolves rather than spawning a
 // duplicate — the "exactly one coord" guarantee (T8) under concurrent [a].
 func Resolve(d Deps, project, agentID string) (Verdict, error) {
-	// (1) A PROCESS-LIVE active owner is the coord — attach, regardless of
-	// heartbeat TTL (process-live overrides stale heartbeat; the incident
-	// regression T3 needs no marker, and T7b's live-wedged leader is never
-	// spawned beside).
+	// (1) The flock is HELD by a live process (LiveOwner is now the LOCK_SH
+	// busy probe — flock-only D1/D6). A live flock holder — busy, booting, or
+	// version-skewed — is the coord and is NEVER spawned beside (the incident
+	// fix; no-auto-kill). Two sub-cases by the body's identity:
+	//   - agent_id present  ⇒ Attach to it (T1/T10).
+	//   - identity-less body ⇒ Wait, NOT Attach (D6). The body is old-binary /
+	//     torn (agent_id==""), and the attach callers (cmd/fleet/attach.go,
+	//     internal/tui/coord_resolve.go) hard-error on an empty AgentID, so
+	//     Attach-with-empty-id would dead-end and violate attach-never-exits.
+	//     Wait reschedules until the identity appears (a re-stamp / the coord
+	//     finishing boot) or the holder dies — never a spawn-beside (T13).
 	if owner, ok := d.LiveOwner(project); ok {
+		if owner.AgentID == "" {
+			return Verdict{
+				Decision: Wait,
+				Reason:   "flock held by a live coord whose identity is not yet readable; polling",
+			}, nil
+		}
 		return Verdict{
 			Decision: Attach,
 			Owner:    owner,

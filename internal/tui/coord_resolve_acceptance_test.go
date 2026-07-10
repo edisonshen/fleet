@@ -154,11 +154,10 @@ func TestTA1_TUIAttachGuardMatrixNoRespawn(t *testing.T) {
 		wantFlash   string
 	}{
 		{
-			name:      "empty owner id",
-			ownerID:   "",
-			wantFlash: "empty owner",
-		},
-		{
+			// NOTE: the identity-less flock holder (LiveOwner AgentID=="") is no
+			// longer an Attach-guard case — under flock-only D6 Resolve returns
+			// WAIT, not Attach-with-empty-id. That behavior is covered by
+			// TestTA1_TUIIdentityLessFlockHolderWaits below.
 			name:      "owner record load failure",
 			ownerID:   "missing1",
 			wantFlash: "agent record is not readable",
@@ -212,6 +211,38 @@ func TestTA1_TUIAttachGuardMatrixNoRespawn(t *testing.T) {
 			}
 			_ = cmd
 		})
+	}
+}
+
+// TestTA1_TUIIdentityLessFlockHolderWaits (T13, flock-only D6): the flock is
+// HELD by a live coord but its body is identity-less (LiveOwner ok, AgentID=="").
+// The TUI [a] path must WAIT (schedule a bounded retry tick), NEVER dead-end with
+// an error flash, spawn beside it, or attach — attach-never-exits under version
+// skew.
+func TestTA1_TUIIdentityLessFlockHolderWaits(t *testing.T) {
+	withFleetHome(t)
+	stub := &stubFleetCmd{}
+	stub.install(t)
+	(&stubSessionProbe{}).install(t)
+	st := reconciletest.State{LiveOwner: &coordlock.Owner{AgentID: "", PID: 501}}
+	resolveCalls := installTUIResolveFromState(t, &st)
+
+	m := New("test")
+	updated, cmd := m.beginResolvedCoordAttach("demo", "project")
+	if updated.pendingAttach != "" {
+		t.Fatalf("pendingAttach = %q; want empty (must not attach beside an identity-less holder)", updated.pendingAttach)
+	}
+	if len(stub.calls) != 0 {
+		t.Fatalf("identity-less holder must not spawn; dispatch calls=%v", stub.calls)
+	}
+	if updated.flash != nil && updated.flash.isErr {
+		t.Fatalf("identity-less holder ⇒ Wait, not an error flash; got %+v", updated.flash)
+	}
+	if cmd == nil {
+		t.Fatal("Wait must schedule a bounded retry tick (non-nil cmd)")
+	}
+	if *resolveCalls != 1 {
+		t.Fatalf("Resolve calls = %d, want 1", *resolveCalls)
 	}
 }
 

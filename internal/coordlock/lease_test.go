@@ -4,6 +4,7 @@ package coordlock
 
 import (
 	"encoding/json"
+	"errors"
 	"io"
 	"os"
 	"os/exec"
@@ -115,9 +116,20 @@ func readEpochFor(t *testing.T, project string) epochRecord {
 }
 
 // holdFlock opens + LOCK_EX-holds coordinator.flock for project via a
-// separate fd, simulating a live holder still owning the flock. Returns a
-// release func.
+// separate fd, simulating a live holder still owning the flock (empty body).
+// Returns a release func. Thin wrapper over heldFlock(nil).
 func holdFlock(t *testing.T, project string) func() {
+	t.Helper()
+	return heldFlock(t, project, nil)
+}
+
+// heldFlock is the flock-only reader-test primitive: it takes a real
+// LOCK_EX on project's coordinator.flock (so the LOCK_SH ownership probe reads
+// BUSY⇒owner, the kernel-proven liveness the readers now trust) and stamps the
+// given body (nil ⇒ empty/torn body, an identity-less holder). The LOCK_EX is
+// dropped + the fd closed via t.Cleanup (and via the returned release func, for
+// tests that model a graceful mid-test Release()).
+func heldFlock(t *testing.T, project string, body *flockBody) func() {
 	t.Helper()
 	paths, err := resolvePaths(project)
 	if err != nil {
@@ -132,6 +144,16 @@ func holdFlock(t *testing.T, project string) func() {
 	}
 	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
 		t.Fatalf("flock: %v", err)
+	}
+	if body != nil {
+		raw, merr := json.Marshal(*body)
+		if merr != nil {
+			t.Fatalf("marshal flock body: %v", merr)
+		}
+		if _, werr := f.Write(raw); werr != nil {
+			t.Fatalf("write flock body: %v", werr)
+		}
+		_ = f.Sync()
 	}
 	var once sync.Once
 	rel := func() {
@@ -164,132 +186,149 @@ func writeEpochRaw(t *testing.T, project string, rec epochRecord) {
 	}
 }
 
-// TestLeaderPresent (codex PR2 iter-11 [P2]): LeaderPresent uses the same
-// healthy/in-progress predicate AcquireLease uses, not a bare
-// state==active check. Healthy active -> true; stale active past TTL ->
-// false; fresh fencing takeover -> true; released / no record -> false.
-func TestLeaderPresent(t *testing.T) {
-	setupHome(t)
-	const project = "lp-test"
-	clk := &fakeClock{}
-	live := newFakeLiveness()
-	cfg := testCfg(clk, live)
-	const (
-		ownerPid   = 7000
-		ownerStart = int64(700700)
-		candPid    = 8000
-		candStart  = int64(800800)
-	)
-	live.set(ownerPid, ownerStart)
-	live.set(candPid, candStart)
-	owner := identity{Pid: ownerPid, PidStart: ownerStart, AgentID: "owner", Project: project}
-	cand := identity{Pid: candPid, PidStart: candStart, AgentID: "cand", Project: project}
-
-	// No record -> false.
-	if leaderPresentWithCfg(project, cfg) {
-		t.Error("no record: want false")
+// assertReaders checks all five repointed ownership readers agree on the
+// flock-only truth for project: busy⇒owner (LiveOwner / LeaseRecordActive /
+// LeaderPresent), the delivery reader additionally requires an agent_id, and
+// CurrentActiveOwnerPID names the body pid. wantPresent=false means the flock
+// is free (no owner) for every reader.
+func assertReaders(t *testing.T, project string, wantPresent bool, wantAgentID string, wantPID int) {
+	t.Helper()
+	if got := LeaseRecordActive(project); got != wantPresent {
+		t.Errorf("LeaseRecordActive = %v, want %v", got, wantPresent)
 	}
-
-	// Healthy active -> true.
-	writeEpochRaw(t, project, epochRecord{
-		Epoch: 5, State: stateActive, Owner: owner,
-		BootID: "test-boot-1", RenewedAtMono: clk.now(),
-	})
-	if !leaderPresentWithCfg(project, cfg) {
-		t.Error("healthy active: want true")
+	if got := LeaderPresent(project); got != wantPresent {
+		t.Errorf("LeaderPresent = %v, want %v", got, wantPresent)
 	}
-
-	// Stale active (owner alive but renewed_at past TTL) -> false.
-	staleClk := &fakeClock{}
-	staleClk.advance(2 * cfg.ttl) // now is well past renewed_at=0
-	if leaderPresentWithCfg(project, testCfg(staleClk, live)) {
-		t.Error("stale active past TTL: want false (stealable)")
+	// LiveOwner: spawn gate — busy⇒ok=true even for an identity-less body.
+	lo, ok := LiveOwner(project)
+	if ok != wantPresent {
+		t.Errorf("LiveOwner ok = %v, want %v", ok, wantPresent)
 	}
-
-	// Dead owner (pid gone) -> false even within TTL.
-	deadLive := newFakeLiveness() // owner/cand NOT set -> dead
-	if leaderPresentWithCfg(project, testCfg(clk, deadLive)) {
-		t.Error("dead owner: want false")
+	if ok && lo.AgentID != wantAgentID {
+		t.Errorf("LiveOwner.AgentID = %q, want %q", lo.AgentID, wantAgentID)
 	}
-
-	// Fresh fencing takeover (live candidate, in budget) -> true.
-	writeEpochRaw(t, project, epochRecord{
-		Epoch: 6, State: stateFencing, Owner: owner, Candidate: cand,
-		BootID: "test-boot-1", RenewedAtMono: clk.now(),
-	})
-	if !leaderPresentWithCfg(project, cfg) {
-		t.Error("fresh fencing takeover: want true")
+	// CurrentActiveOwnerPID: busy + a body pid>0 ⇒ (pid, true); torn body ⇒ (0,false).
+	pid, pok := CurrentActiveOwnerPID(project)
+	wantPidOK := wantPresent && wantPID > 0
+	if pok != wantPidOK {
+		t.Errorf("CurrentActiveOwnerPID ok = %v, want %v", pok, wantPidOK)
 	}
-
-	// Released -> false.
-	writeEpochRaw(t, project, epochRecord{
-		Epoch: 7, State: stateReleased, Owner: owner,
-		BootID: "test-boot-1", RenewedAtMono: clk.now(),
-	})
-	if leaderPresentWithCfg(project, cfg) {
-		t.Error("released: want false")
+	if pok && pid != wantPID {
+		t.Errorf("CurrentActiveOwnerPID pid = %d, want %d", pid, wantPID)
+	}
+	// CurrentOwner: delivery — requires a readable agent_id AND pid, else
+	// identity-pending (ok=false, keep polling).
+	co, cok := CurrentOwner(project)
+	wantCoOK := wantPresent && wantAgentID != "" && wantPID > 0
+	if cok != wantCoOK {
+		t.Errorf("CurrentOwner ok = %v, want %v", cok, wantCoOK)
+	}
+	if cok && (co.AgentID != wantAgentID || co.PID != wantPID) {
+		t.Errorf("CurrentOwner = %+v, want agent=%q pid=%d", co, wantAgentID, wantPID)
 	}
 }
 
-// TestLeaderPresent_BusyFlockNoEpoch_Booting (codex PR3 iter-3 [P2]): a
-// holder grabbed coordinator.flock but has not written coordinator.epoch yet
-// (still booting). LeaderPresent must mirror the acquire path's flock-body
-// freshness check: a FRESH same-boot live holder reads as present (so a
-// duplicate spawn stands down cleanly), a stale/dead/missing body does not.
-func TestLeaderPresent_BusyFlockNoEpoch_Booting(t *testing.T) {
+// TestFlockBodyOwnerReaders is the flock-only reader matrix (T1/T3/T5/T6/T8/T9/
+// T12). A busy flock (real LOCK_EX via heldFlock) makes every spawn-gate reader
+// name the holder — kernel-proven, epoch-independent. A free/absent flock makes
+// every reader report no owner. Body variants exercise the identity split: a
+// full body ⇒ deliverable owner; an old-schema/torn body ⇒ spawn-gate owner but
+// delivery identity-pending; and a stale Mono still ⇒ owner (the deleted TTL
+// clause, D4). No fakeClock/pid seam needed — the flock probe is the oracle.
+func TestFlockBodyOwnerReaders(t *testing.T) {
+	const holderPID = 4242
+	full := &flockBody{Pid: holderPID, PidStart: 222222, AgentID: "holder01", Project: "p", BootID: "b"}
+	cases := []struct {
+		name        string
+		hold        bool
+		createFree  bool // create coordinator.flock but do NOT hold it (free)
+		body        *flockBody
+		wantPresent bool
+		wantAgentID string
+		wantPID     int
+	}{
+		// T1/T6: full body ⇒ every reader names the holder; delivery deliverable.
+		{name: "T1_T6_full_body_names_holder", hold: true, body: full, wantPresent: true, wantAgentID: "holder01", wantPID: holderPID},
+		// T5: a live holder with a stale Mono (would have tripped the old TTL) is
+		// STILL the owner — the reader never reads Mono (busy⇒owner, D4).
+		{name: "T5_stale_mono_still_owner", hold: true, wantPresent: true, wantAgentID: "holder01", wantPID: holderPID,
+			body: &flockBody{Pid: holderPID, PidStart: 222222, AgentID: "holder01", Project: "p", BootID: "b", Mono: -999999999999}},
+		// T8: version skew — old-schema body has a pid but NO agent_id. Spawn gate
+		// still owner (busy); CurrentActiveOwnerPID names the pid; CurrentOwner is
+		// identity-pending (ok=false) — never "no owner", never a duplicate spawn.
+		{name: "T8_old_schema_no_agentid", hold: true, wantPresent: true, wantAgentID: "", wantPID: holderPID,
+			body: &flockBody{Pid: holderPID, PidStart: 222222, BootID: "b"}},
+		// T9: torn/empty body (mid-stamp). Busy⇒owner; no pid/id ⇒ delivery + pid
+		// readers degrade to identity-pending, NOT "no owner".
+		{name: "T9_torn_empty_body", hold: true, body: nil, wantPresent: true, wantAgentID: "", wantPID: 0},
+		// T3: flock file exists but is FREE (no holder) ⇒ no owner.
+		{name: "T3_free_flock", createFree: true, wantPresent: false},
+		// T12: flock file never created (ENOENT) ⇒ no owner, no crash.
+		{name: "T12_enoent_never_created", wantPresent: false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			setupHome(t)
+			const project = "flock-readers"
+			switch {
+			case tc.hold:
+				heldFlock(t, project, tc.body)
+			case tc.createFree:
+				paths, _ := resolvePaths(project)
+				if err := os.MkdirAll(filepath.Dir(paths.flock), 0o755); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(paths.flock, nil, 0o644); err != nil {
+					t.Fatal(err)
+				}
+			}
+			assertReaders(t, project, tc.wantPresent, tc.wantAgentID, tc.wantPID)
+		})
+	}
+}
+
+// TestFlockOwner_EpochIgnored (T7): a busy flock whose body names holder A while
+// a STALE epoch names a DIFFERENT owner B. The repointed readers must return the
+// FLOCK holder A — the epoch is no longer read for ownership.
+func TestFlockOwner_EpochIgnored(t *testing.T) {
 	setupHome(t)
-	const project = "lp-busy-no-epoch"
-	clk := &fakeClock{}
-	live := newFakeLiveness()
-	cfg := testCfg(clk, live)
-	const holderPid, holderStart = 9100, int64(910910)
-	live.set(holderPid, holderStart)
+	const project = "flock-epoch-ignored"
+	heldFlock(t, project, &flockBody{Pid: 4242, PidStart: 222222, AgentID: "flockA", Project: project, BootID: "b"})
+	writeEpochRaw(t, project, epochRecord{
+		Epoch: 9, State: stateActive,
+		Owner:  identity{Pid: 5555, PidStart: 333333, AgentID: "epochB", Project: project},
+		BootID: "test-boot-1", RenewedAtMono: 0,
+	})
+	if o, ok := LiveOwner(project); !ok || o.AgentID != "flockA" {
+		t.Fatalf("LiveOwner = %+v ok=%v, want flockA (flock body wins over epoch)", o, ok)
+	}
+	if pid, ok := CurrentActiveOwnerPID(project); !ok || pid != 4242 {
+		t.Fatalf("CurrentActiveOwnerPID = %d ok=%v, want 4242 (flock body pid)", pid, ok)
+	}
+	if o, ok := CurrentOwner(project); !ok || o.AgentID != "flockA" {
+		t.Fatalf("CurrentOwner = %+v ok=%v, want flockA", o, ok)
+	}
+}
 
-	paths, err := resolvePaths(project)
-	if err != nil {
-		t.Fatal(err)
+// TestFlockOwner_ReleasedButAliveIsFree (T11): a holder stamped its body then
+// dropped the flock (a graceful Release() drops LOCK_EX while the process still
+// lives). The LOCK_SH probe ACQUIRES the freed flock ⇒ owner=false, even though
+// the body still names the holder — a body-pid check alone would wrongly still
+// name the alive-but-released holder. This is why the probe is LOCK_SH, not a
+// body read.
+func TestFlockOwner_ReleasedButAliveIsFree(t *testing.T) {
+	setupHome(t)
+	const project = "flock-released-alive"
+	rel := heldFlock(t, project, &flockBody{Pid: 4242, PidStart: 222222, AgentID: "holder01", Project: project, BootID: "b"})
+	rel() // drop LOCK_EX (Release semantics) — the body persists on disk
+	if o, ok := LiveOwner(project); ok {
+		t.Fatalf("released-but-alive holder must read FREE: got owner=%+v", o)
 	}
-	if err := os.MkdirAll(filepath.Dir(paths.flock), 0o755); err != nil {
-		t.Fatal(err)
+	if LeaseRecordActive(project) {
+		t.Fatal("released flock must not read as a live lease generation")
 	}
-	// Hold the flock for the whole test (simulates the booting holder).
-	f, gotFlock, err := tryFlock(paths.flock)
-	if err != nil || !gotFlock {
-		t.Fatalf("tryFlock: ok=%v err=%v", gotFlock, err)
-	}
-	defer func() { _ = releaseFlock(f) }()
-
-	writeBody := func(b flockBody) {
-		raw, _ := json.Marshal(b)
-		if e := f.Truncate(0); e != nil {
-			t.Fatal(e)
-		}
-		if _, e := f.Seek(0, 0); e != nil {
-			t.Fatal(e)
-		}
-		if _, e := f.Write(raw); e != nil {
-			t.Fatal(e)
-		}
-		_ = f.Sync()
-	}
-
-	// Fresh same-boot live holder, in-budget -> present.
-	writeBody(flockBody{Pid: holderPid, PidStart: holderStart, BootID: "test-boot-1", Mono: clk.now()})
-	if !leaderPresentWithCfg(project, cfg) {
-		t.Error("busy flock + fresh booting holder: want LeaderPresent true")
-	}
-
-	// Hung holder (body mono past TTL) -> not present (stealable).
-	staleClk := &fakeClock{}
-	staleClk.advance(2 * cfg.ttl)
-	if leaderPresentWithCfg(project, testCfg(staleClk, live)) {
-		t.Error("busy flock + hung holder past TTL: want LeaderPresent false")
-	}
-
-	// Dead holder pid -> not present.
-	deadLive := newFakeLiveness() // holder not set -> dead
-	if leaderPresentWithCfg(project, testCfg(clk, deadLive)) {
-		t.Error("busy flock + dead holder: want LeaderPresent false")
+	if _, ok := CurrentOwner(project); ok {
+		t.Fatal("released flock must have no current owner")
 	}
 }
 
@@ -1345,66 +1384,162 @@ func TestStillOwnedRejectsSelfExpiredToken(t *testing.T) {
 	}
 }
 
-func TestCurrentOwnerReturnsActiveOwnerTuple(t *testing.T) {
+// TestIntegration_BusyCoordReadersNameHolder (T1 — the incident regression, end
+// to end): a REAL AcquireLease holds the flock + stamps the body, then EVERY
+// repointed reader names the holder even though the epoch is `starting` (never
+// Activated → deliberately not `active`). This proves the readers read the flock,
+// not the epoch — a busy-but-alive coord can no longer be spawned beside. After
+// Release() the flock frees and every reader reports no owner.
+func TestIntegration_BusyCoordReadersNameHolder(t *testing.T) {
 	setupHome(t)
-	const project = "rainier"
+	const project = "integ-busy"
+	lease, acquired, err := AcquireLease(project, "holder01")
+	if err != nil || !acquired {
+		t.Fatalf("AcquireLease: acquired=%v err=%v", acquired, err)
+	}
+	t.Cleanup(lease.Release)
+	if rec := readEpochFor(t, project); rec.State == stateActive {
+		t.Fatalf("precondition: epoch should be non-active (starting), got %s", rec.State)
+	}
+	selfPID := os.Getpid()
+	if o, ok := LiveOwner(project); !ok || o.AgentID != "holder01" {
+		t.Fatalf("LiveOwner = %+v ok=%v, want holder01", o, ok)
+	}
+	if o, ok := CurrentOwner(project); !ok || o.AgentID != "holder01" || o.PID != selfPID {
+		t.Fatalf("CurrentOwner = %+v ok=%v, want holder01 pid=%d", o, ok, selfPID)
+	}
+	if pid, ok := CurrentActiveOwnerPID(project); !ok || pid != selfPID {
+		t.Fatalf("CurrentActiveOwnerPID = %d ok=%v, want self pid %d", pid, ok, selfPID)
+	}
+	if !LeaderPresent(project) {
+		t.Fatal("LeaderPresent = false, want true for a busy coord")
+	}
+	if !LeaseRecordActive(project) {
+		t.Fatal("LeaseRecordActive = false, want true for a busy coord")
+	}
+	// Release frees the flock -> no owner for any reader.
+	lease.Release()
+	if _, ok := LiveOwner(project); ok {
+		t.Fatal("after Release, LiveOwner must report free")
+	}
+	if LeaderPresent(project) || LeaseRecordActive(project) {
+		t.Fatal("after Release, no leader/lease generation must remain")
+	}
+}
+
+// TestStampFlockBody_FailClosed (T4): a failed flock-body stamp must fail the
+// acquire and RELEASE the flock at EVERY call site (D3) — never leave a
+// body-less held flock a reader would see as identity-pending forever. Exercised
+// at the free-acquire (:573), released-retry (:691), and takeover (:999) sites
+// via the stampErr fault seam. The invariant proved per site: acquire returns
+// an error, no lease, and a subsequent tryFlock SUCCEEDS (the flock was freed).
+func TestStampFlockBody_FailClosed(t *testing.T) {
+	stampFault := errors.New("injected stamp fault")
+	assertFreed := func(t *testing.T, project string) {
+		t.Helper()
+		paths, _ := resolvePaths(project)
+		f, got, ferr := tryFlock(paths.flock)
+		if ferr != nil || !got {
+			t.Fatalf("flock leaked (not released) after fail-closed acquire: got=%v err=%v", got, ferr)
+		}
+		_ = releaseFlock(f)
+	}
+
+	t.Run("site573_free_acquire", func(t *testing.T) {
+		setupHome(t)
+		const project = "stampfail-free"
+		cfg := testCfg(&fakeClock{}, newFakeLiveness())
+		cfg.stampErr = stampFault
+		lease, acquired, err := acquireLease(project, "cand", cfg)
+		if acquired || lease != nil || err == nil {
+			t.Fatalf("fail-closed free acquire: acquired=%v lease=%v err=%v", acquired, lease, err)
+		}
+		assertFreed(t, project)
+	})
+
+	t.Run("site691_released_retry", func(t *testing.T) {
+		setupHome(t)
+		const project = "stampfail-released"
+		clk := &fakeClock{}
+		live := newFakeLiveness()
+		cfg := testCfg(clk, live)
+		cfg.stampErr = stampFault
+		const oldPid, oldStart = 4242, int64(424242)
+		live.set(oldPid, oldStart)
+		writeEpochRaw(t, project, epochRecord{
+			Epoch: 9, State: stateReleased,
+			Owner:  identity{Pid: oldPid, PidStart: oldStart, AgentID: "old", Project: project},
+			BootID: "test-boot-1", RenewedAtMono: clk.now(),
+		})
+		releaseHeld := holdFlock(t, project)
+		// The releaser drops the flock mid-cleanup; retryFlock then acquires and
+		// reaches the :691 stamp (mirrors TestReleasedHolderBusyFlock_RetriesNotFenced).
+		go func() {
+			time.Sleep(40 * time.Millisecond)
+			releaseHeld()
+		}()
+		_, acquired, err := acquireLease(project, "cand", cfg)
+		if acquired || err == nil {
+			t.Fatalf("fail-closed released-retry: acquired=%v err=%v", acquired, err)
+		}
+		assertFreed(t, project)
+	})
+
+	t.Run("site999_takeover", func(t *testing.T) {
+		setupHome(t)
+		const project = "stampfail-takeover"
+		clk := &fakeClock{}
+		live := newFakeLiveness()
+		cfg := testCfg(clk, live)
+		cfg.stampErr = stampFault
+		// All prospective holders DEAD so the takeover proceeds to acquire the
+		// flock after the kill frees it, then reaches the :999 stamp.
+		writeFlockBodyRaw(t, project, flockBody{Pid: 6666, PidStart: 555555, BootID: "test-boot-1", Mono: 0})
+		releaseHolder := holdFlock(t, project)
+		writeEpochRaw(t, project, epochRecord{
+			Epoch: 6, State: stateFencing,
+			Owner:     identity{Pid: 4242, PidStart: 222222, AgentID: "old", Project: project},
+			Candidate: identity{Pid: 5555, PidStart: 333333, AgentID: "prior", Project: project},
+			BootID:    "test-boot-1", RenewedAtMono: 0,
+		})
+		cfg.killStub = func(identity, int64) error { releaseHolder(); return nil }
+		clk.advance(31 * time.Second)
+		_, acquired, err := acquireLease(project, "cand", cfg)
+		if acquired || err == nil {
+			t.Fatalf("fail-closed takeover: acquired=%v err=%v", acquired, err)
+		}
+		assertFreed(t, project)
+	})
+}
+
+// TestFlockHolderRecoverable_NoTTLClause (D4, acquire-side of T5): the deleted
+// TTL clause means a LIVE same-boot holder is NEVER recoverable on staleness, no
+// matter how quiet — the literal incident fix. A provably-GONE holder (dead pid)
+// is still recoverable.
+func TestFlockHolderRecoverable_NoTTLClause(t *testing.T) {
+	setupHome(t)
+	const project = "recover-d4"
 	clk := &fakeClock{}
 	live := newFakeLiveness()
 	cfg := testCfg(clk, live)
-	const (
-		ownerPid   = 4242
-		ownerStart = int64(222222)
-	)
-	live.set(ownerPid, ownerStart) // owner process alive
-
-	// HEALTHY active owner (same boot, within TTL, pid alive) -> deliverable.
-	writeEpochRaw(t, project, epochRecord{
-		Epoch: 5,
-		State: stateActive,
-		Owner: identity{
-			Pid:      ownerPid,
-			PidStart: ownerStart,
-			AgentID:  "owner1",
-			Project:  project,
-		},
-		BootID:        "test-boot-1",
-		RenewedAtMono: clk.now(),
+	paths, _ := resolvePaths(project)
+	if err := os.MkdirAll(filepath.Dir(paths.flock), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	const holderPid, holderStart = 7000, int64(777777)
+	live.set(holderPid, holderStart)
+	writeFlockBodyRaw(t, project, flockBody{
+		Pid: holderPid, PidStart: holderStart, AgentID: "holder", Project: project,
+		BootID: "test-boot-1", Mono: 0,
 	})
-
-	owner, ok := currentOwnerWithCfg(project, cfg)
-	if !ok {
-		t.Fatal("currentOwnerWithCfg ok=false, want true for a healthy active owner")
+	clk.advance(100 * time.Second) // far past ttl=30s (would have tripped the old clause)
+	l := &Lease{cfg: cfg, paths: paths, boot: "test-boot-1"}
+	if l.flockHolderRecoverable() {
+		t.Fatal("a live same-boot holder must NOT be recoverable after quiet time (D4)")
 	}
-	if owner.AgentID != "owner1" || owner.PID != ownerPid || owner.PidStart != ownerStart {
-		t.Fatalf("currentOwnerWithCfg = %+v, want owner1 pid/start tuple", owner)
-	}
-	if !owner.EngineStamped {
-		t.Fatal("EngineStamped=false, want true for complete owner tuple")
-	}
-
-	// codex iter-19 [P2]: a STALE active record (past TTL) must NOT be reported
-	// as a deliverable owner — its process may be hung; the resume prompt would
-	// be typed into a corpse instead of the healthy takeover owner.
-	staleClk := &fakeClock{}
-	staleClk.advance(cfg.ttl + time.Second)
-	if owner, ok := currentOwnerWithCfg(project, testCfg(staleClk, live)); ok {
-		t.Fatalf("stale active owner reported as current: %+v, want ok=false", owner)
-	}
-
-	// A DEAD owner (pid no longer alive) is likewise not deliverable.
-	deadLive := newFakeLiveness() // owner pid not set -> dead
-	if owner, ok := currentOwnerWithCfg(project, testCfg(clk, deadLive)); ok {
-		t.Fatalf("dead owner reported as current: %+v, want ok=false", owner)
-	}
-
-	// Released epoch -> no owner.
-	writeEpochRaw(t, project, epochRecord{
-		Epoch: 6,
-		State: stateReleased,
-		Owner: identity{Pid: ownerPid, PidStart: ownerStart, AgentID: "owner1", Project: project},
-	})
-	if owner, ok := currentOwnerWithCfg(project, cfg); ok {
-		t.Fatalf("released epoch returned owner %+v, want ok=false", owner)
+	live.kill(holderPid)
+	if !l.flockHolderRecoverable() {
+		t.Fatal("a provably-dead holder must be recoverable")
 	}
 }
 
@@ -2080,35 +2215,25 @@ func TestReleaseSurfacesDemoteFaultOnCorruptEpoch(t *testing.T) {
 	}
 }
 
-// codex iter-23 [P1] regression: LeaseRecordActive distinguishes a real lease
-// generation (active / starting / fencing / fenced_not_acquired) from "no
-// lease" (released / missing). A failed takeover (fenced_not_acquired) MUST
-// count as a real lease so handoff delivery stays pending/doctor-gated instead
-// of direct-sending to a queued replacement as if the coord were legacy/bare.
-// `starting` (D2 two-phase startup) MUST also count as a real lease — a
-// handoff-delivery poll landing inside a real coord's boot window must not
-// misread it as "no lease at all" and trigger the legacy direct-send fallback.
+// TestLeaseRecordActive (flock-only): a live lease generation exists iff a live
+// process HOLDS the flock (busy⇒owner), regardless of agent_id or any epoch
+// state. Delivery keeps a doc pending while a coord holds the flock and
+// direct-sends (legacy fallback) only when the flock is genuinely FREE.
 func TestLeaseRecordActive(t *testing.T) {
 	setupHome(t)
 	const project = "lra-test"
 
 	if LeaseRecordActive(project) {
-		t.Fatal("no epoch record -> LeaseRecordActive should be false")
+		t.Fatal("no flock -> LeaseRecordActive should be false")
 	}
-	owner := identity{Pid: 4242, PidStart: 222222, AgentID: "owner1", Project: project}
-	for _, tc := range []struct {
-		state string
-		want  bool
-	}{
-		{stateActive, true},
-		{stateStarting, true},
-		{stateFencing, true},
-		{stateFencedNotAcquired, true},
-		{stateReleased, false},
-	} {
-		writeEpochRaw(t, project, epochRecord{Epoch: 5, State: tc.state, Owner: owner, BootID: "test-boot-1"})
-		if got := LeaseRecordActive(project); got != tc.want {
-			t.Fatalf("LeaseRecordActive(state=%q) = %v, want %v", tc.state, got, tc.want)
-		}
+	// Busy flock, even with an identity-less body -> a real lease generation.
+	rel := heldFlock(t, project, nil)
+	if !LeaseRecordActive(project) {
+		t.Fatal("busy flock -> LeaseRecordActive should be true")
+	}
+	// Released flock -> no lease.
+	rel()
+	if LeaseRecordActive(project) {
+		t.Fatal("released flock -> LeaseRecordActive should be false")
 	}
 }

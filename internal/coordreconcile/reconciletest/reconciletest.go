@@ -7,6 +7,16 @@ import (
 
 // State is a deterministic coordreconcile.Deps builder. Tests set only the
 // fields relevant to a row; the zero value is a free lease.
+//
+// PRODUCTION-CONSISTENCY INVARIANT (flock-only, PR-1 D6): LiveOwner and
+// CurrentStarting are INDEPENDENT closures here, but in production they read the
+// same flock. A LIVE flock holder makes LiveOwner non-nil (busy⇒owner), so a
+// row that models a live flock holder MUST set LiveOwner — otherwise Resolve
+// would reach the flock-free Supersede/SpawnStandby branch that a real live
+// holder can never reach (Resolve step-1 short-circuits to Attach). Leaving
+// LiveOwner nil while Starting.OwnerLive=true models only the FLOCK-FREE
+// pre-acquire window (a process wrote a starting record but has not yet
+// acquired the flock). Setting both inconsistently is the false-green D6 fixed.
 type State struct {
 	LiveOwner *coordlock.Owner
 	Starting  *coordlock.StartingStatus
