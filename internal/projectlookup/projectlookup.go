@@ -187,33 +187,47 @@ func KnownProjects() ([]string, error) {
 // TmuxSession set. Callers that assign `pendingAttach = rec.TmuxSession`
 // (notably the TUI F18 path) would otherwise quit with nothing to attach.
 func FindLiveCoord(records []*agent.Record, projectName string) (*agent.Record, bool) {
-	return FindLiveCoordPreferPID(records, projectName, 0)
+	return FindLiveCoordPreferPID(records, projectName, 0, 0)
 }
 
 // FindLiveCoordPreferPID is FindLiveCoord's disambiguation variant for when a
 // SPECIFIC process is already known to be the live flock holder (e.g.
-// attach's D9e bounded-Wait recovery, which has
-// coordlock.CurrentActiveOwnerPID(project) available even when the flock
-// body's AgentID itself is unreadable). Plain FindLiveCoord returns the
-// FIRST project+coord-task+alive-session match in agent.List() order — fine
-// when at most one such record can exist, but the non-graceful swap path
-// (atomic_coord_swap.go) can deliberately leave an ORPHANED OLD record with a
-// still-alive tmux session behind a botched kill (ErrOrphanSurvived /
-// ErrOldKillProbeAmbiguous), coexisting with NEW. Landing on whichever
-// happens to sort first would attach the operator into a dead-end orphan
-// instead of the real live coordinator (review adversarial-subagent finding).
+// attach's D9e bounded-Wait recovery, which has coordlock.LiveOwner(project)
+// available even when the flock body's AgentID itself is unreadable). Plain
+// FindLiveCoord returns the FIRST project+coord-task+alive-session match in
+// agent.List() order — fine when at most one such record can exist, but the
+// non-graceful swap path (atomic_coord_swap.go) can deliberately leave an
+// ORPHANED OLD record with a still-alive tmux session behind a botched kill
+// (ErrOrphanSurvived / ErrOldKillProbeAmbiguous), coexisting with NEW.
+// Landing on whichever happens to sort first would attach the operator into
+// a dead-end orphan instead of the real live coordinator (review
+// adversarial-subagent finding).
 //
 // preferredPID<=0 (no cross-check available) behaves EXACTLY like
-// FindLiveCoord — scans every candidate and returns the first alive match.
+// FindLiveCoord — scans every candidate and returns the first alive match
+// (preferredPidStart is ignored in this mode).
+//
 // preferredPID>0: a known PID is real evidence, so it is trusted STRICTLY —
-// return the candidate whose SupervisorPID matches it, or ok=false if none
-// does. It does NOT fall back to a first-match guess (codex confirm round
-// [P2]): a confirmed flock-holder PID with no matching record means no
-// record on disk can be trusted as that holder, so guessing at an unrelated
+// return the candidate whose SupervisorPID AND SupervisorPidStart both match,
+// or ok=false if none does. Matching PID alone is NOT enough (codex confirm
+// round [P2] #4): PIDs get reused by the OS, so a stale/orphan record could
+// coincidentally carry the SAME (recycled) pid as the real holder while
+// being a completely different process — pid_start (the process's start
+// time) is this codebase's established discriminant against exactly that
+// (mirrored everywhere else identity is authenticated: HandoffSuccessorAlive,
+// KillCoordIfIdentityMatches, LeaseCheckByAncestor). preferredPidStart<=0
+// means the caller has no pid_start to offer (e.g. a torn body) — in that
+// case NO record can be trusted as a match (matching PID with an unknown
+// pid_start proves nothing), so it always returns ok=false rather than
+// silently degrading to PID-only matching.
+//
+// It does NOT fall back to a first-match guess when preferredPID>0: a
+// confirmed flock-holder identity with no matching record means no record on
+// disk can be trusted as that holder, so guessing at an unrelated
 // project-matching record would reproduce the exact orphan-attach hazard
 // this function exists to prevent. The caller surfaces "not attachable"
 // instead.
-func FindLiveCoordPreferPID(records []*agent.Record, projectName string, preferredPID int) (*agent.Record, bool) {
+func FindLiveCoordPreferPID(records []*agent.Record, projectName string, preferredPID int, preferredPidStart int64) (*agent.Record, bool) {
 	want := CoordTaskID(projectName)
 	var first *agent.Record
 	for _, r := range records {
@@ -234,17 +248,17 @@ func FindLiveCoordPreferPID(records []*agent.Record, projectName string, preferr
 			cand = &cp
 		}
 		if preferredPID > 0 {
-			if cand.SupervisorPID == preferredPID {
+			if preferredPidStart > 0 && cand.SupervisorPID == preferredPID && cand.SupervisorPidStart == preferredPidStart {
 				return cand, true
 			}
-			continue // a confirmed PID demands an exact match, never a guess
+			continue // a confirmed identity demands an exact pid+pid_start match, never a guess
 		}
 		if first == nil {
 			first = cand
 		}
 	}
 	if preferredPID > 0 {
-		return nil, false // no candidate matched the confirmed holder PID
+		return nil, false // no candidate matched the confirmed holder identity
 	}
 	if first != nil {
 		return first, true

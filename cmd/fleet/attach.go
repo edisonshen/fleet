@@ -468,34 +468,33 @@ func resolveAndAttachCoord(token, project string, opts AttachOpts) error {
 			// or a torn body). A busy flock is a live holder — the kernel frees it
 			// only on death — so reaping+respawning would either KILL a live coord
 			// (forbidden, Decision 3) or dead-end (the respawn can't take the held
-			// flock). Recover via the AGENT RECORD instead: FindLiveCoord names a
-			// live coord by project + is_coord + a live tmux session, and we
-			// ATTACH into it (land inside the live session). NEVER a reap.
+			// flock). Recover via the AGENT RECORD instead: FindLiveCoordPreferPID
+			// names a live coord by project + is_coord + a live tmux session, and
+			// we ATTACH into it (land inside the live session). NEVER a reap.
 			//
-			// Prefer the record that actually matches the flock holder's PID
-			// (coordlock.CurrentActiveOwnerPID reads the body's pid even when its
-			// AgentID is unreadable — that's this exact "identity unreadable"
-			// case) over a bare first-match: a botched non-graceful swap can
-			// leave an ORPHANED OLD record with a still-alive session coexisting
-			// with the real live holder (review adversarial-subagent finding);
-			// without the PID cross-check, landing on whichever record sorts
-			// first could attach into the dead-end orphan instead.
-			//
-			// Gate the whole record-fallback on a CONFIRMED holder PID (codex
-			// confirm rounds [P2] x2): a bounded Wait can ALSO mean "flock
-			// genuinely free, a handoff is in flight" (a booting successor
-			// hasn't acquired it yet), or "flock busy but the body is torn
-			// beyond even a PID" -- neither gives us anything to cross-check a
-			// candidate record against. Without a real PID, falling through to
-			// FindLiveCoordPreferPID's plain first-match could attach into an
-			// unrelated stale/orphan session instead of honestly surfacing
-			// "still not attachable." CurrentActiveOwnerPID's ok=true ALREADY
-			// implies the flock is busy (it requires a live LOCK_EX holder AND
-			// a readable positive PID), so checking it alone subsumes a
-			// separate LiveOwner busy check.
-			if holderPID, pidOK := coordlock.CurrentActiveOwnerPID(project); pidOK {
+			// Only attempt this when LiveOwner proves BOTH that the flock is
+			// busy AND that its body yields a confirmed pid+pid_start identity
+			// (review adversarial-subagent finding + 3 rounds of codex confirm
+			// tightened this progressively). Without that, there is nothing to
+			// authenticate a candidate record against, and guessing would
+			// reproduce the exact hazard this path exists to avoid — a botched
+			// non-graceful swap can leave an ORPHANED OLD record with a
+			// still-alive session coexisting with the real live holder
+			// (or a totally unrelated project). Skipped cases fall through to
+			// the honest "not attachable" diagnostic below:
+			//   - flock genuinely FREE (e.g. a handoff in flight, a booting
+			//     successor hasn't acquired it yet): busy=false.
+			//   - flock busy but body torn beyond even a PID: owner.PID==0.
+			//   - flock busy, PID readable, but pid_start unknown/mismatched:
+			//     FindLiveCoordPreferPID itself refuses (PIDs get reused; pid_start
+			//     is this codebase's established discriminant against that,
+			//     mirrored by HandoffSuccessorAlive / KillCoordIfIdentityMatches /
+			//     LeaseCheckByAncestor) — PID alone never proves identity.
+			// LiveOwner (not CurrentActiveOwnerPID) is used because it is the
+			// one reader that carries PidStart even when AgentID is unreadable.
+			if owner, busy := coordlock.LiveOwner(project); busy && owner.PID > 0 {
 				if records, lerr := agent.List(); lerr == nil {
-					if rec, ok := projectlookup.FindLiveCoordPreferPID(records, project, holderPID); ok {
+					if rec, ok := projectlookup.FindLiveCoordPreferPID(records, project, owner.PID, owner.PidStart); ok {
 						session := rec.TmuxSession
 						if session == "" {
 							session = tmux.SessionName(rec.ID)

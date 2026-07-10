@@ -81,15 +81,15 @@ func installD9eStubs(t *testing.T, aliveSessions map[string]bool) *int {
 
 func writeD9eRecord(t *testing.T, id, project string) {
 	t.Helper()
-	writeD9eRecordWithPID(t, id, project, 0)
+	writeD9eRecordWithPID(t, id, project, 0, 0)
 }
 
 // writeD9eRecordWithPID writes a coord-tagged record for id/project, also
-// stamping SupervisorPID so FindLiveCoordPreferPID's strict PID match (codex
-// confirm round [P2] #3) can recognize it as the confirmed flock holder's
-// record. pid<=0 leaves SupervisorPID unset (the "unrelated orphan record"
-// shape most D9e tests want).
-func writeD9eRecordWithPID(t *testing.T, id, project string, pid int) {
+// stamping SupervisorPID+SupervisorPidStart so FindLiveCoordPreferPID's
+// strict identity match (codex confirm rounds [P2] #3-4) can recognize it as
+// the confirmed flock holder's record. pid<=0 leaves both fields unset (the
+// "unrelated orphan record" shape most D9e tests want).
+func writeD9eRecordWithPID(t *testing.T, id, project string, pid int, pidStart int64) {
 	t.Helper()
 	r := agent.New(id)
 	r.Project = project
@@ -97,6 +97,7 @@ func writeD9eRecordWithPID(t *testing.T, id, project string, pid int) {
 	r.TmuxSession = "fleet-" + id
 	if pid > 0 {
 		r.SupervisorPID = pid
+		r.SupervisorPidStart = pidStart
 	}
 	if err := r.Write(); err != nil {
 		t.Fatalf("write agent record %s: %v", id, err)
@@ -222,11 +223,15 @@ func TestResolveAndAttachCoord_D9e_BusyFlock_UsesRecordFallback(t *testing.T) {
 	}
 	t.Cleanup(lease.Release)
 
-	// AcquireLease stamps THIS test process's real pid into the flock body
-	// (no subprocess involved) — the record must carry that SAME pid as its
-	// SupervisorPID to be recognized as the confirmed holder's record under
-	// the strict PID match (codex confirm round [P2] #3).
-	writeD9eRecordWithPID(t, "realholder", project, os.Getpid())
+	// AcquireLease stamps THIS test process's real pid+pid_start into the
+	// flock body (no subprocess involved) — the record must carry that SAME
+	// identity to be recognized as the confirmed holder's record under the
+	// strict pid+pid_start match (codex confirm rounds [P2] #3-4).
+	selfStart, ok := coordlock.PidStartNanos(os.Getpid())
+	if !ok {
+		t.Fatal("PidStartNanos(self) failed")
+	}
+	writeD9eRecordWithPID(t, "realholder", project, os.Getpid(), selfStart)
 	attachCalls := installD9eStubs(t, map[string]bool{"fleet-realholder": true})
 
 	err := resolveAndAttachCoord("tok", project, AttachOpts{ResolveMaxAttempts: 1, Stderr: &bytes.Buffer{}})
