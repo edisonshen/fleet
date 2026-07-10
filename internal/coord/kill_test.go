@@ -150,7 +150,7 @@ func TestKillCoord_T10_EpochGatedSweep(t *testing.T) {
 	d := testKillDeps(rec, recs, live, leaderPid, selfPid)
 
 	// Stale same-project coord -> reaped.
-	if err := killCoord(KillTarget{Pid: stalePid, PidStart: 222, AgentID: "stale001", Project: project, FencerEpoch: 6}, d); err != nil {
+	if err := killCoord(KillTarget{Pid: stalePid, PidStart: 222, AgentID: "stale001", Project: project}, d); err != nil {
 		t.Fatalf("stale same-project kill: want nil (reaped), got %v", err)
 	}
 	if !rec.sentTo(stalePid) {
@@ -159,7 +159,7 @@ func TestKillCoord_T10_EpochGatedSweep(t *testing.T) {
 
 	// Different project -> the record lookup is scoped to target.Project,
 	// so no record matches -> benign no-op, no signal.
-	if err := killCoord(KillTarget{Pid: otherPid, PidStart: 333, AgentID: "other001", Project: project, FencerEpoch: 6}, d); err != nil {
+	if err := killCoord(KillTarget{Pid: otherPid, PidStart: 333, AgentID: "other001", Project: project}, d); err != nil {
 		t.Fatalf("cross-project: want nil no-op, got %v", err)
 	}
 	if rec.sentTo(otherPid) {
@@ -167,7 +167,7 @@ func TestKillCoord_T10_EpochGatedSweep(t *testing.T) {
 	}
 
 	// The current active leader -> refused (epoch gate).
-	err := killCoord(KillTarget{Pid: leaderPid, PidStart: 444, AgentID: "leader01", Project: project, FencerEpoch: 6}, d)
+	err := killCoord(KillTarget{Pid: leaderPid, PidStart: 444, AgentID: "leader01", Project: project}, d)
 	if !errors.Is(err, ErrKillRefused) {
 		t.Errorf("leader kill: want ErrKillRefused, got %v", err)
 	}
@@ -176,7 +176,7 @@ func TestKillCoord_T10_EpochGatedSweep(t *testing.T) {
 	}
 
 	// Self -> refused.
-	err = killCoord(KillTarget{Pid: selfPid, PidStart: 111, AgentID: "self0001", Project: project, FencerEpoch: 6}, d)
+	err = killCoord(KillTarget{Pid: selfPid, PidStart: 111, AgentID: "self0001", Project: project}, d)
 	if !errors.Is(err, ErrKillRefused) {
 		t.Errorf("self kill: want ErrKillRefused, got %v", err)
 	}
@@ -202,7 +202,7 @@ func TestKillCoord_T36_PidReuseRefusal(t *testing.T) {
 	rec := &killRecorder{}
 	d := testKillDeps(rec, recs, live, 0, selfPid)
 
-	err := killCoord(KillTarget{Pid: pid, PidStart: 555, AgentID: "reuse001", Project: project, FencerEpoch: 7}, d)
+	err := killCoord(KillTarget{Pid: pid, PidStart: 555, AgentID: "reuse001", Project: project}, d)
 	if !errors.Is(err, ErrKillRefused) {
 		t.Fatalf("PID-reuse: want ErrKillRefused, got %v", err)
 	}
@@ -225,7 +225,7 @@ func TestKillCoord_W9_ExePathMustBeCoordRun(t *testing.T) {
 		live := map[int]int64{selfPid: 111, pid: 666}
 		rec := &killRecorder{}
 		d := testKillDeps(rec, recs, live, 0, selfPid)
-		err := killCoord(KillTarget{Pid: pid, PidStart: 666, AgentID: "exe00001", Project: project, FencerEpoch: 8}, d)
+		err := killCoord(KillTarget{Pid: pid, PidStart: 666, AgentID: "exe00001", Project: project}, d)
 		if !errors.Is(err, ErrKillRefused) {
 			t.Errorf("exe=%q: want ErrKillRefused, got %v", exe, err)
 		}
@@ -285,7 +285,7 @@ func TestKillCoord_SuccessfulReap_TermThenKill(t *testing.T) {
 	live := map[int]int64{selfPid: 111, pid: 909}
 	rec := &killRecorder{}
 	d := testKillDeps(rec, recs, live, 0, selfPid)
-	if err := killCoord(KillTarget{Pid: pid, PidStart: 909, AgentID: "reap0001", Project: project, FencerEpoch: 5}, d); err != nil {
+	if err := killCoord(KillTarget{Pid: pid, PidStart: 909, AgentID: "reap0001", Project: project}, d); err != nil {
 		t.Fatalf("reap: want nil, got %v", err)
 	}
 	// Stays "alive" in our fake (liveStart never mutated), so both SIGTERM
@@ -322,7 +322,7 @@ func TestKillCoord_SigkillEscalation_ReapsOrphan(t *testing.T) {
 	live := map[int]int64{selfPid: 111, pid: 707} // pid stays alive -> SIGKILL fires
 	rec := &killRecorder{}
 	d := testKillDeps(rec, recs, live, 0, selfPid)
-	if err := killCoord(KillTarget{Pid: pid, PidStart: 707, AgentID: "orph0001", Project: project, FencerEpoch: 7}, d); err != nil {
+	if err := killCoord(KillTarget{Pid: pid, PidStart: 707, AgentID: "orph0001", Project: project}, d); err != nil {
 		t.Fatalf("reap: want nil, got %v", err)
 	}
 	if rec.reapCount() != 1 {
@@ -359,7 +359,7 @@ func TestKillCoord_CleanSigtermExit_NoOrphanReap(t *testing.T) {
 		}
 		return nil
 	}
-	if err := killCoord(KillTarget{Pid: pid, PidStart: 808, AgentID: "clean001", Project: project, FencerEpoch: 8}, d); err != nil {
+	if err := killCoord(KillTarget{Pid: pid, PidStart: 808, AgentID: "clean001", Project: project}, d); err != nil {
 		t.Fatalf("clean exit: want nil, got %v", err)
 	}
 	if rec.reapCount() != 0 {
@@ -392,7 +392,7 @@ func TestKillCoord_P2_BecomesLeaderDuringGrace(t *testing.T) {
 		return leader, true
 	}
 
-	err := killCoord(KillTarget{Pid: pid, PidStart: 1212, AgentID: "p2l00001", Project: project, FencerEpoch: 9}, d)
+	err := killCoord(KillTarget{Pid: pid, PidStart: 1212, AgentID: "p2l00001", Project: project}, d)
 	if !errors.Is(err, ErrKillRefused) {
 		t.Fatalf("became-leader-during-grace: want ErrKillRefused, got %v", err)
 	}
@@ -420,7 +420,7 @@ func TestKillCoord_P2_PidReusedDuringGrace(t *testing.T) {
 	d.PidStart = func(p int) (int64, bool) { st, ok := live[p]; return st, ok }
 	d.Alive = func(p int) bool { _, ok := live[p]; return ok }
 
-	err := killCoord(KillTarget{Pid: pid, PidStart: 3434, AgentID: "p2r00001", Project: project, FencerEpoch: 4}, d)
+	err := killCoord(KillTarget{Pid: pid, PidStart: 3434, AgentID: "p2r00001", Project: project}, d)
 	if !errors.Is(err, ErrKillRefused) {
 		t.Fatalf("pid-reused-during-grace: want ErrKillRefused, got %v", err)
 	}
@@ -477,7 +477,7 @@ func TestKillCoord_SelectsByAgentIDOverStalePidMatch(t *testing.T) {
 	d := testKillDeps(rec, recs, live, 0, selfPid)
 
 	// Target names the REAL agent id + its start time.
-	err := killCoord(KillTarget{Pid: pid, PidStart: 2222, AgentID: "realtgt0", Project: project, FencerEpoch: 3}, d)
+	err := killCoord(KillTarget{Pid: pid, PidStart: 2222, AgentID: "realtgt0", Project: project}, d)
 	if err != nil {
 		t.Fatalf("kill should select realtgt0 and succeed, got %v", err)
 	}
