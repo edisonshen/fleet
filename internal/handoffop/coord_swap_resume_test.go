@@ -31,11 +31,13 @@ func (c leaseCell) deps() CoordSwapResumeDeps {
 			}
 			return coordlock.Owner{AgentID: c.owner}, true
 		},
-		CurrentHandoff: func(string) (coordlock.Handoff, bool) {
+		// PR-2: an in-flight handoff is the write-once journal naming a
+		// process-alive successor ⇒ HandoffInFlight. "" == no journal ⇒ None.
+		ClassifyHandoff: func(string) (coordlock.HandoffDisposition, coordlock.HandoffJournal, error) {
 			if c.handoffSucc == "" {
-				return coordlock.Handoff{}, false
+				return coordlock.HandoffNone, coordlock.HandoffJournal{}, nil
 			}
-			return coordlock.Handoff{SuccessorID: c.handoffSucc}, true
+			return coordlock.HandoffInFlight, coordlock.HandoffJournal{SuccessorID: c.handoffSucc}, nil
 		},
 		OldSessionAlive: func(string) (bool, error) {
 			return c.oldAlive, c.oldProbeErr
@@ -156,7 +158,9 @@ func TestClassifyCoordSwapResume_ForceSkipsProbe(t *testing.T) {
 		CurrentOwner: func(string) (coordlock.Owner, bool) {
 			return coordlock.Owner{AgentID: "NEW"}, true
 		},
-		CurrentHandoff: func(string) (coordlock.Handoff, bool) { return coordlock.Handoff{}, false },
+		ClassifyHandoff: func(string) (coordlock.HandoffDisposition, coordlock.HandoffJournal, error) {
+			return coordlock.HandoffNone, coordlock.HandoffJournal{}, nil
+		},
 		OldSessionAlive: func(string) (bool, error) {
 			probed = true
 			return true, nil
@@ -176,8 +180,10 @@ func TestClassifyCoordSwapResume_ForceSkipsProbe(t *testing.T) {
 func TestClassifyCoordSwapResume_NilProbeStillRefuses(t *testing.T) {
 	tmuxtest.RequireTmux(t) // isolation lint: `Resume(` trigger; no real spawn.
 	d := CoordSwapResumeDeps{
-		CurrentOwner:    func(string) (coordlock.Owner, bool) { return coordlock.Owner{AgentID: "NEW"}, true },
-		CurrentHandoff:  func(string) (coordlock.Handoff, bool) { return coordlock.Handoff{}, false },
+		CurrentOwner: func(string) (coordlock.Owner, bool) { return coordlock.Owner{AgentID: "NEW"}, true },
+		ClassifyHandoff: func(string) (coordlock.HandoffDisposition, coordlock.HandoffJournal, error) {
+			return coordlock.HandoffNone, coordlock.HandoffJournal{}, nil
+		},
 		OldSessionAlive: nil,
 	}
 	got := ClassifyCoordSwapResume("proj", "OLD", "", "NEW", false, d)
