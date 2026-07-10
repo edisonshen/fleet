@@ -234,15 +234,16 @@ func (m Model) unifiedProjectsFiltered(hiddenSet map[string]bool) []*ProjectRow 
 // coordTaskID(projectName) AND project matches AND tmux session is
 // alive AND the per-project state tree exists at ~/.fleet/projects/<name>/
 // AND the coordinator LEASE names the candidate agent's ID (the live active
-// owner, or the current `starting` owner within TTL).
+// owner, or the journal-named in-flight handoff successor).
 //
 // Lease gate (D3, replaces the deleted coord-spawn marker): the coordinator
 // lease is the identity now, so the "operator hand-spawns a coord-shaped
 // record" spoof no longer promotes — a bare record that never acquired the
-// lease is never named by LiveOwner/CurrentStarting. The lease's process-liveness
-// (LiveOwner) + starting TTL (CurrentStarting) subsume the old marker-mtime
-// freshness gate: a coord whose process exited stops being named, so a stale
-// tmux shell wrapper can't resurrect a dead coord.
+// lease is never named by LiveOwner/CurrentHandoffSuccessor. The lease's
+// process-liveness (LiveOwner) + successor process-liveness
+// (CurrentHandoffSuccessor) subsume the old marker-mtime freshness gate: a
+// coord whose process exited stops being named, so a stale tmux shell
+// wrapper can't resurrect a dead coord.
 //
 // Project-tree gate (codex iter-2 P2) keeps legacy records (pre-PR
 // agents with the same task_id shape) from auto-promoting on first

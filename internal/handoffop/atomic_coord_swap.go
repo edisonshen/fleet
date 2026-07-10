@@ -4,18 +4,19 @@ package handoffop
 // project's coordinator on the NON-graceful fallback path (a bare/legacy
 // successor, or auto-resume off). The coord-spawn marker is GONE
 // (TASK-PLAN-coord-lease-sole-identity D3): the coordinator LEASE is the sole
-// identity. The identity COMMIT is now ASYNC — the winning standby bumps the
-// epoch to NEW only when it acquires the flock freed by retiring OLD.
+// identity. The identity COMMIT is now ASYNC — the winning standby only
+// becomes the coordinator when it acquires the flock freed by retiring OLD.
 //
-// This helper's job in the lease world: spawn/probe NEW alive, RESERVE the
-// handoff on OLD's still-owned lease (naming NEW so a contender that observes
-// the freed lease WAITS for NEW instead of spawning a duplicate — coordreconcile
-// rule (a)), then RETIRE OLD (/exit + grace + Kill + archive). ReserveHandoff is
-// a SOFT TTL guard (a record-only CAS, not a hard rename): ok=false (no lease
-// record / bare coord) degrades benignly to the winner-delivery guarantee, and
-// the reservation self-heals if NEW never acquires (it expires and discovery
-// re-resolves). There is NO synchronous commit point here; steps 4-6 never fence
-// or kill a live coord.
+// This helper's job in the lease world: spawn/probe NEW alive, CREATE the
+// write-once handoff journal naming NEW (Decision 7, coordlock.HandoffJournal
+// — so a contender that observes the freed flock WAITS for NEW instead of
+// spawning a duplicate, coordreconcile rule (a)), then RETIRE OLD (/exit +
+// grace + Kill + archive). The journal is NOT a TTL: ok=false (a leftover
+// naming a different live-not-holding successor) degrades benignly to the
+// winner-delivery guarantee, and it self-heals by successor PROCESS liveness
+// (pid + pid_start), never elapsed time — a dead successor's leftover is
+// clearable on the next handoff's Create. There is NO synchronous commit
+// point here; steps 4-6 never fence or kill a live coord.
 //
 // Cases currently wired in production callers:
 //   1. Auto-handoff 50% (Yellow) — fleet-guard MILESTONE drain via

@@ -869,9 +869,7 @@ func takeoverAndRecover(req queue.SpawnFresh, path string, cachedOld *agent.Reco
 	// Abort = loud diagnostic + fleetlog event + drain failure through the
 	// existing "did not confirm the old coord is gone" path: the queue is
 	// preserved for retry, everyone stays alive, and the operator recourse
-	// is `fleet handoff <id>` / `fleet rm <id>`. (KP6 inside
-	// AcquireLeaseWithKill also protects the TakeOver below transitively;
-	// this gate makes the drain-side behavior explicit + tested.)
+	// is `fleet handoff <id>` / `fleet rm <id>`.
 	abortEscalation := func(why string) error {
 		msg := fmt.Sprintf(
 			"fleet drain: NOT escalating takeover for %s: %s; refusing to fence/kill (queue %s preserved for retry; if the old coord is truly wedged run `fleet handoff %s` or `fleet rm %s`)",
@@ -911,11 +909,13 @@ func takeoverAndRecover(req queue.SpawnFresh, path string, cachedOld *agent.Reco
 	}
 	defer release()
 
-	// Re-check the queue UNDER the lock: a peer drain that also won an acquire
-	// (the production TakeOver releases the lease the instant OLD is gone, so two
-	// drains can both observe acquired=true) may have already RecoverSpawned and
-	// deleted the queue. If it is gone, stand down — recovering again would
-	// duplicate the successor (codex PR3 iter-11 [P1]).
+	// Re-check the queue UNDER the lock: two concurrent drains can both observe
+	// the flock free and both pass the KP7 dead-check above (OLD's death frees
+	// the flock for everyone at once, not just the first observer) — this is
+	// exactly why LockAgent + the post-lock re-check exist. A peer drain that
+	// won the lock race may have already RecoverSpawned and deleted the queue.
+	// If it is gone, stand down — recovering again would duplicate the
+	// successor (codex PR3 iter-11 [P1]).
 	if _, statErr := os.Stat(path); errors.Is(statErr, os.ErrNotExist) {
 		_, _ = fmt.Fprintf(stdout, "fleet drain: %s already recovered by a concurrent drain; nothing to do\n", project)
 		return nil

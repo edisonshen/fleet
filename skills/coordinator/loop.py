@@ -380,34 +380,40 @@ def tick(
             )
 
     # 0.5. Parent-lease ownership proof (DESIGN-handoff-drain-storm-leak
-    # PR4). The Go `fleet coord-run` supervisor
-    # that PARENTS this tick holds coordinator.flock + heartbeats the
-    # coordinator.epoch fencing record. If a candidate fenced our parent
-    # (bumped the epoch), every disk-mutating thing this tick does would be
-    # a ZOMBIE write that corrupts the new leader's state — so we must be
-    # FENCED the same way the Go *WithLease APIs are, not merely backed off.
+    # PR4; repointed onto the flock by DESIGN-coord-lease-flock-only PR2).
+    # The Go `fleet coord-run` supervisor that PARENTS this tick holds
+    # coordinator.flock — an OS file lock with no separate heartbeat/TTL
+    # anymore (flock-only deleted the epoch write path; kernel liveness of
+    # the flock itself is the freshness signal now). If a candidate
+    # acquired that flock out from under our parent, every disk-mutating
+    # thing this tick does would be a ZOMBIE write that corrupts the new
+    # leader's state — so we must be FENCED the same way the Go
+    # *WithLease APIs are, not merely backed off.
     #
     # We route the proof through `fleet lease-check --project <p>`, which
-    # re-reads coordinator.epoch in Go and confirms the active lease owner
-    # is an ANCESTOR of this process (epoch + pid + pid_start, PID-reuse
-    # safe). Exit 3 = definitively fenced/not-owner → abort the tick WITHOUT
-    # writing and self-demote. Exit 0 = proven owner (or unsupported platform
-    # no-op success) → proceed. An inconclusive result (binary missing /
-    # internal error / timeout) is surfaced but does NOT abort: a legacy
-    # install without the new subcommand, or a transient fault, must not
-    # wedge a healthy coord — the coordinator.lock + project-ownership guard
-    # remain the defense for those. (A coordinator.lock acquire FAILURE is
-    # still never read as "my parent holds it" — that is step 1's job.)
+    # walks the caller's process ancestry (a lock-free read — the flock is
+    # held for the holder's whole life, so a blocking read would hang) and
+    # confirms the active flock holder is an ANCESTOR of this process (pid
+    # + pid_start, PID-reuse safe). Exit 3 = definitively fenced/not-owner
+    # → abort the tick WITHOUT writing and self-demote. Exit 0 = proven
+    # owner (or unsupported platform no-op success) → proceed. An
+    # inconclusive result (binary missing / internal error / timeout) is
+    # surfaced but does NOT abort: a legacy install without the new
+    # subcommand, or a transient fault, must not wedge a healthy coord —
+    # the coordinator.lock + project-ownership guard remain the defense
+    # for those. (A coordinator.lock acquire FAILURE is still never read
+    # as "my parent holds it" — that is step 1's job.)
     # KILL ROUTE DELETED (DESIGN-coord-lease-false-fence-prevention piece 1):
     # a fence verdict only ever SKIPS the tick — it never tears down the
     # session. Split-brain safety was always enforced by the fence gating
     # tick mutations, not by the kill; the kill is what turned FALSE fences
     # (a stalled supervisor renewal with no rival) into production coord
-    # deaths (rainier, 2x in 9h). The Go lease-check now re-acquires a
-    # rival-free expired lease in place, so a genuine fence here means a
-    # rival exists (or a transient) — either way the right move is: skip,
-    # log loudly, stay alive, re-check next tick. Session teardown of a
-    # genuinely superseded coord belongs to handoff/drain/gc, never here.
+    # deaths (rainier, 2x in 9h). Flock-only deleted the re-acquire/takeover
+    # machinery entirely (D1/D2) — there is no in-place reacquire step left
+    # to run. A genuine fence here means a rival exists (or the flock is
+    # free/stale) — either way the right move is: skip, log loudly, stay
+    # alive, re-check next tick. Session teardown of a genuinely superseded
+    # coord belongs to handoff/drain/gc, never here.
     proof = _lease_check_fn(project, home=home, fleet_bin=fleet_bin)
     if proof == "fenced":
         msg = (
@@ -3281,7 +3287,7 @@ def _prove_parent_lease_ownership(
     #     "unknown command" and exits 1. There is no lease machinery in that
     #     binary either, so fail-OPEN (don't wedge a pre-lease coord).
     #   - The subcommand RAN and hit an internal error (e.g. a corrupt/
-    #     unreadable coordinator.epoch). Per the CLI contract this means
+    #     unreadable coordinator.flock body). Per the CLI contract this means
     #     "cannot prove ownership" -> fail-CLOSED (FENCE). Failing open here
     #     would let a coord that cannot prove ownership keep mutating —
     #     reopening the zombie-write path the fence exists to close.

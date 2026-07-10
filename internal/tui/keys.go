@@ -1222,29 +1222,22 @@ var taskWorkerArchiveExists = func(project, slug string) bool {
 //
 // The active attach path is lease-authoritative: after the in-flight
 // lifecycle guard, beginResolvedCoordAttach delegates to coordreconcile.
-// Resolve and consumes Attach / Wait / Spawn / SpawnStandby. The small
-// CoordID preflight only preserves the dashboard refresh distinction:
-// an unloaded non-archived link is a refresh race, while an archived link
-// gets a real pre-allocated Resolve chance so live boot/handoff states
-// return Wait and flow into the bounded retry path instead of surfacing
-// the destructive [r] reset hint.
+// Resolve and consumes the 3-value Attach / Wait / Spawn verdict (PR-2 D4
+// deleted the epoch `starting`/`Supersede`/SpawnStandby sub-matrix — there is
+// no fourth decision). The small CoordID preflight only preserves the
+// dashboard refresh distinction: an unloaded non-archived link is a refresh
+// race, while an archived link gets a real pre-allocated Resolve chance so
+// live boot/handoff states return Wait and flow into the bounded retry path
+// instead of surfacing the destructive [r] reset hint.
 //
-// Spawn/SpawnStandby verdicts are routed through the SAME
-// consumeResolvedCoordVerdict auto-spawn path beginResolvedCoordAttach
-// uses (never a manual "[r] to reset" flash): a real agentID Resolve call
-// that lands on Spawn has ALREADY performed the mutating
-// ClaimStartingRecord CAS as a side effect (coordlock has no "release an
-// unfulfilled starting claim" primitive), so showing a flash and
-// dropping the returned Cmd — instead of following through with the
-// spawn that claim exists for — would abandon that claim: the project's
-// lease reads as a phantom "coord boot in flight" to every OTHER
-// resolver call (any [a] press, `fleet attach`, or the [r]-reset flow's
-// own respawn step) for up to the starting-record TTL, self-inflicting
-// exactly the "can't reach a coord" outage this preflight exists to
-// avoid. Fulfilling the claim immediately is the only safe option; it is
-// also explicitly free of the never-kill-a-live-coord invariant this
-// preflight protects, because Spawn/SpawnStandby only fire when Resolve
-// has already proven no live/booting coord exists.
+// A Spawn verdict is routed through the SAME consumeResolvedCoordVerdict
+// auto-spawn path beginResolvedCoordAttach uses (never a manual "[r] to
+// reset" flash): Spawn only fires when Resolve has already proven no
+// live/booting coord exists and no in-flight handoff journal names a
+// successor, so fulfilling it immediately — rather than dropping the
+// returned Cmd behind a flash — is the only safe option. It is also
+// explicitly free of the never-kill-a-live-coord invariant this preflight
+// protects, since Spawn never fires while a live or booting coord exists.
 func (m Model) actionAttachProject(p *ProjectRow) (Model, tea.Cmd, bool) {
 	if p == nil {
 		return m, nil, true
@@ -1318,12 +1311,12 @@ func (m Model) actionAttachProject(p *ProjectRow) (Model, tea.Cmd, bool) {
 				isErr: true,
 			}
 			// loadAgentsCmd(), not nil (review-army [maintainability] iter-2):
-			// Decision is a closed 4-value enum so this is unreachable in
-			// practice, but every failure flash on this preflight must honor
-			// the rule startResolvedCoordSpawn already encodes — refresh the
-			// dashboard rather than leaving cmd nil — for defensive
-			// consistency, not because a claim could be abandoned here (no
-			// Resolve call landing in `default` ever reaches ClaimStarting).
+			// Decision is a closed 3-value enum (Attach/Wait/Spawn) so this is
+			// unreachable in practice, but every failure flash on this
+			// preflight must honor the rule startResolvedCoordSpawn already
+			// encodes — refresh the dashboard rather than leaving cmd nil —
+			// for defensive consistency, not because any state could be
+			// abandoned here.
 			return m, loadAgentsCmd(), true
 		}
 	}
@@ -1822,10 +1815,10 @@ var findCoordByLockBody = func(records []*agent.Record, projectName string) (*ag
 // findExistingCoordForProject searches records for the alive agent the
 // coordinator LEASE names as the coord for projectName. "Named" means
 // coordSpawnIdentityFn (the live active owner via coordlock.LiveOwner, or the
-// current `starting` owner within TTL via coordlock.CurrentStarting) equals the
-// record's ID, with task_id == coordTaskID(projectName) AND project match AND a
-// live tmux session (tristate probe so a transport error doesn't drop a live
-// claim).
+// journal-named in-flight handoff successor via
+// coordlock.CurrentHandoffSuccessor) equals the record's ID, with task_id ==
+// coordTaskID(projectName) AND project match AND a live tmux session (tristate
+// probe so a transport error doesn't drop a live claim).
 //
 // Returns (record, true) on a match; (nil, false) when nothing matches
 // or every match has a dead session. Used by the project-row [a] handler

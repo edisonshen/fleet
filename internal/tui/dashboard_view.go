@@ -1228,9 +1228,10 @@ func projectFooterLines(p *ProjectRow, w int, prefix string, ctx coordSpawnCtx) 
 	// here and thread it through to the renderer; both gaps share the
 	// same marker read so the cost is one os.ReadFile per row per render.
 	// Identity comes from the coordinator LEASE now (D3, marker deleted):
-	// coordSpawnIdentityFn names the live active owner or the current `starting`
-	// owner. The boot-window "spawning coord... Xs" timing that used the marker's
-	// mtime now uses the coord record's SpawnedAt (a more accurate spawn start).
+	// coordSpawnIdentityFn names the live active owner or the journal-named
+	// in-flight handoff successor. The boot-window "spawning coord... Xs"
+	// timing that used the marker's mtime now uses the coord record's
+	// SpawnedAt (a more accurate spawn start).
 	markerAgentID := coordSpawnIdentityFn(p.Name)
 	markerOK := markerAgentID != ""
 	markerMtime := time.Time{}
@@ -1238,8 +1239,9 @@ func projectFooterLines(p *ProjectRow, w int, prefix string, ctx coordSpawnCtx) 
 		if rec := findRecordByID(ctx.records, markerAgentID); rec != nil && !rec.SpawnedAt.IsZero() {
 			markerMtime = rec.SpawnedAt
 		} else {
-			// Lease names an agent whose record isn't loaded yet (the pre-boot
-			// ClaimStartingRecord window) — treat the spawn as just-started.
+			// Lease names an agent whose record isn't loaded yet (a fresh
+			// spawn's record write racing this render) — treat the spawn as
+			// just-started.
 			markerMtime = ctx.now
 		}
 	}

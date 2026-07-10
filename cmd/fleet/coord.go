@@ -95,13 +95,14 @@ type coordRunOpts struct {
 	// standby marks this supervisor as a WARM-STANDBY coord
 	// (DESIGN-handoff-drain-storm-leak §3(A)/§3(B), PR3). A normal coord
 	// stands down + exits 0 when a healthy leader already holds the lease;
-	// a standby instead POLLS — re-acquiring (LOCK_NB, which internally
-	// runs TakeOver on a hung leader) every standbyPoll until it acquires
-	// the lease (the old leader exited / was taken over) or ctx is
-	// canceled. Only AFTER acquiring does it start the engine child. This
-	// is the receiving half of a graceful handoff: the old coord spawns
-	// one standby in the background, then retires; the standby's next poll
-	// acquires the kernel-released flock and becomes leader.
+	// a standby instead POLLS — re-acquiring (LOCK_NB; no takeover, just a
+	// plain flock probe post-PR-2 D1/D2) every standbyPoll until it
+	// acquires the lease (the old leader exited and the kernel freed the
+	// flock) or ctx is canceled. Only AFTER acquiring does it start the
+	// engine child. This is the receiving half of a graceful handoff: the
+	// old coord spawns one standby in the background, then retires; the
+	// standby's next poll acquires the kernel-released flock and becomes
+	// leader.
 	standby bool
 	// standbyPoll is the poll interval the standby loop waits between
 	// re-acquire attempts on a busy lease. 0 = production default
@@ -161,12 +162,12 @@ type coordLease interface {
 }
 
 // liveHolderInfo is the platform-neutral projection of one LIVE stale
-// lease holder detected — and deliberately NOT killed — by the takeover's
-// KP6 pre-fence gate (DESIGN-coord-no-auto-kill). coord.go compiles on
-// every GOOS, so this local type (not coordlock.LiveHolder, which is
-// linux||darwin-gated) is what the acquire seam and the drain TakeOver
-// seam carry; the unix wiring converts. Detection is REPORT-ONLY: the
-// standby poll loop quarantines (stderr + fleetlog) and keeps polling.
+// lease holder — deliberately never killed (DESIGN-coord-no-auto-kill).
+// coord.go compiles on every GOOS, so this local type is what the
+// acquireLease seam's return carries; post-PR-2 the takeover/detection
+// machinery is gone (D1/D2), so acquireLease always returns this slice as
+// nil — it is retained only to keep the standby poll loop's signature
+// stable (reportDetection(nil) is a no-op).
 type liveHolderInfo struct {
 	pid      int
 	pidStart int64
@@ -425,11 +426,12 @@ func runCoordRun(ctx context.Context, opts coordRunOpts, stdout, stderr io.Write
 		//
 		//   normal  -> STAND DOWN. Do NOT start the child, exit 0. A plain
 		//              coord-spawn that loses the race is not a failure.
-		//   standby -> POLL. Re-acquire (LOCK_NB, which internally runs
-		//              TakeOver on a hung leader) every standbyPoll until we
-		//              acquire the lease (the old leader exited / was taken
-		//              over) or ctx is canceled. Only then start the child.
-		//              This is the receiving half of a graceful handoff.
+		//   standby -> POLL. Re-acquire (LOCK_NB; just a plain flock probe,
+		//              no takeover, post-PR-2 D1/D2) every standbyPoll until
+		//              we acquire the lease (the old leader exited and the
+		//              kernel freed the flock) or ctx is canceled. Only then
+		//              start the child. This is the receiving half of a
+		//              graceful handoff.
 		if !opts.standby {
 			if opts.onStandDown != nil {
 				opts.onStandDown()

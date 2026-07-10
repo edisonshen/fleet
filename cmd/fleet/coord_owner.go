@@ -3,8 +3,8 @@ package main
 // coord_owner.go — `fleet coord-owner --project <p> [--json]`. A thin READ-ONLY
 // diagnostics window onto the coordinator LEASE identity for the skill-side
 // Python tick (skills/coordinator/loop.py). It is NOT an attach source of truth:
-// CLI/TUI attach must call coordreconcile.Resolve, which understands starting,
-// fencing, handoff reservations, and claim tokens atomically.
+// CLI/TUI attach must call coordreconcile.Resolve, which understands flock
+// ownership and the write-once handoff journal atomically.
 //
 // WHY THIS EXISTS: the coord-spawn marker used to be Python's identity reader —
 // `_read_coord_spawn_marker(project_dir) == coord_id` answered "is THIS session
