@@ -609,6 +609,22 @@ func TestKeyFile_NoCollision(t *testing.T) {
 // probe (NOT the body alone — a stale body after Release must not be trusted)
 // then walks the caller's ppid chain to the flock body's holder pid.
 
+// deepChainTree builds a child->parent ppid map walking from startPid to
+// endPid over exactly hops edges, via synthetic intermediate pids (20000+)
+// that cannot collide with this file's other fixture pids. Used by T12g to
+// place holderPid past leaseCheckByAncestorWithCfg's maxDepth=64 bound.
+func deepChainTree(startPid, endPid, hops int) map[int]int {
+	tree := make(map[int]int, hops)
+	pid := startPid
+	for i := 0; i < hops-1; i++ {
+		next := 20000 + i
+		tree[pid] = next
+		pid = next
+	}
+	tree[pid] = endPid
+	return tree
+}
+
 // leaseCheckCfg builds a lease-check cfg with an injected getppid tree (child ->
 // parent; a pid absent from the map walks to 1). There is no --reacquire flag
 // any more — holding the flock IS ownership, so the read-only probe never
@@ -668,6 +684,27 @@ func TestLeaseCheckByAncestor_FlockProof(t *testing.T) {
 			setup:   func(t *testing.T, p string) { heldFlock(t, p, nil) }, // empty body on a held flock
 			tree:    map[int]int{callerPid: 1},
 			wantTag: fenceTagFlockHeldUnreadable,
+		},
+		{
+			// Review testing-specialist gap: the bounded ppid walk (maxDepth=64,
+			// the documented safety net against a ppid cycle or a pathologically
+			// deep tree) had no test actually driving a cycle or an over-depth
+			// chain. A 3-node cycle that never reaches holderPid must terminate
+			// (not hang) within maxDepth iterations and fence, never PROCEED.
+			name:    "T12f_ppid_cycle_bounded_by_maxDepth_fences",
+			setup:   func(t *testing.T, p string) { heldFlock(t, p, body) },
+			tree:    map[int]int{callerPid: 511, 511: 512, 512: callerPid},
+			wantTag: fenceTagDifferentOwner,
+		},
+		{
+			// holderPid IS a true ancestor of callerPid here, but only past
+			// depth 64 — the walk must give up at the bound and fence rather
+			// than walk arbitrarily deep. Proves maxDepth is a real limit, not
+			// a documented-but-untested one.
+			name:    "T12g_chain_deeper_than_maxDepth_fences_even_though_holder_is_a_true_ancestor",
+			setup:   func(t *testing.T, p string) { heldFlock(t, p, body) },
+			tree:    deepChainTree(callerPid, holderPid, 200),
+			wantTag: fenceTagDifferentOwner,
 		},
 	}
 	for _, tc := range cases {
