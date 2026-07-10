@@ -99,12 +99,17 @@ func TestTA1_CLIVerdictMatrixConsumesResolveActions(t *testing.T) {
 			wantResolveMin: 1,
 		},
 		{
-			name:           "Attach-empty-owner-id-no-respawn",
+			// T13 (flock-only D6): the flock is HELD by a live coord (LiveOwner
+			// ok) but its body is identity-less (AgentID==""). Resolve returns
+			// WAIT, not Attach-with-empty-id — so attach does a bounded lease wait
+			// (poll for the identity), NEVER a hard "empty owner id" dead-end and
+			// NEVER a respawn beside the live holder (attach-never-exits).
+			name:           "Wait-identity-less-flock-holder-no-respawn",
 			state:          reconciletest.State{LiveOwner: &coordlock.Owner{AgentID: "", PID: 104}},
 			wantErr:        true,
 			wantExit:       dispatchVetoExitCode,
-			wantDiagnostic: "empty owner id",
-			wantResolveMin: 1,
+			wantDiagnostic: "bounded lease wait",
+			wantResolveMin: 2,
 		},
 		{
 			name:           "Attach-owner-record-load-failure-no-respawn",

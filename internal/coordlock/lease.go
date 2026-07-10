@@ -209,6 +209,13 @@ type leaseConfig struct {
 	// only fire from the heartbeat loop, which a takeover-only caller never
 	// starts.
 	logLifecycle bool
+
+	// stampErr is a TEST-ONLY fault-injection seam for the fail-closed
+	// flock-body stamp (D3): when non-nil, stampFlockBody returns it without
+	// touching the fd, so a test can prove every acquire call site releases the
+	// flock and fails the acquire rather than holding it body-less (T4).
+	// defaultLeaseConfig leaves it nil (no injection).
+	stampErr error
 }
 
 func defaultLeaseConfig() leaseConfig {
@@ -568,9 +575,13 @@ func (l *Lease) tryAcquireOnce() (done, acquired bool, err error) {
 		return false, false, err
 	}
 	if gotFlock {
-		// Stamp identity+clock into the flock body so a candidate can
-		// recover us if we hang before writing the epoch (P2 window).
-		l.stampFlockBody(f)
+		// Stamp identity into the flock body — the SOLE identity source under
+		// the flock-only lease. Fail-closed (D6): a failed stamp releases the
+		// flock and fails the acquire so no reader ever sees a body-less holder.
+		if serr := l.stampFlockBody(f); serr != nil {
+			_ = releaseFlock(f)
+			return false, false, fmt.Errorf("coordlock: stamp flock body: %w", serr)
+		}
 		// FREE-FLOCK FAST PATH: the previous holder is GONE — holding the
 		// flock is proof of that (the kernel releases on death, and an
 		// explicit Release() frees it; either way no other process holds
@@ -688,7 +699,10 @@ func (l *Lease) tryAcquireOnce() (done, acquired bool, err error) {
 			return false, false, ferr
 		}
 		if got2 {
-			l.stampFlockBody(f2)
+			if serr := l.stampFlockBody(f2); serr != nil {
+				_ = releaseFlock(f2)
+				return false, false, fmt.Errorf("coordlock: stamp flock body (released-retry): %w", serr)
+			}
 			ok, cerr := l.casToActiveAfterFlock(rec.Epoch)
 			if cerr != nil {
 				_ = releaseFlock(f2)
@@ -996,7 +1010,12 @@ func (l *Lease) takeOver(rec epochRecord) (done, acquired bool, err error) {
 				"run `fleet doctor` to recover", old.Pid, l.cfg.flockRetryBudget)
 	}
 
-	l.stampFlockBody(f) // recovery stamp before we CAS to active
+	// Recovery stamp before we CAS to active. Fail-closed (D6): a failed stamp
+	// releases the just-acquired flock and fails the takeover.
+	if serr := l.stampFlockBody(f); serr != nil {
+		_ = releaseFlock(f)
+		return false, false, fmt.Errorf("coordlock: stamp flock body (takeover): %w", serr)
+	}
 	ok, err := l.casFencingToActive(f)
 	if err != nil {
 		_ = releaseFlock(f)
@@ -1651,18 +1670,30 @@ func (t LeaseToken) StillOwned() bool {
 
 // --- helpers: flock, epoch I/O, identity ---
 
-// flockBody is the identity+timestamp stamped into coordinator.flock's
-// body immediately after a successful acquire. It is the recovery signal
-// for the acquire-to-epoch window: a holder that grabs the flock and then
-// hangs BEFORE writing coordinator.epoch leaves no epoch record, so the
-// only fact a candidate has is this body. A body whose Mono is older than
-// the TTL (same boot) — or whose pid is dead / from another boot — marks a
-// holder hung in the window, recoverable via takeover. A fresh body is a
-// legitimate booting holder (stand down). Best-effort: flock alone
-// enforces exclusion; the body is a recovery aid, never the lock.
+// flockBody is the identity stamped into coordinator.flock's body
+// immediately after a successful acquire. Under the flock-only lease
+// (DESIGN-coord-lease-flock-only) it is the SOLE identity source: the
+// ownership readers probe the flock with LOCK_SH and, when busy, read this
+// body for the owner's agent_id + pid. AgentID + Project were added in PR-1
+// (D2). A holder whose pid is dead / from another boot marks a holder hung
+// in the acquire-to-epoch window, recoverable via takeover. PR-1 D4 removed the
+// TTL clause from the ACQUIRE-path flockHolderRecoverable only (a live same-boot
+// holder is never "recoverable" on staleness there), but Mono is STILL read for
+// a TTL decision by the retained flockHolderRecoverableTTL helper — the deferred
+// LeaderPresent reader's epoch-missing fallback (byte-for-byte unchanged in PR-1;
+// PR-2 deletes it). So Mono must NOT be dropped from this schema until PR-2.
+// Best-effort: flock exclusion is kernel-enforced; the body is only for identity,
+// never the lock.
+//
+// Of the two fields PR-1 added, AgentID is the read identity (flockBodyOwner);
+// Project is stamped but not yet read here — retained for schema completeness /
+// diagnostics and a future cross-project reader (write-only in PR-1, unlike Mono
+// which flockHolderRecoverableTTL still reads).
 type flockBody struct {
 	Pid      int    `json:"pid"`
 	PidStart int64  `json:"pid_start"`
+	AgentID  string `json:"agent_id"`
+	Project  string `json:"project"`
 	BootID   string `json:"boot_id"`
 	Mono     int64  `json:"mono"`
 }
@@ -1688,24 +1719,46 @@ func tryFlock(path string) (f *os.File, gotFlock bool, err error) {
 	return nil, false, fmt.Errorf("flock %s: %w", path, lerr)
 }
 
-// stampFlockBody writes this lease's identity + boot + mono into the held
-// flock fd's body, immediately after acquire (before writing the epoch).
-// Best-effort.
-func (l *Lease) stampFlockBody(f *os.File) {
+// stampFlockBody writes this lease's identity (agent_id + project + pid tuple)
+// + boot + mono into the held flock fd's body, immediately after acquire.
+// Under the flock-only lease the body is the SOLE identity source, so the
+// stamp is FAIL-CLOSED (D6): it returns an error on any failure and the caller
+// releases the flock + fails the acquire rather than leave a body-less held
+// flock a concurrent reader would see as identity-pending forever.
+//
+// Write-before-truncate (D3, identity-read hardening): write the full body at
+// offset 0 FIRST, then Truncate to its length. The old order (Truncate(0) then
+// Write) left a torn window where a concurrent identity reader (CurrentOwner)
+// could see an EMPTY body on a held flock. Writing first means a grow is
+// atomic-enough that a reader sees a complete body; only a shrink leaves stale
+// trailing bytes for the microseconds before the truncate, which degrades to
+// identity-pending (poll again), never to "no owner".
+func (l *Lease) stampFlockBody(f *os.File) error {
+	if l.cfg.stampErr != nil {
+		return fmt.Errorf("stampFlockBody: %w", l.cfg.stampErr) // test-only fault injection (D3/T4)
+	}
 	b, err := json.Marshal(flockBody{
-		Pid: l.self.Pid, PidStart: l.self.PidStart, BootID: l.boot, Mono: l.cfg.nowMono(),
+		Pid: l.self.Pid, PidStart: l.self.PidStart,
+		AgentID: l.self.AgentID, Project: l.self.Project,
+		BootID: l.boot, Mono: l.cfg.nowMono(),
 	})
 	if err != nil {
-		return
-	}
-	if e := f.Truncate(0); e != nil {
-		return
+		return fmt.Errorf("stampFlockBody: marshal: %w", err)
 	}
 	if _, e := f.Seek(0, 0); e != nil {
-		return
+		return fmt.Errorf("stampFlockBody: seek: %w", e)
 	}
-	_, _ = f.Write(b)
-	_ = f.Sync()
+	n, e := f.Write(b)
+	if e != nil {
+		return fmt.Errorf("stampFlockBody: write: %w", e)
+	}
+	if e := f.Truncate(int64(n)); e != nil {
+		return fmt.Errorf("stampFlockBody: truncate: %w", e)
+	}
+	if e := f.Sync(); e != nil {
+		return fmt.Errorf("stampFlockBody: sync: %w", e)
+	}
+	return nil
 }
 
 // syntheticRecordFromFlockBody builds the takeOver input for the
@@ -1813,13 +1866,52 @@ func (l *Lease) killTargets(old identity, extra ...identity) []identity {
 	return targets
 }
 
-// flockHolderRecoverable reports whether a BUSY flock with NO epoch record
-// (a holder that hung in the acquire-to-epoch window) is recoverable via
-// takeover. It reads the flock body: recoverable if the body is missing/
-// unparseable, from another boot, its pid is dead, or its Mono is older
-// than the TTL. A fresh same-boot body with a live pid is a legitimate
-// booting holder -> NOT recoverable (stand down).
+// flockHolderRecoverable reports whether a BUSY flock is recoverable via
+// takeover. It reads the flock body: recoverable ONLY if the body is missing/
+// unparseable, from another boot, or its pid is dead. A same-boot body with a
+// live pid is a legitimate holder -> NOT recoverable (stand down), even if it
+// has been quiet for a long time.
+//
+// PR-1 (D4) DELETED the old TTL clause (`nowMono-body.Mono > ttl`). That clause
+// made a live-but-quiet holder look recoverable — the literal incident bug: a
+// busy coord heads-down in a long task stopped stamping/renewing and was
+// wrongly treated as recoverable, letting an attach spawn a duplicate beside
+// it. A holder is now recoverable iff it is provably GONE (missing / cross-boot
+// / pid-dead), never merely quiet. Mono is retained in the body for schema
+// stability but no longer drives a recovery decision.
 func (l *Lease) flockHolderRecoverable() bool {
+	b, err := os.ReadFile(l.paths.flock)
+	if err != nil || len(b) == 0 {
+		return true // no body to vouch for the holder -> recoverable
+	}
+	var body flockBody
+	if json.Unmarshal(b, &body) != nil {
+		return true // unparseable stamp -> recoverable
+	}
+	if body.BootID != l.boot {
+		return true // previous boot
+	}
+	if !l.pidAlive(identity{Pid: body.Pid, PidStart: body.PidStart}) {
+		return true // holder pid dead
+	}
+	return false // live same-boot holder -> NOT recoverable (D4: no TTL clause)
+}
+
+// flockHolderRecoverableTTL is the PRE-PR-1 recoverable check, WITH the TTL
+// clause the acquire-path flockHolderRecoverable dropped in D4. It exists for
+// exactly ONE caller: LeaderPresent's epoch-missing fallback (leaderPresentWith-
+// Cfg). LeaderPresent is a DEFERRED reader in PR-1 (it stays epoch-based; it
+// repoints onto the flock in PR-2 with its drain/gc consumer rework), so its
+// fallback must stay BYTE-FOR-BYTE unchanged vs origin/main — including the
+// "hung past TTL -> recoverable" clause. If the acquire-path helper were reused
+// here, the D4 clause deletion would leak into LeaderPresent: a live-but-quiet
+// holder in the acquire-to-epoch window would flip false->true, and drain's
+// healthySuccessorPresent (which routes on LeaderPresent) would treat that
+// not-yet-active starter as a healthy successor and delete the handoff queue —
+// the exact R4/B hazard the PR-1 re-boundary defers. PR-2 deletes this helper
+// when it repoints LeaderPresent. Recoverable iff the body is missing/
+// unparseable, cross-boot, pid-dead, OR its Mono is older than the TTL.
+func (l *Lease) flockHolderRecoverableTTL() bool {
 	b, err := os.ReadFile(l.paths.flock)
 	if err != nil || len(b) == 0 {
 		return true // no body to vouch for the holder -> recoverable
@@ -1995,6 +2087,115 @@ func hostname() string {
 	return h
 }
 
+// flockBodyOwner reports the current owner of project's coordinator.flock by
+// probing it (flock-only lease, DESIGN-coord-lease-flock-only). See
+// flockBodyOwnerWithCfg.
+func flockBodyOwner(project string) (Owner, bool) {
+	return flockBodyOwnerWithCfg(project, defaultLeaseConfig())
+}
+
+// flockBodyOwnerWithCfg is the single flock-body ownership reader — the read
+// truth for every ownership reader in the flock-only lease (D1). It probes
+// coordinator.flock with a SHARED non-blocking lock (LOCK_SH|LOCK_NB), the
+// load-bearing choice:
+//
+//   - EWOULDBLOCK ⇒ a live holder's LOCK_EX conflicts ⇒ owner=true. Kernel-
+//     proven liveness: a held LOCK_EX means the holder process is alive (the
+//     kernel frees the flock on death; fleet's flock fd is O_CLOEXEC so exec'd
+//     children can't keep it held). Identity comes from the body's agent_id +
+//     pid when parseable; an old-schema (pid, no agent_id) body borrows its
+//     agent_id from the epoch as a rollout bridge (see the fallback below); a
+//     torn / empty / no-pid body is STILL owner=true with AgentID="" — never
+//     downgraded (busy is the truth; the body is only for identity).
+//   - acquired (no LOCK_EX holder) ⇒ owner=false; release the shared probe
+//     immediately. This correctly reads a released-but-alive holder (graceful
+//     handoff Release() drops the LOCK_EX though the process lives) AND a dead
+//     holder as free — a body-pid check alone could not.
+//   - ENOENT / unreadable ⇒ owner=false (free) — never created, no crash.
+//
+// LOCK_SH (not LOCK_EX) so concurrent readers coexist and never make each
+// other misread "busy"; the shared probe releases in microseconds. cfg supplies
+// the boot id for the epoch-identity fallback's cross-boot guard (below);
+// liveness itself needs no clock/pid seam because the kernel is the oracle.
+//
+// Identity is BEST-EFFORT. There is a sub-millisecond acquire-before-stamp
+// window — a new holder N has taken LOCK_EX but has not yet reached
+// stampFlockBody (the immediate next statement at every acquire site) — during
+// which the file still holds the PREVIOUS holder's body, so a concurrent read
+// can briefly return the retired identity. This does NOT reopen the
+// duplicate-spawn incident: busy⇒owner=true holds regardless of the body, so
+// the spawn gate never spawns beside N. The misidentification is bounded and
+// self-heals — delivery polls (CurrentOwner), attach polls + guards on an
+// unreachable session (Resolve/Attach), and the kill gate only REFUSES on this
+// pid, never fires. Consistent with D1 ("the body is only for identity") and
+// D3's minimized-not-eliminated flicker.
+func flockBodyOwnerWithCfg(project string, cfg leaseConfig) (Owner, bool) {
+	paths, err := resolvePaths(project)
+	if err != nil {
+		return Owner{}, false
+	}
+	f, err := os.OpenFile(paths.flock, os.O_RDONLY, 0)
+	if err != nil {
+		return Owner{}, false // ENOENT (never created) or unreadable -> free
+	}
+	defer func() { _ = f.Close() }()
+	lerr := syscall.Flock(int(f.Fd()), syscall.LOCK_SH|syscall.LOCK_NB)
+	if lerr == nil {
+		// Acquired the shared lock ⇒ no exclusive holder ⇒ free. Release at once
+		// so a real LOCK_EX acquire is never delayed by a lingering reader.
+		_ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
+		return Owner{}, false
+	}
+	if lerr != syscall.EWOULDBLOCK { //nolint:errorlint // bare errno from syscall.Flock.
+		// An unexpected flock errno (e.g. ENOLCK, EINTR) reads as "free". For a
+		// spawn gate that is the fail-OPEN direction, but it cannot produce a
+		// duplicate coordinator: the real acquire (tryFlock's LOCK_EX|LOCK_NB)
+		// hits the same errno and fails-closed too, so a spuriously-triggered
+		// spawn stands down at the kernel lock — worst case is one wasted
+		// stand-down, never split-brain. Extremely unlikely on a local
+		// LOCK_SH|LOCK_NB anyway.
+		return Owner{}, false
+	}
+	// Busy: a live LOCK_EX holder exists ⇒ owner=true regardless of the body.
+	// Read the body best-effort for identity (agent_id + pid tuple).
+	owner := Owner{}
+	if b, rerr := os.ReadFile(paths.flock); rerr == nil && len(b) > 0 {
+		var body flockBody
+		if json.Unmarshal(b, &body) == nil {
+			owner = Owner{
+				AgentID:       body.AgentID,
+				PID:           body.Pid,
+				PidStart:      body.PidStart,
+				EngineStamped: body.AgentID != "" && body.PidStart > 0,
+			}
+			// TRANSITIONAL epoch-identity fallback (PR-1 rollout bridge). A coord
+			// started by a PRE-PR-1 binary stamped an old-schema body with a pid
+			// but NO agent_id (the old stamp predates D2) — yet its agent_id still
+			// lives in the epoch record it wrote. Without this, after deploying
+			// PR-1 every already-running old-binary coord reads identity-less
+			// (agent_id=""), so attach ⇒ Wait-timeout and handoff delivery strands
+			// PENDING on a HEALTHY coord until it restarts — reintroducing
+			// un-attachability, the exact incident this stack fixes. Borrow the
+			// agent_id from the epoch, cross-checked by the (pid,pid_start,boot)
+			// tuple so a stale/foreign/cross-boot record is never adopted.
+			// Ownership stays flock-based (busy⇒owner above); this only supplies
+			// the identity string for a CONFIRMED-live flock holder, so the
+			// lapse/spawn-beside bug cannot recur. Fires ONLY for an identity-less
+			// body (a full body wins outright; a torn/no-pid body has nothing to
+			// cross-check ⇒ stays identity-pending). Removed in PR-2 with the epoch.
+			if owner.AgentID == "" && owner.PID > 0 {
+				if rec, eerr := readEpoch(paths.epoch); eerr == nil &&
+					rec.Owner.AgentID != "" && rec.BootID == cfg.boot() &&
+					rec.Owner.Pid == body.Pid && rec.Owner.PidStart == body.PidStart {
+					owner.AgentID = rec.Owner.AgentID
+					owner.EngineStamped = owner.PidStart > 0
+				}
+			}
+		}
+	}
+	return owner, true
+}
+
 // CurrentActiveOwnerPID reports the supervisor PID recorded as the
 // current ACTIVE lease owner for project, or (0,false) if there is no
 // active owner (no epoch file, or its state != active). The
@@ -2005,6 +2206,10 @@ func hostname() string {
 // Best-effort + read-only — it takes no lock (a torn read degrades to
 // (0,false), i.e. "no active owner", which makes the kill primitive
 // refuse rather than fire on stale data).
+//
+// DEFERRED reader (PR-1): stays epoch-based here. It feeds the gc dead/live
+// split + the kill gate, which need active-HEALTHY (not merely busy⇒owner);
+// PR-2 repoints it onto the flock together with that consumer rework (D5).
 func CurrentActiveOwnerPID(project string) (pid int, ok bool) {
 	paths, err := resolvePaths(project)
 	if err != nil {
@@ -2026,102 +2231,43 @@ func CurrentActiveOwnerPID(project string) (pid int, ok bool) {
 // resume prompt must address the agent record named by the lease owner, not a
 // preselected standby that may have lost the lock race.
 //
-// It applies the SAME holderHealthy predicate AcquireLease / LeaderPresent use
-// (codex iter-19 [P2]), not a bare state==active check: a stale/expired active
-// record or a dead/cross-boot prior holder is NOT a deliverable owner — its
-// process is gone, so DeliverToCurrentOwner must keep polling for the healthy
-// takeover owner rather than type the resume prompt into a corpse's session.
+// It is the DELIVERY reader (D5): it reads the flock body (busy⇒owner) and
+// ADDITIONALLY requires a readable agent_id to type a resume prompt. A busy
+// flock whose body is identity-less (old-binary / torn body) is
+// owner-present-but-identity-PENDING → ok=false, so DeliverToCurrentOwner keeps
+// polling for the identity rather than reading "no owner" or typing into a
+// corpse. A free flock → ok=false (no owner).
 func CurrentOwner(project string) (Owner, bool) {
 	return currentOwnerWithCfg(project, defaultLeaseConfig())
 }
 
 func currentOwnerWithCfg(project string, cfg leaseConfig) (Owner, bool) {
-	paths, err := resolvePaths(project)
-	if err != nil {
-		return Owner{}, false
+	owner, present := flockBodyOwnerWithCfg(project, cfg)
+	if !present || owner.AgentID == "" || owner.PID <= 0 {
+		return Owner{}, false // free, or identity-pending -> keep polling
 	}
-	rec, err := readEpoch(paths.epoch)
-	if err != nil {
-		return Owner{}, false
-	}
-	if rec.Owner.Pid <= 0 || rec.Owner.AgentID == "" {
-		return Owner{}, false
-	}
-	// Throwaway lease carrying the seams so holderHealthy applies the same
-	// boot-id + TTL + pid-liveness logic the acquire path does (self is zero;
-	// we only read the foreign record).
-	l := &Lease{cfg: cfg, paths: paths, boot: cfg.boot()}
-	if !l.holderHealthy(rec) {
-		return Owner{}, false
-	}
-	return Owner{
-		AgentID:       rec.Owner.AgentID,
-		PID:           rec.Owner.Pid,
-		PidStart:      rec.Owner.PidStart,
-		EngineStamped: rec.Owner.AgentID != "" && rec.Owner.PidStart > 0,
-	}, true
+	return owner, true
 }
 
-// LiveOwner reports the ACTIVE lease owner for project whenever its
-// supervisor pid+pid_start is a LIVE process — REGARDLESS of heartbeat
-// TTL. It is the resolver's (internal/coordreconcile) attach gate and
-// implements the §2A / §7.0 "process-live overrides stale heartbeat"
-// rule: a live-but-stale active owner (its renewal briefly stalled during
-// a machine sleep/load stall) is STILL the coord and MUST be attached to,
-// never spawned beside (the no-auto-kill invariant — a live coord is never
-// clobbered on a staleness heuristic). This is deliberately weaker than
-// CurrentOwner's holderHealthy (which TTL-gates), precisely so a
-// stale-but-alive leader is not misread as "no owner" and overwritten by a
-// fresh ClaimStartingRecord.
+// LiveOwner reports the coordinator lease owner for project whenever the flock
+// is HELD by a live process (D1 busy⇒owner). It is the resolver's
+// (internal/coordreconcile) attach/spawn gate: a live flock holder — busy,
+// booting, or version-skewed — is STILL the coord and MUST NOT be spawned
+// beside (the no-auto-kill invariant; the incident fix). It is a SPAWN-GATE
+// reader (D5): it does NOT gate on agent_id, so a busy flock with an
+// identity-less body is still an owner (ok=true, Owner.AgentID==""); the attach
+// verdict (coordreconcile.Resolve) then distinguishes AgentID present ⇒ Attach
+// from identity-less ⇒ Wait.
 //
-// ok=false when there is no readable record, the state is not active, the
-// owner pid is unset, the record is from a PREVIOUS boot, or the owner
-// process is provably DEAD (pid+pid_start reuse-safe). A dead active owner
-// IS stealable — the resolver claims + spawns a successor there. Read-only;
-// a torn read degrades to ok=false.
+// ok=false only when the flock is FREE (kernel-freed on the holder's death, or
+// dropped by a graceful Release()). Read-only; a torn body degrades to
+// ok=true / identity-pending, never to ok=false.
 func LiveOwner(project string) (Owner, bool) {
 	return liveOwnerWithCfg(project, defaultLeaseConfig())
 }
 
 func liveOwnerWithCfg(project string, cfg leaseConfig) (Owner, bool) {
-	paths, err := resolvePaths(project)
-	if err != nil {
-		return Owner{}, false
-	}
-	rec, err := readEpoch(paths.epoch)
-	if err != nil {
-		return Owner{}, false
-	}
-	if rec.State != stateActive || rec.Owner.Pid <= 0 || rec.Owner.AgentID == "" {
-		return Owner{}, false
-	}
-	// A cross-boot record is provably DEAD by construction (any real live
-	// process's boot must be the CURRENT boot — a machine reboot kills
-	// everything). This gate is load-bearing, not merely a TTL heuristic:
-	// on Linux, pidStartNanos is boot-relative (platform_linux.go), so
-	// pid+pid_start equality ALONE is only reuse-safe within the SAME boot
-	// — across a reboot, a stale record's (pid, pid_start) can coincidentally
-	// collide with an unrelated post-reboot process (e.g. a low-numbered,
-	// deterministic-timing early-boot daemon), which would make pidAlive
-	// wrongly report a dead owner as live. Every other pidAlive caller
-	// (holderHealthy) already gates on BootID first; LiveOwner is the
-	// resolver's #1 decision-matrix branch, so skipping it here was the
-	// most exposed instance of the gap (codex-adversarial review finding).
-	// No TTL gate otherwise: process-live (same-boot) overrides stale
-	// heartbeat, per the no-auto-kill invariant.
-	if rec.BootID != cfg.boot() {
-		return Owner{}, false
-	}
-	l := &Lease{cfg: cfg, paths: paths, boot: cfg.boot()}
-	if !l.pidAlive(rec.Owner) {
-		return Owner{}, false
-	}
-	return Owner{
-		AgentID:       rec.Owner.AgentID,
-		PID:           rec.Owner.Pid,
-		PidStart:      rec.Owner.PidStart,
-		EngineStamped: rec.Owner.AgentID != "" && rec.Owner.PidStart > 0,
-	}, true
+	return flockBodyOwnerWithCfg(project, cfg)
 }
 
 // CurrentHandoff returns the NON-expired successor reservation for project,
@@ -2160,10 +2306,12 @@ func currentHandoffWithCfg(project string, cfg leaseConfig) (Handoff, bool) {
 // CurrentStarting reports whether project's lease is currently in `starting`
 // state and, if so, the owner tuple + liveness + whether it is within its
 // startingTTL. ok=false when the record is missing/unreadable or its state
-// is not `starting`. OwnerLive is same-boot-gated (see liveOwnerWithCfg):
+// is not `starting`. OwnerLive is same-boot-gated (the `sameBoot` check below):
 // pid+pid_start equality alone is only reuse-safe within the SAME boot, so a
 // cross-boot record's owner is reported dead regardless of the raw pidAlive
-// result. Read-only; a torn read degrades to ok=false.
+// result. (CurrentStarting still reads the epoch — it is NOT one of the readers
+// PR-1 repointed onto the flock; it is deleted with the starting state in PR-2.)
+// Read-only; a torn read degrades to ok=false.
 func CurrentStarting(project string) (StartingStatus, bool) {
 	return currentStartingWithCfg(project, defaultLeaseConfig())
 }
@@ -2193,8 +2341,8 @@ func currentStartingWithCfg(project string, cfg leaseConfig) (StartingStatus, bo
 		// Cross-boot record -> the owner is provably dead (a reboot kills
 		// every process), regardless of what a bare pid+pid_start equality
 		// on Linux's boot-relative starttime might coincidentally match
-		// (codex-adversarial review finding, same root cause as
-		// liveOwnerWithCfg above).
+		// (codex-adversarial review finding; the `sameBoot &&` guard below is
+		// the gate).
 		OwnerLive: sameBoot && l.pidAlive(rec.Owner),
 		WithinTTL: withinTTL,
 		Epoch:     rec.Epoch,
@@ -2237,6 +2385,22 @@ func CurrentEpoch(project string) (epoch int64, ok bool) {
 // for the booting owner. Read-only; a missing/torn/terminal record degrades to
 // false.
 func LeaseRecordActive(project string) bool {
+	// A live lease generation exists iff the flock is HELD by a live process
+	// (busy⇒owner — a healthy holder or one still booting before it writes the
+	// epoch) OR — during PR-1's mixed window, while the epoch is still written —
+	// the epoch records a NON-TERMINAL generation whose flock is momentarily
+	// FREE: a ClaimStartingRecord `starting` written before coord-run acquires
+	// the flock, or a `fencing` takeover gap. Delivery (DeliverToCurrentOwner)
+	// uses this to keep the handoff doc PENDING for the eventual owner rather
+	// than direct-send to a bare coord (codex iter-22 [P1]). This reader is
+	// delivery-only and NEVER drives a spawn, so the epoch clause cannot reopen
+	// the duplicate-spawn incident; unlike the ownership readers, the original
+	// LeaseRecordActive was state-based (no TTL), so it never lapsed and the
+	// epoch clause is retained here as a transitional bridge — PR-2 deletes the
+	// epoch and this collapses to the pure flock-busy read.
+	if _, present := flockBodyOwner(project); present {
+		return true
+	}
 	paths, err := resolvePaths(project)
 	if err != nil {
 		return false
@@ -2245,13 +2409,6 @@ func LeaseRecordActive(project string) bool {
 	if err != nil {
 		return false
 	}
-	// active / starting / fencing / fenced_not_acquired all denote a real lease
-	// generation (a healthy holder, a coord mid-boot, a mid-flight takeover, or
-	// a failed takeover awaiting doctor recovery with a possibly-unreaped old
-	// holder). Only released or a missing record means "no lease" (codex
-	// iter-23 [P1]: a failed takeover must NOT be mistaken for a legacy/bare
-	// coord and direct-sent; D2 extends the same rule to a booting `starting`
-	// owner).
 	return rec.State == stateActive ||
 		rec.State == stateStarting ||
 		rec.State == stateFencing ||
@@ -2289,6 +2446,13 @@ func BarrierPath(project string, epoch int64) (string, error) {
 // Read-only, takes no lock; a torn/missing read degrades to false. Used by
 // cmd/fleet's coordLeaderCheck to disambiguate a clean stand-down from a
 // real supervisor failure.
+//
+// DEFERRED reader (PR-1): stays epoch-based here — byte-for-byte unchanged vs
+// origin/main, including its epoch-missing fallback's TTL-gated recoverable
+// check (via flockHolderRecoverableTTL, D4). It feeds drain's
+// healthySuccessorPresent + the spawn gate, whose liveness needs conflict with
+// busy⇒owner; PR-2 repoints it onto the flock with that consumer rework and
+// deletes the retained TTL helper.
 func LeaderPresent(project string) bool {
 	return leaderPresentWithCfg(project, defaultLeaseConfig())
 }
@@ -2301,7 +2465,7 @@ func leaderPresentWithCfg(project string, cfg leaseConfig) bool {
 		return false
 	}
 	// Throwaway lease carrying the seams so holderHealthy /
-	// transientResumable / flockHolderRecoverable apply the same logic the
+	// transientResumable / flockHolderRecoverableTTL apply the same logic the
 	// acquire path does. self is zero (we only read foreign records);
 	// transientResumable's "is this MY fencing record" short-circuit can
 	// never fire on a zero self vs a real candidate.
@@ -2315,9 +2479,10 @@ func leaderPresentWithCfg(project string, cfg leaseConfig) bool {
 		// false here would misclassify that fresh booting leader as "no leader"
 		// — making a duplicate spawn report a failure instead of a clean
 		// stand-down. So: if the flock is BUSY and its body vouches for a
-		// FRESH same-boot live holder (flockHolderRecoverable == false), a
+		// FRESH same-boot live holder (flockHolderRecoverableTTL == false), a
 		// leader is present. A free flock, or a stale/dead/hung body, is no
-		// healthy leader.
+		// healthy leader. This fallback keeps the D4 TTL clause (via the
+		// -TTL helper) so LeaderPresent is unchanged in PR-1 (deferred reader).
 		if !errors.Is(err, os.ErrNotExist) {
 			return false // unreadable epoch (not just "absent") -> conservative
 		}
@@ -2332,7 +2497,7 @@ func leaderPresentWithCfg(project string, cfg leaseConfig) bool {
 		}
 		// Busy flock, no epoch yet: present iff the holder is a fresh booting
 		// one (not recoverable/stealable).
-		return !l.flockHolderRecoverable()
+		return !l.flockHolderRecoverableTTL()
 	}
 	switch rec.State {
 	case stateActive:

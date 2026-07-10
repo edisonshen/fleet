@@ -17,19 +17,24 @@
 //
 // Decision matrix (evaluated top-to-bottom; first match wins):
 //
-//	LiveOwner (active, pid alive, TTL-independent) -> ATTACH  (T3, T7b)
-//	starting, owner pid stamped + confirmed DEAD    -> claim   (falls to free branch, TTL-independent)
+//	LiveOwner  flock HELD + agent_id  -> ATTACH  (T1/T3/T7b/T10)
+//	LiveOwner  flock HELD + no id      -> WAIT    (T13: identity-pending, poll)
+//	starting, owner pid stamped + confirmed DEAD    -> claim   (falls to free branch)
 //	starting within TTL (owner unset/live)          -> WAIT    (T2: boot in flight)
 //	starting past TTL, owner LIVE                   -> SUPERSEDE + SPAWN-STANDBY (T6s)
 //	starting past TTL, owner unset                  -> claim   (falls to free branch)
 //	valid handoff reservation                       -> WAIT   (#247 gap-window rule a)
 //	free / dead-active lease                         -> CLAIM + SPAWN (T7a, T8)
 //
-// The ATTACH gate keys on PROCESS-LIVENESS (LiveOwner), not TTL-health, so a
-// live-but-stale leader (a machine sleep briefly stalled its renewal) is
-// attached to and never spawned beside — the "process-live overrides stale
-// heartbeat" rule (§7.0). By the time control reaches the free/dead branch,
-// any active record has a provably-DEAD owner, so the ClaimStartingRecord
+// Flock-only note (PR-1, DESIGN-coord-lease-flock-only): step-1 LiveOwner is now
+// the LOCK_SH flock-busy probe, so ATTACH keys on "a live process holds the
+// flock" — a live/booting/version-skewed holder is never spawned beside (the
+// incident fix). Every CurrentStarting/Supersede/SpawnStandby row below it is
+// only reachable in the FLOCK-FREE pre-acquire window (a process wrote a
+// starting record but has not yet taken the flock — still epoch-based in PR-1);
+// once a live coord holds the flock, step-1 short-circuits. That whole
+// flock-free starting/handoff sub-matrix is deleted in PR-2. By the time control
+// reaches the free/dead branch the flock is free, so the ClaimStartingRecord
 // there can never clobber a live coord's lease.
 package coordreconcile
 
@@ -137,11 +142,24 @@ func DefaultDeps() Deps {
 // resolves to Wait, so the caller re-resolves rather than spawning a
 // duplicate — the "exactly one coord" guarantee (T8) under concurrent [a].
 func Resolve(d Deps, project, agentID string) (Verdict, error) {
-	// (1) A PROCESS-LIVE active owner is the coord — attach, regardless of
-	// heartbeat TTL (process-live overrides stale heartbeat; the incident
-	// regression T3 needs no marker, and T7b's live-wedged leader is never
-	// spawned beside).
+	// (1) The flock is HELD by a live process (LiveOwner is now the LOCK_SH
+	// busy probe — flock-only D1/D6). A live flock holder — busy, booting, or
+	// version-skewed — is the coord and is NEVER spawned beside (the incident
+	// fix; no-auto-kill). Two sub-cases by the body's identity:
+	//   - agent_id present  ⇒ Attach to it (T1/T10).
+	//   - identity-less body ⇒ Wait, NOT Attach (D6). The body is old-binary /
+	//     torn (agent_id==""), and the attach callers (cmd/fleet/attach.go,
+	//     internal/tui/coord_resolve.go) hard-error on an empty AgentID, so
+	//     Attach-with-empty-id would dead-end and violate attach-never-exits.
+	//     Wait reschedules until the identity appears (a re-stamp / the coord
+	//     finishing boot) or the holder dies — never a spawn-beside (T13).
 	if owner, ok := d.LiveOwner(project); ok {
+		if owner.AgentID == "" {
+			return Verdict{
+				Decision: Wait,
+				Reason:   "flock held by a live coord whose identity is not yet readable; polling",
+			}, nil
+		}
 		return Verdict{
 			Decision: Attach,
 			Owner:    owner,
