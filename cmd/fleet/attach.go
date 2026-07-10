@@ -480,17 +480,28 @@ func resolveAndAttachCoord(token, project string, opts AttachOpts) error {
 			// with the real live holder (review adversarial-subagent finding);
 			// without the PID cross-check, landing on whichever record sorts
 			// first could attach into the dead-end orphan instead.
-			holderPID, _ := coordlock.CurrentActiveOwnerPID(project)
-			if records, lerr := agent.List(); lerr == nil {
-				if rec, ok := projectlookup.FindLiveCoordPreferPID(records, project, holderPID); ok {
-					session := rec.TmuxSession
-					if session == "" {
-						session = tmux.SessionName(rec.ID)
+			//
+			// Gate the whole record-fallback on a CONFIRMED busy flock (codex
+			// confirm round [P2]): a bounded Wait can ALSO mean "flock
+			// genuinely free, a handoff is in flight" (a booting successor
+			// hasn't acquired it yet) — there is no live flock holder to
+			// recover via an agent record in that case, and falling through to
+			// FindLiveCoordPreferPID's plain first-match (no PID to prefer)
+			// could attach into an unrelated stale/orphan session instead of
+			// honestly surfacing "still not attachable."
+			if _, busy := coordlock.LiveOwner(project); busy {
+				holderPID, _ := coordlock.CurrentActiveOwnerPID(project)
+				if records, lerr := agent.List(); lerr == nil {
+					if rec, ok := projectlookup.FindLiveCoordPreferPID(records, project, holderPID); ok {
+						session := rec.TmuxSession
+						if session == "" {
+							session = tmux.SessionName(rec.ID)
+						}
+						_, _ = fmt.Fprintf(opts.Stderr,
+							"%s: coord for %s holds the flock but its identity is not readable from the lease body; recovered live coord %s via its agent record — attaching (no respawn, no reap)\n",
+							token, project, rec.ID)
+						return attachExistingCoord(token, project, rec.ID, session)
 					}
-					_, _ = fmt.Fprintf(opts.Stderr,
-						"%s: coord for %s holds the flock but its identity is not readable from the lease body; recovered live coord %s via its agent record — attaching (no respawn, no reap)\n",
-						token, project, rec.ID)
-					return attachExistingCoord(token, project, rec.ID, session)
 				}
 			}
 			// No live coord record derivable — surface guidance (still no
