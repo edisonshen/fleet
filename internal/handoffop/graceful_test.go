@@ -156,9 +156,12 @@ func TestGracefulHandoff_EndToEnd_OneStandby_BarrierLast(t *testing.T) {
 // codex PR2-review [P1]: CreateHandoffJournal MUST run BEFORE the barrier
 // write (D3 — BarrierExists resolves the barrier path THROUGH the journal's
 // barrier_id, so a barrier durable before its journal entry exists is
-// invisible to drain). This pins the ordering AND that the journal seam is
-// handed the exact same barrier id the barrier file ends up naming.
-func TestGracefulHandoff_CreateHandoffJournal_RunsBeforeBarrier(t *testing.T) {
+// invisible to drain). codex PR2-review iter-2 [P2]: it must ALSO run AFTER
+// doc/checkpoint/drain (not right after spawn), maximizing the standby's
+// window to stamp its own supervisor identity before the journal captures
+// it. This pins BOTH orderings AND that the journal seam is handed the
+// exact same barrier id the barrier file ends up naming.
+func TestGracefulHandoff_CreateHandoffJournal_AfterDurableSteps_BeforeBarrier(t *testing.T) {
 	orig := newHandoffBarrierID
 	newHandoffBarrierID = func() string { return "b-journal-first" }
 	t.Cleanup(func() { newHandoffBarrierID = orig })
@@ -197,11 +200,14 @@ func TestGracefulHandoff_CreateHandoffJournal_RunsBeforeBarrier(t *testing.T) {
 	if iSpawn == -1 || iJournal == -1 || iDoc == -1 || iCkpt == -1 || iDrain == -1 || iBarrier == -1 {
 		t.Fatalf("missing expected step(s); order=%v", order)
 	}
-	if iSpawn > iJournal {
-		t.Errorf("journal created before the standby spawned; order=%v", order)
+	if iSpawn > iDoc || iSpawn > iCkpt || iSpawn > iDrain {
+		t.Errorf("standby not spawned first; order=%v", order)
 	}
-	if iJournal >= iDoc || iJournal >= iCkpt || iJournal >= iDrain || iJournal >= iBarrier {
-		t.Errorf("journal must be created BEFORE doc/checkpoint/drain/barrier; order=%v", order)
+	if iDoc >= iJournal || iCkpt >= iJournal || iDrain >= iJournal {
+		t.Errorf("journal must be created AFTER doc/checkpoint/drain (max stamp window); order=%v", order)
+	}
+	if iJournal >= iBarrier {
+		t.Errorf("journal must be created BEFORE the barrier; order=%v", order)
 	}
 	if gotBarrierID != "b-journal-first" {
 		t.Errorf("journal seam got barrier id %q, want b-journal-first", gotBarrierID)
@@ -211,14 +217,18 @@ func TestGracefulHandoff_CreateHandoffJournal_RunsBeforeBarrier(t *testing.T) {
 	}
 }
 
-// A CreateHandoffJournal failure is SOFT (same philosophy as AtomicCoordSwap's
-// own journal-create step): it must NOT abort the handoff. The barrier still
-// gets written — flock-exclusivity, not the journal, is the hard
-// no-duplicate-coordinator guarantee.
-func TestGracefulHandoff_CreateHandoffJournalError_Soft_StillWritesBarrier(t *testing.T) {
+// codex PR2-review iter-2 [P1]: a CreateHandoffJournal failure is HARD — it
+// must abort BEFORE the barrier exactly like a doc/checkpoint/drain
+// failure, never proceed to write a barrier that would be durable but
+// permanently undiscoverable (BarrierExists resolves the barrier path
+// THROUGH the journal). This replaces an earlier "soft" version of this
+// seam that reproduced the exact bug this fix closes, just conditioned on
+// the create failing instead of always happening.
+func TestGracefulHandoff_CreateHandoffJournalError_Hard_AbortsBeforeBarrier(t *testing.T) {
 	rec := newGracefulRecorder()
 	journalErr := errors.New("journal disk full")
 	var journalCalls int
+	reaped := 0
 	in := GracefulHandoffInputs{
 		OldRec:         oldRecForGraceful(),
 		HandoffDocPath: gracefulDocPath,
@@ -226,6 +236,7 @@ func TestGracefulHandoff_CreateHandoffJournalError_Soft_StillWritesBarrier(t *te
 	}
 	deps := GracefulHandoffDeps{
 		SpawnStandby: func(time.Duration) error { return nil },
+		ReapStandby:  func() error { reaped++; return nil },
 		CreateHandoffJournal: func(string) error {
 			journalCalls++
 			return journalErr
@@ -233,15 +244,19 @@ func TestGracefulHandoff_CreateHandoffJournalError_Soft_StillWritesBarrier(t *te
 		WriteAtomic: rec.write,
 		BarrierPath: func(_ string, _ string) (string, error) { return gracefulBarrierPath, nil },
 	}
-	if err := GracefulHandoff(in, deps); err != nil {
-		t.Fatalf("a journal-create failure must be soft (no hard error), got: %v", err)
+	err := GracefulHandoff(in, deps)
+	if !errors.Is(err, journalErr) {
+		t.Fatalf("expected the journal-create error surfaced (errors.Is), got: %v", err)
 	}
 	if journalCalls != 1 {
 		t.Errorf("CreateHandoffJournal called %d times, want 1", journalCalls)
 	}
 	_, writes, _ := rec.snapshot()
-	if _, ok := writes[gracefulBarrierPath]; !ok {
-		t.Errorf("barrier not written despite a soft journal-create failure")
+	if _, ok := writes[gracefulBarrierPath]; ok {
+		t.Errorf("BARRIER written despite a journal-create failure — it would be permanently undiscoverable")
+	}
+	if reaped != 1 {
+		t.Errorf("ReapStandby ran %d times after a journal-create abort, want 1 (same as doc/checkpoint/drain)", reaped)
 	}
 }
 
