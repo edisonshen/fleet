@@ -101,6 +101,50 @@ func TestSweepStaleCompetitors_ReportOnly(t *testing.T) {
 	}
 }
 
+// TestProductionAcquireLease_CommitsHandoffJournalOnAcquire is a /review
+// testing-specialist gap: every coord-run test stubs opts.acquireLease, so
+// productionAcquireLease's real step-3a — the winner commits (deletes) any
+// in-flight handoff journal + barrier on acquire (Decision 7) — had zero
+// direct test coverage. Seed a leftover journal for the project, invoke the
+// real production closure, and assert the journal is gone once the lease is
+// acquired.
+func TestProductionAcquireLease_CommitsHandoffJournalOnAcquire(t *testing.T) {
+	setupFleetHome(t)
+	const project = "rainier"
+	const agentID = "pal-winner"
+
+	rec := agent.New(agentID)
+	rec.Project = project
+	rec.TaskID = CoordTaskIDPrefix + project
+	if err := rec.Write(); err != nil {
+		t.Fatalf("write record: %v", err)
+	}
+
+	if err := coordlock.CreateHandoffJournal(coordlock.HandoffJournal{
+		Project: project, SuccessorID: agentID, BarrierID: "b-pal",
+		SuccessorPID: 999999, SuccessorPidStart: 424242,
+	}); err != nil {
+		t.Fatalf("seed leftover handoff journal: %v", err)
+	}
+	if _, ok, err := coordlock.ReadHandoffJournal(project); err != nil || !ok {
+		t.Fatalf("precondition: journal must be seeded, ok=%v err=%v", ok, err)
+	}
+
+	var stderr bytes.Buffer
+	acquire := productionAcquireLease(coordRunOpts{agentID: agentID, project: project}, &stderr)
+	lease, acquired, holders, err := acquire()
+	if err != nil || !acquired || lease == nil {
+		t.Fatalf("productionAcquireLease: acquired=%v err=%v lease=%v (stderr=%s)", acquired, err, lease, stderr.String())
+	}
+	defer lease.Release()
+	if holders != nil {
+		t.Errorf("live-holder slice = %v, want nil (flock-only never populates it)", holders)
+	}
+	if _, ok, rerr := coordlock.ReadHandoffJournal(project); rerr != nil || ok {
+		t.Fatalf("handoff journal must be committed (deleted) on acquire; ok=%v err=%v (stderr=%s)", ok, rerr, stderr.String())
+	}
+}
+
 // The unstamped lease-wrapped standby family (the sweep's second former
 // kill target) is also detect+report now: reported, never session-killed.
 func TestSweepStaleCompetitors_UnstampedStandbyReportedNotKilled(t *testing.T) {

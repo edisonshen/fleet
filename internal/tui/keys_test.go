@@ -1126,9 +1126,9 @@ const coordBootWindow = 60 * time.Second
 // require the lease to NAME the candidate agent's ID before promoting, so
 // stubbing coordSpawnIdentityFn to project→agentID reproduces exactly what
 // the old marker file drove — minus the separate mtime gate (LiveOwner is
-// process-live and CurrentStarting is TTL-bounded, so identity subsumes
-// freshness). Tests that want "a dead/stale coord no longer names identity"
-// use stubCoordLeaseIdentityStale.
+// process-live and CurrentHandoffSuccessor is liveness-gated, so identity
+// subsumes freshness). Tests that want "a dead/stale coord no longer names
+// identity" use stubCoordLeaseIdentityStale.
 type stubCoordLeaseIdentity struct {
 	markers map[string]string // project → agent ID (the lease-named coord)
 }
@@ -1143,8 +1143,8 @@ func (s *stubCoordLeaseIdentity) install(t *testing.T) {
 }
 
 // stubCoordLeaseIdentityStale models a stale/dead coord in the lease world:
-// its process exited, so LiveOwner/CurrentStarting no longer name it and
-// coordSpawnIdentityFn returns "" for the project. That reproduces the old
+// its process exited, so LiveOwner/CurrentHandoffSuccessor no longer name it
+// and coordSpawnIdentityFn returns "" for the project. That reproduces the old
 // "marker mtime aged out → not promoted" behavior via the single lease
 // signal — the row flips to Idle and the record stays on the RIGHT column
 // for triage. The markers map records which agent WOULD have been named;
@@ -1161,29 +1161,6 @@ func (s *stubCoordLeaseIdentityStale) install(t *testing.T) {
 		return ""
 	}
 	t.Cleanup(func() { coordSpawnIdentityFn = prev })
-}
-
-// stubClaimStartingRecord replaces claimStartingRecordFn for tests so the
-// TUI's post-spawn `starting`-lease claim (which replaced the deleted
-// coord-spawn marker write, D3) doesn't touch FLEET_HOME / the real lease.
-// Captures (project, id) tuples per claim so callers can assert the TUI
-// claimed (or, on the veto / prompt-failed paths, did NOT claim) the lease.
-type stubClaimStartingRecord struct {
-	calls map[string]string // project → agent ID
-	err   error             // returned from each claim
-}
-
-func (s *stubClaimStartingRecord) install(t *testing.T) {
-	t.Helper()
-	prev := claimStartingRecordFn
-	claimStartingRecordFn = func(projectName, agentID string) error {
-		if s.calls == nil {
-			s.calls = map[string]string{}
-		}
-		s.calls[projectName] = agentID
-		return s.err
-	}
-	t.Cleanup(func() { claimStartingRecordFn = prev })
 }
 
 // stubSessionProbe replaces sessionProbeFn (used by loadAgentsCmd's

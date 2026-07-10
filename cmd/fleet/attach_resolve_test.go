@@ -48,24 +48,31 @@ func forceCLICurrentOwner(t *testing.T, ok bool, ownerID string) {
 	t.Cleanup(func() { attachCurrentOwnerFnVar = prev })
 }
 
+// TestTA1_CLIVerdictMatrixConsumesResolveActions drives the flock-only Resolve
+// matrix (PR-2 D4) end-to-end through the CLI attach path:
+//
+//	busy flock + body id       -> Attach
+//	busy flock + identity-less -> Wait (poll; PROJECT-RECOVERY falls back to FindLiveCoord)
+//	free flock + journal alive  -> Wait (handoff in flight)
+//	free flock + journal dead   -> clear (ClearCalls++) then Spawn
+//	free flock + no journal      -> Spawn
+//	torn journal                 -> Wait (never spawn beside a possibly-booting successor)
 func TestTA1_CLIVerdictMatrixConsumesResolveActions(t *testing.T) {
 	cases := []struct {
-		name             string
-		state            reconciletest.State
-		seedOwner        string
-		ownerReachable   bool
-		ownerProbeErr    bool
-		currentOwnerOK   bool
-		wantErr          bool
-		wantExit         int
-		wantAttached     string
-		wantDispatches   int
-		wantWarning      string
-		wantDiagnostic   string
-		wantClaims       int
-		wantSupersedes   int
-		wantResolveMin   int
-		wantNoOrphanKill bool
+		name           string
+		state          reconciletest.State
+		seedOwner      string
+		ownerReachable bool
+		ownerProbeErr  bool
+		currentOwnerOK bool
+		wantErr        bool
+		wantExit       int
+		wantAttached   string
+		wantDispatches int
+		wantWarning    string
+		wantDiagnostic string
+		wantClears     int
+		wantResolveMin int
 	}{
 		{
 			name:           "Attach-healthy",
@@ -77,7 +84,7 @@ func TestTA1_CLIVerdictMatrixConsumesResolveActions(t *testing.T) {
 			wantResolveMin: 1,
 		},
 		{
-			name:           "Attach-hung-TTL",
+			name:           "Attach-stale-current-owner-probe",
 			state:          reconciletest.State{LiveOwner: &coordlock.Owner{AgentID: "hungaaaa", PID: 102}},
 			seedOwner:      "hungaaaa",
 			ownerReachable: true,
@@ -99,7 +106,7 @@ func TestTA1_CLIVerdictMatrixConsumesResolveActions(t *testing.T) {
 			wantResolveMin: 1,
 		},
 		{
-			// T13 (flock-only D6): the flock is HELD by a live coord (LiveOwner
+			// T13 (flock-only D9e): the flock is HELD by a live coord (LiveOwner
 			// ok) but its body is identity-less (AgentID==""). Resolve returns
 			// WAIT, not Attach-with-empty-id — so attach does a bounded lease wait
 			// (poll for the identity), NEVER a hard "empty owner id" dead-end and
@@ -131,66 +138,43 @@ func TestTA1_CLIVerdictMatrixConsumesResolveActions(t *testing.T) {
 			wantResolveMin: 1,
 		},
 		{
-			name: "Wait-starting",
-			state: reconciletest.State{Starting: &coordlock.StartingStatus{
-				Owner: coordlock.Owner{AgentID: "bootaaaa", PID: 201}, OwnerLive: true, WithinTTL: true, Epoch: 3,
-			}},
+			// Handoff in flight: journal names a successor whose process is ALIVE
+			// (booting, not yet holding the flock) -> WAIT, never spawn beside it
+			// (the journal replaces the old CurrentHandoff reservation).
+			name:           "Wait-handoff-in-flight",
+			state:          reconciletest.State{HandoffDisp: coordlock.HandoffInFlight},
 			wantErr:        true,
 			wantExit:       dispatchVetoExitCode,
 			wantDiagnostic: "bounded lease wait",
 			wantResolveMin: 2,
 		},
 		{
-			name:           "Wait-handoff-reservation-247",
-			state:          reconciletest.State{Handoff: &coordlock.Handoff{SuccessorID: "succaaaa"}},
+			// A torn/unreadable journal is ambiguous (a handoff may be in flight)
+			// -> WAIT and re-resolve; NEVER spawn beside a possibly-booting successor.
+			name:           "Wait-torn-journal",
+			state:          reconciletest.State{ClassifyErr: errors.New("journal torn")},
 			wantErr:        true,
 			wantExit:       dispatchVetoExitCode,
 			wantDiagnostic: "bounded lease wait",
 			wantResolveMin: 2,
 		},
 		{
-			name:           "Wait-fencing-CAS-race",
-			state:          reconciletest.State{ClaimOK: false},
-			wantErr:        true,
-			wantExit:       dispatchVetoExitCode,
-			wantDiagnostic: "bounded lease wait",
-			wantResolveMin: 2,
-			wantClaims:     2,
-		},
-		{
-			name:           "Spawn-free",
-			state:          reconciletest.State{ClaimOK: true},
+			// Free flock, no journal -> Spawn a fresh coord.
+			name:           "Spawn-free-no-journal",
+			state:          reconciletest.State{HandoffDisp: coordlock.HandoffNone},
 			wantAttached:   "fleet-newcoord",
 			wantDispatches: 1,
-			wantClaims:     1,
 			wantResolveMin: 1,
 		},
 		{
-			name: "Spawn-dead-starting",
-			state: reconciletest.State{
-				Starting: &coordlock.StartingStatus{
-					Owner: coordlock.Owner{AgentID: "deadboot", PID: 202}, OwnerLive: false, WithinTTL: false, Epoch: 4,
-				},
-				ClaimOK: true,
-			},
+			// Free flock + journal names a DEAD successor (abandoned) -> clear the
+			// stale journal FIRST (clear-before-spawn), THEN Spawn.
+			name:           "Spawn-abandoned-handoff-clears-first",
+			state:          reconciletest.State{HandoffDisp: coordlock.HandoffAbandoned},
 			wantAttached:   "fleet-newcoord",
 			wantDispatches: 1,
-			wantClaims:     1,
+			wantClears:     1,
 			wantResolveMin: 1,
-		},
-		{
-			name: "SpawnStandby",
-			state: reconciletest.State{
-				Starting: &coordlock.StartingStatus{
-					Owner: coordlock.Owner{AgentID: "zombie01", PID: 203}, OwnerLive: true, WithinTTL: false, Epoch: 5,
-				},
-				SupersedeOK: true,
-			},
-			wantAttached:     "fleet-newcoord",
-			wantDispatches:   1,
-			wantSupersedes:   1,
-			wantResolveMin:   1,
-			wantNoOrphanKill: true,
 		},
 	}
 
@@ -248,20 +232,11 @@ func TestTA1_CLIVerdictMatrixConsumesResolveActions(t *testing.T) {
 			if tc.wantWarning != "" && !strings.Contains(stderr.String(), tc.wantWarning) {
 				t.Errorf("stderr should contain warning %q; got %q", tc.wantWarning, stderr.String())
 			}
-			if st.ClaimCalls != tc.wantClaims {
-				t.Errorf("ClaimStarting calls = %d, want %d", st.ClaimCalls, tc.wantClaims)
-			}
-			if st.SupersedeCalls != tc.wantSupersedes {
-				t.Errorf("Supersede calls = %d, want %d", st.SupersedeCalls, tc.wantSupersedes)
-			}
-			if tc.wantClaims > 0 && st.ClaimedID != "claimtok" {
-				t.Errorf("claimed id = %q, want preallocated claimtok", st.ClaimedID)
+			if st.ClearCalls != tc.wantClears {
+				t.Errorf("ClearHandoff calls = %d, want %d (clear-before-spawn on an abandoned journal)", st.ClearCalls, tc.wantClears)
 			}
 			if *resolveCalls < tc.wantResolveMin {
 				t.Errorf("Resolve calls = %d, want at least %d", *resolveCalls, tc.wantResolveMin)
-			}
-			if tc.wantNoOrphanKill && len(s.killedSessions) != 0 {
-				t.Errorf("SpawnStandby must not run orphan kill; killed %v", s.killedSessions)
 			}
 		})
 	}
@@ -308,7 +283,7 @@ func TestTA2_CLICoordTierHitResolvesCurrentHolder(t *testing.T) {
 func TestTA4_CLIResolveErrorSurfacesRecovery(t *testing.T) {
 	s := newFailoverSetup(t)
 	s.installStubs(t)
-	resolveCalls := installCLIResolveError(t, errors.New("epoch unreadable"))
+	resolveCalls := installCLIResolveError(t, errors.New("journal unreadable"))
 
 	stderr, err := s.run(t, "tok", AttachOpts{Project: "demo", IsTty: false})
 	if err == nil {
@@ -335,7 +310,7 @@ func TestTA6_CLIOrphanTmuxKilledBeforeSpawn(t *testing.T) {
 	s.installStubs(t)
 	s.addArchivedRecord(t, "deadbeef", "demo", agent.ArchivedCauseKill, "")
 	s.addOrphanTmux(t, "deadbeef")
-	st := reconciletest.State{ClaimOK: true}
+	st := reconciletest.State{} // free flock, no journal -> Spawn
 	installCLIResolveFromState(t, &st)
 
 	stderr, err := s.run(t, "tok", AttachOpts{Project: "demo", IsTty: false})
@@ -359,7 +334,7 @@ func TestTA6_CLIOrphanTmuxKilledBeforeSpawn(t *testing.T) {
 func TestTA7a_CLIWaitLoopIsBoundedAndNoSleep(t *testing.T) {
 	s := newFailoverSetup(t)
 	s.installStubs(t)
-	st := reconciletest.State{Handoff: &coordlock.Handoff{SuccessorID: "succwait"}}
+	st := reconciletest.State{HandoffDisp: coordlock.HandoffInFlight} // handoff in flight -> Wait
 	resolveCalls := installCLIResolveFromState(t, &st)
 
 	stderr, err := s.run(t, "tok", AttachOpts{
@@ -463,12 +438,12 @@ func TestTA9_CLIWaitHappyPathFlipsToAttach(t *testing.T) {
 	}
 }
 
-func TestTA11_CLISpawnFailureAfterPreClaimSurfacesSelfHeal(t *testing.T) {
+func TestTA11_CLISpawnFailureAfterOrphanCleanupSurfacesSelfHeal(t *testing.T) {
 	s := newFailoverSetup(t)
 	s.installStubs(t)
 	s.addArchivedRecord(t, "badc0ffe", "demo", agent.ArchivedCauseKill, "")
 	s.addOrphanTmux(t, "badc0ffe")
-	st := reconciletest.State{ClaimOK: true}
+	st := reconciletest.State{} // free flock, no journal -> Spawn
 	installCLIResolveFromState(t, &st)
 
 	prevKill := killTmuxSessionFnVar
@@ -480,9 +455,6 @@ func TestTA11_CLISpawnFailureAfterPreClaimSurfacesSelfHeal(t *testing.T) {
 	stderr, err := s.run(t, "tok", AttachOpts{Project: "demo", IsTty: false})
 	if err == nil {
 		t.Fatal("expected orphan cleanup failure")
-	}
-	if st.ClaimCalls != 1 || st.ClaimedID != "claimtok" {
-		t.Fatalf("spawn verdict must pre-claim once before fallible cleanup; calls=%d id=%q", st.ClaimCalls, st.ClaimedID)
 	}
 	for _, want := range []string{"pre-spawn orphan cleanup failed", "self-heal after its TTL"} {
 		if !strings.Contains(err.Error()+stderr.String(), want) {

@@ -1053,36 +1053,26 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			return m, loadAgentsCmd()
 		}
-		// Codex iter-5 P2: only claim the coord's `starting` lease record when
-		// the dispatch actually delivered the /coordinator prompt to the pane. A
-		// prompt-delivery failure leaves a plain Claude session running with no
-		// coord skill — claiming the lease for it would render a healthy in-flight
-		// coord in the dashboard while the project is actually unowned. We still
-		// attach the operator to the session (they can type the prompt manually),
-		// but the dashboard stays inactive until the operator re-presses [a] from
-		// a proper boot. (D3: the coord-spawn marker is gone; ClaimStartingRecord
-		// closes the pre-boot window until the coord-run supervisor takes over.)
-		switch {
-		case !msg.promptDelivered:
+		// PR-2 (D2/D4): there is no `starting` lease record to claim any more —
+		// acquiring coordinator.flock IS becoming the coordinator, and the
+		// coord-run supervisor does that itself. The pre-boot double-spawn window
+		// is closed by the retained writeCoordPendingClaim / coordSpawnVeto
+		// (epoch-independent, cleared by the coord's first tick), NOT by a
+		// starting-record claim. So the TUI only attaches here. A
+		// prompt-delivery failure still surfaces so the operator can type
+		// /coordinator manually.
+		if !msg.promptDelivered {
 			m.flash = &flashMsg{
 				text: fmt.Sprintf(
-					"coord %s spawned for project %s but the /coordinator prompt failed to deliver — attaching so you can type it manually; project will not show as coord-bound until next [a]",
+					"coord %s spawned for project %s but the /coordinator prompt failed to deliver — attaching so you can type it manually; re-press [a] after it boots",
 					msg.agentID, msg.projectName),
 				isErr: true,
 			}
-		default:
-			if werr := claimStartingRecordFn(msg.projectName, msg.agentID); werr != nil {
-				m.flash = &flashMsg{
-					text: fmt.Sprintf(
-						"coord %s spawned for project %s (lease claim failed: %v) — attaching to %s",
-						msg.agentID, msg.projectName, werr, msg.session),
-				}
-			} else {
-				m.flash = &flashMsg{
-					text: fmt.Sprintf(
-						"coord %s spawned for project %s — attaching to %s",
-						msg.agentID, msg.projectName, msg.session),
-				}
+		} else {
+			m.flash = &flashMsg{
+				text: fmt.Sprintf(
+					"coord %s spawned for project %s — attaching to %s",
+					msg.agentID, msg.projectName, msg.session),
 			}
 		}
 		m.pendingAttach = msg.session

@@ -18,6 +18,7 @@ import (
 // leaseCell is one committed/reserved/free lease configuration.
 type leaseCell struct {
 	owner       string // active lease owner AgentID; "" == no active owner
+	flockLive   bool   // flock HELD by a live process (independent of owner identity readability)
 	handoffSucc string // handoff reservation successor; "" == none
 	oldAlive    bool   // defensive OLD-session probe result
 	oldProbeErr error  // defensive OLD-session probe error
@@ -31,14 +32,21 @@ func (c leaseCell) deps() CoordSwapResumeDeps {
 			}
 			return coordlock.Owner{AgentID: c.owner}, true
 		},
-		CurrentHandoff: func(string) (coordlock.Handoff, bool) {
+		// PR-2: an in-flight handoff is the write-once journal naming a
+		// process-alive successor ⇒ HandoffInFlight. "" == no journal ⇒ None.
+		ClassifyHandoff: func(string) (coordlock.HandoffDisposition, coordlock.HandoffJournal, error) {
 			if c.handoffSucc == "" {
-				return coordlock.Handoff{}, false
+				return coordlock.HandoffNone, coordlock.HandoffJournal{}, nil
 			}
-			return coordlock.Handoff{SuccessorID: c.handoffSucc}, true
+			return coordlock.HandoffInFlight, coordlock.HandoffJournal{SuccessorID: c.handoffSucc}, nil
 		},
 		OldSessionAlive: func(string) (bool, error) {
 			return c.oldAlive, c.oldProbeErr
+		},
+		FlockLive: func(string) bool {
+			// A named owner always implies a live flock; flockLive lets a case
+			// model "busy but identity-pending" (owner=="" yet flock IS held).
+			return c.owner != "" || c.flockLive
 		},
 	}
 }
@@ -129,6 +137,20 @@ func TestClassifyCoordSwapResume_Matrix(t *testing.T) {
 			cell:       leaseCell{owner: newID, handoffSucc: newID},
 			wantAction: ResumeRefuse,
 		},
+		{
+			// Review adversarial-subagent finding: CurrentOwner's ok=false covers
+			// BOTH "flock genuinely free" and "flock BUSY with an
+			// identity-pending/torn body" (old-binary straggler, or the narrow
+			// stampFlockBody stamp window) — ClassifyFreeFlockHandoff requires the
+			// caller to have already established the flock is free. A busy-but-
+			// unreadable flock with a leftover journal naming NEW must NOT be
+			// misread as "swap in flight" (telling the caller not to respawn) —
+			// it must fall through to case (3) and respawn; flock-exclusivity is
+			// what actually protects against a duplicate here.
+			name:       "busy/identity-pending with stale handoff → respawn (not wait)",
+			cell:       leaseCell{owner: "", flockLive: true, handoffSucc: newID},
+			wantAction: ResumeRespawn,
+		},
 	}
 
 	for _, tc := range tests {
@@ -156,7 +178,9 @@ func TestClassifyCoordSwapResume_ForceSkipsProbe(t *testing.T) {
 		CurrentOwner: func(string) (coordlock.Owner, bool) {
 			return coordlock.Owner{AgentID: "NEW"}, true
 		},
-		CurrentHandoff: func(string) (coordlock.Handoff, bool) { return coordlock.Handoff{}, false },
+		ClassifyHandoff: func(string) (coordlock.HandoffDisposition, coordlock.HandoffJournal, error) {
+			return coordlock.HandoffNone, coordlock.HandoffJournal{}, nil
+		},
 		OldSessionAlive: func(string) (bool, error) {
 			probed = true
 			return true, nil
@@ -176,8 +200,10 @@ func TestClassifyCoordSwapResume_ForceSkipsProbe(t *testing.T) {
 func TestClassifyCoordSwapResume_NilProbeStillRefuses(t *testing.T) {
 	tmuxtest.RequireTmux(t) // isolation lint: `Resume(` trigger; no real spawn.
 	d := CoordSwapResumeDeps{
-		CurrentOwner:    func(string) (coordlock.Owner, bool) { return coordlock.Owner{AgentID: "NEW"}, true },
-		CurrentHandoff:  func(string) (coordlock.Handoff, bool) { return coordlock.Handoff{}, false },
+		CurrentOwner: func(string) (coordlock.Owner, bool) { return coordlock.Owner{AgentID: "NEW"}, true },
+		ClassifyHandoff: func(string) (coordlock.HandoffDisposition, coordlock.HandoffJournal, error) {
+			return coordlock.HandoffNone, coordlock.HandoffJournal{}, nil
+		},
 		OldSessionAlive: nil,
 	}
 	got := ClassifyCoordSwapResume("proj", "OLD", "", "NEW", false, d)

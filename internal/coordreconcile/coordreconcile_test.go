@@ -7,19 +7,7 @@ import (
 	"github.com/edisonshen/fleet/internal/coordlock"
 	"github.com/edisonshen/fleet/internal/coordreconcile"
 	"github.com/edisonshen/fleet/internal/coordreconcile/reconciletest"
-	"github.com/edisonshen/fleet/internal/state"
 )
-
-// setupReconcileHome points FLEET_HOME at a temp dir + bootstraps it so the real
-// coordlock lease primitives (AcquireLease / the flock readers) resolve a
-// per-project .locks dir. Used by the integration test below.
-func setupReconcileHome(t *testing.T) {
-	t.Helper()
-	t.Setenv("FLEET_HOME", t.TempDir())
-	if _, err := state.Bootstrap(); err != nil {
-		t.Fatalf("bootstrap: %v", err)
-	}
-}
 
 func TestResolveMatrix(t *testing.T) {
 	const project = "projects-fleet"
@@ -31,232 +19,90 @@ func TestResolveMatrix(t *testing.T) {
 		state     reconciletest.State
 		wantDec   coordreconcile.Decision
 		wantOwner string // AgentID expected on coordreconcile.Attach; "" otherwise
-		// assertions on recorded side effects
-		wantSupersede int
-		wantSupEpoch  int64
-		wantClaim     int
-		wantClaimID   string
-		wantErr       bool
+		wantClear int    // expected ClearHandoff invocations (clear-before-spawn)
+		wantErr   bool
 	}{
 		{
-			// T3: `[a]`/attach on a live active owner with NO marker file —
-			// attaches, never spawns a duplicate (the incident regression).
-			name:      "T3_live_active_owner_attaches",
+			// T3: a live flock holder WITH an identity ⇒ Attach, never spawn a
+			// duplicate (the incident regression). A busy flock is a live coord.
+			name:      "T3_live_flock_holder_attaches",
 			agentID:   agentID,
 			state:     reconciletest.State{LiveOwner: &coordlock.Owner{AgentID: "live01", PID: 4242}},
 			wantDec:   coordreconcile.Attach,
 			wantOwner: "live01",
 		},
 		{
-			// T7b: owner ALIVE but wedged (stopped renewing, past TTL). LiveOwner
-			// is TTL-independent, so it STILL reports the live owner -> ATTACH,
-			// never claim/spawn beside a live coord (no-auto-kill). Assert NO
-			// ClaimStarting ran.
-			name:      "T7b_live_wedged_owner_never_clobbered",
-			agentID:   agentID,
-			state:     reconciletest.State{LiveOwner: &coordlock.Owner{AgentID: "wedged01", PID: 777}},
-			wantDec:   coordreconcile.Attach,
-			wantOwner: "wedged01",
-			wantClaim: 0,
-		},
-		{
-			// T2: a second [a] while the first coord is `starting` within TTL —
-			// WAIT (no duplicate spawn), regardless of OwnerLive.
-			name:    "T2_starting_within_ttl_waits",
+			// T13 (D9e): the flock is HELD by a live coord but its body is
+			// identity-less (old-binary / torn ⇒ AgentID==""). Resolve WAITs
+			// (poll for the identity); attach's PROJECT-RECOVERY falls back to
+			// FindLiveCoord. Never Attach-with-empty-id, never spawn beside it.
+			name:    "T13_flock_held_identity_less_waits",
 			agentID: agentID,
-			state: reconciletest.State{Starting: &coordlock.StartingStatus{
-				Owner: coordlock.Owner{AgentID: "boot01", PID: 555}, OwnerLive: true, WithinTTL: true, Epoch: 5,
-			}},
-			wantDec:       coordreconcile.Wait,
-			wantSupersede: 0,
-			wantClaim:     0,
-		},
-		{
-			// T2b: starting within TTL but owner pid NOT yet live (pre-spawn
-			// claim window) — still WAIT.
-			name:    "T2b_starting_within_ttl_owner_not_yet_live_waits",
-			agentID: agentID,
-			state: reconciletest.State{Starting: &coordlock.StartingStatus{
-				OwnerLive: false, WithinTTL: true, Epoch: 5,
-			}},
+			state:   reconciletest.State{LiveOwner: &coordlock.Owner{AgentID: "", PID: 999}},
 			wantDec: coordreconcile.Wait,
 		},
 		{
-			// T6s (flock-only D6): a wedged-past-TTL `starting` owner that is LIVE
-			// holds the flock, so LiveOwner is non-nil ⇒ Resolve step-1 ATTACHES —
-			// it never reaches Supersede/SpawnStandby (unreachable when the flock
-			// is held). Formerly this row asserted SpawnStandby via an INCONSISTENT
-			// double (LiveOwner nil while modeling a live flock holder — the
-			// false-green D6 fixed). Now consistent: a live flock holder ⇒
-			// LiveOwner set. The wedged epoch state is irrelevant; the flock wins.
-			name:    "T6s_wedged_live_holder_attaches",
-			agentID: agentID,
-			state: reconciletest.State{
-				LiveOwner: &coordlock.Owner{AgentID: "zombie01", PID: 999},
-				Starting: &coordlock.StartingStatus{
-					Owner: coordlock.Owner{AgentID: "zombie01", PID: 999}, OwnerLive: true, WithinTTL: false, Epoch: 7,
-				},
-			},
-			wantDec:       coordreconcile.Attach,
-			wantOwner:     "zombie01",
-			wantSupersede: 0,
-			wantClaim:     0,
-		},
-		{
-			// T6s CAS coverage — re-anchored to the FLOCK-FREE pre-acquire window
-			// where Supersede is genuinely reached: LiveOwner NIL (flock free) + a
-			// `starting` record whose owner is live-but-not-holding (wrote
-			// ClaimStartingRecord, hasn't acquired the flock) and is past TTL. The
-			// supersede loses (record flipped/advanced) -> WAIT.
-			name:    "T6s_supersede_race_waits",
-			agentID: agentID,
-			state: reconciletest.State{
-				Starting: &coordlock.StartingStatus{
-					Owner: coordlock.Owner{AgentID: "zombie01", PID: 999}, OwnerLive: true, WithinTTL: false, Epoch: 7,
-				},
-				SupersedeOK: false,
-			},
-			wantDec:       coordreconcile.Wait,
-			wantSupersede: 1,
-			wantSupEpoch:  7,
-		},
-		{
-			// T6s supersede error surfaces (never silently reconcile) — same
-			// flock-free pre-acquire window as the race row above.
-			name:    "T6s_supersede_error_surfaces",
-			agentID: agentID,
-			state: reconciletest.State{
-				Starting: &coordlock.StartingStatus{
-					Owner: coordlock.Owner{AgentID: "zombie01", PID: 999}, OwnerLive: true, WithinTTL: false, Epoch: 7,
-				},
-				SupersedeErr: errors.New("epoch.lock busy"),
-			},
-			wantErr:       true,
-			wantSupersede: 1,
-		},
-		{
-			// T10 (flock-only D6): a live flock holder still in epoch `starting`
-			// WITHIN TTL (pre-Activate boot) ⇒ LiveOwner non-nil ⇒ Attach, NOT the
-			// Wait/Supersede branch. Proves the flock truth beats the booting
-			// starting sub-state too (companion to T6s's wedged sub-state).
-			name:    "T10_booting_flock_holder_attaches",
-			agentID: agentID,
-			state: reconciletest.State{
-				LiveOwner: &coordlock.Owner{AgentID: "boot01", PID: 555},
-				Starting: &coordlock.StartingStatus{
-					Owner: coordlock.Owner{AgentID: "boot01", PID: 555}, OwnerLive: true, WithinTTL: true, Epoch: 5,
-				},
-			},
-			wantDec:       coordreconcile.Attach,
-			wantOwner:     "boot01",
-			wantSupersede: 0,
-			wantClaim:     0,
-		},
-		{
-			// T13 (flock-only D6): the flock is HELD by a live coord but its body
-			// is identity-less (old-binary / torn ⇒ AgentID==""). Resolve must
-			// WAIT (poll for the identity), NOT Attach (an empty-id Attach dead-ends
-			// the attach callers) and NOT Spawn (never beside a live holder) — the
-			// attach-never-exits guarantee under version skew.
-			name:    "T13_flock_held_identity_less_waits",
-			agentID: agentID,
-			state: reconciletest.State{
-				LiveOwner: &coordlock.Owner{AgentID: "", PID: 999},
-			},
-			wantDec:       coordreconcile.Wait,
-			wantSupersede: 0,
-			wantClaim:     0,
-		},
-		{
-			// starting past TTL with a DEAD owner -> NOT superseded (no live
-			// process to fence at the record CAS level); falls through to the
-			// free/dead claim branch and SPAWNS.
-			name:    "starting_wedged_dead_owner_falls_through_to_spawn",
-			agentID: agentID,
-			state: reconciletest.State{
-				Starting: &coordlock.StartingStatus{
-					Owner: coordlock.Owner{AgentID: "deadboot01", PID: 111}, OwnerLive: false, WithinTTL: false, Epoch: 7,
-				},
-				ClaimOK: true,
-			},
-			wantDec:       coordreconcile.Spawn,
-			wantSupersede: 0,
-			wantClaim:     1,
-			wantClaimID:   agentID,
-		},
-		{
-			// codex D2 iter-3 [P1]: starting WITHIN TTL but owner pid was
-			// stamped and is DEAD (pre-activation SIGKILL) -> do NOT wait out
-			// the TTL; fall through to claim + SPAWN. Recovery is immediate,
-			// not a ~120s outage.
-			name:    "starting_within_ttl_dead_owner_recovers_now",
-			agentID: agentID,
-			state: reconciletest.State{
-				Starting: &coordlock.StartingStatus{
-					Owner: coordlock.Owner{AgentID: "crashboot01", PID: 424242}, OwnerLive: false, WithinTTL: true, Epoch: 9,
-				},
-				ClaimOK: true,
-			},
-			wantDec:       coordreconcile.Spawn,
-			wantSupersede: 0,
-			wantClaim:     1,
-			wantClaimID:   agentID,
-		},
-		{
-			// Handoff reservation naming a successor -> WAIT for it (#247 rule a).
-			name:      "handoff_reservation_waits",
+			// T4: flock FREE + journal names a successor whose process is ALIVE
+			// (handoff in flight) ⇒ WAIT, do not spawn beside the booting
+			// successor. No clear.
+			name:      "T4_handoff_in_flight_waits",
 			agentID:   agentID,
-			state:     reconciletest.State{Handoff: &coordlock.Handoff{SuccessorID: "succ01"}},
+			state:     reconciletest.State{HandoffDisp: coordlock.HandoffInFlight},
 			wantDec:   coordreconcile.Wait,
-			wantClaim: 0,
+			wantClear: 0,
 		},
 		{
-			// T7a: free / dead-active lease -> CLAIM + SPAWN. (A dead active
-			// owner is NOT LiveOwner, so we reach here and the claim is safe.)
-			name:        "T7a_free_lease_claims_and_spawns",
-			agentID:     agentID,
-			state:       reconciletest.State{ClaimOK: true},
-			wantDec:     coordreconcile.Spawn,
-			wantClaim:   1,
-			wantClaimID: agentID,
-		},
-		{
-			// T8: two [a] racing on a free lease — the loser's ClaimStarting CAS
-			// returns ok=false -> WAIT (re-resolve), so exactly one spawns.
-			name:      "T8_claim_race_loser_waits",
+			// T5: flock FREE + journal names a successor whose process is DEAD
+			// (abandoned) ⇒ clear the stale journal FIRST (clear-before-spawn),
+			// THEN Spawn.
+			name:      "T5_handoff_abandoned_clears_then_spawns",
 			agentID:   agentID,
-			state:     reconciletest.State{ClaimOK: false},
-			wantDec:   coordreconcile.Wait,
-			wantClaim: 1,
+			state:     reconciletest.State{HandoffDisp: coordlock.HandoffAbandoned},
+			wantDec:   coordreconcile.Spawn,
+			wantClear: 1,
 		},
 		{
-			// claim error surfaces.
-			name:    "claim_error_surfaces",
+			// T6: flock FREE + no journal ⇒ Spawn a fresh coord. No clear.
+			name:      "T6_free_no_journal_spawns",
+			agentID:   agentID,
+			state:     reconciletest.State{HandoffDisp: coordlock.HandoffNone},
+			wantDec:   coordreconcile.Spawn,
+			wantClear: 0,
+		},
+		{
+			// Torn/unreadable journal ⇒ ambiguous, a handoff may be in flight ⇒
+			// WAIT (never spawn beside a possibly-booting successor). No clear.
+			name:      "torn_journal_waits",
+			agentID:   agentID,
+			state:     reconciletest.State{ClassifyErr: errors.New("torn journal")},
+			wantDec:   coordreconcile.Wait,
+			wantClear: 0,
+		},
+		{
+			// clear-before-spawn FAILS on an abandoned journal ⇒ error surfaces
+			// (never silently spawn beside a stale journal that wedges O_EXCL).
+			name:    "abandoned_clear_error_surfaces",
 			agentID: agentID,
-			state:   reconciletest.State{ClaimErr: errors.New("epoch.lock busy")},
+			state:   reconciletest.State{HandoffDisp: coordlock.HandoffAbandoned, ClearErr: errors.New("clear failed")},
 			wantErr: true,
 		},
 		{
-			// free lease but no agentID -> WAIT (cannot spawn without an id);
-			// never claims.
-			name:      "free_no_agentid_waits",
-			agentID:   "",
-			state:     reconciletest.State{},
-			wantDec:   coordreconcile.Wait,
-			wantClaim: 0,
+			// free flock, no journal, but no agentID ⇒ WAIT (cannot spawn
+			// without an id).
+			name:    "free_no_agentid_waits",
+			agentID: "",
+			state:   reconciletest.State{HandoffDisp: coordlock.HandoffNone},
+			wantDec: coordreconcile.Wait,
 		},
 	}
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			st := tc.state // copy so recorded-call counters are per-case
+			st := tc.state // copy so ClearCalls is per-case
 			v, err := coordreconcile.Resolve(st.Deps(), project, tc.agentID)
 			if tc.wantErr {
 				if err == nil {
 					t.Fatalf("want error, got nil (verdict=%+v)", v)
-				}
-				if st.SupersedeCalls != tc.wantSupersede {
-					t.Errorf("supersede calls = %d, want %d", st.SupersedeCalls, tc.wantSupersede)
 				}
 				return
 			}
@@ -269,17 +115,8 @@ func TestResolveMatrix(t *testing.T) {
 			if v.Owner.AgentID != tc.wantOwner {
 				t.Errorf("Owner.AgentID = %q, want %q", v.Owner.AgentID, tc.wantOwner)
 			}
-			if st.SupersedeCalls != tc.wantSupersede {
-				t.Errorf("supersede calls = %d, want %d", st.SupersedeCalls, tc.wantSupersede)
-			}
-			if tc.wantSupEpoch != 0 && st.SupersedeEpoch != tc.wantSupEpoch {
-				t.Errorf("supersede epoch = %d, want %d", st.SupersedeEpoch, tc.wantSupEpoch)
-			}
-			if st.ClaimCalls != tc.wantClaim {
-				t.Errorf("claim calls = %d, want %d", st.ClaimCalls, tc.wantClaim)
-			}
-			if tc.wantClaimID != "" && st.ClaimedID != tc.wantClaimID {
-				t.Errorf("claimed id = %q, want %q", st.ClaimedID, tc.wantClaimID)
+			if st.ClearCalls != tc.wantClear {
+				t.Errorf("ClearHandoff calls = %d, want %d", st.ClearCalls, tc.wantClear)
 			}
 			if v.Reason == "" {
 				t.Errorf("Verdict.Reason is empty; every decision must surface a reason")
@@ -288,81 +125,29 @@ func TestResolveMatrix(t *testing.T) {
 	}
 }
 
-// TestResolveOrdering pins the precedence: a live owner wins even if a stale
-// starting/handoff record also exists on disk (the incident's stale-cache
-// class — the live lease always beats a leftover record).
+// TestResolveOrdering pins the precedence: a live flock holder wins even if a
+// journal also exists (the flock is the sole source of truth — a live holder is
+// never spawned beside, and the journal is only consulted when the flock is
+// FREE).
 func TestResolveOrdering(t *testing.T) {
 	live := coordlock.Owner{AgentID: "live01", PID: 4242}
 	st := reconciletest.State{
-		LiveOwner: &live,
-		Starting:  &coordlock.StartingStatus{OwnerLive: true, WithinTTL: false, Epoch: 3},
-		Handoff:   &coordlock.Handoff{SuccessorID: "succ01"},
-		ClaimOK:   true,
+		LiveOwner:   &live,
+		HandoffDisp: coordlock.HandoffAbandoned, // would clear+spawn IF the flock were free
 	}
 	v, err := coordreconcile.Resolve(st.Deps(), "projects-fleet", "newcoord01")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if v.Decision != coordreconcile.Attach || v.Owner.AgentID != "live01" {
-		t.Fatalf("live owner must win: got %s owner=%q", v.Decision, v.Owner.AgentID)
+		t.Fatalf("live flock holder must win: got %s owner=%q", v.Decision, v.Owner.AgentID)
 	}
-	if st.SupersedeCalls != 0 || st.ClaimCalls != 0 {
-		t.Fatalf("no CAS may run when a live owner is present: supersede=%d claim=%d", st.SupersedeCalls, st.ClaimCalls)
+	if st.ClearCalls != 0 {
+		t.Fatalf("no journal clear may run when a live holder is present: clear=%d", st.ClearCalls)
 	}
 }
 
-// TestResolve_RealFlockReaders is the flock-only INTEGRATION test: it drives
-// coordreconcile.Resolve with the REAL coordlock readers (DefaultDeps) against a
-// REAL held flock (via coordlock.AcquireLease), crossing the
-// coordlock→coordreconcile boundary the unit table fakes. Covers T1 (busy coord
-// with identity ⇒ Attach; freed ⇒ Spawn) and T13 (identity-less body ⇒ Wait).
-func TestResolve_RealFlockReaders(t *testing.T) {
-	t.Run("T1_busy_coord_with_identity_attaches_then_freed_spawns", func(t *testing.T) {
-		setupReconcileHome(t)
-		const project = "resolve-integ-attach"
-		lease, acquired, err := coordlock.AcquireLease(project, "holder01")
-		if err != nil || !acquired {
-			t.Fatalf("AcquireLease: acquired=%v err=%v", acquired, err)
-		}
-		t.Cleanup(lease.Release)
-
-		// Busy flock with a stamped identity ⇒ Attach — never spawn beside it
-		// (the incident regression), even though the epoch is only `starting`.
-		v, err := coordreconcile.Resolve(coordreconcile.DefaultDeps(), project, "newcaller")
-		if err != nil {
-			t.Fatalf("Resolve: %v", err)
-		}
-		if v.Decision != coordreconcile.Attach || v.Owner.AgentID != "holder01" {
-			t.Fatalf("busy coord ⇒ Attach holder01; got %s owner=%q", v.Decision, v.Owner.AgentID)
-		}
-
-		// Release frees the flock ⇒ a fresh Resolve now Spawns.
-		lease.Release()
-		v, err = coordreconcile.Resolve(coordreconcile.DefaultDeps(), project, "newcaller")
-		if err != nil {
-			t.Fatalf("Resolve after release: %v", err)
-		}
-		if v.Decision != coordreconcile.Spawn {
-			t.Fatalf("freed lease ⇒ Spawn; got %s (reason=%q)", v.Decision, v.Reason)
-		}
-	})
-
-	t.Run("T13_identity_less_flock_waits", func(t *testing.T) {
-		setupReconcileHome(t)
-		const project = "resolve-integ-wait"
-		// An empty agentID stamps an identity-less body (the old-binary / torn
-		// body case) — the flock is held but names no agent.
-		lease, acquired, err := coordlock.AcquireLease(project, "")
-		if err != nil || !acquired {
-			t.Fatalf("AcquireLease: acquired=%v err=%v", acquired, err)
-		}
-		t.Cleanup(lease.Release)
-		v, err := coordreconcile.Resolve(coordreconcile.DefaultDeps(), project, "newcaller")
-		if err != nil {
-			t.Fatalf("Resolve: %v", err)
-		}
-		if v.Decision != coordreconcile.Wait {
-			t.Fatalf("flock held with identity-less body ⇒ Wait; got %s owner=%q", v.Decision, v.Owner.AgentID)
-		}
-	})
-}
+// TestResolve_RealFlockReaders (the flock-only INTEGRATION test driving the
+// REAL coordlock.AcquireLease) moved to coordreconcile_unix_test.go
+// (//go:build linux || darwin) — codex PR2-review iter-2 [P2]: AcquireLease
+// is itself gated to those GOOS values, so it doesn't compile here.

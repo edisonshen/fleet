@@ -49,7 +49,28 @@ def test_parses_live_owner_and_successor(monkeypatch, tmp_path):
         stdout='{"project":"p","live_owner_id":"coord-a","owner_id":"coord-a",'
         '"handoff_successor_id":"coord-b"}',
     )
-    assert loop._read_coord_lease_identity("p", home=tmp_path) == ("coord-a", "coord-b")
+    assert loop._read_coord_lease_identity("p", home=tmp_path) == ("coord-a", "coord-b", False, False)
+
+
+def test_parses_present_and_identity_pending(monkeypatch, tmp_path):
+    """D9d: a live-but-UNNAMED flock holder serializes as live_owner_id="" with
+    live_owner_present=true + identity_pending=true. The reader must surface both
+    flags so gate 5 can skip a self-exit against it without treating it as a
+    named duplicate (locks the D9d cross-language key contract)."""
+    _fake_run(
+        monkeypatch,
+        stdout='{"project":"p","live_owner_id":"","live_owner_present":true,'
+        '"identity_pending":true,"live_owner_pid":4242,"handoff_successor_id":""}',
+    )
+    assert loop._read_coord_lease_identity("p", home=tmp_path) == ("", "", True, True)
+
+    # A NAMED live holder: present=true, identity_pending=false.
+    _fake_run(
+        monkeypatch,
+        stdout='{"project":"p","live_owner_id":"coord-x","live_owner_present":true,'
+        '"identity_pending":false,"live_owner_pid":4242,"handoff_successor_id":""}',
+    )
+    assert loop._read_coord_lease_identity("p", home=tmp_path) == ("coord-x", "", True, False)
 
 
 def test_empty_fields_are_conclusive_empty(monkeypatch, tmp_path):
@@ -60,7 +81,7 @@ def test_empty_fields_are_conclusive_empty(monkeypatch, tmp_path):
         monkeypatch,
         stdout='{"project":"p","live_owner_id":"","owner_id":"","handoff_successor_id":""}',
     )
-    assert loop._read_coord_lease_identity("p", home=tmp_path) == ("", "")
+    assert loop._read_coord_lease_identity("p", home=tmp_path) == ("", "", False, False)
 
 
 def test_missing_keys_are_conclusive_empty(monkeypatch, tmp_path):
@@ -68,7 +89,7 @@ def test_missing_keys_are_conclusive_empty(monkeypatch, tmp_path):
     never a KeyError. The CLI ran (returncode 0, valid object), so this is
     conclusive-empty, not inconclusive."""
     _fake_run(monkeypatch, stdout='{"project":"p"}')
-    assert loop._read_coord_lease_identity("p", home=tmp_path) == ("", "")
+    assert loop._read_coord_lease_identity("p", home=tmp_path) == ("", "", False, False)
 
 
 def test_nonzero_returncode_is_inconclusive(monkeypatch, tmp_path):
@@ -76,21 +97,21 @@ def test_nonzero_returncode_is_inconclusive(monkeypatch, tmp_path):
     internal error: INCONCLUSIVE (None, None), NOT empty. A stale FLEET_BIN must
     never let gate 5 self-exit a legit successor (#182 stale-binary class)."""
     _fake_run(monkeypatch, returncode=1, stdout="")
-    assert loop._read_coord_lease_identity("p", home=tmp_path) == (None, None)
+    assert loop._read_coord_lease_identity("p", home=tmp_path) == (None, None, False, False)
 
 
 def test_unparseable_stdout_is_inconclusive(monkeypatch, tmp_path):
     """Garbage on stdout must not crash the tick, and must be INCONCLUSIVE (a
     corrupt read is not proof of an empty lease) -> (None, None)."""
     _fake_run(monkeypatch, stdout="not json at all")
-    assert loop._read_coord_lease_identity("p", home=tmp_path) == (None, None)
+    assert loop._read_coord_lease_identity("p", home=tmp_path) == (None, None, False, False)
 
 
 def test_non_dict_json_is_inconclusive(monkeypatch, tmp_path):
     """Valid JSON that isn't an object (e.g. a list) -> (None, None), never an
     AttributeError on .get, never mistaken for an empty lease."""
     _fake_run(monkeypatch, stdout="[1, 2, 3]")
-    assert loop._read_coord_lease_identity("p", home=tmp_path) == (None, None)
+    assert loop._read_coord_lease_identity("p", home=tmp_path) == (None, None, False, False)
 
 
 def test_empty_stdout_is_inconclusive(monkeypatch, tmp_path):
@@ -98,20 +119,20 @@ def test_empty_stdout_is_inconclusive(monkeypatch, tmp_path):
     JSON object on success) — the read did not really happen -> (None, None),
     NOT a conclusive-empty lease."""
     _fake_run(monkeypatch, stdout="")
-    assert loop._read_coord_lease_identity("p", home=tmp_path) == (None, None)
+    assert loop._read_coord_lease_identity("p", home=tmp_path) == (None, None, False, False)
 
 
 def test_timeout_is_inconclusive(monkeypatch, tmp_path):
     """A hung binary (TimeoutExpired) must not wedge the tick and must be
     INCONCLUSIVE -> (None, None)."""
     _fake_run(monkeypatch, raises=subprocess.TimeoutExpired(cmd="fleet", timeout=1))
-    assert loop._read_coord_lease_identity("p", home=tmp_path) == (None, None)
+    assert loop._read_coord_lease_identity("p", home=tmp_path) == (None, None, False, False)
 
 
 def test_oserror_is_inconclusive(monkeypatch, tmp_path):
     """Binary missing / not executable (OSError) -> (None, None) INCONCLUSIVE."""
     _fake_run(monkeypatch, raises=OSError("no such file"))
-    assert loop._read_coord_lease_identity("p", home=tmp_path) == (None, None)
+    assert loop._read_coord_lease_identity("p", home=tmp_path) == (None, None, False, False)
 
 
 def test_invokes_coord_owner_json_with_fleet_home(monkeypatch, tmp_path):

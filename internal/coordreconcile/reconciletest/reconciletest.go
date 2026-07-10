@@ -5,32 +5,25 @@ import (
 	"github.com/edisonshen/fleet/internal/coordreconcile"
 )
 
-// State is a deterministic coordreconcile.Deps builder. Tests set only the
-// fields relevant to a row; the zero value is a free lease.
+// State is a deterministic coordreconcile.Deps builder (flock-only, PR-2 D4).
+// Tests set only the fields relevant to a row; the zero value is a free lease
+// with no handoff journal (HandoffNone) — i.e. a clean Spawn.
 //
-// PRODUCTION-CONSISTENCY INVARIANT (flock-only, PR-1 D6): LiveOwner and
-// CurrentStarting are INDEPENDENT closures here, but in production they read the
-// same flock. A LIVE flock holder makes LiveOwner non-nil (busy⇒owner), so a
-// row that models a live flock holder MUST set LiveOwner — otherwise Resolve
-// would reach the flock-free Supersede/SpawnStandby branch that a real live
-// holder can never reach (Resolve step-1 short-circuits to Attach). Leaving
-// LiveOwner nil while Starting.OwnerLive=true models only the FLOCK-FREE
-// pre-acquire window (a process wrote a starting record but has not yet
-// acquired the flock). Setting both inconsistently is the false-green D6 fixed.
+// LiveOwner models the flock: non-nil ⇒ a live holder (busy⇒owner); nil ⇒ the
+// flock is FREE, and the ClassifyHandoff journal disposition then decides
+// Wait (in-flight) vs Spawn (none/abandoned-after-clear).
 type State struct {
 	LiveOwner *coordlock.Owner
-	Starting  *coordlock.StartingStatus
-	Handoff   *coordlock.Handoff
 
-	SupersedeOK  bool
-	SupersedeErr error
-	ClaimOK      bool
-	ClaimErr     error
+	// HandoffDisp + HandoffJournal model coordlock.ClassifyFreeFlockHandoff for
+	// a FLOCK-FREE project. ClassifyErr models a torn-journal read.
+	HandoffDisp    coordlock.HandoffDisposition
+	HandoffJournal coordlock.HandoffJournal
+	ClassifyErr    error
 
-	SupersedeCalls int
-	SupersedeEpoch int64
-	ClaimCalls     int
-	ClaimedID      string
+	// ClearErr models a failed clear-before-spawn; ClearCalls counts invocations.
+	ClearErr   error
+	ClearCalls int
 }
 
 func (s *State) Deps() coordreconcile.Deps {
@@ -41,27 +34,12 @@ func (s *State) Deps() coordreconcile.Deps {
 			}
 			return *s.LiveOwner, true
 		},
-		CurrentStarting: func(string) (coordlock.StartingStatus, bool) {
-			if s.Starting == nil {
-				return coordlock.StartingStatus{}, false
-			}
-			return *s.Starting, true
+		ClassifyHandoff: func(string) (coordlock.HandoffDisposition, coordlock.HandoffJournal, error) {
+			return s.HandoffDisp, s.HandoffJournal, s.ClassifyErr
 		},
-		CurrentHandoff: func(string) (coordlock.Handoff, bool) {
-			if s.Handoff == nil {
-				return coordlock.Handoff{}, false
-			}
-			return *s.Handoff, true
-		},
-		Supersede: func(_ string, epoch int64) (bool, error) {
-			s.SupersedeCalls++
-			s.SupersedeEpoch = epoch
-			return s.SupersedeOK, s.SupersedeErr
-		},
-		ClaimStarting: func(_ string, id string) (bool, error) {
-			s.ClaimCalls++
-			s.ClaimedID = id
-			return s.ClaimOK, s.ClaimErr
+		ClearHandoff: func(string) error {
+			s.ClearCalls++
+			return s.ClearErr
 		},
 	}
 }

@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/edisonshen/fleet/internal/agent"
+	"github.com/edisonshen/fleet/internal/coordlock"
 	"github.com/edisonshen/fleet/internal/spawn"
 	"github.com/edisonshen/fleet/internal/state"
 	"github.com/edisonshen/fleet/internal/tmux"
@@ -22,16 +23,17 @@ import (
 // the helper consults; nil/zero values pick a sensible default
 // (spawn succeeds, session always alive, handoff reserve succeeds, etc.).
 //
-// D3: the coord-spawn marker is gone. The helper no longer writes a marker at a
-// synchronous commit point; instead it RESERVES a handoff on OLD's lease (naming
-// NEW) before retiring OLD. reserveHandoffFn is the injected seam.
+// PR-2 (D3): the coord-spawn marker AND the epoch ReserveHandoff are gone. The
+// helper's step-4 identity commit is now the write-once handoff journal
+// (coordlock.CreateHandoffJournal, a real on-disk O_EXCL write — not a seam), so
+// tests assert against the on-disk coordinator.handoff.json via
+// assertHandoffJournalNames / assertNoHandoffJournal rather than a reserve seam.
 type fakeSwap struct {
 	spawnErr       error
 	spawnNewRec    *agent.Record // override the synthesized NEW record
 	waitErr        error
 	postReadyAlive bool  // step 3.b alive return
 	postReadyErr   error // step 3.b err return
-	reserveErr     error // step 4 ReserveHandoff error (best-effort; never rolls back)
 	sendKeysErr    error
 	killErr        error
 	postKillAlive  bool  // step 5.c alive return
@@ -41,9 +43,6 @@ type fakeSwap struct {
 	spawnCalls         int
 	waitCalls          int
 	postReadyProbeOf   []string
-	reserveCalled      bool
-	reservedSuccessor  string
-	reservedProj       string
 	sendKeysCalled     bool
 	killCalled         bool
 	postKillProbeCalls int
@@ -57,7 +56,6 @@ func (f *fakeSwap) install(t *testing.T, newRec *agent.Record) func() {
 	origSpawn := spawnFn
 	origWait := waitForReadyToPromptFn
 	origAlive := sessionAliveFn
-	origReserve := reserveHandoffFn
 	origSendKeys := tmuxSendKeysFn
 	origKill := tmuxKillFn
 	origSleep := sleepFn
@@ -93,15 +91,6 @@ func (f *fakeSwap) install(t *testing.T, newRec *agent.Record) func() {
 		f.postKillProbeCalls++
 		return f.postKillAlive, f.postKillErr
 	}
-	reserveHandoffFn = func(project, successorID string, ttl time.Duration) (bool, error) {
-		f.reserveCalled = true
-		f.reservedProj = project
-		f.reservedSuccessor = successorID
-		if f.reserveErr != nil {
-			return false, f.reserveErr
-		}
-		return true, nil
-	}
 	tmuxSendKeysFn = func(session string, keys ...string) error {
 		f.sendKeysCalled = true
 		return f.sendKeysErr
@@ -118,10 +107,36 @@ func (f *fakeSwap) install(t *testing.T, newRec *agent.Record) func() {
 		spawnFn = origSpawn
 		waitForReadyToPromptFn = origWait
 		sessionAliveFn = origAlive
-		reserveHandoffFn = origReserve
 		tmuxSendKeysFn = origSendKeys
 		tmuxKillFn = origKill
 		sleepFn = origSleep
+	}
+}
+
+// assertHandoffJournalNames asserts coordinator.handoff.json exists for project
+// and names successorID (the PR-2 flock-only replacement for the reserve seam).
+func assertHandoffJournalNames(t *testing.T, project, successorID string) {
+	t.Helper()
+	j, ok, err := coordlock.ReadHandoffJournal(project)
+	if err != nil {
+		t.Fatalf("read handoff journal: %v", err)
+	}
+	if !ok {
+		t.Fatalf("expected a handoff journal naming %q on the commit path; none found", successorID)
+	}
+	if j.SuccessorID != successorID {
+		t.Errorf("handoff journal successor = %q, want %q", j.SuccessorID, successorID)
+	}
+}
+
+// assertNoHandoffJournal asserts no coordinator.handoff.json exists for project
+// (the swap aborted pre-commit, or the commit was skipped on OldIsDead).
+func assertNoHandoffJournal(t *testing.T, project string) {
+	t.Helper()
+	if _, ok, err := coordlock.ReadHandoffJournal(project); err != nil {
+		t.Fatalf("read handoff journal: %v", err)
+	} else if ok {
+		t.Errorf("expected NO handoff journal for %q, but one exists", project)
 	}
 }
 
@@ -178,9 +193,7 @@ func TestAtomicCoordSwap_HappyPath_LiveOld(t *testing.T) {
 	if err != nil {
 		t.Fatalf("AtomicCoordSwap: %v (stderr=%s)", err, stderr.String())
 	}
-	if !fake.reserveCalled || fake.reservedSuccessor != "newcoord" {
-		t.Errorf("expected ReserveHandoff(newcoord) on the commit path; reserveCalled=%v successor=%q", fake.reserveCalled, fake.reservedSuccessor)
-	}
+	assertHandoffJournalNames(t, in.Project, "newcoord")
 	if !res.OldArchived {
 		t.Errorf("OldArchived = false; want true")
 	}
@@ -200,53 +213,101 @@ func TestAtomicCoordSwap_HappyPath_LiveOld(t *testing.T) {
 	}
 }
 
-// TestAtomicCoordSwap_ReserveFailure_SoftGuard is the D3 regression guard for
-// the new soft-reserve contract that REPLACED the old marker-write commit. The
-// deleted marker write was HARD: a write failure rolled back NEW and aborted the
-// swap (ErrConcurrentSwap / marker-write-failed). The lease reserve is SOFT — a
-// best-effort record-only CAS whose failure MUST NOT roll back NEW or abort the
-// retire: OLD is still retired + archived, the swap completes, and the failure
-// only logs (the identity commit is the winner's async epoch bump, not this
-// reserve). Without this test a future refactor could silently re-harden the
-// reserve into an abort and reintroduce a stuck-handoff class.
-func TestAtomicCoordSwap_ReserveFailure_SoftGuard(t *testing.T) {
+// TestAtomicCoordSwap_JournalCollision_LiveSuccessor_SoftGuard (moved to
+// atomic_coord_swap_unix_test.go, review iter-7: it drives
+// coordlock.PidStartNanos directly, which has no cross-platform stub) covers
+// the T8 O_EXCL collision "live-not-holding" arm + the soft-guarantee: a
+// leftover journal naming a DIFFERENT successor whose process is ALIVE is NOT
+// clobbered, and the resulting create refusal only WARNS — flock-exclusivity
+// is the real no-duplicate guard, so the swap still completes (retire +
+// archive OLD).
+
+// TestAtomicCoordSwap_JournalPreCreated_SkipsRedundantCreate is the codex
+// PR2-review [P1] regression guard: on the GRACEFUL route,
+// graceful_unix.go's CreateHandoffJournal seam now creates the journal
+// BEFORE AtomicCoordSwap ever runs (D3 fix — the journal must precede the
+// barrier so BarrierExists, which resolves the barrier path THROUGH the
+// journal, never misses an already-durable barrier). Step 4 here must
+// recognize its OWN just-created entry (same successor + same barrier id)
+// and skip the redundant create — the old code would otherwise call
+// createHandoffJournalResolving a second time, hit ErrHandoffJournalExists
+// against an entry that is neither committed-stale nor dead, and misreport a
+// spurious "live in-flight successor, not overwriting" collision.
+func TestAtomicCoordSwap_JournalPreCreated_SkipsRedundantCreate(t *testing.T) {
 	in, newRec := seedCoordSwap(t, "rainier", "oldcoord", "newcoord")
 	fake := &fakeSwap{
-		postReadyAlive: true,                               // NEW alive
-		postKillAlive:  false,                              // OLD dead after kill
-		reserveErr:     errors.New("epoch lock contended"), // reserve fails
+		postReadyAlive: true,  // NEW alive
+		postKillAlive:  false, // OLD dead after kill
 	}
 	restore := fake.install(t, newRec)
 	defer restore()
 
+	const barrierID = "b-precreated"
+	in.BarrierID = barrierID
+	// Simulate GracefulHandoff's CreateHandoffJournal seam having ALREADY
+	// made this exact journal durable before AtomicCoordSwap ever runs.
+	if err := createHandoffJournalResolving(buildHandoffJournal(in.Project, in.OldRec, newRec, barrierID)); err != nil {
+		t.Fatalf("pre-create journal: %v", err)
+	}
+
 	var stderr bytes.Buffer
 	res, err := AtomicCoordSwap(in, &stderr)
-	// Soft guard: reserve failure must NOT abort the swap.
 	if err != nil {
-		t.Fatalf("reserve failure must NOT abort the swap; got err=%v (stderr=%s)", err, stderr.String())
+		t.Fatalf("AtomicCoordSwap: %v (stderr=%s)", err, stderr.String())
 	}
-	if !fake.reserveCalled {
-		t.Errorf("ReserveHandoff should still be attempted on the live-OLD commit path")
+	if strings.Contains(stderr.String(), "create handoff journal") {
+		t.Errorf("spurious journal-create warning against an already-durable matching journal: %s", stderr.String())
 	}
-	// Retire proceeds despite the failed reserve — NEW is NOT rolled back, OLD is
-	// killed + archived exactly as on the happy path.
+	assertHandoffJournalNames(t, in.Project, "newcoord")
+	j, ok, jerr := coordlock.ReadHandoffJournal(in.Project)
+	if jerr != nil || !ok {
+		t.Fatalf("read handoff journal: ok=%v err=%v", ok, jerr)
+	}
+	if j.BarrierID != barrierID {
+		t.Errorf("journal barrier_id = %q, want the pre-created %q (must not be regenerated)", j.BarrierID, barrierID)
+	}
 	if !fake.killCalled {
-		t.Errorf("Kill OLD must still run after a soft reserve failure")
+		t.Errorf("Kill OLD must still run")
 	}
 	if !res.OldArchived {
-		t.Errorf("OldArchived = false; the swap must complete despite the reserve failure")
+		t.Errorf("OldArchived = false; want true")
 	}
-	livePath, _ := state.AgentPath("oldcoord")
-	if _, statErr := os.Stat(livePath); !errors.Is(statErr, os.ErrNotExist) {
-		t.Errorf("OLD live record still exists at %s; retire must proceed", livePath)
+}
+
+// TestCreateHandoffJournalResolving_CommittedStale_DeletesAndRetries (moved
+// to atomic_coord_swap_unix_test.go, review iter-7: it drives
+// coordlock.AcquireLease directly, which has no cross-platform stub) covers
+// the "committed-stale" O_EXCL collision arm of createHandoffJournalResolving.
+
+// TestCreateHandoffJournalResolving_DeadSuccessor_ClearsAndRetries covers the
+// "dead successor" O_EXCL collision arm: a leftover journal names a successor
+// whose process no longer exists (died mid-boot, never acquired the flock).
+// createHandoffJournalResolving must clear it (Abandon semantics) and create
+// the new entry.
+func TestCreateHandoffJournalResolving_DeadSuccessor_ClearsAndRetries(t *testing.T) {
+	setupFleetHome(t)
+	const project = "chjr-dead-successor"
+	if _, err := state.EnsureProjectInitialized(project); err != nil {
+		t.Fatalf("EnsureProjectInitialized: %v", err)
 	}
-	// NEW is NOT rolled back: every old rollback path returned an error, so
-	// err==nil + OldArchived above already proves the swap kept NEW and retired
-	// OLD despite the reserve failure.
-	// Surface-don't-silo: the failure is logged, not swallowed.
-	if !strings.Contains(stderr.String(), "reserve handoff") {
-		t.Errorf("expected a stderr warning about the failed reserve; got %q", stderr.String())
+
+	// Flock is FREE here (nothing acquired it), so LiveOwner reports
+	// present=false and committed-stale never triggers — only the
+	// dead-successor liveness check decides. 999999/424242 is this
+	// codebase's established "provably not a live successor" fixture pid
+	// (see coordlock.TestCurrentHandoffSuccessor's dead_names_nothing case).
+	if err := coordlock.CreateHandoffJournal(coordlock.HandoffJournal{
+		Project: project, SuccessorID: "deadsucc", BarrierID: "b-dead",
+		SuccessorPID: 999999, SuccessorPidStart: 424242,
+	}); err != nil {
+		t.Fatalf("seed leftover journal: %v", err)
 	}
+
+	next := coordlock.HandoffJournal{Project: project, SuccessorID: "nextsucc2", BarrierID: "b-next2"}
+	if err := createHandoffJournalResolving(next); err != nil {
+		t.Fatalf("createHandoffJournalResolving must clear the dead-successor leftover and succeed; got %v", err)
+	}
+	assertHandoffJournalNames(t, project, "nextsucc2")
 }
 
 // TestAtomicCoordSwap_HappyPath_DeadOld covers case 4 — operator
@@ -266,11 +327,9 @@ func TestAtomicCoordSwap_HappyPath_DeadOld(t *testing.T) {
 	if err != nil {
 		t.Fatalf("AtomicCoordSwap: %v", err)
 	}
-	// oldIsDead=true: the handoff reservation is SKIPPED (no live OLD lease to
-	// reserve against) — NEW is spawned and OLD is preserved for operator [x].
-	if fake.reserveCalled {
-		t.Errorf("ReserveHandoff must be SKIPPED when oldIsDead=true; reserved %q", fake.reservedSuccessor)
-	}
+	// oldIsDead=true: the handoff journal is SKIPPED (no live OLD to name a
+	// successor against) — NEW is spawned and OLD is preserved for operator [x].
+	assertNoHandoffJournal(t, in.Project)
 	if res.OldArchived {
 		t.Errorf("OldArchived = true; want false for oldIsDead=true case")
 	}
@@ -304,7 +363,6 @@ func TestAtomicCoordSwap_Preconditions_LockHeld(t *testing.T) {
 	origSpawn := spawnFn
 	origWait := waitForReadyToPromptFn
 	origAlive := sessionAliveFn
-	origReserve := reserveHandoffFn
 	origSendKeys := tmuxSendKeysFn
 	origKill := tmuxKillFn
 	origSleep := sleepFn
@@ -312,7 +370,6 @@ func TestAtomicCoordSwap_Preconditions_LockHeld(t *testing.T) {
 		spawnFn = origSpawn
 		waitForReadyToPromptFn = origWait
 		sessionAliveFn = origAlive
-		reserveHandoffFn = origReserve
 		tmuxSendKeysFn = origSendKeys
 		tmuxKillFn = origKill
 		sleepFn = origSleep
@@ -344,7 +401,6 @@ func TestAtomicCoordSwap_Preconditions_LockHeld(t *testing.T) {
 		}
 		return false, nil
 	}
-	reserveHandoffFn = func(project, successorID string, ttl time.Duration) (bool, error) { return true, nil }
 	tmuxSendKeysFn = func(session string, keys ...string) error { return nil }
 	tmuxKillFn = func(session string) error { return nil }
 	sleepFn = func(d time.Duration) {}
@@ -421,9 +477,7 @@ func TestAtomicCoordSwap_Spawn_Fails_NoObservable(t *testing.T) {
 	if err == nil {
 		t.Fatalf("expected error on spawn failure")
 	}
-	if fake.reserveCalled {
-		t.Errorf("swap aborted pre-reserve; ReserveHandoff must NOT be called (reserved %q)", fake.reservedSuccessor)
-	}
+	assertNoHandoffJournal(t, in.Project)
 	livePath, _ := state.AgentPath("oldcoord")
 	if _, err := os.Stat(livePath); err != nil {
 		t.Errorf("OLD record disappeared on spawn-failure rollback: %v", err)
@@ -450,9 +504,7 @@ func TestAtomicCoordSwap_WaitForReady_Timeout(t *testing.T) {
 	if err != nil {
 		t.Fatalf("AtomicCoordSwap should not fail on wait-timeout alone (probe is authoritative): %v", err)
 	}
-	if !fake.reserveCalled || fake.reservedSuccessor != "newcoord" {
-		t.Errorf("expected ReserveHandoff(newcoord) on the commit path; reserveCalled=%v successor=%q", fake.reserveCalled, fake.reservedSuccessor)
-	}
+	assertHandoffJournalNames(t, in.Project, "newcoord")
 	if !strings.Contains(stderr.String(), "did not converge") {
 		t.Errorf("stderr should warn about wait-timeout; got: %s", stderr.String())
 	}
@@ -481,9 +533,7 @@ func TestAtomicCoordSwap_ReProbe_DefinitivelyDead(t *testing.T) {
 	if !strings.Contains(err.Error(), "exited during readiness wait") {
 		t.Errorf("error should mention readiness wait; got: %v", err)
 	}
-	if fake.reserveCalled {
-		t.Errorf("swap aborted pre-reserve; ReserveHandoff must NOT be called (reserved %q)", fake.reservedSuccessor)
-	}
+	assertNoHandoffJournal(t, in.Project)
 	// NEW record should be removed.
 	newPath, _ := state.AgentPath("newcoord")
 	if _, statErr := os.Stat(newPath); !errors.Is(statErr, os.ErrNotExist) {
@@ -513,9 +563,7 @@ func TestAtomicCoordSwap_ReProbe_AmbiguousError(t *testing.T) {
 	if !strings.Contains(err.Error(), "preserved for operator inspection") {
 		t.Errorf("error should mention preservation; got: %v", err)
 	}
-	if fake.reserveCalled {
-		t.Errorf("swap aborted pre-reserve; ReserveHandoff must NOT be called (reserved %q)", fake.reservedSuccessor)
-	}
+	assertNoHandoffJournal(t, in.Project)
 	// NEW record MUST be preserved (operator inspection).
 	newPath, _ := state.AgentPath("newcoord")
 	if _, statErr := os.Stat(newPath); statErr != nil {
@@ -562,9 +610,7 @@ func TestAtomicCoordSwap_OldKill_Fails_StillAlive(t *testing.T) {
 		t.Errorf("orphan.NewAgentID = %q; want newcoord", orphan.NewAgentID)
 	}
 	// Marker MUST be at NEW (committed in step 4).
-	if !fake.reserveCalled || fake.reservedSuccessor != "newcoord" {
-		t.Errorf("expected ReserveHandoff(newcoord) on the commit path; reserveCalled=%v successor=%q", fake.reserveCalled, fake.reservedSuccessor)
-	}
+	assertHandoffJournalNames(t, in.Project, "newcoord")
 	// OLD record MUST be PRESERVED on disk (codex iter-7 [P1]).
 	// Operator can see the live OLD via `fleet status` and decide
 	// whether the cross-socket case obtains.
@@ -628,9 +674,7 @@ func TestAtomicCoordSwap_OldKill_ProbeAmbiguous(t *testing.T) {
 		t.Errorf("expected ErrOldKillProbeAmbiguous; got: %v", err)
 	}
 	// Marker committed.
-	if !fake.reserveCalled || fake.reservedSuccessor != "newcoord" {
-		t.Errorf("expected ReserveHandoff(newcoord) on the commit path; reserveCalled=%v successor=%q", fake.reserveCalled, fake.reservedSuccessor)
-	}
+	assertHandoffJournalNames(t, in.Project, "newcoord")
 	// OLD record MUST stay on disk (operator triage).
 	livePath, _ := state.AgentPath("oldcoord")
 	if _, statErr := os.Stat(livePath); statErr != nil {
@@ -694,9 +738,7 @@ func TestAtomicCoordSwap_OldKill_Fails_PostProbeNotOnSocket(t *testing.T) {
 	}
 	// Marker still committed in step 4 — that's the load-bearing
 	// invariant of the helper.
-	if !fake.reserveCalled || fake.reservedSuccessor != "newcoord" {
-		t.Errorf("expected ReserveHandoff(newcoord) on the commit path; reserveCalled=%v successor=%q", fake.reserveCalled, fake.reservedSuccessor)
-	}
+	assertHandoffJournalNames(t, in.Project, "newcoord")
 	// OLD record MUST be preserved (operator triage).
 	if res.OldArchived {
 		t.Errorf("OldArchived = true; want false (ambiguous cross-socket: preserve OLD for operator triage)")
@@ -751,9 +793,7 @@ func TestAtomicCoordSwap_OldArchive_Fails_KillConfirmed(t *testing.T) {
 	if err != nil {
 		t.Fatalf("AtomicCoordSwap should fall back to os.Remove when Archive fails but kill confirmed: %v (stderr=%s)", err, stderr.String())
 	}
-	if !fake.reserveCalled || fake.reservedSuccessor != "newcoord" {
-		t.Errorf("expected ReserveHandoff(newcoord) on the commit path; reserveCalled=%v successor=%q", fake.reserveCalled, fake.reservedSuccessor)
-	}
+	assertHandoffJournalNames(t, in.Project, "newcoord")
 	if !res.OldArchived {
 		t.Errorf("OldArchived = false; fallback path should still set OldArchived=true")
 	}

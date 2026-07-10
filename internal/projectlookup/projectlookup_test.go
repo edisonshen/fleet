@@ -224,6 +224,100 @@ func TestFindLiveCoord_WrongProjectMisses(t *testing.T) {
 	}
 }
 
+// TestFindLiveCoordPreferPID_PicksMatchingSupervisor — review adversarial-
+// subagent finding: a botched non-graceful swap can leave TWO live-session
+// records for the same project+coord-task (an orphaned OLD alongside the
+// real NEW; atomic_coord_swap.go's ErrOrphanSurvived/ErrOldKillProbeAmbiguous
+// deliberately preserve OLD's record + session rather than force-killing on
+// an ambiguous probe). Plain first-match (sorted by ID) would land on
+// whichever sorts first, which may be the orphan, not the live flock holder.
+// FindLiveCoordPreferPID must pick the record whose SupervisorPID+
+// SupervisorPidStart both match the ACTUAL flock holder when that identity
+// is known (attach's D9e path reads it via coordlock.LiveOwner even when the
+// body's AgentID itself is unreadable).
+func TestFindLiveCoordPreferPID_PicksMatchingSupervisor(t *testing.T) {
+	withFleetHome(t)
+	old := writeAgentRec(t, "aaaaaaaa", "fleet", "coord-fleet") // sorts first by ID
+	old.SupervisorPID = 111
+	old.SupervisorPidStart = 1110
+	if err := old.Write(); err != nil {
+		t.Fatal(err)
+	}
+	newRec := writeAgentRec(t, "bbbbbbbb", "fleet", "coord-fleet") // sorts second by ID
+	newRec.SupervisorPID = 222
+	newRec.SupervisorPidStart = 2220
+	if err := newRec.Write(); err != nil {
+		t.Fatal(err)
+	}
+	records := recordsFromList(t)
+	restore := stubSessionAlive(t, map[string]bool{"fleet-aaaaaaaa": true, "fleet-bbbbbbbb": true})
+	defer restore()
+
+	// Sanity: plain FindLiveCoord (no PID hint) picks the first-sorted record
+	// (the orphan) — this is the exact hazard the PID-aware variant closes.
+	if got, ok := FindLiveCoord(records, "fleet"); !ok || got.ID != "aaaaaaaa" {
+		t.Fatalf("sanity: FindLiveCoord = %v ok=%v, want aaaaaaaa (first-match baseline)", got, ok)
+	}
+
+	// The real flock holder's identity is pid=222/pid_start=2220 (newRec) —
+	// must be preferred over the naive first-match.
+	got, ok := FindLiveCoordPreferPID(records, "fleet", 222, 2220)
+	if !ok {
+		t.Fatal("FindLiveCoordPreferPID: ok=false, want true")
+	}
+	if got.ID != "bbbbbbbb" {
+		t.Fatalf("FindLiveCoordPreferPID: got %s, want bbbbbbbb (the actual flock holder, not the orphan)", got.ID)
+	}
+}
+
+// TestFindLiveCoordPreferPID_PidReuseMismatchRejected is codex confirm round
+// [P2] #4: PIDs get reused by the OS, so a stale/orphan record can
+// coincidentally carry the SAME (recycled) pid as the real live holder while
+// being a completely different process. Matching on SupervisorPID alone
+// would wrongly accept it; pid_start (the process's actual start time) must
+// also match, mirroring this codebase's identity convention everywhere else
+// (HandoffSuccessorAlive, KillCoordIfIdentityMatches, LeaseCheckByAncestor).
+func TestFindLiveCoordPreferPID_PidReuseMismatchRejected(t *testing.T) {
+	withFleetHome(t)
+	stale := writeAgentRec(t, "aaaaaaaa", "fleet", "coord-fleet")
+	stale.SupervisorPID = 555      // SAME pid as the real holder below...
+	stale.SupervisorPidStart = 111 // ...but a DIFFERENT (older) start time — a recycled pid.
+	if err := stale.Write(); err != nil {
+		t.Fatal(err)
+	}
+	records := recordsFromList(t)
+	restore := stubSessionAlive(t, map[string]bool{"fleet-aaaaaaaa": true})
+	defer restore()
+
+	// The real holder is pid=555, but pid_start=222 (freshly started) — does
+	// NOT match the stale record's pid_start=111.
+	if got, ok := FindLiveCoordPreferPID(records, "fleet", 555, 222); ok {
+		t.Fatalf("FindLiveCoordPreferPID matched a recycled pid with a different pid_start: got %v ok=%v, want ok=false", got, ok)
+	}
+}
+
+// TestFindLiveCoordPreferPID_NoMatchIsStrict — a preferredPID>0 that matches
+// no candidate's SupervisorPID+SupervisorPidStart must return ok=false
+// (codex confirm round [P2]: a confirmed identity is real evidence and must
+// never degrade into a guess at an unrelated record — that reproduces the
+// exact orphan-attach hazard this function exists to close). preferredPID<=0
+// (no cross-check available) is the one case that still falls back to
+// first-match — identical to plain FindLiveCoord.
+func TestFindLiveCoordPreferPID_NoMatchIsStrict(t *testing.T) {
+	withFleetHome(t)
+	writeAgentRec(t, "aaaaaaaa", "fleet", "coord-fleet")
+	records := recordsFromList(t)
+	restore := stubSessionAlive(t, map[string]bool{"fleet-aaaaaaaa": true})
+	defer restore()
+
+	if got, ok := FindLiveCoordPreferPID(records, "fleet", 999999, 424242); ok {
+		t.Fatalf("FindLiveCoordPreferPID with no matching identity = %v ok=%v, want ok=false (no guessing)", got, ok)
+	}
+	if got, ok := FindLiveCoordPreferPID(records, "fleet", 0, 0); !ok || got.ID != "aaaaaaaa" {
+		t.Fatalf("FindLiveCoordPreferPID with preferredPID<=0 = %v ok=%v, want aaaaaaaa (identical to FindLiveCoord)", got, ok)
+	}
+}
+
 // TestFindLiveCoord_EmptyTmuxSession_ReturnsSynthesized — codex review
 // iter-3 P2 #2. Legacy records may have TmuxSession=="" on disk; the
 // helper probes the synthesized "fleet-<id>" and treats a live session

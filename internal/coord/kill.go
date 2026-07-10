@@ -4,11 +4,12 @@ package coord
 
 // kill.go — KillCoordIfIdentityMatches: the ONE authenticated coord-kill
 // primitive (DESIGN-handoff-drain-storm-leak §B.5). Every path that
-// terminates a coord — the takeover STONITH (injected into the lease via
-// coordlock.AcquireLeaseWithKill), the new-leader competitor sweep, and
-// (in later PRs) the graceful drain killer / fleet doctor — funnels
-// through this function so the PID-reuse + exe-path + epoch + self gate is
-// enforced in exactly one place.
+// terminates a coord — the new-leader competitor sweep, `fleet rm`, and
+// `fleet gc` (corpse reaping) — funnels through this function so the
+// PID-reuse + exe-path + active-owner + self gate is enforced in exactly one
+// place. PR-2 retired the lease-injected takeover STONITH (the flock-only lease
+// never fences/kills: a hung-alive holder is cleared by `fleet rm`, a dead
+// holder already freed the flock).
 //
 // It targets the `fleet coord-run` SUPERVISOR pid (agent.Record.
 // SupervisorPID), NOT the engine child (agent.Record.PID). Killing the
@@ -28,12 +29,12 @@ package coord
 //	     3. record.SupervisorExePath is the fleet coord-run binary
 //	        (NOT the engine child)            (W9)
 //	     4. target.Pid is NOT the current active lease owner
-//	        (epoch gate — never shoot the live leader, T10)
+//	        (flock-owner gate — never shoot the live leader, T10)
 //	     5. target.Pid != self
 //	                              │
 //	   grace delay  →  SIGTERM  →  poll  →  SIGKILL
 //	                              │
-//	   stderr: "reaped coord pid=<n> agent=<id> epoch=<e>"
+//	   stderr: "reaped coord pid=<n> agent=<id>"
 
 import (
 	"errors"
@@ -54,11 +55,10 @@ import (
 // target. The supervisor wires the two together (coordlock.KillTarget ->
 // coord.KillTarget) in cmd/fleet/coord.go.
 type KillTarget struct {
-	Pid         int    // OLD coord-run supervisor pid to reap
-	PidStart    int64  // its start time at fence (PID-reuse guard)
-	AgentID     string // OLD coord's agent id (diagnostics + record match)
-	Project     string // scopes the kill to one project's coord
-	FencerEpoch int64  // the epoch the caller fenced TO (diagnostics + log)
+	Pid      int    // OLD coord-run supervisor pid to reap
+	PidStart int64  // its start time at fence (PID-reuse guard)
+	AgentID  string // OLD coord's agent id (diagnostics + record match)
+	Project  string // scopes the kill to one project's coord
 }
 
 // ErrKillRefused wraps every "do not signal" outcome so callers can
@@ -83,7 +83,7 @@ type KillDeps struct {
 	// ListRecords returns the live agent records. Production: agent.List.
 	ListRecords func() ([]*agent.Record, error)
 	// CurrentLeaderPID returns the current ACTIVE lease owner pid for the
-	// project (epoch gate). Production: coordlock.CurrentActiveOwnerPID.
+	// project (flock-owner gate, PR-2 D9a). Production: coordlock.CurrentActiveOwnerPID.
 	CurrentLeaderPID func(project string) (int, bool)
 	// IsCoordRunBinary reports whether exePath is the fleet coord-run
 	// supervisor binary (NOT the engine child). Production:
@@ -261,7 +261,7 @@ func killCoord(target KillTarget, d KillDeps) error {
 			ErrKillRefused, liveStart, target.PidStart, target.Pid, match.ID)
 	}
 
-	// Clause 4: epoch gate. Never shoot the CURRENT active lease owner.
+	// Clause 4: flock-owner gate. Never shoot the CURRENT active lease owner.
 	// Once we hold the lease, any other coord supervisor for this project
 	// is stale by construction; but if the target IS the recorded active
 	// owner, killing it is killing the live leader -> refuse.
@@ -361,8 +361,8 @@ func killCoord(target KillTarget, d KillDeps) error {
 		}
 	}
 
-	_, _ = fmt.Fprintf(stderr, "reaped coord pid=%d agent=%s epoch=%d\n",
-		target.Pid, match.ID, target.FencerEpoch)
+	_, _ = fmt.Fprintf(stderr, "reaped coord pid=%d agent=%s\n",
+		target.Pid, match.ID)
 	return nil
 }
 

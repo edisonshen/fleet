@@ -92,7 +92,7 @@ func TestTA3_TUIConcurrentAttachPressesSingleSpawn(t *testing.T) {
 	seedProjectMeta(t, "demo", t.TempDir())
 	stub := &stubFleetCmd{}
 	stub.install(t)
-	st := reconciletest.State{ClaimOK: true}
+	st := reconciletest.State{}
 	resolveCalls := installTUIResolveFromState(t, &st)
 
 	m := New("test")
@@ -102,9 +102,6 @@ func TestTA3_TUIConcurrentAttachPressesSingleSpawn(t *testing.T) {
 	}
 	if len(stub.calls) != 1 {
 		t.Fatalf("dispatch calls after first [a] = %v, want one", stub.calls)
-	}
-	if st.ClaimCalls != 1 || st.ClaimedID != "claimtui" {
-		t.Fatalf("first [a] should claim exactly one starting token; calls=%d id=%q", st.ClaimCalls, st.ClaimedID)
 	}
 
 	second, cmd2 := first.beginResolvedCoordAttach("demo", "project")
@@ -252,7 +249,7 @@ func TestTA6_TUISpawnKillsOrphanBeforeDispatch(t *testing.T) {
 	killed := installTUIOrphanTmux(t, "demo", "deadbeef", nil)
 	stub := &stubFleetCmd{}
 	stub.install(t)
-	st := reconciletest.State{ClaimOK: true}
+	st := reconciletest.State{}
 	installTUIResolveFromState(t, &st)
 
 	m := New("test")
@@ -310,15 +307,12 @@ func TestTA6_TUIOrphanCleanupListStrictFaultsSurface(t *testing.T) {
 			tc.setup(t, root)
 			stub := &stubFleetCmd{}
 			stub.install(t)
-			st := reconciletest.State{ClaimOK: true}
+			st := reconciletest.State{}
 			installTUIResolveFromState(t, &st)
 
 			updated, cmd := New("test").beginResolvedCoordAttach("demo", "project")
 			if len(stub.calls) != 0 {
 				t.Fatalf("ListStrict fault must abort before dispatch; calls=%v", stub.calls)
-			}
-			if st.ClaimCalls != 1 || st.ClaimedID != "claimtui" {
-				t.Fatalf("Spawn verdict must pre-claim before fallible cleanup; calls=%d id=%q", st.ClaimCalls, st.ClaimedID)
 			}
 			if updated.flash == nil || !updated.flash.isErr {
 				t.Fatalf("ListStrict fault should flash an error; got %+v", updated.flash)
@@ -335,7 +329,7 @@ func TestTA6_TUIOrphanCleanupListStrictFaultsSurface(t *testing.T) {
 
 func TestTA7b_TUIWaitLoopAsyncBounded(t *testing.T) {
 	withFleetHome(t)
-	st := reconciletest.State{Handoff: &coordlock.Handoff{SuccessorID: "succwait"}}
+	st := reconciletest.State{HandoffDisp: coordlock.HandoffInFlight}
 	resolveCalls := installTUIResolveFromState(t, &st)
 
 	prevAttempts := tuiCoordResolveMaxAttempts
@@ -431,14 +425,11 @@ func TestTA11_TUISpawnFailureAfterPreClaimSurfacesSelfHeal(t *testing.T) {
 	killed := installTUIOrphanTmux(t, "demo", "badc0ffe", errors.New("kill refused"))
 	stub := &stubFleetCmd{}
 	stub.install(t)
-	st := reconciletest.State{ClaimOK: true}
+	st := reconciletest.State{}
 	installTUIResolveFromState(t, &st)
 
 	m := New("test")
 	updated, _ := m.beginResolvedCoordAttach("demo", "project")
-	if st.ClaimCalls != 1 || st.ClaimedID != "claimtui" {
-		t.Fatalf("Spawn verdict must pre-claim before fallible cleanup; calls=%d id=%q", st.ClaimCalls, st.ClaimedID)
-	}
 	if strings.Join(*killed, ",") != "fleet-badc0ffe" {
 		t.Fatalf("killed sessions = %v, want attempted fleet-badc0ffe", *killed)
 	}
@@ -479,13 +470,10 @@ func TestTA11b_TUISpawnInitFailureAfterPreClaimSurfacesSelfHeal(t *testing.T) {
 	}
 	stub := &stubFleetCmd{}
 	stub.install(t)
-	st := reconciletest.State{ClaimOK: true}
+	st := reconciletest.State{}
 	installTUIResolveFromState(t, &st)
 
 	updated, _ := New("test").beginResolvedCoordAttach("demo", "project")
-	if st.ClaimCalls != 1 || st.ClaimedID != "claimtui" {
-		t.Fatalf("Spawn verdict must pre-claim before the fallible init check; calls=%d id=%q", st.ClaimCalls, st.ClaimedID)
-	}
 	if len(stub.calls) != 0 {
 		t.Fatalf("init failure must not dispatch; calls=%v", stub.calls)
 	}
@@ -511,13 +499,10 @@ func TestTA11c_TUISpawnRepoUnresolvedAfterPreClaimSurfacesSelfHeal(t *testing.T)
 	// writable FLEET_HOME, so it succeeds and control reaches this branch.
 	stub := &stubFleetCmd{}
 	stub.install(t)
-	st := reconciletest.State{ClaimOK: true}
+	st := reconciletest.State{}
 	installTUIResolveFromState(t, &st)
 
 	updated, _ := New("test").beginResolvedCoordAttach("ghost-project", "project")
-	if st.ClaimCalls != 1 || st.ClaimedID != "claimtui" {
-		t.Fatalf("Spawn verdict must pre-claim before the fallible repo resolve; calls=%d id=%q", st.ClaimCalls, st.ClaimedID)
-	}
 	if len(stub.calls) != 0 {
 		t.Fatalf("repo-unresolved failure must not dispatch; calls=%v", stub.calls)
 	}

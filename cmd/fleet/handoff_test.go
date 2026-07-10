@@ -812,19 +812,17 @@ func TestHandoff_RecoveryProbe_OldCoordAlive_RefusesRespawn(t *testing.T) {
 	}
 	const staleNewID = "stalenew"
 
-	// Establish the committed epoch: the coordinator lease names the
-	// replacement (owner == NEW). CurrentOwner then reports staleNewID, so
-	// the classifier's committed arm (ResumeRefuse) fires. The lease owner
-	// pid is this live test process, so holderHealthy keeps it fresh for
-	// the duration of runHandoff.
+	// Establish the committed lease: acquiring the flock IS becoming the
+	// coordinator (PR-2 D1 — no Activate flip). The flock body names the
+	// replacement (agent_id == NEW), so CurrentOwner reports staleNewID and the
+	// classifier's committed arm (ResumeRefuse) fires. The lease owner pid is
+	// this live test process, so the busy flock stays live for the duration of
+	// runHandoff.
 	lease, acquired, lerr := coordlock.AcquireLease(old.Project, staleNewID)
 	if lerr != nil || !acquired || lease == nil {
 		t.Fatalf("acquire committed lease for NEW: acquired=%v err=%v", acquired, lerr)
 	}
 	t.Cleanup(lease.Release)
-	if ok, aerr := lease.Activate(); aerr != nil || !ok {
-		t.Fatalf("activate committed lease: ok=%v err=%v", ok, aerr)
-	}
 
 	staleNew := agent.New(staleNewID)
 	staleNew.TaskID = old.TaskID

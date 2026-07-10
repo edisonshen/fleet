@@ -7,27 +7,33 @@
 //
 //   - NEVER holds a lock across Resume / tmux / spawn / kill (the root-cause
 //     line drain.go:101-106 is gone on this path);
-//   - STANDS DOWN (exit 0) when a healthy leader holds the lease and no
+//   - STANDS DOWN (exit 0) when a healthy leader holds the flock and no
 //     handoff is pending (nothing to do);
-//   - waits (BOUNDED) for the handoff-complete-<epoch>.json barrier before a
-//     GRACEFUL kill, then reaps OLD through the ONE authenticated
-//     coord.KillCoordIfIdentityMatches primitive (never an unguarded kill);
-//   - on a slow/hung handoff (timeout) ESCALATES to the safety-net takeover
-//     (coordlock.AcquireLeaseWithKill, which internally fences -> kills ->
-//     acquires) instead of blocking — so a stuck handoff can never wedge
-//     later drains.
+//   - keys the whole routing on the FLOCK + the write-once handoff journal
+//     (PR-2 D9b′ — the deleted epoch is gone): `barrierUp` reads the journal's
+//     barrier_id, `leaderBusy` is a live flock holder (busy⇒owner). On a
+//     graceful barrier it completes ONLY on a POSITIVE successor identity
+//     (flock body agent_id == the queue's pre-allocated successor, D9b), then
+//     reaps OLD's already-exited supervisor through the ONE authenticated
+//     coord.KillCoordIfIdentityMatches primitive (a benign no-op on a corpse);
+//   - recovers WITHOUT a kill (PR-2 D8): there is NO autonomous fence→kill
+//     takeover. When OLD is PROVABLY DEAD the flock is already free, so a fresh
+//     lease-wrapped successor is cold-spawned into it; a hung-but-ALIVE OLD is
+//     never signaled — drain surfaces `run 'fleet rm <id>'` and preserves the
+//     queue for retry.
 //
 //	┌──────────────────────────────────────────────────────────────────┐
-//	│ drainOneLeaseAware(req)                                            │
-//	│   leader healthy + NO barrier  -> STAND DOWN (exit 0)              │
-//	│   barrier present (graceful)   -> KillCoordIfIdentityMatches(OLD)  │
-//	│   no barrier, bounded wait     -> wait barrier OR timeout          │
-//	│   timeout / hung leader        -> AcquireLeaseWithKill (TAKEOVER)  │
-//	│   stealable lease (cold)       -> bounded Resume (NO lock held)    │
+//	│ drainOneLeaseAwareWith(req)                                        │
+//	│   barrier present (journal)    -> graceful: positive-id successor  │
+//	│                                   completes; else no-kill recover  │
+//	│   flock busy (live holder)     -> stale-queue stand-down / legacy  │
+//	│                                   Resume fallback (no barrier yet)  │
+//	│   flock free (OLD released/died) -> wait for successor; else       │
+//	│                                     no-kill dead-recover / surface │
 //	└──────────────────────────────────────────────────────────────────┘
 //
-// Build-tagged linux||darwin (the lease + STONITH primitives are). Other
-// Unix targets compile drain_lease_other.go's stub (lease unsupported).
+// Build-tagged linux||darwin (the flock lease primitive is). Other Unix
+// targets compile drain_lease_other.go's stub (lease unsupported).
 
 package main
 
@@ -37,8 +43,6 @@ import (
 	"io"
 	"os"
 	"path/filepath"
-	"strconv"
-	"strings"
 	"time"
 
 	"github.com/edisonshen/fleet/internal/agent"
@@ -65,40 +69,34 @@ func leaseDrainEnabled() bool {
 // deterministic under test (no real lease reads, no real kill, no real
 // Resume, no real clock). Production callers use defaultDrainLeaseDeps().
 type drainLeaseDeps struct {
-	// LeaderPresent reports whether a HEALTHY leader (or fresh in-progress
-	// takeover) holds the lease for project. Production: coordlock.LeaderPresent.
+	// LeaderPresent reports whether a live process HOLDS the flock for project
+	// (busy⇒owner, D9a). Production: coordlock.LeaderPresent.
 	LeaderPresent func(project string) bool
-	// CurrentEpoch returns the project's current lease epoch (the barrier's
-	// generation). Production: coordlock.CurrentEpoch.
-	CurrentEpoch func(project string) (int64, bool)
-	// ActiveOwnerPID returns the pid of the current ACTIVE lease owner (and
-	// ok=false if none). Used to tell "OLD is still the active leader,
-	// finishing its graceful exit" (must NOT be force-killed — the epoch gate
-	// refuses; wait for its self-release / escalate to takeover, which fences
-	// first) apart from "OLD already releasing/stale" (safe to reap directly
-	// through the authenticated primitive). Production:
+	// LiveOwner reports the live flock holder's identity (agent_id + pid),
+	// busy⇒owner. Used for the D9b POSITIVE successor-identity gate: a handoff
+	// is complete only when the flock body's agent_id equals the queue's
+	// pre-allocated successor id (req.NewAgentID) — never a bare busy flock.
+	// Production: coordlock.LiveOwner.
+	LiveOwner func(project string) (coordlock.Owner, bool)
+	// ActiveOwnerPID returns the supervisor pid of the current live flock holder
+	// (ok=false if free). Used only to tell "OLD is still the flock holder,
+	// finishing its exit" from "OLD released". Production:
 	// coordlock.CurrentActiveOwnerPID.
 	ActiveOwnerPID func(project string) (int, bool)
-	// BarrierExists reports whether the handoff-complete-<epoch>.json barrier
-	// for (project, epoch) is on disk. Production: a stat through
-	// coordlock.BarrierPath.
-	BarrierExists func(project string, epoch int64) bool
+	// BarrierExists reports whether this handoff cycle's completion barrier is
+	// on disk, resolved via the write-once handoff journal's barrier_id (PR-2
+	// D3/D9b′ — no longer keyed on the deleted epoch). Production: a journal read
+	// + stat through coordlock.HandoffBarrierPath.
+	BarrierExists func(project string) bool
 	// LoadAgent loads an agent record (for OLD's supervisor identity).
 	// Production: agent.Load.
 	LoadAgent func(id string) (*agent.Record, error)
 	// KillCoord reaps OLD's coord-run supervisor through the authenticated
-	// gate. Production: coord.KillCoordIfIdentityMatches.
+	// gate. Production: coord.KillCoordIfIdentityMatches. Used only to reap an
+	// already-exited OLD's lingering supervisor (a benign no-op on a corpse) —
+	// PR-2 (D8) removed the autonomous fence→kill takeover; a hung-but-alive
+	// flock holder is surfaced for `fleet rm`, never signaled.
 	KillCoord func(coord.KillTarget) error
-	// TakeOver escalates to the safety-net takeover (fence -> kill ->
-	// acquire). Production: a closure over coordlock.AcquireLeaseWithKill +
-	// the authenticated kill. Returns acquired + the KP6 live-holder
-	// detection (DESIGN-coord-no-auto-kill: acquired=false with a non-empty
-	// live set means the takeover found a prospective kill target ALIVE and
-	// stood down without fencing — the drain surfaces the pids in its
-	// diagnostic, it never acts on them) + err. The drain does not keep the
-	// lease (it is not the coord); it only needs the side effect of a DEAD
-	// OLD holder being fenced/reaped so a standby/successor can lead.
-	TakeOver func(project, agentID string) (acquired bool, live []liveHolderInfo, err error)
 	// SupervisorAlive reports whether pid is STILL the same live process
 	// recorded at spawn — pid + pid_start identity, the pidAlive standard
 	// (a bare-pid probe false-alives on reuse). It backs the KP7
@@ -160,44 +158,25 @@ const defaultBarrierPoll = 200 * time.Millisecond
 func defaultDrainLeaseDeps() drainLeaseDeps {
 	return drainLeaseDeps{
 		LeaderPresent:  coordlock.LeaderPresent,
-		CurrentEpoch:   coordlock.CurrentEpoch,
+		LiveOwner:      coordlock.LiveOwner,
 		ActiveOwnerPID: coordlock.CurrentActiveOwnerPID,
-		BarrierExists: func(project string, epoch int64) bool {
-			p, err := coordlock.BarrierPath(project, epoch)
+		BarrierExists: func(project string) bool {
+			// PR-2 (D3/D9b′): the barrier is named by the write-once handoff
+			// journal's barrier_id (the epoch is gone). Read the journal, resolve
+			// the barrier through the SAME helper the producer used, then stat it.
+			j, ok, err := coordlock.ReadHandoffJournal(project)
+			if err != nil || !ok || j.BarrierID == "" {
+				return false
+			}
+			p, err := coordlock.HandoffBarrierPath(project, j.BarrierID)
 			if err != nil {
 				return false
 			}
 			_, statErr := os.Stat(p)
 			return statErr == nil
 		},
-		LoadAgent: agent.Load,
-		KillCoord: coord.KillCoordIfIdentityMatches,
-		TakeOver: func(project, agentID string) (bool, []liveHolderInfo, error) {
-			// AcquireLeaseTakeover (not AcquireLeaseWithKill): the drain is not
-			// a coordinator — it fences+kills the hung holder then releases
-			// immediately, so it must NOT emit lease.acquire/release lifecycle
-			// events (they would show a phantom coordinator during drain
-			// recovery — codex P2).
-			lease, acquired, live, err := coordlock.AcquireLeaseTakeover(project, agentID,
-				func(t coordlock.KillTarget) error {
-					return coord.KillCoordIfIdentityMatches(coord.KillTarget{
-						Pid:         t.Pid,
-						PidStart:    t.PidStart,
-						AgentID:     t.AgentID,
-						Project:     t.Project,
-						FencerEpoch: t.FencerEpoch,
-					})
-				})
-			// The drain is NOT the coordinator — if it accidentally acquired
-			// the lease (the OLD holder was already gone), release it
-			// immediately so a real standby/successor can lead. The point of
-			// the escalation is to FENCE+KILL the hung OLD, not to make the
-			// drain process the leader.
-			if acquired && lease != nil {
-				lease.Release()
-			}
-			return acquired, liveHolderInfosFrom(live), err
-		},
+		LoadAgent:       agent.Load,
+		KillCoord:       coord.KillCoordIfIdentityMatches,
 		SupervisorAlive: supervisorAliveByStart,
 		Resume:          handoffop.Resume,
 		LockAgent:       state.LockAgent,
@@ -487,9 +466,12 @@ func drainOneLeaseAwareWith(req queue.SpawnFresh, path string, graceMillis, resu
 	timeout := time.Duration(resumeTimeoutMillis) * time.Millisecond
 	deadline := time.Now().Add(timeout)
 
-	epoch, hasEpoch := d.CurrentEpoch(project)
-	barrierUp := hasEpoch && d.BarrierExists(project, epoch)
-	leaderHealthy := d.LeaderPresent(project)
+	// PR-2 (D9b′): key the whole routing on the FLOCK + the write-once handoff
+	// journal, not the deleted epoch. barrierUp reads the journal's barrier_id;
+	// leaderBusy is a live flock holder (busy⇒owner). A free flock ⇒ OLD
+	// released/died.
+	barrierUp := d.BarrierExists(project)
+	leaderBusy := d.LeaderPresent(project)
 
 	// BARE-COORD GUARD (codex PR4 [P1]) — runs BEFORE the barrier/leader
 	// branch decision. The OLD coord being drained may be a BARE
@@ -532,194 +514,125 @@ func drainOneLeaseAwareWith(req queue.SpawnFresh, path string, graceMillis, resu
 
 	switch {
 	case barrierUp:
-		// Graceful path: the OLD coord wrote the completion barrier — doc +
-		// checkpoint are durable. How we finish depends on whether OLD is
-		// STILL the active lease owner:
-		//   - OLD still active owner -> it is responsive and exiting on its
-		//     own; the authenticated kill's epoch gate would (correctly)
-		//     refuse to shoot the active leader, so we WAIT (bounded) for OLD
-		//     to release the flock — the standby then acquires it. On timeout
-		//     -> escalate to takeover (which FENCES first, so its kill is no
-		//     longer gated by "is the active owner"). codex PR3 iter-1 [P1].
-		//   - OLD already releasing / not the active owner -> reap directly
-		//     through the authenticated primitive (the gate passes).
-		return drainGraceful(req, path, epoch, deadline, stdout, stderr, d)
+		// Graceful path: the OLD coord wrote the completion barrier (named by
+		// the journal's barrier_id) — doc + checkpoint are durable. Finish by
+		// waiting for the EXPECTED successor (positive identity == req.NewAgentID)
+		// to take the freed flock, then reap OLD's already-exited supervisor
+		// (benign) + clean. If OLD is a hung-alive flock holder that never
+		// yields, drainGraceful escalates to the no-kill recovery (surface
+		// `fleet rm`).
+		return drainGraceful(req, path, deadline, stdout, stderr, d)
 
-	case leaderHealthy:
-		// A healthy heartbeating leader holds the lease and no completion
-		// barrier exists yet. Two sub-cases (codex PR3 iter-5 [P1]):
+	case leaderBusy:
+		// A live process HOLDS the flock and no completion barrier exists yet.
 		//   - OLD already archived -> the handoff already completed; the queue
 		//     file is a stale leftover. STAND DOWN (clean the queue, spawn
-		//     nothing). This is the true "nothing to drain" case (T13).
-		//   - OLD still live -> a handoff was requested (the queue file exists).
-		//     The in-process GRACEFUL producer (GracefulHandoff) may have
-		//     spawned a standby and be about to write the barrier, so we POLL
-		//     (bounded) for the barrier FIRST (codex PR3 iter-12 [P2]) — racing
-		//     straight to legacy Resume here would spawn a SECOND successor
-		//     while the standby is already polling. Only if no barrier appears
-		//     within the budget (no graceful producer ran) do we fall back to
-		//     the proven legacy Resume to complete the handoff.
+		//     nothing) — the true "nothing to drain" case (T13).
+		//   - OLD still live -> a handoff was requested (the queue exists). A
+		//     GracefulHandoff producer may be about to write the barrier, so we
+		//     POLL (bounded) for it FIRST — racing straight to legacy Resume
+		//     would spawn a SECOND successor while the standby is already
+		//     polling. Only if no barrier appears do we fall back to the proven
+		//     legacy Resume (the requested /exit+kill retire) to complete it.
 		return drainLiveLeaderFallback(req, path, deadline, graceMillis, resumeTimeoutMillis, stdout, stderr, d)
 
-	case !hasEpoch:
-		// COLD recovery: there is NO lease epoch for this
-		// project (no coord ever held the lease here, or the record is gone)
-		// — the lease is stealable and nothing to fence/kill. Spawn the
-		// successor via coldResume (codex PR3 iter-1 [P2]). coldResume holds a
-		// SHORT per-agent lock for Resume's serialization contract (codex PR3
-		// iter-4 [P1]) — safe here: a cold spawn has no hung live leader to
-		// wedge on. This is the "stealable lease -> cold-spawn" path.
-		_, _ = fmt.Fprintf(stderr, "fleet drain: no lease leader for %s; cold-spawning successor\n", project)
-		return coldResume(req, path, graceMillis, resumeTimeoutMillis, stdout, stderr, d)
-
 	default:
-		// An epoch exists, the leader is NOT healthy (hung past TTL / stale)
-		// and NO barrier. The bare-coord case was already routed to legacy
-		// resume by the pre-switch guard, so OLD here is a LEASE-WRAPPED coord:
-		// either mid-handoff (will write the barrier soon) OR HUNG before the
-		// barrier (the incident). Wait BOUNDED for the barrier; if it appears
-		// -> graceful finish; if the deadline passes -> ESCALATE to the
-		// safety-net takeover (never block).
-		return drainWaitBarrierOrEscalate(req, path, deadline, graceMillis, resumeTimeoutMillis, stdout, stderr, d)
+		// The flock is FREE — no live holder. OLD released or died (a graceful
+		// handoff writes the barrier BEFORE releasing, so a free flock with no
+		// barrier is a non-graceful release/crash, or a cold start where no
+		// coord ever held the flock). Recover WITHOUT a kill (D8): wait bounded
+		// for the expected successor to acquire the free flock; else dead-recover
+		// (cold-spawn a fresh successor / surface `fleet rm` if OLD is somehow
+		// still alive but not holding). Never fences a live coord.
+		return drainFreeFlockRecover(req, path, deadline, graceMillis, resumeTimeoutMillis, stdout, stderr, d)
 	}
 }
 
-// drainGraceful finishes a graceful handoff once the completion barrier is
-// up. If OLD is still the ACTIVE lease owner it is finishing its own exit;
-// we wait (bounded) for it to release (the standby then acquires) and
-// escalate to takeover on timeout (the takeover fences first, so its kill is
-// not blocked by the active-owner gate). Otherwise OLD is already
-// releasing/stale and we reap it directly through the authenticated
-// primitive. Holds NO lock.
-func drainGraceful(req queue.SpawnFresh, path string, epoch int64, deadline time.Time,
+// drainGraceful finishes a graceful handoff once the completion barrier is up.
+// PR-2 (D9b): the handoff is COMPLETE only when the EXPECTED successor — the
+// flock body's agent_id == the queue's pre-allocated successor id
+// (req.NewAgentID) — holds the flock. A bare/booting/foreign busy flock is NOT
+// a healthy successor (the R4/B hazard). Until the expected successor acquires,
+// wait bounded (OLD may still be finishing its exit); on timeout dead-recover
+// via takeoverAndRecover (no kill — D8: it cold-spawns a dead OLD's successor,
+// or surfaces `fleet rm` for a hung-alive OLD). Holds NO lock.
+func drainGraceful(req queue.SpawnFresh, path string, deadline time.Time,
 	stdout, stderr io.Writer, d drainLeaseDeps) error {
 
 	oldRec, err := d.LoadAgent(req.OldAgentID)
 	switch {
 	case errors.Is(err, state.ErrNotFound):
-		// OLD already archived — but that is NOT proof a standby acquired the
-		// lease (codex PR3 iter-14 [P1]): coord-run RELEASES the lease and THEN
-		// archives OLD, so between the archive and the standby's next poll there
-		// is a window where the lease is free and unowned. Deleting the queue
-		// here would strand the project coordless if the standby crashed / is
-		// still mid-acquire. Wait (bounded) for a CONFIRMED active owner before
-		// declaring the handoff done. We cannot RecoverSpawn here (OLD's record
-		// is archived, so there is nothing to recover FROM), so on a no-successor
-		// timeout we PRESERVE the queue and surface — a later drain pass (or the
-		// standby finally acquiring) completes it; `fleet doctor` (PR6) handles a
-		// truly-stuck case. Surface-don't-silo: never a silent coordless delete.
-		// OLD is archived/gone so there is no pid to exclude; require a HEALTHY
-		// owner (a present-but-crashed active-epoch owner is not a live successor
-		// — codex PR3 iter-14 [P1]).
-		if d.waitForHealthySuccessor(req.Project, 0, deadline) {
+		// OLD already archived — but that is NOT proof the expected successor
+		// acquired: coord-run RELEASES the flock and THEN archives OLD, so there
+		// is a window where the flock is free and unowned. Deleting the queue
+		// here would strand the project coordless. Wait (bounded) for the
+		// EXPECTED successor (positive identity) before declaring done. We cannot
+		// RecoverSpawn here (OLD's record is archived — nothing to recover FROM),
+		// so on timeout PRESERVE the queue + surface. Never a silent coordless
+		// delete.
+		if d.waitForHealthySuccessor(req.Project, req.NewAgentID, deadline) {
 			if derr := d.DeliverPending(req, nil, stdout, stderr); derr != nil {
 				return fmt.Errorf("fleet drain: deliver pending handoff doc to %s's successor: %w (queue %s preserved)",
 					req.OldAgentID, derr, path)
 			}
 			_, _ = fmt.Fprintf(stdout,
-				"fleet drain: %s retired and a healthy successor holds the lease; cleaning queue\n", req.OldAgentID)
+				"fleet drain: %s retired and the expected successor holds the flock; cleaning queue\n", req.OldAgentID)
 			return queue.Delete(path)
 		}
 		_, _ = fmt.Fprintf(stderr,
-			"fleet drain: %s archived (barrier present) but NO successor acquired the lease within the budget; "+
+			"fleet drain: %s archived (barrier present) but the expected successor has NOT acquired the flock within the budget; "+
 				"preserving queue %s for retry (a standby may still be mid-acquire; run `fleet doctor` if it persists)\n",
 			req.OldAgentID, path)
-		return fmt.Errorf("fleet drain: %s retired but no successor leads %s yet; queue preserved for retry",
+		return fmt.Errorf("fleet drain: %s retired but the expected successor does not lead %s yet; queue preserved for retry",
 			req.OldAgentID, req.Project)
 	case err != nil:
 		return fmt.Errorf("fleet drain: load old agent %s: %w", req.OldAgentID, err)
 	}
 
-	// Branch on who currently OWNS the lease (codex PR3 iter-14 [P1]). The
-	// invariant across ALL branches: never declare the handoff done / delete the
-	// queue without either reaping a still-present OLD or confirming a HEALTHY
-	// SUCCESSOR. A successor that crashed after writing its `active` epoch but
-	// before releasing still shows up as ActiveOwnerPID, so "successor" means a
-	// HEALTHY owner (LeaderPresent's TTL + pid_start liveness) whose pid != OLD —
-	// raw active-epoch ownership alone is NOT proof of a live successor.
-	ownerPid, ownerOK := d.ActiveOwnerPID(req.Project)
-	switch {
-	case ownerOK && ownerPid == oldRec.SupervisorPID:
-		// OLD is still the recorded ACTIVE lease owner — finishing its own exit.
-		// Do NOT force-kill it (the epoch gate refuses the active leader,
-		// correctly). Wait bounded for a HEALTHY successor; escalate on timeout.
-		_, _ = fmt.Fprintf(stdout,
-			"fleet drain: %s wrote the barrier and is still the active leader; waiting for its self-release\n",
-			oldRec.ID)
-		for {
-			// Completion requires a HEALTHY successor (pid != OLD AND
-			// LeaderPresent), not merely OLD's absence or a stale active epoch:
-			// !healthy means OLD released but no LIVE standby owns the lease yet
-			// (mid-poll, or a successor that crashed after writing its epoch) —
-			// keep waiting. On the deadline fall through to takeover+recover,
-			// which brings up a successor so the project is never left coordless.
-			if op, ok := d.healthySuccessorPresent(req.Project, oldRec.SupervisorPID); ok {
-				if derr := d.DeliverPending(req, oldRec, stdout, stderr); derr != nil {
-					return fmt.Errorf("fleet drain: deliver pending handoff doc to %s's successor: %w (queue %s preserved)",
-						oldRec.ID, derr, path)
-				}
-				_, _ = fmt.Fprintf(stdout,
-					"fleet drain: %s released the lease and healthy successor pid %d acquired it; handoff complete\n",
-					oldRec.ID, op)
-				return queue.Delete(path)
-			}
-			if !time.Now().Before(deadline) {
-				break
-			}
-			wait := d.BarrierPoll
-			if rem := time.Until(deadline); rem < wait {
-				wait = rem
-			}
-			if wait > 0 {
-				time.Sleep(wait)
-			}
-		}
-		// OLD wedged past the budget (or released with no HEALTHY successor ever
-		// acquiring) — escalate to the safety-net takeover + lease-wrapped
-		// recovery (fence+kill OLD, then spawn a successor). Never block.
-		_, _ = fmt.Fprintf(stderr,
-			"fleet drain: %s did not yield to a healthy successor within the budget; escalating to takeover\n",
-			oldRec.ID)
-		return takeoverAndRecover(req, path, oldRec, stdout, stderr, d)
-
-	case ownerOK && ownerPid != oldRec.SupervisorPID && d.LeaderPresent(req.Project):
-		// A HEALTHY SUCCESSOR already leads (a standby acquired and is
-		// heartbeating). OLD's record is still present but it released the lease —
-		// deliver the still-pending doc to the winner, then reap OLD's lingering
-		// supervisor through the authenticated primitive and clean the queue.
+	// Positive-identity completion (D9b): the handoff is done ONLY when the
+	// flock body names the EXPECTED successor (req.NewAgentID). A bare/booting/
+	// foreign busy flock never satisfies this, so it never triggers the
+	// queue-delete (the R4/B fix).
+	if _, ok := d.healthySuccessorPresent(req.Project, req.NewAgentID); ok {
 		if derr := d.DeliverPending(req, oldRec, stdout, stderr); derr != nil {
 			return fmt.Errorf("fleet drain: deliver pending handoff doc to %s's successor: %w (queue %s preserved)",
 				oldRec.ID, derr, path)
 		}
-		return drainReapOld(oldRec, req, path, epoch, stdout, stderr, d)
-
-	default:
-		// Either no owner (!ownerOK) OR the active owner is a non-OLD pid that is
-		// NOT healthy (a successor that crashed after writing its epoch). Either
-		// way there is no LIVE successor yet: reaping OLD + deleting the queue
-		// here would strand the project coordless (codex PR3 iter-14 [P1]). Wait
-		// bounded for a HEALTHY successor; if one acquires, reap OLD's lingering
-		// supervisor and finish. If none by the deadline, escalate to
-		// takeover+recover so a successor is brought up — never a coordless
-		// queue-delete.
-		_, _ = fmt.Fprintf(stdout,
-			"fleet drain: %s released the lease but no healthy successor owns it yet; waiting for a confirmed successor\n",
-			oldRec.ID)
-		if d.waitForHealthySuccessor(req.Project, oldRec.SupervisorPID, deadline) {
-			if derr := d.DeliverPending(req, oldRec, stdout, stderr); derr != nil {
-				return fmt.Errorf("fleet drain: deliver pending handoff doc to %s's successor: %w (queue %s preserved)",
-					oldRec.ID, derr, path)
-			}
-			_, _ = fmt.Fprintf(stdout,
-				"fleet drain: a healthy successor acquired the lease for %s; reaping the old supervisor and finishing\n",
-				req.Project)
-			return drainReapOld(oldRec, req, path, epoch, stdout, stderr, d)
-		}
-		_, _ = fmt.Fprintf(stderr,
-			"fleet drain: %s released the lease but NO healthy successor acquired within the budget; escalating to takeover\n",
-			oldRec.ID)
-		return takeoverAndRecover(req, path, oldRec, stdout, stderr, d)
+		// The expected successor leads (so OLD already released + exited). Reap
+		// OLD's lingering supervisor (a benign no-op on the already-dead OLD) and
+		// clean the queue.
+		return drainReapOld(oldRec, req, path, stdout, stderr, d)
 	}
+
+	// The expected successor has NOT taken over yet. If OLD still holds the flock
+	// it is finishing its exit (surface that for diagnostics). Wait bounded for
+	// the expected successor either way.
+	if ownerPid, ownerOK := d.ActiveOwnerPID(req.Project); ownerOK && ownerPid == oldRec.SupervisorPID {
+		_, _ = fmt.Fprintf(stdout,
+			"fleet drain: %s wrote the barrier and still holds the flock; waiting for its self-release and the successor's acquire\n",
+			oldRec.ID)
+	} else {
+		_, _ = fmt.Fprintf(stdout,
+			"fleet drain: %s released the flock but the expected successor does not hold it yet; waiting for a confirmed successor\n",
+			oldRec.ID)
+	}
+	if d.waitForHealthySuccessor(req.Project, req.NewAgentID, deadline) {
+		if derr := d.DeliverPending(req, oldRec, stdout, stderr); derr != nil {
+			return fmt.Errorf("fleet drain: deliver pending handoff doc to %s's successor: %w (queue %s preserved)",
+				oldRec.ID, derr, path)
+		}
+		_, _ = fmt.Fprintf(stdout,
+			"fleet drain: the expected successor acquired the flock for %s; reaping the old supervisor and finishing\n",
+			req.Project)
+		return drainReapOld(oldRec, req, path, stdout, stderr, d)
+	}
+	// Timeout: the expected successor never acquired. Dead-recover WITHOUT a kill
+	// (D8): takeoverAndRecover cold-spawns if OLD is provably dead, or surfaces
+	// `fleet rm` if OLD is a hung-alive flock holder. Never fences a live coord.
+	_, _ = fmt.Fprintf(stderr,
+		"fleet drain: %s did not yield to the expected successor within the budget; attempting no-kill recovery\n",
+		oldRec.ID)
+	return takeoverAndRecover(req, path, oldRec, stdout, stderr, d)
 }
 
 // drainGracefulDeliverPending delivers the still-pending handoff doc to the
@@ -770,33 +683,33 @@ func drainGracefulDeliverPending(req queue.SpawnFresh, oldRec *agent.Record,
 		disable, true, stdout, stderr)
 }
 
-// healthySuccessorPresent reports whether a HEALTHY successor (not OLD) holds
-// the lease for project: the active owner pid is present, differs from
-// excludePid (OLD's supervisor), AND a healthy leader is heartbeating
-// (LeaderPresent's TTL + pid_start liveness). A successor that crashed after
-// writing its `active` epoch but before releasing still shows in ActiveOwnerPID,
-// so the LeaderPresent gate is what proves the successor is LIVE (codex PR3
-// iter-14 [P1]). Returns (ownerPid, true) only when all hold.
-func (d drainLeaseDeps) healthySuccessorPresent(project string, excludePid int) (int, bool) {
-	op, ok := d.ActiveOwnerPID(project)
-	if !ok || op == excludePid {
+// healthySuccessorPresent reports whether the EXPECTED successor holds the flock
+// for project (PR-2 D9b — the R4/B fix). "Healthy" is a POSITIVE IDENTITY match:
+// the flock body's agent_id must equal expectedSuccessorID (the queue's
+// pre-allocated successor id, req.NewAgentID). A bare/booting/foreign busy flock
+// — held by a coord that has NOT committed the expected handoff — is NOT healthy,
+// so it never triggers the queue-delete + delivery. An EMPTY expectedSuccessorID
+// (a legacy/v1 queue that never carried a successor id) maps to not-healthy
+// (never a match of "" == body.agent_id, which a torn/identity-less body could
+// satisfy). Returns (ownerPid, true) only on a positive identity match.
+func (d drainLeaseDeps) healthySuccessorPresent(project, expectedSuccessorID string) (int, bool) {
+	if expectedSuccessorID == "" {
 		return 0, false
 	}
-	if !d.LeaderPresent(project) {
+	owner, ok := d.LiveOwner(project)
+	if !ok || owner.AgentID == "" || owner.AgentID != expectedSuccessorID {
 		return 0, false
 	}
-	return op, true
+	return owner.PID, true
 }
 
-// waitForHealthySuccessor polls (bounded by deadline) for a HEALTHY successor
-// (not excludePid) to hold the lease for project. Used after OLD is confirmed
-// gone (archived / released) to verify a LIVE standby acquired the freed lease
-// before declaring the handoff complete — a present-but-dead active owner is not
-// a successor (codex PR3 iter-14 [P1]). Returns true the instant a healthy
-// successor is observed; false if the deadline passes with none. Holds no lock.
-func (d drainLeaseDeps) waitForHealthySuccessor(project string, excludePid int, deadline time.Time) bool {
+// waitForHealthySuccessor polls (bounded by deadline) for the EXPECTED successor
+// (positive identity == expectedSuccessorID) to hold the flock for project.
+// Returns true the instant it is observed; false if the deadline passes with
+// none. Holds no lock.
+func (d drainLeaseDeps) waitForHealthySuccessor(project, expectedSuccessorID string, deadline time.Time) bool {
 	for {
-		if _, ok := d.healthySuccessorPresent(project, excludePid); ok {
+		if _, ok := d.healthySuccessorPresent(project, expectedSuccessorID); ok {
 			return true
 		}
 		if !time.Now().Before(deadline) {
@@ -812,10 +725,13 @@ func (d drainLeaseDeps) waitForHealthySuccessor(project string, excludePid int, 
 	}
 }
 
-// drainReapOld reaps OLD's coord-run supervisor through the ONE
-// authenticated kill primitive (NO unguarded kill). T42: a recycled PID is
-// refused by the primitive (start-time mismatch).
-func drainReapOld(oldRec *agent.Record, req queue.SpawnFresh, path string, epoch int64,
+// drainReapOld reaps OLD's coord-run supervisor through the ONE authenticated
+// kill primitive (NO unguarded kill) after the EXPECTED successor already holds
+// the flock — so OLD has released it and exited, making this a benign no-op on
+// a corpse in the common case. T42: a recycled PID is refused by the primitive
+// (start-time mismatch); clause-4 refuses to shoot the current flock owner (the
+// successor). Then cleans the queue.
+func drainReapOld(oldRec *agent.Record, req queue.SpawnFresh, path string,
 	stdout, stderr io.Writer, d drainLeaseDeps) error {
 
 	if oldRec.SupervisorPID <= 0 {
@@ -830,57 +746,66 @@ func drainReapOld(oldRec *agent.Record, req queue.SpawnFresh, path string, epoch
 	}
 
 	if err := d.KillCoord(coord.KillTarget{
-		Pid:         oldRec.SupervisorPID,
-		PidStart:    oldRec.SupervisorPidStart,
-		AgentID:     oldRec.ID,
-		Project:     oldRec.Project,
-		FencerEpoch: epoch,
+		Pid:      oldRec.SupervisorPID,
+		PidStart: oldRec.SupervisorPidStart,
+		AgentID:  oldRec.ID,
+		Project:  oldRec.Project,
 	}); err != nil {
-		// A refusal (T42 PID-reuse, exe-path, would-shoot-leader) is surfaced
-		// — never silently dropped. The queue file is preserved so a later
-		// pass can retry once the ambiguity clears.
+		// A refusal (T42 PID-reuse, exe-path, would-shoot-the-successor) is
+		// surfaced — never silently dropped. The queue file is preserved so a
+		// later pass can retry once the ambiguity clears.
 		return fmt.Errorf("fleet drain: graceful reap of old coord %s refused/failed: %w (queue %s preserved)",
 			oldRec.ID, err, path)
 	}
-	_, _ = fmt.Fprintf(stdout, "fleet drain: reaped old coord %s (graceful, barrier epoch %d)\n", oldRec.ID, epoch)
-	// OLD is dead -> kernel released the flock -> the standby's next poll
-	// acquires it. Clean the queue file.
+	_, _ = fmt.Fprintf(stdout, "fleet drain: reaped old coord %s (graceful, successor leads)\n", oldRec.ID)
+	// OLD is dead -> kernel released the flock (the successor already holds it).
+	// Clean the queue file.
 	if err := queue.Delete(path); err != nil {
 		return fmt.Errorf("fleet drain: reaped %s but queue delete failed: %w", oldRec.ID, err)
 	}
 	return nil
 }
 
-// drainWaitBarrierOrEscalate polls (bounded) for the barrier. On the barrier
-// appearing -> graceful finish. On the deadline -> escalate to the safety-net
-// takeover (fence -> kill the hung OLD), THEN cold-spawn a successor so the
-// project is not left coordless (codex PR3 iter-6 [P1]). NEVER blocks past the
-// deadline; NEVER holds a lock across the kill. T25 (no graceful kill before
-// barrier) + T41 (escalate on a hung OLD).
-func drainWaitBarrierOrEscalate(req queue.SpawnFresh, path string, deadline time.Time,
+// drainFreeFlockRecover handles a coord handoff when the flock is FREE — OLD
+// released or died (PR-2 D8, replacing the deleted barrier-wait-then-fence-kill
+// escalation). A graceful handoff writes the barrier BEFORE releasing the flock,
+// so a free flock with no barrier is a non-graceful release/crash (or a cold
+// start where no coord ever held the flock). It polls (bounded) for the barrier
+// (in case a graceful producer is mid-write) and for the EXPECTED successor
+// acquiring the freed flock; on the deadline it dead-recovers via
+// takeoverAndRecover — which cold-spawns a successor when OLD is provably dead
+// (the flock is already free, so NO kill is needed) or surfaces `fleet rm` when
+// OLD is somehow still alive. NEVER fences a live coord.
+func drainFreeFlockRecover(req queue.SpawnFresh, path string, deadline time.Time,
 	graceMillis, resumeTimeoutMillis int, stdout, stderr io.Writer, d drainLeaseDeps) error {
 
 	project := req.Project
-	// Cache OLD's record BEFORE the takeover (codex PR3 iter-7 [P1]): the
-	// takeover kills OLD's coord-run, whose cleanup archives the record, so a
-	// post-takeover load would race the archive. The cached record is what the
-	// lease-wrapped recovery spawns from. A load failure here is non-fatal: we
-	// still escalate (reap the hung OLD); RecoverSpawn surfaces a recovery
-	// instruction when the record is missing.
+	// Cache OLD's record up front: a later load could race OLD's own exit-time
+	// archive. The cached record is what RecoverSpawn spawns from. A load failure
+	// is non-fatal: RecoverSpawn surfaces a recovery instruction when it is nil.
 	var cachedOld *agent.Record
 	if rec, lerr := d.LoadAgent(req.OldAgentID); lerr == nil {
 		cachedOld = rec
 	}
 	for {
-		if epoch, ok := d.CurrentEpoch(project); ok && d.BarrierExists(project, epoch) {
-			// Barrier appeared while we waited — finish the graceful path.
-			return drainGraceful(req, path, epoch, deadline, stdout, stderr, d)
+		if d.BarrierExists(project) {
+			// A graceful barrier appeared while we waited — finish the graceful
+			// path (positive-identity successor completion).
+			return drainGraceful(req, path, deadline, stdout, stderr, d)
+		}
+		// The expected successor may have already acquired the freed flock.
+		if _, ok := d.healthySuccessorPresent(project, req.NewAgentID); ok {
+			if derr := d.DeliverPending(req, cachedOld, stdout, stderr); derr != nil {
+				return fmt.Errorf("fleet drain: deliver pending handoff doc to %s's successor: %w (queue %s preserved)",
+					req.OldAgentID, derr, path)
+			}
+			_, _ = fmt.Fprintf(stdout,
+				"fleet drain: the expected successor acquired the flock for %s; handoff complete, cleaning queue\n", project)
+			return queue.Delete(path)
 		}
 		if !time.Now().Before(deadline) {
 			break
 		}
-		// Sleep the smaller of the poll interval and the time left, so we
-		// never overshoot the deadline.
 		wait := d.BarrierPoll
 		if rem := time.Until(deadline); rem < wait {
 			wait = rem
@@ -890,53 +815,34 @@ func drainWaitBarrierOrEscalate(req queue.SpawnFresh, path string, deadline time
 		}
 	}
 
-	// Deadline passed with no barrier — OLD is slow or HUNG before the
-	// barrier, and no graceful standby was ever spawned (no producer ran). The
-	// takeover (fence -> kill -> [drain releases]) reaps the hung OLD but does
-	// NOT itself bring up a replacement, so we must cold-spawn the successor
-	// after it — otherwise the project is left coordless after the kill
-	// (codex PR3 iter-6 [P1]).
+	// Deadline passed with no barrier and no successor — OLD released/died and no
+	// standby acquired. Dead-recover WITHOUT a kill (D8): takeoverAndRecover
+	// cold-spawns a successor from the cached record when OLD is provably dead
+	// (the flock is already free), or surfaces `fleet rm` if OLD is somehow still
+	// alive but not holding the flock.
 	_, _ = fmt.Fprintf(stderr,
-		"fleet drain: handoff for %s did not reach the barrier within the budget; escalating to safety-net takeover\n",
+		"fleet drain: flock free for %s with no barrier and no successor; attempting no-kill recovery\n",
 		project)
 	return takeoverAndRecover(req, path, cachedOld, stdout, stderr, d)
 }
 
-// takeoverAndRecover runs the safety-net takeover (fence -> kill the hung OLD)
-// and then brings up a FRESH lease-wrapped successor from the CACHED old record
-// (dead-coord recovery), deleting the queue on success.
+// takeoverAndRecover is the NO-KILL safety-net recovery (PR-2 D8). It replaces
+// the deleted fence→kill takeover: it NEVER signals a live process. It proceeds
+// only past the KP7 dead-targets-only gate (OLD PROVABLY DEAD by pid+pid_start),
+// then — because a dead coord-run was kernel-freed of the flock on death — brings
+// up a FRESH lease-wrapped successor from the CACHED old record straight into the
+// already-free flock, deleting the queue on success. A LIVE / unauthenticatable
+// OLD aborts (surface `fleet rm`, preserve the queue).
 //
-// LOCK DISCIPLINE (codex PR3 iter-14 [P1] — the deadlock this whole stack
-// exists to kill, reintroduced in PR3's takeover path):
-//
-//	WRONG (self-deadlock):                   RIGHT (narrow critical section):
-//	┌──────────────────────────────┐        ┌──────────────────────────────┐
-//	│ LockAgent(OLD)                │        │ TakeOver(OLD)   ◄── lock-free │
-//	│   TakeOver(OLD)               │        │   fence -> SIGTERM OLD        │
-//	│     SIGTERM OLD               │        │   OLD's coord.Cleanup runs:   │
-//	│     OLD's coord.Cleanup runs: │        │     LockAgent(OLD)  ◄─ FREE   │
-//	│       LockAgent(OLD) ◄ BLOCKS │        │     archive record + reap     │
-//	│       (drain holds it!)       │        │   OLD exits -> flock freed    │
-//	│     OLD never archives ──────►│ stale  │   TakeOver acquires + releases│
-//	│   SIGKILL OLD (record stale,  │ rec +  │ LockAgent(OLD)  ◄ short scope │
-//	│   tmux/engine orphaned)       │ orphan │   re-check queue + RecoverSpawn│
-//	│ release()                     │        │ release()                     │
-//	└──────────────────────────────┘        └──────────────────────────────┘
-//
-// The per-agent lock must NOT span TakeOver: TakeOver SIGTERMs the hung OLD,
-// whose coord.Cleanup archives OLD's record under the SAME state.LockAgent(OLD).
-// Holding it across the kill self-blocks OLD's cleanup -> OLD is SIGKILLed with
-// a STALE live record and an orphaned tmux/engine. So TakeOver runs LOCK-FREE
-// (OLD's dying cleanup can grab the lock and archive cleanly); the lock is taken
-// only for the SHORT RecoverSpawn critical section AFTER OLD is gone.
-//
-// The lock still serializes duplicate recovery (codex PR3 iter-11 [P1]): the
-// production TakeOver releases the lease the instant OLD is proven gone, so two
-// concurrent drains could both observe acquired=true. The post-takeover lock +
-// queue re-check makes only ONE of them RecoverSpawn; the loser sees the queue
-// gone and stands down. The lock is BOUNDED (state.acquireBoundedAt — never a
-// bare LOCK_EX), so a contender times out instead of hanging. Shared by the
-// hung-leader, graceful-past-budget, and Resume-timeout escalations. Returns
+// LOCK DISCIPLINE (codex PR3 iter-11/14 [P1]): the SHORT per-agent lock wraps
+// ONLY the RecoverSpawn critical section, never a kill (there is none). It
+// serializes duplicate recovery: two concurrent drains that both reach here
+// (the flock is free, so both see a stealable lease) contend on the bounded
+// LockAgent; the post-lock queue + flock-owner re-check makes only ONE
+// RecoverSpawn, and the loser sees the queue gone / the successor leading and
+// stands down. The lock is BOUNDED (state.acquireBoundedAt — never a bare
+// LOCK_EX), so a contender times out instead of hanging. Shared by the
+// graceful-past-budget and free-flock recovery escalations. Returns
 // ErrEscalatedToTakeOver on success (a non-fatal processed outcome).
 func takeoverAndRecover(req queue.SpawnFresh, path string, cachedOld *agent.Record,
 	stdout, stderr io.Writer, d drainLeaseDeps) error {
@@ -963,9 +869,7 @@ func takeoverAndRecover(req queue.SpawnFresh, path string, cachedOld *agent.Reco
 	// Abort = loud diagnostic + fleetlog event + drain failure through the
 	// existing "did not confirm the old coord is gone" path: the queue is
 	// preserved for retry, everyone stays alive, and the operator recourse
-	// is `fleet handoff <id>` / `fleet rm <id>`. (KP6 inside
-	// AcquireLeaseWithKill also protects the TakeOver below transitively;
-	// this gate makes the drain-side behavior explicit + tested.)
+	// is `fleet handoff <id>` / `fleet rm <id>`.
 	abortEscalation := func(why string) error {
 		msg := fmt.Sprintf(
 			"fleet drain: NOT escalating takeover for %s: %s; refusing to fence/kill (queue %s preserved for retry; if the old coord is truly wedged run `fleet handoff %s` or `fleet rm %s`)",
@@ -991,72 +895,39 @@ func takeoverAndRecover(req queue.SpawnFresh, path string, cachedOld *agent.Reco
 			cachedOld.SupervisorPID))
 	}
 
-	// TakeOver runs LOCK-FREE so the hung OLD's coord.Cleanup can take
-	// state.LockAgent(OLD) to archive its record + reap tmux/engine while we
-	// fence->kill it. Holding the per-agent lock here would self-deadlock that
-	// cleanup (see the LOCK DISCIPLINE diagram above).
-	acquired, liveHolders, err := d.TakeOver(project, req.OldAgentID)
-	if err != nil {
-		return fmt.Errorf("fleet drain: safety-net takeover for %s: %w", project, err)
-	}
-	// acquired==false means the takeover did NOT confirm OLD is gone (codex PR3
-	// iter-9 [P1]): the production seam (AcquireLeaseWithKill) only fences+kills
-	// a HUNG holder — a HEALTHY holder makes it stand down (acquired=false,
-	// err=nil), and a hung holder it could not authenticate/kill also yields
-	// acquired=false. In neither case may we RecoverSpawn: a healthy OLD is
-	// still leading (a successor would duplicate) and an un-killable OLD must
-	// not be shot over. Surface the incomplete escalation; leave the queue so a
-	// later drain retries once OLD is provably gone (or `fleet doctor` recovers
-	// the un-killable case — PR6).
-	if !acquired {
-		detail := "old coord still leading or un-killable"
-		if len(liveHolders) > 0 {
-			pids := make([]string, 0, len(liveHolders))
-			for _, h := range liveHolders {
-				pids = append(pids, strconv.Itoa(h.pid))
-			}
-			detail = "live lease holder(s) detected pre-fence, pid(s) " + strings.Join(pids, ",") +
-				" — quarantined, not killed"
-		}
-		_, _ = fmt.Fprintf(stderr,
-			"fleet drain: takeover for %s did not acquire the lease (%s); "+
-				"NOT spawning a successor (would duplicate); leaving queue for retry\n", project, detail)
-		return fmt.Errorf("fleet drain: takeover for %s did not confirm the old coord is gone", project)
-	}
-	// OLD is provably gone now (the takeover fenced+killed it AND its
-	// coord.Cleanup ran lock-free, archiving the record + reaping tmux/engine).
-	// Only NOW take the SHORT per-agent lock — it serializes the RecoverSpawn
-	// against a concurrent drain so only ONE successor is recovered (codex PR3
-	// iter-11 [P1]). Crucially the lock does NOT span TakeOver above (codex PR3
-	// iter-14 [P1]): OLD's cleanup needed this same lock, so holding it across
-	// the kill self-deadlocked the archive (see LOCK DISCIPLINE above).
+	// PR-2 (D8): NO fence→kill takeover any more. The KP7 gate above already
+	// proved OLD is PROVABLY DEAD (it aborts + surfaces `fleet rm` for a live
+	// OLD), and a dead coord-run's supervisor was kernel-freed of the flock on
+	// death (and its own `defer Cleanup` archived its record + reaped its
+	// session). So the flock is already FREE and stealable — we recover a fresh
+	// successor directly, never signaling anything. Take the SHORT per-agent
+	// lock to serialize RecoverSpawn against a concurrent drain (only ONE
+	// recovers; the loser sees the queue gone and stands down).
 	release, lerr := d.LockAgent(req.OldAgentID)
 	if lerr != nil {
 		return fmt.Errorf("fleet drain: lock agent %s for takeover recovery: %w", req.OldAgentID, lerr)
 	}
 	defer release()
 
-	// Re-check the queue UNDER the lock: a peer drain that also won an acquire
-	// (the production TakeOver releases the lease the instant OLD is gone, so two
-	// drains can both observe acquired=true) may have already RecoverSpawned and
-	// deleted the queue. If it is gone, stand down — recovering again would
-	// duplicate the successor (codex PR3 iter-11 [P1]).
+	// Re-check the queue UNDER the lock: two concurrent drains can both observe
+	// the flock free and both pass the KP7 dead-check above (OLD's death frees
+	// the flock for everyone at once, not just the first observer) — this is
+	// exactly why LockAgent + the post-lock re-check exist. A peer drain that
+	// won the lock race may have already RecoverSpawned and deleted the queue.
+	// If it is gone, stand down — recovering again would duplicate the
+	// successor (codex PR3 iter-11 [P1]).
 	if _, statErr := os.Stat(path); errors.Is(statErr, os.ErrNotExist) {
 		_, _ = fmt.Fprintf(stdout, "fleet drain: %s already recovered by a concurrent drain; nothing to do\n", project)
 		return nil
 	}
 
-	// Re-check the lease OWNER under the lock before spawning (codex PR3
-	// iter-14 [P1]): a graceful WARM STANDBY may have been polling all along and
-	// acquired the freed lease in the gap between TakeOver killing OLD and
-	// TakeOver releasing the lease. If a HEALTHY successor already leads,
-	// RecoverSpawn would either duplicate the coord or fail on the pre-allocated
-	// standby session/id. Require a HEALTHY owner (LeaderPresent — a successor
-	// that crashed after writing its `active` epoch is not a live leader); OLD is
-	// already dead post-takeover so there is no pid to exclude. A confirmed
-	// healthy successor means the handoff is complete — clean the queue and stand
-	// down instead of cold-spawning a redundant replacement.
-	if op, ok := d.healthySuccessorPresent(project, 0); ok {
+	// Re-check the flock OWNER under the lock before spawning: a graceful WARM
+	// STANDBY may have been polling all along and acquired the freed flock. If
+	// the EXPECTED successor (positive identity == req.NewAgentID) already leads,
+	// RecoverSpawn would duplicate the coord or collide on the pre-allocated
+	// session/id. A confirmed expected successor means the handoff is complete —
+	// clean the queue and stand down instead of cold-spawning a redundant one.
+	if op, ok := d.healthySuccessorPresent(project, req.NewAgentID); ok {
 		// The warm standby that acquired during the takeover gap never got
 		// the doc through THIS pass — deliver it before the queue is cleaned
 		// (codex PR3-completion iter-3 [P1]; sentinel dedupes re-sends).
@@ -1065,40 +936,35 @@ func takeoverAndRecover(req queue.SpawnFresh, path string, cachedOld *agent.Reco
 				req.OldAgentID, derr, path)
 		}
 		_, _ = fmt.Fprintf(stdout,
-			"fleet drain: a healthy successor (pid %d) acquired the lease for %s after takeover; standing down (no recovery spawn)\n",
+			"fleet drain: the expected successor (pid %d) acquired the flock for %s; standing down (no recovery spawn)\n",
 			op, project)
 		if derr := queue.Delete(path); derr != nil {
 			return fmt.Errorf(
-				"fleet drain: successor leads %s after takeover but queue delete failed (%w); rerun fleet drain to clean it",
+				"fleet drain: successor leads %s after recovery but queue delete failed (%w); rerun fleet drain to clean it",
 				project, derr)
 		}
 		return ErrEscalatedToTakeOver
 	}
 
-	// The hung OLD is fenced + killed (drain acquired the freed flock, proving
-	// OLD released, then released it for the successor). Bring up a
-	// FRESH lease-wrapped successor from the CACHED old record via the
-	// unified standby path so it acquires + heartbeats the now-free lease
-	// (codex PR3 iter-7 [P1]). We do NOT route through handoffop.Resume:
-	// that loads OLD by id (racing the archive).
+	// OLD is provably dead (KP7 gate) so the flock is free + stealable. Bring up
+	// a FRESH lease-wrapped successor from the CACHED old record via the unified
+	// standby path so it acquires the now-free flock (codex PR3 iter-7 [P1]). We
+	// do NOT route through handoffop.Resume: that loads OLD by id (racing the
+	// archive).
 	_, _ = fmt.Fprintf(stderr,
-		"fleet drain: takeover fenced/killed the hung coord for %s; recovering a lease-wrapped successor\n", project)
+		"fleet drain: old coord for %s is provably dead; recovering a lease-wrapped successor into the free flock\n", project)
 	if err := d.RecoverSpawn(cachedOld, req.HandoffDoc, req.NewAgentID, effectiveDisableAutoResume(req, cachedOld), stdout, stderr); err != nil {
-		// Surface the recovery-spawn failure but keep the escalation semantics:
-		// the takeover succeeded (OLD reaped). Leave the queue in place so the
-		// dead-coord recovery path (next dispatch / TUI [a]) retries against
-		// the now-stealable lease.
-		return fmt.Errorf("fleet drain: takeover for %s succeeded but recover-spawn failed: %w", project, err)
+		// Surface the recovery-spawn failure. Leave the queue in place so the
+		// dead-coord recovery path (next dispatch / TUI [a]) retries against the
+		// now-stealable flock.
+		return fmt.Errorf("fleet drain: recovery for %s failed: %w", project, err)
 	}
-	// Successor recovered after a clean takeover. The queue file's handoff
-	// request is fulfilled by the recovery spawn; delete it so a later drain
-	// doesn't re-escalate. A delete FAILURE is surfaced as an error (codex PR3
-	// iter-11 [P2]): if we returned ErrEscalatedToTakeOver, runDrain would
-	// count this processed while the queue lingers, and a later drain would
-	// re-escalate / re-spawn for an already-completed handoff.
+	// Successor recovered. The queue file's handoff request is fulfilled by the
+	// recovery spawn; delete it so a later drain doesn't re-escalate. A delete
+	// FAILURE is surfaced as an error (codex PR3 iter-11 [P2]).
 	if derr := queue.Delete(path); derr != nil {
 		return fmt.Errorf(
-			"fleet drain: recovered %s after takeover but queue delete failed (%w); rerun fleet drain to clean it",
+			"fleet drain: recovered %s but queue delete failed (%w); rerun fleet drain to clean it",
 			project, derr)
 	}
 	return ErrEscalatedToTakeOver
@@ -1137,18 +1003,16 @@ func drainLiveLeaderFallback(req queue.SpawnFresh, path string, deadline time.Ti
 
 	// POLL (bounded) for the graceful barrier before falling back (codex PR3
 	// iter-12 [P2]): a GracefulHandoff producer may have spawned a standby and
-	// be about to write handoff-complete-<epoch>.json. If it appears, finish the
-	// graceful path (which never spawns a second successor). Only on timeout do
-	// we fall back to legacy Resume.
+	// be about to write the barrier (named by the journal's barrier_id). If it
+	// appears, finish the graceful path (which never spawns a second successor).
+	// Only on timeout do we fall back to legacy Resume.
 	for time.Now().Before(deadline) {
-		if epoch, ok := d.CurrentEpoch(req.Project); ok && d.BarrierExists(req.Project, epoch) {
-			return drainGraceful(req, path, epoch, deadline, stdout, stderr, d)
+		if d.BarrierExists(req.Project) {
+			return drainGraceful(req, path, deadline, stdout, stderr, d)
 		}
-		// Also bail early if a successor already took over (active owner != OLD).
-		if oldRec != nil && oldRec.SupervisorPID > 0 {
-			if op, ok := d.ActiveOwnerPID(req.Project); ok && op != oldRec.SupervisorPID {
-				break
-			}
+		// Also bail early if the EXPECTED successor already took over the flock.
+		if _, ok := d.healthySuccessorPresent(req.Project, req.NewAgentID); ok {
+			break
 		}
 		wait := d.BarrierPoll
 		if rem := time.Until(deadline); rem < wait {
@@ -1158,18 +1022,14 @@ func drainLiveLeaderFallback(req queue.SpawnFresh, path string, deadline time.Ti
 			time.Sleep(wait)
 		}
 	}
-	// A HEALTHY SUCCESSOR already leads (codex PR3 iter-6 [P2]; iter-14 [P1]): if
-	// a non-OLD pid owns the lease AND is heartbeating (LeaderPresent), a graceful
-	// standby has already acquired (the barrier was written at OLD's now-
-	// superseded epoch, so the current-epoch barrier check above missed it).
-	// OLD's record just hasn't been archived yet. The handoff IS complete — clean
-	// the stale queue, do NOT run legacy Resume (which would spawn a SECOND
-	// replacement). Gate on healthySuccessorPresent, NOT raw ActiveOwnerPID: a
-	// standby that wrote its `active` epoch then crashed still shows as owner but
-	// is not a live leader — deleting the queue for it strands the project
-	// coordless (same class as the graceful path).
-	if err == nil && oldRec != nil && oldRec.SupervisorPID > 0 {
-		if ownerPid, ok := d.healthySuccessorPresent(req.Project, oldRec.SupervisorPID); ok {
+	// The EXPECTED successor already leads (positive identity == req.NewAgentID,
+	// D9b): a graceful standby has acquired the flock (its barrier was cleaned on
+	// commit, so the barrier check above missed it). OLD's record just hasn't
+	// been archived yet. The handoff IS complete — clean the stale queue, do NOT
+	// run legacy Resume (which would spawn a SECOND replacement). A bare/foreign
+	// busy flock never matches the expected id, so it never triggers this delete.
+	if err == nil && oldRec != nil {
+		if ownerPid, ok := d.healthySuccessorPresent(req.Project, req.NewAgentID); ok {
 			// Same delivery-before-delete contract as drainGraceful (codex
 			// PR3-completion iter-3 [P1]): the successor leading does not
 			// prove the doc landed; the sentinel dedupes a re-send.
@@ -1178,8 +1038,8 @@ func drainLiveLeaderFallback(req queue.SpawnFresh, path string, deadline time.Ti
 					oldRec.ID, derr, path)
 			}
 			_, _ = fmt.Fprintf(stdout,
-				"fleet drain: a healthy successor already leads %s (active owner pid %d != old %d); handoff complete, cleaning queue\n",
-				req.Project, ownerPid, oldRec.SupervisorPID)
+				"fleet drain: the expected successor already leads %s (flock owner pid %d); handoff complete, cleaning queue\n",
+				req.Project, ownerPid)
 			return queue.Delete(path)
 		}
 	}
@@ -1287,8 +1147,8 @@ func fillDrainLeaseDeps(d drainLeaseDeps) drainLeaseDeps {
 	if d.LeaderPresent == nil {
 		d.LeaderPresent = def.LeaderPresent
 	}
-	if d.CurrentEpoch == nil {
-		d.CurrentEpoch = def.CurrentEpoch
+	if d.LiveOwner == nil {
+		d.LiveOwner = def.LiveOwner
 	}
 	if d.ActiveOwnerPID == nil {
 		d.ActiveOwnerPID = def.ActiveOwnerPID
@@ -1301,9 +1161,6 @@ func fillDrainLeaseDeps(d drainLeaseDeps) drainLeaseDeps {
 	}
 	if d.KillCoord == nil {
 		d.KillCoord = def.KillCoord
-	}
-	if d.TakeOver == nil {
-		d.TakeOver = def.TakeOver
 	}
 	if d.SupervisorAlive == nil {
 		d.SupervisorAlive = def.SupervisorAlive

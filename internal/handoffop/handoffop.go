@@ -171,12 +171,14 @@ func isCoordHandoffForAgent(rec *agent.Record) bool {
 
 // leaseNamesCoord reports whether the coordinator lease for project names
 // agentID as its coord identity — either the current active owner
-// (coordlock.CurrentOwner) or an in-flight handoff successor reservation
-// (coordlock.CurrentHandoff). It replaces the deleted spawn marker's
-// `marker == agentID` fallback in the coord-delivery detectors (D3): the lease
-// owner/successor IS the identity now. spawn.IsCoordSpawn stays the PRIMARY
-// coord detector at the call sites; this is the secondary "the lease points at
-// this specific agent" signal that the marker used to carry.
+// (coordlock.CurrentOwner) or an in-flight handoff successor named by the
+// write-once handoff journal (coordlock.CurrentHandoffSuccessor, PR-2 D3/D4:
+// the flock-only replacement for the deleted epoch CurrentHandoff reservation).
+// It replaces the deleted spawn marker's `marker == agentID` fallback in the
+// coord-delivery detectors: the lease owner/successor IS the identity now.
+// spawn.IsCoordSpawn stays the PRIMARY coord detector at the call sites; this
+// is the secondary "the lease points at this specific agent" signal that the
+// marker used to carry.
 func leaseNamesCoord(project, agentID string) bool {
 	if project == "" || agentID == "" {
 		return false
@@ -184,7 +186,7 @@ func leaseNamesCoord(project, agentID string) bool {
 	if o, ok := coordlock.CurrentOwner(project); ok && o.AgentID == agentID {
 		return true
 	}
-	if h, ok := coordlock.CurrentHandoff(project); ok && h.SuccessorID == agentID {
+	if succ, ok := coordlock.CurrentHandoffSuccessor(project); ok && succ == agentID {
 		return true
 	}
 	return false

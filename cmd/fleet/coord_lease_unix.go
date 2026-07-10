@@ -67,14 +67,18 @@ func coordLeaderCheck(project string) bool {
 //     valid kill target. Best-effort: a stamp failure is surfaced but
 //     does not abort (the lease still protects exclusion; the kill
 //     primitive simply refuses on an unstamped record).
-//  2. coordlock.AcquireLeaseWithKill, injecting the authenticated
-//     internal/coord.KillCoordIfIdentityMatches as the takeover STONITH.
-//  3. On acquire, run the new-leader competitor SWEEP: DETECT + REPORT
-//     any same-project coord straggler (a pre-lease or cross-socket coord
-//     the flock alone wouldn't catch). Report-only (KP3,
-//     DESIGN-coord-no-auto-kill): the flock is the singleton; reaping is
-//     operator-gated (`fleet gc --apply` for corpses, `fleet rm` /
-//     `fleet handoff` for live ones).
+//  2. coordlock.AcquireLease (flock-only, D1): got the flock ⇒ we are the
+//     coordinator; busy ⇒ a live holder owns it ⇒ stand down. No takeover,
+//     no STONITH from the lease (a hung-alive holder is cleared by `fleet rm`,
+//     Decision 3; a dead holder already freed the flock).
+//  3. On acquire, COMMIT any in-flight handoff (Decision 7): the winner that
+//     took the freed flock deletes the write-once handoff journal + its barrier
+//     (idempotent; a leftover naming us is committed-stale). Then run the
+//     new-leader competitor SWEEP: DETECT + REPORT any same-project coord
+//     straggler (a pre-lease or cross-socket coord the flock alone wouldn't
+//     catch). Report-only (KP3, DESIGN-coord-no-auto-kill): the flock is the
+//     singleton; reaping is operator-gated (`fleet gc --apply` for corpses,
+//     `fleet rm` / `fleet handoff` for live ones).
 func productionAcquireLease(opts coordRunOpts, stderr io.Writer) func() (coordLease, bool, []liveHolderInfo, error) {
 	return func() (coordLease, bool, []liveHolderInfo, error) {
 		// Step 1: stamp supervisor identity (best-effort). spawn.Spawn writes
@@ -95,44 +99,33 @@ func productionAcquireLease(opts coordRunOpts, stderr io.Writer) func() (coordLe
 					"(continuing; STONITH may refuse on the unstamped record)\n", opts.agentID, serr)
 		}
 
-		// Step 2: acquire with the authenticated kill injected. The KP6
-		// live-holder detection rides along (converted to the
-		// platform-neutral shape) so the standby poll loop can quarantine.
-		lease, acquired, live, err := coordlock.AcquireLeaseWithKill(
-			opts.project, opts.agentID,
-			func(t coordlock.KillTarget) error {
-				return coord.KillCoordIfIdentityMatches(coord.KillTarget{
-					Pid:         t.Pid,
-					PidStart:    t.PidStart,
-					AgentID:     t.AgentID,
-					Project:     t.Project,
-					FencerEpoch: t.FencerEpoch,
-				})
-			})
+		// Step 2: acquire the flock (flock-only, D1). Busy ⇒ a live holder owns
+		// it ⇒ stand down (no takeover, no live-holder detection — that
+		// machinery went with the epoch write path). The live-holder slice is
+		// always nil now.
+		lease, acquired, err := coordlock.AcquireLease(opts.project, opts.agentID)
 		if err != nil || !acquired {
-			return nil, acquired, liveHolderInfosFrom(live), err
+			return nil, acquired, nil, err
 		}
 
-		// Step 3: new-leader competitor sweep — detect + report only (KP3).
+		// Step 3a: COMMIT any in-flight handoff (Decision 7). We took the freed
+		// flock, so any handoff journal + barrier is now stale — delete them
+		// (idempotent; best-effort). This is the winner's commit; the O_EXCL
+		// collision-resolve on the next handoff's Create is the backstop if this
+		// delete fails.
+		if derr := coordlock.DeleteHandoffJournal(opts.project); derr != nil {
+			_, _ = fmt.Fprintf(stderr,
+				"coord-run: warning: clear handoff journal after acquiring the lease for %s: %v\n",
+				opts.project, derr)
+		}
+
+		// Step 3b: new-leader competitor sweep — detect + report only (KP3).
 		// Best-effort: a sweep error is surfaced but does NOT fail the
 		// acquire — we already hold the flock, so we are the leader
 		// regardless.
 		sweepStaleCompetitors(opts.agentID, opts.project, stderr)
 		return lease, true, nil, nil
 	}
-}
-
-// liveHolderInfosFrom converts coordlock's exported detection tuples into
-// the platform-neutral shape coord.go's seams carry.
-func liveHolderInfosFrom(hs []coordlock.LiveHolder) []liveHolderInfo {
-	if len(hs) == 0 {
-		return nil
-	}
-	out := make([]liveHolderInfo, 0, len(hs))
-	for _, h := range hs {
-		out = append(out, liveHolderInfo{pid: h.Pid, pidStart: h.PidStart, agentID: h.AgentID})
-	}
-	return out
 }
 
 // stampSupervisorIdentityRetries / Delay bound the load-modify-write

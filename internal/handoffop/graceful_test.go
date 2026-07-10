@@ -78,6 +78,10 @@ const (
 // T11: end-to-end graceful handoff. Spawns exactly one standby, writes doc
 // + checkpoint BEFORE the barrier, and the barrier names the captured epoch.
 func TestGracefulHandoff_EndToEnd_OneStandby_BarrierLast(t *testing.T) {
+	orig := newHandoffBarrierID
+	newHandoffBarrierID = func() string { return "b7" }
+	t.Cleanup(func() { newHandoffBarrierID = orig })
+
 	rec := newGracefulRecorder()
 	wantTimeout := 3 * time.Minute
 	var gotTimeout time.Duration
@@ -100,8 +104,7 @@ func TestGracefulHandoff_EndToEnd_OneStandby_BarrierLast(t *testing.T) {
 		},
 		WriteAtomic:   rec.write,
 		DrainInFlight: func() error { rec.note("drain"); return nil },
-		CurrentEpoch:  func(string) (int64, bool) { return 7, true },
-		BarrierPath:   func(_ string, epoch int64) (string, error) { return gracefulBarrierPath, nil },
+		BarrierPath:   func(_ string, _ string) (string, error) { return gracefulBarrierPath, nil },
 	}
 
 	if err := GracefulHandoff(in, deps); err != nil {
@@ -141,12 +144,143 @@ func TestGracefulHandoff_EndToEnd_OneStandby_BarrierLast(t *testing.T) {
 	if iBarrier != len(order)-1 {
 		t.Errorf("barrier write is not the final side effect; order=%v", order)
 	}
-	// Barrier names the captured epoch.
-	if b := string(writes[gracefulBarrierPath]); !strings.Contains(b, `"epoch":7`) {
-		t.Errorf("barrier body missing epoch 7: %q", b)
+	// Barrier names the per-cycle barrier id (PR-2 D3, not the deleted epoch).
+	if b := string(writes[gracefulBarrierPath]); !strings.Contains(b, `"barrier_id":"b7"`) {
+		t.Errorf("barrier body missing barrier_id b7: %q", b)
 	}
 	if !strings.Contains(string(writes[gracefulBarrierPath]), `"old_agent":"oldcoord1"`) {
 		t.Errorf("barrier body missing old_agent: %q", writes[gracefulBarrierPath])
+	}
+}
+
+// codex PR2-review [P1]: CreateHandoffJournal MUST run BEFORE the barrier
+// write (D3 — BarrierExists resolves the barrier path THROUGH the journal's
+// barrier_id, so a barrier durable before its journal entry exists is
+// invisible to drain). codex PR2-review iter-2 [P2]: it must ALSO run AFTER
+// doc/checkpoint/drain (not right after spawn), maximizing the standby's
+// window to stamp its own supervisor identity before the journal captures
+// it. This pins BOTH orderings AND that the journal seam is handed the
+// exact same barrier id the barrier file ends up naming.
+func TestGracefulHandoff_CreateHandoffJournal_AfterDurableSteps_BeforeBarrier(t *testing.T) {
+	orig := newHandoffBarrierID
+	newHandoffBarrierID = func() string { return "b-journal-first" }
+	t.Cleanup(func() { newHandoffBarrierID = orig })
+
+	rec := newGracefulRecorder()
+	var gotBarrierID string
+	in := GracefulHandoffInputs{
+		OldRec:         oldRecForGraceful(),
+		HandoffDocPath: gracefulDocPath,
+		HandoffDoc:     []byte("# doc\n"),
+		CheckpointPath: gracefulCheckpointPath,
+		Checkpoint:     []byte("{}"),
+	}
+	deps := GracefulHandoffDeps{
+		SpawnStandby: func(time.Duration) error { rec.note("spawn-standby"); return nil },
+		CreateHandoffJournal: func(barrierID string) error {
+			gotBarrierID = barrierID
+			rec.note("create-journal")
+			return nil
+		},
+		WriteAtomic:   rec.write,
+		DrainInFlight: func() error { rec.note("drain"); return nil },
+		BarrierPath:   func(_ string, _ string) (string, error) { return gracefulBarrierPath, nil },
+	}
+	if err := GracefulHandoff(in, deps); err != nil {
+		t.Fatalf("GracefulHandoff: %v", err)
+	}
+
+	order, writes, _ := rec.snapshot()
+	iSpawn := orderIdx(order, "spawn-standby")
+	iJournal := orderIdx(order, "create-journal")
+	iDoc := orderIdx(order, "write:"+gracefulDocPath)
+	iCkpt := orderIdx(order, "write:"+gracefulCheckpointPath)
+	iDrain := orderIdx(order, "drain")
+	iBarrier := orderIdx(order, "write:"+gracefulBarrierPath)
+	if iSpawn == -1 || iJournal == -1 || iDoc == -1 || iCkpt == -1 || iDrain == -1 || iBarrier == -1 {
+		t.Fatalf("missing expected step(s); order=%v", order)
+	}
+	if iSpawn > iDoc || iSpawn > iCkpt || iSpawn > iDrain {
+		t.Errorf("standby not spawned first; order=%v", order)
+	}
+	if iDoc >= iJournal || iCkpt >= iJournal || iDrain >= iJournal {
+		t.Errorf("journal must be created AFTER doc/checkpoint/drain (max stamp window); order=%v", order)
+	}
+	if iJournal >= iBarrier {
+		t.Errorf("journal must be created BEFORE the barrier; order=%v", order)
+	}
+	if gotBarrierID != "b-journal-first" {
+		t.Errorf("journal seam got barrier id %q, want b-journal-first", gotBarrierID)
+	}
+	if b := string(writes[gracefulBarrierPath]); !strings.Contains(b, `"barrier_id":"b-journal-first"`) {
+		t.Errorf("barrier does not name the SAME id passed to the journal seam: %q", b)
+	}
+}
+
+// codex PR2-review iter-2 [P1]: a CreateHandoffJournal failure is HARD — it
+// must abort BEFORE the barrier exactly like a doc/checkpoint/drain
+// failure, never proceed to write a barrier that would be durable but
+// permanently undiscoverable (BarrierExists resolves the barrier path
+// THROUGH the journal). This replaces an earlier "soft" version of this
+// seam that reproduced the exact bug this fix closes, just conditioned on
+// the create failing instead of always happening.
+func TestGracefulHandoff_CreateHandoffJournalError_Hard_AbortsBeforeBarrier(t *testing.T) {
+	rec := newGracefulRecorder()
+	journalErr := errors.New("journal disk full")
+	var journalCalls int
+	reaped := 0
+	in := GracefulHandoffInputs{
+		OldRec:         oldRecForGraceful(),
+		HandoffDocPath: gracefulDocPath,
+		HandoffDoc:     []byte("# doc\n"),
+	}
+	deps := GracefulHandoffDeps{
+		SpawnStandby: func(time.Duration) error { return nil },
+		ReapStandby:  func() error { reaped++; return nil },
+		CreateHandoffJournal: func(string) error {
+			journalCalls++
+			return journalErr
+		},
+		WriteAtomic: rec.write,
+		BarrierPath: func(_ string, _ string) (string, error) { return gracefulBarrierPath, nil },
+	}
+	err := GracefulHandoff(in, deps)
+	if !errors.Is(err, journalErr) {
+		t.Fatalf("expected the journal-create error surfaced (errors.Is), got: %v", err)
+	}
+	if journalCalls != 1 {
+		t.Errorf("CreateHandoffJournal called %d times, want 1", journalCalls)
+	}
+	_, writes, _ := rec.snapshot()
+	if _, ok := writes[gracefulBarrierPath]; ok {
+		t.Errorf("BARRIER written despite a journal-create failure — it would be permanently undiscoverable")
+	}
+	if reaped != 1 {
+		t.Errorf("ReapStandby ran %d times after a journal-create abort, want 1 (same as doc/checkpoint/drain)", reaped)
+	}
+}
+
+// nil CreateHandoffJournal is a valid legal state (bespoke/prepare-only
+// callers with nothing to journal) — GracefulHandoff must not panic or
+// misbehave when the seam is unset.
+func TestGracefulHandoff_NilCreateHandoffJournal_Skipped(t *testing.T) {
+	rec := newGracefulRecorder()
+	in := GracefulHandoffInputs{
+		OldRec:         oldRecForGraceful(),
+		HandoffDocPath: gracefulDocPath,
+		HandoffDoc:     []byte("# doc\n"),
+	}
+	deps := GracefulHandoffDeps{
+		SpawnStandby: func(time.Duration) error { return nil },
+		WriteAtomic:  rec.write,
+		BarrierPath:  func(_ string, _ string) (string, error) { return gracefulBarrierPath, nil },
+	}
+	if err := GracefulHandoff(in, deps); err != nil {
+		t.Fatalf("GracefulHandoff with nil CreateHandoffJournal: %v", err)
+	}
+	_, writes, _ := rec.snapshot()
+	if _, ok := writes[gracefulBarrierPath]; !ok {
+		t.Errorf("barrier not written with a nil journal seam")
 	}
 }
 
@@ -172,8 +306,7 @@ func TestGracefulHandoff_CheckpointError_NoBarrier(t *testing.T) {
 			}
 			return rec.write(path, data)
 		},
-		CurrentEpoch: func(string) (int64, bool) { return 7, true },
-		BarrierPath:  func(_ string, _ int64) (string, error) { return gracefulBarrierPath, nil },
+		BarrierPath: func(_ string, _ string) (string, error) { return gracefulBarrierPath, nil },
 	}
 
 	err := GracefulHandoff(in, deps)
@@ -201,8 +334,7 @@ func TestGracefulHandoff_DrainError_NoBarrier(t *testing.T) {
 		SpawnStandby:  func(time.Duration) error { return nil },
 		WriteAtomic:   rec.write,
 		DrainInFlight: func() error { return wantErr },
-		CurrentEpoch:  func(string) (int64, bool) { return 7, true },
-		BarrierPath:   func(_ string, _ int64) (string, error) { return gracefulBarrierPath, nil },
+		BarrierPath:   func(_ string, _ string) (string, error) { return gracefulBarrierPath, nil },
 	}
 	err := GracefulHandoff(in, deps)
 	if !errors.Is(err, wantErr) {
@@ -237,8 +369,7 @@ func TestGracefulHandoff_PostSpawnAbort_ReapsStandby(t *testing.T) {
 			}
 			return rec.write(path, data)
 		},
-		CurrentEpoch: func(string) (int64, bool) { return 7, true },
-		BarrierPath:  func(_ string, _ int64) (string, error) { return gracefulBarrierPath, nil },
+		BarrierPath: func(_ string, _ string) (string, error) { return gracefulBarrierPath, nil },
 	}
 	err := GracefulHandoff(in, deps)
 	if !errors.Is(err, wantErr) {
@@ -268,8 +399,7 @@ func TestGracefulHandoff_Success_DoesNotReapStandby(t *testing.T) {
 		SpawnStandby: func(time.Duration) error { rec.standbyRuns++; return nil },
 		ReapStandby:  func() error { reaped++; return nil },
 		WriteAtomic:  rec.write,
-		CurrentEpoch: func(string) (int64, bool) { return 7, true },
-		BarrierPath:  func(_ string, _ int64) (string, error) { return gracefulBarrierPath, nil },
+		BarrierPath:  func(_ string, _ string) (string, error) { return gracefulBarrierPath, nil },
 	}
 	if err := GracefulHandoff(in, deps); err != nil {
 		t.Fatalf("GracefulHandoff: %v", err)
@@ -294,8 +424,7 @@ func TestGracefulHandoff_SpawnError_NothingWritten(t *testing.T) {
 	deps := GracefulHandoffDeps{
 		SpawnStandby: func(time.Duration) error { return wantErr },
 		WriteAtomic:  rec.write,
-		CurrentEpoch: func(string) (int64, bool) { return 7, true },
-		BarrierPath:  func(_ string, _ int64) (string, error) { return gracefulBarrierPath, nil },
+		BarrierPath:  func(_ string, _ string) (string, error) { return gracefulBarrierPath, nil },
 	}
 	err := GracefulHandoff(in, deps)
 	if !errors.Is(err, wantErr) {
@@ -307,30 +436,32 @@ func TestGracefulHandoff_SpawnError_NothingWritten(t *testing.T) {
 	}
 }
 
-// No lease epoch -> refuse before doing anything destructive.
-func TestGracefulHandoff_NoEpoch_Refuses(t *testing.T) {
+// PR-2: an empty barrier id (the allocator failed) -> refuse before doing
+// anything destructive (replaces the deleted no-lease-epoch refusal).
+func TestGracefulHandoff_EmptyBarrierID_Refuses(t *testing.T) {
+	orig := newHandoffBarrierID
+	newHandoffBarrierID = func() string { return "" }
+	t.Cleanup(func() { newHandoffBarrierID = orig })
+
 	rec := newGracefulRecorder()
 	in := GracefulHandoffInputs{OldRec: oldRecForGraceful()}
 	deps := GracefulHandoffDeps{
 		SpawnStandby: func(time.Duration) error { rec.standbyRuns++; return nil },
 		WriteAtomic:  rec.write,
-		CurrentEpoch: func(string) (int64, bool) { return 0, false }, // no lease
-		BarrierPath:  func(_ string, _ int64) (string, error) { return gracefulBarrierPath, nil },
+		BarrierPath:  func(_ string, _ string) (string, error) { return gracefulBarrierPath, nil },
 	}
 	if err := GracefulHandoff(in, deps); err == nil {
-		t.Fatal("expected refusal when no lease epoch is held")
+		t.Fatal("expected refusal when the barrier id allocator returns empty")
 	}
 	if _, _, standby := rec.snapshot(); standby != 0 {
-		t.Errorf("standby spawned despite no-epoch refusal (count=%d)", standby)
+		t.Errorf("standby spawned despite empty-barrier-id refusal (count=%d)", standby)
 	}
 }
 
 // nil SpawnStandby is a programming error -> refuse.
 func TestGracefulHandoff_NilSpawnSeam_Refuses(t *testing.T) {
 	in := GracefulHandoffInputs{OldRec: oldRecForGraceful()}
-	deps := GracefulHandoffDeps{
-		CurrentEpoch: func(string) (int64, bool) { return 7, true },
-	}
+	deps := GracefulHandoffDeps{}
 	if err := GracefulHandoff(in, deps); err == nil {
 		t.Fatal("expected refusal when SpawnStandby seam is nil")
 	}
@@ -369,9 +500,8 @@ func TestGracefulHandoff_Completion_RetireAfterBarrier_ThenDeliver(t *testing.T)
 	deps := GracefulHandoffDeps{
 		SpawnStandby: func(time.Duration) error { rec.note("spawn-standby"); return nil },
 		WriteAtomic:  rec.write,
-		CurrentEpoch: func(string) (int64, bool) { return 7, true },
-		BarrierPath:  func(string, int64) (string, error) { return gracefulBarrierPath, nil },
-		RetireOld:    func() error { rec.note("retire-old"); return nil },
+		BarrierPath:  func(string, string) (string, error) { return gracefulBarrierPath, nil },
+		RetireOld:    func(string) error { rec.note("retire-old"); return nil },
 		DeliverDocToWinner: func() (*agent.Record, error) {
 			rec.note("deliver")
 			delivered = winner
@@ -414,9 +544,8 @@ func TestGracefulHandoff_Completion_RetireError_NoDeliver_NoReap(t *testing.T) {
 		SpawnStandby: func(time.Duration) error { return nil },
 		ReapStandby:  func() error { reaped++; return nil },
 		WriteAtomic:  rec.write,
-		CurrentEpoch: func(string) (int64, bool) { return 7, true },
-		BarrierPath:  func(string, int64) (string, error) { return gracefulBarrierPath, nil },
-		RetireOld:    func() error { return wantErr },
+		BarrierPath:  func(string, string) (string, error) { return gracefulBarrierPath, nil },
+		RetireOld:    func(string) error { return wantErr },
 		DeliverDocToWinner: func() (*agent.Record, error) {
 			deliverCalls++
 			return nil, nil
@@ -454,9 +583,8 @@ func TestGracefulHandoff_Completion_DeliverError_Propagates_NoReap(t *testing.T)
 		SpawnStandby: func(time.Duration) error { return nil },
 		ReapStandby:  func() error { reaped++; return nil },
 		WriteAtomic:  rec.write,
-		CurrentEpoch: func(string) (int64, bool) { return 7, true },
-		BarrierPath:  func(string, int64) (string, error) { return gracefulBarrierPath, nil },
-		RetireOld:    func() error { return nil },
+		BarrierPath:  func(string, string) (string, error) { return gracefulBarrierPath, nil },
+		RetireOld:    func(string) error { return nil },
 		DeliverDocToWinner: func() (*agent.Record, error) {
 			return nil, wantErr
 		},
@@ -477,12 +605,10 @@ func TestGracefulHandoff_Completion_SeamsMustPair(t *testing.T) {
 	for name, deps := range map[string]GracefulHandoffDeps{
 		"retire-only": {
 			SpawnStandby: func(time.Duration) error { t.Error("spawned despite invalid seams"); return nil },
-			CurrentEpoch: func(string) (int64, bool) { return 7, true },
-			RetireOld:    func() error { return nil },
+			RetireOld:    func(string) error { return nil },
 		},
 		"deliver-only": {
 			SpawnStandby:       func(time.Duration) error { t.Error("spawned despite invalid seams"); return nil },
-			CurrentEpoch:       func(string) (int64, bool) { return 7, true },
 			DeliverDocToWinner: func() (*agent.Record, error) { return nil, nil },
 		},
 	} {
@@ -506,8 +632,7 @@ func TestGracefulHandoff_PrepareOnly_NoCompletionSeams_StopsAtBarrier(t *testing
 	deps := GracefulHandoffDeps{
 		SpawnStandby: func(time.Duration) error { return nil },
 		WriteAtomic:  rec.write,
-		CurrentEpoch: func(string) (int64, bool) { return 7, true },
-		BarrierPath:  func(string, int64) (string, error) { return gracefulBarrierPath, nil },
+		BarrierPath:  func(string, string) (string, error) { return gracefulBarrierPath, nil },
 	}
 	if err := GracefulHandoff(in, deps); err != nil {
 		t.Fatalf("prepare-only GracefulHandoff: %v", err)
@@ -589,6 +714,12 @@ func TestGracefulSwapEligible(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestGracefulCoordSwap_BarrierThenSwapThenDeliver_ReturnsWinner(t *testing.T) {
+	// GracefulCoordSwap now wires a REAL CreateHandoffJournal closure (D3;
+	// codex PR2-review [P1] fix) that touches real coordlock disk state via
+	// state.ProjectDir — isolate FLEET_HOME so this never writes under the
+	// developer/CI machine's actual ~/.fleet (oldRecForGraceful's project,
+	// "projects-fleet", is this very repo's real project name).
+	setupFleetHome(t)
 	rec := newGracefulRecorder()
 	oldRec := oldRecForGraceful()
 	newRec := agent.New("standby01")
@@ -603,9 +734,8 @@ func TestGracefulCoordSwap_BarrierThenSwapThenDeliver_ReturnsWinner(t *testing.T
 	})
 	gracefulSwapDepsFn = func() GracefulHandoffDeps {
 		return GracefulHandoffDeps{
-			WriteAtomic:  rec.write,
-			CurrentEpoch: func(string) (int64, bool) { return 7, true },
-			BarrierPath:  func(string, int64) (string, error) { return gracefulBarrierPath, nil },
+			WriteAtomic: rec.write,
+			BarrierPath: func(string, string) (string, error) { return gracefulBarrierPath, nil },
 		}
 	}
 	var gotSwap AtomicCoordSwapInputs
@@ -646,6 +776,9 @@ func TestGracefulCoordSwap_BarrierThenSwapThenDeliver_ReturnsWinner(t *testing.T
 }
 
 func TestGracefulCoordSwap_SwapError_Propagates_NoDeliver(t *testing.T) {
+	// See isolation note in TestGracefulCoordSwap_BarrierThenSwapThenDeliver_ReturnsWinner:
+	// CreateHandoffJournal is real; sandbox FLEET_HOME.
+	setupFleetHome(t)
 	rec := newGracefulRecorder()
 	oldRec := oldRecForGraceful()
 	newRec := agent.New("standby01")
@@ -661,9 +794,8 @@ func TestGracefulCoordSwap_SwapError_Propagates_NoDeliver(t *testing.T) {
 	})
 	gracefulSwapDepsFn = func() GracefulHandoffDeps {
 		return GracefulHandoffDeps{
-			WriteAtomic:  rec.write,
-			CurrentEpoch: func(string) (int64, bool) { return 7, true },
-			BarrierPath:  func(string, int64) (string, error) { return gracefulBarrierPath, nil },
+			WriteAtomic: rec.write,
+			BarrierPath: func(string, string) (string, error) { return gracefulBarrierPath, nil },
 		}
 	}
 	atomicCoordSwapFn = func(AtomicCoordSwapInputs, io.Writer) (AtomicCoordSwapResult, error) {

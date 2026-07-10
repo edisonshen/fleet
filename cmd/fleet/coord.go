@@ -95,13 +95,14 @@ type coordRunOpts struct {
 	// standby marks this supervisor as a WARM-STANDBY coord
 	// (DESIGN-handoff-drain-storm-leak §3(A)/§3(B), PR3). A normal coord
 	// stands down + exits 0 when a healthy leader already holds the lease;
-	// a standby instead POLLS — re-acquiring (LOCK_NB, which internally
-	// runs TakeOver on a hung leader) every standbyPoll until it acquires
-	// the lease (the old leader exited / was taken over) or ctx is
-	// canceled. Only AFTER acquiring does it start the engine child. This
-	// is the receiving half of a graceful handoff: the old coord spawns
-	// one standby in the background, then retires; the standby's next poll
-	// acquires the kernel-released flock and becomes leader.
+	// a standby instead POLLS — re-acquiring (LOCK_NB; no takeover, just a
+	// plain flock probe post-PR-2 D1/D2) every standbyPoll until it
+	// acquires the lease (the old leader exited and the kernel freed the
+	// flock) or ctx is canceled. Only AFTER acquiring does it start the
+	// engine child. This is the receiving half of a graceful handoff: the
+	// old coord spawns one standby in the background, then retires; the
+	// standby's next poll acquires the kernel-released flock and becomes
+	// leader.
 	standby bool
 	// standbyPoll is the poll interval the standby loop waits between
 	// re-acquire attempts on a busy lease. 0 = production default
@@ -123,27 +124,24 @@ type coordRunOpts struct {
 	// --- lease wiring (DESIGN-handoff-drain-storm-leak PR2) ---
 	//
 	// acquireLease is the lease-acquire seam. nil = production
-	// (productionAcquireLease, which calls coordlock.AcquireLeaseWithKill
-	// + stamps the supervisor identity + runs the new-leader sweep). Tests
-	// inject a stub that returns a
-	// fakeLease + an acquired flag without touching a real flock.
+	// (productionAcquireLease, which calls coordlock.AcquireLease + stamps the
+	// supervisor identity + clears the handoff journal + runs the new-leader
+	// sweep). Tests inject a stub that returns a fakeLease + an acquired flag
+	// without touching a real flock.
 	//
 	// Contract (mirrors coordlock.AcquireLease):
-	//   acquired=true,  lease!=nil  -> we are the leader; runCoordRun
-	//       registers lease.Release() in the cleanup defer stack, starts
-	//       lease.Heartbeat(), then starts the child.
-	//   acquired=false              -> a healthy live leader exists;
-	//       runCoordRun stands down (prints, returns nil, NEVER starts
-	//       the child).
+	//   acquired=true,  lease!=nil  -> we hold the flock; we ARE the coordinator.
+	//       runCoordRun registers lease.Release() in the cleanup defer stack,
+	//       then starts the child (no Activate flip, no Heartbeat — D1).
+	//   acquired=false              -> a live holder owns the flock; runCoordRun
+	//       stands down (prints, returns nil, NEVER starts the child) — a standby
+	//       instead polls.
 	//   err!=nil with unsupported-platform sentinel -> runCoordRun skips all
 	//       lease behavior and runs the legacy bare-child path.
 	//
-	// The []liveHolderInfo return is the KP6 detection outcome
-	// (DESIGN-coord-no-auto-kill): non-empty ONLY when acquired==false
-	// because a staleness-triggered takeover found a prospective kill
-	// target still ALIVE and stood down without fencing. Only the standby
-	// poll loop emits quarantine events from it (with cross-round dedup);
-	// other callers may ignore it.
+	// The []liveHolderInfo return is retained (always nil post-PR-2 — the
+	// takeover/KP6 detection machinery is gone with the epoch write path) so the
+	// standby poll loop's signature is stable; reportDetection(nil) is a no-op.
 	acquireLease func() (coordLease, bool, []liveHolderInfo, error)
 
 	// onStandDown, when non-nil, is invoked instead of the default
@@ -154,25 +152,22 @@ type coordRunOpts struct {
 
 // coordLease is the minimal lease surface runCoordRun needs. The real
 // *coordlock.Lease satisfies it; tests inject a fake so the lifetime
-// (acquire -> heartbeat -> release on every exit path) is exercised
-// without a real kernel flock.
+// (acquire -> release on every exit path) is exercised without a real kernel
+// flock. PR-2 (D1) collapsed it to Release() only: acquiring the flock IS
+// becoming the coordinator — there is no starting->active flip (Activate) and
+// no TTL to renew (Heartbeat). A live process holding the flock is the coord;
+// the kernel releases the flock the instant it dies.
 type coordLease interface {
-	// Activate performs the starting->active flip (D2 two-phase startup):
-	// the LAST startup step, run after the engine child starts and BEFORE
-	// the first tick. ok=false means a resolver superseded this wedged
-	// starter (fail-closed CAS) — the supervisor self-demotes + exits.
-	Activate() (bool, error)
-	Heartbeat()
 	Release()
 }
 
 // liveHolderInfo is the platform-neutral projection of one LIVE stale
-// lease holder detected — and deliberately NOT killed — by the takeover's
-// KP6 pre-fence gate (DESIGN-coord-no-auto-kill). coord.go compiles on
-// every GOOS, so this local type (not coordlock.LiveHolder, which is
-// linux||darwin-gated) is what the acquire seam and the drain TakeOver
-// seam carry; the unix wiring converts. Detection is REPORT-ONLY: the
-// standby poll loop quarantines (stderr + fleetlog) and keeps polling.
+// lease holder — deliberately never killed (DESIGN-coord-no-auto-kill).
+// coord.go compiles on every GOOS, so this local type is what the
+// acquireLease seam's return carries; post-PR-2 the takeover/detection
+// machinery is gone (D1/D2), so acquireLease always returns this slice as
+// nil — it is retained only to keep the standby poll loop's signature
+// stable (reportDetection(nil) is a no-op).
 type liveHolderInfo struct {
 	pid      int
 	pidStart int64
@@ -431,11 +426,12 @@ func runCoordRun(ctx context.Context, opts coordRunOpts, stdout, stderr io.Write
 		//
 		//   normal  -> STAND DOWN. Do NOT start the child, exit 0. A plain
 		//              coord-spawn that loses the race is not a failure.
-		//   standby -> POLL. Re-acquire (LOCK_NB, which internally runs
-		//              TakeOver on a hung leader) every standbyPoll until we
-		//              acquire the lease (the old leader exited / was taken
-		//              over) or ctx is canceled. Only then start the child.
-		//              This is the receiving half of a graceful handoff.
+		//   standby -> POLL. Re-acquire (LOCK_NB; just a plain flock probe,
+		//              no takeover, post-PR-2 D1/D2) every standbyPoll until
+		//              we acquire the lease (the old leader exited and the
+		//              kernel freed the flock) or ctx is canceled. Only then
+		//              start the child. This is the receiving half of a
+		//              graceful handoff.
 		if !opts.standby {
 			if opts.onStandDown != nil {
 				opts.onStandDown()
@@ -464,9 +460,9 @@ func runCoordRun(ctx context.Context, opts coordRunOpts, stdout, stderr io.Write
 				opts.standbyOnAcquired()
 			}
 			defer lease.Release()
-			// Heartbeat starts AFTER the starting->active flip (below), not
-			// here: a `starting` record self-demotes the heartbeat (state !=
-			// active), so the flip must land first.
+			// Holding the flock IS being the coordinator (D1) — no Activate
+			// flip, no Heartbeat. Release() (cleanup defer) frees the flock on
+			// every exit path.
 		}
 	default:
 		// acquired==true: we are the leader. Release joins the cleanup
@@ -475,23 +471,14 @@ func runCoordRun(ctx context.Context, opts coordRunOpts, stdout, stderr io.Write
 		// also stops the heartbeat goroutine, so heartbeat-stop is on the
 		// same every-exit-path guarantee.
 		//
-		// SCOPE BOUNDARY (codex PR2 iter-5 [P1] — deferred to PR3/PR4 by
-		// design): this heartbeat reflects SUPERVISOR LIVENESS, not
-		// coordinator PROGRESS. While child.Wait blocks (engine process
-		// alive) the lease keeps renewing — even if the Claude
-		// /coordinator child is wedged-but-alive and no longer updating
-		// coord-state.json. A wedged engine that stays a live process is
-		// therefore NOT yet detected by this layer:
-		//   - a DEAD engine process -> child.Wait returns -> lease releases
-		//     (handled here today),
-		//   - a WEDGED-but-alive engine -> detected by the central
-		//     lease-gated mutation API rejecting its stale token (PR4) and
-		//     by the warm-standby progress poll (PR3), NOT by PR2.
-		// Tying the heartbeat to coord-state.json freshness would duplicate
-		// the progress-tracking the warm-standby owns.
+		// SCOPE BOUNDARY: a WEDGED-but-alive engine that stays a live process
+		// keeps holding the flock (the supervisor lives while child.Wait
+		// blocks), so it is NOT detected by this layer — a hung-but-alive coord
+		// is cleared by `fleet rm` (Decision 3), never auto-killed. A DEAD engine
+		// process -> child.Wait returns -> Release() frees the flock -> a standby
+		// acquires. Holding the flock IS being the coordinator (D1): no Activate,
+		// no Heartbeat.
 		defer lease.Release()
-		// Heartbeat starts AFTER the starting->active flip (below): a
-		// `starting` record self-demotes the heartbeat (state != active).
 	}
 
 	// Build the child with the cancellable context — when the parent's
@@ -509,40 +496,10 @@ func runCoordRun(ctx context.Context, opts coordRunOpts, stdout, stderr io.Write
 		return fmt.Errorf("coord-run: start child: %w", err)
 	}
 
-	// --- starting->active flip (D2 two-phase startup) ---
-	//
-	// We acquired the lease as `starting` (has done zero coord work). The
-	// engine child (claude) is now running but sits IDLE at its prompt — the
-	// /coordinator prompt is delivered LATER by the dispatcher/winner-delivery
-	// path — so no tick has run. Flip `starting`->`active` NOW, before the
-	// first tick, via an owner-CAS that FAILS CLOSED: if a resolver superseded
-	// us while we were a wedged starter (SupersedeStartingLease bumped the
-	// epoch, T6f), Activate refuses and we self-demote + exit BEFORE any tick —
-	// two owners can never coexist. Only AFTER a successful flip do we start
-	// the heartbeat (a `starting` record self-demotes it). Guarded on lease !=
-	// nil for unsupported-platform/test seams that run without a lease.
-	if lease != nil {
-		activated, aerr := lease.Activate()
-		switch {
-		case aerr != nil:
-			// A write fault flipping the lease. Surface-don't-silo: refuse to
-			// run a coord whose ownership record we could not commit.
-			_ = child.Process.Kill()
-			return fmt.Errorf("coord-run: activate lease for project %q: %w", opts.project, aerr)
-		case !activated:
-			// Superseded while starting (a resolver spawned a replacement).
-			// Self-demote: kill the never-ticked child + exit 0. Deferred
-			// Release()/Cleanup reap our flock + record. NEVER run a tick.
-			_ = child.Process.Kill()
-			_, _ = fmt.Fprintf(stderr,
-				"coord-run: superseded while starting for %s (a replacement acquired the lease); exiting before first tick\n",
-				opts.project)
-			exitNote = "superseded-starting"
-			return nil
-		default:
-			lease.Heartbeat()
-		}
-	}
+	// PR-2 (D1): acquiring the flock WAS becoming the coordinator (above) —
+	// there is no starting->active flip and no heartbeat to start. The engine
+	// child is now running; the deferred lease.Release() frees the flock on
+	// every exit path.
 
 	// WARM STANDBY engine-pid stamp (codex PR3 iter-14 [P1]): a standby spawn
 	// SKIPPED engine-pid resolution at spawn time (the engine wasn't launched

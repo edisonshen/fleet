@@ -107,7 +107,7 @@ def _stub_lease_identity(monkeypatch: pytest.MonkeyPatch) -> None:
     the lease-names-us skip override this with their own stub."""
     monkeypatch.setattr(
         loop, "_coord_lease_identity_fn",
-        lambda project, *, home, fleet_bin="fleet": ("", ""),
+        lambda project, *, home, fleet_bin="fleet": ("", "", False, False),
     )
 
 
@@ -284,7 +284,7 @@ def test_intended_coord_per_marker_does_not_self_exit(
     # successor coord => never self-exit (D3: replaces the marker-names-us guard).
     monkeypatch.setattr(
         loop, "_coord_lease_identity_fn",
-        lambda project, *, home, fleet_bin="fleet": (me, ""),
+        lambda project, *, home, fleet_bin="fleet": (me, "", True, False),
     )
     monkeypatch.setattr(
         supervisor_mod, "tmux_session_alive", lambda session, **kw: True,
@@ -321,7 +321,7 @@ def test_handoff_successor_does_not_self_exit(
     # No active owner; the handoff reservation names US as successor.
     monkeypatch.setattr(
         loop, "_coord_lease_identity_fn",
-        lambda project, *, home, fleet_bin="fleet": ("", me),
+        lambda project, *, home, fleet_bin="fleet": ("", me, False, False),
     )
     monkeypatch.setattr(
         supervisor_mod, "tmux_session_alive", lambda session, **kw: True,
@@ -362,7 +362,7 @@ def test_inconclusive_lease_read_does_not_self_exit(
     # gate 6 and self-exits — see test_live_other_coord_not_intended_...).
     monkeypatch.setattr(
         loop, "_coord_lease_identity_fn",
-        lambda project, *, home, fleet_bin="fleet": (None, None),
+        lambda project, *, home, fleet_bin="fleet": (None, None, False, False),
     )
     monkeypatch.setattr(
         supervisor_mod, "tmux_session_alive", lambda session, **kw: True,
@@ -377,6 +377,81 @@ def test_inconclusive_lease_read_does_not_self_exit(
         "an inconclusive lease-identity read must skip, never self-exit"
     )
     assert result.reason == "lock-busy"
+
+
+def test_identity_pending_holder_does_not_self_exit(
+    fleet_home: Path,
+    held_lock,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """D9d / T18: the flock is HELD by a live-but-UNNAMED coord (present=true,
+    identity_pending=true, live_owner_id=""). Gate 5 must SKIP the self-exit — a
+    live-but-unnamed holder could be a booting coord (possibly us) whose body is
+    not stamped yet, or an old-binary straggler; self-exiting against it would
+    neuter recovery (no-auto-kill). It must NOT be mistaken for the
+    CONCLUSIVE-empty ("","") case that falls through to gate 6."""
+    me = "eeeepend"
+    old = "ffffpend"
+    pdir = _minimal_project(fleet_home)
+    _seed_agent_record(fleet_home, me)
+    _seed_agent_record(fleet_home, old)
+    held_lock(pdir, old)
+    monkeypatch.setattr(
+        loop, "_coord_lease_identity_fn",
+        lambda project, *, home, fleet_bin="fleet": ("", "", True, True),
+    )
+    monkeypatch.setattr(
+        supervisor_mod, "tmux_session_alive", lambda session, **kw: True,
+    )
+
+    result = loop.tick(
+        project="fleet", coord_id=me, cwd="/tmp/x",
+        fleet_home=str(fleet_home),
+    )
+
+    assert result.self_exit is False, (
+        "a live-but-unnamed (identity-pending) flock holder must not trigger self-exit"
+    )
+    assert result.reason == "lock-busy"
+
+
+def test_named_different_live_holder_still_self_exits(
+    fleet_home: Path,
+    held_lock,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """D9d guard (R2 P2 — do NOT over-generalize): a present=true holder with
+    identity_pending=FALSE is a NAMED different live coord — the genuine
+    duplicate — and MUST still fall through gate 5 to gate 6's self-exit. A
+    blanket 'present ⇒ skip' would leave two coords running. This pins the narrow
+    rule: skip ONLY when present && identity_pending."""
+    me = "aaaa1212"
+    holder = "bbbb3434"
+    pdir = _minimal_project(fleet_home)
+    _seed_agent_record(fleet_home, me)
+    _seed_agent_record(fleet_home, holder)
+    held_lock(pdir, holder)
+    # The lease names a DIFFERENT live coord (holder), not us: present=true,
+    # identity_pending=false.
+    monkeypatch.setattr(
+        loop, "_coord_lease_identity_fn",
+        lambda project, *, home, fleet_bin="fleet": (holder, "", True, False),
+    )
+    monkeypatch.setattr(
+        supervisor_mod, "tmux_session_alive",
+        lambda session, **kw: session == f"fleet-{holder}",
+    )
+
+    result = loop.tick(
+        project="fleet", coord_id=me, cwd="/tmp/x",
+        fleet_home=str(fleet_home),
+    )
+
+    assert result.self_exit is True, (
+        "a NAMED different live coord (present, not identity-pending) is a "
+        "genuine duplicate and must still self-exit"
+    )
+    assert result.reason == "duplicate-coord-self-exit"
 
 
 # ---------- conservatism gates: each one => skip, never self-exit ----------

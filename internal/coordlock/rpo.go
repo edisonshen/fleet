@@ -46,6 +46,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"syscall"
 	"time"
 )
 
@@ -633,271 +634,140 @@ var ErrNotLeaseOwner = errors.New(
 
 // Fence branch tags (DESIGN-coord-lease-false-fence-prevention piece 1).
 // STABLE strings embedded in every fence return's error text so the
-// observability layer (lease-observability-8c4e) can forward WHICH branch
-// fenced without this package enumerating consumers. A fence verdict only
-// ever SKIPS a tick — no fence path kills a session (kill route deleted).
-// The no-rival re-acquire path is a non-error and carries no tag.
+// observability layer (loop.py's _parse_fence_detail) can forward WHICH branch
+// fenced. A fence verdict only ever SKIPS a tick — no fence path kills a
+// session. PR-2 (D7) moved the proof onto the FLOCK, so the tag set collapsed
+// to the three flock outcomes; the epoch-era tags are gone.
 const (
-	fenceTagOwnExpiredRival    = "own-expired-rival-fenced"
-	fenceTagOwnExpiredReadOnly = "own-expired-readonly-fenced"
-	fenceTagOwnReleased        = "own-released-fenced"
-	fenceTagDifferentOwner     = "different-owner-fenced"
-	fenceTagTakeover           = "takeover-fenced"
+	// fenceTagDifferentOwner: the flock is held by a LIVE process the caller
+	// is NOT a descendant of — a live successor leads; the caller is the zombie.
+	fenceTagDifferentOwner = "different-owner-fenced"
+	// fenceTagFlockFree: the flock is FREE (kernel-freed on death, or dropped
+	// by a graceful Release() mid-handoff). The persisted body still names the
+	// old (possibly-alive) supervisor, so it is NOT trusted — a released-but-
+	// alive coord's descendant must not PROCEED and write after ownership moved.
+	fenceTagFlockFree = "flock-free-fenced"
+	// fenceTagFlockHeldUnreadable: the flock is HELD but its body is
+	// torn/empty/pid-less, so the caller cannot prove it descends from the
+	// holder — fence conservatively (a live holder exists that is not provably us).
+	fenceTagFlockHeldUnreadable = "flock-held-unreadable-fenced"
 )
 
-// LeaseCheckByAncestor decides whether the calling process (startPid,
-// normally os.Getpid()) may mutate, given the project's lease state. It is
-// the executable form of the design's skill-side ownership proof.
+// LeaseCheckByAncestor decides whether the calling process (startPid, normally
+// os.Getppid()) may mutate, given the project's FLOCK-only lease state (D7). It
+// is the executable form of the design's skill-side ownership proof: the tick
+// (loop.py) and the fleet-guard per-turn producer fence shell out to it before
+// any disk mutation, so a fenced/stale coord's skill-side writes are REFUSED in
+// Go (the same boundary the *WithLease APIs enforce), not merely discouraged.
 //
-// The discriminant is the caller's OWN lease, identified by walking its
-// getppid chain to find the recorded owner pid — NOT merely "is there a
-// healthy owner somewhere." This closes two holes (codex PR4 [P1]): a
-// fence-before-kill window (state=fencing) and a self-expired-but-still-
-// active record (a paused leader past TTL) must both FENCE the zombie's
-// tick, even though neither is a "healthy" record.
+// PR-2 (D7) moved the discriminant off the (no-longer-written) epoch onto the
+// FLOCK. It reuses PR-1's LOCK_SH busy-probe, NOT the flock body alone: the
+// body persists after Release() and still names the old (possibly-alive)
+// supervisor, so trusting it would let a released-but-alive coord's descendant
+// PROCEED and write after ownership moved. Rule:
 //
-//	read coordinator.epoch
-//	  ├─ NO record -> no lease in play -> PROCEED (legacy / non-wrapped coord).
-//	  └─ a record exists; walk startPid's ancestors:
-//	        ├─ an ancestor IS the recorded owner (pid+pid_start match)
-//	        │     ├─ record active AND NOT self-expired -> PROCEED (live leader)
-//	        │     ├─ released / rival or abandoned takeover / cross-boot /
-//	        │     │  read-only probe -> FENCE (a verdict that only SKIPS the
-//	        │     │  tick; loop.py re-checks next tick — no kill).
-//	        │     └─ expired ACTIVE with NO rival (reacquire path) ->
-//	        │        RE-ACQUIRE in place at the SAME epoch and PROCEED.
-//	        └─ NO ancestor is the recorded owner
-//	              ├─ a DIFFERENT owner is healthy+active -> FENCE (a live
-//	              │  successor holds the lease; we are the zombie).
-//	              └─ else (owner dead/released/expired, not our ancestor)
-//	                 -> PROCEED: no live lease is in play for us (a legacy
-//	                    non-wrapped coord, or a live `fleet handoff` successor
-//	                    spawned after the old coord retired).
+//	probe coordinator.flock (LOCK_SH|LOCK_NB):
+//	  ├─ file never existed (ENOENT) -> PROCEED (legacy / non-wrapped coord).
+//	  ├─ FREE (probe acquires) -> FENCE (flock-free-fenced): a stale body after
+//	  │    Release / a momentarily-unheld mid-handoff flock is NOT trusted.
+//	  └─ HELD (EWOULDBLOCK, a LIVE holder) -> read the body for the holder pid:
+//	        ├─ startPid descends from the holder (pid + pid_start match) -> PROCEED.
+//	        ├─ NOT a descendant -> FENCE (different-owner-fenced): a live
+//	        │    successor holds the flock; the caller is the zombie.
+//	        └─ body torn / pid-less -> FENCE (flock-held-unreadable-fenced): a
+//	             live holder exists that is not provably us.
 //
 // The walk is bounded so an unexpected ppid cycle / deep tree can't spin.
-//
-// LeaseCheckByAncestor is READ-ONLY: an own-expired no-rival lease FENCES
-// (own-expired-readonly-fenced) instead of renewing. Non-tick callers
-// (fleet-guard's per-turn producer fence, diagnostics) must never renew the
-// lease as a side effect of a check — a wedged coord whose claude engine
-// still produces turns would otherwise keep its lease fresh forever and
-// block a standby takeover (codex iter-2 [P1]). The coordinator tick uses
-// LeaseCheckByAncestorReacquire.
+// READ-ONLY: it never acquires or mutates the flock — the epoch's --reacquire
+// renew path is gone (holding the flock IS ownership; there is nothing to
+// renew), so LeaseCheckByAncestorReacquire collapsed into this single entry.
 func LeaseCheckByAncestor(project string, startPid int) error {
 	return leaseCheckByAncestorWithCfg(project, startPid, defaultLeaseConfig())
 }
 
-// LeaseCheckByAncestorReacquire is the coordinator tick's opt-in variant
-// (DESIGN-coord-lease-false-fence-prevention piece 1): identical proof, but
-// an own-expired lease with NO rival is RE-ACQUIRED in place at the same
-// epoch (zero downtime) instead of fenced. Only the tick may take this
-// path — it is the coord's liveness signal, so renewing here is truthful.
-func LeaseCheckByAncestorReacquire(project string, startPid int) error {
-	cfg := defaultLeaseConfig()
-	cfg.reacquire = true
-	return leaseCheckByAncestorWithCfg(project, startPid, cfg)
-}
-
-// fenceEpochSnapshot renders a compact one-line JSON of the fence-time epoch
-// record (DESIGN-coord-lease-false-fence-prevention piece 2). Appended to
-// every fence verdict's error text so `fleet lease-check`'s exit-3 stderr —
-// and the loop.py fleetlog event it feeds — carry WHAT the record looked like
-// at fence time, not just WHICH branch fenced. Best-effort: on a marshal
-// fault it returns "{}" (the tag alone still diagnoses the branch). Keys are
-// sorted by encoding/json, so the output is deterministic for tests.
-func fenceEpochSnapshot(rec epochRecord) string {
-	b, err := json.Marshal(map[string]any{
-		"epoch":           rec.Epoch,
-		"state":           rec.State,
-		"owner_pid":       rec.Owner.Pid,
-		"candidate_pid":   rec.Candidate.Pid,
-		"boot_id":         rec.BootID,
-		"renewed_at_mono": rec.RenewedAtMono,
-		"renewed_at_wall": rec.RenewedAtWall,
-	})
-	if err != nil {
-		return "{}"
-	}
-	return string(b)
-}
-
 // leaseCheckByAncestorWithCfg is the seam-injected core so tests drive a
-// deterministic clock / pid-liveness / ppid walk.
-func leaseCheckByAncestorWithCfg(project string, startPid int, cfg leaseConfig) (retErr error) {
+// deterministic pid-liveness probe + ppid walk against a real flock.
+func leaseCheckByAncestorWithCfg(project string, startPid int, cfg leaseConfig) error {
 	paths, err := resolvePaths(project)
 	if err != nil {
 		return fmt.Errorf("coordlock.LeaseCheck: resolve paths: %w", err)
 	}
-	rec, err := readEpoch(paths.epoch)
-	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			// No lease record at all -> no lease in play -> proceed. This is
-			// a legacy / non-lease-wrapped coord; fencing it would wedge the
+	f, oerr := os.OpenFile(paths.flock, os.O_RDONLY, 0)
+	if oerr != nil {
+		if errors.Is(oerr, os.ErrNotExist) {
+			// The flock file was never created -> no lease in play -> PROCEED.
+			// A legacy / non-lease-wrapped coord; fencing it would wedge the
 			// pre-lease path the reversibility contract preserves.
 			return nil
 		}
-		return fmt.Errorf("coordlock.LeaseCheck: read epoch: %w", err)
+		return fmt.Errorf("coordlock.LeaseCheck: open flock: %w", oerr)
 	}
-	// Decorate every fence verdict (ErrNotLeaseOwner) with the probe-time
-	// epoch snapshot for the observability layer. Wrapping with %w keeps
-	// errors.Is(retErr, ErrNotLeaseOwner) true and the branch tag substring
-	// intact; only fence verdicts (not read/resolve faults, not the proceed
-	// nil) get decorated.
-	//
-	// KNOWN APPROXIMATION (codex iter-3 P3, accepted): on the reacquireOwnExpired
-	// race paths the verdict text is built from a LATER re-read under epoch.lock,
-	// so if a candidate advances the lease between this probe and that CAS the
-	// appended snapshot can lag the verdict's own old->new detail by one epoch.
-	// The re-acquire verdicts already carry their old->new numbers inline; the
-	// snapshot is the probe-time record, a best-effort correlation aid, not a
-	// linearizable capture. Tightening it would require threading the post-CAS
-	// record out of reacquireOwnExpired for marginal diagnostic gain in a rare
-	// contested-renewal window — deferred.
-	defer func() {
-		if errors.Is(retErr, ErrNotLeaseOwner) {
-			retErr = fmt.Errorf("%w [epoch-snapshot %s]", retErr, fenceEpochSnapshot(rec))
-		}
-	}()
-	l := &Lease{cfg: cfg, paths: paths, boot: cfg.boot()}
-
-	// Walk the caller's ancestor chain looking for the RECORDED owner pid.
+	defer func() { _ = f.Close() }()
+	lerr := syscall.Flock(int(f.Fd()), syscall.LOCK_SH|syscall.LOCK_NB)
+	if lerr == nil {
+		// We acquired the shared lock -> NO exclusive holder -> the flock is
+		// FREE. Release the probe and FENCE: the persisted body may still name a
+		// released-but-alive old supervisor, and trusting it would let its
+		// descendant PROCEED and write after ownership moved (the zombie-write
+		// guard). A momentarily-unheld mid-handoff flock is covered too (the
+		// successor will hold it; the caller re-checks next tick).
+		_ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
+		return fmt.Errorf("%w: %s: coordinator flock for %q is free (no live holder); a stale body is not trusted",
+			ErrNotLeaseOwner, fenceTagFlockFree, project)
+	}
+	if lerr != syscall.EWOULDBLOCK { //nolint:errorlint // bare errno from syscall.Flock.
+		return fmt.Errorf("coordlock.LeaseCheck: probe flock: %w", lerr)
+	}
+	// HELD by a LIVE holder (the kernel frees the flock on death). Read the body
+	// for the holder's pid + pid_start; walk startPid's ancestors to it.
+	holderPid, holderStart, ok := flockHolderIdentity(paths.flock)
+	if !ok {
+		// Torn / empty / pid-less body on a HELD flock: a live holder exists we
+		// cannot name, so we cannot prove the caller descends from it. Fence.
+		return fmt.Errorf("%w: %s: coordinator flock for %q is held by a live holder whose identity is unreadable",
+			ErrNotLeaseOwner, fenceTagFlockHeldUnreadable, project)
+	}
 	ppidFn := cfg.ppid
 	if ppidFn == nil {
 		ppidFn = ppidOf
 	}
-	ancestorIsOwner := false
 	pid := startPid
 	const maxDepth = 64
 	for depth := 0; depth < maxDepth && pid > 1; depth++ {
-		if pid == rec.Owner.Pid {
-			// pid matches the recorded owner pid; confirm it is the SAME
-			// process (PID-reuse-safe start-time match). A start-time
-			// mismatch means a recycled pid — NOT actually the owner.
-			if st, ok := cfg.pidStart(pid); ok && st == rec.Owner.PidStart {
-				ancestorIsOwner = true
+		if pid == holderPid {
+			// pid matches the holder; confirm it is the SAME process
+			// (PID-reuse-safe start-time match). A mismatch means a recycled pid.
+			if st, sok := cfg.pidStart(pid); sok && st == holderStart {
+				return nil // caller descends from the live flock holder -> PROCEED
 			}
 			break
 		}
-		ppid, ok := ppidFn(pid)
-		if !ok || ppid == pid {
+		ppid, pok := ppidFn(pid)
+		if !pok || ppid == pid {
 			break
 		}
 		pid = ppid
 	}
+	// The caller is NOT a descendant of the live flock holder -> a live successor
+	// holds the lease; the caller is the zombie. FENCE (skip the tick).
+	return fmt.Errorf("%w: %s: coordinator flock for %q is held by pid=%d, not an ancestor of pid=%d",
+		ErrNotLeaseOwner, fenceTagDifferentOwner, project, holderPid, startPid)
+}
 
-	if ancestorIsOwner {
-		// The caller descends from the recorded owner — this is OUR lease.
-		// Proceed immediately if it is still validly ours: state==active AND
-		// not self-expired (same boot, within TTL).
-		if rec.State == stateActive && rec.BootID == l.boot &&
-			cfg.nowMono()-rec.RenewedAtMono <= int64(cfg.ttl) {
-			return nil
-		}
-		// Our own lease is expired or demoted. A fence verdict requires a
-		// RIVAL (DESIGN-coord-lease-false-fence-prevention piece 1): killing
-		// a rival-free coord just strands the project (rainier, 2x in 9h).
-		// Since the recorded owner is definitionally our own ancestor, the
-		// only rival shape possible here is an in-progress takeover — a
-		// healthy DIFFERENT owner would have routed to the other branch.
-		//
-		//	own lease expired (owner == my ancestor)
-		//	  ├─ released / fenced_not_acquired  -> FENCE own-released-fenced
-		//	  │    (a deliberate Release()/gave-up escalation is never
-		//	  │     resurrected: a standby may be taking the freed flock;
-		//	  │     same-epoch resurrection is a zombie-write hazard)
-		//	  ├─ fencing, fresh OR live candidate -> FENCE own-expired-rival-
-		//	  │    fenced (a live candidate hung past TTL can still resume
-		//	  │     its takeover + kill phase — still a rival)
-		//	  ├─ record from a PREVIOUS boot -> FENCE (pid_start is only
-		//	  │    comparable within a boot, so the ancestor match above is
-		//	  │    unprovable — a recycled pid could coincidentally match;
-		//	  │    codex iter-2 [P2]. Await a real takeover.)
-		//	  ├─ fencing with a DEAD candidate (abandoned takeover) -> FENCE
-		//	  │    (codex iter-4 [P1]: our heartbeat self-demoted when the
-		//	  │     candidate fenced, so re-activating the record would leave
-		//	  │     a lease nothing renews — churn + a spurious steal. A
-		//	  │     successor resumes it via transientResumable.)
-		//	  ├─ read-only probe (no cfg.reacquire) -> FENCE own-expired-
-		//	  │    readonly-fenced. Only the coord tick's opt-in path may
-		//	  │    renew (codex iter-2 [P1]): fleet-guard's per-turn producer
-		//	  │    fence must never keep a wedged coord's lease fresh and
-		//	  │    block a standby takeover.
-		//	  └─ expired ACTIVE, same boot, reacquire path -> RE-ACQUIRE in
-		//	       place, SAME epoch (zero downtime — the heartbeat goroutine
-		//	       never stops on an expired-active record, so normal renewal
-		//	       resumes); verdict nil, the tick proceeds.
-		//
-		// Every fence verdict here only SKIPS the tick — loop.py no longer
-		// kills the session on a fence; it re-checks on the next tick.
-		switch {
-		case rec.State == stateReleased || rec.State == stateFencedNotAcquired:
-			return fmt.Errorf("%w: %s: our lease was deliberately released/escalated (state=%s); never resurrect",
-				ErrNotLeaseOwner, fenceTagOwnReleased, rec.State)
-		case l.ownExpiredRival(rec):
-			return fmt.Errorf("%w: %s: a takeover rival exists for our expired lease (state=fencing, candidate pid=%d)",
-				ErrNotLeaseOwner, fenceTagOwnExpiredRival, rec.Candidate.Pid)
-		case rec.State == stateFencing:
-			// Abandoned takeover (dead candidate — the live-candidate case
-			// fenced above as a rival). NOT re-acquirable: our heartbeat
-			// self-demoted when the candidate fenced, so a re-activated
-			// record would never be renewed (codex iter-4 [P1]). Fence; a
-			// successor resumes the takeover via transientResumable.
-			return fmt.Errorf("%w: %s: abandoned takeover (state=fencing, dead candidate); awaiting a successor to resume it",
-				ErrNotLeaseOwner, fenceTagOwnExpiredRival)
-		case rec.State != stateActive:
-			// Unrecognized state string: fence conservatively (skip one
-			// tick, re-check next) rather than guess at a write.
-			return fmt.Errorf("%w: %s: unrecognized lease state %q for our expired lease",
-				ErrNotLeaseOwner, fenceTagOwnExpiredRival, rec.State)
-		case rec.BootID != l.boot:
-			// Cross-boot record: the pid+pid_start ancestor match is not a
-			// valid ownership proof across boots — never re-acquire it.
-			return fmt.Errorf("%w: %s: lease record is from a previous boot (%q); pid identity unprovable across boots — awaiting takeover",
-				ErrNotLeaseOwner, fenceTagOwnExpiredRival, rec.BootID)
-		case !cfg.reacquire:
-			// Read-only probe (fleet-guard producer fence, diagnostics):
-			// report the expiry without renewing. The coord tick re-acquires
-			// on its next `lease-check --reacquire`; this caller just skips.
-			return fmt.Errorf("%w: %s: our lease is expired (state=%s) and this is a read-only probe; not renewing",
-				ErrNotLeaseOwner, fenceTagOwnExpiredReadOnly, rec.State)
-		default:
-			// No rival: a pure renewal stall on our own ACTIVE record.
-			// Re-acquire in place at the same epoch.
-			return l.reacquireOwnExpired(rec)
-		}
+// flockHolderIdentity reads coordinator.flock's body for the holder's pid +
+// pid_start. ok=false when the body is absent / torn / pid-less. Best-effort:
+// the caller has already confirmed the flock is HELD (LOCK_SH busy-probe), so
+// this only supplies the identity for the ancestor walk.
+func flockHolderIdentity(flockPath string) (pid int, pidStart int64, ok bool) {
+	b, err := os.ReadFile(flockPath)
+	if err != nil || len(b) == 0 {
+		return 0, 0, false
 	}
-
-	// No ancestor is the recorded owner. FENCE iff a live leader OR a FRESH
-	// in-progress takeover holds the lease (we are the zombie). Two cases:
-	//
-	//   - a DIFFERENT owner is a HEALTHY ACTIVE leader (a successor genuinely
-	//     leads); OR
-	//   - the record is FRESH `fencing` — a candidate is mid-takeover and may
-	//     have already killed/reparented the old supervisor, so the ancestor
-	//     walk no longer finds rec.Owner. Treating this as "no live lease"
-	//     (holderHealthy is always false for non-active records) would let the
-	//     old skill-side tick keep writing DURING the takeover — exactly the
-	//     zombie-write window this check must close (codex PR4 [P1]). Mirror
-	//     LeaderPresent's predicate: a fresh fencing record == a live takeover.
-	//
-	// Otherwise no live lease is in play for us (legacy coord, or a live
-	// `fleet handoff` bare successor after the old retired) -> proceed.
-	if l.holderHealthy(rec) {
-		return fmt.Errorf("%w: %s: active lease owner pid=%d is not an ancestor of pid=%d",
-			ErrNotLeaseOwner, fenceTagDifferentOwner, rec.Owner.Pid, startPid)
+	var body flockBody
+	if json.Unmarshal(b, &body) != nil || body.Pid <= 0 {
+		return 0, 0, false
 	}
-	if l.ownExpiredRival(rec) {
-		// A live takeover is acquiring (fresh in-budget record, OR a stale
-		// record whose candidate pid is STILL ALIVE — a hung candidate can
-		// resume and finish its kill phase; codex iter-3 [P1]) -> a new
-		// leader is coming; the non-descendant caller must self-demote.
-		// Shared predicate with the own-ancestor branch so the two can
-		// never drift: only a fencing record with a DEAD candidate reads
-		// as "no live lease in play".
-		return fmt.Errorf("%w: %s: a takeover is in progress (state=fencing) for project %q; pid=%d must self-demote",
-			ErrNotLeaseOwner, fenceTagTakeover, rec.Owner.Project, startPid)
-	}
-	return nil
+	return body.Pid, body.PidStart, true
 }
 
 // --- atomic write helpers (shared) ---

@@ -7,9 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"syscall"
 	"testing"
-	"time"
 )
 
 // ---- RPO + boundary test harness ----
@@ -594,657 +592,8 @@ func TestT31_SafetyNetPreBarrierReplaysInFlight(t *testing.T) {
 	}
 }
 
-// ---- skill-side ownership proof (LeaseCheckByAncestor) ----
+// ---- keyFile helper ----
 
-// fakeTree models a getppid chain: child -> parent. A pid absent from the
-// map walks to 1 (init) and the walk stops.
-func leaseCheckCfg(clk *fakeClock, live *fakeLiveness, tree map[int]int) leaseConfig {
-	cfg := testCfg(clk, live)
-	cfg.ppid = func(pid int) (int, bool) {
-		p, ok := tree[pid]
-		return p, ok
-	}
-	// The reacquire (tick) variant is the default under test — the suite's
-	// re-acquire coverage drives it. Read-only probe tests flip it off.
-	cfg.reacquire = true
-	return cfg
-}
-
-// T30 (Go side): a fenced/stale coord's tick fails the ownership proof.
-func TestLeaseCheckByAncestor_ProvenAndRefused(t *testing.T) {
-	setupHome(t)
-	const project = "rainier"
-	clk := &fakeClock{}
-	live := newFakeLiveness()
-
-	// Owner supervisor pid=500 (start 9001), tick pid=510 whose parent is 500.
-	owner := identity{Pid: 500, PidStart: 9001, AgentID: "coord", Project: project}
-	live.set(owner.Pid, owner.PidStart)
-	live.set(510, 9002)
-	tree := map[int]int{510: 500, 500: 1}
-	cfg := leaseCheckCfg(clk, live, tree)
-
-	writeEpochRaw(t, project, epochRecord{
-		Epoch: 4, State: stateActive, Owner: owner,
-		BootID: "test-boot-1", RenewedAtMono: clk.now(),
-	})
-
-	// PROVEN: tick (510) descends from the active owner (500).
-	if err := leaseCheckByAncestorWithCfg(project, 510, cfg); err != nil {
-		t.Fatalf("a tick under the active owner must pass, got %v", err)
-	}
-
-	// REFUSED #1: a fenced epoch (owner record now belongs to a NEW pid).
-	writeEpochRaw(t, project, epochRecord{
-		Epoch: 5, State: stateActive,
-		Owner:  identity{Pid: 999, PidStart: 7777, AgentID: "new", Project: project},
-		BootID: "test-boot-1", RenewedAtMono: clk.now(),
-	})
-	live.set(999, 7777)
-	if err := leaseCheckByAncestorWithCfg(project, 510, cfg); !errors.Is(err, ErrNotLeaseOwner) {
-		t.Fatalf("a tick NOT under the new owner must be refused, got %v", err)
-	}
-
-	// PROCEED: PID reuse — the recorded owner pid is now a DIFFERENT process
-	// (start-time mismatch). pidAlive(owner) is false -> holderHealthy false
-	// -> no live successor holds the lease -> PROCEED (the recycled-pid owner
-	// is provably dead, so there is no split-brain to guard against).
-	writeEpochRaw(t, project, epochRecord{
-		Epoch: 6, State: stateActive,
-		Owner:  identity{Pid: 500, PidStart: 9001, AgentID: "coord", Project: project},
-		BootID: "test-boot-1", RenewedAtMono: clk.now(),
-	})
-	live.set(500, 12345) // pid 500 recycled -> different start time -> owner dead
-	if err := leaseCheckByAncestorWithCfg(project, 510, cfg); err != nil {
-		t.Fatalf("a recycled-pid (dead) owner must PROCEED, got %v", err)
-	}
-}
-
-// codex PR4 [P1] (fresh-takeover window): a FRESH `fencing` record (a
-// candidate mid-takeover that may have killed/reparented the old supervisor)
-// must FENCE a caller that doesn't descend from the recorded owner — else
-// the old skill-side tick keeps writing DURING the takeover.
-func TestLeaseCheckByAncestor_FreshTakeoverFences(t *testing.T) {
-	setupHome(t)
-	const project = "rainier"
-	clk := &fakeClock{}
-	live := newFakeLiveness()
-	// A candidate (pid 800, live) is mid-takeover; owner=old (pid 500, now
-	// dead — killed by the takeover). The stale tick (pid 510) descends from
-	// the dead old supervisor, but the ancestor walk won't match a dead owner
-	// pid (it can still be in the tree, but the record is fencing not active).
-	live.set(800, 6000)                                  // candidate alive
-	cfg := leaseCheckCfg(clk, live, map[int]int{700: 1}) // caller 700 under nothing relevant
-	writeEpochRaw(t, project, epochRecord{
-		Epoch: 5, State: stateFencing,
-		Owner:     identity{Pid: 500, PidStart: 9001, AgentID: "old", Project: project},
-		Candidate: identity{Pid: 800, PidStart: 6000, AgentID: "cand", Project: project},
-		BootID:    "test-boot-1", RenewedAtMono: clk.now(),
-	})
-	if err := leaseCheckByAncestorWithCfg(project, 700, cfg); !errors.Is(err, ErrNotLeaseOwner) {
-		t.Fatalf("a fresh in-progress takeover must FENCE a non-owner tick, got %v", err)
-	}
-
-	// But an ABANDONED fencing record (candidate dead, past resume) is NOT a
-	// live takeover -> proceed (a successor will resume or a legacy tick runs).
-	live.kill(800)
-	clk.advance(cfg.ttl + 1)
-	if err := leaseCheckByAncestorWithCfg(project, 700, cfg); err != nil {
-		t.Fatalf("an abandoned (stale) fencing record must PROCEED, got %v", err)
-	}
-}
-
-// FENCE: a genuinely live successor (healthy active owner) that the caller
-// does NOT descend from — the real split-brain case the fence exists for.
-func TestLeaseCheckByAncestor_GenuineSuccessorFences(t *testing.T) {
-	setupHome(t)
-	const project = "rainier"
-	clk := &fakeClock{}
-	live := newFakeLiveness()
-	// New leader 999 is live + healthy; the old coord's tick (510) descends
-	// from the RETIRED old supervisor 500, not from 999.
-	live.set(999, 7777)
-	live.set(500, 9001)
-	cfg := leaseCheckCfg(clk, live, map[int]int{510: 500, 500: 1})
-	writeEpochRaw(t, project, epochRecord{
-		Epoch: 7, State: stateActive,
-		Owner:  identity{Pid: 999, PidStart: 7777, AgentID: "new", Project: project},
-		BootID: "test-boot-1", RenewedAtMono: clk.now(),
-	})
-	if err := leaseCheckByAncestorWithCfg(project, 510, cfg); !errors.Is(err, ErrNotLeaseOwner) {
-		t.Fatalf("a tick under the OLD coord while a NEW leader holds the lease must FENCE, got %v", err)
-	}
-}
-
-// Kill-route deletion (DESIGN-coord-lease-false-fence-prevention piece 1):
-// when the caller's OWN ancestor is the recorded owner and the record shows
-// a RIVAL (fresh in-progress takeover, live candidate) or a DELIBERATE
-// release, the caller must FENCE — a verdict that only ever skips the tick
-// (loop.py no longer kills) — with the stable branch tag in the error.
-func TestLeaseCheckByAncestor_OwnLeaseFencedSelfDemotes(t *testing.T) {
-	setupHome(t)
-	const project = "rainier"
-	clk := &fakeClock{}
-	live := newFakeLiveness()
-	owner := identity{Pid: 500, PidStart: 9001, AgentID: "coord", Project: project}
-	live.set(owner.Pid, owner.PidStart)
-	live.set(800, 6000) // live takeover candidate — the rival
-	tree := map[int]int{510: 500, 500: 1}
-	cfg := leaseCheckCfg(clk, live, tree)
-
-	// Plan test 3: fresh in-progress takeover (owner == my ancestor, live
-	// candidate) -> fence, tag own-expired-rival-fenced. No write.
-	writeEpochRaw(t, project, epochRecord{
-		Epoch: 5, State: stateFencing, Owner: owner,
-		Candidate: identity{Pid: 800, PidStart: 6000, AgentID: "cand", Project: project},
-		BootID:    "test-boot-1", RenewedAtMono: clk.now(),
-	})
-	err := leaseCheckByAncestorWithCfg(project, 510, cfg)
-	if !errors.Is(err, ErrNotLeaseOwner) {
-		t.Fatalf("a fresh own-ancestor takeover must fence, got %v", err)
-	}
-	if !strings.Contains(err.Error(), "own-expired-rival-fenced") {
-		t.Fatalf("fence must carry the own-expired-rival-fenced tag, got %v", err)
-	}
-	if got := readEpochFor(t, project); got.State != stateFencing || got.Epoch != 5 {
-		t.Fatalf("fence verdict must not write; got state=%s epoch=%d", got.State, got.Epoch)
-	}
-
-	// Plan test 3b: released / fenced_not_acquired -> never resurrected,
-	// tag own-released-fenced, no re-acquire write.
-	for _, st := range []string{stateReleased, stateFencedNotAcquired} {
-		writeEpochRaw(t, project, epochRecord{
-			Epoch: 4, State: st, Owner: owner,
-			BootID: "test-boot-1", RenewedAtMono: clk.now(),
-		})
-		err := leaseCheckByAncestorWithCfg(project, 510, cfg)
-		if !errors.Is(err, ErrNotLeaseOwner) {
-			t.Fatalf("state=%s: our own released lease must fence, got %v", st, err)
-		}
-		if !strings.Contains(err.Error(), "own-released-fenced") {
-			t.Fatalf("state=%s: fence must carry own-released-fenced, got %v", st, err)
-		}
-		if got := readEpochFor(t, project); got.State != st {
-			t.Fatalf("state=%s: a released record must never be resurrected, got state=%s", st, got.State)
-		}
-	}
-}
-
-// Plan test 1 (no-rival re-acquire): our own active lease expired (a pure
-// renewal stall) with NO rival -> lease-check RE-ACQUIRES in place at the
-// SAME epoch and the tick proceeds (nil verdict). Owner identity unchanged,
-// renewed_at fresh, host preserved. This replaces the old always-fence
-// behavior that stranded rival-free coords (rainier, 2x in 9h).
-func TestLeaseCheckByAncestor_OwnExpiredNoRivalReacquires(t *testing.T) {
-	setupHome(t)
-	const project = "rainier"
-	clk := &fakeClock{}
-	live := newFakeLiveness()
-	owner := identity{Pid: 500, PidStart: 9001, AgentID: "coord", Project: project}
-	live.set(owner.Pid, owner.PidStart)
-	cfg := leaseCheckCfg(clk, live, map[int]int{510: 500, 500: 1})
-	writeEpochRaw(t, project, epochRecord{
-		Epoch: 4, State: stateActive, Owner: owner, Host: "sup-host",
-		BootID: "test-boot-1", RenewedAtMono: clk.now(),
-	})
-	clk.advance(cfg.ttl + 1) // renewal stalled past TTL — no rival anywhere
-	if err := leaseCheckByAncestorWithCfg(project, 510, cfg); err != nil {
-		t.Fatalf("own expired lease with no rival must re-acquire and proceed, got %v", err)
-	}
-	rec := readEpochFor(t, project)
-	if rec.Epoch != 4 {
-		t.Errorf("re-acquire must keep the SAME epoch, got %d", rec.Epoch)
-	}
-	if rec.State != stateActive {
-		t.Errorf("state = %q, want active", rec.State)
-	}
-	if !rec.Owner.equal(owner) {
-		t.Errorf("owner identity must be unchanged, got %+v", rec.Owner)
-	}
-	if rec.RenewedAtMono != clk.now() {
-		t.Errorf("renewed_at_mono must be refreshed, got %d want %d", rec.RenewedAtMono, clk.now())
-	}
-	if rec.Host != "sup-host" {
-		t.Errorf("host must be preserved (the lease-check process has none), got %q", rec.Host)
-	}
-}
-
-// Plan test 2: after a no-rival re-acquire (expired-`active` sub-case) the
-// incumbent supervisor's heartbeat still holds the SAME epoch, so its next
-// beat renews normally — no self-demote (the whole point of not bumping).
-func TestLeaseCheckByAncestor_HeartbeatSurvivesReacquire(t *testing.T) {
-	setupHome(t)
-	const project = "rainier"
-	clk := &fakeClock{}
-	live := newFakeLiveness()
-	owner := identity{Pid: 500, PidStart: 9001, AgentID: "coord", Project: project}
-	live.set(owner.Pid, owner.PidStart)
-	cfg := leaseCheckCfg(clk, live, map[int]int{510: 500, 500: 1})
-	writeEpochRaw(t, project, epochRecord{
-		Epoch: 4, State: stateActive, Owner: owner,
-		BootID: "test-boot-1", RenewedAtMono: clk.now(),
-	})
-	clk.advance(cfg.ttl + 1)
-	if err := leaseCheckByAncestorWithCfg(project, 510, cfg); err != nil {
-		t.Fatalf("re-acquire failed: %v", err)
-	}
-	// The incumbent supervisor still believes epoch 4 — heartbeatOnce is
-	// driven directly (the ticker seam does not exist until d7bb).
-	paths, err := resolvePaths(project)
-	if err != nil {
-		t.Fatalf("resolvePaths: %v", err)
-	}
-	sup := &Lease{cfg: cfg, paths: paths, self: owner, host: "sup-host", boot: cfg.boot(), epoch: 4}
-	clk.advance(1)
-	ok, err := sup.heartbeatOnce()
-	if err != nil {
-		t.Fatalf("heartbeatOnce after re-acquire: %v", err)
-	}
-	if !ok {
-		t.Fatal("heartbeat must NOT self-demote after a same-epoch re-acquire")
-	}
-	if rec := readEpochFor(t, project); rec.RenewedAtMono != clk.now() {
-		t.Errorf("heartbeat must renew normally, renewed_at=%d want %d", rec.RenewedAtMono, clk.now())
-	}
-}
-
-// codex iter-4 [P1] (supersedes plan test 3c): a STALE fencing record with
-// a DEAD candidate is NOT re-acquirable — the incumbent heartbeat self-
-// demoted when the candidate fenced, so re-activating the record would
-// leave a lease nothing renews (expire-per-TTL churn ending in a spurious
-// steal from a healthy coord). It FENCES and awaits a successor resume.
-func TestLeaseCheckByAncestor_StaleFencingDeadCandidateFences(t *testing.T) {
-	setupHome(t)
-	const project = "rainier"
-	clk := &fakeClock{}
-	live := newFakeLiveness()
-	owner := identity{Pid: 500, PidStart: 9001, AgentID: "coord", Project: project}
-	live.set(owner.Pid, owner.PidStart)
-	cfg := leaseCheckCfg(clk, live, map[int]int{510: 500, 500: 1})
-	// Candidate 800 fenced to epoch 5 then died; the record went stale.
-	writeEpochRaw(t, project, epochRecord{
-		Epoch: 5, State: stateFencing, Owner: owner, Host: "orig-host",
-		Candidate: identity{Pid: 800, PidStart: 6000, AgentID: "cand", Project: project},
-		BootID:    "test-boot-1", RenewedAtMono: clk.now(),
-	})
-	clk.advance(cfg.ttl + 1) // stale fencing; candidate 800 not in live map -> dead
-	err := leaseCheckByAncestorWithCfg(project, 510, cfg)
-	if !errors.Is(err, ErrNotLeaseOwner) {
-		t.Fatalf("an abandoned takeover must fence (not re-acquire), got %v", err)
-	}
-	if !strings.Contains(err.Error(), "own-expired-rival-fenced") ||
-		!strings.Contains(err.Error(), "abandoned takeover") {
-		t.Fatalf("want abandoned-takeover fence with the rival tag, got %v", err)
-	}
-	rec := readEpochFor(t, project)
-	if rec.State != stateFencing || rec.Epoch != 5 {
-		t.Fatalf("fence must not write; got state=%s epoch=%d", rec.State, rec.Epoch)
-	}
-	if rec.Host != "orig-host" {
-		t.Errorf("record must be untouched, host=%q", rec.Host)
-	}
-}
-
-// Plan test 3d (CAS-failure verdicts): the record flips to released /
-// fenced_not_acquired between the probe read and the locked CAS re-read ->
-// NO write, fence verdict own-released-fenced. Never a bare-proceed, never
-// a retry loop.
-func TestLeaseCheckByAncestor_ReacquireCASFailReleasedFences(t *testing.T) {
-	setupHome(t)
-	const project = "rainier"
-	clk := &fakeClock{}
-	live := newFakeLiveness()
-	owner := identity{Pid: 500, PidStart: 9001, AgentID: "coord", Project: project}
-	live.set(owner.Pid, owner.PidStart)
-	cfg := leaseCheckCfg(clk, live, map[int]int{510: 500, 500: 1})
-	paths, err := resolvePaths(project)
-	if err != nil {
-		t.Fatalf("resolvePaths: %v", err)
-	}
-	l := &Lease{cfg: cfg, paths: paths, boot: cfg.boot()}
-
-	// prev is the probe snapshot: our expired active record.
-	prev := epochRecord{
-		Epoch: 4, State: stateActive, Owner: owner,
-		BootID: "test-boot-1", RenewedAtMono: clk.now(),
-	}
-	clk.advance(cfg.ttl + 1)
-	for _, st := range []string{stateReleased, stateFencedNotAcquired} {
-		// The record flipped to a terminal state in the probe->CAS window.
-		flipped := epochRecord{
-			Epoch: 4, State: st, Owner: owner,
-			BootID: "test-boot-1", RenewedAtMono: prev.RenewedAtMono,
-		}
-		writeEpochRaw(t, project, flipped)
-		err := l.reacquireOwnExpired(prev)
-		if !errors.Is(err, ErrNotLeaseOwner) {
-			t.Fatalf("state=%s mid-CAS: want fence verdict, got %v", st, err)
-		}
-		if !strings.Contains(err.Error(), "own-released-fenced") {
-			t.Fatalf("state=%s mid-CAS: want own-released-fenced tag, got %v", st, err)
-		}
-		if got := readEpochFor(t, project); got != flipped {
-			t.Fatalf("state=%s mid-CAS: record must be untouched, got %+v", st, got)
-		}
-	}
-}
-
-// Plan test 3e (own heartbeat recovers mid-CAS): the record flips back to
-// FRESH active (owner == ancestor, epoch unchanged) in the probe->CAS
-// window (d7bb's force-renew makes this race likelier) -> NO write, NO
-// fence: the recovered lease is healthy, the tick proceeds.
-func TestLeaseCheckByAncestor_ReacquireCASFreshActiveProceeds(t *testing.T) {
-	setupHome(t)
-	const project = "rainier"
-	clk := &fakeClock{}
-	live := newFakeLiveness()
-	owner := identity{Pid: 500, PidStart: 9001, AgentID: "coord", Project: project}
-	live.set(owner.Pid, owner.PidStart)
-	cfg := leaseCheckCfg(clk, live, map[int]int{510: 500, 500: 1})
-	paths, err := resolvePaths(project)
-	if err != nil {
-		t.Fatalf("resolvePaths: %v", err)
-	}
-	l := &Lease{cfg: cfg, paths: paths, boot: cfg.boot()}
-
-	prev := epochRecord{ // probe snapshot: expired active
-		Epoch: 4, State: stateActive, Owner: owner,
-		BootID: "test-boot-1", RenewedAtMono: clk.now(),
-	}
-	clk.advance(cfg.ttl + 1)
-	// The supervisor's own heartbeat recovered: fresh renewed_at, same
-	// epoch + owner. The distinctive stamp proves no re-acquire write ran.
-	recovered := epochRecord{
-		Epoch: 4, State: stateActive, Owner: owner, Host: "hb-host",
-		BootID: "test-boot-1", RenewedAtMono: clk.now() - 1, RenewedAtWall: 424242,
-	}
-	writeEpochRaw(t, project, recovered)
-	if err := l.reacquireOwnExpired(prev); err != nil {
-		t.Fatalf("a recovered healthy own lease must proceed without fencing, got %v", err)
-	}
-	if got := readEpochFor(t, project); got != recovered {
-		t.Fatalf("no write allowed when the lease recovered; got %+v", got)
-	}
-}
-
-// Plan test 3f (live hung candidate is a rival): a fencing record stale past
-// TTL whose candidate pid is ALIVE can still resume its takeover and run the
-// kill phase — it is a rival: fence, do NOT re-acquire. The same record with
-// a dead candidate re-acquires.
-func TestLeaseCheckByAncestor_LiveHungCandidateIsRival(t *testing.T) {
-	setupHome(t)
-	const project = "rainier"
-	clk := &fakeClock{}
-	live := newFakeLiveness()
-	owner := identity{Pid: 500, PidStart: 9001, AgentID: "coord", Project: project}
-	live.set(owner.Pid, owner.PidStart)
-	live.set(800, 6000) // hung-but-ALIVE candidate
-	cfg := leaseCheckCfg(clk, live, map[int]int{510: 500, 500: 1})
-	writeEpochRaw(t, project, epochRecord{
-		Epoch: 5, State: stateFencing, Owner: owner,
-		Candidate: identity{Pid: 800, PidStart: 6000, AgentID: "cand", Project: project},
-		BootID:    "test-boot-1", RenewedAtMono: clk.now(),
-	})
-	clk.advance(cfg.ttl + 1) // record stale, but the candidate still lives
-
-	err := leaseCheckByAncestorWithCfg(project, 510, cfg)
-	if !errors.Is(err, ErrNotLeaseOwner) {
-		t.Fatalf("a live hung candidate is a rival -> fence, got %v", err)
-	}
-	if !strings.Contains(err.Error(), "own-expired-rival-fenced") {
-		t.Fatalf("want own-expired-rival-fenced tag, got %v", err)
-	}
-	if got := readEpochFor(t, project); got.State != stateFencing {
-		t.Fatalf("fence must not write, got state=%s", got.State)
-	}
-
-	// Same record, candidate now DEAD -> no RIVAL fence, but a fencing
-	// record is still not re-acquirable (abandoned takeover; codex iter-4
-	// [P1]) — it fences with the abandoned message, awaiting a successor.
-	live.kill(800)
-	err = leaseCheckByAncestorWithCfg(project, 510, cfg)
-	if !errors.Is(err, ErrNotLeaseOwner) {
-		t.Fatalf("dead-candidate fencing must still fence (abandoned), got %v", err)
-	}
-	if !strings.Contains(err.Error(), "abandoned takeover") {
-		t.Fatalf("want the abandoned-takeover fence, got %v", err)
-	}
-	if got := readEpochFor(t, project); got.State != stateFencing || got.Epoch != 5 {
-		t.Fatalf("fence must not write, got state=%s epoch=%d", got.State, got.Epoch)
-	}
-}
-
-// Plan test 4, amended by codex iter-4 [P1] (fence then rival evaporates):
-// tick 1 sees a fresh takeover -> fence verdict (skip, stay alive). The
-// rival then evaporates (candidate dies, record goes stale). Tick 2 STILL
-// fences — the abandoned fencing record is not re-acquirable (the
-// incumbent heartbeat is gone); recovery belongs to a successor resuming
-// the takeover. Never a bare-proceed on an expired record.
-func TestLeaseCheckByAncestor_FenceThenRivalEvaporatesStaysFenced(t *testing.T) {
-	setupHome(t)
-	const project = "rainier"
-	clk := &fakeClock{}
-	live := newFakeLiveness()
-	owner := identity{Pid: 500, PidStart: 9001, AgentID: "coord", Project: project}
-	live.set(owner.Pid, owner.PidStart)
-	live.set(800, 6000)
-	cfg := leaseCheckCfg(clk, live, map[int]int{510: 500, 500: 1})
-	writeEpochRaw(t, project, epochRecord{
-		Epoch: 5, State: stateFencing, Owner: owner,
-		Candidate: identity{Pid: 800, PidStart: 6000, AgentID: "cand", Project: project},
-		BootID:    "test-boot-1", RenewedAtMono: clk.now(),
-	})
-
-	// Tick 1: fresh rival -> fence.
-	if err := leaseCheckByAncestorWithCfg(project, 510, cfg); !errors.Is(err, ErrNotLeaseOwner) {
-		t.Fatalf("tick 1 must fence on the fresh takeover, got %v", err)
-	}
-
-	// The takeover evaporates: candidate dies, record goes stale.
-	live.kill(800)
-	clk.advance(cfg.ttl + 1)
-
-	// Tick 2: still fenced (abandoned takeover), record untouched.
-	err := leaseCheckByAncestorWithCfg(project, 510, cfg)
-	if !errors.Is(err, ErrNotLeaseOwner) {
-		t.Fatalf("tick 2 must stay fenced on the abandoned record, got %v", err)
-	}
-	if !strings.Contains(err.Error(), "abandoned takeover") {
-		t.Fatalf("want the abandoned-takeover fence, got %v", err)
-	}
-	if got := readEpochFor(t, project); got.State != stateFencing {
-		t.Fatalf("no write allowed (no bare-proceed either), got state=%s", got.State)
-	}
-}
-
-// Plan test 5 (CAS race, both orderings): incumbent re-acquire vs candidate
-// takeOver serialize on coordinator.epoch.lock — exactly one wins, and the
-// loser stands down without writing.
-func TestLeaseCheckByAncestor_ReacquireVsTakeoverSerialized(t *testing.T) {
-	setupHome(t)
-	const project = "rainier"
-	clk := &fakeClock{}
-	live := newFakeLiveness()
-	owner := identity{Pid: 500, PidStart: 9001, AgentID: "coord", Project: project}
-	cand := identity{Pid: 800, PidStart: 6000, AgentID: "cand", Project: project}
-	live.set(owner.Pid, owner.PidStart)
-	live.set(cand.Pid, cand.PidStart)
-	cfg := leaseCheckCfg(clk, live, map[int]int{510: 500, 500: 1})
-	paths, err := resolvePaths(project)
-	if err != nil {
-		t.Fatalf("resolvePaths: %v", err)
-	}
-
-	// Shared starting point: our expired active record @ epoch 4.
-	stale := epochRecord{
-		Epoch: 4, State: stateActive, Owner: owner,
-		BootID: "test-boot-1", RenewedAtMono: clk.now(),
-	}
-	clk.advance(cfg.ttl + 1)
-
-	// Ordering A — candidate fenced FIRST (epoch bumped to 5, fresh fencing):
-	// the incumbent's re-acquire CAS re-read sees the moved epoch -> fence
-	// verdict, no write.
-	writeEpochRaw(t, project, epochRecord{
-		Epoch: 5, State: stateFencing, Owner: owner, Candidate: cand,
-		BootID: "test-boot-1", RenewedAtMono: clk.now(),
-	})
-	incumbent := &Lease{cfg: cfg, paths: paths, boot: cfg.boot()}
-	err = incumbent.reacquireOwnExpired(stale)
-	if !errors.Is(err, ErrNotLeaseOwner) {
-		t.Fatalf("ordering A: loser incumbent must get ErrNotLeaseOwner, got %v", err)
-	}
-	if got := readEpochFor(t, project); got.Epoch != 5 || got.State != stateFencing {
-		t.Fatalf("ordering A: winner's record must stand, got epoch=%d state=%s", got.Epoch, got.State)
-	}
-
-	// Ordering B — incumbent re-acquired FIRST (fresh active @ epoch 4): the
-	// candidate's takeOver fence closure re-reads under epoch.lock, sees a
-	// HEALTHY active holder (lease.go:646 recheck — no epoch change needed)
-	// and stands down without writing.
-	writeEpochRaw(t, project, stale) // reset to the expired record
-	if err := leaseCheckByAncestorWithCfg(project, 510, cfg); err != nil {
-		t.Fatalf("ordering B: incumbent re-acquire failed: %v", err)
-	}
-	candidate := &Lease{cfg: cfg, paths: paths, self: cand, host: "cand-host", boot: cfg.boot()}
-	done, acquired, terr := candidate.takeOver(stale) // stale pre-race snapshot
-	if terr != nil {
-		t.Fatalf("ordering B: takeOver returned err: %v", terr)
-	}
-	if acquired {
-		t.Fatal("ordering B: loser candidate must NOT acquire")
-	}
-	_ = done // stand-down shape: done=false -> outer loop re-reads and yields
-	rec := readEpochFor(t, project)
-	if rec.Epoch != 4 || rec.State != stateActive || !rec.Owner.equal(owner) {
-		t.Fatalf("ordering B: incumbent's re-acquired record must stand, got %+v", rec)
-	}
-}
-
-// Never bare-proceed: if coordinator.epoch.lock stays busy for the whole
-// budget during a re-acquire (a writer is mid-flight), the verdict is a
-// FENCE (skip this tick, re-check next), not a proceed on an expired record.
-func TestLeaseCheckByAncestor_ReacquireSerializerBusyFences(t *testing.T) {
-	setupHome(t)
-	const project = "rainier"
-	clk := &fakeClock{}
-	live := newFakeLiveness()
-	owner := identity{Pid: 500, PidStart: 9001, AgentID: "coord", Project: project}
-	live.set(owner.Pid, owner.PidStart)
-	cfg := leaseCheckCfg(clk, live, map[int]int{510: 500, 500: 1})
-	writeEpochRaw(t, project, epochRecord{
-		Epoch: 4, State: stateActive, Owner: owner,
-		BootID: "test-boot-1", RenewedAtMono: clk.now(),
-	})
-	clk.advance(cfg.ttl + 1)
-
-	// Hold the epoch serializer from the test so the CAS can't win.
-	paths, err := resolvePaths(project)
-	if err != nil {
-		t.Fatalf("resolvePaths: %v", err)
-	}
-	if err := os.MkdirAll(filepath.Dir(paths.epochLock), 0o755); err != nil {
-		t.Fatalf("mkdir: %v", err)
-	}
-	f, err := os.OpenFile(paths.epochLock, os.O_CREATE|os.O_RDWR, 0o644)
-	if err != nil {
-		t.Fatalf("open epoch.lock: %v", err)
-	}
-	defer func() { _ = f.Close() }()
-	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
-		t.Fatalf("flock epoch.lock: %v", err)
-	}
-
-	oldBudget := epochLockBudget
-	epochLockBudget = 30 * time.Millisecond
-	t.Cleanup(func() { epochLockBudget = oldBudget })
-
-	verr := leaseCheckByAncestorWithCfg(project, 510, cfg)
-	if !errors.Is(verr, ErrNotLeaseOwner) {
-		t.Fatalf("serializer-busy re-acquire must FENCE (never bare-proceed), got %v", verr)
-	}
-	if got := readEpochFor(t, project); got.State != stateActive || got.RenewedAtMono == clk.now() {
-		t.Fatalf("no write may land while the serializer is held, got %+v", got)
-	}
-}
-
-// Plan tests 6 + 6b: the two non-ancestor fence branches carry their stable
-// tags — different-owner-fenced (healthy foreign leader) and takeover-fenced
-// (in-progress takeover, owner not my ancestor).
-func TestLeaseCheckByAncestor_NonAncestorBranchTags(t *testing.T) {
-	setupHome(t)
-	const project = "rainier"
-	clk := &fakeClock{}
-	live := newFakeLiveness()
-	cfg := leaseCheckCfg(clk, live, map[int]int{700: 1}) // caller under nothing relevant
-
-	// 6: healthy foreign active owner -> different-owner-fenced.
-	live.set(999, 7777)
-	writeEpochRaw(t, project, epochRecord{
-		Epoch: 7, State: stateActive,
-		Owner:  identity{Pid: 999, PidStart: 7777, AgentID: "new", Project: project},
-		BootID: "test-boot-1", RenewedAtMono: clk.now(),
-	})
-	err := leaseCheckByAncestorWithCfg(project, 700, cfg)
-	if !errors.Is(err, ErrNotLeaseOwner) {
-		t.Fatalf("healthy foreign owner must fence, got %v", err)
-	}
-	if !strings.Contains(err.Error(), "different-owner-fenced") {
-		t.Fatalf("want different-owner-fenced tag, got %v", err)
-	}
-
-	// 6b: fresh in-progress takeover, owner NOT my ancestor -> takeover-fenced.
-	live.set(800, 6000)
-	writeEpochRaw(t, project, epochRecord{
-		Epoch: 8, State: stateFencing,
-		Owner:     identity{Pid: 500, PidStart: 9001, AgentID: "old", Project: project},
-		Candidate: identity{Pid: 800, PidStart: 6000, AgentID: "cand", Project: project},
-		BootID:    "test-boot-1", RenewedAtMono: clk.now(),
-	})
-	err = leaseCheckByAncestorWithCfg(project, 700, cfg)
-	if !errors.Is(err, ErrNotLeaseOwner) {
-		t.Fatalf("non-ancestor in-progress takeover must fence, got %v", err)
-	}
-	if !strings.Contains(err.Error(), "takeover-fenced") {
-		t.Fatalf("want takeover-fenced tag, got %v", err)
-	}
-}
-
-// codex PR4 [P1]: no lease record at all -> legacy/non-wrapped coord ->
-// PROCEED (the reversibility contract; fencing it would wedge the pre-lease
-// path).
-func TestLeaseCheckByAncestor_NoRecordProceeds(t *testing.T) {
-	setupHome(t)
-	clk := &fakeClock{}
-	live := newFakeLiveness()
-	cfg := leaseCheckCfg(clk, live, map[int]int{})
-	if err := leaseCheckByAncestorWithCfg("rainier", os.Getpid(), cfg); err != nil {
-		t.Fatalf("no lease record must PROCEED (legacy path), got %v", err)
-	}
-}
-
-// An expired (TTL-stale) active record also means no live successor holds
-// the lease -> PROCEED, not fence.
-func TestLeaseCheckByAncestor_ExpiredOwnerProceeds(t *testing.T) {
-	setupHome(t)
-	const project = "rainier"
-	clk := &fakeClock{}
-	live := newFakeLiveness()
-	owner := identity{Pid: 500, PidStart: 9001, AgentID: "coord", Project: project}
-	live.set(owner.Pid, owner.PidStart)
-	cfg := leaseCheckCfg(clk, live, map[int]int{700: 1}) // caller 700 NOT under owner
-	writeEpochRaw(t, project, epochRecord{
-		Epoch: 4, State: stateActive, Owner: owner,
-		BootID: "test-boot-1", RenewedAtMono: clk.now(),
-	})
-	clk.advance(cfg.ttl + 1) // expire the owner's TTL
-	if err := leaseCheckByAncestorWithCfg(project, 700, cfg); err != nil {
-		t.Fatalf("an expired owner must PROCEED (no live successor), got %v", err)
-	}
-}
-
-// keyFile must map distinct keys to distinct files even when they sanitize
-// to the same basename (slash vs underscore).
 func TestKeyFile_NoCollision(t *testing.T) {
 	a := keyFile("a/b", ".intent.json")
 	b := keyFile("a_b", ".intent.json")
@@ -1253,259 +602,175 @@ func TestKeyFile_NoCollision(t *testing.T) {
 	}
 }
 
-// Reviewer iter-2 (testing specialist): an own-ancestor record with an
-// UNRECOGNIZED state string fences conservatively (own-expired-rival tag,
-// no write) — at BOTH the probe switch's default branch and
-// reacquireOwnExpired's CAS re-read.
-func TestLeaseCheckByAncestor_UnrecognizedStateFencesConservatively(t *testing.T) {
-	setupHome(t)
-	const project = "rainier"
-	clk := &fakeClock{}
-	live := newFakeLiveness()
-	owner := identity{Pid: 500, PidStart: 9001, AgentID: "coord", Project: project}
-	live.set(owner.Pid, owner.PidStart)
-	cfg := leaseCheckCfg(clk, live, map[int]int{510: 500, 500: 1})
+// ---- skill-side ownership proof: LeaseCheckByAncestor (D7, flock-only) ----
+//
+// PR-2 moved the tick / fleet-guard producer fence off the (no-longer-written)
+// epoch onto the FLOCK. leaseCheckByAncestorWithCfg reuses the LOCK_SH busy-
+// probe (NOT the body alone — a stale body after Release must not be trusted)
+// then walks the caller's ppid chain to the flock body's holder pid.
 
-	// Probe switch default branch: state "bogus" -> fence, no write.
-	bogus := epochRecord{
-		Epoch: 4, State: "bogus", Owner: owner,
-		BootID: "test-boot-1", RenewedAtMono: clk.now(),
+// deepChainTree builds a child->parent ppid map walking from startPid to
+// endPid over exactly hops edges, via synthetic intermediate pids (20000+)
+// that cannot collide with this file's other fixture pids. Used by T12g to
+// place holderPid past leaseCheckByAncestorWithCfg's maxDepth=64 bound.
+func deepChainTree(startPid, endPid, hops int) map[int]int {
+	tree := make(map[int]int, hops)
+	pid := startPid
+	for i := 0; i < hops-1; i++ {
+		next := 20000 + i
+		tree[pid] = next
+		pid = next
 	}
-	writeEpochRaw(t, project, bogus)
-	err := leaseCheckByAncestorWithCfg(project, 510, cfg)
-	if !errors.Is(err, ErrNotLeaseOwner) {
-		t.Fatalf("unrecognized state must fence conservatively, got %v", err)
-	}
-	if !strings.Contains(err.Error(), "own-expired-rival-fenced") {
-		t.Fatalf("want conservative own-expired-rival-fenced tag, got %v", err)
-	}
-	if got := readEpochFor(t, project); got != bogus {
-		t.Fatalf("conservative fence must not write, got %+v", got)
-	}
+	tree[pid] = endPid
+	return tree
+}
 
-	// CAS re-read: the record flips to "bogus" in the probe->CAS window
-	// (same epoch + owner) -> fence verdict, no write, never a guess-write.
-	paths, perr := resolvePaths(project)
-	if perr != nil {
-		t.Fatalf("resolvePaths: %v", perr)
+// leaseCheckCfg builds a lease-check cfg with an injected getppid tree (child ->
+// parent; a pid absent from the map walks to 1). There is no --reacquire flag
+// any more — holding the flock IS ownership, so the read-only probe never
+// renews.
+func leaseCheckCfg(live *fakeLiveness, tree map[int]int) leaseConfig {
+	cfg := testCfg(&fakeClock{}, live)
+	cfg.ppid = func(pid int) (int, bool) {
+		p, ok := tree[pid]
+		return p, ok
 	}
-	l := &Lease{cfg: cfg, paths: paths, boot: cfg.boot()}
-	prev := epochRecord{
-		Epoch: 4, State: stateActive, Owner: owner,
-		BootID: "test-boot-1", RenewedAtMono: clk.now(),
+	return cfg
+}
+
+// TestLeaseCheckByAncestor_FlockProof (T12): the flock is the discriminant.
+//
+//	flock HELD + caller descends from the body's holder   -> PROCEED
+//	flock HELD + caller is NOT a descendant               -> FENCE (different-owner)
+//	flock HELD + body torn/pid-less                        -> FENCE (held-unreadable)
+//	flock FREE (probe acquires) + a stale body persists    -> FENCE (flock-free)
+//	flock file never created (ENOENT)                      -> PROCEED (legacy)
+func TestLeaseCheckByAncestor_FlockProof(t *testing.T) {
+	const holderPid, holderStart = 500, int64(9001)
+	const callerPid = 510
+	body := &flockBody{Pid: holderPid, PidStart: holderStart, AgentID: "coord", Project: "rainier", BootID: "b"}
+	cases := []struct {
+		name    string
+		setup   func(t *testing.T, project string)
+		tree    map[int]int
+		wantTag string // "" => PROCEED
+	}{
+		{
+			name:    "T12a_descendant_of_held_holder_proceeds",
+			setup:   func(t *testing.T, p string) { heldFlock(t, p, body) },
+			tree:    map[int]int{callerPid: holderPid, holderPid: 1},
+			wantTag: "",
+		},
+		{
+			name:    "T12b_stranger_of_held_holder_fences_different_owner",
+			setup:   func(t *testing.T, p string) { heldFlock(t, p, body) },
+			tree:    map[int]int{callerPid: 1},
+			wantTag: fenceTagDifferentOwner,
+		},
+		{
+			name:    "T12c_free_flock_stale_body_fences_flock_free",
+			setup:   func(t *testing.T, p string) { writeFlockBodyRaw(t, p, *body) }, // body on disk, NOT held
+			tree:    map[int]int{callerPid: holderPid, holderPid: 1},
+			wantTag: fenceTagFlockFree,
+		},
+		{
+			name:    "T12d_enoent_never_created_proceeds",
+			setup:   func(t *testing.T, p string) {}, // nothing — no flock file
+			tree:    nil,
+			wantTag: "",
+		},
+		{
+			name:    "T12e_held_torn_body_fences_unreadable",
+			setup:   func(t *testing.T, p string) { heldFlock(t, p, nil) }, // empty body on a held flock
+			tree:    map[int]int{callerPid: 1},
+			wantTag: fenceTagFlockHeldUnreadable,
+		},
+		{
+			// Review testing-specialist gap: the bounded ppid walk (maxDepth=64,
+			// the documented safety net against a ppid cycle or a pathologically
+			// deep tree) had no test actually driving a cycle or an over-depth
+			// chain. A 3-node cycle that never reaches holderPid must terminate
+			// (not hang) within maxDepth iterations and fence, never PROCEED.
+			name:    "T12f_ppid_cycle_bounded_by_maxDepth_fences",
+			setup:   func(t *testing.T, p string) { heldFlock(t, p, body) },
+			tree:    map[int]int{callerPid: 511, 511: 512, 512: callerPid},
+			wantTag: fenceTagDifferentOwner,
+		},
+		{
+			// holderPid IS a true ancestor of callerPid here, but only past
+			// depth 64 — the walk must give up at the bound and fence rather
+			// than walk arbitrarily deep. Proves maxDepth is a real limit, not
+			// a documented-but-untested one.
+			name:    "T12g_chain_deeper_than_maxDepth_fences_even_though_holder_is_a_true_ancestor",
+			setup:   func(t *testing.T, p string) { heldFlock(t, p, body) },
+			tree:    deepChainTree(callerPid, holderPid, 200),
+			wantTag: fenceTagDifferentOwner,
+		},
 	}
-	clk.advance(cfg.ttl + 1)
-	writeEpochRaw(t, project, bogus)
-	err = l.reacquireOwnExpired(prev)
-	if !errors.Is(err, ErrNotLeaseOwner) {
-		t.Fatalf("unrecognized state mid-CAS must fence, got %v", err)
-	}
-	if !strings.Contains(err.Error(), "own-expired-rival-fenced") {
-		t.Fatalf("want own-expired-rival-fenced tag mid-CAS, got %v", err)
-	}
-	if got := readEpochFor(t, project); got != bogus {
-		t.Fatalf("mid-CAS fence must not write, got %+v", got)
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			setupHome(t)
+			const project = "rainier"
+			live := newFakeLiveness()
+			live.set(holderPid, holderStart) // the flock holder is a live process
+			live.set(callerPid, 9002)
+			tc.setup(t, project)
+			cfg := leaseCheckCfg(live, tc.tree)
+			err := leaseCheckByAncestorWithCfg(project, callerPid, cfg)
+			if tc.wantTag == "" {
+				if err != nil {
+					t.Fatalf("want PROCEED, got %v", err)
+				}
+				return
+			}
+			if !errors.Is(err, ErrNotLeaseOwner) {
+				t.Fatalf("want a fence (ErrNotLeaseOwner), got %v", err)
+			}
+			if !strings.Contains(err.Error(), tc.wantTag) {
+				t.Fatalf("fence tag = %v, want %q", err, tc.wantTag)
+			}
+		})
 	}
 }
 
-// codex iter-2 [P2]: a CROSS-BOOT own record must NEVER be re-acquired —
-// pid_start values are only comparable within a boot, so the ancestor
-// match is not a valid ownership proof for a previous boot's record (a
-// recycled pid could coincidentally match). Fence, no write, both at the
-// probe and at the CAS re-read.
-func TestLeaseCheckByAncestor_CrossBootExpiredFences(t *testing.T) {
+// TestLeaseCheckByAncestor_RecycledHolderPidFences: the flock is held but the
+// live process at the body's pid has a DIFFERENT start time (pid reuse) — the
+// caller cannot prove it descends from the real holder, so fence.
+func TestLeaseCheckByAncestor_RecycledHolderPidFences(t *testing.T) {
 	setupHome(t)
 	const project = "rainier"
-	clk := &fakeClock{}
+	const holderPid, holderStart = 500, int64(9001)
+	const callerPid = 510
+	heldFlock(t, project, &flockBody{Pid: holderPid, PidStart: holderStart, AgentID: "coord", Project: project, BootID: "b"})
 	live := newFakeLiveness()
-	owner := identity{Pid: 500, PidStart: 9001, AgentID: "coord", Project: project}
-	live.set(owner.Pid, owner.PidStart)
-	cfg := leaseCheckCfg(clk, live, map[int]int{510: 500, 500: 1})
-	crossBoot := epochRecord{
-		Epoch: 4, State: stateActive, Owner: owner, Host: "old-host",
-		BootID: "prev-boot", RenewedAtMono: clk.now(), // fresh stamp, WRONG boot
-	}
-	writeEpochRaw(t, project, crossBoot)
-	err := leaseCheckByAncestorWithCfg(project, 510, cfg)
-	if !errors.Is(err, ErrNotLeaseOwner) {
-		t.Fatalf("a cross-boot record must fence (pid identity unprovable), got %v", err)
-	}
-	if !strings.Contains(err.Error(), "own-expired-rival-fenced") {
-		t.Fatalf("want conservative own-expired-rival-fenced tag, got %v", err)
-	}
-	if got := readEpochFor(t, project); got != crossBoot {
-		t.Fatalf("cross-boot fence must not write, got %+v", got)
-	}
-
-	// CAS mirror: prev same-boot at probe, record flips to cross-boot in
-	// the window (defensive) -> fence, no write.
-	paths, perr := resolvePaths(project)
-	if perr != nil {
-		t.Fatalf("resolvePaths: %v", perr)
-	}
-	l := &Lease{cfg: cfg, paths: paths, boot: cfg.boot()}
-	prev := epochRecord{
-		Epoch: 4, State: stateActive, Owner: owner,
-		BootID: "test-boot-1", RenewedAtMono: clk.now(),
-	}
-	clk.advance(cfg.ttl + 1)
-	writeEpochRaw(t, project, crossBoot)
-	if err := l.reacquireOwnExpired(prev); !errors.Is(err, ErrNotLeaseOwner) {
-		t.Fatalf("cross-boot mid-CAS must fence, got %v", err)
-	}
-	if got := readEpochFor(t, project); got != crossBoot {
-		t.Fatalf("cross-boot mid-CAS must not write, got %+v", got)
+	live.set(holderPid, 12345) // pid 500 recycled -> start-time mismatch vs the body
+	live.set(callerPid, 9002)
+	cfg := leaseCheckCfg(live, map[int]int{callerPid: holderPid, holderPid: 1})
+	if err := leaseCheckByAncestorWithCfg(project, callerPid, cfg); !errors.Is(err, ErrNotLeaseOwner) {
+		t.Fatalf("a recycled holder pid must FENCE (not a provable ancestor), got %v", err)
 	}
 }
 
-// codex iter-2 [P1]: the READ-ONLY probe (no cfg.reacquire — every caller
-// except the coord tick, e.g. fleet-guard's per-turn producer fence) must
-// FENCE an own expired no-rival lease WITHOUT renewing it. A check that
-// renews as a side effect would let a wedged coord's still-talking claude
-// engine keep the lease fresh forever and block a standby takeover.
-func TestLeaseCheckByAncestor_ReadOnlyProbeNeverRenews(t *testing.T) {
+// TestLeaseCheckByAncestor_ReadOnlyNeverRenews (T12 read-only property): the
+// probe never mutates the flock — the epoch's --reacquire renew path is gone, so
+// a PROCEED leaves the flock body byte-identical.
+func TestLeaseCheckByAncestor_ReadOnlyNeverRenews(t *testing.T) {
 	setupHome(t)
 	const project = "rainier"
-	clk := &fakeClock{}
+	const holderPid, holderStart = 500, int64(9001)
+	const callerPid = 510
+	heldFlock(t, project, &flockBody{Pid: holderPid, PidStart: holderStart, AgentID: "coord", Project: project, BootID: "b"})
+	paths, _ := resolvePaths(project)
+	before, _ := os.ReadFile(paths.flock)
 	live := newFakeLiveness()
-	owner := identity{Pid: 500, PidStart: 9001, AgentID: "coord", Project: project}
-	live.set(owner.Pid, owner.PidStart)
-	cfg := leaseCheckCfg(clk, live, map[int]int{510: 500, 500: 1})
-	cfg.reacquire = false // the read-only default every non-tick caller gets
-	stale := epochRecord{
-		Epoch: 4, State: stateActive, Owner: owner,
-		BootID: "test-boot-1", RenewedAtMono: clk.now(),
+	live.set(holderPid, holderStart)
+	live.set(callerPid, 9002)
+	cfg := leaseCheckCfg(live, map[int]int{callerPid: holderPid, holderPid: 1})
+	if err := leaseCheckByAncestorWithCfg(project, callerPid, cfg); err != nil {
+		t.Fatalf("want PROCEED, got %v", err)
 	}
-	writeEpochRaw(t, project, stale)
-	clk.advance(cfg.ttl + 1)
-
-	err := leaseCheckByAncestorWithCfg(project, 510, cfg)
-	if !errors.Is(err, ErrNotLeaseOwner) {
-		t.Fatalf("read-only probe of an own expired lease must fence, got %v", err)
-	}
-	if !strings.Contains(err.Error(), "own-expired-readonly-fenced") {
-		t.Fatalf("want own-expired-readonly-fenced tag, got %v", err)
-	}
-	if got := readEpochFor(t, project); got != stale {
-		t.Fatalf("read-only probe must not write, got %+v", got)
-	}
-
-	// A fresh healthy own lease still passes read-only (no regression for
-	// fleet-guard's producer fence on a healthy coord).
-	writeEpochRaw(t, project, epochRecord{
-		Epoch: 4, State: stateActive, Owner: owner,
-		BootID: "test-boot-1", RenewedAtMono: clk.now(),
-	})
-	if err := leaseCheckByAncestorWithCfg(project, 510, cfg); err != nil {
-		t.Fatalf("read-only probe of a healthy own lease must pass, got %v", err)
-	}
-}
-
-// Reviewer iter-3 (adversarial F5): the recorded owner DIES in the
-// probe->CAS window. The re-acquire must NOT publish a fresh `active`
-// record for a corpse (holderHealthy readers + the STONITH live-leader
-// gate would report a dead leader for up to TTL) — fence, no write.
-func TestLeaseCheckByAncestor_ReacquireOwnerDiedMidCASFences(t *testing.T) {
-	setupHome(t)
-	const project = "rainier"
-	clk := &fakeClock{}
-	live := newFakeLiveness()
-	owner := identity{Pid: 500, PidStart: 9001, AgentID: "coord", Project: project}
-	live.set(owner.Pid, owner.PidStart)
-	cfg := leaseCheckCfg(clk, live, map[int]int{510: 500, 500: 1})
-	paths, err := resolvePaths(project)
-	if err != nil {
-		t.Fatalf("resolvePaths: %v", err)
-	}
-	l := &Lease{cfg: cfg, paths: paths, boot: cfg.boot()}
-
-	prev := epochRecord{ // probe snapshot: expired active, owner alive
-		Epoch: 4, State: stateActive, Owner: owner,
-		BootID: "test-boot-1", RenewedAtMono: clk.now(),
-	}
-	clk.advance(cfg.ttl + 1)
-	stale := prev
-	writeEpochRaw(t, project, stale)
-	live.kill(owner.Pid) // supervisor dies between probe and CAS
-
-	verr := l.reacquireOwnExpired(prev)
-	if !errors.Is(verr, ErrNotLeaseOwner) {
-		t.Fatalf("a dead owner must never be resurrected fresh-active, got %v", verr)
-	}
-	if !strings.Contains(verr.Error(), "own-expired-rival-fenced") {
-		t.Fatalf("want conservative own-expired-rival-fenced tag, got %v", verr)
-	}
-	if got := readEpochFor(t, project); got != stale {
-		t.Fatalf("no write may land for a dead owner, got %+v", got)
-	}
-}
-
-// Reviewer iter-3 (adversarial F6): a malformed fencing record with a ZERO
-// candidate is NOT a rival (no provable takeover), and that verdict must
-// come from the pidAlive clause — never from the self-equal short-circuit
-// accidentally matching the lease-check probe's zero self identity.
-func TestOwnExpiredRival_ZeroCandidateIsNotARival(t *testing.T) {
-	setupHome(t)
-	clk := &fakeClock{}
-	live := newFakeLiveness()
-	cfg := leaseCheckCfg(clk, live, map[int]int{})
-	paths, err := resolvePaths("rainier")
-	if err != nil {
-		t.Fatalf("resolvePaths: %v", err)
-	}
-	// Zero self — exactly the shape leaseCheckByAncestorWithCfg builds.
-	l := &Lease{cfg: cfg, paths: paths, boot: cfg.boot()}
-	rec := epochRecord{
-		Epoch: 5, State: stateFencing, // fresh, in budget, candidate zero
-		Owner:  identity{Pid: 500, PidStart: 9001, AgentID: "coord", Project: "rainier"},
-		BootID: "test-boot-1", RenewedAtMono: clk.now(),
-	}
-	if l.ownExpiredRival(rec) {
-		t.Fatal("a zero-candidate fencing record has no provable rival; must be re-acquirable")
-	}
-	// And the guarded short-circuit must still fire for a REAL self match:
-	// a candidate retrying its own fresh takeover reads it as resumable.
-	cand := identity{Pid: 800, PidStart: 6000, AgentID: "cand", Project: "rainier"}
-	live.set(cand.Pid, cand.PidStart)
-	lc := &Lease{cfg: cfg, paths: paths, self: cand, boot: cfg.boot()}
-	own := rec
-	own.Candidate = cand
-	if !lc.transientResumable(own) {
-		t.Fatal("a candidate's own fresh fencing record must stay resumable (self short-circuit)")
-	}
-}
-
-// codex iter-3 [P1]: the NON-ANCESTOR branch must fence a STALE takeover
-// whose candidate is still ALIVE — a hung candidate can resume its takeover
-// and kill phase, so treating its record as "no live lease" would open a
-// zombie-write window for the old coord's non-descendant child. Shared
-// ownExpiredRival predicate; a dead candidate still proceeds (abandoned).
-func TestLeaseCheckByAncestor_NonAncestorStaleLiveCandidateFences(t *testing.T) {
-	setupHome(t)
-	const project = "rainier"
-	clk := &fakeClock{}
-	live := newFakeLiveness()
-	live.set(800, 6000)                                  // hung-but-ALIVE candidate
-	cfg := leaseCheckCfg(clk, live, map[int]int{700: 1}) // caller not under owner
-	writeEpochRaw(t, project, epochRecord{
-		Epoch: 5, State: stateFencing,
-		Owner:     identity{Pid: 500, PidStart: 9001, AgentID: "old", Project: project},
-		Candidate: identity{Pid: 800, PidStart: 6000, AgentID: "cand", Project: project},
-		BootID:    "test-boot-1", RenewedAtMono: clk.now(),
-	})
-	clk.advance(cfg.ttl + 1) // record stale, candidate still lives
-
-	err := leaseCheckByAncestorWithCfg(project, 700, cfg)
-	if !errors.Is(err, ErrNotLeaseOwner) {
-		t.Fatalf("stale fencing with a LIVE candidate must fence a non-ancestor, got %v", err)
-	}
-	if !strings.Contains(err.Error(), "takeover-fenced") {
-		t.Fatalf("want takeover-fenced tag, got %v", err)
-	}
-
-	// Candidate dies -> abandoned takeover -> non-ancestor proceeds again.
-	live.kill(800)
-	if err := leaseCheckByAncestorWithCfg(project, 700, cfg); err != nil {
-		t.Fatalf("abandoned (dead-candidate) stale fencing must proceed, got %v", err)
+	after, _ := os.ReadFile(paths.flock)
+	if string(before) != string(after) {
+		t.Fatal("lease-check mutated the flock body (must be read-only — no --reacquire)")
 	}
 }

@@ -43,33 +43,6 @@ type Owner struct {
 	EngineStamped bool
 }
 
-// Handoff is the public view of a successor reservation (D3): an OLD coord
-// stamps SuccessorID into the epoch record as it releases the lease so a
-// contender waits for the named successor instead of spawning a duplicate.
-type Handoff struct {
-	SuccessorID string
-}
-
-// StartingStatus is the resolver's view of a lease sitting in `starting`
-// (a holder acquired the flock but its /coordinator loop is not up + flipped
-// to active yet). The attach/spawn resolver (D4) uses it to decide WAIT (a
-// slow-but-healthy boot in progress) vs SUPERSEDE-and-spawn (the boot is
-// wedged past startingTTL — the `starting-wedged` backstop, a pure record
-// CAS, no process signalled).
-type StartingStatus struct {
-	Owner Owner
-	// OwnerLive reports whether the recorded owner supervisor pid+pid_start
-	// is still a live process (PID-reuse-safe).
-	OwnerLive bool
-	// WithinTTL reports whether the record is still within startingTTL (same
-	// boot). A within-TTL live starting owner is a healthy boot → WAIT; past
-	// TTL (or a dead owner) is wedged → SUPERSEDE.
-	WithinTTL bool
-	// Epoch is the epoch of the starting record — the token the resolver's
-	// SupersedeStartingLease CAS fences against.
-	Epoch int64
-}
-
 // Acquire takes an NB-flock on
 // ~/.fleet/projects/<project>/.locks/coord-spawn.lock so the
 // (live-coord veto + agent-record-write + spawn) tuple inside both

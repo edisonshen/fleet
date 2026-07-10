@@ -19,15 +19,15 @@
 //  1. isolated FLEET_HOME; pre-write the coord agent record.
 //  2. launch `fleet coord-run --agent <id> --project <p> -- sleep 600`.
 //  3. poll until a from-test AcquireLease returns acquired=false (the
-//     supervisor holds the flock) AND the epoch names the supervisor as
-//     the active owner with a fresh renewed_at (heartbeat established).
+//     supervisor holds the flock) AND the flock body names the supervisor
+//     as the active owner (busy⇒owner; no separate heartbeat exists once
+//     flock-only removed the epoch/TTL re-stamp — see PR-2 D1/D2).
 //  4. kill the supervisor; poll until a from-test AcquireLease SUCCEEDS
 //     (kernel + the supervisor's defer Release freed the flock).
 //  5. t.Cleanup reaps the temp home + the process.
 package main
 
 import (
-	"encoding/json"
 	"errors"
 	"os"
 	"os/exec"
@@ -91,21 +91,20 @@ func TestCoordRun_Lease_Integration_RealFlockHeldThenReleased(t *testing.T) {
 	t.Cleanup(killSupervisor)
 
 	lockDir := filepath.Join(fleetHome, "projects", project, ".locks")
-	epochPath := filepath.Join(lockDir, "coordinator.epoch")
 	flockPath := filepath.Join(lockDir, "coordinator.flock")
 
 	// Step 3: poll until the supervisor holds the lease (a from-test
-	// nonblocking flock probe reports busy) AND the epoch names it active.
-	// Do not call coordlock.AcquireLease as the probe here: on Linux that
-	// participates in takeover/epoch logic and can perturb the exact state
-	// this test is trying to observe.
+	// nonblocking flock probe reports busy) AND the flock body names it as
+	// the active owner. Do not call coordlock.AcquireLease as the probe
+	// here: on Linux that participates in acquire/stamp logic and can
+	// perturb the exact state this test is trying to observe.
 	heldDeadline := time.Now().Add(15 * time.Second)
 	held := false
 	for time.Now().Before(heldDeadline) {
 		busy, err := flockBusy(flockPath)
 		if err == nil && busy {
 			// Busy: a live holder owns the flock. Confirm it is OUR supervisor
-			// via the epoch's active owner pid.
+			// via the flock body's active owner pid.
 			if ownerPid, ok := coordlock.CurrentActiveOwnerPID(project); ok && ownerPid == supPid {
 				held = true
 				break
@@ -117,30 +116,24 @@ func TestCoordRun_Lease_Integration_RealFlockHeldThenReleased(t *testing.T) {
 		t.Fatalf("supervisor pid %d did not hold the lease within 15s", supPid)
 	}
 
-	// W8-lite: the epoch record is active, names the supervisor, and has a
-	// non-zero monotonic renewed_at (the heartbeat path stamped it). We do
-	// not assert exact advancement timing (heartbeat is ~10s) — presence
-	// of a fresh active owner record is the deterministic signal.
-	var epoch struct {
-		State         string            `json:"state"`
-		Owner         struct{ Pid int } `json:"owner"`
-		RenewedAtMono int64             `json:"renewed_at_mono"`
+	// W8-lite (post-PR-2): the flock body names the supervisor with a
+	// stamped identity. Flock-only removed the periodic heartbeat/TTL
+	// re-stamp (D1/D2) — stampFlockBody runs once at acquire, and kernel
+	// flock liveness IS the "heartbeat" now, so there is no renewed_at to
+	// assert. Presence of a valid, matching owner tuple is the
+	// deterministic signal that replaces the old epoch-state check.
+	owner, ok := coordlock.CurrentOwner(project)
+	if !ok {
+		t.Fatalf("CurrentOwner(%q) = ok=false, want a stamped owner", project)
 	}
-	data, err := os.ReadFile(epochPath)
-	if err != nil {
-		t.Fatalf("read epoch: %v", err)
+	if owner.PID != supPid {
+		t.Errorf("flock owner pid = %d, want supervisor %d", owner.PID, supPid)
 	}
-	if err := json.Unmarshal(data, &epoch); err != nil {
-		t.Fatalf("unmarshal epoch: %v", err)
+	if owner.AgentID != agentID {
+		t.Errorf("flock owner agent_id = %q, want %q", owner.AgentID, agentID)
 	}
-	if epoch.State != "active" {
-		t.Errorf("epoch state = %q, want active", epoch.State)
-	}
-	if epoch.Owner.Pid != supPid {
-		t.Errorf("epoch owner pid = %d, want supervisor %d", epoch.Owner.Pid, supPid)
-	}
-	if epoch.RenewedAtMono == 0 {
-		t.Errorf("epoch renewed_at_mono = 0, want a monotonic stamp")
+	if owner.PidStart == 0 {
+		t.Errorf("flock owner pid_start = 0, want a stamped start time")
 	}
 
 	// W10 (end-to-end): the supervisor stamped its identity into the agent
