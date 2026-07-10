@@ -2077,6 +2077,18 @@ func flockBodyOwner(project string) (Owner, bool) {
 // accepted for parity with the sibling *WithCfg readers so callers thread the
 // same seam — the probe itself needs no clock/boot/pid seam because the kernel
 // is the liveness oracle.
+//
+// Identity is BEST-EFFORT. There is a sub-millisecond acquire-before-stamp
+// window — a new holder N has taken LOCK_EX but has not yet reached
+// stampFlockBody (the immediate next statement at every acquire site) — during
+// which the file still holds the PREVIOUS holder's body, so a concurrent read
+// can briefly return the retired identity. This does NOT reopen the
+// duplicate-spawn incident: busy⇒owner=true holds regardless of the body, so
+// the spawn gate never spawns beside N. The misidentification is bounded and
+// self-heals — delivery polls (CurrentOwner), attach polls + guards on an
+// unreachable session (Resolve/Attach), and the kill gate only REFUSES on this
+// pid, never fires. Consistent with D1 ("the body is only for identity") and
+// D3's minimized-not-eliminated flicker.
 func flockBodyOwnerWithCfg(project string, cfg leaseConfig) (Owner, bool) {
 	_ = cfg
 	paths, err := resolvePaths(project)
