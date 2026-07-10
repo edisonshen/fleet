@@ -13,8 +13,9 @@
 //	│     2. write handoff doc        (atomic, fsync)      (busy: BUSY)  │
 //	│     3. write checkpoint         (atomic, fsync)                    │
 //	│     4. drain in-flight work safely (no crash)                      │
-//	│     5. write handoff-complete-<epoch>.json BARRIER                 │
-//	│        (atomic, ONLY after 2+3 fsynced)                            │
+//	│     5. write handoff-complete-<barrier_id>.json BARRIER            │
+//	│        (atomic, ONLY after 2+3 fsynced; barrier_id from the        │
+//	│         write-once handoff journal, PR-2 D3 — NOT the epoch)       │
 //	│   ── completion phase (only when the seams are wired) ──           │
 //	│     6. RetireOld: OLD releases lease + exits ──▶ poll ACQUIRES     │
 //	│                                                  (winner reaps     │
@@ -37,9 +38,10 @@
 // is preferred over a silent strand, §5c).
 //
 // Build-tagged linux||darwin because the lease primitive it reads
-// (coordlock.CurrentEpoch / BarrierPath) is itself gated to those GOOS
-// values. Other Unix targets compile graceful_other.go's stub, which
-// refuses (the whole lease path is unsupported there).
+// (the coordlock flock + the write-once handoff journal's barrier_id via
+// coordlock.HandoffBarrierPath, PR-2) is itself gated to those GOOS values.
+// Other Unix targets compile graceful_other.go's stub, which refuses (the
+// whole lease path is unsupported there).
 
 package handoffop
 
@@ -156,7 +158,8 @@ var newHandoffBarrierID = coordlock.NewBarrierID
 //  2. write handoff doc      (atomic, fsync)  } durable BEFORE the
 //  3. write checkpoint       (atomic, fsync)  } barrier — load-bearing
 //  4. drain in-flight work safely (no crash)
-//  5. write handoff-complete-<epoch>.json     (atomic; barrier)
+//  5. write handoff-complete-<barrier_id>.json (atomic; barrier — id from
+//     the write-once handoff journal, PR-2 D3, not the epoch)
 //  6. RetireOld    — OLD releases the lease + exits        } completion
 //  7. DeliverDocToWinner — poll lock winner, inject doc    } (PR3; only
 //     } when wired)

@@ -7,27 +7,33 @@
 //
 //   - NEVER holds a lock across Resume / tmux / spawn / kill (the root-cause
 //     line drain.go:101-106 is gone on this path);
-//   - STANDS DOWN (exit 0) when a healthy leader holds the lease and no
+//   - STANDS DOWN (exit 0) when a healthy leader holds the flock and no
 //     handoff is pending (nothing to do);
-//   - waits (BOUNDED) for the handoff-complete-<epoch>.json barrier before a
-//     GRACEFUL kill, then reaps OLD through the ONE authenticated
-//     coord.KillCoordIfIdentityMatches primitive (never an unguarded kill);
-//   - on a slow/hung handoff (timeout) ESCALATES to the safety-net takeover
-//     (coordlock.AcquireLeaseWithKill, which internally fences -> kills ->
-//     acquires) instead of blocking — so a stuck handoff can never wedge
-//     later drains.
+//   - keys the whole routing on the FLOCK + the write-once handoff journal
+//     (PR-2 D9b′ — the deleted epoch is gone): `barrierUp` reads the journal's
+//     barrier_id, `leaderBusy` is a live flock holder (busy⇒owner). On a
+//     graceful barrier it completes ONLY on a POSITIVE successor identity
+//     (flock body agent_id == the queue's pre-allocated successor, D9b), then
+//     reaps OLD's already-exited supervisor through the ONE authenticated
+//     coord.KillCoordIfIdentityMatches primitive (a benign no-op on a corpse);
+//   - recovers WITHOUT a kill (PR-2 D8): there is NO autonomous fence→kill
+//     takeover. When OLD is PROVABLY DEAD the flock is already free, so a fresh
+//     lease-wrapped successor is cold-spawned into it; a hung-but-ALIVE OLD is
+//     never signaled — drain surfaces `run 'fleet rm <id>'` and preserves the
+//     queue for retry.
 //
 //	┌──────────────────────────────────────────────────────────────────┐
-//	│ drainOneLeaseAware(req)                                            │
-//	│   leader healthy + NO barrier  -> STAND DOWN (exit 0)              │
-//	│   barrier present (graceful)   -> KillCoordIfIdentityMatches(OLD)  │
-//	│   no barrier, bounded wait     -> wait barrier OR timeout          │
-//	│   timeout / hung leader        -> AcquireLeaseWithKill (TAKEOVER)  │
-//	│   stealable lease (cold)       -> bounded Resume (NO lock held)    │
+//	│ drainOneLeaseAwareWith(req)                                        │
+//	│   barrier present (journal)    -> graceful: positive-id successor  │
+//	│                                   completes; else no-kill recover  │
+//	│   flock busy (live holder)     -> stale-queue stand-down / legacy  │
+//	│                                   Resume fallback (no barrier yet)  │
+//	│   flock free (OLD released/died) -> wait for successor; else       │
+//	│                                     no-kill dead-recover / surface │
 //	└──────────────────────────────────────────────────────────────────┘
 //
-// Build-tagged linux||darwin (the lease + STONITH primitives are). Other
-// Unix targets compile drain_lease_other.go's stub (lease unsupported).
+// Build-tagged linux||darwin (the flock lease primitive is). Other Unix
+// targets compile drain_lease_other.go's stub (lease unsupported).
 
 package main
 
@@ -820,41 +826,23 @@ func drainFreeFlockRecover(req queue.SpawnFresh, path string, deadline time.Time
 	return takeoverAndRecover(req, path, cachedOld, stdout, stderr, d)
 }
 
-// takeoverAndRecover runs the safety-net takeover (fence -> kill the hung OLD)
-// and then brings up a FRESH lease-wrapped successor from the CACHED old record
-// (dead-coord recovery), deleting the queue on success.
+// takeoverAndRecover is the NO-KILL safety-net recovery (PR-2 D8). It replaces
+// the deleted fence→kill takeover: it NEVER signals a live process. It proceeds
+// only past the KP7 dead-targets-only gate (OLD PROVABLY DEAD by pid+pid_start),
+// then — because a dead coord-run was kernel-freed of the flock on death — brings
+// up a FRESH lease-wrapped successor from the CACHED old record straight into the
+// already-free flock, deleting the queue on success. A LIVE / unauthenticatable
+// OLD aborts (surface `fleet rm`, preserve the queue).
 //
-// LOCK DISCIPLINE (codex PR3 iter-14 [P1] — the deadlock this whole stack
-// exists to kill, reintroduced in PR3's takeover path):
-//
-//	WRONG (self-deadlock):                   RIGHT (narrow critical section):
-//	┌──────────────────────────────┐        ┌──────────────────────────────┐
-//	│ LockAgent(OLD)                │        │ TakeOver(OLD)   ◄── lock-free │
-//	│   TakeOver(OLD)               │        │   fence -> SIGTERM OLD        │
-//	│     SIGTERM OLD               │        │   OLD's coord.Cleanup runs:   │
-//	│     OLD's coord.Cleanup runs: │        │     LockAgent(OLD)  ◄─ FREE   │
-//	│       LockAgent(OLD) ◄ BLOCKS │        │     archive record + reap     │
-//	│       (drain holds it!)       │        │   OLD exits -> flock freed    │
-//	│     OLD never archives ──────►│ stale  │   TakeOver acquires + releases│
-//	│   SIGKILL OLD (record stale,  │ rec +  │ LockAgent(OLD)  ◄ short scope │
-//	│   tmux/engine orphaned)       │ orphan │   re-check queue + RecoverSpawn│
-//	│ release()                     │        │ release()                     │
-//	└──────────────────────────────┘        └──────────────────────────────┘
-//
-// The per-agent lock must NOT span TakeOver: TakeOver SIGTERMs the hung OLD,
-// whose coord.Cleanup archives OLD's record under the SAME state.LockAgent(OLD).
-// Holding it across the kill self-blocks OLD's cleanup -> OLD is SIGKILLed with
-// a STALE live record and an orphaned tmux/engine. So TakeOver runs LOCK-FREE
-// (OLD's dying cleanup can grab the lock and archive cleanly); the lock is taken
-// only for the SHORT RecoverSpawn critical section AFTER OLD is gone.
-//
-// The lock still serializes duplicate recovery (codex PR3 iter-11 [P1]): the
-// production TakeOver releases the lease the instant OLD is proven gone, so two
-// concurrent drains could both observe acquired=true. The post-takeover lock +
-// queue re-check makes only ONE of them RecoverSpawn; the loser sees the queue
-// gone and stands down. The lock is BOUNDED (state.acquireBoundedAt — never a
-// bare LOCK_EX), so a contender times out instead of hanging. Shared by the
-// hung-leader, graceful-past-budget, and Resume-timeout escalations. Returns
+// LOCK DISCIPLINE (codex PR3 iter-11/14 [P1]): the SHORT per-agent lock wraps
+// ONLY the RecoverSpawn critical section, never a kill (there is none). It
+// serializes duplicate recovery: two concurrent drains that both reach here
+// (the flock is free, so both see a stealable lease) contend on the bounded
+// LockAgent; the post-lock queue + flock-owner re-check makes only ONE
+// RecoverSpawn, and the loser sees the queue gone / the successor leading and
+// stands down. The lock is BOUNDED (state.acquireBoundedAt — never a bare
+// LOCK_EX), so a contender times out instead of hanging. Shared by the
+// graceful-past-budget and free-flock recovery escalations. Returns
 // ErrEscalatedToTakeOver on success (a non-fatal processed outcome).
 func takeoverAndRecover(req queue.SpawnFresh, path string, cachedOld *agent.Record,
 	stdout, stderr io.Writer, d drainLeaseDeps) error {

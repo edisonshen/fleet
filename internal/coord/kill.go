@@ -29,7 +29,7 @@ package coord
 //	     3. record.SupervisorExePath is the fleet coord-run binary
 //	        (NOT the engine child)            (W9)
 //	     4. target.Pid is NOT the current active lease owner
-//	        (epoch gate — never shoot the live leader, T10)
+//	        (flock-owner gate — never shoot the live leader, T10)
 //	     5. target.Pid != self
 //	                              │
 //	   grace delay  →  SIGTERM  →  poll  →  SIGKILL
@@ -83,7 +83,7 @@ type KillDeps struct {
 	// ListRecords returns the live agent records. Production: agent.List.
 	ListRecords func() ([]*agent.Record, error)
 	// CurrentLeaderPID returns the current ACTIVE lease owner pid for the
-	// project (epoch gate). Production: coordlock.CurrentActiveOwnerPID.
+	// project (flock-owner gate, PR-2 D9a). Production: coordlock.CurrentActiveOwnerPID.
 	CurrentLeaderPID func(project string) (int, bool)
 	// IsCoordRunBinary reports whether exePath is the fleet coord-run
 	// supervisor binary (NOT the engine child). Production:
@@ -261,7 +261,7 @@ func killCoord(target KillTarget, d KillDeps) error {
 			ErrKillRefused, liveStart, target.PidStart, target.Pid, match.ID)
 	}
 
-	// Clause 4: epoch gate. Never shoot the CURRENT active lease owner.
+	// Clause 4: flock-owner gate. Never shoot the CURRENT active lease owner.
 	// Once we hold the lease, any other coord supervisor for this project
 	// is stale by construction; but if the target IS the recorded active
 	// owner, killing it is killing the live leader -> refuse.
