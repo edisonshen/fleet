@@ -327,6 +327,77 @@ func TestAtomicCoordSwap_JournalPreCreated_SkipsRedundantCreate(t *testing.T) {
 	}
 }
 
+// TestCreateHandoffJournalResolving_CommittedStale_DeletesAndRetries covers
+// the "committed-stale" O_EXCL collision arm of createHandoffJournalResolving
+// directly (a /review testing-specialist gap: only the "live-not-holding"
+// soft-guard arm above had a test). A leftover journal whose SuccessorID
+// names the CURRENT live flock holder is a prior handoff that committed
+// ownership but never cleared its own journal (e.g. the winner's post-acquire
+// DeleteHandoffJournal never ran). createHandoffJournalResolving must delete
+// it and create the new entry — never refuse a fresh handoff cycle because of
+// a leftover that already resolved in the caller's favor.
+func TestCreateHandoffJournalResolving_CommittedStale_DeletesAndRetries(t *testing.T) {
+	setupFleetHome(t)
+	const project = "chjr-committed-stale"
+	if _, err := state.EnsureProjectInitialized(project); err != nil {
+		t.Fatalf("EnsureProjectInitialized: %v", err)
+	}
+
+	// "winner" is the CURRENT live flock holder — simulates a coord that
+	// already won a prior handoff cycle but raced/crashed before it could
+	// commit (DeleteHandoffJournal) its own leftover journal.
+	lease, acquired, err := coordlock.AcquireLease(project, "winner")
+	if err != nil || !acquired || lease == nil {
+		t.Fatalf("AcquireLease(winner): acquired=%v err=%v", acquired, err)
+	}
+	defer lease.Release()
+
+	if err := coordlock.CreateHandoffJournal(coordlock.HandoffJournal{
+		Project: project, SuccessorID: "winner", BarrierID: "b-stale",
+		// Liveness is irrelevant here: committedStale short-circuits it.
+		SuccessorPID: 999999, SuccessorPidStart: 424242,
+	}); err != nil {
+		t.Fatalf("seed leftover journal: %v", err)
+	}
+
+	next := coordlock.HandoffJournal{Project: project, SuccessorID: "nextsucc", BarrierID: "b-next"}
+	if err := createHandoffJournalResolving(next); err != nil {
+		t.Fatalf("createHandoffJournalResolving must delete the committed-stale leftover and succeed; got %v", err)
+	}
+	assertHandoffJournalNames(t, project, "nextsucc")
+}
+
+// TestCreateHandoffJournalResolving_DeadSuccessor_ClearsAndRetries covers the
+// "dead successor" O_EXCL collision arm: a leftover journal names a successor
+// whose process no longer exists (died mid-boot, never acquired the flock).
+// createHandoffJournalResolving must clear it (Abandon semantics) and create
+// the new entry.
+func TestCreateHandoffJournalResolving_DeadSuccessor_ClearsAndRetries(t *testing.T) {
+	setupFleetHome(t)
+	const project = "chjr-dead-successor"
+	if _, err := state.EnsureProjectInitialized(project); err != nil {
+		t.Fatalf("EnsureProjectInitialized: %v", err)
+	}
+
+	// Flock is FREE here (nothing acquired it), so LiveOwner reports
+	// present=false and committed-stale never triggers — only the
+	// dead-successor liveness check decides. 999999/424242 is this
+	// codebase's established "provably not a live successor" fixture pid
+	// (see coordlock.TestCurrentHandoffSuccessor's dead_names_nothing case).
+	if err := coordlock.CreateHandoffJournal(coordlock.HandoffJournal{
+		Project: project, SuccessorID: "deadsucc", BarrierID: "b-dead",
+		SuccessorPID: 999999, SuccessorPidStart: 424242,
+	}); err != nil {
+		t.Fatalf("seed leftover journal: %v", err)
+	}
+
+	next := coordlock.HandoffJournal{Project: project, SuccessorID: "nextsucc2", BarrierID: "b-next2"}
+	if err := createHandoffJournalResolving(next); err != nil {
+		t.Fatalf("createHandoffJournalResolving must clear the dead-successor leftover and succeed; got %v", err)
+	}
+	assertHandoffJournalNames(t, project, "nextsucc2")
+}
+
 // TestAtomicCoordSwap_HappyPath_DeadOld covers case 4 — operator
 // invoked dead-coord resume via TUI [a]. oldIsDead=true: kill + archive
 // are SKIPPED; OLD record stays on disk for operator [x] cleanup.
