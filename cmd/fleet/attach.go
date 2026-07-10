@@ -481,16 +481,19 @@ func resolveAndAttachCoord(token, project string, opts AttachOpts) error {
 			// without the PID cross-check, landing on whichever record sorts
 			// first could attach into the dead-end orphan instead.
 			//
-			// Gate the whole record-fallback on a CONFIRMED busy flock (codex
-			// confirm round [P2]): a bounded Wait can ALSO mean "flock
+			// Gate the whole record-fallback on a CONFIRMED holder PID (codex
+			// confirm rounds [P2] x2): a bounded Wait can ALSO mean "flock
 			// genuinely free, a handoff is in flight" (a booting successor
-			// hasn't acquired it yet) — there is no live flock holder to
-			// recover via an agent record in that case, and falling through to
-			// FindLiveCoordPreferPID's plain first-match (no PID to prefer)
-			// could attach into an unrelated stale/orphan session instead of
-			// honestly surfacing "still not attachable."
-			if _, busy := coordlock.LiveOwner(project); busy {
-				holderPID, _ := coordlock.CurrentActiveOwnerPID(project)
+			// hasn't acquired it yet), or "flock busy but the body is torn
+			// beyond even a PID" -- neither gives us anything to cross-check a
+			// candidate record against. Without a real PID, falling through to
+			// FindLiveCoordPreferPID's plain first-match could attach into an
+			// unrelated stale/orphan session instead of honestly surfacing
+			// "still not attachable." CurrentActiveOwnerPID's ok=true ALREADY
+			// implies the flock is busy (it requires a live LOCK_EX holder AND
+			// a readable positive PID), so checking it alone subsumes a
+			// separate LiveOwner busy check.
+			if holderPID, pidOK := coordlock.CurrentActiveOwnerPID(project); pidOK {
 				if records, lerr := agent.List(); lerr == nil {
 					if rec, ok := projectlookup.FindLiveCoordPreferPID(records, project, holderPID); ok {
 						session := rec.TmuxSession

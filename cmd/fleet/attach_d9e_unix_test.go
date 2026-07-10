@@ -23,7 +23,10 @@ package main
 
 import (
 	"bytes"
+	"os"
+	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 
 	"github.com/edisonshen/fleet/internal/agent"
@@ -118,6 +121,66 @@ func TestResolveAndAttachCoord_D9e_FreeFlock_SkipsRecordFallback(t *testing.T) {
 		t.Fatalf("attachFnVar called %d times; want 0 — must NOT attach into an unrelated record when the flock is genuinely free", *attachCalls)
 	}
 	if got := err.Error(); !strings.Contains(got, "no live coord record is derivable") {
+		t.Fatalf("error = %q, want the \"no live coord record is derivable\" diagnostic", got)
+	}
+}
+
+// TestResolveAndAttachCoord_D9e_BusyTornBody_SkipsRecordFallback covers the
+// SECOND codex confirm-round [P2]: the flock can be genuinely BUSY (a real
+// live LOCK_EX holder) while its body is torn beyond even a readable PID —
+// coordlock.CurrentActiveOwnerPID then returns ok=false too (not just
+// LiveOwner-busy=true), so there is STILL no PID to cross-check a candidate
+// record against. Must behave identically to the genuinely-free case: skip
+// the fallback, surface the honest diagnostic.
+func TestResolveAndAttachCoord_D9e_BusyTornBody_SkipsRecordFallback(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("FLEET_HOME", tmp)
+	if _, err := state.Bootstrap(); err != nil {
+		t.Fatalf("Bootstrap: %v", err)
+	}
+	const project = "d9e-torn"
+	if _, err := state.EnsureProjectInitialized(project); err != nil {
+		t.Fatalf("EnsureProjectInitialized: %v", err)
+	}
+
+	// Hold a REAL flock lock with a torn (non-JSON) body — busy, but no PID
+	// is readable from it at all.
+	pdir, err := state.ProjectDir(project)
+	if err != nil {
+		t.Fatalf("ProjectDir: %v", err)
+	}
+	lockDir := filepath.Join(pdir, ".locks")
+	if err := os.MkdirAll(lockDir, 0o755); err != nil {
+		t.Fatalf("mkdir locks: %v", err)
+	}
+	flockPath := filepath.Join(lockDir, "coordinator.flock")
+	f, err := os.OpenFile(flockPath, os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		t.Fatalf("open flock: %v", err)
+	}
+	t.Cleanup(func() { _ = f.Close() })
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		t.Fatalf("flock LOCK_EX: %v", err)
+	}
+	if _, err := f.WriteString("not valid json, no pid field here"); err != nil {
+		t.Fatalf("write torn body: %v", err)
+	}
+	// Held for the test's duration; released by t.Cleanup's f.Close().
+
+	// An unrelated but project-matching, alive-session record — the thing a
+	// naive fallback (or a fallback keyed on LiveOwner-busy alone) would
+	// wrongly attach into.
+	writeD9eRecord(t, "orphanrec2", project)
+	attachCalls := installD9eStubs(t, map[string]bool{"fleet-orphanrec2": true})
+
+	gotErr := resolveAndAttachCoord("tok", project, AttachOpts{ResolveMaxAttempts: 1, Stderr: &bytes.Buffer{}})
+	if gotErr == nil {
+		t.Fatal("resolveAndAttachCoord: err=nil, want the bounded-wait-exhausted diagnostic")
+	}
+	if *attachCalls != 0 {
+		t.Fatalf("attachFnVar called %d times; want 0 — must NOT attach into an unrelated record when the flock body is torn beyond a readable PID", *attachCalls)
+	}
+	if got := gotErr.Error(); !strings.Contains(got, "no live coord record is derivable") {
 		t.Fatalf("error = %q, want the \"no live coord record is derivable\" diagnostic", got)
 	}
 }
