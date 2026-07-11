@@ -592,6 +592,37 @@ def resolve_resume_project(doc_path: str | os.PathLike) -> str:
     return _parse_frontmatter_project(doc_path).strip()
 
 
+def _validate_project_name(project: str) -> None:
+    """Mirror Go state.ValidateProjectName for Python-side project paths."""
+    if not project:
+        raise ValueError("project name must not be empty")
+    if project in {".", "..", ".locks"}:
+        raise ValueError(f"project name {project!r} reserved")
+    if project.startswith("-"):
+        raise ValueError(f"project name {project!r} must not start with '-'")
+    has_alnum = False
+    for ch in project:
+        if "a" <= ch <= "z" or "0" <= ch <= "9":
+            has_alnum = True
+            continue
+        if ch in {"-", "_", "."}:
+            continue
+        if "A" <= ch <= "Z":
+            raise ValueError(
+                f"project name {project!r} contains uppercase {ch!r}",
+            )
+        raise ValueError(
+            f"project name {project!r} contains invalid character {ch!r}",
+        )
+    if not has_alnum:
+        raise ValueError(f"project name {project!r} has no alphanumeric character")
+
+
+def _project_dir(home: Path, project: str) -> Path:
+    _validate_project_name(project)
+    return home / "projects" / project
+
+
 def record_resumed_handoff_marker(
     doc_path: str | os.PathLike, *, project: str, home: Path,
 ) -> None:
@@ -602,7 +633,7 @@ def record_resumed_handoff_marker(
     """
     if not project:
         raise ValueError("project is required to write resumed_handoff_path")
-    project_dir = home / "projects" / project
+    project_dir = _project_dir(home, project)
     state_path = project_dir / "coord-state.json"
     lock_path = project_dir / ".locks" / "coordinator.lock"
     with _take_coord_lock(lock_path):
@@ -649,7 +680,7 @@ def record_resumed_session_tasks(
     if not resumed_slugs:
         return
     try:
-        project_dir = home / "projects" / project
+        project_dir = _project_dir(home, project)
         state_path = project_dir / "coord-state.json"
         lock_path = project_dir / ".locks" / "coordinator.lock"
         with _take_coord_lock(lock_path):
@@ -719,6 +750,11 @@ def main(argv: list[str] | None = None) -> int:
             "handoff frontmatter has no project)",
             file=sys.stderr,
         )
+        return 1
+    try:
+        _validate_project_name(project)
+    except ValueError as exc:
+        print(f"handoff_resume: invalid project: {exc}", file=sys.stderr)
         return 1
     resumed_slugs: list[str] = []
     blocks, skipped = build_resume_dispatches(

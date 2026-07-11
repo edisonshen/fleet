@@ -591,6 +591,70 @@ def test_main_uses_frontmatter_project_for_marker_when_env_unset(
     assert cs["resumed_handoff_path"] == str(doc)
 
 
+def test_main_rejects_traversal_project_before_resume_side_effects(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fleet_home = tmp_path / "fleet-home"
+    wip_dir = tmp_path / "wip"
+    outside = tmp_path / "outside"
+    fleet_home.mkdir()
+    wip_dir.mkdir()
+    (fleet_home / "inbox").mkdir()
+    inbox = fleet_home / "inbox" / "abcd1234.md"
+    inbox.write_text("orig prompt", encoding="utf-8")
+    (wip_dir / "fix-foo.md").write_text("phase 1", encoding="utf-8")
+    doc = tmp_path / "handoff.md"
+    _seed_handoff(
+        doc,
+        body_subagents=(
+            '- task="fix-foo" branch="worker/fix-foo" phase="tdd-green" '
+            'agent_id="abcd1234" subagent_id=""'
+        ),
+        project="../../outside",
+    )
+    monkeypatch.setenv("FLEET_HOME", str(fleet_home))
+    monkeypatch.setenv("FLEET_SUBAGENT_WIP_DIR", str(wip_dir))
+    monkeypatch.delenv("FLEET_PROJECT", raising=False)
+
+    rc = handoff_resume.main([str(doc)])
+
+    assert rc == 1
+    assert inbox.read_text(encoding="utf-8") == "orig prompt"
+    assert not outside.exists()
+
+
+def test_main_rejects_absolute_project_before_resume_side_effects(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fleet_home = tmp_path / "fleet-home"
+    wip_dir = tmp_path / "wip"
+    outside = tmp_path / "outside"
+    fleet_home.mkdir()
+    wip_dir.mkdir()
+    (fleet_home / "inbox").mkdir()
+    inbox = fleet_home / "inbox" / "abcd1234.md"
+    inbox.write_text("orig prompt", encoding="utf-8")
+    (wip_dir / "fix-foo.md").write_text("phase 1", encoding="utf-8")
+    doc = tmp_path / "handoff.md"
+    _seed_handoff(
+        doc,
+        body_subagents=(
+            '- task="fix-foo" branch="worker/fix-foo" phase="tdd-green" '
+            'agent_id="abcd1234" subagent_id=""'
+        ),
+        project=str(outside),
+    )
+    monkeypatch.setenv("FLEET_HOME", str(fleet_home))
+    monkeypatch.setenv("FLEET_SUBAGENT_WIP_DIR", str(wip_dir))
+    monkeypatch.delenv("FLEET_PROJECT", raising=False)
+
+    rc = handoff_resume.main([str(doc)])
+
+    assert rc == 1
+    assert inbox.read_text(encoding="utf-8") == "orig prompt"
+    assert not outside.exists()
+
+
 def test_record_resumed_session_tasks_does_not_write_handoff_marker(
     tmp_path: Path,
 ) -> None:
@@ -609,6 +673,24 @@ def test_record_resumed_session_tasks_does_not_write_handoff_marker(
 
     cs = json.loads(state_path.read_text(encoding="utf-8"))
     assert cs["resumed_handoff_path"] == "/tmp/old.md"
+
+
+@pytest.mark.parametrize(
+    "project",
+    ["../../outside", "/tmp/outside", "BadProj", ".locks", "-flag"],
+)
+def test_record_resumed_handoff_marker_rejects_unsafe_project(
+    tmp_path: Path, project: str,
+) -> None:
+    fleet_home = tmp_path / "fleet-home"
+    outside = tmp_path / "outside"
+
+    with pytest.raises(ValueError):
+        handoff_resume.record_resumed_handoff_marker(
+            "/tmp/handoff.md", project=project, home=fleet_home,
+        )
+
+    assert not outside.exists()
 
 
 def test_record_resumed_handoff_marker_preserves_malformed_coord_state(

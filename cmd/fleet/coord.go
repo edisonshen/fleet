@@ -218,7 +218,7 @@ const (
 	defaultHandoffResumeInitialDelay      = 5 * time.Second
 	defaultHandoffResumeRecheckInterval   = 30 * time.Second
 	resumedHandoffPathCoordStateKey       = "resumed_handoff_path"
-	handoffResumeOperatorDiagnosticFormat = "coord-run: handoff %s was not applied by %s after %d resume nudges; attach %s and run `python3 /path/to/skills/coordinator/handoff_resume.py %s`\n"
+	handoffResumeOperatorDiagnosticFormat = "coord-run: handoff %s was not applied by %s after %d resume nudges; attach %s and run the coordinator skill's handoff_resume.py helper against %s\n"
 )
 
 // newCoordRunCmd builds the cobra subcommand for `fleet coord-run`.
@@ -781,6 +781,10 @@ func sendHandoffResumeNudge(cfg handoffResumeNudgeConfig, rec *agent.Record, doc
 				lastErr = fmt.Errorf("readiness did not converge for %s: %w; %v",
 					session, readyErr, lastErr)
 			}
+			continue
+		}
+		if readyErr != nil {
+			lastErr = fmt.Errorf("readiness did not converge for %s: %w", session, readyErr)
 			continue
 		}
 		return nil

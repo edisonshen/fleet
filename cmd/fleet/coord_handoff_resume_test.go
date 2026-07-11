@@ -131,11 +131,12 @@ func TestHandoffResumeNudgeLoop_DecisionCases(t *testing.T) {
 		docPath = "/tmp/fleet-handoff.md"
 	)
 	tests := []struct {
-		name       string
-		lastPath   *string
-		marker     string
-		wantSends  int32
-		wantLoadID string
+		name              string
+		lastPath          *string
+		marker            string
+		disableAutoResume bool
+		wantSends         int32
+		wantLoadID        string
 	}{
 		{
 			name:       "nil path fresh coord",
@@ -158,10 +159,28 @@ func TestHandoffResumeNudgeLoop_DecisionCases(t *testing.T) {
 			wantSends:  1,
 			wantLoadID: agentID,
 		},
+		{
+			name:              "disable auto resume suppresses nudge",
+			lastPath:          ptrString(docPath),
+			marker:            "/tmp/old.md",
+			disableAutoResume: true,
+			wantSends:         0,
+			wantLoadID:        agentID,
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			setupHandoffResumeRecord(t, agentID, project, session, tt.lastPath)
+			if tt.disableAutoResume {
+				rec, err := agent.Load(agentID)
+				if err != nil {
+					t.Fatalf("load record: %v", err)
+				}
+				rec.DisableAutoResume = true
+				if err := rec.Write(); err != nil {
+					t.Fatalf("write disabled record: %v", err)
+				}
+			}
 			writeTestCoordState(t, project, map[string]any{
 				resumedHandoffPathCoordStateKey: tt.marker,
 			})
@@ -296,6 +315,47 @@ func TestHandoffResumeNudgeLoop_TransportRetryUntilReady(t *testing.T) {
 	}
 	if got := atomic.LoadInt32(&sends); got != 3 {
 		t.Fatalf("send calls = %d, want 3 re-issued sends while readiness converges", got)
+	}
+}
+
+func TestHandoffResumeNudgeLoop_TransportRetryUntilReadinessSucceedsEvenIfSubmitted(t *testing.T) {
+	const (
+		agentID = "hrready"
+		project = "hr-ready"
+		session = "fleet-hrready"
+		docPath = "/tmp/fleet-handoff.md"
+	)
+	setupHandoffResumeRecord(t, agentID, project, session, ptrString(docPath))
+	writeTestCoordState(t, project, map[string]any{
+		resumedHandoffPathCoordStateKey: "",
+	})
+	var readyCalls int32
+	var sends int32
+	var stderr bytes.Buffer
+	cfg := baseHandoffResumeConfig(agentID, project, session, nil, &stderr)
+	cfg.maxAttempts = 1
+	cfg.transportTries = 3
+	cfg.waitReady = func(string) error {
+		if atomic.AddInt32(&readyCalls, 1) < 3 {
+			return errors.New("ready prompt not visible yet")
+		}
+		return nil
+	}
+	cfg.sendVerified = func(string, string) (bool, error) {
+		atomic.AddInt32(&sends, 1)
+		if atomic.LoadInt32(&readyCalls) >= 3 {
+			writeTestCoordState(t, project, map[string]any{
+				resumedHandoffPathCoordStateKey: docPath,
+			})
+		}
+		return true, nil
+	}
+	runHandoffResumeNudgeLoop(context.Background(), cfg)
+	if got := atomic.LoadInt32(&readyCalls); got != 3 {
+		t.Fatalf("ready calls = %d, want retry until readiness succeeds", got)
+	}
+	if got := atomic.LoadInt32(&sends); got != 3 {
+		t.Fatalf("send calls = %d, want 3 verified sends", got)
 	}
 }
 
@@ -442,6 +502,64 @@ func TestCoordRun_HandoffResumeNudge_StandDownDoesNotNudge(t *testing.T) {
 	}
 	if got := atomic.LoadInt32(&sends); got != 0 {
 		t.Fatalf("non-flock-winner sent %d nudges, want 0", got)
+	}
+}
+
+func TestCoordRun_HandoffResumeNudge_FlockWinnerStartsNudger(t *testing.T) {
+	const (
+		agentID = "hrwinner"
+		project = "hr-winner"
+		session = "fleet-hrwinner"
+		docPath = "/tmp/fleet-handoff.md"
+	)
+	setupHandoffResumeRecord(t, agentID, project, session, ptrString(docPath))
+	writeTestCoordState(t, project, map[string]any{
+		resumedHandoffPathCoordStateKey: "",
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	lease := &fakeLease{}
+	sendCh := make(chan struct{}, 1)
+	var sends int32
+	var stderr bytes.Buffer
+	opts := coordRunOpts{
+		agentID:  agentID,
+		project:  project,
+		session:  session,
+		argv:     []string{"sleep", "30"},
+		killTmux: func(string) error { return nil },
+		acquireLease: func() (coordLease, bool, []liveHolderInfo, error) {
+			return lease, true, nil, nil
+		},
+		handoffResumeInitialDelayC: closedTimeChan(),
+		handoffResumeWakeC:         make(chan time.Time),
+		handoffResumeWaitReady:     func(string) error { return nil },
+		handoffResumeSendVerified: func(string, string) (bool, error) {
+			if atomic.AddInt32(&sends, 1) == 1 {
+				writeTestCoordState(t, project, map[string]any{
+					resumedHandoffPathCoordStateKey: docPath,
+				})
+				sendCh <- struct{}{}
+			}
+			return true, nil
+		},
+	}
+	done := make(chan error, 1)
+	go func() {
+		done <- runCoordRun(ctx, opts, os.Stdout, &stderr)
+	}()
+	waitHandoffResumeSend(t, sendCh)
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatalf("runCoordRun did not exit after cancel; stderr=%q", stderr.String())
+	}
+	if got := atomic.LoadInt32(&sends); got != 1 {
+		t.Fatalf("send count = %d, want flock winner nudge", got)
+	}
+	if got := lease.releases(); got != 1 {
+		t.Fatalf("lease releases = %d, want 1", got)
 	}
 }
 

@@ -1,6 +1,6 @@
 # DESIGN — Durable handoff resume delivery (the successor coord must always get its handoff)
 
-- **Status:** OPERATOR-APPROVED 2026-07-10 (dual-review clean: codex 2 consecutive PASS + `/review` PASS). Task-plan review then surfaced a cadence ambiguity ("retry until applied" vs "next acquire") — resolved here (see *Nudge cadence*: acquire + bounded resident re-check, cap K, then surface); pending confirming re-review of that delta.
+- **Status:** OPERATOR-APPROVED 2026-07-10. Cadence ambiguity resolved in this design (see *Nudge cadence*: acquire + bounded resident re-check, cap K, then surface); implementation PR-1 carries the confirming review evidence.
 - **Priority:** **P0** — operator: *"this is P0"*. Silent, total loss of coordinator context on a missed handoff; observed ≥2 times in the field, plus this session.
 - **Author:** coord `d1b783ec` (fleet)
 - **Scope:** how a handoff-successor coord *receives* (or *fetches*) its handoff doc. NOT the doc's contents (that's `DESIGN-handoff-curated-context.md`) and NOT lease/ownership mechanics (`DESIGN-coord-lease-*`).
