@@ -7,6 +7,65 @@ import (
 	"strings"
 )
 
+const (
+	resumeInlineKeyDecisionsHeading = "## Key Decisions"
+	resumeInlineNextStepsHeading    = "## Next Steps (prioritized)"
+	// ResumeInlineSectionMaxBytes bounds each inlined section defensively.
+	// Handoff sections are curated and short, but send-keys payloads should
+	// not grow without a hard cap if a malformed doc slips through.
+	ResumeInlineSectionMaxBytes = 4096
+)
+
+func resumePromptInlineSections(doc []byte, maxBytes int) string {
+	if len(doc) == 0 || maxBytes <= 0 {
+		return ""
+	}
+	var sections []string
+	for _, heading := range []string{
+		resumeInlineKeyDecisionsHeading,
+		resumeInlineNextStepsHeading,
+	} {
+		section := sliceMarkdownH2Section(doc, heading)
+		if resumeInlineSectionEmpty(section, heading) {
+			continue
+		}
+		if len(section) > maxBytes {
+			section = section[:maxBytes]
+		}
+		sections = append(sections, strings.TrimRight(section, "\r\n"))
+	}
+	return strings.Join(sections, "\n\n")
+}
+
+func sliceMarkdownH2Section(doc []byte, heading string) string {
+	lines := strings.SplitAfter(string(doc), "\n")
+	var b strings.Builder
+	inSection := false
+	for _, line := range lines {
+		lineNoNL := strings.TrimRight(line, "\r\n")
+		if !inSection {
+			if strings.TrimSpace(lineNoNL) == heading {
+				inSection = true
+				b.WriteString(line)
+			}
+			continue
+		}
+		if strings.HasPrefix(lineNoNL, "## ") {
+			break
+		}
+		b.WriteString(line)
+	}
+	return b.String()
+}
+
+func resumeInlineSectionEmpty(section, heading string) bool {
+	if section == "" {
+		return true
+	}
+	body := strings.TrimSpace(strings.TrimPrefix(section, heading))
+	return body == "" || body == Placeholder
+}
+
 // ParseActiveSubagents extracts the `## Active Subagents` section from
 // a rendered handoff doc body and returns the list of in-flight worker
 // entries. Used by the successor coord on its first turn after handoff

@@ -73,7 +73,7 @@ func TestDeliverHandoffResumePrompt_NoLeaseOwner_FallsBackToDirectSend(t *testin
 	}
 
 	out := &bytes.Buffer{}
-	delivered, err := deliverHandoffResumePrompt(project, true, rep, docPath, out, out)
+	delivered, err := deliverHandoffResumePrompt(project, true, "oldcoord", rep, docPath, out, out)
 	if err != nil {
 		t.Fatalf("expected direct-send fallback, got error: %v\n%s", err, out.String())
 	}

@@ -95,7 +95,18 @@ func TestSmoke_AutoHandoffEndToEnd(t *testing.T) {
 	}
 	payloadBytes, _ := json.Marshal(payload)
 
-	// Step 4: invoke the installed main.py.
+	// Step 4: invoke the installed main.py. The producer normally kicks a
+	// detached `fleet drain` after writing the queue; this smoke test drives
+	// runDrain explicitly in step 6, so pre-throttle the detached kick to avoid
+	// a second drain racing temp-dir cleanup.
+	queueDir := filepath.Join(fleetHome, "queue")
+	if err := os.MkdirAll(queueDir, 0o755); err != nil {
+		t.Fatalf("mkdir queue dir: %v", err)
+	}
+	kickedSentinel := filepath.Join(queueDir, "spawn-fresh-"+old.ID+".json.kicked")
+	if err := os.WriteFile(kickedSentinel, []byte{}, 0o644); err != nil {
+		t.Fatalf("write drain kick sentinel: %v", err)
+	}
 	cmd := exec.Command("python3", mainPath)
 	cmd.Stdin = bytes.NewReader(payloadBytes)
 	cmd.Env = append(os.Environ(),

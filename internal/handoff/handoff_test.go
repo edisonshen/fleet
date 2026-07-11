@@ -674,6 +674,91 @@ func TestResumePrompt(t *testing.T) {
 	})
 }
 
+func TestResumePromptWithInlineSections(t *testing.T) {
+	const path = "/Users/x/.fleet/handoffs/a1b2c3d4-20260430-100000.md"
+	base := ResumePrompt(path)
+	tests := []struct {
+		name        string
+		doc         string
+		want        []string
+		wantMissing []string
+		// pathOnly asserts got == base exactly: no sections AND no dangling
+		// "Inline handoff sections:" label (empty-section noise regression).
+		pathOnly bool
+	}{
+		{
+			name: "exact headings inline both sections verbatim",
+			doc: "## Completed\nfinished\n\n" +
+				"## Key Decisions\n- keep Path B as the guarantee\n- Path A is latency\n\n" +
+				"## Open Questions\n_(none)_\n\n" +
+				"## Next Steps (prioritized)\n1. ship PR-2\n2. dogfood handoff\n\n" +
+				"## Active Subagents\n_(none)_\n",
+			want: []string{
+				base,
+				"## Key Decisions\\n- keep Path B as the guarantee\\n- Path A is latency",
+				"## Next Steps (prioritized)\\n1. ship PR-2\\n2. dogfood handoff",
+			},
+			wantMissing: []string{"## Completed", "## Open Questions"},
+		},
+		{
+			name:     "missing headings stays path only",
+			doc:      "## Completed\nplaceholder\n\n## Active Subagents\n_(none)_\n",
+			pathOnly: true,
+		},
+		{
+			name: "placeholder sections stay path only",
+			doc: "## Key Decisions\n" + Placeholder + "\n\n" +
+				"## Next Steps (prioritized)\n" + Placeholder + "\n\n",
+			pathOnly: true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := ResumePromptWithInlineSections(path, []byte(tt.doc))
+			if strings.Contains(got, "\n") || strings.Contains(got, "\r") {
+				t.Fatalf("resume prompt must stay single-line for tmux send-keys, got:\n%q", got)
+			}
+			if tt.pathOnly {
+				if got != base {
+					t.Fatalf("path-only doc must degrade to bare path directive, got:\n%q", got)
+				}
+				return
+			}
+			for _, want := range tt.want {
+				if !strings.Contains(got, want) {
+					t.Fatalf("prompt missing %q:\n%s", want, got)
+				}
+			}
+			for _, bad := range tt.wantMissing {
+				if strings.Contains(strings.TrimPrefix(got, base), bad) {
+					t.Fatalf("prompt included noisy section %q:\n%s", bad, got)
+				}
+			}
+		})
+	}
+}
+
+func TestResumePromptInlineSections_CapsEachSection(t *testing.T) {
+	max := len("## Key Decisions\n") + 12
+	doc := []byte(
+		"## Key Decisions\n" + strings.Repeat("a", 100) + "\n\n" +
+			"## Next Steps (prioritized)\n" + strings.Repeat("b", 100) + "\n\n" +
+			"## Active Subagents\n_(none)_\n",
+	)
+	got := resumePromptInlineSections(doc, max)
+	if got == "" {
+		t.Fatal("expected capped inline sections")
+	}
+	for _, section := range strings.Split(got, "\n\n") {
+		if len(section) > max {
+			t.Fatalf("section length = %d, want <= %d:\n%s", len(section), max, section)
+		}
+	}
+	if strings.Contains(got, "## Active Subagents") {
+		t.Fatalf("cap test included next section:\n%s", got)
+	}
+}
+
 func TestWrite_PublishesAtomically(t *testing.T) {
 	tmp := t.TempDir()
 	t.Setenv("FLEET_HOME", tmp)

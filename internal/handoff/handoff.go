@@ -18,6 +18,7 @@ package handoff
 import (
 	"bytes"
 	"fmt"
+	"os"
 	"strconv"
 	"strings"
 	"time"
@@ -32,11 +33,6 @@ import (
 // (internal/handoffop) build this from the doc path so the format
 // stays identical across entry points.
 //
-// Path reference (not inlined doc body) keeps the prompt to one line —
-// no escape headaches for tmux send-keys, no size cap on the doc, and
-// the doc on disk remains the single source of truth if the operator
-// later edits it before the agent's first read tool call.
-//
 // Empty docPath returns "" so callers can pass the result straight
 // into spawn.SendInitialPrompt; the helper treats an empty prompt as
 // a silent no-op.
@@ -46,6 +42,36 @@ func ResumePrompt(docPath string) string {
 	}
 	return "Read your handoff doc at " + docPath +
 		" and continue the task. Do not wait for further operator input."
+}
+
+// ResumePromptWithInlineDoc builds the handoff-resume directive from one
+// delivery-time read of docPath. If the read fails or the selected sections are
+// missing/placeholder-only, the directive degrades to the durable path alone.
+func ResumePromptWithInlineDoc(docPath string) string {
+	if docPath == "" {
+		return ""
+	}
+	raw, err := os.ReadFile(docPath)
+	if err != nil {
+		return ResumePrompt(docPath)
+	}
+	return ResumePromptWithInlineSections(docPath, raw)
+}
+
+// ResumePromptWithInlineSections appends the decision-critical rendered handoff
+// sections to the normal path directive. The path remains load-bearing because
+// handoff_resume.py consumes the full document; the inline text only protects
+// the first turn against a later file-read failure.
+func ResumePromptWithInlineSections(docPath string, doc []byte) string {
+	prompt := ResumePrompt(docPath)
+	if prompt == "" {
+		return ""
+	}
+	inline := resumePromptInlineSections(doc, ResumeInlineSectionMaxBytes)
+	if inline == "" {
+		return prompt
+	}
+	return prompt + " Inline handoff sections: " + strconv.Quote(inline)
 }
 
 // Placeholder is the body text for stub sections in operator-triggered

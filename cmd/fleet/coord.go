@@ -762,7 +762,7 @@ func sendHandoffResumeNudge(cfg handoffResumeNudgeConfig, rec *agent.Record, doc
 	if session == "" {
 		return fmt.Errorf("agent %s has no tmux session", rec.ID)
 	}
-	prompt := handoff.ResumePrompt(docPath)
+	prompt := handoff.ResumePromptWithInlineDoc(docPath)
 	var lastErr error
 	for i := 0; i < cfg.transportTries; i++ {
 		readyErr := cfg.waitReady(session)

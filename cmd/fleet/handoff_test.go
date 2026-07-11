@@ -1797,12 +1797,73 @@ func TestDeliverHandoffResumePrompt_LeaseWrapped_NoOwner_NoFallback(t *testing.T
 	}
 
 	out := &bytes.Buffer{}
-	delivered, err := deliverHandoffResumePrompt(rep.Project, true, rep, "/tmp/handoff.md", out, out)
+	delivered, err := deliverHandoffResumePrompt(rep.Project, true, "oldcoord", rep, "/tmp/handoff.md", out, out)
 	if !errors.Is(err, handoffdelivery.ErrNoOwnerObserved) {
 		t.Fatalf("want ErrNoOwnerObserved propagated (queue stays pending), got %v", err)
 	}
 	if delivered != nil {
 		t.Fatalf("delivered = %+v on the no-owner path, want nil", delivered)
+	}
+}
+
+func TestDeliverHandoffResumePrompt_LeaseWrapped_TargetsSuccessorAndInlinesSections(t *testing.T) {
+	setupFleetHome(t)
+
+	rep := agent.New("newcoord")
+	rep.Project = "rainier"
+	rep.TmuxSession = tmux.SessionName(rep.ID)
+	rep.LeaseWrapped = true
+	docPath := filepath.Join(t.TempDir(), "handoff.md")
+	doc := "## Completed\nold work\n\n" +
+		"## Key Decisions\n- target the spawned session\n\n" +
+		"## Next Steps (prioritized)\n1. keep the queue until successor owns the lock\n\n" +
+		"## Active Subagents\n_(none)_\n"
+	if err := os.WriteFile(docPath, []byte(doc), 0o644); err != nil {
+		t.Fatalf("write handoff doc: %v", err)
+	}
+
+	origDeps := handoffDeliveryDepsFn
+	t.Cleanup(func() { handoffDeliveryDepsFn = origDeps })
+	var sentSession, sentPrompt string
+	handoffDeliveryDepsFn = func() handoffdelivery.Deps {
+		deps := handoffdelivery.DefaultDeps()
+		deps.CurrentOwner = func(string) (coordlock.Owner, bool) {
+			return coordlock.Owner{AgentID: rep.ID, PID: 2002, PidStart: 22}, true
+		}
+		deps.LoadAgent = func(id string) (*agent.Record, error) {
+			if id != rep.ID {
+				t.Fatalf("LoadAgent id = %q, want %q", id, rep.ID)
+			}
+			return rep, nil
+		}
+		deps.WaitReady = func(string) error { return nil }
+		deps.SessionAlive = func(string) (bool, error) { return true, nil }
+		deps.SendVerified = func(session, prompt string) (bool, error) {
+			sentSession, sentPrompt = session, prompt
+			return true, nil
+		}
+		return deps
+	}
+
+	out := &bytes.Buffer{}
+	delivered, err := deliverHandoffResumePrompt(rep.Project, true, "oldcoord", rep, docPath, out, out)
+	if err != nil {
+		t.Fatalf("deliverHandoffResumePrompt: %v\n%s", err, out.String())
+	}
+	if delivered == nil || delivered.ID != rep.ID {
+		t.Fatalf("delivered = %+v, want successor %s", delivered, rep.ID)
+	}
+	if sentSession != rep.TmuxSession {
+		t.Fatalf("sent session = %q, want owning successor session %q", sentSession, rep.TmuxSession)
+	}
+	for _, want := range []string{
+		"Read your handoff doc at " + docPath,
+		"## Key Decisions\\n- target the spawned session",
+		"## Next Steps (prioritized)\\n1. keep the queue until successor owns the lock",
+	} {
+		if !strings.Contains(sentPrompt, want) {
+			t.Fatalf("sent prompt missing %q:\n%s", want, sentPrompt)
+		}
 	}
 }
 
@@ -1903,16 +1964,25 @@ func TestHandoff_ArchivedOldRecovery_LeaseWrapped_NoOwner_PreservesQueue(t *test
 	}
 }
 
-// codex PR3-completion iter-9 [P2]: the queued lease-wrapped standby can be a
-// LOSING competitor the lock winner already reaped. The archived-OLD recovery
-// must not abort on the dead queued session — delivery follows the CURRENT
-// lock owner, so the still-pending doc reaches the live winner and the queue
-// is consumed.
-func TestHandoff_ArchivedOldRecovery_DeadQueuedStandby_DeliversToWinner(t *testing.T) {
-	requireFakeTmux(t)
-	root := setupFleetHome(t)
+// archivedRecoveryFixture holds the seeded state for the archived-OLD
+// recovery consumption-gate tests (PR-2 Path A). OLD is already archived; its
+// lease-wrapped replacement (newRec) is queued and alive to receive the
+// transport push; winner is a rival record a subtest can hand the lock to.
+type archivedRecoveryFixture struct {
+	old     *agent.Record
+	newRec  *agent.Record
+	winner  *agent.Record
+	qp      string
+	docPath string
+}
 
-	const project = "rainier"
+// seedArchivedRecoveryHandoff builds the shared archived-OLD recovery state so
+// the consumption-gate variants below differ only in who owns the lock. The
+// caller must install fake-tmux isolation (requireFakeTmux) itself — the
+// test-isolation lint only sees the marker in the Test function body, not here.
+func seedArchivedRecoveryHandoff(t *testing.T, project string) archivedRecoveryFixture {
+	t.Helper()
+	root := setupFleetHome(t)
 	cwd := seedRecoveryRepo(t, root, project)
 	if _, err := state.EnsureProjectInitialized(project); err != nil {
 		t.Fatalf("EnsureProjectInitialized: %v", err)
@@ -1928,8 +1998,8 @@ func TestHandoff_ArchivedOldRecovery_DeadQueuedStandby_DeliversToWinner(t *testi
 		t.Fatalf("write old: %v", err)
 	}
 
-	// Queued LEASE-WRAPPED standby that LOST the race: record present,
-	// session ALREADY GONE (the winner reaped it).
+	// Queued LEASE-WRAPPED standby: record present, session alive so it can
+	// receive the transport push regardless of who wins the lock.
 	newRec := agent.New(agent.NewID())
 	newRec.TaskID = old.TaskID
 	newRec.Project = project
@@ -1937,11 +2007,16 @@ func TestHandoff_ArchivedOldRecovery_DeadQueuedStandby_DeliversToWinner(t *testi
 	newRec.Command = []string{"sleep", "60"}
 	newRec.TmuxSession = tmux.SessionName(newRec.ID)
 	newRec.LeaseWrapped = true
+	if err := tmux.Spawn(newRec.TmuxSession, newRec.Cwd, newRec.Command,
+		[]string{"FLEET_AGENT_ID=" + newRec.ID}); err != nil {
+		t.Fatalf("spawn replacement: %v", err)
+	}
+	t.Cleanup(func() { _ = tmux.Kill(newRec.TmuxSession) })
 	if err := newRec.Write(); err != nil {
 		t.Fatalf("write replacement: %v", err)
 	}
 
-	// The live WINNER that holds the lock.
+	// A rival coord record a subtest can name as the lock owner.
 	winner := agent.New(agent.NewID())
 	winner.TaskID = old.TaskID
 	winner.Project = project
@@ -1970,7 +2045,13 @@ func TestHandoff_ArchivedOldRecovery_DeadQueuedStandby_DeliversToWinner(t *testi
 	if err := old.ArchiveWithHandoff(newRec.ID); err != nil {
 		t.Fatalf("archive old: %v", err)
 	}
+	return archivedRecoveryFixture{old: old, newRec: newRec, winner: winner, qp: qp, docPath: docPath}
+}
 
+// installArchivedRecoveryDeps points delivery at owner and records the session
+// keys were pushed to. Returns the sent-session pointer for assertions.
+func installArchivedRecoveryDeps(t *testing.T, owner coordlock.Owner) *string {
+	t.Helper()
 	origDeps := handoffDeliveryDepsFn
 	origTimeout := handoffDeliveryTimeout
 	origPoll := handoffDeliveryPoll
@@ -1981,30 +2062,70 @@ func TestHandoff_ArchivedOldRecovery_DeadQueuedStandby_DeliversToWinner(t *testi
 	})
 	handoffDeliveryTimeout = time.Second
 	handoffDeliveryPoll = time.Millisecond
-	var sentSession string
+	sentSession := new(string)
 	handoffDeliveryDepsFn = func() handoffdelivery.Deps {
 		deps := handoffdelivery.DefaultDeps()
-		deps.CurrentOwner = func(string) (coordlock.Owner, bool) {
-			return coordlock.Owner{AgentID: winner.ID, PID: 9001, PidStart: 99}, true
-		}
+		deps.CurrentOwner = func(string) (coordlock.Owner, bool) { return owner, true }
 		deps.WaitReady = func(string) error { return nil }
 		deps.SessionAlive = func(string) (bool, error) { return true, nil }
 		deps.SendVerified = func(session, _ string) (bool, error) {
-			sentSession = session
+			*sentSession = session
 			return true, nil
 		}
 		deps.Sleep = func(time.Duration) {}
 		return deps
 	}
+	return sentSession
+}
+
+// PR-2 Path A (Option A): a lease-failover winner (a live coord that took the
+// lease, distinct from both the retired OLD and the queued replacement) is the
+// coord that owns the role — delivery follows it, finalizes on it (archive
+// retargeted, queue consumed), and supersedes the losing replacement. This is
+// the pre-PR-2 "deliver to the live winner" behavior Option A restores.
+func TestHandoff_ArchivedOldRecovery_DifferentWinner_DeliversToWinner(t *testing.T) {
+	requireFakeTmux(t)
+	fx := seedArchivedRecoveryHandoff(t, "rainier")
+	sentSession := installArchivedRecoveryDeps(t,
+		coordlock.Owner{AgentID: fx.winner.ID, PID: 9001, PidStart: 99})
 
 	out := &bytes.Buffer{}
-	if err := runHandoff(&handoffOpts{oldID: old.ID, graceMillis: 1}, out, out); err != nil {
-		t.Fatalf("dead-standby recovery should deliver to the winner: %v\n%s", err, out.String())
+	if err := runHandoff(&handoffOpts{oldID: fx.old.ID, graceMillis: 1}, out, out); err != nil {
+		t.Fatalf("live lock winner should be delivered to + finalized: %v\n%s", err, out.String())
 	}
-	if sentSession != winner.TmuxSession {
-		t.Fatalf("delivery went to %q, want winner %q", sentSession, winner.TmuxSession)
+	if *sentSession != fx.winner.TmuxSession {
+		t.Fatalf("delivery went to %q, want live lock winner %q", *sentSession, fx.winner.TmuxSession)
 	}
-	if _, statErr := os.Stat(qp); !errors.Is(statErr, os.ErrNotExist) {
+	if _, statErr := os.Stat(fx.qp); !errors.Is(statErr, os.ErrNotExist) {
 		t.Fatalf("queue should be consumed after winner delivery, stat err=%v", statErr)
+	}
+	arc, err := agent.LoadArchive(fx.old.ID)
+	if err != nil {
+		t.Fatalf("LoadArchive: %v", err)
+	}
+	if arc.SuccessorID != fx.winner.ID {
+		t.Fatalf("archive successor = %q, want retargeted winner %q", arc.SuccessorID, fx.winner.ID)
+	}
+}
+
+// PR-2 Path A (T14 integration): when the intended successor OWNS the lock, the
+// consumption gate passes — the queue file is consumed and runHandoff succeeds.
+// Sibling of the pending case above; both feed the same recovery branch so the
+// gate's two outcomes are asserted end-to-end, not just at the delivery unit.
+func TestHandoff_ArchivedOldRecovery_SuccessorOwnsLock_ConsumesQueue(t *testing.T) {
+	requireFakeTmux(t)
+	fx := seedArchivedRecoveryHandoff(t, "rainier")
+	sentSession := installArchivedRecoveryDeps(t,
+		coordlock.Owner{AgentID: fx.newRec.ID, PID: 2002, PidStart: 22})
+
+	out := &bytes.Buffer{}
+	if err := runHandoff(&handoffOpts{oldID: fx.old.ID, graceMillis: 1}, out, out); err != nil {
+		t.Fatalf("successor-owns-lock delivery should consume the queue: %v\n%s", err, out.String())
+	}
+	if *sentSession != fx.newRec.TmuxSession {
+		t.Fatalf("delivery went to %q, want named successor %q", *sentSession, fx.newRec.TmuxSession)
+	}
+	if _, statErr := os.Stat(fx.qp); !errors.Is(statErr, os.ErrNotExist) {
+		t.Fatalf("queue should be consumed after successor-owns-lock delivery, stat err=%v", statErr)
 	}
 }

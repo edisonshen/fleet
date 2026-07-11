@@ -462,6 +462,47 @@ func TestHandoffResumeNudgeLoop_CommonCaseZeroRenudge(t *testing.T) {
 	}
 }
 
+func TestHandoffResumeNudgeLoop_InlinesHandoffSections(t *testing.T) {
+	const (
+		agentID = "hrinline"
+		project = "hr-inline"
+		session = "fleet-hrinline"
+	)
+	docPath := filepath.Join(t.TempDir(), "handoff.md")
+	doc := "## Completed\nold work\n\n" +
+		"## Key Decisions\n- Path B owns the guarantee\n\n" +
+		"## Next Steps (prioritized)\n1. land PR-2\n\n" +
+		"## Active Subagents\n_(none)_\n"
+	if err := os.WriteFile(docPath, []byte(doc), 0o644); err != nil {
+		t.Fatalf("write handoff doc: %v", err)
+	}
+	setupHandoffResumeRecord(t, agentID, project, session, ptrString(docPath))
+	writeTestCoordState(t, project, map[string]any{
+		resumedHandoffPathCoordStateKey: "",
+	})
+	var prompt string
+	var stderr bytes.Buffer
+	cfg := baseHandoffResumeConfig(agentID, project, session, nil, &stderr)
+	cfg.maxAttempts = 1
+	cfg.sendVerified = func(_ string, gotPrompt string) (bool, error) {
+		prompt = gotPrompt
+		writeTestCoordState(t, project, map[string]any{
+			resumedHandoffPathCoordStateKey: docPath,
+		})
+		return true, nil
+	}
+	runHandoffResumeNudgeLoop(context.Background(), cfg)
+	for _, want := range []string{
+		"Read your handoff doc at " + docPath,
+		"## Key Decisions\\n- Path B owns the guarantee",
+		"## Next Steps (prioritized)\\n1. land PR-2",
+	} {
+		if !strings.Contains(prompt, want) {
+			t.Fatalf("nudge prompt missing %q:\n%s", want, prompt)
+		}
+	}
+}
+
 func TestCoordRun_HandoffResumeNudge_StandDownDoesNotNudge(t *testing.T) {
 	const (
 		agentID = "hrloser1"
