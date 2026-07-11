@@ -513,6 +513,50 @@ def test_main_transient_resume_skip_does_not_ack(
     assert not (fleet_home / "projects" / "myproj" / "coord-state.json").exists()
 
 
+def test_main_transient_skip_still_emits_prepared_blocks(
+    capsys: pytest.CaptureFixture, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fleet_home = tmp_path / "fleet-home"
+    wip_dir = tmp_path / "wip"
+    fleet_home.mkdir()
+    wip_dir.mkdir()
+    (fleet_home / "inbox").mkdir()
+    (fleet_home / "inbox" / "11111111.md").write_text("prompt A", encoding="utf-8")
+    (fleet_home / "inbox" / "22222222.md").write_text("prompt B", encoding="utf-8")
+    (wip_dir / "task-a.md").write_text("phase A", encoding="utf-8")
+    (wip_dir / "task-b.md").write_text("phase B", encoding="utf-8")
+    doc = tmp_path / "handoff.md"
+    body = (
+        '- task="task-a" branch="worker/task-a" phase="tdd-green" '
+        'agent_id="11111111" subagent_id=""\n'
+        '- task="task-b" branch="worker/task-b" phase="tdd-green" '
+        'agent_id="22222222" subagent_id=""'
+    )
+    _seed_handoff(doc, body_subagents=body)
+
+    def fake_reset(agent_id: str, *_args, **_kwargs) -> dict:
+        if agent_id == "11111111":
+            return {"outcome": "reset", "generation": 7}
+        return {"outcome": "contention"}
+
+    monkeypatch.setenv("FLEET_HOME", str(fleet_home))
+    monkeypatch.setenv("FLEET_SUBAGENT_WIP_DIR", str(wip_dir))
+    monkeypatch.setenv("FLEET_PROJECT", "myproj")
+    monkeypatch.setattr(dispatch_mod, "reset_for_relaunch", fake_reset)
+
+    rc = handoff_resume.main([str(doc)])
+
+    captured = capsys.readouterr()
+    assert rc == 1
+    assert "DISPATCH: task-a" in captured.out
+    assert "generation: 7" in captured.out
+    assert "DISPATCH: task-b" not in captured.out
+    assert "transient resume skip" in captured.err
+    state_path = fleet_home / "projects" / "myproj" / "coord-state.json"
+    cs = json.loads(state_path.read_text(encoding="utf-8"))
+    assert "resumed_handoff_path" not in cs
+
+
 def test_main_failure_does_not_write_resumed_handoff_marker(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
