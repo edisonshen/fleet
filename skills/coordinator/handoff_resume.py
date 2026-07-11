@@ -819,6 +819,7 @@ def main(argv: list[str] | None = None) -> int:
             f"open_prs={len(open_pr_urls)})",
             file=sys.stderr,
         )
+    sys.stdout.flush()
     try:
         # Stamp the resumed tasks and applied marker in one coordinator.lock
         # RMW, after stdout delivery succeeds. A busy lock means skip the

@@ -484,6 +484,49 @@ def test_main_stdout_failure_does_not_ack_resume(
     assert not apply_state_called
 
 
+def test_main_stdout_flush_failure_does_not_ack_resume(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class BrokenFlushStdout:
+        def write(self, s: str) -> int:
+            return len(s)
+
+        def flush(self) -> None:
+            raise BrokenPipeError("stdout flush failed")
+
+    fleet_home = tmp_path / "fleet-home"
+    wip_dir = tmp_path / "wip"
+    fleet_home.mkdir()
+    wip_dir.mkdir()
+    (fleet_home / "inbox").mkdir()
+    (fleet_home / "inbox" / "abcd1234.md").write_text("orig prompt", encoding="utf-8")
+    (wip_dir / "fix-foo.md").write_text("phase 1", encoding="utf-8")
+    doc = tmp_path / "handoff.md"
+    _seed_handoff(
+        doc,
+        body_subagents=(
+            '- task="fix-foo" branch="worker/fix-foo" phase="tdd-green" '
+            'agent_id="abcd1234" subagent_id=""'
+        ),
+    )
+    apply_state_called = False
+
+    def fake_apply_state(*_args, **_kwargs) -> None:
+        nonlocal apply_state_called
+        apply_state_called = True
+
+    monkeypatch.setenv("FLEET_HOME", str(fleet_home))
+    monkeypatch.setenv("FLEET_SUBAGENT_WIP_DIR", str(wip_dir))
+    monkeypatch.setenv("FLEET_PROJECT", "myproj")
+    monkeypatch.setattr(handoff_resume, "_record_resumed_apply_state", fake_apply_state)
+    monkeypatch.setattr("sys.stdout", BrokenFlushStdout())
+
+    with pytest.raises(BrokenPipeError):
+        handoff_resume.main([str(doc)])
+
+    assert not apply_state_called
+
+
 def test_main_transient_resume_skip_does_not_ack(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
