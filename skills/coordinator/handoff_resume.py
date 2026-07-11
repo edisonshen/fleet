@@ -52,6 +52,7 @@ the coord agent doesn't pick up the wakeup-loop conventions.
 """
 from __future__ import annotations
 
+import errno
 import fcntl
 import json
 import os
@@ -437,10 +438,10 @@ def build_resume_dispatches(
             generation = 0
         else:
             # error (binary missing / unexpected): the journal was NOT
-            # mutated and we cannot re-arm it via the Go path. Best-effort
-            # direct inbox write with gen 0 — if a journal does exist at a
-            # higher gen the gen-0 block predicate-fails (no double-launch);
-            # this just preserves the inbox body for a manual re-dispatch.
+            # mutated and we cannot re-arm it via the Go path. Preserve the
+            # inbox body, but do NOT emit a gen-0 block or advance the marker:
+            # an existing higher-gen journal would predicate-fail and the ack
+            # would permanently suppress coord-run's retry.
             try:
                 dispatch_mod.write_worker_inbox(
                     e.agent_id, resume_body, fleet_home=str(fleet_home_p),
@@ -451,7 +452,11 @@ def build_resume_dispatches(
                     f"(reset outcome={outcome!r}): {exc}; skip",
                 )
                 continue
-            generation = 0
+            skipped.append(
+                f"task {e.task_id}: reset-for-relaunch error "
+                f"(outcome={outcome!r}); skip (retry next tick)",
+            )
+            continue
         try:
             block = dispatch_mod.format_dispatch_instruction(
                 agent_id=e.agent_id,
@@ -471,30 +476,14 @@ def build_resume_dispatches(
     return blocks, skipped
 
 
-# ---------- session_tasks recording (review iter-2) ----------
+# ---------- coord-state recording (review iter-2 + handoff resume ack) ----------
 #
-# handoff_resume is a standalone script (not run inside loop.py's tick),
-# so it needs its own tiny coord-state.json RMW — mirrors
-# register_subagent._read_coord_state / _write_coord_state / _take_coord_lock
-# verbatim rather than importing them (established convention in this
-# package: each small script that touches coord-state.json keeps its own
-# local copy of the atomic-write + coordinator.lock helpers instead of a
-# shared cross-module dependency).
+# coord-state.json has multiple RMW writers (loop.py, register_subagent.py,
+# and this helper). They must all serialize on coordinator.lock or independent
+# read/modify/write cycles can silently clobber sibling fields.
 
 _LOCK_RETRY_ATTEMPTS = 10
 _LOCK_RETRY_INTERVAL_S = 0.1
-
-
-def _read_coord_state(path: Path) -> dict:
-    """Load coord-state.json. Empty dict on first run / read error."""
-    try:
-        with open(path, "r", encoding="utf-8") as fh:
-            data = json.load(fh)
-        if isinstance(data, dict):
-            return data
-    except (FileNotFoundError, json.JSONDecodeError, OSError):
-        pass
-    return {}
 
 
 def _write_coord_state(path: Path, state: dict) -> None:
@@ -520,28 +509,33 @@ def _take_coord_lock(path: Path):
     """Acquire coordinator.lock LOCK_EX | LOCK_NB with a brief retry.
     Returns a context manager; raises OSError after exhausting retries."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    fd = os.open(str(path), os.O_CREAT | os.O_RDWR, 0o644)
     last_err: OSError | None = None
     for _ in range(_LOCK_RETRY_ATTEMPTS):
+        fd = os.open(str(path), os.O_CREAT | os.O_RDWR, 0o644)
         try:
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            return _ResumeLockHandle(fd)
+            return _CoordLockHandle(fd)
         except OSError as exc:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+            if exc.errno not in (errno.EAGAIN, errno.EWOULDBLOCK):
+                raise
             last_err = exc
             time.sleep(_LOCK_RETRY_INTERVAL_S)
-    os.close(fd)
-    raise OSError(f"coordinator.lock busy after {_LOCK_RETRY_ATTEMPTS} attempts") from last_err
+    raise OSError(f"{path.name} busy after {_LOCK_RETRY_ATTEMPTS} attempts") from last_err
 
 
-class _ResumeLockHandle:
-    """Tiny RAII handle for the coord lock (mirrors register_subagent's
+class _CoordLockHandle:
+    """Tiny RAII handle for the coordinator lock (mirrors register_subagent's
     _LockHandle). Errors during release are swallowed — the kernel
     reclaims the flock on close regardless."""
 
     def __init__(self, fd: int) -> None:
         self.fd = fd
 
-    def __enter__(self) -> "_ResumeLockHandle":
+    def __enter__(self) -> "_CoordLockHandle":
         return self
 
     def __exit__(self, *_exc) -> None:
@@ -555,48 +549,155 @@ class _ResumeLockHandle:
             pass
 
 
-def record_resumed_session_tasks(
-    resumed_slugs: list[str], *, project: str, coord_id: str, home: Path,
-) -> None:
-    """Best-effort RMW: stamp each just-resumed task_id into
-    coord-state.json:session_tasks under THIS (successor) coord's own
-    coord_id, via the shared dispatch.record_session_task writer — the
-    same buffer/dedupe/cap logic every other dispatch seam uses.
+def _parse_frontmatter_project(path: str | os.PathLike) -> str:
+    """Return the handoff doc frontmatter project, or "" when absent."""
+    text = Path(path).read_text(encoding="utf-8")
+    lines = text.splitlines()
+    if not lines or lines[0].strip() != "---":
+        return ""
+    for raw in lines[1:]:
+        if raw.strip() == "---":
+            break
+        key, sep, value = raw.partition(":")
+        if sep and key.strip() == "project":
+            return _decode_frontmatter_value(value.strip())
+    return ""
 
-    Never raises: a resume that can't record its session_tasks stamp
-    must not abort the resume dispatch itself (the DISPATCH blocks are
-    already built and about to be printed to stdout regardless).
+
+def _decode_frontmatter_value(value: str) -> str:
+    """Decode the simple YAML-ish values emitted by Go's fmt %q."""
+    if len(value) >= 2 and value[0] == '"' and value[-1] == '"':
+        return _unquote_go(value[1:-1])
+    if len(value) >= 2 and value[0] == "'" and value[-1] == "'":
+        return value[1:-1]
+    return value.strip()
+
+
+def resolve_resume_project(doc_path: str | os.PathLike) -> str:
+    """Resolve the project for the applied marker.
+
+    Fleet normally sets FLEET_PROJECT in the coord pane. Handoff docs also
+    carry project: in frontmatter, and that is the mandatory fallback so an
+    unset env cannot silently skip the resume ack write.
     """
-    if not resumed_slugs:
-        return
+    env_project = os.environ.get("FLEET_PROJECT", "").strip()
+    if env_project:
+        return env_project
+    return _parse_frontmatter_project(doc_path).strip()
+
+
+def _validate_project_name(project: str) -> None:
+    """Mirror Go state.ValidateProjectName for Python-side project paths."""
+    if not project:
+        raise ValueError("project name must not be empty")
+    if project in {".", "..", ".locks"}:
+        raise ValueError(f"project name {project!r} reserved")
+    if project.startswith("-"):
+        raise ValueError(f"project name {project!r} must not start with '-'")
+    has_alnum = False
+    for ch in project:
+        if "a" <= ch <= "z" or "0" <= ch <= "9":
+            has_alnum = True
+            continue
+        if ch in {"-", "_", "."}:
+            continue
+        if "A" <= ch <= "Z":
+            raise ValueError(
+                f"project name {project!r} contains uppercase {ch!r}",
+            )
+        raise ValueError(
+            f"project name {project!r} contains invalid character {ch!r}",
+        )
+    if not has_alnum:
+        raise ValueError(f"project name {project!r} has no alphanumeric character")
+
+
+def _project_dir(home: Path, project: str) -> Path:
+    _validate_project_name(project)
+    return home / "projects" / project
+
+
+def _coord_lock_path(project_dir: Path) -> Path:
+    return project_dir / ".locks" / "coordinator.lock"
+
+
+def _load_coord_state_for_marker(state_path: Path) -> dict:
+    """Strict load for applied-ack writes: never clobber malformed state."""
+    if not state_path.exists():
+        return {}
     try:
-        project_dir = home / "projects" / project
-        state_path = project_dir / "coord-state.json"
-        lock_path = project_dir / ".locks" / "coordinator.lock"
-        with _take_coord_lock(lock_path):
-            # codex iter-10 [P2]: _read_coord_state() flattens BOTH a missing
-            # file AND a MALFORMED (JSONDecodeError / non-dict) file to {}.
-            # A missing file is fine to create fresh, but overwriting a
-            # malformed file with {session_tasks:[…]} would silently DROP its
-            # sibling keys (worker_agent_ids, recent_decisions, redispatch
-            # markers…) — real data loss. This stamp is best-effort, so the
-            # safe move on a present-but-unparseable file is to SKIP the write,
-            # not truncate it. Distinguish the two by reading raw first.
-            if state_path.exists():
-                try:
-                    raw = json.loads(state_path.read_text(encoding="utf-8"))
-                except (ValueError, OSError):
-                    return  # malformed / unreadable → do not clobber
-                if not isinstance(raw, dict):
-                    return  # non-dict payload → do not clobber
-                cs = raw
-            else:
-                cs = {}
-            for slug in resumed_slugs:
-                dispatch_mod.record_session_task(cs, slug, coord_id)
-            _write_coord_state(state_path, cs)
-    except Exception:  # noqa: BLE001 — best-effort, mirrors loop._record_session_task
-        pass
+        raw = json.loads(state_path.read_text(encoding="utf-8"))
+    except (ValueError, OSError) as exc:
+        raise ValueError(
+            "coord-state.json malformed; not writing resumed_handoff_path",
+        ) from exc
+    if not isinstance(raw, dict):
+        raise ValueError(
+            "coord-state.json is not an object; not writing resumed_handoff_path",
+        )
+    return raw
+
+
+class _PendingResumeApply:
+    """Holds coordinator.lock for the short print+ack critical section."""
+
+    def __init__(
+        self, lock: _CoordLockHandle, state_path: Path, state: dict,
+    ) -> None:
+        self._lock = lock
+        self._state_path = state_path
+        self._state = state
+
+    def __enter__(self) -> "_PendingResumeApply":
+        return self
+
+    def __exit__(self, *exc) -> None:
+        self._lock.__exit__(*exc)
+
+    def commit(
+        self,
+        doc_path: str | os.PathLike,
+        resumed_slugs: list[str],
+        *,
+        coord_id: str,
+    ) -> None:
+        for slug in resumed_slugs:
+            dispatch_mod.record_session_task(self._state, slug, coord_id)
+        self._state["resumed_handoff_path"] = str(doc_path)
+        _write_coord_state(self._state_path, self._state)
+
+
+def _prepare_resumed_apply_state(
+    *, project: str, home: Path,
+) -> _PendingResumeApply:
+    """Acquire coordinator.lock and strict-load coord-state before output.
+
+    If the lock is busy or coord-state is malformed, the caller can fail before
+    printing launchable DISPATCH blocks. That keeps the marker-behind retry path
+    from re-emitting blocks that may already have been consumed.
+    """
+    if not project:
+        raise ValueError("project is required to write resumed_handoff_path")
+    project_dir = _project_dir(home, project)
+    state_path = project_dir / "coord-state.json"
+    lock = _take_coord_lock(_coord_lock_path(project_dir))
+    try:
+        state = _load_coord_state_for_marker(state_path)
+    except Exception:
+        lock.__exit__(None, None, None)
+        raise
+    return _PendingResumeApply(lock, state_path, state)
+
+
+def _has_transient_resume_skip(skipped: list[str]) -> bool:
+    """Return true when a skip means the handoff was not fully applied."""
+    transient_needles = (
+        "reset-for-relaunch contention",
+        "reset-for-relaunch error",
+        "resume acquire failed",
+        "inbox rewrite failed",
+    )
+    return any(any(needle in line for needle in transient_needles) for line in skipped)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -633,41 +734,74 @@ def main(argv: list[str] | None = None) -> int:
     wip_dir = os.environ.get(
         "FLEET_SUBAGENT_WIP_DIR",
     ) or os.path.expanduser("~/.fleet/subagent-wip")
-    project = os.environ.get("FLEET_PROJECT", "") or None
+    project = resolve_resume_project(doc_path)
+    if not project:
+        print(
+            "handoff_resume: project missing (FLEET_PROJECT unset and "
+            "handoff frontmatter has no project)",
+            file=sys.stderr,
+        )
+        return 1
+    try:
+        _validate_project_name(project)
+    except ValueError as exc:
+        print(f"handoff_resume: invalid project: {exc}", file=sys.stderr)
+        return 1
     resumed_slugs: list[str] = []
     blocks, skipped = build_resume_dispatches(
         entries, wip_dir=wip_dir, fleet_home=fleet_home,
         project=project, on_resume=resumed_slugs.append,
     )
-    # review iter-2 (codex): stamp every resumed task_id into THIS coord's
-    # own session_tasks under its own coord_id — without this, a resumed
-    # active task silently disappears from Next Steps/Open Questions if
-    # this successor hands off again before any loop.py tick seam
-    # independently touches it. Best-effort: the DISPATCH blocks below are
-    # unconditional regardless of whether this stamp lands.
-    if project:
-        record_resumed_session_tasks(
-            resumed_slugs, project=project,
-            coord_id=os.environ.get("FLEET_AGENT_ID", ""),
-            home=Path(fleet_home),
-        )
-    for line in skipped:
-        print(f"# {line}", file=sys.stderr)
-    for url in open_pr_urls:
+    if _has_transient_resume_skip(skipped):
+        for line in skipped:
+            print(f"# {line}", file=sys.stderr)
         print(
-            f"# open-pr-shepherd: {url} — respawn `gh pr view` watch loop",
+            "handoff_resume: transient resume skip; not writing "
+            "resumed_handoff_path so coord-run can retry",
             file=sys.stderr,
         )
-    for b in blocks:
-        print(b)
-        print()
-    if not blocks:
-        print(
-            "# handoff_resume: no resumable subagents "
-            f"(parsed={len(entries)} skipped={len(skipped)} "
-            f"open_prs={len(open_pr_urls)})",
-            file=sys.stderr,
+        return 1
+    try:
+        pending_apply = _prepare_resumed_apply_state(
+            project=project, home=Path(fleet_home),
         )
+    except Exception as exc:  # noqa: BLE001 — exit 0 is the applied ack.
+        print(f"handoff_resume: write resumed_handoff_path failed: {exc}", file=sys.stderr)
+        return 1
+    with pending_apply:
+        for line in skipped:
+            print(f"# {line}", file=sys.stderr)
+        for url in open_pr_urls:
+            print(
+                f"# open-pr-shepherd: {url} — respawn `gh pr view` watch loop",
+                file=sys.stderr,
+            )
+        for b in blocks:
+            print(b)
+            print()
+        if not blocks:
+            print(
+                "# handoff_resume: no resumable subagents "
+                f"(parsed={len(entries)} skipped={len(skipped)} "
+                f"open_prs={len(open_pr_urls)})",
+                file=sys.stderr,
+            )
+        sys.stdout.flush()
+        try:
+            # Stamp the resumed tasks and applied marker in one coordinator.lock
+            # RMW after stdout delivery succeeds. Lock acquisition and strict
+            # state load happened before output, so busy/malformed state cannot
+            # create a delivered-but-unacked retry loop.
+            pending_apply.commit(
+                doc_path, resumed_slugs,
+                coord_id=os.environ.get("FLEET_AGENT_ID", ""),
+            )
+        except Exception as exc:  # noqa: BLE001 — exit 0 is the applied ack.
+            print(
+                f"handoff_resume: write resumed_handoff_path failed: {exc}",
+                file=sys.stderr,
+            )
+            return 1
     return 0
 
 

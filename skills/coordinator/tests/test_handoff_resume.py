@@ -10,9 +10,13 @@ Covers:
 """
 from __future__ import annotations
 
+import fcntl
 import json
+import os
 import shutil
 import subprocess
+import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -39,6 +43,25 @@ def built_fleet_bin(tmp_path_factory) -> str:
     if proc.returncode != 0:
         pytest.skip(f"fleet build failed: {proc.stderr}")
     return str(binary)
+
+
+@pytest.fixture
+def stub_reset_relaunch(monkeypatch: pytest.MonkeyPatch):
+    """CI-safe stub for dispatch.reset_for_relaunch.
+
+    CI has no `fleet` binary on PATH, so the real call raises FileNotFoundError
+    → {"outcome": "error"} → build_resume_dispatches SKIPS the entry and emits
+    no DISPATCH block (see project_test_real_fleet_binary_ci_trap). Any test
+    that asserts a block IS produced must not depend on the ambient binary.
+    The stub mimics the Go re-arm: rewrite the inbox to the resume prompt (as
+    the flock-held reset does) and return a bumped generation."""
+    def _fake(agent_id, prompt, *, fleet_bin="fleet", fleet_home=None, timeout_s=10.0):
+        inbox = Path(fleet_home) / "inbox" / f"{agent_id}.md"
+        inbox.parent.mkdir(parents=True, exist_ok=True)
+        inbox.write_text(prompt, encoding="utf-8")
+        return {"outcome": "reset", "generation": 7, "path": ""}
+
+    monkeypatch.setattr(dispatch_mod, "reset_for_relaunch", _fake)
 
 
 def test_resume_absent_journal_acquires_gen0_passes_gate(
@@ -97,6 +120,7 @@ def _seed_handoff(
     *,
     body_subagents: str,
     body_open_prs: str = "_(no open PRs)_",
+    project: str = "myproj",
 ) -> None:
     """Write a minimal handoff doc with the Active Subagents section
     filled with the given body_subagents string and the Open PRs
@@ -105,7 +129,7 @@ def _seed_handoff(
         "---\n"
         'agent_id: "abcd1234"\n'
         'task_id: "coord-myproj"\n'
-        'project: "myproj"\n'
+        f'project: "{project}"\n'
         "context_pct_at_handoff: 50\n"
         "previous_handoff: null\n"
         "handoff_number: 1\n"
@@ -244,7 +268,7 @@ def test_build_resume_dispatches_skips_when_inbox_missing(tmp_path: Path) -> Non
 
 
 def test_build_resume_dispatches_emits_block_when_wip_and_inbox_present(
-    tmp_path: Path,
+    tmp_path: Path, stub_reset_relaunch,
 ) -> None:
     fleet_home = tmp_path / "fleet-home"
     wip_dir = tmp_path / "wip"
@@ -301,7 +325,9 @@ def test_build_resume_dispatches_skips_entry_with_empty_agent_id(
     assert any("agent_id" in s for s in skipped)
 
 
-def test_build_resume_dispatches_handles_multiple_entries(tmp_path: Path) -> None:
+def test_build_resume_dispatches_handles_multiple_entries(
+    tmp_path: Path, stub_reset_relaunch,
+) -> None:
     """One worker resumable, one not — block emission is per-entry,
     not all-or-nothing."""
     fleet_home = tmp_path / "fleet-home"
@@ -348,6 +374,7 @@ def test_main_missing_doc_returns_one(
 
 def test_main_emits_dispatch_blocks_on_stdout(
     capsys: pytest.CaptureFixture, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    stub_reset_relaunch,
 ) -> None:
     fleet_home = tmp_path / "fleet-home"
     wip_dir = tmp_path / "wip"
@@ -375,6 +402,7 @@ def test_main_emits_dispatch_blocks_on_stdout(
 
 def test_main_records_resumed_task_into_session_tasks(
     capsys: pytest.CaptureFixture, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    stub_reset_relaunch,
 ) -> None:
     """Review iter-2 (codex P1): a resumed task must be stamped into THIS
     (successor) coord's own coord-state.json:session_tasks under its own
@@ -411,45 +439,502 @@ def test_main_records_resumed_task_into_session_tasks(
     st = cs.get("session_tasks", [])
     assert [e["slug"] for e in st] == ["fix-foo"]
     assert st[0]["coord_id"] == "succ0001"
+    assert cs["resumed_handoff_path"] == str(doc)
 
 
-def test_record_resumed_session_tasks_preserves_malformed_coord_state(
+def test_main_writes_resumed_handoff_marker_on_exit_zero(
+    capsys: pytest.CaptureFixture, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fleet_home = tmp_path / "fleet-home"
+    wip_dir = tmp_path / "wip"
+    fleet_home.mkdir()
+    wip_dir.mkdir()
+    doc = tmp_path / "handoff.md"
+    _seed_handoff(doc, body_subagents="_(none)_")
+    monkeypatch.setenv("FLEET_HOME", str(fleet_home))
+    monkeypatch.setenv("FLEET_SUBAGENT_WIP_DIR", str(wip_dir))
+    monkeypatch.setenv("FLEET_PROJECT", "myproj")
+
+    rc = handoff_resume.main([str(doc)])
+    assert rc == 0
+    capsys.readouterr()
+
+    state_path = fleet_home / "projects" / "myproj" / "coord-state.json"
+    cs = json.loads(state_path.read_text(encoding="utf-8"))
+    assert cs["resumed_handoff_path"] == str(doc)
+
+
+def test_main_stdout_failure_does_not_ack_resume(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, stub_reset_relaunch,
+) -> None:
+    class BrokenStdout:
+        def write(self, _s: str) -> int:
+            raise BrokenPipeError("stdout closed")
+
+        def flush(self) -> None:
+            return None
+
+    fleet_home = tmp_path / "fleet-home"
+    wip_dir = tmp_path / "wip"
+    fleet_home.mkdir()
+    wip_dir.mkdir()
+    (fleet_home / "inbox").mkdir()
+    (fleet_home / "inbox" / "abcd1234.md").write_text("orig prompt", encoding="utf-8")
+    (wip_dir / "fix-foo.md").write_text("phase 1", encoding="utf-8")
+    doc = tmp_path / "handoff.md"
+    _seed_handoff(
+        doc,
+        body_subagents=(
+            '- task="fix-foo" branch="worker/fix-foo" phase="tdd-green" '
+            'agent_id="abcd1234" subagent_id=""'
+        ),
+    )
+    monkeypatch.setenv("FLEET_HOME", str(fleet_home))
+    monkeypatch.setenv("FLEET_SUBAGENT_WIP_DIR", str(wip_dir))
+    monkeypatch.setenv("FLEET_PROJECT", "myproj")
+    monkeypatch.setattr("sys.stdout", BrokenStdout())
+
+    with pytest.raises(BrokenPipeError):
+        handoff_resume.main([str(doc)])
+
+    assert not (fleet_home / "projects" / "myproj" / "coord-state.json").exists()
+
+
+def test_main_stdout_flush_failure_does_not_ack_resume(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, stub_reset_relaunch,
+) -> None:
+    class BrokenFlushStdout:
+        def write(self, s: str) -> int:
+            return len(s)
+
+        def flush(self) -> None:
+            raise BrokenPipeError("stdout flush failed")
+
+    fleet_home = tmp_path / "fleet-home"
+    wip_dir = tmp_path / "wip"
+    fleet_home.mkdir()
+    wip_dir.mkdir()
+    (fleet_home / "inbox").mkdir()
+    (fleet_home / "inbox" / "abcd1234.md").write_text("orig prompt", encoding="utf-8")
+    (wip_dir / "fix-foo.md").write_text("phase 1", encoding="utf-8")
+    doc = tmp_path / "handoff.md"
+    _seed_handoff(
+        doc,
+        body_subagents=(
+            '- task="fix-foo" branch="worker/fix-foo" phase="tdd-green" '
+            'agent_id="abcd1234" subagent_id=""'
+        ),
+    )
+    monkeypatch.setenv("FLEET_HOME", str(fleet_home))
+    monkeypatch.setenv("FLEET_SUBAGENT_WIP_DIR", str(wip_dir))
+    monkeypatch.setenv("FLEET_PROJECT", "myproj")
+    monkeypatch.setattr("sys.stdout", BrokenFlushStdout())
+
+    with pytest.raises(BrokenPipeError):
+        handoff_resume.main([str(doc)])
+
+    assert not (fleet_home / "projects" / "myproj" / "coord-state.json").exists()
+
+
+def test_main_busy_coordinator_lock_does_not_emit_dispatch_or_ack(
+    capsys: pytest.CaptureFixture, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fleet_home = tmp_path / "fleet-home"
+    wip_dir = tmp_path / "wip"
+    project_dir = fleet_home / "projects" / "myproj"
+    locks_dir = project_dir / ".locks"
+    locks_dir.mkdir(parents=True)
+    wip_dir.mkdir()
+    (fleet_home / "inbox").mkdir(parents=True)
+    (fleet_home / "inbox" / "abcd1234.md").write_text("orig prompt", encoding="utf-8")
+    (wip_dir / "fix-foo.md").write_text("phase 1", encoding="utf-8")
+    doc = tmp_path / "handoff.md"
+    _seed_handoff(
+        doc,
+        body_subagents=(
+            '- task="fix-foo" branch="worker/fix-foo" phase="tdd-green" '
+            'agent_id="abcd1234" subagent_id=""'
+        ),
+    )
+    coord_lock = locks_dir / "coordinator.lock"
+    ready = tmp_path / "holder-ready"
+    holder = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import fcntl, pathlib, sys, time; "
+                "p = pathlib.Path(sys.argv[1]); "
+                "fh = p.open('w'); "
+                "fcntl.flock(fh, fcntl.LOCK_EX); "
+                "pathlib.Path(sys.argv[2]).write_text('ready', encoding='utf-8'); "
+                "time.sleep(30)"
+            ),
+            str(coord_lock),
+            str(ready),
+        ],
+    )
+    try:
+        deadline = time.monotonic() + 5
+        while not ready.exists() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert ready.exists(), "lock holder did not start"
+        monkeypatch.setenv("FLEET_HOME", str(fleet_home))
+        monkeypatch.setenv("FLEET_SUBAGENT_WIP_DIR", str(wip_dir))
+        monkeypatch.setenv("FLEET_PROJECT", "myproj")
+        monkeypatch.setattr(handoff_resume, "_LOCK_RETRY_ATTEMPTS", 2)
+        monkeypatch.setattr(handoff_resume, "_LOCK_RETRY_INTERVAL_S", 0.01)
+        monkeypatch.setattr(
+            dispatch_mod,
+            "reset_for_relaunch",
+            lambda *_args, **_kwargs: {"outcome": "reset", "generation": 7},
+        )
+
+        rc = handoff_resume.main([str(doc)])
+
+        captured = capsys.readouterr()
+        assert rc == 1
+        assert "DISPATCH: fix-foo" not in captured.out
+        assert "write resumed_handoff_path failed" in captured.err
+        assert not (project_dir / "coord-state.json").exists()
+    finally:
+        holder.terminate()
+        try:
+            holder.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            holder.kill()
+            holder.wait(timeout=5)
+
+
+def test_main_transient_resume_skip_does_not_ack(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fleet_home = tmp_path / "fleet-home"
+    wip_dir = tmp_path / "wip"
+    fleet_home.mkdir()
+    wip_dir.mkdir()
+    (fleet_home / "inbox").mkdir()
+    (fleet_home / "inbox" / "abcd1234.md").write_text("orig prompt", encoding="utf-8")
+    (wip_dir / "fix-foo.md").write_text("phase 1", encoding="utf-8")
+    doc = tmp_path / "handoff.md"
+    _seed_handoff(
+        doc,
+        body_subagents=(
+            '- task="fix-foo" branch="worker/fix-foo" phase="tdd-green" '
+            'agent_id="abcd1234" subagent_id=""'
+        ),
+    )
+    monkeypatch.setenv("FLEET_HOME", str(fleet_home))
+    monkeypatch.setenv("FLEET_SUBAGENT_WIP_DIR", str(wip_dir))
+    monkeypatch.setenv("FLEET_PROJECT", "myproj")
+    monkeypatch.setattr(
+        dispatch_mod,
+        "reset_for_relaunch",
+        lambda *_args, **_kwargs: {"outcome": "contention"},
+    )
+
+    rc = handoff_resume.main([str(doc)])
+
+    assert rc == 1
+    assert not (fleet_home / "projects" / "myproj" / "coord-state.json").exists()
+
+
+def test_main_transient_skip_suppresses_prepared_blocks(
+    capsys: pytest.CaptureFixture, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fleet_home = tmp_path / "fleet-home"
+    wip_dir = tmp_path / "wip"
+    fleet_home.mkdir()
+    wip_dir.mkdir()
+    (fleet_home / "inbox").mkdir()
+    (fleet_home / "inbox" / "11111111.md").write_text("prompt A", encoding="utf-8")
+    (fleet_home / "inbox" / "22222222.md").write_text("prompt B", encoding="utf-8")
+    (wip_dir / "task-a.md").write_text("phase A", encoding="utf-8")
+    (wip_dir / "task-b.md").write_text("phase B", encoding="utf-8")
+    doc = tmp_path / "handoff.md"
+    body = (
+        '- task="task-a" branch="worker/task-a" phase="tdd-green" '
+        'agent_id="11111111" subagent_id=""\n'
+        '- task="task-b" branch="worker/task-b" phase="tdd-green" '
+        'agent_id="22222222" subagent_id=""'
+    )
+    _seed_handoff(doc, body_subagents=body)
+
+    def fake_reset(agent_id: str, *_args, **_kwargs) -> dict:
+        if agent_id == "11111111":
+            return {"outcome": "reset", "generation": 7}
+        return {"outcome": "contention"}
+
+    monkeypatch.setenv("FLEET_HOME", str(fleet_home))
+    monkeypatch.setenv("FLEET_SUBAGENT_WIP_DIR", str(wip_dir))
+    monkeypatch.setenv("FLEET_PROJECT", "myproj")
+    monkeypatch.setattr(dispatch_mod, "reset_for_relaunch", fake_reset)
+
+    rc = handoff_resume.main([str(doc)])
+
+    captured = capsys.readouterr()
+    assert rc == 1
+    assert "DISPATCH: task-a" not in captured.out
+    assert "DISPATCH: task-b" not in captured.out
+    assert "transient resume skip" in captured.err
+    state_path = fleet_home / "projects" / "myproj" / "coord-state.json"
+    assert not state_path.exists()
+
+
+def test_main_reset_error_does_not_emit_or_ack_fallback_block(
+    capsys: pytest.CaptureFixture, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fleet_home = tmp_path / "fleet-home"
+    wip_dir = tmp_path / "wip"
+    fleet_home.mkdir()
+    wip_dir.mkdir()
+    (fleet_home / "inbox").mkdir()
+    inbox = fleet_home / "inbox" / "abcd1234.md"
+    inbox.write_text("orig prompt", encoding="utf-8")
+    (wip_dir / "fix-foo.md").write_text("phase 1", encoding="utf-8")
+    doc = tmp_path / "handoff.md"
+    _seed_handoff(
+        doc,
+        body_subagents=(
+            '- task="fix-foo" branch="worker/fix-foo" phase="tdd-green" '
+            'agent_id="abcd1234" subagent_id=""'
+        ),
+    )
+    monkeypatch.setenv("FLEET_HOME", str(fleet_home))
+    monkeypatch.setenv("FLEET_SUBAGENT_WIP_DIR", str(wip_dir))
+    monkeypatch.setenv("FLEET_PROJECT", "myproj")
+    monkeypatch.setattr(
+        dispatch_mod,
+        "reset_for_relaunch",
+        lambda *_args, **_kwargs: {"outcome": "error", "error": "boom"},
+    )
+
+    rc = handoff_resume.main([str(doc)])
+
+    captured = capsys.readouterr()
+    assert rc == 1
+    assert "DISPATCH: fix-foo" not in captured.out
+    assert "reset-for-relaunch error" in captured.err
+    assert "RESUMING after coord handoff" in inbox.read_text(encoding="utf-8")
+    state_path = fleet_home / "projects" / "myproj" / "coord-state.json"
+    assert not state_path.exists()
+
+
+def test_main_failure_does_not_write_resumed_handoff_marker(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fleet_home = tmp_path / "fleet-home"
+    fleet_home.mkdir()
+    monkeypatch.setenv("FLEET_HOME", str(fleet_home))
+    monkeypatch.setenv("FLEET_PROJECT", "myproj")
+
+    rc = handoff_resume.main([str(tmp_path / "missing.md")])
+
+    assert rc == 1
+    assert not (fleet_home / "projects" / "myproj" / "coord-state.json").exists()
+
+
+def test_main_uses_frontmatter_project_for_marker_when_env_unset(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fleet_home = tmp_path / "fleet-home"
+    wip_dir = tmp_path / "wip"
+    fleet_home.mkdir()
+    wip_dir.mkdir()
+    doc = tmp_path / "handoff.md"
+    _seed_handoff(doc, body_subagents="_(none)_", project="fallback-proj")
+    monkeypatch.setenv("FLEET_HOME", str(fleet_home))
+    monkeypatch.setenv("FLEET_SUBAGENT_WIP_DIR", str(wip_dir))
+    monkeypatch.delenv("FLEET_PROJECT", raising=False)
+
+    rc = handoff_resume.main([str(doc)])
+
+    assert rc == 0
+    state_path = fleet_home / "projects" / "fallback-proj" / "coord-state.json"
+    cs = json.loads(state_path.read_text(encoding="utf-8"))
+    assert cs["resumed_handoff_path"] == str(doc)
+
+
+def test_main_rejects_traversal_project_before_resume_side_effects(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fleet_home = tmp_path / "fleet-home"
+    wip_dir = tmp_path / "wip"
+    outside = tmp_path / "outside"
+    fleet_home.mkdir()
+    wip_dir.mkdir()
+    (fleet_home / "inbox").mkdir()
+    inbox = fleet_home / "inbox" / "abcd1234.md"
+    inbox.write_text("orig prompt", encoding="utf-8")
+    (wip_dir / "fix-foo.md").write_text("phase 1", encoding="utf-8")
+    doc = tmp_path / "handoff.md"
+    _seed_handoff(
+        doc,
+        body_subagents=(
+            '- task="fix-foo" branch="worker/fix-foo" phase="tdd-green" '
+            'agent_id="abcd1234" subagent_id=""'
+        ),
+        project="../../outside",
+    )
+    monkeypatch.setenv("FLEET_HOME", str(fleet_home))
+    monkeypatch.setenv("FLEET_SUBAGENT_WIP_DIR", str(wip_dir))
+    monkeypatch.delenv("FLEET_PROJECT", raising=False)
+
+    rc = handoff_resume.main([str(doc)])
+
+    assert rc == 1
+    assert inbox.read_text(encoding="utf-8") == "orig prompt"
+    assert not outside.exists()
+
+
+def test_main_rejects_absolute_project_before_resume_side_effects(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fleet_home = tmp_path / "fleet-home"
+    wip_dir = tmp_path / "wip"
+    outside = tmp_path / "outside"
+    fleet_home.mkdir()
+    wip_dir.mkdir()
+    (fleet_home / "inbox").mkdir()
+    inbox = fleet_home / "inbox" / "abcd1234.md"
+    inbox.write_text("orig prompt", encoding="utf-8")
+    (wip_dir / "fix-foo.md").write_text("phase 1", encoding="utf-8")
+    doc = tmp_path / "handoff.md"
+    _seed_handoff(
+        doc,
+        body_subagents=(
+            '- task="fix-foo" branch="worker/fix-foo" phase="tdd-green" '
+            'agent_id="abcd1234" subagent_id=""'
+        ),
+        project=str(outside),
+    )
+    monkeypatch.setenv("FLEET_HOME", str(fleet_home))
+    monkeypatch.setenv("FLEET_SUBAGENT_WIP_DIR", str(wip_dir))
+    monkeypatch.delenv("FLEET_PROJECT", raising=False)
+
+    rc = handoff_resume.main([str(doc)])
+
+    assert rc == 1
+    assert inbox.read_text(encoding="utf-8") == "orig prompt"
+    assert not outside.exists()
+
+
+def test_main_preserves_concurrent_coord_state_rmw(
     tmp_path: Path,
 ) -> None:
-    """codex iter-10 [P2]: a present-but-MALFORMED coord-state.json must NOT
-    be clobbered by the best-effort resume stamp. Overwriting it would drop
-    sibling keys (worker_agent_ids, recent_decisions, redispatch markers).
-    On a parse failure the safe move is to SKIP the write entirely."""
+    """The LIVE ack write (main() → _prepare_resumed_apply_state + commit)
+    must share coordinator.lock with the other coord-state.json RMW writers.
+    A simulated coord writer holds coordinator.lock and updates a sibling
+    field; main() (run in a subprocess) can only write resumed_handoff_path
+    after the lock is released, so NO update is lost — both fields survive.
+    This exercises the code path main() actually runs, not a helper twin."""
     fleet_home = tmp_path / "fleet-home"
+    wip_dir = tmp_path / "wip"
+    project_dir = fleet_home / "projects" / "myproj"
+    locks_dir = project_dir / ".locks"
+    locks_dir.mkdir(parents=True)
+    wip_dir.mkdir()
+    state_path = project_dir / "coord-state.json"
+    state_path.write_text(
+        json.dumps({"recent_decisions": ["keep"]}),
+        encoding="utf-8",
+    )
+    doc = tmp_path / "handoff.md"
+    _seed_handoff(doc, body_subagents="_(none)_")
+    coord_lock = locks_dir / "coordinator.lock"
+
+    fd = os.open(str(coord_lock), os.O_CREAT | os.O_RDWR, 0o644)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        repo_coord_dir = Path(__file__).resolve().parents[1]
+        env = {
+            **os.environ,
+            "FLEET_HOME": str(fleet_home),
+            "FLEET_SUBAGENT_WIP_DIR": str(wip_dir),
+            "FLEET_PROJECT": "myproj",
+            "FLEET_AGENT_ID": "succ0001",
+        }
+        proc = subprocess.Popen(
+            [
+                sys.executable,
+                "-c",
+                (
+                    "import sys; "
+                    "sys.path.insert(0, sys.argv[1]); "
+                    "import handoff_resume; "
+                    "sys.exit(handoff_resume.main([sys.argv[2]]))"
+                ),
+                str(repo_coord_dir),
+                str(doc),
+            ],
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+
+        # RMW a sibling field while holding coordinator.lock; main() is
+        # blocked on the lock and cannot interleave its own read/modify/write.
+        cs = json.loads(state_path.read_text(encoding="utf-8"))
+        cs["worker_agent_ids"] = {"fix-foo": "abcd1234"}
+        handoff_resume._write_coord_state(state_path, cs)
+    finally:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            os.close(fd)
+
+    out, err = proc.communicate(timeout=10)
+    assert proc.returncode == 0, (out, err)
+
+    cs = json.loads(state_path.read_text(encoding="utf-8"))
+    assert cs["recent_decisions"] == ["keep"]
+    assert cs["worker_agent_ids"] == {"fix-foo": "abcd1234"}
+    assert cs["resumed_handoff_path"] == str(doc)
+
+
+def test_main_preserves_malformed_coord_state(
+    capsys: pytest.CaptureFixture, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A present-but-MALFORMED coord-state.json makes the live ack write fail
+    loud (exit 1, strict load raises) and leaves the file byte-for-byte
+    intact — never a partial/truncated write that drops sibling keys."""
+    fleet_home = tmp_path / "fleet-home"
+    wip_dir = tmp_path / "wip"
     project_dir = fleet_home / "projects" / "myproj"
     (project_dir / ".locks").mkdir(parents=True)
+    wip_dir.mkdir()
     state_path = project_dir / "coord-state.json"
     garbage = '{"worker_agent_ids": {"foo": "aaaa1111"}, TRUNCATED'
     state_path.write_text(garbage, encoding="utf-8")
+    doc = tmp_path / "handoff.md"
+    _seed_handoff(doc, body_subagents="_(none)_")
+    monkeypatch.setenv("FLEET_HOME", str(fleet_home))
+    monkeypatch.setenv("FLEET_SUBAGENT_WIP_DIR", str(wip_dir))
+    monkeypatch.setenv("FLEET_PROJECT", "myproj")
 
-    handoff_resume.record_resumed_session_tasks(
-        ["fix-foo"], project="myproj", coord_id="succ0001", home=fleet_home,
-    )
+    rc = handoff_resume.main([str(doc)])
 
-    # The malformed file is left byte-for-byte intact — NOT truncated to a
-    # fresh {session_tasks:[…]} that would have lost worker_agent_ids.
+    assert rc == 1
+    assert "write resumed_handoff_path failed" in capsys.readouterr().err
     assert state_path.read_text(encoding="utf-8") == garbage
 
 
-def test_record_resumed_session_tasks_writes_when_absent(
-    tmp_path: Path,
-) -> None:
-    """A MISSING coord-state.json is fine to create fresh (only the absent
-    case, never a malformed one)."""
-    fleet_home = tmp_path / "fleet-home"
-    project_dir = fleet_home / "projects" / "myproj"
-    (project_dir / ".locks").mkdir(parents=True)
+@pytest.mark.parametrize(
+    "project",
+    ["../../outside", "/tmp/outside", "BadProj", ".locks", "-flag", ""],
+)
+def test_validate_project_name_rejects_unsafe(project: str) -> None:
+    """The shared guard the live ack path runs before touching any project
+    dir must reject traversal, absolute, uppercase, reserved, dash-leading,
+    and empty names."""
+    with pytest.raises(ValueError):
+        handoff_resume._validate_project_name(project)
 
-    handoff_resume.record_resumed_session_tasks(
-        ["fix-foo"], project="myproj", coord_id="succ0001", home=fleet_home,
-    )
-    cs = json.loads((project_dir / "coord-state.json").read_text(encoding="utf-8"))
-    assert [e["slug"] for e in cs.get("session_tasks", [])] == ["fix-foo"]
+
+def test_validate_project_name_accepts_valid() -> None:
+    for project in ("myproj", "fleet", "a-b_c.d", "proj123"):
+        handoff_resume._validate_project_name(project)
 
 
 def test_main_no_resumable_writes_footer_to_stderr(
@@ -538,7 +1023,9 @@ def test_handoff_resume_does_not_redispatch_when_in_review(tmp_path: Path) -> No
     assert "shepherd-only" in skipped[0]
 
 
-def test_handoff_resume_redispatches_when_in_progress_no_pr(tmp_path: Path) -> None:
+def test_handoff_resume_redispatches_when_in_progress_no_pr(
+    tmp_path: Path, stub_reset_relaunch,
+) -> None:
     """An entry with empty pr_url + status=in-progress (or empty for
     legacy rows) MUST produce a DISPATCH block — worker was still
     writing code; resume from WIP."""
@@ -593,7 +1080,7 @@ def test_handoff_resume_skips_terminal_status(tmp_path: Path) -> None:
 
 
 def test_handoff_resume_legacy_empty_status_falls_back_to_redispatch(
-    tmp_path: Path,
+    tmp_path: Path, stub_reset_relaunch,
 ) -> None:
     """Legacy 5-field row → status="" → pre-enrichment 'always re-
     dispatch if WIP+inbox' behavior is preserved."""

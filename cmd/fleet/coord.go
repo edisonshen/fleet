@@ -57,7 +57,10 @@ import (
 	"github.com/edisonshen/fleet/internal/agent"
 	"github.com/edisonshen/fleet/internal/coord"
 	"github.com/edisonshen/fleet/internal/fleetlog"
+	"github.com/edisonshen/fleet/internal/handoff"
 	"github.com/edisonshen/fleet/internal/install"
+	"github.com/edisonshen/fleet/internal/spawn"
+	"github.com/edisonshen/fleet/internal/state"
 	"github.com/edisonshen/fleet/internal/tmux"
 )
 
@@ -148,6 +151,22 @@ type coordRunOpts struct {
 	// stderr print when acquired==false. Test-only seam so a stand-down
 	// test can assert the path was taken without scraping stderr.
 	onStandDown func()
+
+	// Handoff-resume pull seams. Production leaves these nil so coord-run
+	// reads the successor's own record + coord-state.json and nudges the
+	// child via the same readiness-verified tmux send surface as handoff
+	// delivery. Tests inject these to exercise the bounded resident retry
+	// loop deterministically.
+	handoffResumeLoadAgent       func(string) (*agent.Record, error)
+	handoffResumeReadMarker      func(string) (string, error)
+	handoffResumeWaitReady       func(string) error
+	handoffResumeSendVerified    func(string, string) (bool, error)
+	handoffResumeInitialDelay    time.Duration
+	handoffResumeInitialDelayC   <-chan time.Time
+	handoffResumeRecheckInterval time.Duration
+	handoffResumeWakeC           <-chan time.Time
+	handoffResumeMaxAttempts     int
+	handoffResumeTransportTries  int
 }
 
 // coordLease is the minimal lease surface runCoordRun needs. The real
@@ -192,6 +211,15 @@ var defaultStandbyPoll = 2 * time.Second
 var defaultStandbyTimeout = 10 * time.Minute
 
 var errStandbyTimedOut = errors.New("coord-run: standby timed out")
+
+const (
+	defaultHandoffResumeMaxAttempts       = 4
+	defaultHandoffResumeTransportTries    = 3
+	defaultHandoffResumeInitialDelay      = 5 * time.Second
+	defaultHandoffResumeRecheckInterval   = 30 * time.Second
+	resumedHandoffPathCoordStateKey       = "resumed_handoff_path"
+	handoffResumeOperatorDiagnosticFormat = "coord-run: handoff %s was not applied by %s after %d resume nudges; attach %s and run the coordinator skill's handoff_resume.py helper against %s\n"
+)
 
 // newCoordRunCmd builds the cobra subcommand for `fleet coord-run`.
 // Registered from cmd/fleet/main.go's newRootCmd.
@@ -410,6 +438,7 @@ func runCoordRun(ctx context.Context, opts coordRunOpts, stdout, stderr io.Write
 	if acquire == nil {
 		acquire = defaultAcquireLease(opts, stderr)
 	}
+	wonLease := false
 	lease, acquired, liveHolders, lerr := acquire()
 	switch {
 	case leaseDisabledOrUnsupported(lerr):
@@ -459,6 +488,7 @@ func runCoordRun(ctx context.Context, opts coordRunOpts, stdout, stderr io.Write
 			if opts.standbyOnAcquired != nil {
 				opts.standbyOnAcquired()
 			}
+			wonLease = true
 			defer lease.Release()
 			// Holding the flock IS being the coordinator (D1) — no Activate
 			// flip, no Heartbeat. Release() (cleanup defer) frees the flock on
@@ -478,6 +508,7 @@ func runCoordRun(ctx context.Context, opts coordRunOpts, stdout, stderr io.Write
 		// process -> child.Wait returns -> Release() frees the flock -> a standby
 		// acquires. Holding the flock IS being the coordinator (D1): no Activate,
 		// no Heartbeat.
+		wonLease = true
 		defer lease.Release()
 	}
 
@@ -520,6 +551,12 @@ func runCoordRun(ctx context.Context, opts coordRunOpts, stdout, stderr io.Write
 		}
 	}
 
+	stopHandoffResumeNudger := func() {}
+	if wonLease {
+		stopHandoffResumeNudger = startHandoffResumeNudger(ctx, opts, stderr)
+	}
+	defer stopHandoffResumeNudger()
+
 	// Test-only panic hook. Production leaves panicAfterStart false; the
 	// PanicViaDefer test sets it to true to prove the top-level defer
 	// cleanup fires even when runCoordRun blows up between Start and
@@ -541,6 +578,252 @@ func runCoordRun(ctx context.Context, opts coordRunOpts, stdout, stderr io.Write
 		return err
 	}
 	return nil
+}
+
+type handoffResumeNudgeConfig struct {
+	agentID        string
+	project        string
+	session        string
+	loadAgent      func(string) (*agent.Record, error)
+	readMarker     func(string) (string, error)
+	waitReady      func(string) error
+	sendVerified   func(string, string) (bool, error)
+	initialDelayC  <-chan time.Time
+	wakeC          <-chan time.Time
+	maxAttempts    int
+	transportTries int
+	stderr         io.Writer
+}
+
+func startHandoffResumeNudger(parent context.Context, opts coordRunOpts, stderr io.Writer) func() {
+	interval := opts.handoffResumeRecheckInterval
+	if interval <= 0 {
+		interval = defaultHandoffResumeRecheckInterval
+	}
+	wakeC := opts.handoffResumeWakeC
+	var ticker *time.Ticker
+	if wakeC == nil {
+		ticker = time.NewTicker(interval)
+		wakeC = ticker.C
+	}
+	initialDelayC := opts.handoffResumeInitialDelayC
+	var initialTimer *time.Timer
+	if initialDelayC == nil {
+		initialDelay := opts.handoffResumeInitialDelay
+		if initialDelay <= 0 {
+			initialDelay = defaultHandoffResumeInitialDelay
+		}
+		initialTimer = time.NewTimer(initialDelay)
+		initialDelayC = initialTimer.C
+	}
+
+	loadAgent := opts.handoffResumeLoadAgent
+	if loadAgent == nil {
+		loadAgent = agent.Load
+	}
+	readMarker := opts.handoffResumeReadMarker
+	if readMarker == nil {
+		readMarker = readResumedHandoffPath
+	}
+	waitReady := opts.handoffResumeWaitReady
+	if waitReady == nil {
+		waitReady = spawnWaitForReadyToPrompt
+	}
+	sendVerified := opts.handoffResumeSendVerified
+	if sendVerified == nil {
+		sendVerified = spawnSendPromptKeysVerified
+	}
+	maxAttempts := opts.handoffResumeMaxAttempts
+	if maxAttempts <= 0 {
+		maxAttempts = defaultHandoffResumeMaxAttempts
+	}
+	transportTries := opts.handoffResumeTransportTries
+	if transportTries <= 0 {
+		transportTries = defaultHandoffResumeTransportTries
+	}
+
+	ctx, cancel := context.WithCancel(parent)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		runHandoffResumeNudgeLoop(ctx, handoffResumeNudgeConfig{
+			agentID:        opts.agentID,
+			project:        opts.project,
+			session:        opts.session,
+			loadAgent:      loadAgent,
+			readMarker:     readMarker,
+			waitReady:      waitReady,
+			sendVerified:   sendVerified,
+			initialDelayC:  initialDelayC,
+			wakeC:          wakeC,
+			maxAttempts:    maxAttempts,
+			transportTries: transportTries,
+			stderr:         stderr,
+		})
+	}()
+	return func() {
+		cancel()
+		if ticker != nil {
+			ticker.Stop()
+		}
+		if initialTimer != nil {
+			initialTimer.Stop()
+		}
+		select {
+		case <-done:
+		case <-time.After(2 * time.Second):
+			// Best-effort shutdown. The only blocking production call inside the
+			// goroutine is the bounded readiness poll; process exit will reap it.
+		}
+	}
+}
+
+var (
+	spawnWaitForReadyToPrompt   = spawn.WaitForReadyToPrompt
+	spawnSendPromptKeysVerified = spawn.SendPromptKeysVerified
+)
+
+func runHandoffResumeNudgeLoop(ctx context.Context, cfg handoffResumeNudgeConfig) {
+	attempts := 0
+	if cfg.initialDelayC != nil {
+		select {
+		case <-ctx.Done():
+			return
+		case <-cfg.initialDelayC:
+		}
+	}
+	for {
+		rec, path, ok := handoffResumeNeedsNudge(cfg)
+		if !ok {
+			return
+		}
+		if attempts >= cfg.maxAttempts {
+			emitHandoffResumeDiagnostic(cfg, rec, path, attempts)
+			return
+		}
+		attempts++
+		if err := sendHandoffResumeNudge(cfg, rec, path); err != nil && cfg.stderr != nil {
+			_, _ = fmt.Fprintf(cfg.stderr,
+				"coord-run: warning: resume nudge %d/%d for handoff %s to %s failed: %v\n",
+				attempts, cfg.maxAttempts, path, rec.ID, err)
+		}
+		if marker, err := cfg.readMarker(cfg.project); err == nil && marker == path {
+			return
+		}
+		if attempts >= cfg.maxAttempts {
+			emitHandoffResumeDiagnostic(cfg, rec, path, attempts)
+			return
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-cfg.wakeC:
+		}
+	}
+}
+
+func handoffResumeNeedsNudge(cfg handoffResumeNudgeConfig) (*agent.Record, string, bool) {
+	if cfg.loadAgent == nil || cfg.readMarker == nil {
+		return nil, "", false
+	}
+	rec, err := cfg.loadAgent(cfg.agentID)
+	if err != nil {
+		if cfg.stderr != nil {
+			_, _ = fmt.Fprintf(cfg.stderr,
+				"coord-run: warning: load own agent record %s for handoff resume: %v\n",
+				cfg.agentID, err)
+		}
+		return nil, "", false
+	}
+	if rec == nil || rec.LastHandoffPath == nil || strings.TrimSpace(*rec.LastHandoffPath) == "" {
+		return rec, "", false
+	}
+	if rec.DisableAutoResume {
+		return rec, "", false
+	}
+	path := *rec.LastHandoffPath
+	marker, err := cfg.readMarker(cfg.project)
+	if err != nil {
+		if cfg.stderr != nil {
+			_, _ = fmt.Fprintf(cfg.stderr,
+				"coord-run: warning: read coord-state resumed handoff marker for %s: %v\n",
+				cfg.project, err)
+		}
+		return rec, path, false
+	}
+	return rec, path, marker != path
+}
+
+func sendHandoffResumeNudge(cfg handoffResumeNudgeConfig, rec *agent.Record, docPath string) error {
+	session := rec.TmuxSession
+	if session == "" {
+		session = cfg.session
+	}
+	if session == "" {
+		return fmt.Errorf("agent %s has no tmux session", rec.ID)
+	}
+	prompt := handoff.ResumePrompt(docPath)
+	var lastErr error
+	for i := 0; i < cfg.transportTries; i++ {
+		readyErr := cfg.waitReady(session)
+		submitted, err := cfg.sendVerified(session, prompt)
+		if err != nil {
+			lastErr = fmt.Errorf("send verified prompt to %s: %w", session, err)
+			if readyErr != nil {
+				lastErr = fmt.Errorf("readiness did not converge for %s: %w; %v",
+					session, readyErr, lastErr)
+			}
+			continue
+		}
+		if !submitted {
+			lastErr = fmt.Errorf("prompt remained unsubmitted in %s", session)
+			if readyErr != nil {
+				lastErr = fmt.Errorf("readiness did not converge for %s: %w; %v",
+					session, readyErr, lastErr)
+			}
+			continue
+		}
+		if readyErr != nil {
+			lastErr = fmt.Errorf("readiness did not converge for %s: %w", session, readyErr)
+			continue
+		}
+		return nil
+	}
+	if lastErr == nil {
+		lastErr = errors.New("transport attempts exhausted")
+	}
+	return lastErr
+}
+
+func emitHandoffResumeDiagnostic(cfg handoffResumeNudgeConfig, rec *agent.Record, docPath string, attempts int) {
+	session := rec.TmuxSession
+	if session == "" {
+		session = cfg.session
+	}
+	if cfg.stderr != nil {
+		_, _ = fmt.Fprintf(cfg.stderr, handoffResumeOperatorDiagnosticFormat,
+			docPath, rec.ID, attempts, session, docPath)
+	}
+	fleetlog.Log(fleetlog.CompCoord, "handoff_resume.unapplied", "warn", fleetlog.Fields{
+		Proj:  cfg.project,
+		Agent: rec.ID,
+		Msg:   fmt.Sprintf("handoff %s was not applied after %d resume nudges", docPath, attempts),
+		Data: map[string]any{
+			"handoff_path": docPath,
+			"attempts":     attempts,
+			"tmux_session": session,
+		},
+	})
+}
+
+func readResumedHandoffPath(project string) (string, error) {
+	pdir, err := state.ProjectDir(project)
+	if err != nil {
+		return "", err
+	}
+	cs := readCoordStateDict(filepath.Join(pdir, "coord-state.json"))
+	s, _ := cs[resumedHandoffPathCoordStateKey].(string)
+	return s, nil
 }
 
 // standbyPollUntilAcquired runs the warm-standby poll loop. It re-calls
