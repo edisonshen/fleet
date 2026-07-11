@@ -438,10 +438,10 @@ def build_resume_dispatches(
             generation = 0
         else:
             # error (binary missing / unexpected): the journal was NOT
-            # mutated and we cannot re-arm it via the Go path. Best-effort
-            # direct inbox write with gen 0 — if a journal does exist at a
-            # higher gen the gen-0 block predicate-fails (no double-launch);
-            # this just preserves the inbox body for a manual re-dispatch.
+            # mutated and we cannot re-arm it via the Go path. Preserve the
+            # inbox body, but do NOT emit a gen-0 block or advance the marker:
+            # an existing higher-gen journal would predicate-fail and the ack
+            # would permanently suppress coord-run's retry.
             try:
                 dispatch_mod.write_worker_inbox(
                     e.agent_id, resume_body, fleet_home=str(fleet_home_p),
@@ -452,7 +452,11 @@ def build_resume_dispatches(
                     f"(reset outcome={outcome!r}): {exc}; skip",
                 )
                 continue
-            generation = 0
+            skipped.append(
+                f"task {e.task_id}: reset-for-relaunch error "
+                f"(outcome={outcome!r}); skip (retry next tick)",
+            )
+            continue
         try:
             block = dispatch_mod.format_dispatch_instruction(
                 agent_id=e.agent_id,
@@ -691,6 +695,7 @@ def _has_transient_resume_skip(skipped: list[str]) -> bool:
     """Return true when a skip means the handoff was not fully applied."""
     transient_needles = (
         "reset-for-relaunch contention",
+        "reset-for-relaunch error",
         "resume acquire failed",
         "inbox rewrite failed",
     )
