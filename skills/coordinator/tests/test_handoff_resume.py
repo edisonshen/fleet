@@ -45,6 +45,25 @@ def built_fleet_bin(tmp_path_factory) -> str:
     return str(binary)
 
 
+@pytest.fixture
+def stub_reset_relaunch(monkeypatch: pytest.MonkeyPatch):
+    """CI-safe stub for dispatch.reset_for_relaunch.
+
+    CI has no `fleet` binary on PATH, so the real call raises FileNotFoundError
+    → {"outcome": "error"} → build_resume_dispatches SKIPS the entry and emits
+    no DISPATCH block (see project_test_real_fleet_binary_ci_trap). Any test
+    that asserts a block IS produced must not depend on the ambient binary.
+    The stub mimics the Go re-arm: rewrite the inbox to the resume prompt (as
+    the flock-held reset does) and return a bumped generation."""
+    def _fake(agent_id, prompt, *, fleet_bin="fleet", fleet_home=None, timeout_s=10.0):
+        inbox = Path(fleet_home) / "inbox" / f"{agent_id}.md"
+        inbox.parent.mkdir(parents=True, exist_ok=True)
+        inbox.write_text(prompt, encoding="utf-8")
+        return {"outcome": "reset", "generation": 7, "path": ""}
+
+    monkeypatch.setattr(dispatch_mod, "reset_for_relaunch", _fake)
+
+
 def test_resume_absent_journal_acquires_gen0_passes_gate(
     built_fleet_bin: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -249,7 +268,7 @@ def test_build_resume_dispatches_skips_when_inbox_missing(tmp_path: Path) -> Non
 
 
 def test_build_resume_dispatches_emits_block_when_wip_and_inbox_present(
-    tmp_path: Path,
+    tmp_path: Path, stub_reset_relaunch,
 ) -> None:
     fleet_home = tmp_path / "fleet-home"
     wip_dir = tmp_path / "wip"
@@ -306,7 +325,9 @@ def test_build_resume_dispatches_skips_entry_with_empty_agent_id(
     assert any("agent_id" in s for s in skipped)
 
 
-def test_build_resume_dispatches_handles_multiple_entries(tmp_path: Path) -> None:
+def test_build_resume_dispatches_handles_multiple_entries(
+    tmp_path: Path, stub_reset_relaunch,
+) -> None:
     """One worker resumable, one not — block emission is per-entry,
     not all-or-nothing."""
     fleet_home = tmp_path / "fleet-home"
@@ -353,6 +374,7 @@ def test_main_missing_doc_returns_one(
 
 def test_main_emits_dispatch_blocks_on_stdout(
     capsys: pytest.CaptureFixture, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    stub_reset_relaunch,
 ) -> None:
     fleet_home = tmp_path / "fleet-home"
     wip_dir = tmp_path / "wip"
@@ -380,6 +402,7 @@ def test_main_emits_dispatch_blocks_on_stdout(
 
 def test_main_records_resumed_task_into_session_tasks(
     capsys: pytest.CaptureFixture, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    stub_reset_relaunch,
 ) -> None:
     """Review iter-2 (codex P1): a resumed task must be stamped into THIS
     (successor) coord's own coord-state.json:session_tasks under its own
@@ -442,7 +465,7 @@ def test_main_writes_resumed_handoff_marker_on_exit_zero(
 
 
 def test_main_stdout_failure_does_not_ack_resume(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, stub_reset_relaunch,
 ) -> None:
     class BrokenStdout:
         def write(self, _s: str) -> int:
@@ -478,7 +501,7 @@ def test_main_stdout_failure_does_not_ack_resume(
 
 
 def test_main_stdout_flush_failure_does_not_ack_resume(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, stub_reset_relaunch,
 ) -> None:
     class BrokenFlushStdout:
         def write(self, s: str) -> int:
@@ -1000,7 +1023,9 @@ def test_handoff_resume_does_not_redispatch_when_in_review(tmp_path: Path) -> No
     assert "shepherd-only" in skipped[0]
 
 
-def test_handoff_resume_redispatches_when_in_progress_no_pr(tmp_path: Path) -> None:
+def test_handoff_resume_redispatches_when_in_progress_no_pr(
+    tmp_path: Path, stub_reset_relaunch,
+) -> None:
     """An entry with empty pr_url + status=in-progress (or empty for
     legacy rows) MUST produce a DISPATCH block — worker was still
     writing code; resume from WIP."""
@@ -1055,7 +1080,7 @@ def test_handoff_resume_skips_terminal_status(tmp_path: Path) -> None:
 
 
 def test_handoff_resume_legacy_empty_status_falls_back_to_redispatch(
-    tmp_path: Path,
+    tmp_path: Path, stub_reset_relaunch,
 ) -> None:
     """Legacy 5-field row → status="" → pre-enrichment 'always re-
     dispatch if WIP+inbox' behavior is preserved."""
