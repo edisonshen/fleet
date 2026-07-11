@@ -302,3 +302,123 @@ func TestDeliverToCurrentOwner_StaleOwnerButLeaseActive_NotSentinel(t *testing.T
 		t.Fatalf("error = %v, must NOT be ErrNoOwnerObserved (lease record is active)", err)
 	}
 }
+
+// PR-2 Path A (Option A): delivery follows the confirmed LIVE lock owner and
+// consumes on it — a lease-failover winner is served directly. The one
+// exception is the mid-swap window: while the OUTGOING coord still holds the
+// lease, keys are redirected to the spawned successor and the doc stays pending.
+func TestDeliverToCurrentOwner_DeliversToLiveOwnerExceptOutgoing(t *testing.T) {
+	const (
+		project          = "rainier"
+		prompt           = "resume now"
+		successorID      = "newcoord"
+		successorSession = "fleet-newcoord"
+		outgoingID       = "oldcoord"
+		outgoingSession  = "fleet-oldcoord"
+		winnerID         = "winnercoord"
+		winnerSession    = "fleet-winnercoord"
+	)
+	tests := []struct {
+		name          string
+		owner         coordlock.Owner
+		records       map[string]*agent.Record
+		wantErr       string
+		wantRecID     string
+		wantSentSess  string
+		wantReadySess string
+	}{
+		{
+			// Mid-swap (Failure A): lease still held by the OUTGOING coord →
+			// redirect keys to the spawned successor, keep pending.
+			name:  "outgoing owner mid-swap redirects to successor and stays pending",
+			owner: coordlock.Owner{AgentID: outgoingID, PID: 1001, PidStart: 11},
+			records: map[string]*agent.Record{
+				outgoingID: {ID: outgoingID, Project: project, TmuxSession: outgoingSession},
+			},
+			wantErr:       "outgoing coord",
+			wantSentSess:  successorSession,
+			wantReadySess: successorSession,
+		},
+		{
+			// Spawned successor already owns the lease → deliver to it, consume.
+			name:  "successor owns lease delivers and consumes",
+			owner: coordlock.Owner{AgentID: successorID, PID: 2002, PidStart: 22},
+			records: map[string]*agent.Record{
+				successorID: {ID: successorID, Project: project, TmuxSession: successorSession},
+			},
+			wantRecID:     successorID,
+			wantSentSess:  successorSession,
+			wantReadySess: successorSession,
+		},
+		{
+			// Lease-failover: a live DIFFERENT standby won the lease → deliver to
+			// the winner's own session and consume (no redirect, no strand).
+			name:  "failover winner delivers to winner and consumes",
+			owner: coordlock.Owner{AgentID: winnerID, PID: 3003, PidStart: 33},
+			records: map[string]*agent.Record{
+				winnerID: {ID: winnerID, Project: project, TmuxSession: winnerSession},
+			},
+			wantRecID:     winnerID,
+			wantSentSess:  winnerSession,
+			wantReadySess: winnerSession,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var sentSession, sentPrompt, readySession string
+			rec, err := DeliverToCurrentOwner(Options{
+				Project:          project,
+				Prompt:           prompt,
+				SuccessorSession: successorSession,
+				OutgoingOwnerID:  outgoingID,
+				Timeout:          time.Second,
+				Poll:             time.Millisecond,
+			}, Deps{
+				CurrentOwner: func(gotProject string) (coordlock.Owner, bool) {
+					if gotProject != project {
+						t.Fatalf("CurrentOwner project = %q", gotProject)
+					}
+					return tt.owner, true
+				},
+				LoadAgent: func(id string) (*agent.Record, error) {
+					rec := tt.records[id]
+					if rec == nil {
+						t.Fatalf("LoadAgent id = %q", id)
+					}
+					return rec, nil
+				},
+				WaitReady: func(session string) error {
+					readySession = session
+					return nil
+				},
+				SessionAlive: func(string) (bool, error) { return true, nil },
+				SendVerified: func(session, gotPrompt string) (bool, error) {
+					sentSession, sentPrompt = session, gotPrompt
+					return true, nil
+				},
+				Now:   time.Now,
+				Sleep: func(time.Duration) {},
+			})
+			if tt.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+					t.Fatalf("err = %v, want containing %q", err, tt.wantErr)
+				}
+				if rec != nil {
+					t.Fatalf("rec = %+v, want nil on pending delivery", rec)
+				}
+			} else if err != nil {
+				t.Fatalf("DeliverToCurrentOwner: %v", err)
+			} else if rec == nil || rec.ID != tt.wantRecID {
+				t.Fatalf("rec = %+v, want id %q", rec, tt.wantRecID)
+			}
+			// Every case sends (mid-swap redirects to the successor before the
+			// pending gate); assert both the target session and the prompt body.
+			if sentSession != tt.wantSentSess || sentPrompt != prompt {
+				t.Fatalf("sent (%q,%q), want (%q,%q)", sentSession, sentPrompt, tt.wantSentSess, prompt)
+			}
+			if readySession != tt.wantReadySess {
+				t.Fatalf("ready session = %q, want %q", readySession, tt.wantReadySess)
+			}
+		})
+	}
+}

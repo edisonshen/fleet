@@ -56,16 +56,34 @@ func DefaultDeps() Deps {
 type Options struct {
 	Project string
 	Prompt  string
-	Timeout time.Duration
-	Poll    time.Duration
-	Stdout  io.Writer
-	Stderr  io.Writer
+	// SuccessorSession is the transport fallback for the mid-swap window
+	// (design Failure A). While the lock is momentarily still held by the
+	// OUTGOING coord being retired (OutgoingOwnerID), the push is redirected
+	// here — the freshly spawned successor's session — instead of typing into
+	// the dying owner, and the delivery is kept PENDING so the durable pull
+	// serves the successor once it acquires the lease. Any OTHER live owner
+	// (e.g. a lease-failover winner) is delivered to on its own session and
+	// consumed. Empty leaves transport on the owner's own session.
+	SuccessorSession string
+	// OutgoingOwnerID, when set, is the coord this handoff is retiring. A
+	// confirmed owner equal to it is the mid-swap window: redirect transport to
+	// SuccessorSession and keep the doc pending. Empty always delivers to and
+	// consumes the confirmed owner (legacy / non-swap callers). A non-empty
+	// OutgoingOwnerID MUST be paired with a non-empty SuccessorSession — that is
+	// the only safe place to aim the mid-swap push (never the retiring coord).
+	OutgoingOwnerID string
+	Timeout         time.Duration
+	Poll            time.Duration
+	Stdout          io.Writer
+	Stderr          io.Writer
 }
 
 // DeliverToCurrentOwner polls the coordinator lease, resolves the active owner
-// to its agent record, and submits prompt to that owner's tmux session. It
-// returns only after SendVerified confirms the prompt was submitted. Callers
-// should mark their durable inbox/queue consumed only after this returns nil.
+// to its agent record, and submits prompt to the requested transport session
+// (or the owner session by default). It returns success only after SendVerified
+// confirms submission AND the confirmed owner passes the intended-owner gate.
+// Callers should mark their durable inbox/queue consumed only after this
+// returns nil.
 func DeliverToCurrentOwner(opts Options, deps Deps) (*agent.Record, error) {
 	if opts.Project == "" {
 		return nil, fmt.Errorf("handoff delivery: project is empty")
@@ -74,7 +92,8 @@ func DeliverToCurrentOwner(opts Options, deps Deps) (*agent.Record, error) {
 		deps.WaitReady == nil || deps.SessionAlive == nil {
 		return nil, fmt.Errorf("handoff delivery: incomplete dependencies")
 	}
-	if opts.Prompt != "" && deps.SendVerified == nil {
+	prompt := opts.Prompt
+	if prompt != "" && deps.SendVerified == nil {
 		return nil, fmt.Errorf("handoff delivery: incomplete dependencies")
 	}
 	if deps.Now == nil {
@@ -107,33 +126,38 @@ func DeliverToCurrentOwner(opts Options, deps Deps) (*agent.Record, error) {
 			ownerObserved = true
 			rec, err := deps.LoadAgent(owner.AgentID)
 			if err == nil {
-				if werr := deps.WaitReady(rec.TmuxSession); werr != nil {
-					alive, perr := deps.SessionAlive(rec.TmuxSession)
+				if rec == nil {
+					lastErr = fmt.Errorf("load lock owner %s: empty record", owner.AgentID)
+					continue
+				}
+				session := deliverySession(opts, owner, rec)
+				if werr := deps.WaitReady(session); werr != nil {
+					alive, perr := deps.SessionAlive(session)
 					if !alive && perr == nil {
-						lastErr = fmt.Errorf("owner %s session %s is dead", owner.AgentID, rec.TmuxSession)
+						lastErr = fmt.Errorf("delivery target for owner %s session %s is dead", owner.AgentID, session)
 					} else {
 						if opts.Stderr != nil {
 							_, _ = fmt.Fprintf(opts.Stderr,
-								"warning: readiness poll for lock owner %s (%s) did not converge: %v (sending anyway)\n",
-								owner.AgentID, rec.TmuxSession, werr)
+								"warning: readiness poll for delivery target %s (lock owner %s) did not converge: %v (sending anyway)\n",
+								session, owner.AgentID, werr)
 						}
-						if delivered, ferr := finishDelivery(opts, deps, owner, rec); ferr != nil {
+						if delivered, ferr := finishDelivery(opts, deps, owner, rec, prompt); ferr != nil {
 							return nil, ferr
 						} else if delivered {
 							return rec, nil
 						}
 					}
 				} else {
-					alive, perr := deps.SessionAlive(rec.TmuxSession)
+					alive, perr := deps.SessionAlive(session)
 					if !alive && perr == nil {
-						lastErr = fmt.Errorf("owner %s session %s is dead", owner.AgentID, rec.TmuxSession)
+						lastErr = fmt.Errorf("delivery target for owner %s session %s is dead", owner.AgentID, session)
 					} else {
 						if perr != nil && opts.Stderr != nil {
 							_, _ = fmt.Fprintf(opts.Stderr,
-								"warning: post-readiness probe for lock owner %s (%s) failed: %v (sending anyway)\n",
-								owner.AgentID, rec.TmuxSession, perr)
+								"warning: post-readiness probe for delivery target %s (lock owner %s) failed: %v (sending anyway)\n",
+								session, owner.AgentID, perr)
 						}
-						if delivered, ferr := finishDelivery(opts, deps, owner, rec); ferr != nil {
+						if delivered, ferr := finishDelivery(opts, deps, owner, rec, prompt); ferr != nil {
 							return nil, ferr
 						} else if delivered {
 							return rec, nil
@@ -185,21 +209,35 @@ func DeliverToCurrentOwner(opts Options, deps Deps) (*agent.Record, error) {
 	}
 }
 
-func finishDelivery(opts Options, deps Deps, owner coordlock.Owner, rec *agent.Record) (bool, error) {
+// deliverySession picks the transport target. Normally the confirmed owner's
+// own session, so a lease-failover winner (a live coord that took the lease)
+// receives the directive directly. The one exception is the mid-swap window
+// (design Failure A): while the lock is still held by the OUTGOING coord being
+// retired, redirect to the spawned successor rather than type into the dying
+// session (finishDelivery keeps that delivery pending).
+func deliverySession(opts Options, owner coordlock.Owner, rec *agent.Record) string {
+	if opts.OutgoingOwnerID != "" && owner.AgentID == opts.OutgoingOwnerID && opts.SuccessorSession != "" {
+		return opts.SuccessorSession
+	}
+	return rec.TmuxSession
+}
+
+func finishDelivery(opts Options, deps Deps, owner coordlock.Owner, rec *agent.Record, prompt string) (bool, error) {
 	current, ok := deps.CurrentOwner(opts.Project)
 	if !ok || current.AgentID != owner.AgentID || current.PID != owner.PID ||
 		current.PidStart != owner.PidStart {
 		return false, nil
 	}
-	if opts.Prompt != "" {
-		submitted, serr := deps.SendVerified(rec.TmuxSession, opts.Prompt)
+	session := deliverySession(opts, owner, rec)
+	if prompt != "" {
+		submitted, serr := deps.SendVerified(session, prompt)
 		if serr != nil {
-			return false, fmt.Errorf("send resume prompt to lock owner %s (%s): %w",
-				owner.AgentID, rec.TmuxSession, serr)
+			return false, fmt.Errorf("send resume prompt to %s (lock owner %s): %w",
+				session, owner.AgentID, serr)
 		}
 		if !submitted {
-			return false, fmt.Errorf("send resume prompt to lock owner %s (%s): prompt was not submitted",
-				owner.AgentID, rec.TmuxSession)
+			return false, fmt.Errorf("send resume prompt to %s (lock owner %s): prompt was not submitted",
+				session, owner.AgentID)
 		}
 		current, ok = deps.CurrentOwner(opts.Project)
 		if !ok || current.AgentID != owner.AgentID || current.PID != owner.PID ||
@@ -224,6 +262,23 @@ func finishDelivery(opts Options, deps Deps, owner coordlock.Owner, rec *agent.R
 				"handoff delivery: lock owner for project %s flipped after verified send to %s before confirmation",
 				opts.Project, owner.AgentID)
 		}
+	}
+	if opts.OutgoingOwnerID != "" && current.AgentID == opts.OutgoingOwnerID {
+		// Mid-swap (design Failure A): the lease is momentarily still held by the
+		// OUTGOING coord we are retiring. The push went to the spawned successor's
+		// session (deliverySession) for latency, but the successor has NOT acquired
+		// the lease yet — so we must not consume. Keep the doc pending; the durable
+		// pull (Path B) delivers once the successor owns the lease. Any non-outgoing
+		// live owner (incl. a lease-failover winner) falls through and is consumed.
+		if opts.Stderr != nil {
+			_, _ = fmt.Fprintf(opts.Stderr,
+				"warning: lock for project %s still held by outgoing coord %s; "+
+					"keeping handoff pending for successor takeover\n",
+				opts.Project, current.AgentID)
+		}
+		return false, fmt.Errorf(
+			"handoff delivery: lock for project %s still held by outgoing coord %s; awaiting successor takeover",
+			opts.Project, current.AgentID)
 	}
 	// The lease OWNER already IS the coord identity (the epoch bump on acquire),
 	// so there is nothing to promote after the send — the flip-after-send guard

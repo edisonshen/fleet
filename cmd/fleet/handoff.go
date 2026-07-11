@@ -191,21 +191,29 @@ var (
 // observed" means the standby has not acquired YET, never a legacy bare coord.
 // Bare legacy successors stay out of the owner-poll branch and use the direct
 // send below.
-func deliverHandoffResumePrompt(project string, isCoordSwap bool, rec *agent.Record,
+func deliverHandoffResumePrompt(project string, isCoordSwap bool, outgoingID string, rec *agent.Record,
 	docPath string, stdout, stderr io.Writer) (*agent.Record, error) {
-	prompt := handoff.ResumePrompt(docPath)
+	prompt := handoff.ResumePromptWithInlineDoc(docPath)
 	// Route through the lock owner ONLY when the successor was actually
 	// lease-wrapped (codex iter-24 [P2]). Legacy bare successors stay out of
 	// this branch and take the direct-send path below; a wrapped successor with
 	// no observed owner is still pending, not safe to direct-send into.
+	//
+	// Delivery follows the confirmed live lock owner (a lease-failover winner
+	// is served directly). The one redirect: while the lock is still held by
+	// the OUTGOING coord (outgoingID) mid-swap, the push aims at the spawned
+	// successor's session and stays pending (design Failure A / consumption
+	// gate) — Path B finishes it once the successor owns the lease.
 	if coordLeaseSupported() && isCoordSwap && rec.LeaseWrapped && project != "" {
 		delivered, err := handoffdelivery.DeliverToCurrentOwner(handoffdelivery.Options{
-			Project: project,
-			Prompt:  prompt,
-			Timeout: handoffDeliveryTimeout,
-			Poll:    handoffDeliveryPoll,
-			Stdout:  stdout,
-			Stderr:  stderr,
+			Project:          project,
+			Prompt:           prompt,
+			SuccessorSession: rec.TmuxSession,
+			OutgoingOwnerID:  outgoingID,
+			Timeout:          handoffDeliveryTimeout,
+			Poll:             handoffDeliveryPoll,
+			Stdout:           stdout,
+			Stderr:           stderr,
 		}, handoffDeliveryDepsFn())
 		if err != nil {
 			return nil, err
@@ -420,7 +428,7 @@ func runHandoff(opts *handoffOpts, stdout, stderr io.Writer) error {
 				// replacement, no-owner means mid-acquire; bare replacements
 				// direct-send below.
 				deliveredRec, err := deliverHandoffResumePrompt(newRec.Project, coordDelivery,
-					newRec, pending.HandoffDoc, stdout, stderr)
+					opts.oldID, newRec, pending.HandoffDoc, stdout, stderr)
 				if err != nil {
 					return fmt.Errorf(
 						"agent %s already archived BUT resume prompt delivery is still pending: %w (queue preserved at %s)",
@@ -974,7 +982,7 @@ func runHandoff(opts *handoffOpts, stdout, stderr io.Writer) error {
 			time.Duration(opts.graceMillis)*time.Millisecond,
 			func() (*agent.Record, error) {
 				return deliverHandoffResumePrompt(oldRec.Project, isCoordSwap,
-					newRec, docPath, stdout, stderr)
+					oldRec.ID, newRec, docPath, stdout, stderr)
 			}, stderr)
 		if gerr != nil {
 			// Queue stays PENDING (queue.Delete only runs below on
@@ -1125,7 +1133,7 @@ func runHandoff(opts *handoffOpts, stdout, stderr io.Writer) error {
 		} else {
 			var err error
 			deliveredRec, err = deliverHandoffResumePrompt(oldRec.Project, isCoordSwap,
-				newRec, docPath, stdout, stderr)
+				oldRec.ID, newRec, docPath, stdout, stderr)
 			if err != nil {
 				return fmt.Errorf("resume prompt delivery pending for %s: %w (queue preserved at %s)",
 					newRec.ID, err, queuePath)
@@ -1282,7 +1290,7 @@ func resumeHandoff(opts *handoffOpts, stdout, stderr io.Writer,
 			time.Duration(opts.graceMillis)*time.Millisecond,
 			func() (*agent.Record, error) {
 				return deliverHandoffResumePrompt(oldRec.Project, isCoordSwap,
-					newRec, docPath, stdout, stderr)
+					oldRec.ID, newRec, docPath, stdout, stderr)
 			}, stderr)
 		if gerr != nil {
 			return fmt.Errorf("resume handoff: graceful coord swap for %s: %w (queue preserved at %s)",
@@ -1353,7 +1361,7 @@ func resumeHandoff(opts *handoffOpts, stdout, stderr io.Writer,
 		} else {
 			var err error
 			deliveredRec, err = deliverHandoffResumePrompt(oldRec.Project, isCoordSwap,
-				newRec, docPath, stdout, stderr)
+				oldRec.ID, newRec, docPath, stdout, stderr)
 			if err != nil {
 				return fmt.Errorf("resume handoff: prompt delivery pending for %s: %w (queue preserved at %s)",
 					newRec.ID, err, queuePath)
