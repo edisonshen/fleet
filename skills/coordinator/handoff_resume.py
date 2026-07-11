@@ -650,6 +650,57 @@ def _load_coord_state_for_marker(state_path: Path) -> dict:
     return raw
 
 
+class _PendingResumeApply:
+    """Holds coordinator.lock for the short print+ack critical section."""
+
+    def __init__(
+        self, lock: _CoordLockHandle, state_path: Path, state: dict,
+    ) -> None:
+        self._lock = lock
+        self._state_path = state_path
+        self._state = state
+
+    def __enter__(self) -> "_PendingResumeApply":
+        return self
+
+    def __exit__(self, *exc) -> None:
+        self._lock.__exit__(*exc)
+
+    def commit(
+        self,
+        doc_path: str | os.PathLike,
+        resumed_slugs: list[str],
+        *,
+        coord_id: str,
+    ) -> None:
+        for slug in resumed_slugs:
+            dispatch_mod.record_session_task(self._state, slug, coord_id)
+        self._state["resumed_handoff_path"] = str(doc_path)
+        _write_coord_state(self._state_path, self._state)
+
+
+def _prepare_resumed_apply_state(
+    *, project: str, home: Path,
+) -> _PendingResumeApply:
+    """Acquire coordinator.lock and strict-load coord-state before output.
+
+    If the lock is busy or coord-state is malformed, the caller can fail before
+    printing launchable DISPATCH blocks. That keeps the marker-behind retry path
+    from re-emitting blocks that may already have been consumed.
+    """
+    if not project:
+        raise ValueError("project is required to write resumed_handoff_path")
+    project_dir = _project_dir(home, project)
+    state_path = project_dir / "coord-state.json"
+    lock = _take_coord_lock(_coord_lock_path(project_dir))
+    try:
+        state = _load_coord_state_for_marker(state_path)
+    except Exception:
+        lock.__exit__(None, None, None)
+        raise
+    return _PendingResumeApply(lock, state_path, state)
+
+
 def _record_resumed_apply_state(
     doc_path: str | os.PathLike,
     resumed_slugs: list[str],
@@ -659,17 +710,8 @@ def _record_resumed_apply_state(
     home: Path,
 ) -> None:
     """Single locked RMW for the resume's session stamp and applied marker."""
-    if not project:
-        raise ValueError("project is required to write resumed_handoff_path")
-    project_dir = _project_dir(home, project)
-    state_path = project_dir / "coord-state.json"
-    lock_path = _coord_lock_path(project_dir)
-    with _take_coord_lock(lock_path):
-        cs = _load_coord_state_for_marker(state_path)
-        for slug in resumed_slugs:
-            dispatch_mod.record_session_task(cs, slug, coord_id)
-        cs["resumed_handoff_path"] = str(doc_path)
-        _write_coord_state(state_path, cs)
+    with _prepare_resumed_apply_state(project=project, home=home) as pending:
+        pending.commit(doc_path, resumed_slugs, coord_id=coord_id)
 
 
 def record_resumed_handoff_marker(
@@ -807,37 +849,47 @@ def main(argv: list[str] | None = None) -> int:
             file=sys.stderr,
         )
         return 1
-    for line in skipped:
-        print(f"# {line}", file=sys.stderr)
-    for url in open_pr_urls:
-        print(
-            f"# open-pr-shepherd: {url} — respawn `gh pr view` watch loop",
-            file=sys.stderr,
-        )
-    for b in blocks:
-        print(b)
-        print()
-    if not blocks:
-        print(
-            "# handoff_resume: no resumable subagents "
-            f"(parsed={len(entries)} skipped={len(skipped)} "
-            f"open_prs={len(open_pr_urls)})",
-            file=sys.stderr,
-        )
-    sys.stdout.flush()
     try:
-        # Stamp the resumed tasks and applied marker in one coordinator.lock
-        # RMW, after stdout delivery succeeds. A busy lock means skip the
-        # marker this turn so coord-run's bounded applied retry can re-nudge.
-        _record_resumed_apply_state(
-            doc_path, resumed_slugs,
-            project=project,
-            coord_id=os.environ.get("FLEET_AGENT_ID", ""),
-            home=Path(fleet_home),
+        pending_apply = _prepare_resumed_apply_state(
+            project=project, home=Path(fleet_home),
         )
     except Exception as exc:  # noqa: BLE001 — exit 0 is the applied ack.
         print(f"handoff_resume: write resumed_handoff_path failed: {exc}", file=sys.stderr)
         return 1
+    with pending_apply:
+        for line in skipped:
+            print(f"# {line}", file=sys.stderr)
+        for url in open_pr_urls:
+            print(
+                f"# open-pr-shepherd: {url} — respawn `gh pr view` watch loop",
+                file=sys.stderr,
+            )
+        for b in blocks:
+            print(b)
+            print()
+        if not blocks:
+            print(
+                "# handoff_resume: no resumable subagents "
+                f"(parsed={len(entries)} skipped={len(skipped)} "
+                f"open_prs={len(open_pr_urls)})",
+                file=sys.stderr,
+            )
+        sys.stdout.flush()
+        try:
+            # Stamp the resumed tasks and applied marker in one coordinator.lock
+            # RMW after stdout delivery succeeds. Lock acquisition and strict
+            # state load happened before output, so busy/malformed state cannot
+            # create a delivered-but-unacked retry loop.
+            pending_apply.commit(
+                doc_path, resumed_slugs,
+                coord_id=os.environ.get("FLEET_AGENT_ID", ""),
+            )
+        except Exception as exc:  # noqa: BLE001 — exit 0 is the applied ack.
+            print(
+                f"handoff_resume: write resumed_handoff_path failed: {exc}",
+                file=sys.stderr,
+            )
+            return 1
     return 0
 
 

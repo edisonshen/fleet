@@ -466,22 +466,15 @@ def test_main_stdout_failure_does_not_ack_resume(
             'agent_id="abcd1234" subagent_id=""'
         ),
     )
-    apply_state_called = False
-
-    def fake_apply_state(*_args, **_kwargs) -> None:
-        nonlocal apply_state_called
-        apply_state_called = True
-
     monkeypatch.setenv("FLEET_HOME", str(fleet_home))
     monkeypatch.setenv("FLEET_SUBAGENT_WIP_DIR", str(wip_dir))
     monkeypatch.setenv("FLEET_PROJECT", "myproj")
-    monkeypatch.setattr(handoff_resume, "_record_resumed_apply_state", fake_apply_state)
     monkeypatch.setattr("sys.stdout", BrokenStdout())
 
     with pytest.raises(BrokenPipeError):
         handoff_resume.main([str(doc)])
 
-    assert not apply_state_called
+    assert not (fleet_home / "projects" / "myproj" / "coord-state.json").exists()
 
 
 def test_main_stdout_flush_failure_does_not_ack_resume(
@@ -509,22 +502,85 @@ def test_main_stdout_flush_failure_does_not_ack_resume(
             'agent_id="abcd1234" subagent_id=""'
         ),
     )
-    apply_state_called = False
-
-    def fake_apply_state(*_args, **_kwargs) -> None:
-        nonlocal apply_state_called
-        apply_state_called = True
-
     monkeypatch.setenv("FLEET_HOME", str(fleet_home))
     monkeypatch.setenv("FLEET_SUBAGENT_WIP_DIR", str(wip_dir))
     monkeypatch.setenv("FLEET_PROJECT", "myproj")
-    monkeypatch.setattr(handoff_resume, "_record_resumed_apply_state", fake_apply_state)
     monkeypatch.setattr("sys.stdout", BrokenFlushStdout())
 
     with pytest.raises(BrokenPipeError):
         handoff_resume.main([str(doc)])
 
-    assert not apply_state_called
+    assert not (fleet_home / "projects" / "myproj" / "coord-state.json").exists()
+
+
+def test_main_busy_coordinator_lock_does_not_emit_dispatch_or_ack(
+    capsys: pytest.CaptureFixture, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fleet_home = tmp_path / "fleet-home"
+    wip_dir = tmp_path / "wip"
+    project_dir = fleet_home / "projects" / "myproj"
+    locks_dir = project_dir / ".locks"
+    locks_dir.mkdir(parents=True)
+    wip_dir.mkdir()
+    (fleet_home / "inbox").mkdir(parents=True)
+    (fleet_home / "inbox" / "abcd1234.md").write_text("orig prompt", encoding="utf-8")
+    (wip_dir / "fix-foo.md").write_text("phase 1", encoding="utf-8")
+    doc = tmp_path / "handoff.md"
+    _seed_handoff(
+        doc,
+        body_subagents=(
+            '- task="fix-foo" branch="worker/fix-foo" phase="tdd-green" '
+            'agent_id="abcd1234" subagent_id=""'
+        ),
+    )
+    coord_lock = locks_dir / "coordinator.lock"
+    ready = tmp_path / "holder-ready"
+    holder = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import fcntl, pathlib, sys, time; "
+                "p = pathlib.Path(sys.argv[1]); "
+                "fh = p.open('w'); "
+                "fcntl.flock(fh, fcntl.LOCK_EX); "
+                "pathlib.Path(sys.argv[2]).write_text('ready', encoding='utf-8'); "
+                "time.sleep(30)"
+            ),
+            str(coord_lock),
+            str(ready),
+        ],
+    )
+    try:
+        deadline = time.monotonic() + 5
+        while not ready.exists() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert ready.exists(), "lock holder did not start"
+        monkeypatch.setenv("FLEET_HOME", str(fleet_home))
+        monkeypatch.setenv("FLEET_SUBAGENT_WIP_DIR", str(wip_dir))
+        monkeypatch.setenv("FLEET_PROJECT", "myproj")
+        monkeypatch.setattr(handoff_resume, "_LOCK_RETRY_ATTEMPTS", 2)
+        monkeypatch.setattr(handoff_resume, "_LOCK_RETRY_INTERVAL_S", 0.01)
+        monkeypatch.setattr(
+            dispatch_mod,
+            "reset_for_relaunch",
+            lambda *_args, **_kwargs: {"outcome": "reset", "generation": 7},
+        )
+
+        rc = handoff_resume.main([str(doc)])
+
+        captured = capsys.readouterr()
+        assert rc == 1
+        assert "DISPATCH: fix-foo" not in captured.out
+        assert "write resumed_handoff_path failed" in captured.err
+        assert not (project_dir / "coord-state.json").exists()
+    finally:
+        holder.terminate()
+        try:
+            holder.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            holder.kill()
+            holder.wait(timeout=5)
 
 
 def test_main_transient_resume_skip_does_not_ack(
