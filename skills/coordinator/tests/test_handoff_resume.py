@@ -437,6 +437,49 @@ def test_main_writes_resumed_handoff_marker_on_exit_zero(
     assert cs["resumed_handoff_path"] == str(doc)
 
 
+def test_main_stdout_failure_does_not_ack_resume(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class BrokenStdout:
+        def write(self, _s: str) -> int:
+            raise BrokenPipeError("stdout closed")
+
+        def flush(self) -> None:
+            return None
+
+    fleet_home = tmp_path / "fleet-home"
+    wip_dir = tmp_path / "wip"
+    fleet_home.mkdir()
+    wip_dir.mkdir()
+    (fleet_home / "inbox").mkdir()
+    (fleet_home / "inbox" / "abcd1234.md").write_text("orig prompt", encoding="utf-8")
+    (wip_dir / "fix-foo.md").write_text("phase 1", encoding="utf-8")
+    doc = tmp_path / "handoff.md"
+    _seed_handoff(
+        doc,
+        body_subagents=(
+            '- task="fix-foo" branch="worker/fix-foo" phase="tdd-green" '
+            'agent_id="abcd1234" subagent_id=""'
+        ),
+    )
+    marker_called = False
+
+    def fake_marker(*_args, **_kwargs) -> None:
+        nonlocal marker_called
+        marker_called = True
+
+    monkeypatch.setenv("FLEET_HOME", str(fleet_home))
+    monkeypatch.setenv("FLEET_SUBAGENT_WIP_DIR", str(wip_dir))
+    monkeypatch.setenv("FLEET_PROJECT", "myproj")
+    monkeypatch.setattr(handoff_resume, "record_resumed_handoff_marker", fake_marker)
+    monkeypatch.setattr("sys.stdout", BrokenStdout())
+
+    with pytest.raises(BrokenPipeError):
+        handoff_resume.main([str(doc)])
+
+    assert not marker_called
+
+
 def test_main_failure_does_not_write_resumed_handoff_marker(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
