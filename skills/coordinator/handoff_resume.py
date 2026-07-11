@@ -611,6 +611,16 @@ def record_resumed_handoff_marker(
         _write_coord_state(state_path, cs)
 
 
+def _has_transient_resume_skip(skipped: list[str]) -> bool:
+    """Return true when a skip means the handoff was not fully applied."""
+    transient_needles = (
+        "reset-for-relaunch contention",
+        "resume acquire failed",
+        "inbox rewrite failed",
+    )
+    return any(any(needle in line for needle in transient_needles) for line in skipped)
+
+
 def record_resumed_session_tasks(
     resumed_slugs: list[str], *, project: str, coord_id: str, home: Path,
 ) -> None:
@@ -713,6 +723,15 @@ def main(argv: list[str] | None = None) -> int:
         coord_id=os.environ.get("FLEET_AGENT_ID", ""),
         home=Path(fleet_home),
     )
+    if _has_transient_resume_skip(skipped):
+        for line in skipped:
+            print(f"# {line}", file=sys.stderr)
+        print(
+            "handoff_resume: transient resume skip; not writing "
+            "resumed_handoff_path so coord-run can retry",
+            file=sys.stderr,
+        )
+        return 1
     for line in skipped:
         print(f"# {line}", file=sys.stderr)
     for url in open_pr_urls:

@@ -740,17 +740,22 @@ func sendHandoffResumeNudge(cfg handoffResumeNudgeConfig, rec *agent.Record, doc
 	prompt := handoff.ResumePrompt(docPath)
 	var lastErr error
 	for i := 0; i < cfg.transportTries; i++ {
-		if err := cfg.waitReady(session); err != nil {
-			lastErr = fmt.Errorf("readiness did not converge for %s: %w", session, err)
-			continue
-		}
+		readyErr := cfg.waitReady(session)
 		submitted, err := cfg.sendVerified(session, prompt)
 		if err != nil {
 			lastErr = fmt.Errorf("send verified prompt to %s: %w", session, err)
+			if readyErr != nil {
+				lastErr = fmt.Errorf("readiness did not converge for %s: %w; %v",
+					session, readyErr, lastErr)
+			}
 			continue
 		}
 		if !submitted {
 			lastErr = fmt.Errorf("prompt remained unsubmitted in %s", session)
+			if readyErr != nil {
+				lastErr = fmt.Errorf("readiness did not converge for %s: %w; %v",
+					session, readyErr, lastErr)
+			}
 			continue
 		}
 		return nil

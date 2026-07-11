@@ -242,17 +242,20 @@ func TestHandoffResumeNudgeLoop_TransportRetryUntilReady(t *testing.T) {
 	}
 	cfg.sendVerified = func(string, string) (bool, error) {
 		atomic.AddInt32(&sends, 1)
-		writeTestCoordState(t, project, map[string]any{
-			resumedHandoffPathCoordStateKey: docPath,
-		})
-		return true, nil
+		if atomic.LoadInt32(&readyCalls) >= 3 {
+			writeTestCoordState(t, project, map[string]any{
+				resumedHandoffPathCoordStateKey: docPath,
+			})
+			return true, nil
+		}
+		return false, nil
 	}
 	runHandoffResumeNudgeLoop(context.Background(), cfg)
 	if got := atomic.LoadInt32(&readyCalls); got != 3 {
 		t.Fatalf("ready calls = %d, want 3", got)
 	}
-	if got := atomic.LoadInt32(&sends); got != 1 {
-		t.Fatalf("send calls = %d, want 1 after readiness converges", got)
+	if got := atomic.LoadInt32(&sends); got != 3 {
+		t.Fatalf("send calls = %d, want 3 re-issued sends while readiness converges", got)
 	}
 }
 

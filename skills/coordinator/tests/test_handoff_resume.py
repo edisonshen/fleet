@@ -480,6 +480,39 @@ def test_main_stdout_failure_does_not_ack_resume(
     assert not marker_called
 
 
+def test_main_transient_resume_skip_does_not_ack(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fleet_home = tmp_path / "fleet-home"
+    wip_dir = tmp_path / "wip"
+    fleet_home.mkdir()
+    wip_dir.mkdir()
+    (fleet_home / "inbox").mkdir()
+    (fleet_home / "inbox" / "abcd1234.md").write_text("orig prompt", encoding="utf-8")
+    (wip_dir / "fix-foo.md").write_text("phase 1", encoding="utf-8")
+    doc = tmp_path / "handoff.md"
+    _seed_handoff(
+        doc,
+        body_subagents=(
+            '- task="fix-foo" branch="worker/fix-foo" phase="tdd-green" '
+            'agent_id="abcd1234" subagent_id=""'
+        ),
+    )
+    monkeypatch.setenv("FLEET_HOME", str(fleet_home))
+    monkeypatch.setenv("FLEET_SUBAGENT_WIP_DIR", str(wip_dir))
+    monkeypatch.setenv("FLEET_PROJECT", "myproj")
+    monkeypatch.setattr(
+        dispatch_mod,
+        "reset_for_relaunch",
+        lambda *_args, **_kwargs: {"outcome": "contention"},
+    )
+
+    rc = handoff_resume.main([str(doc)])
+
+    assert rc == 1
+    assert not (fleet_home / "projects" / "myproj" / "coord-state.json").exists()
+
+
 def test_main_failure_does_not_write_resumed_handoff_marker(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
