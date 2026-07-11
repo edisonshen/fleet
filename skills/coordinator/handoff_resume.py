@@ -52,6 +52,7 @@ the coord agent doesn't pick up the wakeup-loop conventions.
 """
 from __future__ import annotations
 
+import errno
 import fcntl
 import json
 import os
@@ -471,13 +472,11 @@ def build_resume_dispatches(
     return blocks, skipped
 
 
-# ---------- session_tasks recording (review iter-2) ----------
+# ---------- coord-state recording (review iter-2 + handoff resume ack) ----------
 #
-# handoff_resume is a standalone script, so it needs its own tiny
-# coord-state.json RMW. The applied ack cannot take coordinator.lock: in
-# lease-wrapped coord runtimes that lock may already be held by the live
-# successor. Use a helper-local handoff-resume.lock so the ack can land while
-# still serializing this helper's own coord-state writes.
+# coord-state.json has multiple RMW writers (loop.py, register_subagent.py,
+# and this helper). They must all serialize on coordinator.lock or independent
+# read/modify/write cycles can silently clobber sibling fields.
 
 _LOCK_RETRY_ATTEMPTS = 10
 _LOCK_RETRY_INTERVAL_S = 0.1
@@ -514,32 +513,37 @@ def _write_coord_state(path: Path, state: dict) -> None:
         raise
 
 
-def _take_resume_lock(path: Path):
-    """Acquire handoff-resume.lock LOCK_EX | LOCK_NB with a brief retry.
+def _take_coord_lock(path: Path):
+    """Acquire coordinator.lock LOCK_EX | LOCK_NB with a brief retry.
     Returns a context manager; raises OSError after exhausting retries."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    fd = os.open(str(path), os.O_CREAT | os.O_RDWR, 0o644)
     last_err: OSError | None = None
     for _ in range(_LOCK_RETRY_ATTEMPTS):
+        fd = os.open(str(path), os.O_CREAT | os.O_RDWR, 0o644)
         try:
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            return _ResumeLockHandle(fd)
+            return _CoordLockHandle(fd)
         except OSError as exc:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+            if exc.errno not in (errno.EAGAIN, errno.EWOULDBLOCK):
+                raise
             last_err = exc
             time.sleep(_LOCK_RETRY_INTERVAL_S)
-    os.close(fd)
     raise OSError(f"{path.name} busy after {_LOCK_RETRY_ATTEMPTS} attempts") from last_err
 
 
-class _ResumeLockHandle:
-    """Tiny RAII handle for the resume lock (mirrors register_subagent's
+class _CoordLockHandle:
+    """Tiny RAII handle for the coordinator lock (mirrors register_subagent's
     _LockHandle). Errors during release are swallowed — the kernel
     reclaims the flock on close regardless."""
 
     def __init__(self, fd: int) -> None:
         self.fd = fd
 
-    def __enter__(self) -> "_ResumeLockHandle":
+    def __enter__(self) -> "_CoordLockHandle":
         return self
 
     def __exit__(self, *_exc) -> None:
@@ -621,14 +625,53 @@ def _project_dir(home: Path, project: str) -> Path:
     return home / "projects" / project
 
 
-def _resume_lock_path(project_dir: Path) -> Path:
-    return project_dir / ".locks" / "handoff-resume.lock"
+def _coord_lock_path(project_dir: Path) -> Path:
+    return project_dir / ".locks" / "coordinator.lock"
+
+
+def _load_coord_state_for_marker(state_path: Path) -> dict:
+    """Strict load for applied-ack writes: never clobber malformed state."""
+    if not state_path.exists():
+        return {}
+    try:
+        raw = json.loads(state_path.read_text(encoding="utf-8"))
+    except (ValueError, OSError) as exc:
+        raise ValueError(
+            "coord-state.json malformed; not writing resumed_handoff_path",
+        ) from exc
+    if not isinstance(raw, dict):
+        raise ValueError(
+            "coord-state.json is not an object; not writing resumed_handoff_path",
+        )
+    return raw
+
+
+def _record_resumed_apply_state(
+    doc_path: str | os.PathLike,
+    resumed_slugs: list[str],
+    *,
+    project: str,
+    coord_id: str,
+    home: Path,
+) -> None:
+    """Single locked RMW for the resume's session stamp and applied marker."""
+    if not project:
+        raise ValueError("project is required to write resumed_handoff_path")
+    project_dir = _project_dir(home, project)
+    state_path = project_dir / "coord-state.json"
+    lock_path = _coord_lock_path(project_dir)
+    with _take_coord_lock(lock_path):
+        cs = _load_coord_state_for_marker(state_path)
+        for slug in resumed_slugs:
+            dispatch_mod.record_session_task(cs, slug, coord_id)
+        cs["resumed_handoff_path"] = str(doc_path)
+        _write_coord_state(state_path, cs)
 
 
 def record_resumed_handoff_marker(
     doc_path: str | os.PathLike, *, project: str, home: Path,
 ) -> None:
-    """Write coord-state.json:resumed_handoff_path under handoff-resume.lock.
+    """Write coord-state.json:resumed_handoff_path under coordinator.lock.
 
     This is the single applied-ack writer for durable handoff resume. The
     coord-run supervisor and prompt-delivery paths only read this marker.
@@ -637,22 +680,9 @@ def record_resumed_handoff_marker(
         raise ValueError("project is required to write resumed_handoff_path")
     project_dir = _project_dir(home, project)
     state_path = project_dir / "coord-state.json"
-    lock_path = _resume_lock_path(project_dir)
-    with _take_resume_lock(lock_path):
-        if state_path.exists():
-            try:
-                raw = json.loads(state_path.read_text(encoding="utf-8"))
-            except (ValueError, OSError) as exc:
-                raise ValueError(
-                    "coord-state.json malformed; not writing resumed_handoff_path",
-                ) from exc
-            if not isinstance(raw, dict):
-                raise ValueError(
-                    "coord-state.json is not an object; not writing resumed_handoff_path",
-                )
-            cs = raw
-        else:
-            cs = {}
+    lock_path = _coord_lock_path(project_dir)
+    with _take_coord_lock(lock_path):
+        cs = _load_coord_state_for_marker(state_path)
         cs["resumed_handoff_path"] = str(doc_path)
         _write_coord_state(state_path, cs)
 
@@ -684,8 +714,8 @@ def record_resumed_session_tasks(
     try:
         project_dir = _project_dir(home, project)
         state_path = project_dir / "coord-state.json"
-        lock_path = _resume_lock_path(project_dir)
-        with _take_resume_lock(lock_path):
+        lock_path = _coord_lock_path(project_dir)
+        with _take_coord_lock(lock_path):
             # codex iter-10 [P2]: _read_coord_state() flattens BOTH a missing
             # file AND a MALFORMED (JSONDecodeError / non-dict) file to {}.
             # A missing file is fine to create fresh, but overwriting a
@@ -763,17 +793,6 @@ def main(argv: list[str] | None = None) -> int:
         entries, wip_dir=wip_dir, fleet_home=fleet_home,
         project=project, on_resume=resumed_slugs.append,
     )
-    # review iter-2 (codex): stamp every resumed task_id into THIS coord's
-    # own session_tasks under its own coord_id — without this, a resumed
-    # active task silently disappears from Next Steps/Open Questions if
-    # this successor hands off again before any loop.py tick seam
-    # independently touches it. Best-effort: the DISPATCH blocks below are
-    # unconditional regardless of whether this stamp lands.
-    record_resumed_session_tasks(
-        resumed_slugs, project=project,
-        coord_id=os.environ.get("FLEET_AGENT_ID", ""),
-        home=Path(fleet_home),
-    )
     if _has_transient_resume_skip(skipped):
         for line in skipped:
             print(f"# {line}", file=sys.stderr)
@@ -801,8 +820,14 @@ def main(argv: list[str] | None = None) -> int:
             file=sys.stderr,
         )
     try:
-        record_resumed_handoff_marker(
-            doc_path, project=project, home=Path(fleet_home),
+        # Stamp the resumed tasks and applied marker in one coordinator.lock
+        # RMW, after stdout delivery succeeds. A busy lock means skip the
+        # marker this turn so coord-run's bounded applied retry can re-nudge.
+        _record_resumed_apply_state(
+            doc_path, resumed_slugs,
+            project=project,
+            coord_id=os.environ.get("FLEET_AGENT_ID", ""),
+            home=Path(fleet_home),
         )
     except Exception as exc:  # noqa: BLE001 — exit 0 is the applied ack.
         print(f"handoff_resume: write resumed_handoff_path failed: {exc}", file=sys.stderr)

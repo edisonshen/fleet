@@ -10,7 +10,9 @@ Covers:
 """
 from __future__ import annotations
 
+import fcntl
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -464,22 +466,22 @@ def test_main_stdout_failure_does_not_ack_resume(
             'agent_id="abcd1234" subagent_id=""'
         ),
     )
-    marker_called = False
+    apply_state_called = False
 
-    def fake_marker(*_args, **_kwargs) -> None:
-        nonlocal marker_called
-        marker_called = True
+    def fake_apply_state(*_args, **_kwargs) -> None:
+        nonlocal apply_state_called
+        apply_state_called = True
 
     monkeypatch.setenv("FLEET_HOME", str(fleet_home))
     monkeypatch.setenv("FLEET_SUBAGENT_WIP_DIR", str(wip_dir))
     monkeypatch.setenv("FLEET_PROJECT", "myproj")
-    monkeypatch.setattr(handoff_resume, "record_resumed_handoff_marker", fake_marker)
+    monkeypatch.setattr(handoff_resume, "_record_resumed_apply_state", fake_apply_state)
     monkeypatch.setattr("sys.stdout", BrokenStdout())
 
     with pytest.raises(BrokenPipeError):
         handoff_resume.main([str(doc)])
 
-    assert not marker_called
+    assert not apply_state_called
 
 
 def test_main_transient_resume_skip_does_not_ack(
@@ -554,8 +556,7 @@ def test_main_transient_skip_suppresses_prepared_blocks(
     assert "DISPATCH: task-b" not in captured.out
     assert "transient resume skip" in captured.err
     state_path = fleet_home / "projects" / "myproj" / "coord-state.json"
-    cs = json.loads(state_path.read_text(encoding="utf-8"))
-    assert "resumed_handoff_path" not in cs
+    assert not state_path.exists()
 
 
 def test_main_failure_does_not_write_resumed_handoff_marker(
@@ -695,8 +696,8 @@ def test_record_resumed_handoff_marker_rejects_unsafe_project(
     assert not outside.exists()
 
 
-def test_record_resumed_handoff_marker_works_while_coordinator_lock_is_held(
-    tmp_path: Path,
+def test_record_resumed_handoff_marker_skips_while_coordinator_lock_stays_busy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     fleet_home = tmp_path / "fleet-home"
     project_dir = fleet_home / "projects" / "myproj"
@@ -727,12 +728,14 @@ def test_record_resumed_handoff_marker_works_while_coordinator_lock_is_held(
             time.sleep(0.01)
         assert ready.exists(), "lock holder did not start"
 
-        handoff_resume.record_resumed_handoff_marker(
-            "/tmp/handoff.md", project="myproj", home=fleet_home,
-        )
+        monkeypatch.setattr(handoff_resume, "_LOCK_RETRY_ATTEMPTS", 2)
+        monkeypatch.setattr(handoff_resume, "_LOCK_RETRY_INTERVAL_S", 0.01)
+        with pytest.raises(OSError):
+            handoff_resume.record_resumed_handoff_marker(
+                "/tmp/handoff.md", project="myproj", home=fleet_home,
+            )
 
-        cs = json.loads((project_dir / "coord-state.json").read_text(encoding="utf-8"))
-        assert cs["resumed_handoff_path"] == "/tmp/handoff.md"
+        assert not (project_dir / "coord-state.json").exists()
     finally:
         holder.terminate()
         try:
@@ -740,6 +743,68 @@ def test_record_resumed_handoff_marker_works_while_coordinator_lock_is_held(
         except subprocess.TimeoutExpired:
             holder.kill()
             holder.wait(timeout=5)
+
+
+def test_record_resumed_handoff_marker_preserves_concurrent_coord_state_rmw(
+    tmp_path: Path,
+) -> None:
+    """The marker writer must share coordinator.lock with other
+    coord-state.json RMW writers. The simulated coord writer updates a
+    sibling field while holding coordinator.lock; the marker subprocess can
+    only write after the lock is released, so both updates must survive."""
+    fleet_home = tmp_path / "fleet-home"
+    project_dir = fleet_home / "projects" / "myproj"
+    locks_dir = project_dir / ".locks"
+    locks_dir.mkdir(parents=True)
+    state_path = project_dir / "coord-state.json"
+    state_path.write_text(
+        json.dumps({"recent_decisions": ["keep"]}),
+        encoding="utf-8",
+    )
+    coord_lock = locks_dir / "coordinator.lock"
+
+    fd = os.open(str(coord_lock), os.O_CREAT | os.O_RDWR, 0o644)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        repo_coord_dir = Path(__file__).resolve().parents[1]
+        marker = subprocess.Popen(
+            [
+                sys.executable,
+                "-c",
+                (
+                    "import sys; "
+                    "from pathlib import Path; "
+                    "sys.path.insert(0, sys.argv[1]); "
+                    "import handoff_resume; "
+                    "handoff_resume.record_resumed_handoff_marker("
+                    "sys.argv[2], project=sys.argv[3], home=Path(sys.argv[4]))"
+                ),
+                str(repo_coord_dir),
+                "/tmp/handoff.md",
+                "myproj",
+                str(fleet_home),
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+
+        cs = json.loads(state_path.read_text(encoding="utf-8"))
+        cs["worker_agent_ids"] = {"fix-foo": "abcd1234"}
+        handoff_resume._write_coord_state(state_path, cs)
+    finally:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            os.close(fd)
+
+    out, err = marker.communicate(timeout=5)
+    assert marker.returncode == 0, (out, err)
+
+    cs = json.loads(state_path.read_text(encoding="utf-8"))
+    assert cs["recent_decisions"] == ["keep"]
+    assert cs["worker_agent_ids"] == {"fix-foo": "abcd1234"}
+    assert cs["resumed_handoff_path"] == "/tmp/handoff.md"
 
 
 def test_record_resumed_handoff_marker_preserves_malformed_coord_state(
