@@ -606,7 +606,20 @@ def record_resumed_handoff_marker(
     state_path = project_dir / "coord-state.json"
     lock_path = project_dir / ".locks" / "coordinator.lock"
     with _take_coord_lock(lock_path):
-        cs = _read_coord_state(state_path)
+        if state_path.exists():
+            try:
+                raw = json.loads(state_path.read_text(encoding="utf-8"))
+            except (ValueError, OSError) as exc:
+                raise ValueError(
+                    "coord-state.json malformed; not writing resumed_handoff_path",
+                ) from exc
+            if not isinstance(raw, dict):
+                raise ValueError(
+                    "coord-state.json is not an object; not writing resumed_handoff_path",
+                )
+            cs = raw
+        else:
+            cs = {}
         cs["resumed_handoff_path"] = str(doc_path)
         _write_coord_state(state_path, cs)
 

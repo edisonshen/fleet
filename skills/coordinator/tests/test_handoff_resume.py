@@ -568,6 +568,24 @@ def test_record_resumed_session_tasks_does_not_write_handoff_marker(
     assert cs["resumed_handoff_path"] == "/tmp/old.md"
 
 
+def test_record_resumed_handoff_marker_preserves_malformed_coord_state(
+    tmp_path: Path,
+) -> None:
+    fleet_home = tmp_path / "fleet-home"
+    project_dir = fleet_home / "projects" / "myproj"
+    (project_dir / ".locks").mkdir(parents=True)
+    state_path = project_dir / "coord-state.json"
+    garbage = '{"worker_agent_ids": {"foo": "aaaa1111"}, TRUNCATED'
+    state_path.write_text(garbage, encoding="utf-8")
+
+    with pytest.raises(ValueError):
+        handoff_resume.record_resumed_handoff_marker(
+            "/tmp/handoff.md", project="myproj", home=fleet_home,
+        )
+
+    assert state_path.read_text(encoding="utf-8") == garbage
+
+
 def test_record_resumed_session_tasks_preserves_malformed_coord_state(
     tmp_path: Path,
 ) -> None:
