@@ -473,13 +473,11 @@ def build_resume_dispatches(
 
 # ---------- session_tasks recording (review iter-2) ----------
 #
-# handoff_resume is a standalone script (not run inside loop.py's tick),
-# so it needs its own tiny coord-state.json RMW — mirrors
-# register_subagent._read_coord_state / _write_coord_state / _take_coord_lock
-# verbatim rather than importing them (established convention in this
-# package: each small script that touches coord-state.json keeps its own
-# local copy of the atomic-write + coordinator.lock helpers instead of a
-# shared cross-module dependency).
+# handoff_resume is a standalone script, so it needs its own tiny
+# coord-state.json RMW. The applied ack cannot take coordinator.lock: in
+# lease-wrapped coord runtimes that lock may already be held by the live
+# successor. Use a helper-local handoff-resume.lock so the ack can land while
+# still serializing this helper's own coord-state writes.
 
 _LOCK_RETRY_ATTEMPTS = 10
 _LOCK_RETRY_INTERVAL_S = 0.1
@@ -516,8 +514,8 @@ def _write_coord_state(path: Path, state: dict) -> None:
         raise
 
 
-def _take_coord_lock(path: Path):
-    """Acquire coordinator.lock LOCK_EX | LOCK_NB with a brief retry.
+def _take_resume_lock(path: Path):
+    """Acquire handoff-resume.lock LOCK_EX | LOCK_NB with a brief retry.
     Returns a context manager; raises OSError after exhausting retries."""
     path.parent.mkdir(parents=True, exist_ok=True)
     fd = os.open(str(path), os.O_CREAT | os.O_RDWR, 0o644)
@@ -530,11 +528,11 @@ def _take_coord_lock(path: Path):
             last_err = exc
             time.sleep(_LOCK_RETRY_INTERVAL_S)
     os.close(fd)
-    raise OSError(f"coordinator.lock busy after {_LOCK_RETRY_ATTEMPTS} attempts") from last_err
+    raise OSError(f"{path.name} busy after {_LOCK_RETRY_ATTEMPTS} attempts") from last_err
 
 
 class _ResumeLockHandle:
-    """Tiny RAII handle for the coord lock (mirrors register_subagent's
+    """Tiny RAII handle for the resume lock (mirrors register_subagent's
     _LockHandle). Errors during release are swallowed — the kernel
     reclaims the flock on close regardless."""
 
@@ -623,10 +621,14 @@ def _project_dir(home: Path, project: str) -> Path:
     return home / "projects" / project
 
 
+def _resume_lock_path(project_dir: Path) -> Path:
+    return project_dir / ".locks" / "handoff-resume.lock"
+
+
 def record_resumed_handoff_marker(
     doc_path: str | os.PathLike, *, project: str, home: Path,
 ) -> None:
-    """Write coord-state.json:resumed_handoff_path under coordinator.lock.
+    """Write coord-state.json:resumed_handoff_path under handoff-resume.lock.
 
     This is the single applied-ack writer for durable handoff resume. The
     coord-run supervisor and prompt-delivery paths only read this marker.
@@ -635,8 +637,8 @@ def record_resumed_handoff_marker(
         raise ValueError("project is required to write resumed_handoff_path")
     project_dir = _project_dir(home, project)
     state_path = project_dir / "coord-state.json"
-    lock_path = project_dir / ".locks" / "coordinator.lock"
-    with _take_coord_lock(lock_path):
+    lock_path = _resume_lock_path(project_dir)
+    with _take_resume_lock(lock_path):
         if state_path.exists():
             try:
                 raw = json.loads(state_path.read_text(encoding="utf-8"))
@@ -682,8 +684,8 @@ def record_resumed_session_tasks(
     try:
         project_dir = _project_dir(home, project)
         state_path = project_dir / "coord-state.json"
-        lock_path = project_dir / ".locks" / "coordinator.lock"
-        with _take_coord_lock(lock_path):
+        lock_path = _resume_lock_path(project_dir)
+        with _take_resume_lock(lock_path):
             # codex iter-10 [P2]: _read_coord_state() flattens BOTH a missing
             # file AND a MALFORMED (JSONDecodeError / non-dict) file to {}.
             # A missing file is fine to create fresh, but overwriting a

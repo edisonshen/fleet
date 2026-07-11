@@ -393,7 +393,9 @@ Scenario / Input / Expected — one line each.
 
 **Marker — `handoff_resume.py` is the single writer (`skills/coordinator`):**
 7. `handoff_resume.py` completes successfully (exit 0) → writes
-   `resumed_handoff_path = <doc path>` under `coordinator.lock`.
+   `resumed_handoff_path = <doc path>` under the helper-local
+   `handoff-resume.lock` so a live successor that already owns coordinator
+   execution can still ack the applied resume.
 8. `handoff_resume.py` errors / is killed before completing → marker **not** written
    (mark-after-applied; the successful exit is the only trigger).
 9. `coord-run`/`loop.py` never write `resumed_handoff_path` — assert the marker is

@@ -13,6 +13,8 @@ from __future__ import annotations
 import json
 import shutil
 import subprocess
+import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -691,6 +693,53 @@ def test_record_resumed_handoff_marker_rejects_unsafe_project(
         )
 
     assert not outside.exists()
+
+
+def test_record_resumed_handoff_marker_works_while_coordinator_lock_is_held(
+    tmp_path: Path,
+) -> None:
+    fleet_home = tmp_path / "fleet-home"
+    project_dir = fleet_home / "projects" / "myproj"
+    locks_dir = project_dir / ".locks"
+    locks_dir.mkdir(parents=True)
+    coord_lock = locks_dir / "coordinator.lock"
+    ready = tmp_path / "holder-ready"
+    holder = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import fcntl, pathlib, sys, time; "
+                "p = pathlib.Path(sys.argv[1]); "
+                "p.parent.mkdir(parents=True, exist_ok=True); "
+                "fh = p.open('w'); "
+                "fcntl.flock(fh, fcntl.LOCK_EX); "
+                "pathlib.Path(sys.argv[2]).write_text('ready', encoding='utf-8'); "
+                "time.sleep(30)"
+            ),
+            str(coord_lock),
+            str(ready),
+        ],
+    )
+    try:
+        deadline = time.monotonic() + 5
+        while not ready.exists() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert ready.exists(), "lock holder did not start"
+
+        handoff_resume.record_resumed_handoff_marker(
+            "/tmp/handoff.md", project="myproj", home=fleet_home,
+        )
+
+        cs = json.loads((project_dir / "coord-state.json").read_text(encoding="utf-8"))
+        assert cs["resumed_handoff_path"] == "/tmp/handoff.md"
+    finally:
+        holder.terminate()
+        try:
+            holder.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            holder.kill()
+            holder.wait(timeout=5)
 
 
 def test_record_resumed_handoff_marker_preserves_malformed_coord_state(
