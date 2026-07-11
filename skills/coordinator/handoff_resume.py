@@ -736,7 +736,15 @@ def main(argv: list[str] | None = None) -> int:
         coord_id=os.environ.get("FLEET_AGENT_ID", ""),
         home=Path(fleet_home),
     )
-    transient_resume_skip = _has_transient_resume_skip(skipped)
+    if _has_transient_resume_skip(skipped):
+        for line in skipped:
+            print(f"# {line}", file=sys.stderr)
+        print(
+            "handoff_resume: transient resume skip; not writing "
+            "resumed_handoff_path so coord-run can retry",
+            file=sys.stderr,
+        )
+        return 1
     for line in skipped:
         print(f"# {line}", file=sys.stderr)
     for url in open_pr_urls:
@@ -754,13 +762,6 @@ def main(argv: list[str] | None = None) -> int:
             f"open_prs={len(open_pr_urls)})",
             file=sys.stderr,
         )
-    if transient_resume_skip:
-        print(
-            "handoff_resume: transient resume skip; not writing "
-            "resumed_handoff_path so coord-run can retry",
-            file=sys.stderr,
-        )
-        return 1
     try:
         record_resumed_handoff_marker(
             doc_path, project=project, home=Path(fleet_home),

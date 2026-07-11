@@ -513,7 +513,7 @@ def test_main_transient_resume_skip_does_not_ack(
     assert not (fleet_home / "projects" / "myproj" / "coord-state.json").exists()
 
 
-def test_main_transient_skip_still_emits_prepared_blocks(
+def test_main_transient_skip_suppresses_prepared_blocks(
     capsys: pytest.CaptureFixture, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     fleet_home = tmp_path / "fleet-home"
@@ -548,8 +548,7 @@ def test_main_transient_skip_still_emits_prepared_blocks(
 
     captured = capsys.readouterr()
     assert rc == 1
-    assert "DISPATCH: task-a" in captured.out
-    assert "generation: 7" in captured.out
+    assert "DISPATCH: task-a" not in captured.out
     assert "DISPATCH: task-b" not in captured.out
     assert "transient resume skip" in captured.err
     state_path = fleet_home / "projects" / "myproj" / "coord-state.json"

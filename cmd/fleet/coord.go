@@ -161,6 +161,8 @@ type coordRunOpts struct {
 	handoffResumeReadMarker      func(string) (string, error)
 	handoffResumeWaitReady       func(string) error
 	handoffResumeSendVerified    func(string, string) (bool, error)
+	handoffResumeInitialDelay    time.Duration
+	handoffResumeInitialDelayC   <-chan time.Time
 	handoffResumeRecheckInterval time.Duration
 	handoffResumeWakeC           <-chan time.Time
 	handoffResumeMaxAttempts     int
@@ -213,6 +215,7 @@ var errStandbyTimedOut = errors.New("coord-run: standby timed out")
 const (
 	defaultHandoffResumeMaxAttempts       = 4
 	defaultHandoffResumeTransportTries    = 3
+	defaultHandoffResumeInitialDelay      = 5 * time.Second
 	defaultHandoffResumeRecheckInterval   = 30 * time.Second
 	resumedHandoffPathCoordStateKey       = "resumed_handoff_path"
 	handoffResumeOperatorDiagnosticFormat = "coord-run: handoff %s was not applied by %s after %d resume nudges; attach %s and run `python3 /path/to/skills/coordinator/handoff_resume.py %s`\n"
@@ -585,6 +588,7 @@ type handoffResumeNudgeConfig struct {
 	readMarker     func(string) (string, error)
 	waitReady      func(string) error
 	sendVerified   func(string, string) (bool, error)
+	initialDelayC  <-chan time.Time
 	wakeC          <-chan time.Time
 	maxAttempts    int
 	transportTries int
@@ -601,6 +605,16 @@ func startHandoffResumeNudger(parent context.Context, opts coordRunOpts, stderr 
 	if wakeC == nil {
 		ticker = time.NewTicker(interval)
 		wakeC = ticker.C
+	}
+	initialDelayC := opts.handoffResumeInitialDelayC
+	var initialTimer *time.Timer
+	if initialDelayC == nil {
+		initialDelay := opts.handoffResumeInitialDelay
+		if initialDelay <= 0 {
+			initialDelay = defaultHandoffResumeInitialDelay
+		}
+		initialTimer = time.NewTimer(initialDelay)
+		initialDelayC = initialTimer.C
 	}
 
 	loadAgent := opts.handoffResumeLoadAgent
@@ -640,6 +654,7 @@ func startHandoffResumeNudger(parent context.Context, opts coordRunOpts, stderr 
 			readMarker:     readMarker,
 			waitReady:      waitReady,
 			sendVerified:   sendVerified,
+			initialDelayC:  initialDelayC,
 			wakeC:          wakeC,
 			maxAttempts:    maxAttempts,
 			transportTries: transportTries,
@@ -650,6 +665,9 @@ func startHandoffResumeNudger(parent context.Context, opts coordRunOpts, stderr 
 		cancel()
 		if ticker != nil {
 			ticker.Stop()
+		}
+		if initialTimer != nil {
+			initialTimer.Stop()
 		}
 		select {
 		case <-done:
@@ -667,6 +685,13 @@ var (
 
 func runHandoffResumeNudgeLoop(ctx context.Context, cfg handoffResumeNudgeConfig) {
 	attempts := 0
+	if cfg.initialDelayC != nil {
+		select {
+		case <-ctx.Done():
+			return
+		case <-cfg.initialDelayC:
+		}
+	}
 	for {
 		rec, path, ok := handoffResumeNeedsNudge(cfg)
 		if !ok {

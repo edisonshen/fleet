@@ -79,6 +79,7 @@ func baseHandoffResumeConfig(agentID, project, session string, wakeC <-chan time
 		readMarker:     readResumedHandoffPath,
 		waitReady:      func(string) error { return nil },
 		sendVerified:   func(string, string) (bool, error) { return true, nil },
+		initialDelayC:  closedTimeChan(),
 		wakeC:          wakeC,
 		maxAttempts:    4,
 		transportTries: 3,
@@ -114,6 +115,12 @@ func waitHandoffResumeSend(t *testing.T, ch <-chan struct{}) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("handoff resume nudge was not sent")
 	}
+}
+
+func closedTimeChan() <-chan time.Time {
+	ch := make(chan time.Time)
+	close(ch)
+	return ch
 }
 
 func TestHandoffResumeNudgeLoop_DecisionCases(t *testing.T) {
@@ -184,6 +191,39 @@ func TestHandoffResumeNudgeLoop_DecisionCases(t *testing.T) {
 				t.Fatalf("load id = %q, want own successor id %q", gotLoadID, tt.wantLoadID)
 			}
 		})
+	}
+}
+
+func TestHandoffResumeNudgeLoop_InitialRecheckSuppressesPushDuplicate(t *testing.T) {
+	const (
+		agentID = "hrrechek"
+		project = "hr-recheck"
+		session = "fleet-hrrechek"
+		docPath = "/tmp/fleet-handoff.md"
+	)
+	setupHandoffResumeRecord(t, agentID, project, session, ptrString(docPath))
+	writeTestCoordState(t, project, map[string]any{
+		resumedHandoffPathCoordStateKey: "",
+	})
+	initialDelayC := make(chan time.Time)
+	wakeC := make(chan time.Time)
+	var sends int32
+	var stderr bytes.Buffer
+	cfg := baseHandoffResumeConfig(agentID, project, session, wakeC, &stderr)
+	cfg.initialDelayC = initialDelayC
+	cfg.sendVerified = func(string, string) (bool, error) {
+		atomic.AddInt32(&sends, 1)
+		return true, nil
+	}
+	_, done := runHandoffResumeLoopAsync(t, cfg)
+
+	writeTestCoordState(t, project, map[string]any{
+		resumedHandoffPathCoordStateKey: docPath,
+	})
+	close(initialDelayC)
+	waitHandoffResumeDone(t, done)
+	if got := atomic.LoadInt32(&sends); got != 0 {
+		t.Fatalf("resident nudge sent %d prompts after push ack caught up, want 0", got)
 	}
 }
 
