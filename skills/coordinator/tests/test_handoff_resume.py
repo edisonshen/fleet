@@ -796,137 +796,62 @@ def test_main_rejects_absolute_project_before_resume_side_effects(
     assert not outside.exists()
 
 
-def test_record_resumed_session_tasks_does_not_write_handoff_marker(
+def test_main_preserves_concurrent_coord_state_rmw(
     tmp_path: Path,
 ) -> None:
+    """The LIVE ack write (main() → _prepare_resumed_apply_state + commit)
+    must share coordinator.lock with the other coord-state.json RMW writers.
+    A simulated coord writer holds coordinator.lock and updates a sibling
+    field; main() (run in a subprocess) can only write resumed_handoff_path
+    after the lock is released, so NO update is lost — both fields survive.
+    This exercises the code path main() actually runs, not a helper twin."""
     fleet_home = tmp_path / "fleet-home"
-    project_dir = fleet_home / "projects" / "myproj"
-    (project_dir / ".locks").mkdir(parents=True)
-    state_path = project_dir / "coord-state.json"
-    state_path.write_text(
-        json.dumps({"resumed_handoff_path": "/tmp/old.md"}),
-        encoding="utf-8",
-    )
-
-    handoff_resume.record_resumed_session_tasks(
-        ["fix-foo"], project="myproj", coord_id="succ0001", home=fleet_home,
-    )
-
-    cs = json.loads(state_path.read_text(encoding="utf-8"))
-    assert cs["resumed_handoff_path"] == "/tmp/old.md"
-
-
-@pytest.mark.parametrize(
-    "project",
-    ["../../outside", "/tmp/outside", "BadProj", ".locks", "-flag"],
-)
-def test_record_resumed_handoff_marker_rejects_unsafe_project(
-    tmp_path: Path, project: str,
-) -> None:
-    fleet_home = tmp_path / "fleet-home"
-    outside = tmp_path / "outside"
-
-    with pytest.raises(ValueError):
-        handoff_resume.record_resumed_handoff_marker(
-            "/tmp/handoff.md", project=project, home=fleet_home,
-        )
-
-    assert not outside.exists()
-
-
-def test_record_resumed_handoff_marker_skips_while_coordinator_lock_stays_busy(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    fleet_home = tmp_path / "fleet-home"
+    wip_dir = tmp_path / "wip"
     project_dir = fleet_home / "projects" / "myproj"
     locks_dir = project_dir / ".locks"
     locks_dir.mkdir(parents=True)
-    coord_lock = locks_dir / "coordinator.lock"
-    ready = tmp_path / "holder-ready"
-    holder = subprocess.Popen(
-        [
-            sys.executable,
-            "-c",
-            (
-                "import fcntl, pathlib, sys, time; "
-                "p = pathlib.Path(sys.argv[1]); "
-                "p.parent.mkdir(parents=True, exist_ok=True); "
-                "fh = p.open('w'); "
-                "fcntl.flock(fh, fcntl.LOCK_EX); "
-                "pathlib.Path(sys.argv[2]).write_text('ready', encoding='utf-8'); "
-                "time.sleep(30)"
-            ),
-            str(coord_lock),
-            str(ready),
-        ],
-    )
-    try:
-        deadline = time.monotonic() + 5
-        while not ready.exists() and time.monotonic() < deadline:
-            time.sleep(0.01)
-        assert ready.exists(), "lock holder did not start"
-
-        monkeypatch.setattr(handoff_resume, "_LOCK_RETRY_ATTEMPTS", 2)
-        monkeypatch.setattr(handoff_resume, "_LOCK_RETRY_INTERVAL_S", 0.01)
-        with pytest.raises(OSError):
-            handoff_resume.record_resumed_handoff_marker(
-                "/tmp/handoff.md", project="myproj", home=fleet_home,
-            )
-
-        assert not (project_dir / "coord-state.json").exists()
-    finally:
-        holder.terminate()
-        try:
-            holder.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            holder.kill()
-            holder.wait(timeout=5)
-
-
-def test_record_resumed_handoff_marker_preserves_concurrent_coord_state_rmw(
-    tmp_path: Path,
-) -> None:
-    """The marker writer must share coordinator.lock with other
-    coord-state.json RMW writers. The simulated coord writer updates a
-    sibling field while holding coordinator.lock; the marker subprocess can
-    only write after the lock is released, so both updates must survive."""
-    fleet_home = tmp_path / "fleet-home"
-    project_dir = fleet_home / "projects" / "myproj"
-    locks_dir = project_dir / ".locks"
-    locks_dir.mkdir(parents=True)
+    wip_dir.mkdir()
     state_path = project_dir / "coord-state.json"
     state_path.write_text(
         json.dumps({"recent_decisions": ["keep"]}),
         encoding="utf-8",
     )
+    doc = tmp_path / "handoff.md"
+    _seed_handoff(doc, body_subagents="_(none)_")
     coord_lock = locks_dir / "coordinator.lock"
 
     fd = os.open(str(coord_lock), os.O_CREAT | os.O_RDWR, 0o644)
     try:
         fcntl.flock(fd, fcntl.LOCK_EX)
         repo_coord_dir = Path(__file__).resolve().parents[1]
-        marker = subprocess.Popen(
+        env = {
+            **os.environ,
+            "FLEET_HOME": str(fleet_home),
+            "FLEET_SUBAGENT_WIP_DIR": str(wip_dir),
+            "FLEET_PROJECT": "myproj",
+            "FLEET_AGENT_ID": "succ0001",
+        }
+        proc = subprocess.Popen(
             [
                 sys.executable,
                 "-c",
                 (
                     "import sys; "
-                    "from pathlib import Path; "
                     "sys.path.insert(0, sys.argv[1]); "
                     "import handoff_resume; "
-                    "handoff_resume.record_resumed_handoff_marker("
-                    "sys.argv[2], project=sys.argv[3], home=Path(sys.argv[4]))"
+                    "sys.exit(handoff_resume.main([sys.argv[2]]))"
                 ),
                 str(repo_coord_dir),
-                "/tmp/handoff.md",
-                "myproj",
-                str(fleet_home),
+                str(doc),
             ],
+            env=env,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
         )
 
+        # RMW a sibling field while holding coordinator.lock; main() is
+        # blocked on the lock and cannot interleave its own read/modify/write.
         cs = json.loads(state_path.read_text(encoding="utf-8"))
         cs["worker_agent_ids"] = {"fix-foo": "abcd1234"}
         handoff_resume._write_coord_state(state_path, cs)
@@ -936,70 +861,57 @@ def test_record_resumed_handoff_marker_preserves_concurrent_coord_state_rmw(
         finally:
             os.close(fd)
 
-    out, err = marker.communicate(timeout=5)
-    assert marker.returncode == 0, (out, err)
+    out, err = proc.communicate(timeout=10)
+    assert proc.returncode == 0, (out, err)
 
     cs = json.loads(state_path.read_text(encoding="utf-8"))
     assert cs["recent_decisions"] == ["keep"]
     assert cs["worker_agent_ids"] == {"fix-foo": "abcd1234"}
-    assert cs["resumed_handoff_path"] == "/tmp/handoff.md"
+    assert cs["resumed_handoff_path"] == str(doc)
 
 
-def test_record_resumed_handoff_marker_preserves_malformed_coord_state(
-    tmp_path: Path,
+def test_main_preserves_malformed_coord_state(
+    capsys: pytest.CaptureFixture, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """A present-but-MALFORMED coord-state.json makes the live ack write fail
+    loud (exit 1, strict load raises) and leaves the file byte-for-byte
+    intact — never a partial/truncated write that drops sibling keys."""
     fleet_home = tmp_path / "fleet-home"
+    wip_dir = tmp_path / "wip"
     project_dir = fleet_home / "projects" / "myproj"
     (project_dir / ".locks").mkdir(parents=True)
+    wip_dir.mkdir()
     state_path = project_dir / "coord-state.json"
     garbage = '{"worker_agent_ids": {"foo": "aaaa1111"}, TRUNCATED'
     state_path.write_text(garbage, encoding="utf-8")
+    doc = tmp_path / "handoff.md"
+    _seed_handoff(doc, body_subagents="_(none)_")
+    monkeypatch.setenv("FLEET_HOME", str(fleet_home))
+    monkeypatch.setenv("FLEET_SUBAGENT_WIP_DIR", str(wip_dir))
+    monkeypatch.setenv("FLEET_PROJECT", "myproj")
 
+    rc = handoff_resume.main([str(doc)])
+
+    assert rc == 1
+    assert "write resumed_handoff_path failed" in capsys.readouterr().err
+    assert state_path.read_text(encoding="utf-8") == garbage
+
+
+@pytest.mark.parametrize(
+    "project",
+    ["../../outside", "/tmp/outside", "BadProj", ".locks", "-flag", ""],
+)
+def test_validate_project_name_rejects_unsafe(project: str) -> None:
+    """The shared guard the live ack path runs before touching any project
+    dir must reject traversal, absolute, uppercase, reserved, dash-leading,
+    and empty names."""
     with pytest.raises(ValueError):
-        handoff_resume.record_resumed_handoff_marker(
-            "/tmp/handoff.md", project="myproj", home=fleet_home,
-        )
-
-    assert state_path.read_text(encoding="utf-8") == garbage
+        handoff_resume._validate_project_name(project)
 
 
-def test_record_resumed_session_tasks_preserves_malformed_coord_state(
-    tmp_path: Path,
-) -> None:
-    """codex iter-10 [P2]: a present-but-MALFORMED coord-state.json must NOT
-    be clobbered by the best-effort resume stamp. Overwriting it would drop
-    sibling keys (worker_agent_ids, recent_decisions, redispatch markers).
-    On a parse failure the safe move is to SKIP the write entirely."""
-    fleet_home = tmp_path / "fleet-home"
-    project_dir = fleet_home / "projects" / "myproj"
-    (project_dir / ".locks").mkdir(parents=True)
-    state_path = project_dir / "coord-state.json"
-    garbage = '{"worker_agent_ids": {"foo": "aaaa1111"}, TRUNCATED'
-    state_path.write_text(garbage, encoding="utf-8")
-
-    handoff_resume.record_resumed_session_tasks(
-        ["fix-foo"], project="myproj", coord_id="succ0001", home=fleet_home,
-    )
-
-    # The malformed file is left byte-for-byte intact — NOT truncated to a
-    # fresh {session_tasks:[…]} that would have lost worker_agent_ids.
-    assert state_path.read_text(encoding="utf-8") == garbage
-
-
-def test_record_resumed_session_tasks_writes_when_absent(
-    tmp_path: Path,
-) -> None:
-    """A MISSING coord-state.json is fine to create fresh (only the absent
-    case, never a malformed one)."""
-    fleet_home = tmp_path / "fleet-home"
-    project_dir = fleet_home / "projects" / "myproj"
-    (project_dir / ".locks").mkdir(parents=True)
-
-    handoff_resume.record_resumed_session_tasks(
-        ["fix-foo"], project="myproj", coord_id="succ0001", home=fleet_home,
-    )
-    cs = json.loads((project_dir / "coord-state.json").read_text(encoding="utf-8"))
-    assert [e["slug"] for e in cs.get("session_tasks", [])] == ["fix-foo"]
+def test_validate_project_name_accepts_valid() -> None:
+    for project in ("myproj", "fleet", "a-b_c.d", "proj123"):
+        handoff_resume._validate_project_name(project)
 
 
 def test_main_no_resumable_writes_footer_to_stderr(

@@ -486,18 +486,6 @@ _LOCK_RETRY_ATTEMPTS = 10
 _LOCK_RETRY_INTERVAL_S = 0.1
 
 
-def _read_coord_state(path: Path) -> dict:
-    """Load coord-state.json. Empty dict on first run / read error."""
-    try:
-        with open(path, "r", encoding="utf-8") as fh:
-            data = json.load(fh)
-        if isinstance(data, dict):
-            return data
-    except (FileNotFoundError, json.JSONDecodeError, OSError):
-        pass
-    return {}
-
-
 def _write_coord_state(path: Path, state: dict) -> None:
     """Atomic publish (tmp + rename + fsync)."""
     parent = path.parent
@@ -701,38 +689,6 @@ def _prepare_resumed_apply_state(
     return _PendingResumeApply(lock, state_path, state)
 
 
-def _record_resumed_apply_state(
-    doc_path: str | os.PathLike,
-    resumed_slugs: list[str],
-    *,
-    project: str,
-    coord_id: str,
-    home: Path,
-) -> None:
-    """Single locked RMW for the resume's session stamp and applied marker."""
-    with _prepare_resumed_apply_state(project=project, home=home) as pending:
-        pending.commit(doc_path, resumed_slugs, coord_id=coord_id)
-
-
-def record_resumed_handoff_marker(
-    doc_path: str | os.PathLike, *, project: str, home: Path,
-) -> None:
-    """Write coord-state.json:resumed_handoff_path under coordinator.lock.
-
-    This is the single applied-ack writer for durable handoff resume. The
-    coord-run supervisor and prompt-delivery paths only read this marker.
-    """
-    if not project:
-        raise ValueError("project is required to write resumed_handoff_path")
-    project_dir = _project_dir(home, project)
-    state_path = project_dir / "coord-state.json"
-    lock_path = _coord_lock_path(project_dir)
-    with _take_coord_lock(lock_path):
-        cs = _load_coord_state_for_marker(state_path)
-        cs["resumed_handoff_path"] = str(doc_path)
-        _write_coord_state(state_path, cs)
-
-
 def _has_transient_resume_skip(skipped: list[str]) -> bool:
     """Return true when a skip means the handoff was not fully applied."""
     transient_needles = (
@@ -742,50 +698,6 @@ def _has_transient_resume_skip(skipped: list[str]) -> bool:
         "inbox rewrite failed",
     )
     return any(any(needle in line for needle in transient_needles) for line in skipped)
-
-
-def record_resumed_session_tasks(
-    resumed_slugs: list[str], *, project: str, coord_id: str, home: Path,
-) -> None:
-    """Best-effort RMW: stamp each just-resumed task_id into
-    coord-state.json:session_tasks under THIS (successor) coord's own
-    coord_id, via the shared dispatch.record_session_task writer — the
-    same buffer/dedupe/cap logic every other dispatch seam uses.
-
-    Never raises: a resume that can't record its session_tasks stamp
-    must not abort the resume dispatch itself (the DISPATCH blocks are
-    already built and about to be printed to stdout regardless).
-    """
-    if not resumed_slugs:
-        return
-    try:
-        project_dir = _project_dir(home, project)
-        state_path = project_dir / "coord-state.json"
-        lock_path = _coord_lock_path(project_dir)
-        with _take_coord_lock(lock_path):
-            # codex iter-10 [P2]: _read_coord_state() flattens BOTH a missing
-            # file AND a MALFORMED (JSONDecodeError / non-dict) file to {}.
-            # A missing file is fine to create fresh, but overwriting a
-            # malformed file with {session_tasks:[…]} would silently DROP its
-            # sibling keys (worker_agent_ids, recent_decisions, redispatch
-            # markers…) — real data loss. This stamp is best-effort, so the
-            # safe move on a present-but-unparseable file is to SKIP the write,
-            # not truncate it. Distinguish the two by reading raw first.
-            if state_path.exists():
-                try:
-                    raw = json.loads(state_path.read_text(encoding="utf-8"))
-                except (ValueError, OSError):
-                    return  # malformed / unreadable → do not clobber
-                if not isinstance(raw, dict):
-                    return  # non-dict payload → do not clobber
-                cs = raw
-            else:
-                cs = {}
-            for slug in resumed_slugs:
-                dispatch_mod.record_session_task(cs, slug, coord_id)
-            _write_coord_state(state_path, cs)
-    except Exception:  # noqa: BLE001 — best-effort, mirrors loop._record_session_task
-        pass
 
 
 def main(argv: list[str] | None = None) -> int:
