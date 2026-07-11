@@ -555,6 +555,62 @@ class _ResumeLockHandle:
             pass
 
 
+def _parse_frontmatter_project(path: str | os.PathLike) -> str:
+    """Return the handoff doc frontmatter project, or "" when absent."""
+    text = Path(path).read_text(encoding="utf-8")
+    lines = text.splitlines()
+    if not lines or lines[0].strip() != "---":
+        return ""
+    for raw in lines[1:]:
+        if raw.strip() == "---":
+            break
+        key, sep, value = raw.partition(":")
+        if sep and key.strip() == "project":
+            return _decode_frontmatter_value(value.strip())
+    return ""
+
+
+def _decode_frontmatter_value(value: str) -> str:
+    """Decode the simple YAML-ish values emitted by Go's fmt %q."""
+    if len(value) >= 2 and value[0] == '"' and value[-1] == '"':
+        return _unquote_go(value[1:-1])
+    if len(value) >= 2 and value[0] == "'" and value[-1] == "'":
+        return value[1:-1]
+    return value.strip()
+
+
+def resolve_resume_project(doc_path: str | os.PathLike) -> str:
+    """Resolve the project for the applied marker.
+
+    Fleet normally sets FLEET_PROJECT in the coord pane. Handoff docs also
+    carry project: in frontmatter, and that is the mandatory fallback so an
+    unset env cannot silently skip the resume ack write.
+    """
+    env_project = os.environ.get("FLEET_PROJECT", "").strip()
+    if env_project:
+        return env_project
+    return _parse_frontmatter_project(doc_path).strip()
+
+
+def record_resumed_handoff_marker(
+    doc_path: str | os.PathLike, *, project: str, home: Path,
+) -> None:
+    """Write coord-state.json:resumed_handoff_path under coordinator.lock.
+
+    This is the single applied-ack writer for durable handoff resume. The
+    coord-run supervisor and prompt-delivery paths only read this marker.
+    """
+    if not project:
+        raise ValueError("project is required to write resumed_handoff_path")
+    project_dir = home / "projects" / project
+    state_path = project_dir / "coord-state.json"
+    lock_path = project_dir / ".locks" / "coordinator.lock"
+    with _take_coord_lock(lock_path):
+        cs = _read_coord_state(state_path)
+        cs["resumed_handoff_path"] = str(doc_path)
+        _write_coord_state(state_path, cs)
+
+
 def record_resumed_session_tasks(
     resumed_slugs: list[str], *, project: str, coord_id: str, home: Path,
 ) -> None:
@@ -633,7 +689,14 @@ def main(argv: list[str] | None = None) -> int:
     wip_dir = os.environ.get(
         "FLEET_SUBAGENT_WIP_DIR",
     ) or os.path.expanduser("~/.fleet/subagent-wip")
-    project = os.environ.get("FLEET_PROJECT", "") or None
+    project = resolve_resume_project(doc_path)
+    if not project:
+        print(
+            "handoff_resume: project missing (FLEET_PROJECT unset and "
+            "handoff frontmatter has no project)",
+            file=sys.stderr,
+        )
+        return 1
     resumed_slugs: list[str] = []
     blocks, skipped = build_resume_dispatches(
         entries, wip_dir=wip_dir, fleet_home=fleet_home,
@@ -645,12 +708,18 @@ def main(argv: list[str] | None = None) -> int:
     # this successor hands off again before any loop.py tick seam
     # independently touches it. Best-effort: the DISPATCH blocks below are
     # unconditional regardless of whether this stamp lands.
-    if project:
-        record_resumed_session_tasks(
-            resumed_slugs, project=project,
-            coord_id=os.environ.get("FLEET_AGENT_ID", ""),
-            home=Path(fleet_home),
+    record_resumed_session_tasks(
+        resumed_slugs, project=project,
+        coord_id=os.environ.get("FLEET_AGENT_ID", ""),
+        home=Path(fleet_home),
+    )
+    try:
+        record_resumed_handoff_marker(
+            doc_path, project=project, home=Path(fleet_home),
         )
+    except Exception as exc:  # noqa: BLE001 — exit 0 is the applied ack.
+        print(f"handoff_resume: write resumed_handoff_path failed: {exc}", file=sys.stderr)
+        return 1
     for line in skipped:
         print(f"# {line}", file=sys.stderr)
     for url in open_pr_urls:

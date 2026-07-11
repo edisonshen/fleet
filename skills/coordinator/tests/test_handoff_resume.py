@@ -97,6 +97,7 @@ def _seed_handoff(
     *,
     body_subagents: str,
     body_open_prs: str = "_(no open PRs)_",
+    project: str = "myproj",
 ) -> None:
     """Write a minimal handoff doc with the Active Subagents section
     filled with the given body_subagents string and the Open PRs
@@ -105,7 +106,7 @@ def _seed_handoff(
         "---\n"
         'agent_id: "abcd1234"\n'
         'task_id: "coord-myproj"\n'
-        'project: "myproj"\n'
+        f'project: "{project}"\n'
         "context_pct_at_handoff: 50\n"
         "previous_handoff: null\n"
         "handoff_number: 1\n"
@@ -411,6 +412,84 @@ def test_main_records_resumed_task_into_session_tasks(
     st = cs.get("session_tasks", [])
     assert [e["slug"] for e in st] == ["fix-foo"]
     assert st[0]["coord_id"] == "succ0001"
+    assert cs["resumed_handoff_path"] == str(doc)
+
+
+def test_main_writes_resumed_handoff_marker_on_exit_zero(
+    capsys: pytest.CaptureFixture, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fleet_home = tmp_path / "fleet-home"
+    wip_dir = tmp_path / "wip"
+    fleet_home.mkdir()
+    wip_dir.mkdir()
+    doc = tmp_path / "handoff.md"
+    _seed_handoff(doc, body_subagents="_(none)_")
+    monkeypatch.setenv("FLEET_HOME", str(fleet_home))
+    monkeypatch.setenv("FLEET_SUBAGENT_WIP_DIR", str(wip_dir))
+    monkeypatch.setenv("FLEET_PROJECT", "myproj")
+
+    rc = handoff_resume.main([str(doc)])
+    assert rc == 0
+    capsys.readouterr()
+
+    state_path = fleet_home / "projects" / "myproj" / "coord-state.json"
+    cs = json.loads(state_path.read_text(encoding="utf-8"))
+    assert cs["resumed_handoff_path"] == str(doc)
+
+
+def test_main_failure_does_not_write_resumed_handoff_marker(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fleet_home = tmp_path / "fleet-home"
+    fleet_home.mkdir()
+    monkeypatch.setenv("FLEET_HOME", str(fleet_home))
+    monkeypatch.setenv("FLEET_PROJECT", "myproj")
+
+    rc = handoff_resume.main([str(tmp_path / "missing.md")])
+
+    assert rc == 1
+    assert not (fleet_home / "projects" / "myproj" / "coord-state.json").exists()
+
+
+def test_main_uses_frontmatter_project_for_marker_when_env_unset(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fleet_home = tmp_path / "fleet-home"
+    wip_dir = tmp_path / "wip"
+    fleet_home.mkdir()
+    wip_dir.mkdir()
+    doc = tmp_path / "handoff.md"
+    _seed_handoff(doc, body_subagents="_(none)_", project="fallback-proj")
+    monkeypatch.setenv("FLEET_HOME", str(fleet_home))
+    monkeypatch.setenv("FLEET_SUBAGENT_WIP_DIR", str(wip_dir))
+    monkeypatch.delenv("FLEET_PROJECT", raising=False)
+
+    rc = handoff_resume.main([str(doc)])
+
+    assert rc == 0
+    state_path = fleet_home / "projects" / "fallback-proj" / "coord-state.json"
+    cs = json.loads(state_path.read_text(encoding="utf-8"))
+    assert cs["resumed_handoff_path"] == str(doc)
+
+
+def test_record_resumed_session_tasks_does_not_write_handoff_marker(
+    tmp_path: Path,
+) -> None:
+    fleet_home = tmp_path / "fleet-home"
+    project_dir = fleet_home / "projects" / "myproj"
+    (project_dir / ".locks").mkdir(parents=True)
+    state_path = project_dir / "coord-state.json"
+    state_path.write_text(
+        json.dumps({"resumed_handoff_path": "/tmp/old.md"}),
+        encoding="utf-8",
+    )
+
+    handoff_resume.record_resumed_session_tasks(
+        ["fix-foo"], project="myproj", coord_id="succ0001", home=fleet_home,
+    )
+
+    cs = json.loads(state_path.read_text(encoding="utf-8"))
+    assert cs["resumed_handoff_path"] == "/tmp/old.md"
 
 
 def test_record_resumed_session_tasks_preserves_malformed_coord_state(

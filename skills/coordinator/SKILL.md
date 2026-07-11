@@ -360,18 +360,23 @@ Operator commands:
 
 On first turn after coordinator handoff:
 
-1. Read the handoff doc named in the spawn prompt. Follow `previous_handoff`
-   links only when needed.
+1. Read the handoff doc named in `record.last_handoff_path` for this coord's
+   own agent record. If a spawn prompt also names a doc path, it should match
+   this record field; the record is the durable source of truth. Follow
+   `previous_handoff` links only when needed.
 2. Run:
 
 ```bash
 python3 /path/to/skills/coordinator/handoff_resume.py <handoff-doc-path>
 ```
 
-3. For every DISPATCH block it emits, use the Worker dispatch protocol above.
-4. The helper reads `Active Subagents`, checks WIP files, rewrites inbox prompts
+3. This helper must run to completion. Its exit 0 writes
+   `coord-state.json:resumed_handoff_path`, which is the applied ack the
+   `fleet coord-run` supervisor reads to stop resume nudges.
+4. For every DISPATCH block it emits, use the Worker dispatch protocol above.
+5. The helper reads `Active Subagents`, checks WIP files, rewrites inbox prompts
    with a resume preamble, and skips entries already `in-review` or terminal.
-5. For open PR hints, respawn PR shepherd waits on the next supervisor tick.
+6. For open PR hints, respawn PR shepherd waits on the next supervisor tick.
 
 Skipped entries are not automatically errors; stale WIP/inbox files are common
 after clean worker exits.
