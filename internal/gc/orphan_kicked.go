@@ -15,6 +15,13 @@ import (
 // queue file has already been consumed.
 const KindOrphanKicked Kind = "orphan-kicked"
 
+// kickedSuffix is fleet-guard's throttle-sentinel suffix (handoff.py stamps
+// <queue-file>.kicked). The list filter and the sibling-derivation below MUST
+// use the same value or the reaper silently desyncs — one constant keeps them
+// in lockstep. queue.Delete's own literal is a documented cross-language
+// contract (different package + Python producer), not shared here.
+const kickedSuffix = ".kicked"
+
 func reconcileOrphanKicked(r *Report, opts Options, deps Deps) error {
 	if deps.ListOrphanKickedMarkers == nil {
 		return errors.New("ListOrphanKickedMarkers dep not wired")
@@ -31,7 +38,7 @@ func reconcileOrphanKicked(r *Report, opts Options, deps Deps) error {
 		return err
 	}
 	for _, marker := range markers {
-		queueFile := strings.TrimSuffix(marker, ".kicked")
+		queueFile := strings.TrimSuffix(marker, kickedSuffix)
 		if queueFile == marker {
 			continue
 		}
@@ -73,7 +80,7 @@ func listOrphanKickedMarkersOnDisk() ([]string, error) {
 	}
 	markers := make([]string, 0)
 	for _, entry := range entries {
-		if !strings.HasSuffix(entry.Name(), ".kicked") {
+		if !strings.HasSuffix(entry.Name(), kickedSuffix) {
 			continue
 		}
 		markers = append(markers, filepath.Join(dir, entry.Name()))
