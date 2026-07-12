@@ -4,12 +4,21 @@ schema: v1
 
 # Standards
 
+## Implementation
+
+- **Delete-and-rewrite over patch-on-patch.** When a change touches existing logic, rewrite the affected function/unit cleanly — delete the old, write the new — rather than bolting another branch onto the old shape. Layered patches breed dead branches and unreadable archaeology. (A small, clean addition to an already-clean function is a clean write, not a patch — the target is accumulated cruft, not every edit.)
+- **Delete orphaned/subsumed tests.** When a change makes an existing test redundant or obsolete, delete it and fold its coverage into the new (usually table-driven) test — never leave dead tests beside new ones. The task plan must list "Tests removed" (with the reason) and "KEEP (retained behavior)" so the implementer neither over- nor under-deletes. Dead tests are a leak.
+
 ## Testing
 
 - TDD required: a failing test on disk before the implementation.
 - Tests use stdlib `testing` only — no testify, no ginkgo.
 - All bug fixes carry a regression test that fails on the parent commit.
 - Integration tests preferred over heavy mocking when feasible.
+- Test SHAPE matters as much as coverage: a matrix of near-identical single-scenario functions is a review liability. Consolidate scenarios that share a driver into ONE table test (Go table-driven / `pytest.mark.parametrize`), one row per case, and factor setup into a per-package builder/harness. New case = new row, not new function.
+- Test one CONTRACT, not the implementation: no assertion a legitimate refactor would break. One integration test at a real boundary beats N unit tests re-pinning the same behavior through mocks.
+- Budget: test LOC should stay within ~1.5x the production LOC it covers unless a specific case justifies more. If a PR's tests dwarf its logic, that's a signal to consolidate, not a badge.
+- Every test must name the bug it catches — in the function/row name or a one-line comment. A test whose failure wouldn't tell you what broke is noise; delete or rename it.
 
 ## Code review
 
