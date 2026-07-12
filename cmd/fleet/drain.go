@@ -330,9 +330,9 @@ func drainOne(req queue.SpawnFresh, path string, graceMillis, resumeTimeoutMilli
 //	       IsCoordSpawn? ────┤ yes → lock+Resume (coord recovery, UNCHANGED)
 //	                         │ no
 //	classifyBackingTask(project, taskID)
-//	     ├─ terminal (done/abandoned) → queue.Delete + errDropped   [LOCK-FREE]
-//	     ├─ unresolvable (no row / read error) → errHeldPending      [no Resume]
-//	     └─ live → lock+Resume ──► handoffop opt-out → ErrHeldOptOut  [pending]
+//	     ├─ terminal (done/abandoned)          → queue.Delete + errDropped [LOCK-FREE]
+//	     ├─ unresolvable (tasks.md READ ERROR)  → errHeldPending            [no Resume]
+//	     └─ live (incl. no tracked row at all)  → lock+Resume ──► handoffop opt-out → ErrHeldOptOut  [pending]
 //
 // The drop/unresolvable paths run LOCK-FREE — LockAgent is taken only on the
 // live/coord Resume path. Moving it inside that branch is load-bearing: a moot
@@ -383,9 +383,9 @@ func drainOneLegacy(req queue.SpawnFresh, path string, graceMillis int,
 type drainTaskClass int
 
 const (
-	taskLive         drainTaskClass = iota // non-terminal row → resume via the existing route
+	taskLive         drainTaskClass = iota // non-terminal row (or no tracked row) → resume via the existing route
 	taskTerminal                           // done/abandoned → DROP the moot handoff
-	taskUnresolvable                       // missing row / unreadable → HOLD pending (never drop)
+	taskUnresolvable                       // tasks.md/archive genuinely UNREADABLE → HOLD pending (never drop)
 )
 
 // classifyBackingTask resolves taskID's status for project (tasks.md, then
@@ -393,17 +393,35 @@ const (
 // PRESENCE alone never drops, since a task can be archived while still
 // in-progress.
 //
-// A READ ERROR (corrupt/unreadable tasks.md) is SWALLOWED → taskUnresolvable:
-// returning it up to runDrain would count failed++ and resurrect the exit-1
-// banner this feature removes. An unresolvable status is HELD, never dropped —
-// it is not proof of done.
+// A READ ERROR (corrupt/unreadable tasks.md or tasks-archive.md) is SWALLOWED
+// → taskUnresolvable: returning it up to runDrain would count failed++ and
+// resurrect the exit-1 banner this feature removes. An unresolvable status is
+// HELD, never dropped — it is not proof of done.
+//
+// taskID simply ABSENT from both files is NOT unresolvable — it is taskLive
+// (codex/adversarial-review iter-1 [P1]). A task_id that was never registered
+// in tasks.md is the ORDINARY case for a raw/ad-hoc `fleet dispatch <id>` that
+// never touched the task-tracking system (internal/spawn/coord_config.go's own
+// "raw spawn" comment documents an empty TaskID as first-class), and this
+// codebase's own baseline drain tests confirm it: every pre-existing auto-
+// resume test had no tracked task at all. Treating "no row" the same as a
+// genuine read error would silently convert a previously-working auto-resume
+// into a handoff HELD pending forever with no forced failure to alert anyone —
+// exactly the kind of silent breakage this feature exists to remove. Falling
+// through to the existing live/opt-out route reproduces pre-drain-nonforcing
+// behavior exactly (auto-resume succeeds; an opted-out worker still refuses via
+// handoffop's ErrHeldOptOut, bucketed pending same as before). Only a genuine
+// I/O failure reading tasks.md/tasks-archive.md — a real signal something is
+// wrong with the project's state — holds pending pre-emptively.
 //
 // Uses readTasks/readArchiveTasks (resolved Task.Status), NOT internal/gc's
 // loadTaskStatusOnDisk, which coarsely maps any archived row to "done" and
 // would wrongly drop an archived-in-progress task.
 func classifyBackingTask(project, taskID string) (drainTaskClass, tasks.Status) {
-	if project == "" || taskID == "" {
-		return taskUnresolvable, ""
+	if taskID == "" {
+		// Raw spawn (no task_id at all) — never a signal to hold; fall
+		// through to the existing live/opt-out route unchanged.
+		return taskLive, ""
 	}
 	f, _, err := readTasks(project)
 	if err != nil {
@@ -421,7 +439,10 @@ func classifyBackingTask(project, taskID string) (drainTaskClass, tasks.Status) 
 			return classForStatus(t.Status), t.Status
 		}
 	}
-	return taskUnresolvable, ""
+	// Not found in either file: the task was never tracked (ad hoc / pre-
+	// task-tracking dispatch) — not a signal to hold. Fall through to the
+	// existing live/opt-out route, same as taskID=="" above.
+	return taskLive, ""
 }
 
 func classForStatus(s tasks.Status) drainTaskClass {

@@ -700,6 +700,120 @@ func TestDrain_CorruptTasksFileHoldsPending(t *testing.T) {
 	}
 }
 
+// codex/adversarial-review iter-1 [P1]: a task_id that is simply ABSENT from
+// both tasks.md and tasks-archive.md (never registered — the ordinary shape
+// of an ad hoc / pre-task-tracking `fleet dispatch <id>`, and the DEFAULT
+// configuration every OTHER baseline test in this file has to explicitly
+// override via seedDrainTask) must NOT be held pending for an auto-resume
+// (non-opted-out) worker. classifyBackingTask's "not found in either file"
+// branch buckets taskLive (falls through to the existing lock+Resume route),
+// NOT taskUnresolvable — only a genuine tasks.md/archive READ ERROR holds.
+// Before this fix, "no row" and "read error" were conflated into the same
+// taskUnresolvable bucket, silently converting a previously-working
+// auto-resume into a handoff held pending forever with no forced failure to
+// alert anyone (the exact silent-breakage class this feature exists to
+// remove). This test pins the regression closed: PROCESSED, not pending.
+func TestDrain_UntrackedTaskAutoResumesNotHeld(t *testing.T) {
+	requireFakeTmux(t)
+	setupFleetHome(t)
+	oldRec := seedAgentForDrain(t) // auto-resume worker; TaskID="drain-test", NOT seeded anywhere
+	qp, req := writeSkillQueueFile(t, oldRec)
+
+	out := &bytes.Buffer{}
+	if err := runDrain(out, out, 0, 0); err != nil {
+		t.Fatalf("untracked task must still auto-resume (exit 0), got %v\n%s", err, out.String())
+	}
+	s := out.String()
+	if !strings.Contains(s, "1 processed") {
+		t.Errorf("untracked-task worker was held pending instead of processed:\n%s", s)
+	}
+	if strings.Contains(s, "pending") {
+		t.Errorf("untracked task must not be held pending at all:\n%s", s)
+	}
+	if _, statErr := os.Stat(qp); !os.IsNotExist(statErr) {
+		t.Errorf("queue file not deleted after processing: %v", statErr)
+	}
+	newRec, err := agent.Load(req.NewAgentID)
+	if err != nil {
+		t.Fatalf("load replacement: %v", err)
+	}
+	t.Cleanup(func() { _ = tmux.Kill(newRec.TmuxSession) })
+}
+
+// Companion to TestDrain_UntrackedTaskAutoResumesNotHeld: an OPTED-OUT worker
+// whose task_id is untracked still falls through to the live/opt-out route
+// (classifyBackingTask no longer short-circuits it), and handoffop.Resume's
+// existing opt-out refusal (wrapped ErrHeldOptOut) buckets it pending exactly
+// as it did before this fix — the outcome for the opted-out case is
+// unchanged, only the code path that reaches it changed (classifier
+// short-circuit → Resume's own opt-out gate).
+func TestDrain_UntrackedTaskOptedOutHoldsPending(t *testing.T) {
+	requireFakeTmux(t)
+	setupFleetHome(t)
+	oldRec := seedAgentForDrain(t)
+	oldRec.DisableAutoResume = true
+	if err := oldRec.Write(); err != nil {
+		t.Fatalf("rewrite opt-out: %v", err)
+	}
+	qp, _ := writeSkillQueueFile(t, oldRec)
+
+	out := &bytes.Buffer{}
+	if err := runDrain(out, out, 0, 0); err != nil {
+		t.Fatalf("held handoff must exit 0, got %v\n%s", err, out.String())
+	}
+	s := out.String()
+	if !strings.Contains(s, ", 1 pending") {
+		t.Errorf("untracked task + opted-out must still hold pending:\n%s", s)
+	}
+	if _, statErr := os.Stat(qp); statErr != nil {
+		t.Errorf("held handoff: queue file must be preserved: %v", statErr)
+	}
+}
+
+// Testing-specialist gap: the archive-read-error branch (classifyBackingTask's
+// SECOND readArchiveTasks error path, reached only when the slug is absent
+// from tasks.md) was previously unexercised — TestDrain_CorruptTasksFileHoldsPending
+// only corrupts tasks.md, which returns unresolvable from the FIRST readTasks
+// error without ever reaching the archive read. Corrupt tasks-archive.md
+// specifically (with a clean, non-matching tasks.md) to pin the second error
+// path: still HELD pending, never processed, never failed.
+func TestDrain_CorruptArchiveFileHoldsPending(t *testing.T) {
+	requireFakeTmux(t)
+	setupFleetHome(t)
+	oldRec := seedAgentForDrain(t) // auto-resume worker; TaskID="drain-test"
+	dir, err := state.ProjectDir(oldRec.Project)
+	if err != nil {
+		t.Fatalf("ProjectDir: %v", err)
+	}
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// tasks.md is present but doesn't contain oldRec.TaskID, so
+	// classifyBackingTask falls through to the archive read.
+	seedDrainTask(t, oldRec.Project, "some-other-task", tasks.StatusInProgress)
+	// Unterminated / non-key:value frontmatter → tasks.Read parse error.
+	if err := os.WriteFile(filepath.Join(dir, "tasks-archive.md"),
+		[]byte("---\ngarbage line no colon\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	qp, _ := writeSkillQueueFile(t, oldRec)
+
+	out := &bytes.Buffer{}
+	if err := runDrain(out, out, 0, 0); err != nil {
+		t.Fatalf("corrupt tasks-archive.md must HOLD pending (exit 0), not fail: %v\n%s", err, out.String())
+	}
+	s := out.String()
+	if _, statErr := os.Stat(qp); statErr != nil {
+		t.Errorf("held handoff: queue file must be preserved: %v", statErr)
+	}
+	if !strings.Contains(s, ", 1 pending") {
+		t.Errorf("expected pending bucket (archive read error swallowed → unresolvable):\n%s", s)
+	}
+	if strings.Contains(s, "1 processed") {
+		t.Errorf("corrupt-archive classifier wrongly processed instead of holding:\n%s", s)
+	}
+}
+
 // Row 8b (REQUIRED): a coord queue entry called through drainOneLegacy DIRECTLY
 // must hit the IsCoordSpawn skip and NEVER be status-classified/dropped — even
 // with a terminal backing task. On CI leaseDrainEnabled() is always true, so
