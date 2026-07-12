@@ -261,6 +261,61 @@ func TestReconcileOrphanKicked(t *testing.T) {
 			t.Fatalf("apply removed matched marker %s", matchedMarker)
 		}
 	})
+
+	// Safety invariant: a non-ENOENT stat error (e.g. EACCES) is
+	// ambiguous about whether the queue file exists, so the reaper must
+	// fail closed — propagate the error and NEVER delete the marker. A
+	// regression that treated any stat error as "absent" would reap a
+	// live throttle sentinel.
+	t.Run("stat error fails closed", func(t *testing.T) {
+		queueDir := isolatedQueueDir(t)
+		marker := filepath.Join(queueDir, "spawn-fresh-staterr.json.kicked")
+		writeFile(t, marker)
+
+		deps := DefaultDeps()
+		deps.StatOrphanKickedQueueFile = func(string) error { return os.ErrPermission }
+
+		rep, err := Reconcile(Options{Apply: true, Kinds: []Kind{KindOrphanKicked}}, deps)
+		if err == nil {
+			t.Fatal("Reconcile: want error on non-ENOENT stat, got nil")
+		}
+		if !strings.Contains(err.Error(), "stat queue file") {
+			t.Fatalf("error=%q, want substring %q", err, "stat queue file")
+		}
+		if _, ok := findAction(rep, KindOrphanKicked, marker); ok {
+			t.Fatalf("marker must NOT be targeted on an ambiguous stat; actions=%+v", rep.Actions)
+		}
+		if !pathExists(marker) {
+			t.Fatalf("marker must survive an ambiguous stat error: %s", marker)
+		}
+	})
+
+	// Apply-path remove failure must surface as would-remove (not
+	// removed) so the operator isn't told an orphan was reaped when the
+	// unlink actually failed.
+	t.Run("apply remove failure surfaces not-removed", func(t *testing.T) {
+		queueDir := isolatedQueueDir(t)
+		marker := filepath.Join(queueDir, "spawn-fresh-rmfail.json.kicked")
+		writeFile(t, marker)
+
+		deps := DefaultDeps()
+		deps.RemoveOrphanKickedMarker = func(string) error { return errors.New("permission denied") }
+
+		rep, err := Reconcile(Options{Apply: true, Kinds: []Kind{KindOrphanKicked}}, deps)
+		if err != nil {
+			t.Fatalf("Reconcile: %v", err)
+		}
+		a, ok := findAction(rep, KindOrphanKicked, marker)
+		if !ok {
+			t.Fatalf("orphan marker not reported; actions=%+v", rep.Actions)
+		}
+		if a.Verb == VerbRemoved {
+			t.Fatalf("verb=%q, want NOT %q on a failed unlink", a.Verb, VerbRemoved)
+		}
+		if !strings.Contains(a.Reason, "remove failed") {
+			t.Fatalf("reason=%q, want substring %q", a.Reason, "remove failed")
+		}
+	})
 }
 
 func isolatedQueueDir(t *testing.T) string {
