@@ -7,11 +7,13 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"github.com/edisonshen/fleet/internal/agent"
 	"github.com/edisonshen/fleet/internal/fleetlog"
 	"github.com/edisonshen/fleet/internal/handoffop"
 	"github.com/edisonshen/fleet/internal/queue"
 	"github.com/edisonshen/fleet/internal/spawn"
 	"github.com/edisonshen/fleet/internal/state"
+	"github.com/edisonshen/fleet/internal/tasks"
 	"github.com/edisonshen/fleet/internal/tmux"
 )
 
@@ -56,6 +58,25 @@ const defaultResumeTimeoutMillis = 120000
 // drainRunNow): runDrain's accounting is exercised without a real tmux/lease
 // Resume behind it. Production never reassigns it.
 var drainOneFn = drainOne
+
+// errDropped / errHeldPending are the two NON-FAILURE outcomes the
+// worker/legacy classifier returns (DESIGN-drain-nonforcing). Neither is a
+// failure and neither trips exit 1:
+//
+//   - errDropped: the backing task is provably terminal (done/abandoned), so
+//     the handoff is MOOT — drainOneLegacy already deleted the queue file and
+//     surfaced the drop. runDrain counts it in the `dropped` bucket.
+//   - errHeldPending: the backing task is UNRESOLVABLE (missing row / unreadable
+//     tasks.md) — not proof of done, so the handoff is preserved and HELD.
+//     runDrain counts it in the `pending` bucket (alongside handoffop's
+//     ErrHeldOptOut, the live-but-opted-out case).
+//
+// Bucketing both out of `failed` is what removes the recurring "every pending
+// handoff failed" red banner for entries that were never going to force-complete.
+var (
+	errDropped     = errors.New("fleet drain: handoff dropped (backing task terminal)")
+	errHeldPending = errors.New("fleet drain: handoff held pending (unresolvable backing task)")
+)
 
 func newDrainCmd() *cobra.Command {
 	var (
@@ -146,6 +167,8 @@ func runDrain(stdout, stderr io.Writer, graceMillis, resumeTimeoutMillis int) er
 	processed := 0
 	backgrounded := 0
 	failed := 0
+	dropped := 0
+	pending := 0
 	for _, path := range paths {
 		// Progress checkpoint: we are about to start work on the next
 		// queue file, which is forward progress. Advancing the heartbeat
@@ -155,6 +178,12 @@ func runDrain(stdout, stderr io.Writer, graceMillis, resumeTimeoutMillis int) er
 		rh.Beat()
 		req, perr := queue.ReadSpawnFresh(path)
 		if perr != nil {
+			if errors.Is(perr, state.ErrNotFound) {
+				// The file vanished between ListPending and this read — a
+				// concurrent consumer (cron + TUI, or a sibling drain that
+				// dropped it) already handled it. Benign: NOT a failure.
+				continue
+			}
 			// Skip rather than fail-fast — a malformed or future-schema
 			// file is one problem among many. Log and continue so other
 			// pending agents still drain.
@@ -196,6 +225,28 @@ func runDrain(stdout, stderr io.Writer, graceMillis, resumeTimeoutMillis int) er
 			_, _ = fmt.Fprintf(stdout,
 				"fleet drain: %s escalated to safety-net takeover (handoff was slow/hung)\n", req.OldAgentID)
 			processed++
+		case errors.Is(err, errDropped):
+			// Moot handoff dropped (backing task done/abandoned). The drop
+			// diagnostic already fired inside drainOneLegacy; count it in the
+			// `dropped` bucket — neither processed nor failed.
+			dropped++
+		case errors.Is(err, errHeldPending) || errors.Is(err, handoffop.ErrHeldOptOut):
+			// Live-but-must-wait handoff: an opted-out worker (ErrHeldOptOut)
+			// or an unresolvable backing task (errHeldPending). NOT a failure —
+			// the queue file is preserved and the operator is surfaced a
+			// manual-handoff hint. Reclassifying failed→pending is what stops
+			// the recurring "every pending handoff failed" red banner.
+			msg := fmt.Sprintf(
+				"fleet drain: %s pending — worker handoff, run 'fleet handoff %s'",
+				req.OldAgentID, req.OldAgentID)
+			_, _ = fmt.Fprintln(stdout, msg)
+			fleetlog.Log(fleetlog.CompCLI, "drain.pending", "info", fleetlog.Fields{
+				Agent: req.OldAgentID,
+				Proj:  req.Project,
+				Slug:  req.TaskID,
+				Msg:   msg,
+			})
+			pending++
 		case err != nil:
 			_, _ = fmt.Fprintf(stderr, "fleet drain: %s: %v\n", req.OldAgentID, err)
 			failed++
@@ -204,25 +255,38 @@ func runDrain(stdout, stderr io.Writer, graceMillis, resumeTimeoutMillis int) er
 		}
 	}
 
-	// Truthful summary (codex iter-1 [P1]): backgrounded resumes get their
-	// own bucket — they are neither completed nor failed, and the queue
-	// file left in place is what makes "a later drain retries" true. The
-	// two-bucket line is kept verbatim when nothing was backgrounded so
-	// existing cron/log scrapers keep matching.
+	// Truthful summary. Each bucket is neither processed nor failed:
+	// backgrounded (still completing), dropped (moot handoff removed), pending
+	// (held for a manual handoff). The bare "N processed, M failed" and the
+	// backgrounded parenthetical stay VERBATIM when their buckets are zero so
+	// existing cron/log scrapers + drain_test string asserts keep matching;
+	// dropped / pending append via a fixed-order builder only when nonzero
+	// (DESIGN-drain-nonforcing).
+	summary := fmt.Sprintf("fleet drain: %d processed", processed)
 	if backgrounded > 0 {
-		_, _ = fmt.Fprintf(stdout,
-			"fleet drain: %d processed, %d backgrounded (still completing; a later drain retries), %d failed\n",
-			processed, backgrounded, failed)
-	} else {
-		_, _ = fmt.Fprintf(stdout, "fleet drain: %d processed, %d failed\n",
-			processed, failed)
+		summary += fmt.Sprintf(", %d backgrounded (still completing; a later drain retries)", backgrounded)
 	}
-	// Exit code: only "every pending handoff failed" is an error. A
-	// backgrounded resume is not a genuine failure — it must not trip
-	// exit 1 (the false alarm this task exists to fix), and its presence
-	// also falsifies "every ... failed" when mixed with real failures.
+	summary += fmt.Sprintf(", %d failed", failed)
+	if dropped > 0 {
+		summary += fmt.Sprintf(", %d dropped", dropped)
+	}
+	if pending > 0 {
+		summary += fmt.Sprintf(", %d pending", pending)
+	}
+	_, _ = fmt.Fprintln(stdout, summary)
+
+	// Exit code: unchanged rule — non-zero only when nothing succeeded
+	// (processed==0 && backgrounded==0 && failed>0). Dropped + pending are NOT
+	// failures, so they leave the `failed` bucket and never trip exit 1 on
+	// their own (the false alarm this feature removes). But when there ARE
+	// genuine failures alongside drops/holds, "every pending handoff failed"
+	// would overstate — a held/dropped entry did not fail — so gate that exact
+	// wording on dropped==0 && pending==0.
 	if processed == 0 && backgrounded == 0 && failed > 0 {
-		return errors.New("fleet drain: every pending handoff failed")
+		if dropped == 0 && pending == 0 {
+			return errors.New("fleet drain: every pending handoff failed")
+		}
+		return fmt.Errorf("fleet drain: %d handoff(s) failed (no handoff completed)", failed)
 	}
 	return nil
 }
@@ -255,21 +319,211 @@ func drainOne(req queue.SpawnFresh, path string, graceMillis, resumeTimeoutMilli
 }
 
 // drainOneLegacy is the pre-PR3 drain: take the per-agent flock and run
-// Resume under it. Retained verbatim for worker handoffs and platforms
-// without the coordinator lease primitive.
+// Resume under it. Retained for worker handoffs and platforms without the
+// coordinator lease primitive.
 //
-// KNOWN ROOT CAUSE (the reason the lease-aware path exists): this holds the
-// per-agent flock across the ENTIRE Resume — tmux probes, AtomicCoordSwap's
-// nested flock, spawn — any of which can hang, and acquireFlock has no
-// timeout, so a single stuck holder wedges every later drain forever
-// (drain.go:101-106, the 81-process leak). The lease-aware path drops this.
+// drain-nonforcing (DESIGN-drain-nonforcing): before the opt-out refusal it
+// classifies the WORKER handoff by resolved backing-task status and stops
+// FORCING. Coord entries are never classified.
+//
+//	                  drainOneLegacy(req)
+//	                         │
+//	       IsCoordSpawn? ────┤ yes → lock+Resume (coord recovery, UNCHANGED)
+//	                         │ no
+//	classifyBackingTask(project, taskID)
+//	     ├─ terminal (done/abandoned)
+//	     │     ├─ replacement NEVER spawned → queue.Delete + errDropped [LOCK-FREE]
+//	     │     └─ replacement already exists → falls through to lock+Resume
+//	     │           (crash-recovery reconciliation, NOT a fresh drop)
+//	     ├─ unresolvable (tasks.md READ ERROR)  → errHeldPending            [no Resume]
+//	     └─ live (incl. no tracked row at all)  → lock+Resume ──► handoffop opt-out → ErrHeldOptOut  [pending]
+//
+// The drop/unresolvable paths run LOCK-FREE — LockAgent is taken only on the
+// live/coord Resume path. Moving it inside that branch is load-bearing: a moot
+// drop must not wait on the 5-minute agentLockTimeout behind a held lock.
+//
+// KNOWN ROOT CAUSE (why the lease-aware path exists): the lock+Resume tail
+// holds the per-agent flock across the ENTIRE Resume — tmux probes,
+// AtomicCoordSwap's nested flock, spawn — any of which can hang; the
+// lease-aware path drops this for coords on lease builds.
 func drainOneLegacy(req queue.SpawnFresh, path string, graceMillis int,
 	stdout, stderr io.Writer) error {
 
+	// A coord entry is NEVER status-classified or dropped. On lease builds
+	// drainOne already routed it to drainOneLeaseAware; this guard covers the
+	// NON-lease build where everything falls here, so dead-coord recovery stays
+	// intact on every platform. Route it straight to the lock+Resume tail.
+	if !spawn.IsCoordSpawn(req.TaskID, req.Project) {
+		switch class, status := classifyBackingTask(req.Project, req.TaskID); class {
+		case taskTerminal:
+			// codex review iter-2/3 [P2]: terminal task status only tells us
+			// the WORK is done — it says nothing about whether a replacement
+			// was already spawned for THIS queue file (e.g. a crash between
+			// spawnAgentFn succeeding and retireOldAgent completing), or
+			// whether a replacement SESSION exists with no record yet (the
+			// narrower crash window between tmux.Spawn and the record write —
+			// Resume's own step 2 treats a missing record + alive session as
+			// an "orphan successor" and explicitly REFUSES rather than
+			// spawning a duplicate). An unconditional drop here would delete
+			// the sole recovery journal before that reconciliation ever runs,
+			// leaving the old agent's record/session (or the orphan
+			// successor) behind with nothing left to clean it up. Only take
+			// the lock-free drop when NEITHER a replacement record NOR a
+			// replacement session exists — genuinely never spawned; anything
+			// else falls through to lock+Resume instead of guessing.
+			if replacementMayExist(req) {
+				break
+			}
+			// DROP a moot handoff. No LockAgent: the drop only removes a file
+			// and spawns nothing; a concurrent consumer that already deleted it
+			// hits queue.Delete's idempotent ENOENT->nil. No rename to
+			// `.cancelled` (nothing reaps it → a new leak).
+			if err := queue.Delete(path); err != nil {
+				return fmt.Errorf("drain: drop moot handoff %s: %w", req.OldAgentID, err)
+			}
+			emitDropDiagnostic(req, status, stdout)
+			return errDropped
+		case taskUnresolvable:
+			// HOLD: never drop an unresolved status (not proof of done).
+			// Preserve the queue file, report pending (not a failure).
+			return errHeldPending
+		}
+		// taskLive falls through to the lock+Resume tail below.
+	}
+
+	// Live worker OR coord (non-lease build): take the per-agent flock and run
+	// Resume under it — the serialization contract Resume requires.
 	release, err := state.LockAgent(req.OldAgentID)
 	if err != nil {
 		return fmt.Errorf("lock agent %s: %w", req.OldAgentID, err)
 	}
 	defer release()
 	return handoffop.Resume(req, path, graceMillis, stdout, stderr)
+}
+
+// drainTaskClass buckets a worker handoff by its RESOLVED backing-task status.
+type drainTaskClass int
+
+const (
+	taskLive         drainTaskClass = iota // non-terminal row (or no tracked row) → resume via the existing route
+	taskTerminal                           // done/abandoned → DROP the moot handoff
+	taskUnresolvable                       // tasks.md/archive genuinely UNREADABLE → HOLD pending (never drop)
+)
+
+// classifyBackingTask resolves taskID's status for project (tasks.md, then
+// tasks-archive.md) and buckets it. It reads the RESOLVED status — archive
+// PRESENCE alone never drops, since a task can be archived while still
+// in-progress.
+//
+// A READ ERROR (corrupt/unreadable tasks.md or tasks-archive.md) is SWALLOWED
+// → taskUnresolvable: returning it up to runDrain would count failed++ and
+// resurrect the exit-1 banner this feature removes. An unresolvable status is
+// HELD, never dropped — it is not proof of done.
+//
+// taskID simply ABSENT from both files is NOT unresolvable — it is taskLive
+// (codex/adversarial-review iter-1 [P1]). A task_id that was never registered
+// in tasks.md is the ORDINARY case for a raw/ad-hoc `fleet dispatch <id>` that
+// never touched the task-tracking system (internal/spawn/coord_config.go's own
+// "raw spawn" comment documents an empty TaskID as first-class), and this
+// codebase's own baseline drain tests confirm it: every pre-existing auto-
+// resume test had no tracked task at all. Treating "no row" the same as a
+// genuine read error would silently convert a previously-working auto-resume
+// into a handoff HELD pending forever with no forced failure to alert anyone —
+// exactly the kind of silent breakage this feature exists to remove. Falling
+// through to the existing live/opt-out route reproduces pre-drain-nonforcing
+// behavior exactly (auto-resume succeeds; an opted-out worker still refuses via
+// handoffop's ErrHeldOptOut, bucketed pending same as before). Only a genuine
+// I/O failure reading tasks.md/tasks-archive.md — a real signal something is
+// wrong with the project's state — holds pending pre-emptively.
+//
+// Uses readTasks/readArchiveTasks (resolved Task.Status), NOT internal/gc's
+// loadTaskStatusOnDisk, which coarsely maps any archived row to "done" and
+// would wrongly drop an archived-in-progress task.
+func classifyBackingTask(project, taskID string) (drainTaskClass, tasks.Status) {
+	if project == "" {
+		// A missing project is NOT the same as an untracked task_id: it
+		// means the queue file (or the record it was derived from) is
+		// malformed/legacy — state.ProjectDir("") silently resolves to an
+		// internal "_default" fallback directory, a DIFFERENT project than
+		// whatever the caller actually meant. Guessing here risks reading
+		// the wrong project's tasks.md. Hold pending rather than fall
+		// through (2nd-round adversarial review, low-likelihood but
+		// unbounded-blast-radius if it ever happens).
+		return taskUnresolvable, ""
+	}
+	if taskID == "" {
+		// Raw spawn (no task_id at all, project present) — never a signal
+		// to hold; fall through to the existing live/opt-out route
+		// unchanged.
+		return taskLive, ""
+	}
+	f, _, err := readTasks(project)
+	if err != nil {
+		return taskUnresolvable, "" // read error swallowed → hold, never fail
+	}
+	if t, gerr := f.Get(taskID); gerr == nil {
+		return classForStatus(t.Status), t.Status
+	}
+	arch, err := readArchiveTasks(project)
+	if err != nil {
+		return taskUnresolvable, ""
+	}
+	for _, t := range arch {
+		if t.Slug == taskID {
+			return classForStatus(t.Status), t.Status
+		}
+	}
+	// Not found in either file: the task was never tracked (ad hoc / pre-
+	// task-tracking dispatch) — not a signal to hold. Fall through to the
+	// existing live/opt-out route, same as taskID=="" above.
+	return taskLive, ""
+}
+
+func classForStatus(s tasks.Status) drainTaskClass {
+	if s == tasks.StatusDone || s == tasks.StatusAbandoned {
+		return taskTerminal
+	}
+	return taskLive
+}
+
+// replacementMayExist reports whether a replacement for req may already be
+// in flight — either an agent RECORD exists for req.NewAgentID, or a
+// SESSION exists at req.NewSession with no record yet (the narrower crash
+// window between tmux.Spawn and the record write; handoffop.Resume's own
+// step 2 treats exactly this shape as an "orphan successor" and refuses
+// rather than spawning a duplicate — codex review iter-2/3 [P2]). Only
+// "false" (neither record nor session) proves the replacement was never
+// spawned and is safe to lock-free-drop. Errors are NOT proof of absence:
+// an ambiguous agent.Load error or tmux probe failure returns true (fall
+// through to lock+Resume) rather than risk destroying an in-flight
+// recovery journal on a guess.
+func replacementMayExist(req queue.SpawnFresh) bool {
+	if _, nerr := agent.Load(req.NewAgentID); !errors.Is(nerr, state.ErrNotFound) {
+		return true // record exists, or the load itself errored ambiguously
+	}
+	if req.NewSession == "" {
+		return false
+	}
+	alive, perr := tmux.SessionAlive(req.NewSession)
+	return perr != nil || alive
+}
+
+// emitDropDiagnostic surfaces a dropped moot handoff to stdout + fleetlog
+// (feedback_surface_dont_silo). When the OLD session is DEFINITIVELY alive it
+// appends a manual-handoff hint for the rare done-but-still-active anomaly.
+// SessionAlive is tristate: a probe error OMITS the hint but never aborts the
+// drop. Uses tmux.SessionName (not a hand-written fleet-<id>) to avoid drift.
+func emitDropDiagnostic(req queue.SpawnFresh, status tasks.Status, stdout io.Writer) {
+	msg := fmt.Sprintf("fleet drain: %s dropped — backing task %s is %s",
+		req.OldAgentID, req.TaskID, status)
+	if alive, perr := tmux.SessionAlive(tmux.SessionName(req.OldAgentID)); perr == nil && alive {
+		msg += fmt.Sprintf(" — agent live; run 'fleet handoff %s' if it still needs a successor", req.OldAgentID)
+	}
+	_, _ = fmt.Fprintln(stdout, msg)
+	fleetlog.Log(fleetlog.CompCLI, "drain.dropped", "info", fleetlog.Fields{
+		Agent: req.OldAgentID,
+		Proj:  req.Project,
+		Slug:  req.TaskID,
+		Msg:   msg,
+	})
 }

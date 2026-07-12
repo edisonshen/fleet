@@ -39,6 +39,17 @@ import (
 // handoff path may override.
 const DefaultGraceMillis = 3000
 
+// ErrHeldOptOut is the typed signal Resume returns when it refuses an
+// auto-handoff because the agent opted out of auto-resume. It is NOT a
+// failure: a worker's replacement is never silently auto-continued, so the
+// handoff must WAIT for a manual `fleet handoff` (or a later drain). `fleet
+// drain` matches it with errors.Is and buckets the outcome as PENDING rather
+// than failed — the seam that stops the recurring "every pending handoff
+// failed" red banner (DESIGN-drain-nonforcing). The refusal's human message is
+// unchanged; this only makes the outcome classifiable without a fragile string
+// match.
+var ErrHeldOptOut = errors.New("handoff held: agent opted out of auto-resume")
+
 // sessionListProbe is the tmux-session enumerator the auto-drain path
 // uses for the FLEET_MAX_SESSIONS precheck. Indirected via a package-
 // level var so tests inject a fake without touching tmux.
@@ -511,6 +522,48 @@ func cleanUpStaleQueue(req queue.SpawnFresh, queuePath string,
 func spawnAndRetire(req queue.SpawnFresh, queuePath string,
 	oldRec *agent.Record, graceMillis int, stdout, stderr io.Writer) error {
 
+	// Opt-out gate FIRST (codex review iter-2 [P2], DESIGN-drain-nonforcing):
+	// an opted-out agent is NEVER going to get a fresh spawn on this path, so
+	// every check below (session cap, legacy-record cwd/command) is spawn-
+	// precondition checking that's entirely moot once we already know we're
+	// refusing. Checking it FIRST makes the refusal deterministic: before
+	// this reorder, a live worker that was BOTH opted out AND over
+	// FLEET_MAX_SESSIONS hit the cap refusal (an ordinary error) before ever
+	// reaching this branch, so `fleet drain` bucketed it `failed` instead of
+	// `pending` depending on incidental session-count state at the moment of
+	// the drain — exactly the false-alarm class this feature exists to
+	// remove, just gated behind a second precondition instead of eliminated.
+	//
+	// Resolve THIS handoff's auto-resume: queue's override (if set) wins,
+	// else inherit from oldRec (codex review iter-10/11/12 P2).
+	disableAutoResume := oldRec.DisableAutoResume
+	if req.DisableAutoResume != nil {
+		disableAutoResume = *req.DisableAutoResume
+	}
+
+	// Reject fresh-spawn auto-handoff for opt-out agents (codex
+	// review iter-9 P1, scoped to spawnAndRetire per iter-10 P2).
+	// We're about to bring up a NEW agent that won't get a resume
+	// prompt — and there's no operator on this drain path to type
+	// one manually. Spawning would leave the replacement idle
+	// forever. Surface a clear error pointing at `fleet handoff`,
+	// the interactive path. Queue file preserved for that retry.
+	//
+	// IMPORTANT: this reject is for EXPLICIT opt-out only (record
+	// baseline or queue override). v1 schema queues (codex iter-18
+	// P2) are NOT opt-outs — they just predate the auto-resume
+	// feature. v1 queues drain normally; the only difference is
+	// retireOldAgent skips the send for them.
+	if disableAutoResume {
+		// Wrap ErrHeldOptOut (%w) so `fleet drain` can bucket this as PENDING
+		// via errors.Is instead of a forced failure (DESIGN-drain-nonforcing).
+		// The human-facing guidance is unchanged — still points at `fleet
+		// handoff`; only the classifiable sentinel is appended.
+		return fmt.Errorf(
+			"resume: agent %s opted out of auto-resume; auto-handoff would leave the replacement idle. Trigger handoff manually with `fleet handoff %s` (queue file %s preserved): %w",
+			req.OldAgentID, req.OldAgentID, queuePath, ErrHeldOptOut)
+	}
+
 	// FLEET_MAX_SESSIONS backstop on the auto-drain path. The
 	// fleet-guard skill writes queue files on auto-handoff; this
 	// helper is the consumer. Without the cap here, a runaway
@@ -578,31 +631,6 @@ func spawnAndRetire(req queue.SpawnFresh, queuePath string,
 		return fmt.Errorf(
 			"resume: agent %s is a legacy record with no stored command; manual `fleet handoff --command` required",
 			oldRec.ID)
-	}
-	// Resolve THIS handoff's auto-resume: queue's override (if set)
-	// wins, else inherit from oldRec (codex review iter-10/11/12 P2).
-	disableAutoResume := oldRec.DisableAutoResume
-	if req.DisableAutoResume != nil {
-		disableAutoResume = *req.DisableAutoResume
-	}
-
-	// Reject fresh-spawn auto-handoff for opt-out agents (codex
-	// review iter-9 P1, scoped to spawnAndRetire per iter-10 P2).
-	// We're about to bring up a NEW agent that won't get a resume
-	// prompt — and there's no operator on this drain path to type
-	// one manually. Spawning would leave the replacement idle
-	// forever. Surface a clear error pointing at `fleet handoff`,
-	// the interactive path. Queue file preserved for that retry.
-	//
-	// IMPORTANT: this reject is for EXPLICIT opt-out only (record
-	// baseline or queue override). v1 schema queues (codex iter-18
-	// P2) are NOT opt-outs — they just predate the auto-resume
-	// feature. v1 queues drain normally; the only difference is
-	// retireOldAgent skips the send for them.
-	if disableAutoResume {
-		return fmt.Errorf(
-			"resume: agent %s opted out of auto-resume; auto-handoff would leave the replacement idle. Trigger handoff manually with `fleet handoff %s` (queue file %s preserved)",
-			req.OldAgentID, req.OldAgentID, queuePath)
 	}
 
 	// thisHandoffDisableAutoResume is what gets passed to retire's

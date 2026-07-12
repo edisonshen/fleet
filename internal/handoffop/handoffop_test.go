@@ -2178,3 +2178,48 @@ func TestDeliverResumePrompt_LeaseWrappedGraceful_NoOwner_NoFallback(t *testing.
 		t.Fatalf("delivered = %+v on the no-owner path, want nil", delivered)
 	}
 }
+
+// Row 5d (DESIGN-drain-nonforcing): the opt-out refusal in spawnAndRetire
+// wraps the exported ErrHeldOptOut sentinel with %w. This pins the production
+// wrap on the REAL Resume path (not a stubbed drainOneFn in cmd/fleet): a live
+// worker that opted out of auto-resume, with no replacement spawned yet, must
+// return an error satisfying errors.Is(err, ErrHeldOptOut) so `fleet drain`
+// can bucket it as PENDING instead of a forced failure. The human-facing
+// message is unchanged (still names `fleet handoff`).
+func TestResume_OptedOutReturnsHeldOptOutSentinel(t *testing.T) {
+	requireFakeTmux(t)
+	setupFleetHome(t)
+
+	// Seed an outgoing worker that opted out of auto-resume (baseline). The
+	// caps/cwd/command prechecks are all satisfied by spawnSeedAgent, so the
+	// only reason spawnAndRetire refuses is the opt-out — the branch under test.
+	oldRec := spawnSeedAgent(t)
+	oldRec.DisableAutoResume = true
+	if err := oldRec.Write(); err != nil {
+		t.Fatalf("rewrite old with DisableAutoResume=true: %v", err)
+	}
+	// No replacement pre-spawned → Resume takes the fresh-spawn path
+	// (spawnAndRetire), where the opt-out refusal fires before any spawn.
+	req, qp, _ := writeSkillQueue(t, oldRec)
+
+	out := &bytes.Buffer{}
+	err := Resume(req, qp, 1, out, out)
+	if err == nil {
+		t.Fatalf("opted-out Resume must refuse, got nil\n%s", out.String())
+	}
+	if !errors.Is(err, ErrHeldOptOut) {
+		t.Fatalf("opted-out refusal must wrap ErrHeldOptOut (drain buckets it pending); got %v", err)
+	}
+	// Message preserved (surface-don't-silo): still points at `fleet handoff`.
+	if !strings.Contains(err.Error(), "opted out of auto-resume") ||
+		!strings.Contains(err.Error(), "fleet handoff") {
+		t.Errorf("refusal message changed; got %v", err)
+	}
+	// Queue file preserved for the manual retry; old agent untouched.
+	if _, statErr := os.Stat(qp); statErr != nil {
+		t.Errorf("queue file must be preserved on opt-out refusal: %v", statErr)
+	}
+	if _, lerr := agent.Load(oldRec.ID); lerr != nil {
+		t.Errorf("old agent must be untouched on opt-out refusal: %v", lerr)
+	}
+}

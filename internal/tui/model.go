@@ -511,6 +511,18 @@ type queueEventMsg struct{}
 // TestDrain_BackgroundedResumeCountsBackgrounded.
 const drainBackgroundedMarker = "completing in the background"
 
+// drainPendingMarker is the substring `fleet drain` prints on its stdout when
+// it HOLDS a live handoff as PENDING — an opted-out worker or an unresolvable
+// backing task (the pending-diagnostic Fprintln in cmd/fleet/drain.go's
+// runDrain). The TUI matches it to flash the operator that a handoff is waiting
+// on a manual `fleet handoff`. Unlike drainBackgroundedMarker this is
+// INFORMATIONAL ONLY: a held handoff waits for operator action, so the TUI
+// schedules NO re-drain tea.Tick — re-arming a 30s re-drain of a held worker
+// would recreate the forever-retry churn drain-nonforcing removes
+// (DESIGN-drain-nonforcing §TUI). Producer side pinned by
+// TestDrain_* pending assertions in cmd/fleet.
+const drainPendingMarker = "pending — worker handoff"
+
 // redrainDelay is how long the TUI waits before re-running `fleet
 // drain` after a backgrounded resume. The kept queue file is UNCHANGED
 // on disk, so fsnotify will never re-fire for it — this scheduled
@@ -740,6 +752,21 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, tea.Batch(loadAgentsCmd(), tea.Tick(redrainDelay, func(time.Time) tea.Msg {
 				return queueEventMsg{}
 			}))
+		}
+		// Held handoff (DESIGN-drain-nonforcing): an opted-out worker or an
+		// unresolvable backing task was HELD as pending. Flash it so the
+		// operator sees a handoff is waiting — but schedule NO re-drain: the
+		// entry is preserved and waits for a manual `fleet handoff`, and
+		// re-arming a 30s re-drain would recreate the forever-retry churn this
+		// feature removes. Ordered AFTER the backgrounded branch so a run that
+		// emits both keeps the backgrounded re-drain precedence.
+		if strings.Contains(msg.out, drainPendingMarker) {
+			fl := flashMsg{
+				text:  "drain: worker handoff held pending — run 'fleet handoff <id>' to complete it",
+				isErr: false,
+			}
+			m.flash = &fl
+			return m, loadAgentsCmd()
 		}
 		return m, loadAgentsCmd()
 

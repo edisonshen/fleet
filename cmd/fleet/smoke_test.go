@@ -12,6 +12,7 @@ import (
 
 	"github.com/edisonshen/fleet/internal/agent"
 	"github.com/edisonshen/fleet/internal/state"
+	"github.com/edisonshen/fleet/internal/tasks"
 	"github.com/edisonshen/fleet/internal/tmux"
 )
 
@@ -145,6 +146,11 @@ func TestSmoke_AutoHandoffEndToEnd(t *testing.T) {
 	if !strings.Contains(string(doc), `agent_id: "`+old.ID+`"`) {
 		t.Errorf("doc missing agent_id:\n%s", string(doc))
 	}
+
+	// The drain-nonforcing classifier resolves the backing task before the
+	// resume: seed it live so this auto-handoff processes (an unresolvable
+	// task would be HELD pending, not forced).
+	seedDrainTask(t, old.Project, old.TaskID, tasks.StatusInProgress)
 
 	// Step 6: drain the queue.
 	var drainOut, drainErr bytes.Buffer
