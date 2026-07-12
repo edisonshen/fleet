@@ -1285,6 +1285,108 @@ func TestDashboardRows_CoordAttachedToProjectFiltersFromRight(t *testing.T) {
 	}
 }
 
+func TestAgentRowClassification(t *testing.T) {
+	withFleetHome(t)
+	(&stubSessionAlive{}).install(t)
+	(&stubProjectTreeExists{}).install(t)
+	(&stubCoordLeaseIdentity{markers: map[string]string{"demo": "c00bf001"}}).install(t)
+
+	now := time.Now()
+	record := func(id, taskID string) *agent.Record {
+		return &agent.Record{ID: id, Role: "executor", Project: "demo", TaskID: taskID, TmuxSession: "fleet-" + id, SpawnedAt: now}
+	}
+	classify := func(records []*agent.Record, workerSlugs, deadIDs []string, filter string) ([]string, int) {
+		dead := map[string]bool{}
+		for _, id := range deadIDs {
+			dead[id] = true
+		}
+		aliveByID := map[string]bool{}
+		for _, r := range records {
+			aliveByID[r.ID] = !dead[r.ID]
+		}
+		var workers []*WorkerRow
+		for _, slug := range workerSlugs {
+			workers = append(workers, &WorkerRow{Project: "demo", Slug: slug})
+		}
+
+		m := New("test")
+		m.dashboard = &Snapshot{
+			Projects: []*ProjectRow{{Name: "demo", RepoSlug: "demo"}},
+			Workers:  workers,
+			LoadedAt: now,
+		}
+		m.records = records
+		m.aliveByID = aliveByID
+		m.searchFilter = filter
+
+		var rowAgents []string
+		for _, row := range m.dashboardRows() {
+			if row.kind == rowAgent {
+				rowAgents = append(rowAgents, row.agent.ID)
+			}
+		}
+		heading := renderColumnHeadings(m, 60, 90)
+		an := 0
+		if idx := strings.Index(heading, "AGENTS "); idx >= 0 {
+			if _, err := fmt.Sscanf(heading[idx:], "AGENTS %d", &an); err != nil {
+				t.Fatalf("parse AGENTS count from %q: %v", heading, err)
+			}
+		}
+		return rowAgents, an
+	}
+
+	deadWorker := record("dead0001", "real-task")
+	representedWorker := record("live0001", "represented-task")
+	noWorkerDir := record("bbbb2222", "regular-task")
+	coordless := record("loose001", "")
+	coord := record("c00bf001", coordTaskID("demo"))
+	coord.IsCoord = true
+	legacyEmptyRole := record("legacy01", "legacy-task")
+	legacyEmptyRole.Role = ""
+	// crossProject pins the project half of workerSlugKey: its TaskID
+	// collides with a worker slug that lives under a DIFFERENT project,
+	// so it must NOT be deduped. Drops-the-project-from-the-key bug =
+	// this record wrongly vanishes.
+	crossProject := record("xproj001", "represented-task")
+	crossProject.Project = "other"
+
+	type testCase struct {
+		name    string
+		records []*agent.Record
+		workers []string
+		dead    []string
+		filter  string
+		wantIDs []string
+	}
+	tests := []testCase{
+		{"dead worker is skipped", []*agent.Record{deadWorker}, nil, []string{deadWorker.ID}, "", nil},
+		{"live worker with worker row is skipped", []*agent.Record{representedWorker}, []string{representedWorker.TaskID}, nil, representedWorker.ID, nil},
+		{"live worker without worker row remains visible", []*agent.Record{noWorkerDir}, nil, nil, "", []string{noWorkerDir.ID}},
+		{"coordless agent remains visible", []*agent.Record{coordless}, nil, nil, "", []string{coordless.ID}},
+		{"coord is claimed by the project row", []*agent.Record{coord}, nil, nil, "", nil},
+		{"legacy empty role task record remains visible", []*agent.Record{legacyEmptyRole}, nil, nil, "", []string{legacyEmptyRole.ID}},
+		{"cross-project taskID collision is not deduped", []*agent.Record{crossProject}, []string{crossProject.TaskID}, nil, "", []string{crossProject.ID}},
+		{
+			"mixed live records keep heading aligned with rendered agent rows",
+			[]*agent.Record{representedWorker, noWorkerDir, coordless, coord, legacyEmptyRole},
+			[]string{representedWorker.TaskID},
+			nil, "", []string{noWorkerDir.ID, coordless.ID, legacyEmptyRole.ID},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			rowAgents, an := classify(tt.records, tt.workers, tt.dead, tt.filter)
+			if got, want := strings.Join(rowAgents, ","), strings.Join(tt.wantIDs, ","); got != want {
+				t.Errorf("rowAgent IDs = [%s]; want [%s]", got, want)
+			}
+			if an != len(rowAgents) {
+				t.Errorf("AGENTS heading count = %d; rendered rowAgent count = %d", an, len(rowAgents))
+			}
+		})
+	}
+}
+
 // TestColumnHeading_AgentCountExcludesCoord pins the AGENTS sub-heading
 // counter: the coord doesn't count toward right-column "AGENTS N"
 // because it renders on the LEFT under its project (issue #55).

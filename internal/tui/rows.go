@@ -112,6 +112,46 @@ type taskRow struct {
 // navigable so j/k still walks the column predictably.
 const maxExpandedTasks = 10
 
+type workerSlugKey struct {
+	project string
+	slug    string
+}
+
+func workerSlugSetFromDashboard(snap *Snapshot) map[workerSlugKey]struct{} {
+	out := map[workerSlugKey]struct{}{}
+	if snap == nil {
+		return out
+	}
+	for _, w := range snap.Workers {
+		if w == nil {
+			continue
+		}
+		out[workerSlugKey{project: w.Project, slug: w.Slug}] = struct{}{}
+	}
+	return out
+}
+
+func agentRecordIsWorker(r *agent.Record) bool {
+	return r != nil && !r.IsCoord && r.TaskID != "" && r.TaskID != coordTaskID(r.Project)
+}
+
+func agentRecordHasWorkerRow(r *agent.Record, workerSlugs map[workerSlugKey]struct{}) bool {
+	if !agentRecordIsWorker(r) {
+		return false
+	}
+	_, ok := workerSlugs[workerSlugKey{project: r.Project, slug: r.TaskID}]
+	return ok
+}
+
+func shouldSkipWorkerAgentRecord(
+	r *agent.Record,
+	workerSlugs map[workerSlugKey]struct{},
+	aliveByID map[string]bool,
+) bool {
+	return agentRecordIsWorker(r) &&
+		(deriveStatus(r, aliveByID) == "dead" || agentRecordHasWorkerRow(r, workerSlugs))
+}
+
 // unifiedProjects returns the LEFT-column project list: the union of
 // v0.2-initialized project dirs (m.dashboard.Projects) plus synthetic
 // rows for any project tag carried by an agent record (m.records[*].
@@ -457,6 +497,7 @@ func (m Model) dashboardRows() []dashRow {
 	if m.dashboard != nil {
 		workers = m.dashboard.Workers
 	}
+	workerSlugs := workerSlugSetFromDashboard(m.dashboard)
 	window := m.activeWindow
 	if window <= 0 {
 		window = activeWindowDefault
@@ -570,6 +611,9 @@ func (m Model) dashboardRows() []dashRow {
 		if coordIDs[r.ID] {
 			// Coord renders on the LEFT under its project row; skip it
 			// here so the right-column doesn't double-count.
+			continue
+		}
+		if shouldSkipWorkerAgentRecord(r, workerSlugs, m.aliveByID) {
 			continue
 		}
 		if !m.matchesFilter(r.ID) && !m.matchesFilter(r.TaskID) && !m.matchesFilter(r.Project) {
