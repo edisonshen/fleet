@@ -332,14 +332,22 @@ func renderColumnHeadings(m Model, leftW, rightW int) string {
 			coordIDs[p.CoordID] = true
 		}
 	}
+	workerSlugs := workerSlugSetFromDashboard(m.dashboard)
 	an := 0
 	for _, r := range m.records {
-		if r != nil && coordIDs[r.ID] {
+		if r == nil {
 			continue
 		}
-		if deriveStatus(r, m.aliveByID) != "dead" {
-			an++
+		if coordIDs[r.ID] {
+			continue
 		}
+		if deriveStatus(r, m.aliveByID) == "dead" {
+			continue
+		}
+		if agentRecordHasWorkerRow(r, workerSlugs) {
+			continue
+		}
+		an++
 	}
 	leftLabel := columnHeadingStyle.Render(fmt.Sprintf("PROJECTS · %d ACTIVE", pn))
 	rightHeading := fmt.Sprintf("WORKERS · %d ACTIVE", wn)
