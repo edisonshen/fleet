@@ -753,6 +753,21 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return queueEventMsg{}
 			}))
 		}
+		// Held handoff (DESIGN-drain-nonforcing): an opted-out worker or an
+		// unresolvable backing task was HELD as pending. Flash it so the
+		// operator sees a handoff is waiting — but schedule NO re-drain: the
+		// entry is preserved and waits for a manual `fleet handoff`, and
+		// re-arming a 30s re-drain would recreate the forever-retry churn this
+		// feature removes. Ordered AFTER the backgrounded branch so a run that
+		// emits both keeps the backgrounded re-drain precedence.
+		if strings.Contains(msg.out, drainPendingMarker) {
+			fl := flashMsg{
+				text:  "drain: worker handoff held pending — run 'fleet handoff <id>' to complete it",
+				isErr: false,
+			}
+			m.flash = &fl
+			return m, loadAgentsCmd()
+		}
 		return m, loadAgentsCmd()
 
 	case handoffDoneMsg:

@@ -611,9 +611,13 @@ func spawnAndRetire(req queue.SpawnFresh, queuePath string,
 	// feature. v1 queues drain normally; the only difference is
 	// retireOldAgent skips the send for them.
 	if disableAutoResume {
+		// Wrap ErrHeldOptOut (%w) so `fleet drain` can bucket this as PENDING
+		// via errors.Is instead of a forced failure (DESIGN-drain-nonforcing).
+		// The human-facing guidance is unchanged — still points at `fleet
+		// handoff`; only the classifiable sentinel is appended.
 		return fmt.Errorf(
-			"resume: agent %s opted out of auto-resume; auto-handoff would leave the replacement idle. Trigger handoff manually with `fleet handoff %s` (queue file %s preserved)",
-			req.OldAgentID, req.OldAgentID, queuePath)
+			"resume: agent %s opted out of auto-resume; auto-handoff would leave the replacement idle. Trigger handoff manually with `fleet handoff %s` (queue file %s preserved): %w",
+			req.OldAgentID, req.OldAgentID, queuePath, ErrHeldOptOut)
 	}
 
 	// thisHandoffDisableAutoResume is what gets passed to retire's

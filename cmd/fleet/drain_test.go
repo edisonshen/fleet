@@ -534,10 +534,10 @@ func writeSkillQueueFileOptOut(t *testing.T, oldRec *agent.Record, disable *bool
 // live, so the drop rows also cover the "agent live" manual-handoff hint.
 func TestDrain_ClassifyOptedOutWorker(t *testing.T) {
 	cases := []struct {
-		name       string
-		status     tasks.Status // "" = don't seed (unresolvable / absent)
-		archive    bool         // seed in tasks-archive.md instead of tasks.md
-		wantDrop   bool         // true = dropped; false = held pending
+		name     string
+		status   tasks.Status // "" = don't seed (unresolvable / absent)
+		archive  bool         // seed in tasks-archive.md instead of tasks.md
+		wantDrop bool         // true = dropped; false = held pending
 	}{
 		{"row1 done drops", tasks.StatusDone, false, true},
 		{"row3 abandoned drops", tasks.StatusAbandoned, false, true},
