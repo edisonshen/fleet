@@ -45,8 +45,9 @@ func withInjectedSessionAliveProbe(t *testing.T, fn func(string) (bool, error)) 
 // pointing at the prune + rm escape valves.
 //
 // Builds the smallest record/queue state needed to drive spawnAndRetire
-// into the cap-check path BEFORE it tries to call spawn.Spawn. The
-// cap check runs first in spawnAndRetire, so we never need a real
+// into the cap-check path BEFORE it tries to call spawn.Spawn. oldRec is
+// NOT opted out here, so the (unconditionally-first) opt-out gate is a
+// no-op and the cap check is the next real gate — we never need a real
 // tmux/claude. Test FLEET_HOME is isolated via setupFleetHome.
 func TestSpawnAndRetire_SessionCapRefusal(t *testing.T) {
 	tmp := setupFleetHome(t)
@@ -268,6 +269,63 @@ func TestSpawnAndRetire_SessionCapProbeFailureProceeds(t *testing.T) {
 	}
 	if !strings.Contains(stderr.String(), "could not enumerate") {
 		t.Errorf("expected probe-fail warning, got %q", stderr.String())
+	}
+}
+
+// codex review iter-2 [P2] (DESIGN-drain-nonforcing): an opted-out worker
+// must return ErrHeldOptOut even when the host is simultaneously over
+// FLEET_MAX_SESSIONS. Before the opt-out gate was moved to run FIRST in
+// spawnAndRetire, the cap check fired first and returned an ordinary
+// "refusing to spawn" error — `fleet drain` would then bucket the handoff
+// `failed` instead of `pending`, depending on incidental session-count
+// state at the moment of the drain, even though an opted-out handoff was
+// NEVER going to spawn (so the cap was never actually relevant to it).
+// Same cap setup as TestSpawnAndRetire_SessionCapRefusal, but oldRec is
+// opted out — the outcome must be the opt-out sentinel, not the cap error.
+func TestSpawnAndRetire_OptedOutRefusesBeforeSessionCap(t *testing.T) {
+	tmp := setupFleetHome(t)
+	t.Setenv("FLEET_MAX_SESSIONS", "2")
+
+	withInjectedSessionListProbe(t, func() ([]string, error) {
+		return []string{"fleet-aaa", "fleet-bbb", "fleet-ccc"}, nil
+	})
+	withInjectedSessionAliveProbe(t, func(string) (bool, error) {
+		return true, nil
+	})
+	for _, id := range []string{"aaa", "bbb", "ccc"} {
+		seedAgentRecord(t, id)
+	}
+
+	oldID := "olda1234"
+	seedAgentRecord(t, oldID)
+	req := queue.SpawnFresh{
+		OldAgentID: oldID,
+		NewAgentID: "newb5678",
+		NewSession: "fleet-newb5678",
+		HandoffDoc: filepath.Join(tmp, "handoffs", "stub.md"),
+	}
+	queuePath, err := queue.WriteSpawnFresh(req)
+	if err != nil {
+		t.Fatalf("WriteSpawnFresh: %v", err)
+	}
+
+	oldRec := &agent.Record{
+		ID:                oldID,
+		Cwd:               tmp,
+		Command:           []string{"echo", "ok"},
+		DisableAutoResume: true, // the opt-out under test
+	}
+
+	var stdout, stderr bytes.Buffer
+	err = spawnAndRetire(req, queuePath, oldRec, 0, &stdout, &stderr)
+	if err == nil {
+		t.Fatalf("expected opt-out refusal, got nil")
+	}
+	if !errors.Is(err, ErrHeldOptOut) {
+		t.Fatalf("opted-out + over-cap must still return ErrHeldOptOut (drain buckets it pending), got: %v", err)
+	}
+	if strings.Contains(err.Error(), "refusing to spawn") || strings.Contains(err.Error(), "FLEET_MAX_SESSIONS") {
+		t.Errorf("cap refusal must NOT win over the opt-out gate: %v", err)
 	}
 }
 
