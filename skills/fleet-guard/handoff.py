@@ -703,6 +703,8 @@ def kick_drain_if_pending(agent_id: str) -> None:
         # intended once a launch succeeds.
         return
     try:
+        # Go consumers reap this sidecar in queue.Delete and fleet gc
+        # orphan-kicked; keep the <queue-file>.kicked suffix in sync.
         sentinel.touch()
     except OSError:
         # Best-effort: if we can't stamp the sentinel, the worst

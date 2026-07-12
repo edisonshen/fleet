@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"testing"
 	"time"
 )
@@ -146,25 +147,124 @@ func TestListPending_EmptyDir(t *testing.T) {
 	}
 }
 
-func TestDelete_RemovesFile(t *testing.T) {
-	setupFleetHome(t)
-	path, err := WriteSpawnFresh(SpawnFresh{OldAgentID: "a1", HandoffDoc: "/h.md"})
-	if err != nil {
-		t.Fatal(err)
+func TestDelete_ReapsSidecar(t *testing.T) {
+	cases := []struct {
+		name            string
+		setup           func(t *testing.T, path string)
+		wantErr         bool
+		wantJSONExists  bool
+		wantKickExists  bool
+		wantErrContains string
+	}{
+		{
+			name: "json-only removed",
+			setup: func(t *testing.T, path string) {
+				t.Helper()
+				if err := os.WriteFile(path, []byte("{}\n"), 0o644); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+		{
+			name: "missing path nil",
+		},
+		{
+			name: "both present both removed",
+			setup: func(t *testing.T, path string) {
+				t.Helper()
+				if err := os.WriteFile(path, []byte("{}\n"), 0o644); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(path+".kicked", nil, 0o644); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+		{
+			name: "json absent sidecar present removed",
+			setup: func(t *testing.T, path string) {
+				t.Helper()
+				if err := os.WriteFile(path+".kicked", nil, 0o644); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+		{
+			name: "sidecar error swallowed",
+			setup: func(t *testing.T, path string) {
+				t.Helper()
+				if err := os.WriteFile(path, []byte("{}\n"), 0o644); err != nil {
+					t.Fatal(err)
+				}
+				// A non-empty dir yields deterministic non-ENOENT from os.Remove; an empty dir would be removed.
+				if err := os.Mkdir(path+".kicked", 0o755); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(filepath.Join(path+".kicked", "keep"), []byte("x"), 0o644); err != nil {
+					t.Fatal(err)
+				}
+			},
+			wantKickExists: true,
+		},
+		{
+			// codex P2 regression: when the queue-file removal FAILS (file
+			// still present), the sidecar must SURVIVE — stripping it would
+			// let fleet-guard re-kick `fleet drain` on every hook and reopen
+			// the drain storm the sentinel suppresses.
+			name: "json error propagates and keeps sidecar",
+			setup: func(t *testing.T, path string) {
+				t.Helper()
+				// A non-empty dir yields deterministic non-ENOENT from os.Remove; an empty dir would be removed.
+				if err := os.Mkdir(path, 0o755); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(filepath.Join(path, "keep"), []byte("x"), 0o644); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(path+".kicked", nil, 0o644); err != nil {
+					t.Fatal(err)
+				}
+			},
+			wantErr:         true,
+			wantJSONExists:  true,
+			wantKickExists:  true,
+			wantErrContains: "delete queue file ",
+		},
 	}
-	if err := Delete(path); err != nil {
-		t.Fatalf("Delete: %v", err)
-	}
-	if _, err := os.Stat(path); !os.IsNotExist(err) {
-		t.Errorf("file should be gone, stat err=%v", err)
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			tmp := setupFleetHome(t)
+			slug := strings.NewReplacer(" ", "-", "+", "-", "/", "-").Replace(tc.name)
+			path := filepath.Join(tmp, "queue", slug+".json")
+			if tc.setup != nil {
+				tc.setup(t, path)
+			}
+
+			err := Delete(path)
+			if tc.wantErr {
+				if err == nil {
+					t.Fatal("Delete returned nil, want error")
+				}
+				if tc.wantErrContains != "" && !strings.Contains(err.Error(), tc.wantErrContains) {
+					t.Fatalf("Delete error=%q, want substring %q", err, tc.wantErrContains)
+				}
+			} else if err != nil {
+				t.Fatalf("Delete: %v", err)
+			}
+
+			if got := pathExists(path); got != tc.wantJSONExists {
+				t.Errorf("json exists=%t, want %t", got, tc.wantJSONExists)
+			}
+			if got := pathExists(path + ".kicked"); got != tc.wantKickExists {
+				t.Errorf("sidecar exists=%t, want %t", got, tc.wantKickExists)
+			}
+		})
 	}
 }
 
-func TestDelete_IdempotentOnMissing(t *testing.T) {
-	setupFleetHome(t)
-	if err := Delete("/nonexistent/path.json"); err != nil {
-		t.Errorf("Delete on missing file should be nil, got %v", err)
-	}
+func pathExists(path string) bool {
+	_, err := os.Stat(path)
+	return err == nil
 }
 
 func TestReadSpawnFresh_RejectsNewerSchema(t *testing.T) {

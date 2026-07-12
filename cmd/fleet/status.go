@@ -217,7 +217,7 @@ func emitOrphanReconcileSection(stdout, stderr io.Writer) {
 	opts := gc.Options{
 		Apply:  false,
 		MaxAge: statusReconcileMaxAge,
-		Kinds:  gc.AllKinds,
+		Kinds:  dropKind(gc.AllKinds, gc.KindOrphanKicked),
 	}
 	report, err := statusReconcileFn(opts)
 	if err != nil {
@@ -327,12 +327,13 @@ func orphanCleanupHint(a gc.Action, rec *agent.Record) string {
 			return fmt.Sprintf("fleet rm %s  (preserve for dead-coord recovery; do NOT run `fleet gc --apply --kinds=orphan-agents`)", a.Target)
 		}
 		return fmt.Sprintf("fleet rm %s  (per-record; verify FLEET_TMUX_SOCKET matches agent's spawn socket before running)", a.Target)
-	case gc.KindSockets, gc.KindWorktrees, gc.KindCoordLocks, gc.KindWorkerRecords, gc.KindInvalidProjects, gc.KindOrphanRCDaemons, gc.KindDrainProcs:
+	case gc.KindSockets, gc.KindWorktrees, gc.KindCoordLocks, gc.KindWorkerRecords, gc.KindInvalidProjects, gc.KindOrphanRCDaemons, gc.KindDrainProcs, gc.KindOrphanKicked:
 		// coord-locks + worker-records + invalid-projects + orphan-rc-daemons
-		// + drain-procs share the global-gc hint shape (sockets + worktrees):
+		// + drain-procs + orphan-kicked share the global-gc hint shape
+		// (sockets + worktrees). orphan-kicked is normally excluded from
+		// status reconciliation, but keep the renderer exhaustive:
 		// the action is reaped by `fleet gc --apply --kinds=<kind>` with no
-		// per-record FLEET_TMUX_SOCKET caveat (the remove is project-scoped to
-		// the parent project's tree). See cmd/fleet/gc.go's --kinds wiring
+		// per-record FLEET_TMUX_SOCKET caveat. See cmd/fleet/gc.go's --kinds wiring
 		// (fleet#172 coord-locks, fleet#177 worker-records,
 		// invalid-project-dir-guar-d636 invalid-projects, leak-rc-daemon-
 		// lifecycle PR-B orphan-rc-daemons, handoff-drain-storm-leak

@@ -74,6 +74,77 @@ func TestParseKindsCSV_AcceptsDrainProcs(t *testing.T) {
 	}
 }
 
+func TestGC_OrphanKickedCLI(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("FLEET_HOME", root)
+	t.Setenv("FLEET_TMUX_SOCKET", "")
+	if _, err := state.Bootstrap(); err != nil {
+		t.Fatalf("Bootstrap: %v", err)
+	}
+	queueDir, err := state.QueueDir()
+	if err != nil {
+		t.Fatalf("QueueDir: %v", err)
+	}
+	orphan := filepath.Join(queueDir, "spawn-fresh-cli-orphan.json.kicked")
+	matchedBase := filepath.Join(queueDir, "spawn-fresh-cli-live.json")
+	matched := matchedBase + ".kicked"
+	gcTestWriteFile(t, orphan)
+	gcTestWriteFile(t, matchedBase)
+	gcTestWriteFile(t, matched)
+
+	kinds, err := parseKindsCSV("orphan-kicked")
+	if err != nil {
+		t.Fatalf("parseKindsCSV: %v", err)
+	}
+	if len(kinds) != 1 || kinds[0] != gc.KindOrphanKicked {
+		t.Fatalf("got kinds=%v, want [orphan-kicked]", kinds)
+	}
+
+	var stdout, stderr bytes.Buffer
+	if err := runGC(&stdout, &stderr, &gcFlags{
+		maxAge:   gcDefaultMaxAge,
+		kindsCSV: "orphan-kicked",
+	}); err != nil {
+		t.Fatalf("runGC dry-run: %v\nstderr=%s", err, stderr.String())
+	}
+	out := stdout.String()
+	if !strings.Contains(out, "orphan-kicked  "+orphan+"  verb=would-remove") {
+		t.Fatalf("dry-run should report the orphan marker; got:\n%s", out)
+	}
+	if !strings.Contains(out, "1 kicked") {
+		t.Fatalf("summary should include kicked count; got:\n%s", out)
+	}
+	if !gcTestPathExists(orphan) {
+		t.Fatalf("dry-run removed orphan marker %s", orphan)
+	}
+	if !gcTestPathExists(matched) {
+		t.Fatalf("dry-run removed matched marker %s", matched)
+	}
+
+	stdout.Reset()
+	stderr.Reset()
+	if err := runGC(&stdout, &stderr, &gcFlags{
+		apply:    true,
+		maxAge:   gcDefaultMaxAge,
+		kindsCSV: "orphan-kicked",
+	}); err != nil {
+		t.Fatalf("runGC apply: %v\nstderr=%s", err, stderr.String())
+	}
+	out = stdout.String()
+	if !strings.Contains(out, "orphan-kicked  "+orphan+"  verb=removed") {
+		t.Fatalf("apply should remove the orphan marker; got:\n%s", out)
+	}
+	if !strings.Contains(out, "1 kicked") {
+		t.Fatalf("apply summary should include kicked count; got:\n%s", out)
+	}
+	if gcTestPathExists(orphan) {
+		t.Fatalf("--apply left orphan marker %s", orphan)
+	}
+	if !gcTestPathExists(matched) {
+		t.Fatalf("--apply removed matched marker %s", matched)
+	}
+}
+
 func TestParseKindsCSV_UnknownRejected(t *testing.T) {
 	if _, err := parseKindsCSV("sockets,foo"); err == nil {
 		t.Fatal("parseKindsCSV accepted unknown kind 'foo'")
@@ -317,6 +388,21 @@ func writeDrainRun(t *testing.T, root string, pid int, heartbeatAt time.Time) {
 	if err := os.WriteFile(filepath.Join(dir, "999999999.json"), data, 0o644); err != nil {
 		t.Fatalf("write run-record: %v", err)
 	}
+}
+
+func gcTestWriteFile(t *testing.T, path string) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func gcTestPathExists(path string) bool {
+	_, err := os.Stat(path)
+	return err == nil
 }
 
 // TestRunGC_DrainProcs_DryRun_StaleRecordDeadPid surfaces a stale

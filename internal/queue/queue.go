@@ -205,11 +205,18 @@ func ListPending() ([]string, error) {
 // queue file pointing at an old_agent_id that's already archived,
 // and skip it (the drainer checks agent existence before re-running).
 func Delete(path string) error {
-	if err := os.Remove(path); err != nil {
-		if os.IsNotExist(err) {
-			return nil
-		}
+	// Remove the queue file first. Its non-ENOENT error is the durability
+	// signal and propagates; ENOENT (already gone) is success.
+	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
 		return fmt.Errorf("delete queue file %s: %w", path, err)
 	}
+	// The queue file is now gone (we removed it, or it was already absent),
+	// so fleet-guard's <queue-file>.kicked throttle sentinel (stamped by
+	// handoff.py via sentinel.touch(); also swept by `fleet gc orphan-kicked`)
+	// is stale — best-effort unlink, discard all errors. Ordered AFTER the
+	// queue-file removal on purpose: if that removal FAILS (file still
+	// present), we must NOT strip the throttle, or fleet-guard would re-kick
+	// `fleet drain` on every Stop hook and reopen the drain storm.
+	_ = os.Remove(path + ".kicked")
 	return nil
 }

@@ -794,6 +794,10 @@ func TestDrain_UntrackedTaskOptedOutHoldsPending(t *testing.T) {
 		t.Fatalf("rewrite opt-out: %v", err)
 	}
 	qp, _ := writeSkillQueueFile(t, oldRec)
+	kicked := qp + ".kicked"
+	if err := os.WriteFile(kicked, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
 
 	out := &bytes.Buffer{}
 	if err := runDrain(out, out, 0, 0); err != nil {
@@ -805,6 +809,9 @@ func TestDrain_UntrackedTaskOptedOutHoldsPending(t *testing.T) {
 	}
 	if _, statErr := os.Stat(qp); statErr != nil {
 		t.Errorf("held handoff: queue file must be preserved: %v", statErr)
+	}
+	if _, statErr := os.Stat(kicked); statErr != nil {
+		t.Errorf("held handoff: kicked sentinel must be preserved: %v", statErr)
 	}
 }
 

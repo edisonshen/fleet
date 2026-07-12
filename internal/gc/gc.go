@@ -94,7 +94,7 @@ const (
 )
 
 // AllKinds is the default --kinds set when the flag is omitted.
-var AllKinds = []Kind{KindSockets, KindOrphanAgents, KindOrphanTmux, KindWorktrees, KindCoordLocks, KindWorkerRecords, KindInvalidProjects, KindOrphanRCDaemons, KindDrainProcs, KindStaleCoords}
+var AllKinds = []Kind{KindSockets, KindOrphanAgents, KindOrphanTmux, KindWorktrees, KindCoordLocks, KindWorkerRecords, KindInvalidProjects, KindOrphanRCDaemons, KindDrainProcs, KindStaleCoords, KindOrphanKicked}
 
 // Verb enumerates the operation attached to each report entry. Two
 // flavors per mutator (would-X vs X) so dry-run vs apply paths share
@@ -447,6 +447,17 @@ type Deps struct {
 	// is reloadDrainRunOnDisk.
 	ReloadDrainRun func(path string) (DrainRun, bool, error)
 
+	// Orphan-kicked (KindOrphanKicked).
+	// ListOrphanKickedMarkers enumerates ~/.fleet/queue/*.kicked. Each
+	// marker's exact sibling is strings.TrimSuffix(marker, ".kicked") —
+	// no .json* glob, so .json.cancelled decoys do not spare an orphan.
+	ListOrphanKickedMarkers func() ([]string, error)
+	// StatOrphanKickedQueueFile stats the exact sibling queue file. ENOENT
+	// is the target predicate; other stat errors fail closed.
+	StatOrphanKickedQueueFile func(path string) error
+	// RemoveOrphanKickedMarker unlinks the marker under --apply.
+	RemoveOrphanKickedMarker func(path string) error
+
 	// Stale-coords (KindStaleCoords, DESIGN-coord-no-auto-kill). These
 	// three platform seams depend on the lease + authenticated-kill
 	// primitives (linux||darwin only), so DefaultDeps leaves them nil and
@@ -639,6 +650,11 @@ func Reconcile(opts Options, deps Deps) (Report, error) {
 			recordErr(fmt.Errorf("stale-coords: %w", err))
 		}
 	}
+	if hasKind(opts.Kinds, KindOrphanKicked) {
+		if err := reconcileOrphanKicked(&r, opts, deps); err != nil {
+			recordErr(fmt.Errorf("orphan-kicked: %w", err))
+		}
+	}
 
 	// Stable order: Kind primary, Target secondary. Tests rely on
 	// findAction() (linear scan) so the order is for human-readable
@@ -674,6 +690,8 @@ func kindRank(k Kind) int {
 		return 8
 	case KindStaleCoords:
 		return 9
+	case KindOrphanKicked:
+		return 10
 	}
 	return 99
 }
@@ -1034,57 +1052,60 @@ func gcScanDir() string {
 // closure here (the load-bearing wiring).
 func defaultDepsScanning(scanDir string) Deps {
 	return Deps{
-		Now:                   time.Now,
-		ListSockets:           func() ([]SocketInfo, error) { return scanSocketsDir(scanDir) },
-		RemoveSocket:          removeSocketFile,
-		SocketLive:            socketLiveOnDisk,
-		ListAgents:            agent.List,
-		ListAgentsStrict:      agent.ListStrict,
-		ArchiveAgent:          func(r *agent.Record) error { return r.Archive() },
-		SessionAlive:          tmux.SessionAlive,
-		AgentDirSane:          agentDirSane,
-		ListSessions:          tmux.ListSessionsWithCreated,
-		KillSession:           tmux.Kill,
-		OrphanTmuxFreshness:   orphanTmuxFreshness,
-		ListProjects:          listProjectsOnDisk,
-		ListWorktrees:         listProjectWorktrees,
-		RemoveWorktree:        removeGitWorktree,
-		IsTaskTerminal:        isTaskTerminalOnDisk,
-		ListTaskCandidates:    listTaskCandidatesOnDisk,
-		WorktreeBranch:        worktreeBranchOnDisk,
-		WorktreeDirty:         worktreeDirtyOnDisk,
-		ProjectRepo:           projectRepoOnDisk,
-		WorktreeRegistered:    worktreeRegisteredOnDisk,
-		RemoveWorktreeNoForce: removeWorktreeNoForce,
-		ListCoordLocks:        listCoordLocksOnDisk,
-		LoadAgent:             agent.Load,
-		RemoveCoordLock:       removeCoordLockFile,
-		ListWorkerRecords:     listWorkerRecordsOnDisk,
-		LoadWorkerState:       loadWorkerStateOnDisk,
-		LoadTaskStatus:        loadTaskStatusOnDisk,
-		LoadTaskParked:        loadTaskParkedOnDisk,
-		PidAlive:              pidAliveOnDisk,
-		RemoveWorkerRecord:    removeWorkerRecordDir,
-		ListProjectDirs:       listProjectDirsRaw,
-		ValidProjectName:      func(name string) bool { return state.ValidateProjectName(name) == nil },
-		RemoveProjectDir:      removeProjectDirTree,
-		ProjectHasTasks:       projectHasTasksNow,
-		QuarantineProjectDir:  quarantineProjectDir,
-		RestoreProjectDir:     restoreProjectDir,
-		ListRCDaemons:         listRCDaemonsOnDisk,
-		ListRCStates:          listRCStatesOnDisk,
-		CurrentClaudeVersion:  currentClaudeVersionOnDisk,
-		KillRCDaemon:          killRCDaemonOnDisk,
-		CoordRecordExists:     coordRecordExistsOnDisk,
-		ListDrainRuns:         listDrainRunsOnDisk,
-		DrainProcLive:         drainProcLiveOnDisk,
-		KillDrain:             killDrainGuarded,
-		RemoveDrainRun:        removeDrainRunFile,
-		ListDrainProcs:        listDrainProcsOnDisk,
-		ReloadDrainRun:        reloadDrainRunOnDisk,
-		ListLiveTestSockets:   func() ([]LiveTestSocket, error) { return listLiveTestSocketsOnDisk(scanDir) },
-		KillTmuxServer:        killTmuxServerOnDisk,
-		KillTmuxProc:          killTmuxProcByPID,
+		Now:                       time.Now,
+		ListSockets:               func() ([]SocketInfo, error) { return scanSocketsDir(scanDir) },
+		RemoveSocket:              removeSocketFile,
+		SocketLive:                socketLiveOnDisk,
+		ListAgents:                agent.List,
+		ListAgentsStrict:          agent.ListStrict,
+		ArchiveAgent:              func(r *agent.Record) error { return r.Archive() },
+		SessionAlive:              tmux.SessionAlive,
+		AgentDirSane:              agentDirSane,
+		ListSessions:              tmux.ListSessionsWithCreated,
+		KillSession:               tmux.Kill,
+		OrphanTmuxFreshness:       orphanTmuxFreshness,
+		ListProjects:              listProjectsOnDisk,
+		ListWorktrees:             listProjectWorktrees,
+		RemoveWorktree:            removeGitWorktree,
+		IsTaskTerminal:            isTaskTerminalOnDisk,
+		ListTaskCandidates:        listTaskCandidatesOnDisk,
+		WorktreeBranch:            worktreeBranchOnDisk,
+		WorktreeDirty:             worktreeDirtyOnDisk,
+		ProjectRepo:               projectRepoOnDisk,
+		WorktreeRegistered:        worktreeRegisteredOnDisk,
+		RemoveWorktreeNoForce:     removeWorktreeNoForce,
+		ListCoordLocks:            listCoordLocksOnDisk,
+		LoadAgent:                 agent.Load,
+		RemoveCoordLock:           removeCoordLockFile,
+		ListWorkerRecords:         listWorkerRecordsOnDisk,
+		LoadWorkerState:           loadWorkerStateOnDisk,
+		LoadTaskStatus:            loadTaskStatusOnDisk,
+		LoadTaskParked:            loadTaskParkedOnDisk,
+		PidAlive:                  pidAliveOnDisk,
+		RemoveWorkerRecord:        removeWorkerRecordDir,
+		ListProjectDirs:           listProjectDirsRaw,
+		ValidProjectName:          func(name string) bool { return state.ValidateProjectName(name) == nil },
+		RemoveProjectDir:          removeProjectDirTree,
+		ProjectHasTasks:           projectHasTasksNow,
+		QuarantineProjectDir:      quarantineProjectDir,
+		RestoreProjectDir:         restoreProjectDir,
+		ListRCDaemons:             listRCDaemonsOnDisk,
+		ListRCStates:              listRCStatesOnDisk,
+		CurrentClaudeVersion:      currentClaudeVersionOnDisk,
+		KillRCDaemon:              killRCDaemonOnDisk,
+		CoordRecordExists:         coordRecordExistsOnDisk,
+		ListDrainRuns:             listDrainRunsOnDisk,
+		DrainProcLive:             drainProcLiveOnDisk,
+		KillDrain:                 killDrainGuarded,
+		RemoveDrainRun:            removeDrainRunFile,
+		ListDrainProcs:            listDrainProcsOnDisk,
+		ReloadDrainRun:            reloadDrainRunOnDisk,
+		ListOrphanKickedMarkers:   listOrphanKickedMarkersOnDisk,
+		StatOrphanKickedQueueFile: statOrphanKickedQueueFile,
+		RemoveOrphanKickedMarker:  removeOrphanKickedMarker,
+		ListLiveTestSockets:       func() ([]LiveTestSocket, error) { return listLiveTestSocketsOnDisk(scanDir) },
+		KillTmuxServer:            killTmuxServerOnDisk,
+		KillTmuxProc:              killTmuxProcByPID,
 	}
 }
 

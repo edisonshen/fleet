@@ -716,11 +716,10 @@ func TestStatus_HealthyState_NoOrphanSection(t *testing.T) {
 	}
 }
 
-// TestStatus_ReconcilePassesAllKinds pins the call shape: status
-// surfaces ALL six kinds (sockets, orphan-agents, orphan-tmux,
-// worktrees, coord-locks, worker-records), so the reconcile Options
-// must opt into all of them and run dry-run (Apply=false).
-func TestStatus_ReconcilePassesAllKinds(t *testing.T) {
+// TestStatus_ExcludesOrphanKicked pins the call shape: status surfaces
+// heavyweight operator-action orphans, but excludes orphan-kicked so
+// zero-byte throttle markers do not create status noise or scan cost.
+func TestStatus_ExcludesOrphanKicked(t *testing.T) {
 	stubEnsureFresh(t)
 	dir := t.TempDir()
 	t.Setenv("FLEET_HOME", dir)
@@ -733,24 +732,21 @@ func TestStatus_ReconcilePassesAllKinds(t *testing.T) {
 	if opts.Apply {
 		t.Errorf("status reconcile must be dry-run (Apply=false); got Apply=%t", opts.Apply)
 	}
-	// Must include all seven kinds so the operator sees a complete
-	// picture of orphan state (fleet#172 added KindCoordLocks;
-	// fleet#177 added KindWorkerRecords; invalid-project-dir-guar-d636
-	// added KindInvalidProjects).
-	wantKinds := map[gc.Kind]bool{
-		gc.KindSockets: true, gc.KindOrphanAgents: true,
-		gc.KindOrphanTmux: true, gc.KindWorktrees: true,
-		gc.KindCoordLocks: true, gc.KindWorkerRecords: true,
-		gc.KindInvalidProjects: true,
-	}
 	got := map[gc.Kind]bool{}
 	for _, k := range opts.Kinds {
 		got[k] = true
 	}
-	for k := range wantKinds {
+	if got[gc.KindOrphanKicked] {
+		t.Fatalf("status reconcile must exclude %q; opts.Kinds=%v", gc.KindOrphanKicked, opts.Kinds)
+	}
+	wantKinds := dropKind(gc.AllKinds, gc.KindOrphanKicked)
+	for _, k := range wantKinds {
 		if !got[k] {
 			t.Errorf("status reconcile missing kind %q; opts.Kinds=%v", k, opts.Kinds)
 		}
+	}
+	if len(opts.Kinds) != len(wantKinds) {
+		t.Errorf("status reconcile kinds=%v, want exactly %v", opts.Kinds, wantKinds)
 	}
 }
 
