@@ -155,6 +155,142 @@ func findAction(r Report, kind Kind, target string) (Action, bool) {
 	return Action{}, false
 }
 
+func TestReconcileOrphanKicked(t *testing.T) {
+	t.Run("predicate", func(t *testing.T) {
+		cases := []struct {
+			name       string
+			base       string
+			writeJSON  bool
+			writeDecoy bool
+			wantTarget bool
+		}{
+			{
+				name:      "matched marker skipped",
+				base:      "spawn-fresh-matched.json",
+				writeJSON: true,
+			},
+			{
+				name:       "orphan marker targeted",
+				base:       "spawn-fresh-orphan.json",
+				wantTarget: true,
+			},
+			{
+				name:       "orphan marker with json cancelled decoy targeted",
+				base:       "spawn-fresh-decoy.json",
+				writeDecoy: true,
+				wantTarget: true,
+			},
+		}
+		for _, tc := range cases {
+			t.Run(tc.name, func(t *testing.T) {
+				queueDir := isolatedQueueDir(t)
+				basePath := filepath.Join(queueDir, tc.base)
+				marker := basePath + ".kicked"
+				writeFile(t, marker)
+				if tc.writeJSON {
+					writeFile(t, basePath)
+				}
+				if tc.writeDecoy {
+					writeFile(t, basePath+".cancelled")
+				}
+
+				rep, err := Reconcile(Options{Kinds: []Kind{KindOrphanKicked}}, DefaultDeps())
+				if err != nil {
+					t.Fatalf("Reconcile: %v", err)
+				}
+				_, gotTarget := findAction(rep, KindOrphanKicked, marker)
+				if gotTarget != tc.wantTarget {
+					t.Fatalf("targeted=%t, want %t; actions=%+v", gotTarget, tc.wantTarget, rep.Actions)
+				}
+			})
+		}
+	})
+
+	t.Run("dry run then apply", func(t *testing.T) {
+		queueDir := isolatedQueueDir(t)
+		orphans := []string{
+			filepath.Join(queueDir, "spawn-fresh-orphan-a.json.kicked"),
+			filepath.Join(queueDir, "spawn-fresh-orphan-b.json.kicked"),
+			filepath.Join(queueDir, "spawn-fresh-orphan-c.json.kicked"),
+		}
+		for _, marker := range orphans {
+			writeFile(t, marker)
+		}
+		matchedBase := filepath.Join(queueDir, "spawn-fresh-live.json")
+		matchedMarker := matchedBase + ".kicked"
+		writeFile(t, matchedBase)
+		writeFile(t, matchedMarker)
+
+		dry, err := Reconcile(Options{Kinds: []Kind{KindOrphanKicked}}, DefaultDeps())
+		if err != nil {
+			t.Fatalf("Reconcile dry-run: %v", err)
+		}
+		for _, marker := range orphans {
+			a, ok := findAction(dry, KindOrphanKicked, marker)
+			if !ok {
+				t.Fatalf("dry-run missing orphan %s; actions=%+v", marker, dry.Actions)
+			}
+			if a.Verb != VerbWouldRemove {
+				t.Fatalf("dry-run action for %s verb=%q, want %q", marker, a.Verb, VerbWouldRemove)
+			}
+			if !pathExists(marker) {
+				t.Fatalf("dry-run removed %s", marker)
+			}
+		}
+		if _, ok := findAction(dry, KindOrphanKicked, matchedMarker); ok {
+			t.Fatalf("dry-run targeted matched marker %s; actions=%+v", matchedMarker, dry.Actions)
+		}
+
+		applied, err := Reconcile(Options{Apply: true, Kinds: []Kind{KindOrphanKicked}}, DefaultDeps())
+		if err != nil {
+			t.Fatalf("Reconcile apply: %v", err)
+		}
+		for _, marker := range orphans {
+			a, ok := findAction(applied, KindOrphanKicked, marker)
+			if !ok {
+				t.Fatalf("apply missing orphan %s; actions=%+v", marker, applied.Actions)
+			}
+			if a.Verb != VerbRemoved {
+				t.Fatalf("apply action for %s verb=%q, want %q", marker, a.Verb, VerbRemoved)
+			}
+			if pathExists(marker) {
+				t.Fatalf("apply left orphan marker %s", marker)
+			}
+		}
+		if !pathExists(matchedMarker) {
+			t.Fatalf("apply removed matched marker %s", matchedMarker)
+		}
+	})
+}
+
+func isolatedQueueDir(t *testing.T) string {
+	t.Helper()
+	t.Setenv("FLEET_HOME", t.TempDir())
+	if _, err := state.Bootstrap(); err != nil {
+		t.Fatalf("Bootstrap: %v", err)
+	}
+	dir, err := state.QueueDir()
+	if err != nil {
+		t.Fatalf("QueueDir: %v", err)
+	}
+	return dir
+}
+
+func writeFile(t *testing.T, path string) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func pathExists(path string) bool {
+	_, err := os.Stat(path)
+	return err == nil
+}
+
 func TestReconcile_OldSocketRemoved(t *testing.T) {
 	now := time.Date(2026, 5, 21, 12, 0, 0, 0, time.UTC)
 	old := now.Add(-25 * time.Hour) // older than 24h max-age

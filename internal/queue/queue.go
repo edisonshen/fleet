@@ -205,6 +205,9 @@ func ListPending() ([]string, error) {
 // queue file pointing at an old_agent_id that's already archived,
 // and skip it (the drainer checks agent existence before re-running).
 func Delete(path string) error {
+	// fleet-guard's handoff.py stamps <queue-file>.kicked via sentinel.touch().
+	_ = os.Remove(path + ".kicked")
+
 	if err := os.Remove(path); err != nil {
 		if os.IsNotExist(err) {
 			return nil
