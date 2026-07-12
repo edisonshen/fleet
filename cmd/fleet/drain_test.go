@@ -943,6 +943,45 @@ func TestDrain_TerminalWithReplacementAlreadySpawnedFallsThroughToResume(t *test
 	}
 }
 
+// codex review iter-3 [P2]: a NARROWER crash window than the one above —
+// the replacement's tmux SESSION was spawned but the crash landed before
+// the agent RECORD was ever written (tmux.Spawn happens before the record
+// write in the spawn sequence). agent.Load(NewAgentID) alone would see
+// ErrNotFound and (pre-fix) conclude "never spawned, safe to drop" — but
+// handoffop.Resume's own step 2 treats exactly this shape ("record missing,
+// session alive") as an ORPHAN SUCCESSOR and explicitly refuses rather than
+// spawning a duplicate. The classifier must fall through to that logic
+// instead of lock-free-deleting the queue file out from under it.
+func TestDrain_TerminalWithOrphanSuccessorSessionFallsThroughToResume(t *testing.T) {
+	requireFakeTmux(t)
+	setupFleetHome(t)
+	oldRec := seedAgentForDrain(t)
+	qp, req := writeSkillQueueFile(t, oldRec)
+
+	// Spawn ONLY the session at the journaled NewSession — no agent record.
+	if err := tmux.Spawn(req.NewSession, oldRec.Cwd, oldRec.Command,
+		[]string{"FLEET_AGENT_ID=" + req.NewAgentID}); err != nil {
+		t.Fatalf("spawn orphan successor session: %v", err)
+	}
+	t.Cleanup(func() { _ = tmux.Kill(req.NewSession) })
+
+	seedDrainTask(t, oldRec.Project, oldRec.TaskID, tasks.StatusDone)
+
+	out := &bytes.Buffer{}
+	stderr := &bytes.Buffer{}
+	_ = runDrain(out, stderr, 0, 0) // Resume's orphan-successor refusal is a genuine failure; only assert not-dropped
+	combined := out.String() + stderr.String()
+	if strings.Contains(combined, "dropped — backing task") {
+		t.Errorf("orphan-successor entry must NOT take the lock-free drop path:\n%s", combined)
+	}
+	if _, statErr := os.Stat(qp); statErr != nil {
+		t.Errorf("queue file (the recovery journal) must be preserved, not deleted: %v", statErr)
+	}
+	if !tmux.HasSession(req.NewSession) {
+		t.Error("orphan successor session was killed — Resume's refusal must not touch it")
+	}
+}
+
 // Row 8b (REQUIRED): a coord queue entry called through drainOneLegacy DIRECTLY
 // must hit the IsCoordSpawn skip and NEVER be status-classified/dropped — even
 // with a terminal backing task. On CI leaseDrainEnabled() is always true, so

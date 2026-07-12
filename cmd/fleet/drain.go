@@ -356,21 +356,22 @@ func drainOneLegacy(req queue.SpawnFresh, path string, graceMillis int,
 	if !spawn.IsCoordSpawn(req.TaskID, req.Project) {
 		switch class, status := classifyBackingTask(req.Project, req.TaskID); class {
 		case taskTerminal:
-			// codex review iter-2 [P2]: terminal task status only tells us
+			// codex review iter-2/3 [P2]: terminal task status only tells us
 			// the WORK is done — it says nothing about whether a replacement
 			// was already spawned for THIS queue file (e.g. a crash between
-			// spawnAgentFn succeeding and retireOldAgent completing). Resume's
-			// own state machine (handoffop.go Resume step 2) already detects
-			// that case ("replacement record exists") and reconciles it —
-			// retires the old agent or recovers a dead-on-arrival spawn. An
-			// unconditional drop here would delete the sole recovery journal
-			// before that reconciliation ever runs, leaving the old agent's
-			// record/session behind with nothing left to clean it up. Only
-			// take the lock-free drop when the replacement was NEVER spawned
-			// (agent.Load(NewAgentID) is unambiguously ErrNotFound); anything
-			// else (record exists, or the load itself errors) falls through
-			// to lock+Resume instead of guessing.
-			if _, nerr := agent.Load(req.NewAgentID); !errors.Is(nerr, state.ErrNotFound) {
+			// spawnAgentFn succeeding and retireOldAgent completing), or
+			// whether a replacement SESSION exists with no record yet (the
+			// narrower crash window between tmux.Spawn and the record write —
+			// Resume's own step 2 treats a missing record + alive session as
+			// an "orphan successor" and explicitly REFUSES rather than
+			// spawning a duplicate). An unconditional drop here would delete
+			// the sole recovery journal before that reconciliation ever runs,
+			// leaving the old agent's record/session (or the orphan
+			// successor) behind with nothing left to clean it up. Only take
+			// the lock-free drop when NEITHER a replacement record NOR a
+			// replacement session exists — genuinely never spawned; anything
+			// else falls through to lock+Resume instead of guessing.
+			if replacementMayExist(req) {
 				break
 			}
 			// DROP a moot handoff. No LockAgent: the drop only removes a file
@@ -483,6 +484,28 @@ func classForStatus(s tasks.Status) drainTaskClass {
 		return taskTerminal
 	}
 	return taskLive
+}
+
+// replacementMayExist reports whether a replacement for req may already be
+// in flight — either an agent RECORD exists for req.NewAgentID, or a
+// SESSION exists at req.NewSession with no record yet (the narrower crash
+// window between tmux.Spawn and the record write; handoffop.Resume's own
+// step 2 treats exactly this shape as an "orphan successor" and refuses
+// rather than spawning a duplicate — codex review iter-2/3 [P2]). Only
+// "false" (neither record nor session) proves the replacement was never
+// spawned and is safe to lock-free-drop. Errors are NOT proof of absence:
+// an ambiguous agent.Load error or tmux probe failure returns true (fall
+// through to lock+Resume) rather than risk destroying an in-flight
+// recovery journal on a guess.
+func replacementMayExist(req queue.SpawnFresh) bool {
+	if _, nerr := agent.Load(req.NewAgentID); !errors.Is(nerr, state.ErrNotFound) {
+		return true // record exists, or the load itself errored ambiguously
+	}
+	if req.NewSession == "" {
+		return false
+	}
+	alive, perr := tmux.SessionAlive(req.NewSession)
+	return perr != nil || alive
 }
 
 // emitDropDiagnostic surfaces a dropped moot handoff to stdout + fleetlog
