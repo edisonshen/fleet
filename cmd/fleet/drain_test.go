@@ -880,6 +880,69 @@ func TestDrain_CorruptArchiveFileHoldsPending(t *testing.T) {
 	}
 }
 
+// codex review iter-2 [P2]: a terminal task status does NOT mean this queue
+// file is a fresh, never-spawned request. Simulate "a previous Resume
+// crashed AFTER spawning the replacement but BEFORE retiring the old
+// agent" — exactly TestResume_AlreadySpawnedSkipsSpawnRunsTail's shape
+// (internal/handoffop) — then mark the backing task done. The classifier
+// must NOT lock-free-delete the queue file out from under that in-flight
+// reconciliation: it must fall through to lock+Resume, which detects the
+// existing (alive) replacement and retires the old agent, exactly as it
+// would have before this feature existed. A naive unconditional drop would
+// leave the old agent's record un-retired with nothing left to clean it up.
+func TestDrain_TerminalWithReplacementAlreadySpawnedFallsThroughToResume(t *testing.T) {
+	requireFakeTmux(t)
+	setupFleetHome(t)
+	oldRec := seedAgentForDrain(t)
+	qp, req := writeSkillQueueFile(t, oldRec)
+
+	// Simulate the crash window: replacement already spawned + alive,
+	// queue/doc/old record still intact (mirrors
+	// TestResume_AlreadySpawnedSkipsSpawnRunsTail in internal/handoffop).
+	newRec := agent.New(req.NewAgentID)
+	newRec.TaskID = oldRec.TaskID
+	newRec.Project = oldRec.Project
+	newRec.Cwd = oldRec.Cwd
+	newRec.Command = oldRec.Command
+	newRec.TmuxSession = req.NewSession
+	if err := tmux.Spawn(newRec.TmuxSession, newRec.Cwd, newRec.Command,
+		[]string{"FLEET_AGENT_ID=" + newRec.ID}); err != nil {
+		t.Fatalf("pre-spawn replacement: %v", err)
+	}
+	if err := newRec.Write(); err != nil {
+		_ = tmux.Kill(newRec.TmuxSession)
+		t.Fatalf("write replacement record: %v", err)
+	}
+	t.Cleanup(func() { _ = tmux.Kill(newRec.TmuxSession) })
+
+	// NOW the backing task goes terminal — the classifier would otherwise
+	// see this as a moot, droppable request.
+	seedDrainTask(t, oldRec.Project, oldRec.TaskID, tasks.StatusDone)
+
+	out := &bytes.Buffer{}
+	if err := runDrain(out, out, 0, 0); err != nil {
+		t.Fatalf("must exit 0, got %v\n%s", err, out.String())
+	}
+	s := out.String()
+	if strings.Contains(s, "dropped") || strings.Contains(s, ", 1 dropped") {
+		t.Errorf("terminal-but-already-spawned entry must NOT take the lock-free drop path:\n%s", s)
+	}
+	if !strings.Contains(s, "1 processed") {
+		t.Errorf("expected the existing crash-recovery reconciliation to run (processed), got:\n%s", s)
+	}
+	if _, statErr := os.Stat(qp); !os.IsNotExist(statErr) {
+		t.Errorf("queue file should be cleared by Resume's own retire step: %v", statErr)
+	}
+	// The old agent must actually be retired (archived), not left behind —
+	// the whole point of falling through instead of dropping.
+	if _, err := agent.Load(oldRec.ID); err == nil {
+		t.Error("old agent record must be retired/archived, not left live")
+	}
+	if !tmux.HasSession(newRec.TmuxSession) {
+		t.Error("replacement session was killed — should have been left alone")
+	}
+}
+
 // Row 8b (REQUIRED): a coord queue entry called through drainOneLegacy DIRECTLY
 // must hit the IsCoordSpawn skip and NEVER be status-classified/dropped — even
 // with a terminal backing task. On CI leaseDrainEnabled() is always true, so

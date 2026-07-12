@@ -7,6 +7,7 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"github.com/edisonshen/fleet/internal/agent"
 	"github.com/edisonshen/fleet/internal/fleetlog"
 	"github.com/edisonshen/fleet/internal/handoffop"
 	"github.com/edisonshen/fleet/internal/queue"
@@ -330,7 +331,10 @@ func drainOne(req queue.SpawnFresh, path string, graceMillis, resumeTimeoutMilli
 //	       IsCoordSpawn? ────┤ yes → lock+Resume (coord recovery, UNCHANGED)
 //	                         │ no
 //	classifyBackingTask(project, taskID)
-//	     ├─ terminal (done/abandoned)          → queue.Delete + errDropped [LOCK-FREE]
+//	     ├─ terminal (done/abandoned)
+//	     │     ├─ replacement NEVER spawned → queue.Delete + errDropped [LOCK-FREE]
+//	     │     └─ replacement already exists → falls through to lock+Resume
+//	     │           (crash-recovery reconciliation, NOT a fresh drop)
 //	     ├─ unresolvable (tasks.md READ ERROR)  → errHeldPending            [no Resume]
 //	     └─ live (incl. no tracked row at all)  → lock+Resume ──► handoffop opt-out → ErrHeldOptOut  [pending]
 //
@@ -352,6 +356,23 @@ func drainOneLegacy(req queue.SpawnFresh, path string, graceMillis int,
 	if !spawn.IsCoordSpawn(req.TaskID, req.Project) {
 		switch class, status := classifyBackingTask(req.Project, req.TaskID); class {
 		case taskTerminal:
+			// codex review iter-2 [P2]: terminal task status only tells us
+			// the WORK is done — it says nothing about whether a replacement
+			// was already spawned for THIS queue file (e.g. a crash between
+			// spawnAgentFn succeeding and retireOldAgent completing). Resume's
+			// own state machine (handoffop.go Resume step 2) already detects
+			// that case ("replacement record exists") and reconciles it —
+			// retires the old agent or recovers a dead-on-arrival spawn. An
+			// unconditional drop here would delete the sole recovery journal
+			// before that reconciliation ever runs, leaving the old agent's
+			// record/session behind with nothing left to clean it up. Only
+			// take the lock-free drop when the replacement was NEVER spawned
+			// (agent.Load(NewAgentID) is unambiguously ErrNotFound); anything
+			// else (record exists, or the load itself errors) falls through
+			// to lock+Resume instead of guessing.
+			if _, nerr := agent.Load(req.NewAgentID); !errors.Is(nerr, state.ErrNotFound) {
+				break
+			}
 			// DROP a moot handoff. No LockAgent: the drop only removes a file
 			// and spawns nothing; a concurrent consumer that already deleted it
 			// hits queue.Delete's idempotent ENOENT->nil. No rename to
