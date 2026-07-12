@@ -1211,6 +1211,11 @@ func projectFooterLines(p *ProjectRow, w int, prefix string, ctx coordSpawnCtx) 
 	// the dashboard for `fleet attach`.
 	if p.CoordID != "" {
 		coordLabel := dimStyle.Render("coord ") + workerIDStyle.Render(p.CoordID)
+		if rec := findRecordByID(ctx.records, p.CoordID); rec != nil {
+			if bar := renderContextBar(rec.ContextPct); bar != "" {
+				coordLabel += " " + bar
+			}
+		}
 		coordLine := prefix + coordLabel
 		return []string{countsLine, coordLine, ""}
 	}

@@ -1431,12 +1431,21 @@ func TestView_CoordRendersOnLeftUnderProject(t *testing.T) {
 		},
 		LoadedAt: time.Now(),
 	}
+	// Pin the real m.records → spawnCtx (dashboard_view.go:706) →
+	// projectFooterLines wiring the pure formatter test bypasses: a coord
+	// record carrying ContextPct must surface its context chip on the left
+	// coord line. This is the seam a refactor dropping `records: m.records`
+	// would silently break.
+	m.records = []*agent.Record{{ID: "abcd1234", ContextPct: floatPtr(49.0)}}
 	out := m.View()
 	if !strings.Contains(out, "coord ") {
 		t.Errorf("coord label missing from project block, got:\n%s", out)
 	}
 	if !strings.Contains(out, "abcd1234") {
 		t.Errorf("coord ID missing from project block, got:\n%s", out)
+	}
+	if !strings.Contains(out, "49%") {
+		t.Errorf("coord context chip 49%% missing from project block, got:\n%s", out)
 	}
 }
 
