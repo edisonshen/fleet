@@ -602,6 +602,44 @@ func TestDrain_ClassifyOptedOutWorker(t *testing.T) {
 	}
 }
 
+// Testing-specialist gap: every drop test above uses a session that's
+// genuinely alive (seedAgentForDrain spawns a real fake-tmux session), so the
+// "agent live" hint always fires — the alive=false / SessionAlive-error
+// branches of emitDropDiagnostic's tristate (feedback: a probe error OMITS
+// the hint but never aborts the drop) were never exercised. Kill the old
+// session BEFORE draining to pin the omission.
+func TestDrain_DropDiagnosticOmitsHintWhenSessionDead(t *testing.T) {
+	requireFakeTmux(t)
+	setupFleetHome(t)
+	oldRec := seedAgentForDrain(t)
+	oldRec.DisableAutoResume = true // opted-out worker (the wedged shape)
+	if err := oldRec.Write(); err != nil {
+		t.Fatalf("rewrite opt-out: %v", err)
+	}
+	seedDrainTask(t, oldRec.Project, oldRec.TaskID, tasks.StatusDone) // terminal → drop
+	qp, _ := writeSkillQueueFile(t, oldRec)
+
+	// Session dies before drain runs — no in-flight handoff to warn about.
+	if err := tmux.Kill(oldRec.TmuxSession); err != nil {
+		t.Fatalf("kill old session: %v", err)
+	}
+
+	out := &bytes.Buffer{}
+	if err := runDrain(out, out, 0, 0); err != nil {
+		t.Fatalf("drop must exit 0, got %v\n%s", err, out.String())
+	}
+	s := out.String()
+	if _, statErr := os.Stat(qp); !os.IsNotExist(statErr) {
+		t.Errorf("terminal task: queue file not dropped: %v\n%s", statErr, s)
+	}
+	if !strings.Contains(s, "dropped — backing task") {
+		t.Errorf("missing drop diagnostic:\n%s", s)
+	}
+	if strings.Contains(s, "agent live; run 'fleet handoff") {
+		t.Errorf("dead session must NOT get the live/manual-handoff hint:\n%s", s)
+	}
+}
+
 // Rows 5a/5b/5c: per-handoff opt-out precedence. The queue override wins over
 // the record baseline; either "true" pathway HOLDS the live handoff as pending
 // (never a failure), while an override of "false" lets it PROCESS (we don't

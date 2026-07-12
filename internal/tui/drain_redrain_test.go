@@ -144,3 +144,44 @@ func TestUpdate_DrainPending_FlashesNoRedrain(t *testing.T) {
 		}
 	}
 }
+
+// Testing-specialist gap: a single `fleet drain` run can emit BOTH a
+// backgrounded marker (one queue file, still completing) and a pending
+// marker (a different queue file, held) in the same stdout capture. The
+// drainDoneMsg handler's backgrounded check runs first and returns early, so
+// the pending branch is unreachable in that combined run — model.go's own
+// comment claims this ordering keeps "the backgrounded re-drain precedence."
+// No prior test constructed a combined `out` to pin that claim; this one
+// does: the backgrounded flash/re-drain must win, and the flash text must
+// NOT be the pending-only wording.
+func TestUpdate_DrainBackgroundedAndPending_BackgroundedWins(t *testing.T) {
+	t.Setenv("FLEET_HOME", t.TempDir())
+	shrinkRedrainDelay(t)
+	m := New("test")
+
+	out := "fleet drain: slowcord resume still running; handoff completing in the background (queue file kept; a later drain verifies or retries)\n" +
+		"fleet drain: 3f2a pending — worker handoff, run 'fleet handoff 3f2a'\n" +
+		"fleet drain: 0 processed, 1 backgrounded (still completing; a later drain retries), 0 failed, 1 pending\n"
+	next, cmd := m.Update(drainDoneMsg{out: out})
+	nm := next.(Model)
+
+	if nm.flash == nil {
+		t.Fatal("combined backgrounded+pending drain must surface a flash")
+	}
+	if !strings.Contains(nm.flash.text, "re-draining") {
+		t.Errorf("backgrounded branch must win the flash text, got: %s", nm.flash.text)
+	}
+	if strings.Contains(nm.flash.text, "held pending") {
+		t.Errorf("pending-only flash text must not win when backgrounded is also present: %s", nm.flash.text)
+	}
+
+	redrained := false
+	for _, msg := range collectMsgs(t, cmd) {
+		if _, ok := msg.(queueEventMsg); ok {
+			redrained = true
+		}
+	}
+	if !redrained {
+		t.Error("backgrounded branch must still schedule its re-drain even when a pending marker is also present")
+	}
+}
