@@ -349,8 +349,11 @@ func TestProjectFooterLines_CoordContext(t *testing.T) {
 				rec("zzzz9999", floatPtr(8.0)),  // decoy first
 				rec("abcd1234", floatPtr(49.0)), // the coord
 			},
-			wantSub: "49%",
-			wantNot: "8%",
+			// Exact match (not just contains 49% / not-8%) so a regression
+			// that rendered both records or trailing garbage still fails.
+			wantLine: "coord abcd1234 49%",
+			wantSub:  "49%",
+			wantNot:  "8%",
 		},
 		{
 			name:     "nil context renders bare coord line",
