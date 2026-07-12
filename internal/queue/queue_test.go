@@ -207,7 +207,11 @@ func TestDelete_ReapsSidecar(t *testing.T) {
 			wantKickExists: true,
 		},
 		{
-			name: "json error propagates",
+			// codex P2 regression: when the queue-file removal FAILS (file
+			// still present), the sidecar must SURVIVE — stripping it would
+			// let fleet-guard re-kick `fleet drain` on every hook and reopen
+			// the drain storm the sentinel suppresses.
+			name: "json error propagates and keeps sidecar",
 			setup: func(t *testing.T, path string) {
 				t.Helper()
 				// A non-empty dir yields deterministic non-ENOENT from os.Remove; an empty dir would be removed.
@@ -223,6 +227,7 @@ func TestDelete_ReapsSidecar(t *testing.T) {
 			},
 			wantErr:         true,
 			wantJSONExists:  true,
+			wantKickExists:  true,
 			wantErrContains: "delete queue file ",
 		},
 	}
