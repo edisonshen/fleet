@@ -1343,6 +1343,12 @@ func TestAgentRowClassification(t *testing.T) {
 	coord.IsCoord = true
 	legacyEmptyRole := record("legacy01", "legacy-task")
 	legacyEmptyRole.Role = ""
+	// crossProject pins the project half of workerSlugKey: its TaskID
+	// collides with a worker slug that lives under a DIFFERENT project,
+	// so it must NOT be deduped. Drops-the-project-from-the-key bug =
+	// this record wrongly vanishes.
+	crossProject := record("xproj001", "represented-task")
+	crossProject.Project = "other"
 
 	type testCase struct {
 		name    string
@@ -1359,6 +1365,7 @@ func TestAgentRowClassification(t *testing.T) {
 		{"coordless agent remains visible", []*agent.Record{coordless}, nil, nil, "", []string{coordless.ID}},
 		{"coord is claimed by the project row", []*agent.Record{coord}, nil, nil, "", nil},
 		{"legacy empty role task record remains visible", []*agent.Record{legacyEmptyRole}, nil, nil, "", []string{legacyEmptyRole.ID}},
+		{"cross-project taskID collision is not deduped", []*agent.Record{crossProject}, []string{crossProject.TaskID}, nil, "", []string{crossProject.ID}},
 		{
 			"mixed live records keep heading aligned with rendered agent rows",
 			[]*agent.Record{representedWorker, noWorkerDir, coordless, coord, legacyEmptyRole},
