@@ -299,3 +299,106 @@ func TestRenderTwoColumnBody_ScrollHintHarmonized(t *testing.T) {
 		t.Errorf("scroll-hint footer not harmonized with existing 'K hidden — <action>' shape; got:\n%s", body)
 	}
 }
+
+// coordFooterLine returns the "coord <id>…" line from a projectFooterLines
+// result (or "" when none). The coord-id line is the only one carrying the
+// "coord " label; the counts/status line never does, and the spawn-fallback
+// text reads "spawning coord..." (no trailing space), so a "coord " match is
+// unambiguous. lipgloss renders plain in a non-TTY `go test`, so the returned
+// line is directly comparable/searchable without ANSI stripping.
+func coordFooterLine(lines []string) string {
+	for _, l := range lines {
+		if strings.Contains(l, "coord ") {
+			return l
+		}
+	}
+	return ""
+}
+
+// TestProjectFooterLines_CoordContext pins the left-column coord line's
+// context-% chip: projectFooterLines resolves the coord's ContextPct from
+// ctx.records BY p.CoordID (not the first record) and appends renderContextBar
+// inline after the id (`coord <id> 49%`). A coord whose record has a nil
+// ContextPct — or no matching record at all — renders exactly "coord <id>"
+// with no trailing bar or space, unchanged from before the chip. The decoy
+// record makes a first-record-wins lookup bug fail the "49% and not 8%" case.
+func TestProjectFooterLines_CoordContext(t *testing.T) {
+	// Keep the coord-spawn fallback (CoordID=="" row) deterministic
+	// regardless of the host's ~/.fleet lease state.
+	prev := coordSpawnIdentityFn
+	coordSpawnIdentityFn = func(string) string { return "" }
+	t.Cleanup(func() { coordSpawnIdentityFn = prev })
+
+	rec := func(id string, pct *float64) *agent.Record {
+		return &agent.Record{ID: id, ContextPct: pct}
+	}
+
+	tests := []struct {
+		name     string
+		coordID  string
+		records  []*agent.Record
+		wantLine string // exact-equality expectation (ANSI-free in test)
+		wantSub  string // substring the coord line must contain
+		wantNot  string // substring the coord line must NOT contain
+		noCoord  bool   // true → no coord-id line at all
+	}{
+		{
+			name:    "context chip keyed on coord id, decoy ignored",
+			coordID: "abcd1234",
+			records: []*agent.Record{
+				rec("zzzz9999", floatPtr(8.0)),  // decoy first
+				rec("abcd1234", floatPtr(49.0)), // the coord
+			},
+			// Exact match (not just contains 49% / not-8%) so a regression
+			// that rendered both records or trailing garbage still fails.
+			wantLine: "coord abcd1234 49%",
+			wantSub:  "49%",
+			wantNot:  "8%",
+		},
+		{
+			name:     "nil context renders bare coord line",
+			coordID:  "abcd1234",
+			records:  []*agent.Record{rec("abcd1234", nil)},
+			wantLine: "coord abcd1234",
+		},
+		{
+			name:     "no matching record renders bare coord line",
+			coordID:  "abcd1234",
+			records:  []*agent.Record{rec("zzzz9999", floatPtr(8.0))},
+			wantLine: "coord abcd1234",
+		},
+		{
+			name:    "empty coord id renders no coord line",
+			coordID: "",
+			records: nil,
+			noCoord: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			p := &ProjectRow{Name: "fleet", RepoSlug: "fleet", CoordID: tt.coordID}
+			lines := projectFooterLines(p, 80, "", coordSpawnCtx{records: tt.records})
+			coordLine := coordFooterLine(lines)
+
+			if tt.noCoord {
+				if coordLine != "" {
+					t.Fatalf("CoordID=\"\" must render no coord line; got %q", coordLine)
+				}
+				return
+			}
+			if coordLine == "" {
+				t.Fatalf("expected a coord line; got none in %q", lines)
+			}
+			if tt.wantLine != "" && coordLine != tt.wantLine {
+				t.Errorf("coord line = %q, want exactly %q", coordLine, tt.wantLine)
+			}
+			if tt.wantSub != "" && !strings.Contains(coordLine, tt.wantSub) {
+				t.Errorf("coord line %q missing %q", coordLine, tt.wantSub)
+			}
+			if tt.wantNot != "" && strings.Contains(coordLine, tt.wantNot) {
+				t.Errorf("coord line %q must not contain decoy %q", coordLine, tt.wantNot)
+			}
+		})
+	}
+}
