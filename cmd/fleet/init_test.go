@@ -629,6 +629,16 @@ func TestRunInit_SeedsStandardsTemplate(t *testing.T) {
 func TestStandardsTemplate_EmbedsAsyncWaitsSection(t *testing.T) {
 	body := string(fleet.StandardsTemplate())
 	for _, want := range []string{
+		// Implementation + test-shape additions from the operator's
+		// standards file. Pin these so the shipped template cannot drift
+		// back to the narrower version.
+		"## Implementation",
+		"Delete-and-rewrite",
+		"Delete orphaned/subsumed tests",
+		"Test SHAPE matters",
+		"Test one CONTRACT",
+		"~1.5x the production LOC",
+		"name the bug it catches",
 		// Async waits base recipe — issue #105.
 		"## Async waits",
 		"run_in_background: true",
