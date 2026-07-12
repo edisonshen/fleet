@@ -418,9 +418,21 @@ const (
 // loadTaskStatusOnDisk, which coarsely maps any archived row to "done" and
 // would wrongly drop an archived-in-progress task.
 func classifyBackingTask(project, taskID string) (drainTaskClass, tasks.Status) {
+	if project == "" {
+		// A missing project is NOT the same as an untracked task_id: it
+		// means the queue file (or the record it was derived from) is
+		// malformed/legacy — state.ProjectDir("") silently resolves to an
+		// internal "_default" fallback directory, a DIFFERENT project than
+		// whatever the caller actually meant. Guessing here risks reading
+		// the wrong project's tasks.md. Hold pending rather than fall
+		// through (2nd-round adversarial review, low-likelihood but
+		// unbounded-blast-radius if it ever happens).
+		return taskUnresolvable, ""
+	}
 	if taskID == "" {
-		// Raw spawn (no task_id at all) — never a signal to hold; fall
-		// through to the existing live/opt-out route unchanged.
+		// Raw spawn (no task_id at all, project present) — never a signal
+		// to hold; fall through to the existing live/opt-out route
+		// unchanged.
 		return taskLive, ""
 	}
 	f, _, err := readTasks(project)

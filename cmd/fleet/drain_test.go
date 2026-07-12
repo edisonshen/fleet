@@ -808,6 +808,34 @@ func TestDrain_UntrackedTaskOptedOutHoldsPending(t *testing.T) {
 	}
 }
 
+// 2nd-round adversarial review: an empty project is NOT the same as an
+// untracked task_id. state.ProjectDir("") silently resolves to an internal
+// "_default" fallback directory — a DIFFERENT project than whatever the
+// caller actually meant — so falling through to taskLive here would risk
+// resolving status against the wrong project's tasks.md. A missing project
+// signals a malformed/legacy queue entry; classifyBackingTask must hold it
+// pending rather than guess, even though a bare empty task_id (project
+// present) correctly falls through per TestDrain_UntrackedTaskAutoResumesNotHeld.
+func TestClassifyBackingTask_EmptyProjectHoldsRegardlessOfTaskID(t *testing.T) {
+	setupFleetHome(t)
+	seedDrainTask(t, "rainier", "drain-test", tasks.StatusDone) // would wrongly resolve if project=="" leaked to another project
+	cases := []struct {
+		name   string
+		taskID string
+	}{
+		{"empty task_id", ""},
+		{"non-empty task_id", "drain-test"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			class, status := classifyBackingTask("", tc.taskID)
+			if class != taskUnresolvable {
+				t.Errorf("project=\"\" must hold (taskUnresolvable), got class=%v status=%q", class, status)
+			}
+		})
+	}
+}
+
 // Testing-specialist gap: the archive-read-error branch (classifyBackingTask's
 // SECOND readArchiveTasks error path, reached only when the slug is absent
 // from tasks.md) was previously unexercised — TestDrain_CorruptTasksFileHoldsPending
