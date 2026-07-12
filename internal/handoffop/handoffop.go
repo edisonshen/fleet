@@ -39,6 +39,17 @@ import (
 // handoff path may override.
 const DefaultGraceMillis = 3000
 
+// ErrHeldOptOut is the typed signal Resume returns when it refuses an
+// auto-handoff because the agent opted out of auto-resume. It is NOT a
+// failure: a worker's replacement is never silently auto-continued, so the
+// handoff must WAIT for a manual `fleet handoff` (or a later drain). `fleet
+// drain` matches it with errors.Is and buckets the outcome as PENDING rather
+// than failed — the seam that stops the recurring "every pending handoff
+// failed" red banner (DESIGN-drain-nonforcing). The refusal's human message is
+// unchanged; this only makes the outcome classifiable without a fragile string
+// match.
+var ErrHeldOptOut = errors.New("handoff held: agent opted out of auto-resume")
+
 // sessionListProbe is the tmux-session enumerator the auto-drain path
 // uses for the FLEET_MAX_SESSIONS precheck. Indirected via a package-
 // level var so tests inject a fake without touching tmux.

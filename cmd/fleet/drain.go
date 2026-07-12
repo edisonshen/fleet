@@ -57,6 +57,25 @@ const defaultResumeTimeoutMillis = 120000
 // Resume behind it. Production never reassigns it.
 var drainOneFn = drainOne
 
+// errDropped / errHeldPending are the two NON-FAILURE outcomes the
+// worker/legacy classifier returns (DESIGN-drain-nonforcing). Neither is a
+// failure and neither trips exit 1:
+//
+//   - errDropped: the backing task is provably terminal (done/abandoned), so
+//     the handoff is MOOT — drainOneLegacy already deleted the queue file and
+//     surfaced the drop. runDrain counts it in the `dropped` bucket.
+//   - errHeldPending: the backing task is UNRESOLVABLE (missing row / unreadable
+//     tasks.md) — not proof of done, so the handoff is preserved and HELD.
+//     runDrain counts it in the `pending` bucket (alongside handoffop's
+//     ErrHeldOptOut, the live-but-opted-out case).
+//
+// Bucketing both out of `failed` is what removes the recurring "every pending
+// handoff failed" red banner for entries that were never going to force-complete.
+var (
+	errDropped     = errors.New("fleet drain: handoff dropped (backing task terminal)")
+	errHeldPending = errors.New("fleet drain: handoff held pending (unresolvable backing task)")
+)
+
 func newDrainCmd() *cobra.Command {
 	var (
 		graceMillis        int

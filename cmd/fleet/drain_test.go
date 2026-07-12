@@ -14,6 +14,7 @@ import (
 	"github.com/edisonshen/fleet/internal/agent"
 	"github.com/edisonshen/fleet/internal/queue"
 	"github.com/edisonshen/fleet/internal/state"
+	"github.com/edisonshen/fleet/internal/tasks"
 	"github.com/edisonshen/fleet/internal/tmux"
 )
 
@@ -93,6 +94,10 @@ func TestDrain_ProcessesSkillWrittenQueue(t *testing.T) {
 	requireFakeTmux(t)
 	setupFleetHome(t)
 	oldRec := seedAgent(t)
+	// Row 7: a live (non-terminal) backing task routes through the existing
+	// spawn+resume path. Without a resolvable row the drain-nonforcing
+	// classifier would HOLD it pending, so seed the task live.
+	seedDrainTask(t, oldRec.Project, oldRec.TaskID, tasks.StatusInProgress)
 	qp, req := writeSkillQueueFile(t, oldRec)
 
 	out := &bytes.Buffer{}
@@ -129,6 +134,7 @@ func TestDrain_FailoverOn_WorkerHandoffUsesLegacyPath(t *testing.T) {
 	requireFakeTmux(t)
 	setupFleetHome(t)
 	oldRec := seedAgent(t)
+	seedDrainTask(t, oldRec.Project, oldRec.TaskID, tasks.StatusInProgress)
 	qp, req := writeSkillQueueFile(t, oldRec)
 
 	out := &bytes.Buffer{}
@@ -158,6 +164,9 @@ func TestDrain_ProcessesMultipleQueueFilesIndependently(t *testing.T) {
 	// and report 2 processed.
 	oldA := seedAgentForDrain(t)
 	oldB := seedAgentForDrain(t)
+	// Both seedAgentForDrain records share TaskID "drain-test"; one live row
+	// resolves both (classifier routes live → resume).
+	seedDrainTask(t, oldA.Project, oldA.TaskID, tasks.StatusInProgress)
 	_, reqA := writeSkillQueueFile(t, oldA)
 	_, reqB := writeSkillQueueFile(t, oldB)
 
@@ -186,11 +195,15 @@ func TestDrain_FailureIsolatedToOneFile(t *testing.T) {
 	// Agent B has a queue file pointing at a missing record AND a
 	// missing replacement → drain should fail on B but still process A.
 	oldA := seedAgent(t)
+	seedDrainTask(t, oldA.Project, oldA.TaskID, tasks.StatusInProgress)
 	_, reqA := writeSkillQueueFile(t, oldA)
 
 	// Plant a queue file for a non-existent agent. Resume's first step
 	// (Load oldRec) returns ErrNotFound, then cleanUpStaleQueue requires
-	// the new replacement record — also missing → returns an error.
+	// the new replacement record — also missing → returns an error. Seed a
+	// LIVE backing task so the classifier routes it to Resume (where it
+	// genuinely fails) rather than holding it pending.
+	seedDrainTask(t, "ghost", "ghost", tasks.StatusInProgress)
 	bogus := queue.SpawnFresh{
 		OldAgentID: "ghostbas",
 		HandoffDoc: "/nonexistent",
@@ -234,7 +247,10 @@ func TestDrain_AllFailuresReturnsError(t *testing.T) {
 	setupFleetHome(t)
 
 	// One queue file that will fail. With no successful processes, drain
-	// must surface an error so callers (cron, CI smoke) notice.
+	// must surface an error so callers (cron, CI smoke) notice. Seed a LIVE
+	// backing task so the classifier routes it to Resume (genuine failure),
+	// not the pending-hold path.
+	seedDrainTask(t, "ghost", "ghost", tasks.StatusInProgress)
 	bogus := queue.SpawnFresh{
 		OldAgentID: "ghostbas",
 		HandoffDoc: "/nonexistent",
@@ -451,5 +467,459 @@ func TestDrain_GenuineResumeErrorStillFails(t *testing.T) {
 	}
 	if !strings.Contains(out.String(), "0 processed, 1 failed") {
 		t.Errorf("expected '0 processed, 1 failed' summary, got:\n%s", out.String())
+	}
+}
+
+// ---------------------------------------------------------------------------
+// drain-nonforcing (DESIGN-drain-nonforcing): classify by resolved backing-
+// task status BEFORE the opt-out refusal — drop moot handoffs, hold live ones
+// as pending, never force a failure.
+// ---------------------------------------------------------------------------
+
+// seedDrainTask writes a task row into tasks.md so the classifier can resolve
+// req.TaskID. Only Status matters to the classifier; timestamps are filler.
+func seedDrainTask(t *testing.T, project, slug string, status tasks.Status) {
+	t.Helper()
+	now := time.Now().UTC()
+	listSeedTask(t, project, slug, status, tasks.PriorityP1, now, now, now, time.Time{})
+}
+
+// seedDrainArchiveTask seeds the row into tasks-archive.md instead — used to
+// prove archive PRESENCE alone never drops (STATUS decides).
+func seedDrainArchiveTask(t *testing.T, project, slug string, status tasks.Status) {
+	t.Helper()
+	now := time.Now().UTC()
+	listSeedArchiveTask(t, project, slug, status, tasks.PriorityP1, now, now, now)
+}
+
+// writeSkillQueueFileOptOut is writeSkillQueueFile with a per-handoff
+// DisableAutoResume override on the queue file (models fleet-guard writing an
+// opt-out handoff). A nil override leaves the field unset (inherit oldRec).
+func writeSkillQueueFileOptOut(t *testing.T, oldRec *agent.Record, disable *bool) (string, queue.SpawnFresh) {
+	t.Helper()
+	now := time.Now().UTC()
+	dp, err := state.HandoffPath(oldRec.ID, now)
+	if err != nil {
+		t.Fatalf("HandoffPath: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Dir(dp), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(dp, []byte("---\nagent_id: \""+oldRec.ID+"\"\n---\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	newID := agent.NewID()
+	req := queue.SpawnFresh{
+		SchemaVersion:     queue.SchemaVersion,
+		OldAgentID:        oldRec.ID,
+		HandoffDoc:        dp,
+		Project:           oldRec.Project,
+		TaskID:            oldRec.TaskID,
+		NewAgentID:        newID,
+		NewSession:        tmux.SessionName(newID),
+		DisableAutoResume: disable,
+	}
+	qp, err := queue.WriteSpawnFresh(req)
+	if err != nil {
+		t.Fatalf("WriteSpawnFresh: %v", err)
+	}
+	return qp, req
+}
+
+// Rows 1,2,3,4,6a,12: classify an OPTED-OUT worker by resolved backing-task
+// status. Terminal (done/abandoned, in tasks.md OR archive) → DROP; every
+// other resolvable status is live → HOLD pending via the opt-out refusal;
+// an unresolvable (absent) status → HOLD pending via errHeldPending. All exit
+// 0 (drop + pending are not failures). seedAgentForDrain's session is always
+// live, so the drop rows also cover the "agent live" manual-handoff hint.
+func TestDrain_ClassifyOptedOutWorker(t *testing.T) {
+	cases := []struct {
+		name       string
+		status     tasks.Status // "" = don't seed (unresolvable / absent)
+		archive    bool         // seed in tasks-archive.md instead of tasks.md
+		wantDrop   bool         // true = dropped; false = held pending
+	}{
+		{"row1 done drops", tasks.StatusDone, false, true},
+		{"row3 abandoned drops", tasks.StatusAbandoned, false, true},
+		{"row12 in-review holds", tasks.StatusInReview, false, false},
+		{"in-progress holds", tasks.StatusInProgress, false, false},
+		{"row6a absent holds", "", false, false},
+		{"row4 archived done drops", tasks.StatusDone, true, true},
+		{"row4 archived in-progress holds", tasks.StatusInProgress, true, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			requireFakeTmux(t)
+			setupFleetHome(t)
+			oldRec := seedAgentForDrain(t)
+			oldRec.DisableAutoResume = true // opted-out worker (the wedged shape)
+			if err := oldRec.Write(); err != nil {
+				t.Fatalf("rewrite opt-out: %v", err)
+			}
+			if tc.status != "" {
+				if tc.archive {
+					seedDrainArchiveTask(t, oldRec.Project, oldRec.TaskID, tc.status)
+				} else {
+					seedDrainTask(t, oldRec.Project, oldRec.TaskID, tc.status)
+				}
+			}
+			qp, _ := writeSkillQueueFile(t, oldRec)
+
+			out := &bytes.Buffer{}
+			if err := runDrain(out, out, 0, 0); err != nil {
+				t.Fatalf("drop/hold must exit 0, got %v\n%s", err, out.String())
+			}
+			s := out.String()
+			_, statErr := os.Stat(qp)
+			if tc.wantDrop {
+				if !os.IsNotExist(statErr) {
+					t.Errorf("terminal task: queue file not dropped: %v\n%s", statErr, s)
+				}
+				if !strings.Contains(s, "dropped — backing task") {
+					t.Errorf("missing drop diagnostic:\n%s", s)
+				}
+				if !strings.Contains(s, "agent live; run 'fleet handoff") {
+					t.Errorf("drop diagnostic missing live/manual-handoff hint:\n%s", s)
+				}
+				if !strings.Contains(s, ", 1 dropped") {
+					t.Errorf("summary missing dropped bucket:\n%s", s)
+				}
+			} else {
+				if statErr != nil {
+					t.Errorf("held handoff: queue file must be preserved: %v", statErr)
+				}
+				if !strings.Contains(s, "pending — worker handoff") {
+					t.Errorf("missing pending diagnostic:\n%s", s)
+				}
+				if !strings.Contains(s, ", 1 pending") {
+					t.Errorf("summary missing pending bucket:\n%s", s)
+				}
+				if _, err := agent.Load(oldRec.ID); err != nil {
+					t.Errorf("held handoff must leave the old agent untouched: %v", err)
+				}
+			}
+		})
+	}
+}
+
+// Rows 5a/5b/5c: per-handoff opt-out precedence. The queue override wins over
+// the record baseline; either "true" pathway HOLDS the live handoff as pending
+// (never a failure), while an override of "false" lets it PROCESS (we don't
+// over-hold). Task is live so classification routes to Resume.
+func TestDrain_OptOutOverridePrecedence(t *testing.T) {
+	tt, ff := true, false
+	cases := []struct {
+		name         string
+		recDisable   bool
+		queueDisable *bool // nil = no override
+		wantPending  bool  // true = held; false = processed
+	}{
+		{"row5a baseline opt-out holds", true, nil, true},
+		{"row5b queue override true holds", false, &tt, true},
+		{"row5c queue override false does not over-hold", true, &ff, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			requireFakeTmux(t)
+			setupFleetHome(t)
+			oldRec := seedAgentForDrain(t)
+			oldRec.DisableAutoResume = tc.recDisable
+			if err := oldRec.Write(); err != nil {
+				t.Fatalf("rewrite: %v", err)
+			}
+			seedDrainTask(t, oldRec.Project, oldRec.TaskID, tasks.StatusInProgress)
+			qp, req := writeSkillQueueFileOptOut(t, oldRec, tc.queueDisable)
+
+			out := &bytes.Buffer{}
+			if err := runDrain(out, out, 0, 0); err != nil {
+				t.Fatalf("must exit 0, got %v\n%s", err, out.String())
+			}
+			s := out.String()
+			if tc.wantPending {
+				if _, statErr := os.Stat(qp); statErr != nil {
+					t.Errorf("held: queue file must be preserved: %v", statErr)
+				}
+				if !strings.Contains(s, ", 1 pending") {
+					t.Errorf("expected pending bucket:\n%s", s)
+				}
+				if _, err := agent.Load(oldRec.ID); err != nil {
+					t.Errorf("held handoff archived the old agent: %v", err)
+				}
+			} else {
+				if _, statErr := os.Stat(qp); !os.IsNotExist(statErr) {
+					t.Errorf("processed: queue file not deleted: %v", statErr)
+				}
+				if !strings.Contains(s, "1 processed") {
+					t.Errorf("expected processed summary:\n%s", s)
+				}
+				newRec, err := agent.Load(req.NewAgentID)
+				if err != nil {
+					t.Fatalf("load replacement: %v", err)
+				}
+				t.Cleanup(func() { _ = tmux.Kill(newRec.TmuxSession) })
+			}
+		})
+	}
+}
+
+// Row 6b: a corrupt/unreadable tasks.md must be SWALLOWED → unresolvable →
+// HOLD pending, never surfaced as a failure (returning it would count failed++
+// and resurrect the exit-1 banner). The worker is NOT opted out, so a wrong
+// route to Resume would PROCESS — pending discriminates the swallow.
+func TestDrain_CorruptTasksFileHoldsPending(t *testing.T) {
+	requireFakeTmux(t)
+	setupFleetHome(t)
+	oldRec := seedAgentForDrain(t) // auto-resume worker
+	dir, err := state.ProjectDir(oldRec.Project)
+	if err != nil {
+		t.Fatalf("ProjectDir: %v", err)
+	}
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// Unterminated / non-key:value frontmatter → tasks.Read parse error.
+	if err := os.WriteFile(filepath.Join(dir, "tasks.md"),
+		[]byte("---\ngarbage line no colon\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	qp, _ := writeSkillQueueFile(t, oldRec)
+
+	out := &bytes.Buffer{}
+	if err := runDrain(out, out, 0, 0); err != nil {
+		t.Fatalf("corrupt tasks.md must HOLD pending (exit 0), not fail: %v\n%s", err, out.String())
+	}
+	s := out.String()
+	if _, statErr := os.Stat(qp); statErr != nil {
+		t.Errorf("held handoff: queue file must be preserved: %v", statErr)
+	}
+	if !strings.Contains(s, ", 1 pending") {
+		t.Errorf("expected pending bucket (read error swallowed → unresolvable):\n%s", s)
+	}
+	if strings.Contains(s, "1 processed") {
+		t.Errorf("corrupt-file classifier wrongly processed instead of holding:\n%s", s)
+	}
+}
+
+// Row 8b (REQUIRED): a coord queue entry called through drainOneLegacy DIRECTLY
+// must hit the IsCoordSpawn skip and NEVER be status-classified/dropped — even
+// with a terminal backing task. On CI leaseDrainEnabled() is always true, so
+// the public drainOne path can't reach the legacy branch for a coord; this
+// direct call pins the guard on every platform (dead-coord recovery preserved).
+func TestDrain_CoordEntryNeverClassifiedLegacy(t *testing.T) {
+	requireFakeTmux(t)
+	setupFleetHome(t)
+	const project = "rainier"
+	// Seed the coord's synthetic task DONE — IF the classifier wrongly ran on a
+	// coord entry it would DROP it. The skip must prevent that.
+	seedDrainTask(t, project, "coord-"+project, tasks.StatusDone)
+	oldRec := seedAgentForDrain(t)
+	oldRec.TaskID = "coord-" + project
+	oldRec.Project = project
+	if err := oldRec.Write(); err != nil {
+		t.Fatalf("rewrite coord: %v", err)
+	}
+	qp, req := writeSkillQueueFile(t, oldRec)
+
+	out := &bytes.Buffer{}
+	err := drainOneLegacy(req, qp, 0, out, out)
+	if errors.Is(err, errDropped) {
+		t.Fatalf("coord entry was status-classified + dropped — IsCoordSpawn skip failed")
+	}
+	if strings.Contains(out.String(), "dropped — backing task") {
+		t.Errorf("coord entry emitted a drop diagnostic:\n%s", out.String())
+	}
+}
+
+// Row 8a: on a lease build the public drainOne routes a coord entry to
+// drainOneLeaseAware FIRST — never the status classifier — so a coord is never
+// dropped even with a terminal backing task. We only assert not-dropped; the
+// lease-aware outcome (fail/standby) is orthogonal.
+func TestDrain_CoordEntryRoutesToLeaseAware(t *testing.T) {
+	if !leaseDrainEnabled() {
+		t.Skip("lease-aware drain is linux/darwin only")
+	}
+	requireFakeTmux(t)
+	setupFleetHome(t)
+	const project = "rainier"
+	seedDrainTask(t, project, "coord-"+project, tasks.StatusDone) // would drop IF classified
+	oldRec := seedAgentForDrain(t)
+	oldRec.TaskID = "coord-" + project
+	oldRec.Project = project
+	if err := oldRec.Write(); err != nil {
+		t.Fatalf("rewrite coord: %v", err)
+	}
+	writeSkillQueueFile(t, oldRec)
+
+	out := &bytes.Buffer{}
+	_ = runDrain(out, out, 0, 0) // outcome may be a lease-path failure; only assert not-dropped
+	s := out.String()
+	if strings.Contains(s, "dropped — backing task") {
+		t.Errorf("coord entry was status-classified + dropped on the public path:\n%s", s)
+	}
+	if strings.Contains(s, ", 1 dropped") {
+		t.Errorf("coord entry counted as dropped:\n%s", s)
+	}
+}
+
+// Row 10a: concurrent drop. When a drainOne handler deletes a SIBLING queue
+// file, the loop's next ReadSpawnFresh hits ErrNotFound — a benign concurrent-
+// drain skip that must NOT count failed++. Both drains exit 0.
+func TestDrain_ConcurrentDropBenignSkip(t *testing.T) {
+	requireFakeTmux(t)
+	setupFleetHome(t)
+	mk := func(id string) (string, queue.SpawnFresh) {
+		req := queue.SpawnFresh{
+			SchemaVersion: queue.SchemaVersion,
+			OldAgentID:    id,
+			HandoffDoc:    "/nonexistent",
+			Project:       "projects-fleet",
+			TaskID:        "sib",
+			NewAgentID:    "new" + id[:5],
+			NewSession:    "fleet-new" + id[:5],
+		}
+		p, err := queue.WriteSpawnFresh(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return p, req
+	}
+	pathA, reqA := mk("aaaaaaaa")
+	pathB, _ := mk("bbbbbbbb")
+
+	stubDrainOne(t, func(r queue.SpawnFresh, _ string, _, _ int, _, _ io.Writer) error {
+		// Whichever file the loop reaches first deletes the sibling, so the
+		// next ReadSpawnFresh vanishes deterministically.
+		if r.OldAgentID == reqA.OldAgentID {
+			_ = queue.Delete(pathB)
+		} else {
+			_ = queue.Delete(pathA)
+		}
+		return nil
+	})
+
+	out := &bytes.Buffer{}
+	if err := runDrain(out, out, 0, 0); err != nil {
+		t.Fatalf("concurrent benign skip must exit 0, got %v\n%s", err, out.String())
+	}
+	// Exactly one processed; the vanished sibling was benign-skipped, not failed.
+	if !strings.Contains(out.String(), "1 processed, 0 failed") {
+		t.Errorf("expected '1 processed, 0 failed' (sibling benign-skipped):\n%s", out.String())
+	}
+}
+
+// Row 10b: the DROP path must be LOCK-FREE. Holding the per-agent lock that the
+// live/spawn path would take must NOT stall a moot-entry drop. A regression that
+// re-added state.LockAgent as drainOneLegacy's first statement would block this
+// drop on the 5-minute agentLockTimeout — we bound the wait far below that.
+func TestDrain_DropIsLockFree(t *testing.T) {
+	requireFakeTmux(t)
+	setupFleetHome(t)
+	oldRec := seedAgentForDrain(t)
+	seedDrainTask(t, oldRec.Project, oldRec.TaskID, tasks.StatusDone) // terminal → drop
+	qp, _ := writeSkillQueueFile(t, oldRec)
+
+	// Hold the per-agent lock BEFORE draining. release runs at cleanup so a
+	// regressed (blocked) goroutine can eventually unwind.
+	release, err := state.LockAgent(oldRec.ID)
+	if err != nil {
+		t.Fatalf("LockAgent: %v", err)
+	}
+	t.Cleanup(release)
+
+	out := &bytes.Buffer{}
+	done := make(chan error, 1)
+	go func() { done <- runDrain(out, out, 0, 0) }()
+	// Liveness bound, not a timing assertion: lock-free completes in ms; a
+	// regression blocks ~5 min on the held lock. 30 s discriminates with a
+	// huge margin and never false-fails a healthy run (which never waits).
+	select {
+	case derr := <-done:
+		if derr != nil {
+			t.Fatalf("drop must exit 0, got %v\n%s", derr, out.String())
+		}
+	case <-time.After(30 * time.Second):
+		t.Fatal("drop STALLED behind the held agent lock — regression: LockAgent moved before the drop")
+	}
+	if _, statErr := os.Stat(qp); !os.IsNotExist(statErr) {
+		t.Errorf("moot handoff not dropped: %v\n%s", statErr, out.String())
+	}
+}
+
+// Rows 11a-d: summary bucketing + exit code. drainOneFn is stubbed so runDrain's
+// accounting is exercised in isolation. Drop + pending are neither processed nor
+// failed; the exit-1 rule (processed==0 && backgrounded==0 && failed>0) is
+// unchanged; the backgrounded parenthetical stays verbatim; dropped/pending
+// append only when nonzero.
+func TestDrain_SummaryBucketsAndExit(t *testing.T) {
+	cases := []struct {
+		name     string
+		outcomes map[string]error // 8-char OldAgentID -> drainOneFn return
+		wantErr  bool
+		wantSubs []string
+	}{
+		{
+			name: "11a dropped+pending+processed no failure exits 0",
+			outcomes: map[string]error{
+				"dropaaaa": errDropped,
+				"pendbbbb": errHeldPending,
+				"proccccc": nil,
+			},
+			wantErr:  false,
+			wantSubs: []string{"1 processed", ", 1 dropped", ", 1 pending"},
+		},
+		{
+			name: "11b only dropped+pending + 1 failure exits nonzero",
+			outcomes: map[string]error{
+				"dropaaaa": errDropped,
+				"pendbbbb": errHeldPending,
+				"faildddd": errors.New("spawn replacement: boom"),
+			},
+			wantErr:  true,
+			wantSubs: []string{"0 processed", ", 1 failed", ", 1 dropped", ", 1 pending"},
+		},
+		{
+			name: "11c processed + 1 isolated failure exits 0",
+			outcomes: map[string]error{
+				"proccccc": nil,
+				"faildddd": errors.New("spawn replacement: boom"),
+			},
+			wantErr:  false,
+			wantSubs: []string{"1 processed, 1 failed"},
+		},
+		{
+			name: "11d backgrounded+dropped+pending keeps parenthetical verbatim",
+			outcomes: map[string]error{
+				"bgeeeeee": fmt.Errorf("slow: %w", ErrResumeBackgrounded),
+				"dropaaaa": errDropped,
+				"pendbbbb": errHeldPending,
+			},
+			wantErr: false,
+			wantSubs: []string{
+				"0 processed, 1 backgrounded (still completing; a later drain retries), 0 failed, 1 dropped, 1 pending",
+			},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			requireFakeTmux(t)
+			setupFleetHome(t)
+			for id := range tc.outcomes {
+				bogusQueueFileFor(t, id)
+			}
+			stubDrainOne(t, func(r queue.SpawnFresh, _ string, _, _ int, _, _ io.Writer) error {
+				return tc.outcomes[r.OldAgentID]
+			})
+			out := &bytes.Buffer{}
+			stderr := &bytes.Buffer{}
+			err := runDrain(out, stderr, 0, 0)
+			if tc.wantErr != (err != nil) {
+				t.Fatalf("wantErr=%v got err=%v\nstdout=%s\nstderr=%s", tc.wantErr, err, out.String(), stderr.String())
+			}
+			for _, sub := range tc.wantSubs {
+				if !strings.Contains(out.String(), sub) {
+					t.Errorf("summary missing %q:\n%s", sub, out.String())
+				}
+			}
+		})
 	}
 }

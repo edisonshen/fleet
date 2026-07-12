@@ -116,3 +116,31 @@ func TestUpdate_DrainError_FlashesErrorNoRedrain(t *testing.T) {
 		}
 	}
 }
+
+// Row 13 (DESIGN-drain-nonforcing): a PENDING drain result flashes an
+// informational banner but schedules NO re-drain. The pending marker means a
+// live handoff is held waiting on a manual `fleet handoff`; re-arming a 30s
+// re-drain tick (as the backgrounded path does) would recreate the forever-
+// retry churn drain-nonforcing removes.
+func TestUpdate_DrainPending_FlashesNoRedrain(t *testing.T) {
+	t.Setenv("FLEET_HOME", t.TempDir())
+	shrinkRedrainDelay(t)
+	m := New("test")
+
+	out := "fleet drain: 3f2a pending — worker handoff, run 'fleet handoff 3f2a'\n" +
+		"fleet drain: 0 processed, 0 failed, 1 pending\n"
+	next, cmd := m.Update(drainDoneMsg{out: out})
+	nm := next.(Model)
+
+	if nm.flash == nil {
+		t.Fatal("pending drain must surface a flash (silent = invisible held handoff)")
+	}
+	if nm.flash.isErr {
+		t.Errorf("pending handoff is not an error; flash.isErr = true, text: %s", nm.flash.text)
+	}
+	for _, msg := range collectMsgs(t, cmd) {
+		if _, ok := msg.(queueEventMsg); ok {
+			t.Error("pending drain must NOT schedule a re-drain (a held handoff waits for a manual fleet handoff)")
+		}
+	}
+}
