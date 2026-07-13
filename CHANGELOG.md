@@ -6,6 +6,68 @@ follows [SemVer](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.15.0] - 2026-07-13
+
+Coordinator identity becomes lease-only and crash-safe. The three-file
+lease is now the single source of truth for who owns a project: the
+coord-spawn marker is deleted, startup is a two-phase acquire through a
+shared owner resolver, and attach/handoff delivery resolve through the
+lease's flock rather than a best-effort epoch — closing the attach
+split-brain. Just as important, no staleness heuristic can ever kill a
+live coordinator: a fence verdict re-acquires in place instead of
+signaling, the sweep is report-only, and TakeOver gates behind a
+pre-fence liveness probe. Handoff docs carry curated context forward —
+Docs-this-session, an agent decision log, and session-scoped Next Steps
+and Open Questions — and successor resume is durable (a successor pulls
+its own handoff on the first tick). The TUI now surfaces coordinators:
+they appear in the agents list (tagged, `[x]`-guarded) with a live
+context %, while dead and worker-shadow records are kept out. Drain
+stops force-killing and classifies by backing-task status, the full
+standards ship in the embedded skill template, and the concurrent-
+writers durability test is made deterministic.
+
+### Added
+
+- Coordinator lease as sole identity: two-phase startup with a shared
+  owner resolver (#259) and lease-lifecycle observability (#257),
+  retiring the coord-spawn marker (#260).
+- Lease-driven attach via `coordreconcile.Resolve` (#264) and coord
+  remote-control injected centrally at spawn (#263).
+- Handoff enrichment: curated Docs-this-session + agent decision log
+  (#244) and session-scoped Next Steps + Open Questions (#258).
+- TUI coordinator surfacing: coords in the agents list with a live
+  context % on the left coord line, and safe auto-reap of dead agent
+  records (#274, #275).
+- `drain-nonforcing`: drain classifies by backing-task status instead
+  of force-killing (#270).
+- Full standards shipped in the embedded skill template (#272).
+
+### Changed
+
+- Coordinator identity resolves through the lease flock, not the epoch:
+  attach and delivery readers repoint to the flock to close the attach
+  split-brain (#266), and the epoch write path is deleted in favor of a
+  write-once handoff journal with journal-aware `Resolve` (#267).
+
+### Fixed
+
+- No staleness heuristic ever kills a live coordinator: fence verdicts
+  re-acquire the lease in place instead of signaling (#245); the sweep
+  is report-only with a TakeOver pre-fence gate and drain-escalation
+  gates (#246).
+- Coordinator lease is platform-gated (#261).
+- Durable handoff resume — a successor pulls its own handoff on the
+  first tick (#268) — plus Path A hardened push with inline OQ1 payload
+  and an Option A failover fix (#269).
+- TUI: never suggest a destructive `[r]`-reset for a live or booting
+  coord (#265); keep workers out of the agents list by skipping
+  dead/represented worker records (#273).
+- `fleet gc` reaps orphaned `.kicked` throttle sentinels via a
+  `queue.Delete` sidecar and an `orphan-kicked` gc kind (#271).
+- `TestConcurrentWriters_NoLostUpdate` is deterministic — it retries the
+  documented transient contention outcome instead of failing on it
+  (#276).
+
 ## [0.14.0] - 2026-06-30
 
 The coordinator tick goes single-shot. By default each tick now does
@@ -1156,7 +1218,9 @@ Initial public release.
 - Filesystem packages: `internal/state`, `internal/handoff`,
   `internal/queue`, `internal/spawn`, `internal/tmux`.
 
-[Unreleased]: https://github.com/edisonshen/fleet/compare/v0.13.0...HEAD
+[Unreleased]: https://github.com/edisonshen/fleet/compare/v0.15.0...HEAD
+[0.15.0]: https://github.com/edisonshen/fleet/compare/v0.14.0...v0.15.0
+[0.14.0]: https://github.com/edisonshen/fleet/compare/v0.13.0...v0.14.0
 [0.13.0]: https://github.com/edisonshen/fleet/compare/v0.12.0...v0.13.0
 [0.12.0]: https://github.com/edisonshen/fleet/compare/v0.11.0...v0.12.0
 [0.11.0]: https://github.com/edisonshen/fleet/compare/v0.10.0...v0.11.0
