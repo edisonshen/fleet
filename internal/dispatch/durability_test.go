@@ -177,19 +177,32 @@ func TestConcurrentWriters_NoLostUpdate(t *testing.T) {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			res, err := ReserveReplay(id, cap)
-			if err != nil {
-				t.Errorf("reserve %d: %v", i, err)
-				return
+			// Contention is a legitimate ReserveReplay outcome (#184): under a
+			// loaded runner a goroutine can miss the flock deadline. Retry on
+			// contention only — the flock serializes and the critical section is
+			// O(1), so every goroutine reserves within a few tries. A genuinely
+			// stuck lock exhausts the bound and fails loudly via the t.Errorf
+			// below (each try blocks up to the ~2s flock deadline, so
+			// 50*2s=100s worst case stays well under Go's test timeout).
+			const maxTries = 50
+			for try := 0; try < maxTries; try++ {
+				res, err := ReserveReplay(id, cap)
+				if err != nil {
+					t.Errorf("reserve %d: %v", i, err)
+					return
+				}
+				switch res.Outcome {
+				case ReplayReserved:
+					reserved[i] = true
+					return
+				case ReplayContention:
+					continue // retry
+				default:
+					t.Errorf("reserve %d: outcome=%q want reserved", i, res.Outcome)
+					return
+				}
 			}
-			// With a generous deadline and a fast critical section, every
-			// caller should eventually reserve (the flock serializes them;
-			// none times out).
-			if res.Outcome == ReplayReserved {
-				reserved[i] = true
-			} else {
-				t.Errorf("reserve %d: outcome=%q want reserved", i, res.Outcome)
-			}
+			t.Errorf("reserve %d: contention never cleared in %d tries (stuck lock?)", i, maxTries)
 		}(i)
 	}
 	wg.Wait()
