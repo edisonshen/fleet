@@ -543,3 +543,63 @@ class TestWorktreeGCCadence:
             )
         assert ran is True
         assert any("worktree-gc backstop" in e for e in res.errors)
+
+
+class TestOrphanAgentsGCCadence:
+    """_maybe_gc_orphan_agents bounded cadence + coord-scope-strict + fail-soft
+    (Slice B safe auto-reap)."""
+
+    def test_runs_on_cadence_tick_scoped_to_project(self, monkeypatch):
+        # B4: the coord-tick reap is --project-scoped (project X only) and
+        # targets the orphan-agents kind.
+        monkeypatch.setenv("FLEET_ORPHAN_AGENTS_GC_EVERY", "20")
+        res = _Result()
+        with patch.object(loop.subprocess, "run", return_value=_ok()) as run:
+            ran = loop._maybe_gc_orphan_agents(
+                {"tick_count": 20}, project="X", fleet_bin="fleet", result=res,
+            )
+        assert ran is True
+        argv = run.call_args.args[0]
+        assert argv[:2] == ["fleet", "gc"]
+        assert "--apply" in argv and "--kinds=orphan-agents" in argv
+        # Coord-scope strict: exactly --project X, no other project.
+        assert argv[argv.index("--project") + 1] == "X"
+        assert res.errors == []
+
+    def test_skips_off_cadence_tick(self, monkeypatch):
+        monkeypatch.setenv("FLEET_ORPHAN_AGENTS_GC_EVERY", "20")
+        res = _Result()
+        with patch.object(loop.subprocess, "run", side_effect=AssertionError("must not shell out")):
+            ran = loop._maybe_gc_orphan_agents(
+                {"tick_count": 7}, project="X", fleet_bin="fleet", result=res,
+            )
+        assert ran is False
+
+    def test_disabled_when_every_zero(self, monkeypatch):
+        monkeypatch.setenv("FLEET_ORPHAN_AGENTS_GC_EVERY", "0")
+        res = _Result()
+        with patch.object(loop.subprocess, "run", side_effect=AssertionError("must not shell out")):
+            ran = loop._maybe_gc_orphan_agents(
+                {"tick_count": 40}, project="X", fleet_bin="fleet", result=res,
+            )
+        assert ran is False
+
+    def test_nonzero_exit_failsoft(self, monkeypatch):
+        monkeypatch.setenv("FLEET_ORPHAN_AGENTS_GC_EVERY", "20")
+        res = _Result()
+        with patch.object(loop.subprocess, "run", return_value=_err("boom")):
+            ran = loop._maybe_gc_orphan_agents(
+                {"tick_count": 20}, project="X", fleet_bin="fleet", result=res,
+            )
+        assert ran is True
+        assert any("orphan-agents-gc backstop nonzero exit" in e for e in res.errors)
+
+    def test_timeout_failsoft(self, monkeypatch):
+        monkeypatch.setenv("FLEET_ORPHAN_AGENTS_GC_EVERY", "20")
+        res = _Result()
+        with patch.object(loop.subprocess, "run", side_effect=subprocess.TimeoutExpired("fleet", 120.0)):
+            ran = loop._maybe_gc_orphan_agents(
+                {"tick_count": 20}, project="X", fleet_bin="fleet", result=res,
+            )
+        assert ran is True
+        assert any("orphan-agents-gc backstop" in e for e in res.errors)

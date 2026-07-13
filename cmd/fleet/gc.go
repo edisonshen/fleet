@@ -189,10 +189,11 @@ func runGC(stdout, stderr io.Writer, f *gcFlags) error {
 		if sock := strings.TrimSpace(os.Getenv("FLEET_TMUX_SOCKET")); sock != "" {
 			_, _ = fmt.Fprintf(stderr,
 				"warning: FLEET_TMUX_SOCKET=%s is set; orphan-agents probes use THIS socket.\n"+
-					"  Agent records do not persist their spawn-time socket. If any live agent\n"+
-					"  was spawned against a different FLEET_TMUX_SOCKET, --apply may archive it\n"+
-					"  as orphan. Re-run with FLEET_TMUX_SOCKET unset (default) OR drop\n"+
-					"  --kinds=orphan-agents from this sweep to skip the agent-archive pass.\n",
+					"  Agent records do not persist their spawn-time socket, so a live agent\n"+
+					"  spawned against a different socket could read as gone. To avoid a\n"+
+					"  cross-socket false archive, --apply will SURFACE these records only\n"+
+					"  (no auto-archive) while FLEET_TMUX_SOCKET is set. Re-run with\n"+
+					"  FLEET_TMUX_SOCKET unset (default) to archive dead non-coord records.\n",
 				sock)
 		}
 	}
@@ -208,12 +209,13 @@ func runGC(stdout, stderr io.Writer, f *gcFlags) error {
 		}
 	}
 	opts := gc.Options{
-		Apply:        f.apply,
-		Aggressive:   f.aggressive,
-		MaxAge:       f.maxAge,
-		Kinds:        kinds,
-		Project:      f.project,
-		LegacyDrains: f.legacyDrains,
+		Apply:           f.apply,
+		Aggressive:      f.aggressive,
+		MaxAge:          f.maxAge,
+		Kinds:           kinds,
+		Project:         f.project,
+		LegacyDrains:    f.legacyDrains,
+		SocketAmbiguous: strings.TrimSpace(os.Getenv("FLEET_TMUX_SOCKET")) != "",
 	}
 	// DESIGN-coord-worktree-lifecycle § Concurrency: hold the project-
 	// scoped worktree-GC flock across the whole scan → re-check → remove

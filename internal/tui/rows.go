@@ -451,11 +451,9 @@ var sessionProbeOrAliveFn = func(session string) bool {
 // gate triggers the project row appears alone — the operator presses
 // [⏎] to open the inline task list.
 //
-// Coord-on-LEFT (issue #55): a coord agent (record whose ID matches
-// some ProjectRow.CoordID) is filtered out of the right-column agents
-// section. The project-side render attaches the coord visually under
-// the project block; double-rendering it on the right would create
-// the appearance of two agents for one underlying record.
+// Coord dual-presence (Slice A): coord records also render as rows in
+// the right-column agents block, tagged there for clarity, while still
+// rendering on the LEFT under their project block.
 //
 // Activity grouping + hidden list (issue #98): projects are partitioned
 // into ACTIVE / IDLE / HIDDEN buckets BEFORE the per-project task
@@ -470,19 +468,6 @@ func (m Model) dashboardRows() []dashRow {
 	var rows []dashRow
 	projects := m.unifiedProjects()
 	hiddenSet := hiddenProjectsSet()
-
-	// Coord-on-LEFT skip set (issue #55): collect across the visible
-	// projects so the right-column agent block knows which records to
-	// drop. Hidden projects are already absent from `projects`, so
-	// their coord IDs naturally fall through to the agent list — that
-	// matches the spec ("agents tagged with a hidden project still
-	// appear in 'v0.1 agents'").
-	coordIDs := map[string]bool{}
-	for _, p := range projects {
-		if p.CoordID != "" {
-			coordIDs[p.CoordID] = true
-		}
-	}
 
 	// Search-mode override: when an active search filter is set, the
 	// idle separator is suppressed and idle projects merge inline so
@@ -606,11 +591,6 @@ func (m Model) dashboardRows() []dashRow {
 	var activeAgents, idleAgents []*agent.Record
 	for _, r := range m.records {
 		if r == nil {
-			continue
-		}
-		if coordIDs[r.ID] {
-			// Coord renders on the LEFT under its project row; skip it
-			// here so the right-column doesn't double-count.
 			continue
 		}
 		if shouldSkipWorkerAgentRecord(r, workerSlugs, m.aliveByID) {

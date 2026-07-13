@@ -457,6 +457,80 @@ func TestReconcile_OrphanAgentRecord_ArchivedOnApply(t *testing.T) {
 	}
 }
 
+// TestReconcile_OrphanAgents_CoordAndSocketGate pins Slice B's safe reap
+// (B1/B2/B3): a dead NON-coord record is archived only when the socket
+// probe is authoritative (SocketAmbiguous=false); a dead COORD record is
+// surfaced-but-never-archived; and an ambiguous socket forces
+// surface-only even for a non-coord. Each case asserts BOTH the action
+// verb AND whether ArchiveAgent actually ran — discriminating: a
+// surface-only impl that dropped the action, or a bare `continue`, fails.
+func TestReconcile_OrphanAgents_CoordAndSocketGate(t *testing.T) {
+	now := time.Date(2026, 5, 21, 12, 0, 0, 0, time.UTC)
+	cases := []struct {
+		name         string
+		rec          *agent.Record
+		ambiguous    bool
+		wantVerb     Verb
+		wantArchived bool
+	}{
+		{"non-coord authoritative → archived",
+			&agent.Record{ID: "worker01", TaskID: "fix-bug", TmuxSession: "fleet-worker01"}, false, VerbArchived, true},
+		{"dead coord (task prefix) → surfaced",
+			&agent.Record{ID: "coord01", TaskID: "coord-spark", Project: "spark", TmuxSession: "fleet-coord01"}, false, VerbWouldArchive, false},
+		{"dead coord (IsCoord flag) → surfaced",
+			&agent.Record{ID: "coord02", IsCoord: true, TmuxSession: "fleet-coord02"}, false, VerbWouldArchive, false},
+		{"non-coord ambiguous socket → surfaced",
+			&agent.Record{ID: "worker02", TaskID: "fix-bug", TmuxSession: "fleet-worker02"}, true, VerbWouldArchive, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			deps := stubDeps(now)
+			rec := tc.rec
+			deps.ListAgents = func() ([]*agent.Record, error) { return []*agent.Record{rec}, nil }
+			deps.SessionAlive = func(string) (bool, error) { return false, nil } // session gone
+			var archived []string
+			deps.ArchiveAgent = func(r *agent.Record) error {
+				archived = append(archived, r.ID)
+				return nil
+			}
+			got, err := Reconcile(Options{Apply: true, MaxAge: 24 * time.Hour, Kinds: []Kind{KindOrphanAgents}, SocketAmbiguous: tc.ambiguous}, deps)
+			if err != nil {
+				t.Fatalf("Reconcile: %v", err)
+			}
+			a, ok := findAction(got, KindOrphanAgents, rec.ID)
+			if !ok {
+				t.Fatalf("orphan-agents action missing for %s; got %+v", rec.ID, got.Actions)
+			}
+			if a.Verb != tc.wantVerb {
+				t.Errorf("verb = %q; want %q", a.Verb, tc.wantVerb)
+			}
+			gotArch := len(archived) == 1 && archived[0] == rec.ID
+			if gotArch != tc.wantArchived {
+				t.Errorf("ArchiveAgent-called = %v; want %v (archived=%v)", gotArch, tc.wantArchived, archived)
+			}
+		})
+	}
+}
+
+// TestReconcile_OrphanAgents_EmptyIdempotent (B6) pins the no-op path: an
+// empty agents set reaps cleanly and repeatedly — no actions, no error.
+func TestReconcile_OrphanAgents_EmptyIdempotent(t *testing.T) {
+	now := time.Date(2026, 5, 21, 12, 0, 0, 0, time.UTC)
+	deps := stubDeps(now)
+	deps.ListAgents = func() ([]*agent.Record, error) { return nil, nil }
+	for i := 0; i < 2; i++ {
+		got, err := Reconcile(Options{Apply: true, Kinds: []Kind{KindOrphanAgents}}, deps)
+		if err != nil {
+			t.Fatalf("pass %d: Reconcile: %v", i, err)
+		}
+		for _, a := range got.Actions {
+			if a.Kind == KindOrphanAgents {
+				t.Errorf("pass %d: unexpected orphan-agents action %+v", i, a)
+			}
+		}
+	}
+}
+
 func TestReconcile_HealthyAgent_Unchanged(t *testing.T) {
 	now := time.Date(2026, 5, 21, 12, 0, 0, 0, time.UTC)
 	deps := stubDeps(now)

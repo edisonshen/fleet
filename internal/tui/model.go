@@ -34,6 +34,7 @@ import (
 	"github.com/charmbracelet/lipgloss"
 
 	"github.com/edisonshen/fleet/internal/agent"
+	"github.com/edisonshen/fleet/internal/gc"
 	"github.com/edisonshen/fleet/internal/state"
 	"github.com/edisonshen/fleet/internal/version"
 )
@@ -250,6 +251,10 @@ type Model struct {
 	// spawn indicator (issue #86) so its glyph rotates once per
 	// pollInterval. Wraps modulo len(coordSpawnGlyphs) at render time.
 	tickCount int
+	// reapInFlight is set while a background safe-reap (Slice B) pass runs
+	// so the 1 Hz tick doesn't stack overlapping reaps (single-flight).
+	// Cleared when tuiReapMsg lands.
+	reapInFlight bool
 
 	// coordSpawnTimeout is the age past which a coord-spawn marker is
 	// declared "stuck" and the project row flips from the spawning
@@ -553,6 +558,48 @@ const rotationFlashWindow = 3 * time.Second
 
 const pollInterval = 1 * time.Second
 
+// reapEveryTicks gates the background safe-reap (Slice B) so the 1 Hz
+// poll doesn't re-probe every second. Fires when tickCount is a
+// positive multiple of this (mirrors loop.py's _maybe_gc cadence).
+const reapEveryTicks = 30
+
+// tuiReapMsg carries the result of one background safe-reap pass:
+// the agent record IDs archived this pass (empty = nothing reaped).
+type tuiReapMsg struct{ reapedIDs []string }
+
+// tuiReapFn runs one safe orphan-agents reap and returns the archived
+// record IDs. Overridable so the tick→cmd→msg path is unit-testable
+// synchronously (no sleeps). Production: gc.Reconcile with Apply=true,
+// Kinds=[orphan-agents], SocketAmbiguous derived from FLEET_TMUX_SOCKET.
+// The TUI is same-socket by construction, so the default (socket unset)
+// auto-applies; a set socket forces surface-only.
+var tuiReapFn = func() []string {
+	report, _ := gc.Reconcile(gc.Options{
+		Apply:           true,
+		Kinds:           []gc.Kind{gc.KindOrphanAgents},
+		SocketAmbiguous: os.Getenv("FLEET_TMUX_SOCKET") != "",
+	}, gc.DefaultDeps())
+	var ids []string
+	for _, a := range report.Actions {
+		if a.Kind == gc.KindOrphanAgents && a.Verb == gc.VerbArchived {
+			ids = append(ids, a.Target)
+		}
+	}
+	return ids
+}
+
+// reapCmd fires tuiReapFn off the render path and wraps the result in a
+// tuiReapMsg for the Update reducer.
+func reapCmd() tea.Cmd {
+	return func() tea.Msg { return tuiReapMsg{reapedIDs: tuiReapFn()} }
+}
+
+// shouldReapNow gates the background safe-reap: single-flight (no
+// overlap) + cadence (a positive multiple of reapEveryTicks).
+func (m Model) shouldReapNow() bool {
+	return !m.reapInFlight && m.tickCount > 0 && m.tickCount%reapEveryTicks == 0
+}
+
 func tickCmd() tea.Cmd {
 	return tea.Tick(pollInterval, func(t time.Time) tea.Msg { return tickMsg(t) })
 }
@@ -673,7 +720,22 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// via coordSpawnSpinnerGlyph's modulo arithmetic — no need to
 		// reset here.
 		m.tickCount++
-		return m, tea.Batch(loadAgentsCmd(), loadDashboardCmd(), tickCmd())
+		cmds := []tea.Cmd{loadAgentsCmd(), loadDashboardCmd(), tickCmd()}
+		if m.shouldReapNow() {
+			m.reapInFlight = true
+			cmds = append(cmds, reapCmd())
+		}
+		return m, tea.Batch(cmds...)
+
+	case tuiReapMsg:
+		m.reapInFlight = false
+		if len(msg.reapedIDs) > 0 {
+			m.flash = &flashMsg{
+				text: fmt.Sprintf("reaped %d dead agent record(s): %s",
+					len(msg.reapedIDs), strings.Join(msg.reapedIDs, ", ")),
+			}
+		}
+		return m, nil
 
 	case fsEventMsg:
 		// fsnotify saw a change — refresh agents AND the dashboard
