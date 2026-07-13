@@ -18,6 +18,10 @@ import (
 // coord is surfaced-only (kept on disk + still rendered in the agents
 // block) so --coord-spawn recovery holds.
 func TestReap_RealReconcile_WorkerArchivedCoordSurfaced(t *testing.T) {
+	// Scope the reconcile's OrphanTmux scan to an empty temp dir so it does
+	// not walk real /tmp and exec 'tmux -S <sock> ls' on every stray socket
+	// (the PR #232 CI hang). This test's intent is the orphan-AGENTS reap.
+	t.Setenv("FLEET_GC_SCAN_DIR", t.TempDir())
 	pdir := withFleetHome(t)
 	// Archive is where r.Archive() moves reaped records; seed both dirs.
 	if err := os.MkdirAll(filepath.Join(filepath.Dir(pdir), "agents", "archive"), 0o755); err != nil {
