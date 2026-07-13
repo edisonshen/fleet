@@ -1258,7 +1258,11 @@ func TestDashboardRows_RendersSyntheticProjectFromAgent(t *testing.T) {
 // is filtered out of the right-column agents section so it doesn't
 // double-render. The coord-on-LEFT visual is owned by the project
 // block; the right column lists only loose / non-coord agents.
-func TestDashboardRows_CoordAttachedToProjectFiltersFromRight(t *testing.T) {
+// TestDashboardRows_CoordAppearsInAgentsBlock pins Slice A: a coord
+// record (linked via ProjectRow.CoordID) now renders as a row in the
+// right-column agents block alongside loose agents — dual-presence with
+// the LEFT coord line. Workers keep their own block.
+func TestDashboardRows_CoordAppearsInAgentsBlock(t *testing.T) {
 	withFleetHome(t)
 	m := New("test")
 	// Build a project with CoordID attached directly (avoids needing
@@ -1271,17 +1275,16 @@ func TestDashboardRows_CoordAttachedToProjectFiltersFromRight(t *testing.T) {
 	}
 	m.records = []*agent.Record{
 		{ID: "aaaa1111", Project: "fleet", SpawnedAt: time.Now()}, // coord
-		{ID: "bbbb2222", Project: "fleet", SpawnedAt: time.Now()}, // worker
+		{ID: "bbbb2222", Project: "fleet", SpawnedAt: time.Now()}, // loose agent
 	}
-	rows := m.dashboardRows()
 	var agentIDs []string
-	for _, r := range rows {
+	for _, r := range m.dashboardRows() {
 		if r.kind == rowAgent && r.agent != nil {
 			agentIDs = append(agentIDs, r.agent.ID)
 		}
 	}
-	if len(agentIDs) != 1 || agentIDs[0] != "bbbb2222" {
-		t.Errorf("right column should list only non-coord agents (bbbb2222), got %v", agentIDs)
+	if got, want := strings.Join(agentIDs, ","), "aaaa1111,bbbb2222"; got != want {
+		t.Errorf("agents block should list the coord + loose agent; got [%s] want [%s]", got, want)
 	}
 }
 
@@ -1363,14 +1366,14 @@ func TestAgentRowClassification(t *testing.T) {
 		{"live worker with worker row is skipped", []*agent.Record{representedWorker}, []string{representedWorker.TaskID}, nil, representedWorker.ID, nil},
 		{"live worker without worker row remains visible", []*agent.Record{noWorkerDir}, nil, nil, "", []string{noWorkerDir.ID}},
 		{"coordless agent remains visible", []*agent.Record{coordless}, nil, nil, "", []string{coordless.ID}},
-		{"coord is claimed by the project row", []*agent.Record{coord}, nil, nil, "", nil},
+		{"coord renders in the agents block", []*agent.Record{coord}, nil, nil, "", []string{coord.ID}},
 		{"legacy empty role task record remains visible", []*agent.Record{legacyEmptyRole}, nil, nil, "", []string{legacyEmptyRole.ID}},
 		{"cross-project taskID collision is not deduped", []*agent.Record{crossProject}, []string{crossProject.TaskID}, nil, "", []string{crossProject.ID}},
 		{
 			"mixed live records keep heading aligned with rendered agent rows",
 			[]*agent.Record{representedWorker, noWorkerDir, coordless, coord, legacyEmptyRole},
 			[]string{representedWorker.TaskID},
-			nil, "", []string{noWorkerDir.ID, coordless.ID, legacyEmptyRole.ID},
+			nil, "", []string{noWorkerDir.ID, coordless.ID, coord.ID, legacyEmptyRole.ID},
 		},
 	}
 
@@ -1387,10 +1390,10 @@ func TestAgentRowClassification(t *testing.T) {
 	}
 }
 
-// TestColumnHeading_AgentCountExcludesCoord pins the AGENTS sub-heading
-// counter: the coord doesn't count toward right-column "AGENTS N"
-// because it renders on the LEFT under its project (issue #55).
-func TestColumnHeading_AgentCountExcludesCoord(t *testing.T) {
+// TestColumnHeading_AgentCountIncludesCoord pins Slice A: the coord now
+// COUNTS toward the right-column "AGENTS N" heading because it renders in
+// the agents block. The worker-dedup + dead exclusions still apply.
+func TestColumnHeading_AgentCountIncludesCoord(t *testing.T) {
 	withFleetHome(t)
 	m := New("test")
 	m.width = 140
@@ -1403,17 +1406,90 @@ func TestColumnHeading_AgentCountExcludesCoord(t *testing.T) {
 	}
 	m.records = []*agent.Record{
 		{ID: "aaaa1111", Project: "fleet", SpawnedAt: time.Now()}, // coord
-		{ID: "bbbb2222", Project: "fleet", SpawnedAt: time.Now()}, // worker
-		{ID: "cccc3333", Project: "fleet", SpawnedAt: time.Now()}, // worker
+		{ID: "bbbb2222", Project: "fleet", SpawnedAt: time.Now()}, // loose agent
+		{ID: "cccc3333", Project: "fleet", SpawnedAt: time.Now()}, // loose agent
 	}
 	// Stub aliveByID so deriveStatus doesn't read all as dead.
 	m.aliveByID = map[string]bool{
 		"aaaa1111": true, "bbbb2222": true, "cccc3333": true,
 	}
 	out := m.View()
-	// 2 non-coord agents alive → "AGENTS 2".
-	if !strings.Contains(out, "AGENTS 2") {
-		t.Errorf("coord must be excluded from right-column AGENTS count; expected 'AGENTS 2', got:\n%s", out)
+	// coord + 2 loose agents, all alive → "AGENTS 3".
+	if !strings.Contains(out, "AGENTS 3") {
+		t.Errorf("coord must be included in right-column AGENTS count; expected 'AGENTS 3', got:\n%s", out)
+	}
+}
+
+// TestDashboardRows_CoordTaggedWorkerDeduped (A6) pins the full Slice A
+// membership rule in one render: a coord, a loose agent, and a worker
+// that owns a WorkerRow. The coord + loose agent land in the agents
+// block (coord carries the "coord" tag); the worker is deduped (stays in
+// the WORKERS block only, never duplicated into the agents list).
+func TestDashboardRows_CoordTaggedWorkerDeduped(t *testing.T) {
+	withFleetHome(t)
+	now := time.Now()
+	coord := &agent.Record{ID: "cccc0001", Project: "demo", TaskID: "coord-demo", IsCoord: true, TmuxSession: "fleet-cccc0001", SpawnedAt: now}
+	loose := &agent.Record{ID: "loose001", Project: "demo", TmuxSession: "fleet-loose001", SpawnedAt: now}
+	worker := &agent.Record{ID: "work0001", Project: "demo", TaskID: "build-x", TmuxSession: "fleet-work0001", SpawnedAt: now}
+
+	m := New("test")
+	m.dashboard = &Snapshot{
+		Projects: []*ProjectRow{{Name: "demo", RepoSlug: "demo"}},
+		Workers:  []*WorkerRow{{Project: "demo", Slug: "build-x"}},
+		LoadedAt: now,
+	}
+	m.records = []*agent.Record{coord, loose, worker}
+	m.aliveByID = map[string]bool{"cccc0001": true, "loose001": true, "work0001": true}
+
+	var agentIDs []string
+	for _, r := range m.dashboardRows() {
+		if r.kind == rowAgent && r.agent != nil {
+			agentIDs = append(agentIDs, r.agent.ID)
+		}
+	}
+	if got, want := strings.Join(agentIDs, ","), "cccc0001,loose001"; got != want {
+		t.Errorf("agents block = [%s]; want [%s] (coord + loose; worker deduped)", got, want)
+	}
+	// Coord row carries the "coord" tag distinguishing it from a loose agent.
+	block := strings.Join(agentBlockLinesWithFlash(coord, m.aliveByID, 60, false, ""), "\n")
+	if !strings.Contains(block, "coord") {
+		t.Errorf("coord row must carry the 'coord' tag; got:\n%s", block)
+	}
+}
+
+// TestView_CoordDualPresence (A7) is the e2e: a full m.View() shows the
+// coord in the RIGHT agents block (counted) AND on the LEFT coord line,
+// while the WORKERS block still renders (unchanged layout).
+func TestView_CoordDualPresence(t *testing.T) {
+	withFleetHome(t)
+	now := time.Now()
+	m := New("test")
+	m.width = 140
+	m.height = 30
+	m.dashboard = &Snapshot{
+		Projects: []*ProjectRow{{Name: "demo", RepoSlug: "demo", CoordID: "cccc0001", Active: true}},
+		LoadedAt: now,
+	}
+	m.records = []*agent.Record{
+		{ID: "cccc0001", Project: "demo", TaskID: "coord-demo", IsCoord: true, TmuxSession: "fleet-cccc0001", ContextPct: floatPtr(48.0), SpawnedAt: now},
+	}
+	m.aliveByID = map[string]bool{"cccc0001": true}
+	out := m.View()
+	// Dual-presence: the coord ID renders on BOTH left (coord line) + right.
+	if n := strings.Count(out, "cccc0001"); n < 2 {
+		t.Errorf("coord must render on BOTH left + right (dual-presence); saw ID %d time(s):\n%s", n, out)
+	}
+	// Right agents block counts the coord.
+	if !strings.Contains(out, "AGENTS 1") {
+		t.Errorf("agents heading must count the coord (AGENTS 1); got:\n%s", out)
+	}
+	// WORKERS block still present.
+	if !strings.Contains(out, "WORKERS") {
+		t.Errorf("WORKERS block must still render (unchanged layout); got:\n%s", out)
+	}
+	// LEFT coord line label.
+	if !strings.Contains(out, "coord ") {
+		t.Errorf("left coord line must render; got:\n%s", out)
 	}
 }
 
@@ -1579,7 +1655,10 @@ func TestDashboard_CoordSignal_DeadSessionNotPromoted(t *testing.T) {
 // invariant: once unifiedProjects fills CoordID via the task_id
 // fallback, dashboardRows must NOT also list the same agent in the
 // right-column agents section. The coord renders on LEFT only.
-func TestDashboard_FiltersClaimedCoordFromRight(t *testing.T) {
+// TestDashboard_ClaimedCoordAppearsOnRight pins Slice A for a coord
+// resolved via the lease fallback (task_id=coord-<proj>): it now renders
+// on the RIGHT agents block too, not only on the LEFT.
+func TestDashboard_ClaimedCoordAppearsOnRight(t *testing.T) {
 	(&stubSessionAlive{}).install(t)
 	(&stubProjectTreeExists{}).install(t)
 	(&stubCoordLeaseIdentity{markers: map[string]string{"demo": "c00bf001"}}).install(t)
@@ -1593,15 +1672,14 @@ func TestDashboard_FiltersClaimedCoordFromRight(t *testing.T) {
 		{ID: "c00bf001", Project: "demo", TaskID: "coord-demo", TmuxSession: "fleet-c00bf001", SpawnedAt: time.Now()},
 		{ID: "bbbb2222", Project: "demo", TaskID: "regular-task", TmuxSession: "fleet-bbbb2222", SpawnedAt: time.Now()},
 	}
-	rows := m.dashboardRows()
 	var agentIDs []string
-	for _, r := range rows {
+	for _, r := range m.dashboardRows() {
 		if r.kind == rowAgent && r.agent != nil {
 			agentIDs = append(agentIDs, r.agent.ID)
 		}
 	}
-	if len(agentIDs) != 1 || agentIDs[0] != "bbbb2222" {
-		t.Errorf("coord must be filtered from RIGHT (claimed by LEFT); got %v want [bbbb2222]", agentIDs)
+	if got, want := strings.Join(agentIDs, ","), "c00bf001,bbbb2222"; got != want {
+		t.Errorf("coord must appear on the RIGHT (dual-presence); got [%s] want [%s]", got, want)
 	}
 }
 

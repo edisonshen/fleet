@@ -1800,14 +1800,16 @@ func TestUpdate_RmDoneFailureSetsErrorFlash(t *testing.T) {
 // reaches this case when the coord's session has died (so the alive
 // gate fails and the row resurfaces on RIGHT) or when they explicitly
 // archive via `fleet rm <id>` from the shell.
-func TestKeyX_ArchiveCoord_CleansUpAgentAndSession(t *testing.T) {
+// TestKeyX_ArchiveCoord_RefusedAndRedirected pins the Slice A safety
+// guard: now that coords render in the selectable agents block, [x] on a
+// coord row must REFUSE (no `fleet rm`, no confirm mode) and redirect to
+// [h]/[r] on the project row. The PREFIX predicate catches this legacy
+// fixture (IsCoord=false, Project="", TaskID="coord-demo") that a
+// coordTaskID(Project)-equality form (coordTaskID("")=="coord-") misses.
+func TestKeyX_ArchiveCoord_RefusedAndRedirected(t *testing.T) {
 	stub := &stubFleetCmd{}
 	stub.install(t)
-	// Dead session: the coord shows on RIGHT (alive-gate in the
-	// dashboard fallback claims fails) so the cursor can land on it.
-	// [x] still routes through to `fleet rm`; the rm command does the
-	// dead-session-tolerant cleanup itself (rm.go line 119 — skips kill
-	// when SessionAlive returns false, archives anyway).
+	// Dead session: the coord shows on RIGHT so the cursor can land on it.
 	(&stubSessionAlive{dead: map[string]bool{"fleet-c00bf001": true}}).install(t)
 
 	coord := agent.New("c00bf001")
@@ -1820,34 +1822,48 @@ func TestKeyX_ArchiveCoord_CleansUpAgentAndSession(t *testing.T) {
 	if row == nil || row.kind != rowAgent || row.agent == nil || row.agent.ID != "c00bf001" {
 		t.Fatalf("cursor not on coord's agent row; got %+v", row)
 	}
-	// actionArchive's rowAgent branch is gated on deriveStatus != auto-red/
-	// precompact. With no handoff_type the coord status is "ok"/"dead";
-	// either passes the gate.
-	mm1, _, handled := m.actionArchive()
+	mm1, cmd, handled := m.actionArchive()
 	if !handled {
 		t.Fatal("[x] not handled by actionArchive on coord row")
 	}
-	if mm1.mode != modeConfirmArchive {
-		t.Fatalf("after [x], mode = %v; want modeConfirmArchive", mm1.mode)
+	if cmd != nil {
+		t.Fatal("[x] on a coord must not return a command (no rm)")
 	}
-	if mm1.archiveCandidate != "c00bf001" {
-		t.Fatalf("archiveCandidate = %q; want c00bf001", mm1.archiveCandidate)
+	if mm1.mode != modeNav {
+		t.Fatalf("after [x] on coord, mode = %v; want modeNav (refused, no confirm)", mm1.mode)
 	}
-	// Confirm via [y] — must shell out to `fleet rm c00bf001`.
-	updated, cmd := mm1.Update(keyMsg("y"))
-	if cmd == nil {
-		t.Fatal("expected rm cmd from [y] confirm")
+	if mm1.archiveCandidate != "" {
+		t.Errorf("coord must not be staged for archive; archiveCandidate = %q", mm1.archiveCandidate)
 	}
-	mm2 := updated.(Model)
-	if mm2.mode != modeNav {
-		t.Errorf("mode after [y] = %v; want modeNav", mm2.mode)
+	if mm1.flash == nil || !mm1.flash.isErr || !strings.Contains(mm1.flash.text, "coord") {
+		t.Fatalf("expected a coord-refusal flash mentioning coord; got %+v", mm1.flash)
 	}
-	_ = cmd()
-	if len(stub.calls) != 1 {
-		t.Fatalf("expected 1 fleet call (rm); got %d (%v)", len(stub.calls), stub.calls)
+	if len(stub.calls) != 0 {
+		t.Fatalf("coord [x] must not shell out (no `fleet rm`); got calls %v", stub.calls)
 	}
-	if stub.calls[0][0] != "rm" || stub.calls[0][1] != "c00bf001" {
-		t.Errorf("expected ['rm', 'c00bf001']; got %v", stub.calls[0])
+}
+
+// TestRecordIsCoord_PrefixForm (A8) pins the exact discriminator the [x]
+// guard, the coord tag, and the GC skip all share. The prefix form
+// classifies a legacy coord (Project="", TaskID="coord-demo") as a coord
+// (the coordTaskID(Project)-equality form would NOT), and a plain worker
+// as not-coord.
+func TestRecordIsCoord_PrefixForm(t *testing.T) {
+	cases := []struct {
+		name string
+		rec  *agent.Record
+		want bool
+	}{
+		{"legacy coord empty project", &agent.Record{TaskID: "coord-demo"}, true},
+		{"project-scoped coord", &agent.Record{TaskID: "coord-projX", Project: "projX"}, true},
+		{"IsCoord flag without prefix", &agent.Record{IsCoord: true}, true},
+		{"plain worker", &agent.Record{TaskID: "build", Project: "projX"}, false},
+		{"nil record", nil, false},
+	}
+	for _, tc := range cases {
+		if got := recordIsCoord(tc.rec); got != tc.want {
+			t.Errorf("%s: recordIsCoord = %v; want %v", tc.name, got, tc.want)
+		}
 	}
 }
 

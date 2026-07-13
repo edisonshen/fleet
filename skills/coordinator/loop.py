@@ -77,6 +77,7 @@ _ARCHIVE_SCAN_CAP = 200
 # tick"; overridable via FLEET_WORKTREE_GC_EVERY for operators who want a
 # tighter/looser cadence (<=0 disables the backstop entirely).
 _WORKTREE_GC_EVERY_DEFAULT = 20
+_ORPHAN_AGENTS_GC_EVERY_DEFAULT = 20
 
 
 def _in_turn_supervisor_enabled() -> bool:
@@ -165,6 +166,22 @@ def _worktree_gc_every() -> int:
         return int(raw)
     except (TypeError, ValueError):
         return _WORKTREE_GC_EVERY_DEFAULT
+
+
+def _orphan_agents_gc_every() -> int:
+    """Resolve the orphan-agents-GC cadence (ticks between backstop runs).
+
+    Reads FLEET_ORPHAN_AGENTS_GC_EVERY; falls back to
+    _ORPHAN_AGENTS_GC_EVERY_DEFAULT. A value <= 0 disables the backstop.
+    A non-integer value falls back to the default.
+    """
+    raw = os.environ.get("FLEET_ORPHAN_AGENTS_GC_EVERY", "")
+    if not raw:
+        return _ORPHAN_AGENTS_GC_EVERY_DEFAULT
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return _ORPHAN_AGENTS_GC_EVERY_DEFAULT
 
 # How long after a subagent's archived_at the audit keeps probing its
 # branch for bonus PRs. Past this window the audit considers the
@@ -1502,6 +1519,13 @@ def _tick_locked(
         )
     except Exception as exc:  # noqa: BLE001
         result.errors.append(f"worktree-gc: {exc}")
+
+    try:
+        _maybe_gc_orphan_agents(
+            state, project=project, fleet_bin=fleet_bin, result=result,
+        )
+    except Exception as exc:  # noqa: BLE001
+        result.errors.append(f"orphan-agents-gc: {exc}")
 
     # 6. Supervisor loop (issue #79). After the initial reconcile + drain
     # + dispatch pass the legacy behavior kept the lock and watched
@@ -6603,6 +6627,39 @@ def _maybe_gc_worktrees(
     if proc.returncode != 0:
         msg = (proc.stderr or proc.stdout or "").strip() or f"exit {proc.returncode}"
         result.errors.append(f"worktree-gc backstop nonzero exit: {msg}")
+    return True
+
+
+def _maybe_gc_orphan_agents(state, *, project, fleet_bin, result) -> bool:
+    """Run the Go orphan-agents reaper every-N-ticks (Slice B safe auto-reap).
+
+    Mirrors _maybe_gc_worktrees: bounded cadence + coord-scope strict
+    (--project <p>) + fail-soft. Shells `fleet gc --apply
+    --kinds=orphan-agents --project <p>` so dead NON-coord agent records
+    for THIS project are archived; the Go reconciler surfaces (never
+    archives) coord records. --project keeps a per-project coord from
+    reaping other projects' records. Returns True iff gc was invoked.
+    """
+    every = _orphan_agents_gc_every()
+    if every <= 0:
+        return False
+    try:
+        tick_count = int(state.get("tick_count", 0) or 0)
+    except (TypeError, ValueError):
+        tick_count = 0
+    if tick_count <= 0 or (tick_count % every) != 0:
+        return False
+    try:
+        proc = subprocess.run(
+            [fleet_bin, "gc", "--apply", "--kinds=orphan-agents", "--project", project],
+            capture_output=True, text=True, timeout=120.0, check=False,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
+        result.errors.append(f"orphan-agents-gc backstop: {exc}")
+        return True
+    if proc.returncode != 0:
+        msg = (proc.stderr or proc.stdout or "").strip() or f"exit {proc.returncode}"
+        result.errors.append(f"orphan-agents-gc backstop nonzero exit: {msg}")
     return True
 
 

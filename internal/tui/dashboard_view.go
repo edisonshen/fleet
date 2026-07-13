@@ -324,21 +324,10 @@ func renderColumnHeadings(m Model, leftW, rightW int) string {
 	if m.dashboard != nil {
 		wn = len(m.dashboard.Workers)
 	}
-	// Coord IDs are rendered as part of the project block on the LEFT,
-	// so they shouldn't count toward the RIGHT-column agents header.
-	coordIDs := map[string]bool{}
-	for _, p := range m.unifiedProjects() {
-		if p.CoordID != "" {
-			coordIDs[p.CoordID] = true
-		}
-	}
 	workerSlugs := workerSlugSetFromDashboard(m.dashboard)
 	an := 0
 	for _, r := range m.records {
 		if r == nil {
-			continue
-		}
-		if coordIDs[r.ID] {
 			continue
 		}
 		if deriveStatus(r, m.aliveByID) == "dead" {
@@ -1771,6 +1760,17 @@ func agentBlockLinesWithFlash(r *agent.Record, alive map[string]bool, width int,
 	bar := renderContextBar(r.ContextPct)
 	tag := renderHandoffTag(r.HandoffType)
 	chips := joinChips(bar, tag)
+	// Coord tag — distinguishes a coord row from a loose agent in the
+	// agents block (coords now render here per Slice A). Prefix predicate
+	// matches recordIsCoord (keys.go).
+	if r.IsCoord || strings.HasPrefix(r.TaskID, "coord-") {
+		coordChip := dimStyle.Render("coord")
+		if chips != "" {
+			chips = coordChip + " " + chips
+		} else {
+			chips = coordChip
+		}
+	}
 	// Rotation chip ("→ <succ>") appended last so it reads
 	// left-to-right after the context + handoff state. dimStyle
 	// matches the placeholder language of the existing slug/age

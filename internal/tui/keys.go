@@ -683,6 +683,16 @@ func (m Model) actionArchive() (Model, tea.Cmd, bool) {
 			return m, nil, true
 		}
 		cur := row.agent
+		// Coord rows: [x] (archive → `fleet rm`, which kills the session with
+		// no handoff and no replacement) would orphan the coord lock and wedge
+		// the project. Refuse + redirect to [h]/[r] on the project row.
+		if recordIsCoord(cur) {
+			m.flash = &flashMsg{
+				text:  "[x] can't archive a coord — use [h] handoff or [r] reset on its project row (left panel)",
+				isErr: true,
+			}
+			return m, nil, true
+		}
 		status := deriveStatus(cur, m.aliveByID)
 		if status == "auto-red" || status == "precompact" {
 			m.flash = &flashMsg{
@@ -1780,6 +1790,15 @@ func findRecordByID(records []*agent.Record, id string) *agent.Record {
 // so this never embeds a path-unsafe component.
 func coordTaskID(projectName string) string {
 	return "coord-" + projectName
+}
+
+// recordIsCoord reports whether an agent record is a coordinator via the
+// project-independent PREFIX form (IsCoord OR task_id "coord-…") matching
+// shouldSkipArchiveForRecovery (dispatch.go). The prefix catches a legacy
+// record (IsCoord=false, Project="", TaskID="coord-demo") that a
+// coordTaskID(Project)-equality form would miss.
+func recordIsCoord(r *agent.Record) bool {
+	return r != nil && (r.IsCoord || strings.HasPrefix(r.TaskID, "coord-"))
 }
 
 // findCoordByLockBody returns the alive agent whose ID is written

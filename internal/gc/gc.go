@@ -93,6 +93,12 @@ const (
 	// record. Idempotent on already-dead PIDs. See drain_procs.go.
 )
 
+// coordTaskIDPrefix mirrors cmd/fleet's CoordTaskIDPrefix ("coord-").
+// internal/gc cannot import cmd/fleet, so the literal is duplicated here;
+// keep in sync. reconcileOrphanAgents uses it to surface-only (never
+// archive) dead coord records, which are owned by --coord-spawn recovery.
+const coordTaskIDPrefix = "coord-"
+
 // AllKinds is the default --kinds set when the flag is omitted.
 var AllKinds = []Kind{KindSockets, KindOrphanAgents, KindOrphanTmux, KindWorktrees, KindCoordLocks, KindWorkerRecords, KindInvalidProjects, KindOrphanRCDaemons, KindDrainProcs, KindStaleCoords, KindOrphanKicked}
 
@@ -154,6 +160,14 @@ type Options struct {
 	// classifier runs reconcileLegacyDrains IN ADDITION to the
 	// steady-state run-record pass. Default false (run-record path only).
 	LegacyDrains bool
+	// SocketAmbiguous, when true, forces the orphan-agents reap to
+	// SURFACE-ONLY (emit would-archive, never archive) even for non-coord
+	// records — the tmux session probe uses the CURRENT FLEET_TMUX_SOCKET and
+	// a live agent spawned on a different socket reads as gone. The reconciler
+	// stays pure: the CALLER computes SocketAmbiguous = (FLEET_TMUX_SOCKET !=
+	// ""). Zero value false = authoritative single-socket probe (auto-archive
+	// allowed).
+	SocketAmbiguous bool
 }
 
 // Deps groups every external read/write Reconcile needs. Tests stub
@@ -762,16 +776,14 @@ func reconcileSockets(r *Report, opts Options, deps Deps) error {
 // tmux.SessionAlive probes the CURRENT FLEET_TMUX_SOCKET (see
 // internal/tmux/tmux.go:tmuxArgs). agent.Record does not persist the
 // socket path it was spawned on, so a live agent on a different
-// socket can appear "missing" to this classifier and be archived.
+// socket can appear "missing" to this classifier. Callers set
+// Options.SocketAmbiguous when FLEET_TMUX_SOCKET is non-empty so this
+// classifier surfaces would-archive actions without auto-archiving.
 // The same constraint exists in cmd/fleet/handoff.go (SessionAlive at
 // handoff.go:281/397/402/817/820/etc — see the explicit acknowledgement
 // at handoff.go:444). Fixing this properly requires persisting the
 // socket path in agent.Record, which is a schema change tracked
-// separately. Operators running `fleet gc --apply` from a shell with
-// FLEET_TMUX_SOCKET set differently from spawn time can mis-archive;
-// the runGC entrypoint prints a stderr warning when FLEET_TMUX_SOCKET
-// is set + Apply=true + KindOrphanAgents is enabled, so the operator
-// can abort. Defaults (dry-run, FLEET_TMUX_SOCKET unset) are safe.
+// separately. Defaults (dry-run, FLEET_TMUX_SOCKET unset) are safe.
 func reconcileOrphanAgents(r *Report, opts Options, deps Deps) error {
 	records, err := deps.ListAgents()
 	if err != nil {
@@ -801,9 +813,16 @@ func reconcileOrphanAgents(r *Report, opts Options, deps Deps) error {
 		if alive {
 			continue
 		}
-		act := Action{Kind: KindOrphanAgents, Target: rec.ID, Verb: VerbWouldArchive,
-			Reason: fmt.Sprintf("tmux session %s gone", rec.TmuxSession)}
-		if opts.Apply {
+		act := Action{Kind: KindOrphanAgents, Target: rec.ID, Verb: VerbWouldArchive, Reason: fmt.Sprintf("tmux session %s gone", rec.TmuxSession)}
+		// Coord records: emit the would-archive action so the dispatch/status
+		// coord-recovery surfacing still works, but NEVER upgrade to archived —
+		// dead coord records are recovery-owned (dispatch.go
+		// shouldSkipArchiveForRecovery). Local HasPrefix: internal/gc cannot
+		// import cmd/fleet's CoordTaskIDPrefix. A bare `continue` would drop the
+		// action and regress recovery surfacing, so this is surface-only, not a
+		// skip.
+		isCoord := rec.IsCoord || strings.HasPrefix(rec.TaskID, coordTaskIDPrefix)
+		if opts.Apply && !isCoord && !opts.SocketAmbiguous {
 			if aerr := deps.ArchiveAgent(rec); aerr != nil {
 				act.Reason = fmt.Sprintf("archive failed: %v", aerr)
 			} else {
