@@ -457,88 +457,113 @@ func TestWorkersDelete_RejectsArchiveSlug(t *testing.T) {
 
 // ---------- three-stage flow review CLI (reviewer-subagent-arch) ----------
 
-// TestWorkersUpdateCLI_ReviewCodexSkipReasonAllowlist: the CLI flag
-// rejects skip reasons outside the documented allowlist
-// (rate-limited|unavailable) BEFORE state.json is touched. The hard
-// state-layer gate is workers.WriteState; this CLI guard surfaces a
-// friendly error before that fires.
-func TestWorkersUpdateCLI_ReviewCodexSkipReasonAllowlist(t *testing.T) {
-	_, project := setupTasksHome(t)
-
+func TestWorkersUpdateCLI_ReviewValidation(t *testing.T) {
 	cases := []struct {
 		name      string
-		reason    string
+		opts      func(project string) *workersUpdateOpts
 		wantError bool
+		check     func(t *testing.T, project, slug string)
 	}{
-		{name: "rate-limited accepted", reason: "rate-limited", wantError: false},
-		{name: "unavailable accepted", reason: "unavailable", wantError: false},
-		// "no-git" is the documented skip reason for non-git projects
-		// (operator clarification 2026-05-12). Codex review needs a git
-		// diff; non-git workers record this and continue.
-		{name: "no-git accepted", reason: "no-git", wantError: false},
-		{name: "empty rejected", reason: "", wantError: true},
-		{name: "didn't feel like it rejected", reason: "lazy", wantError: true},
-		{name: "uppercase rejected", reason: "RATE-LIMITED", wantError: true},
+		{
+			name: "single claude degraded alpha accepted",
+			opts: func(project string) *workersUpdateOpts {
+				return &workersUpdateOpts{
+					project: project, phase: "review-done",
+					reviewAlphaStatus: "single-claude-degraded", reviewAlphaStatusSet: true,
+					reviewAlphaEngine: "claude", reviewAlphaEngineSet: true,
+					reviewAlphaModel: "opus-4.8", reviewAlphaModelSet: true,
+				}
+			},
+		},
+		{
+			name: "codex engine alpha slot skipped accepted",
+			opts: func(project string) *workersUpdateOpts {
+				return &workersUpdateOpts{
+					project: project, phase: "review-done",
+					reviewAlphaStatus: "skipped", reviewAlphaStatusSet: true,
+					reviewAlphaEngine: "codex", reviewAlphaEngineSet: true,
+					reviewAlphaModel: "codex-default", reviewAlphaModelSet: true,
+					reviewAlphaSkipReason: "rate-limited", reviewAlphaSkipReasonSet: true,
+				}
+			},
+		},
+		{
+			name: "claude engine alpha slot skipped rejected",
+			opts: func(project string) *workersUpdateOpts {
+				return &workersUpdateOpts{
+					project: project, phase: "review-done",
+					reviewAlphaStatus: "skipped", reviewAlphaStatusSet: true,
+					reviewAlphaEngine: "claude", reviewAlphaEngineSet: true,
+					reviewAlphaModel: "sonnet-5", reviewAlphaModelSet: true,
+					reviewAlphaSkipReason: "rate-limited", reviewAlphaSkipReasonSet: true,
+				}
+			},
+			wantError: true,
+		},
+		{
+			name: "skip reason without skipped status rejected",
+			opts: func(project string) *workersUpdateOpts {
+				return &workersUpdateOpts{
+					project: project, phase: "review-done",
+					reviewAlphaStatus: "passed", reviewAlphaStatusSet: true,
+					reviewAlphaEngine: "codex", reviewAlphaEngineSet: true,
+					reviewAlphaModel: "codex-default", reviewAlphaModelSet: true,
+					reviewAlphaSkipReason: "rate-limited", reviewAlphaSkipReasonSet: true,
+				}
+			},
+			wantError: true,
+		},
+		{
+			name: "reset clears both slot state",
+			opts: func(project string) *workersUpdateOpts {
+				return &workersUpdateOpts{project: project, phase: "starting"}
+			},
+			check: func(t *testing.T, project, slug string) {
+				t.Helper()
+				st, err := workers.ReadState(project, slug)
+				if err != nil {
+					t.Fatalf("read: %v", err)
+				}
+				if st.ReviewAlphaStatus != "" || st.ReviewAlphaRounds != 0 || st.ReviewAlphaSkipReason != "" || st.ReviewAlphaEngine != "" || st.ReviewAlphaModel != "" {
+					t.Fatalf("alpha state not cleared: %#v", st)
+				}
+				if st.ReviewBetaStatus != "" || st.ReviewBetaRounds != 0 || st.ReviewBetaSkipReason != "" || st.ReviewBetaEngine != "" || st.ReviewBetaModel != "" {
+					t.Fatalf("beta state not cleared: %#v", st)
+				}
+			},
+		},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
+			_, project := setupTasksHome(t)
 			slug := "rev-cli-" + sanitizeCLISlug(c.name)
-			opts := &workersUpdateOpts{
-				project: project, phase: "review-done",
-				reviewClaudeStatus:       "passed",
-				reviewClaudeStatusSet:    true,
-				reviewClaudeRounds:       1,
-				reviewClaudeRoundsSet:    true,
-				reviewCodexStatus:        "skipped",
-				reviewCodexStatusSet:     true,
-				reviewCodexSkipReason:    c.reason,
-				reviewCodexSkipReasonSet: true,
+			if c.check != nil {
+				if err := runWorkersUpdate(slug, &workersUpdateOpts{
+					project: project, phase: "review-done",
+					reviewAlphaStatus: "skipped", reviewAlphaStatusSet: true,
+					reviewAlphaRounds: 2, reviewAlphaRoundsSet: true,
+					reviewAlphaSkipReason: "rate-limited", reviewAlphaSkipReasonSet: true,
+					reviewAlphaEngine: "codex", reviewAlphaEngineSet: true,
+					reviewAlphaModel: "codex-default", reviewAlphaModelSet: true,
+					reviewBetaStatus: "passed", reviewBetaStatusSet: true,
+					reviewBetaRounds: 1, reviewBetaRoundsSet: true,
+					reviewBetaEngine: "claude", reviewBetaEngineSet: true,
+					reviewBetaModel: "opus-4.8", reviewBetaModelSet: true,
+				}, &bytes.Buffer{}); err != nil {
+					t.Fatalf("seed review-done: %v", err)
+				}
 			}
-			err := runWorkersUpdate(slug, opts, &bytes.Buffer{})
+			err := runWorkersUpdate(slug, c.opts(project), &bytes.Buffer{})
 			if c.wantError && err == nil {
-				t.Errorf("reason=%q: expected error", c.reason)
+				t.Fatal("expected error, got nil")
 			}
 			if !c.wantError && err != nil {
-				t.Errorf("reason=%q: unexpected error: %v", c.reason, err)
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if c.check != nil {
+				c.check(t, project, slug)
 			}
 		})
-	}
-}
-
-// TestWorkersUpdateCLI_ReviewClaudeSkippedRejected: /review can never
-// be skipped — it's the load-bearing reviewer. The CLI rejects
-// --review-claude-status=skipped at the flag layer.
-func TestWorkersUpdateCLI_ReviewClaudeSkippedRejected(t *testing.T) {
-	_, project := setupTasksHome(t)
-	err := runWorkersUpdate("rev-cli-claude-skip", &workersUpdateOpts{
-		project: project, phase: "review-done",
-		reviewClaudeStatus:    "skipped",
-		reviewClaudeStatusSet: true,
-	}, &bytes.Buffer{})
-	if err == nil {
-		t.Fatal("--review-claude-status=skipped should be rejected")
-	}
-	if !strings.Contains(err.Error(), "skipped") {
-		t.Errorf("error should mention skipped: %v", err)
-	}
-}
-
-// TestWorkersUpdateCLI_ReviewCodexSkipReasonWithoutSkippedStatusRejected:
-// setting --review-codex-skip-reason without --review-codex-status=skipped
-// is a confused call (reason has no terminal status to anchor it).
-func TestWorkersUpdateCLI_ReviewCodexSkipReasonWithoutSkippedStatusRejected(t *testing.T) {
-	_, project := setupTasksHome(t)
-	err := runWorkersUpdate("rev-cli-confused", &workersUpdateOpts{
-		project: project, phase: "review-done",
-		reviewClaudeStatus:       "passed",
-		reviewClaudeStatusSet:    true,
-		reviewCodexStatus:        "passed",
-		reviewCodexStatusSet:     true,
-		reviewCodexSkipReason:    "rate-limited", // dangling
-		reviewCodexSkipReasonSet: true,
-	}, &bytes.Buffer{})
-	if err == nil {
-		t.Fatal("skip reason without skipped status should be rejected")
 	}
 }
 
@@ -561,14 +586,15 @@ func TestWorkersUpdateCLI_ReviewFieldsPersist(t *testing.T) {
 	// Step 2: reviewer subagent writes review-done + terminal status.
 	if err := runWorkersUpdate(slug, &workersUpdateOpts{
 		project: project, phase: "review-done",
-		reviewClaudeStatus:       "passed",
-		reviewClaudeStatusSet:    true,
-		reviewClaudeRounds:       3,
-		reviewClaudeRoundsSet:    true,
-		reviewCodexStatus:        "skipped",
-		reviewCodexStatusSet:     true,
-		reviewCodexSkipReason:    "rate-limited",
-		reviewCodexSkipReasonSet: true,
+		reviewAlphaStatus: "skipped", reviewAlphaStatusSet: true,
+		reviewAlphaRounds: 3, reviewAlphaRoundsSet: true,
+		reviewAlphaSkipReason: "rate-limited", reviewAlphaSkipReasonSet: true,
+		reviewAlphaEngine: "codex", reviewAlphaEngineSet: true,
+		reviewAlphaModel: "codex-default", reviewAlphaModelSet: true,
+		reviewBetaStatus: "passed", reviewBetaStatusSet: true,
+		reviewBetaRounds: 1, reviewBetaRoundsSet: true,
+		reviewBetaEngine: "claude", reviewBetaEngineSet: true,
+		reviewBetaModel: "opus-4.8", reviewBetaModelSet: true,
 	}, &bytes.Buffer{}); err != nil {
 		t.Fatalf("review-done: %v", err)
 	}
@@ -587,74 +613,17 @@ func TestWorkersUpdateCLI_ReviewFieldsPersist(t *testing.T) {
 	if st.Phase != workers.PhasePush {
 		t.Errorf("phase=%q; want push", st.Phase)
 	}
-	if st.ReviewClaudeStatus != workers.ReviewStatusPassed {
-		t.Errorf("claude=%q; want passed", st.ReviewClaudeStatus)
+	if st.ReviewAlphaStatus != workers.ReviewStatusSkipped {
+		t.Errorf("alpha=%q; want skipped", st.ReviewAlphaStatus)
 	}
-	if st.ReviewClaudeRounds != 3 {
-		t.Errorf("claude rounds=%d; want 3", st.ReviewClaudeRounds)
+	if st.ReviewAlphaRounds != 3 {
+		t.Errorf("alpha rounds=%d; want 3", st.ReviewAlphaRounds)
 	}
-	if st.ReviewCodexStatus != workers.ReviewStatusSkipped {
-		t.Errorf("codex=%q; want skipped", st.ReviewCodexStatus)
+	if st.ReviewAlphaSkipReason != "rate-limited" {
+		t.Errorf("alpha skip reason=%q; want rate-limited", st.ReviewAlphaSkipReason)
 	}
-	if st.ReviewCodexSkipReason != "rate-limited" {
-		t.Errorf("skip reason=%q; want rate-limited", st.ReviewCodexSkipReason)
-	}
-}
-
-// TestWorkersUpdateCLI_PushRejectedWithoutReview: the CLI must
-// surface the state-layer phase=push gate to the caller. A finisher
-// that tries to flip phase=push on a worker without review terminal
-// status sees the error.
-func TestWorkersUpdateCLI_PushRejectedWithoutReview(t *testing.T) {
-	_, project := setupTasksHome(t)
-	slug := "rev-cli-push-noreview-aaaa"
-	// Worker reached review-pending but no reviewer ever ran.
-	if err := runWorkersUpdate(slug, &workersUpdateOpts{
-		project: project, phase: "review-pending",
-	}, &bytes.Buffer{}); err != nil {
-		t.Fatalf("review-pending: %v", err)
-	}
-	// Finisher tries to skip ahead to push without the reviewer.
-	err := runWorkersUpdate(slug, &workersUpdateOpts{
-		project: project, phase: "push",
-	}, &bytes.Buffer{})
-	if err == nil {
-		t.Fatal("phase=push without review terminal status should be rejected")
-	}
-}
-
-// TestWorkersUpdateCLI_StartingClearsReviewState: a re-dispatch
-// (phase=starting) must reset the prior attempt's review fields.
-// Otherwise a worker that bypassed the reviewer on retry would
-// inherit "passed" from the previous attempt.
-func TestWorkersUpdateCLI_StartingClearsReviewState(t *testing.T) {
-	_, project := setupTasksHome(t)
-	slug := "rev-cli-redispatch-aaaa"
-	// Prior attempt: reached review-done with passed status.
-	if err := runWorkersUpdate(slug, &workersUpdateOpts{
-		project: project, phase: "review-done",
-		reviewClaudeStatus:    "passed",
-		reviewClaudeStatusSet: true,
-		reviewCodexStatus:     "passed",
-		reviewCodexStatusSet:  true,
-	}, &bytes.Buffer{}); err != nil {
-		t.Fatalf("seed review-done: %v", err)
-	}
-	// Re-dispatch.
-	if err := runWorkersUpdate(slug, &workersUpdateOpts{
-		project: project, phase: "starting",
-	}, &bytes.Buffer{}); err != nil {
-		t.Fatalf("re-dispatch starting: %v", err)
-	}
-	st, err := workers.ReadState(project, slug)
-	if err != nil {
-		t.Fatalf("read: %v", err)
-	}
-	if st.ReviewClaudeStatus != "" {
-		t.Errorf("claude not cleared: %q", st.ReviewClaudeStatus)
-	}
-	if st.ReviewCodexStatus != "" {
-		t.Errorf("codex not cleared: %q", st.ReviewCodexStatus)
+	if st.ReviewBetaStatus != workers.ReviewStatusPassed {
+		t.Errorf("beta=%q; want passed", st.ReviewBetaStatus)
 	}
 }
 

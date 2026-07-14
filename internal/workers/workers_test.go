@@ -784,11 +784,15 @@ func TestStateRoundTrip_ReviewFields(t *testing.T) {
 		Phase:                 PhaseReviewDone,
 		StartedAt:             time.Date(2026, 5, 11, 14, 0, 0, 0, time.UTC),
 		PID:                   12345,
-		ReviewClaudeStatus:    ReviewStatusPassed,
-		ReviewClaudeRounds:    3,
-		ReviewCodexStatus:     ReviewStatusSkipped,
-		ReviewCodexRounds:     0,
-		ReviewCodexSkipReason: "rate-limited",
+		ReviewAlphaStatus:     ReviewStatusSkipped,
+		ReviewAlphaRounds:     3,
+		ReviewAlphaSkipReason: "rate-limited",
+		ReviewAlphaEngine:     ReviewEngineCodex,
+		ReviewAlphaModel:      "codex-default",
+		ReviewBetaStatus:      ReviewStatusPassed,
+		ReviewBetaRounds:      1,
+		ReviewBetaEngine:      ReviewEngineClaude,
+		ReviewBetaModel:       "opus-4.8",
 	}
 	if err := WriteState("fleet", in.Slug, in); err != nil {
 		t.Fatalf("WriteState: %v", err)
@@ -797,17 +801,23 @@ func TestStateRoundTrip_ReviewFields(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ReadState: %v", err)
 	}
-	if out.ReviewClaudeStatus != ReviewStatusPassed {
-		t.Errorf("ReviewClaudeStatus=%q; want passed", out.ReviewClaudeStatus)
+	if out.ReviewAlphaStatus != ReviewStatusSkipped {
+		t.Errorf("ReviewAlphaStatus=%q; want skipped", out.ReviewAlphaStatus)
 	}
-	if out.ReviewClaudeRounds != 3 {
-		t.Errorf("ReviewClaudeRounds=%d; want 3", out.ReviewClaudeRounds)
+	if out.ReviewAlphaRounds != 3 {
+		t.Errorf("ReviewAlphaRounds=%d; want 3", out.ReviewAlphaRounds)
 	}
-	if out.ReviewCodexStatus != ReviewStatusSkipped {
-		t.Errorf("ReviewCodexStatus=%q; want skipped", out.ReviewCodexStatus)
+	if out.ReviewAlphaSkipReason != "rate-limited" {
+		t.Errorf("ReviewAlphaSkipReason=%q; want rate-limited", out.ReviewAlphaSkipReason)
 	}
-	if out.ReviewCodexSkipReason != "rate-limited" {
-		t.Errorf("ReviewCodexSkipReason=%q; want rate-limited", out.ReviewCodexSkipReason)
+	if out.ReviewAlphaEngine != ReviewEngineCodex || out.ReviewAlphaModel != "codex-default" {
+		t.Errorf("alpha identity=(%q,%q); want codex/codex-default", out.ReviewAlphaEngine, out.ReviewAlphaModel)
+	}
+	if out.ReviewBetaStatus != ReviewStatusPassed {
+		t.Errorf("ReviewBetaStatus=%q; want passed", out.ReviewBetaStatus)
+	}
+	if out.ReviewBetaRounds != 1 {
+		t.Errorf("ReviewBetaRounds=%d; want 1", out.ReviewBetaRounds)
 	}
 }
 
@@ -835,9 +845,10 @@ func TestStateRoundTrip_ReviewFieldsOmittedWhenEmpty(t *testing.T) {
 	}
 	body := string(raw)
 	for _, field := range []string{
-		"review_claude_status", "review_claude_rounds",
-		"review_codex_status", "review_codex_rounds",
-		"review_codex_skip_reason",
+		"review_alpha_status", "review_alpha_rounds",
+		"review_alpha_skip_reason", "review_alpha_engine", "review_alpha_model",
+		"review_beta_status", "review_beta_rounds",
+		"review_beta_skip_reason", "review_beta_engine", "review_beta_model",
 	} {
 		if containsSubstring(body, field) {
 			t.Errorf("raw state.json contains %q; want omitted (omitempty)", field)
@@ -856,15 +867,15 @@ func TestStateRoundTrip_RejectsBogusReviewStatus(t *testing.T) {
 		mut  func(*State)
 	}{
 		{
-			name: "claude bogus",
+			name: "alpha bogus",
 			mut: func(s *State) {
-				s.ReviewClaudeStatus = ReviewStatus("bogus")
+				s.ReviewAlphaStatus = ReviewStatus("bogus")
 			},
 		},
 		{
-			name: "codex bogus",
+			name: "beta bogus",
 			mut: func(s *State) {
-				s.ReviewCodexStatus = ReviewStatus("nope")
+				s.ReviewBetaStatus = ReviewStatus("nope")
 			},
 		},
 	}
@@ -886,134 +897,215 @@ func TestStateRoundTrip_RejectsBogusReviewStatus(t *testing.T) {
 	}
 }
 
-// TestWorkers_PhasePushRejectedWithoutReview: phase=push requires
-// review_claude_status=passed. A worker (or buggy reviewer) that
-// writes phase=push without a terminal /review status must be
-// rejected at WriteState time — this is the structural enforcement
-// that the three-stage flow is built around.
-func TestWorkers_PhasePushRejectedWithoutReview(t *testing.T) {
-	tmp := t.TempDir()
-	t.Setenv("FLEET_HOME", tmp)
-	s := &State{
-		Slug:               "push-noreview-aaaa",
-		Project:            "fleet",
-		Phase:              PhasePush,
-		StartedAt:          time.Now().UTC(),
-		PID:                1,
-		ReviewClaudeStatus: ReviewStatusPending, // not terminal
-		ReviewCodexStatus:  ReviewStatusPassed,
-	}
-	err := WriteState("fleet", s.Slug, s)
-	if !errors.Is(err, ErrPhaseRequiresReview) {
-		t.Errorf("got %v; want ErrPhaseRequiresReview (claude pending)", err)
-	}
-
-	// Empty (= zero value, pre-three-stage worker) also rejected.
-	s.ReviewClaudeStatus = ""
-	err = WriteState("fleet", s.Slug, s)
-	if !errors.Is(err, ErrPhaseRequiresReview) {
-		t.Errorf("got %v; want ErrPhaseRequiresReview (claude empty)", err)
-	}
-}
-
-// TestWorkers_PhasePushRejectedWithCodexBlockedNotSkipped: codex
-// "blocked" is NOT a valid terminal status for phase=push. Only
-// passed or skipped (with allowed reason) clear the gate.
-func TestWorkers_PhasePushRejectedWithCodexBlockedNotSkipped(t *testing.T) {
-	tmp := t.TempDir()
-	t.Setenv("FLEET_HOME", tmp)
-	s := &State{
-		Slug:               "push-codex-blocked-aaaa",
-		Project:            "fleet",
-		Phase:              PhasePush,
-		StartedAt:          time.Now().UTC(),
-		PID:                1,
-		ReviewClaudeStatus: ReviewStatusPassed,
-		ReviewCodexStatus:  ReviewStatusBlocked,
-	}
-	err := WriteState("fleet", s.Slug, s)
-	if !errors.Is(err, ErrPhaseRequiresReview) {
-		t.Errorf("got %v; want ErrPhaseRequiresReview (codex blocked)", err)
-	}
-}
-
-// TestWorkers_PhasePushRejectedWithoutSkipReason: codex=skipped
-// without a reason in the allowlist is rejected. The reviewer must
-// record WHY codex was skipped (rate-limited|unavailable) — silent
-// skips would let a re-dispatch retry that should have happened slip
-// through.
-func TestWorkers_PhasePushRejectedWithoutSkipReason(t *testing.T) {
-	tmp := t.TempDir()
-	t.Setenv("FLEET_HOME", tmp)
-	s := &State{
-		Slug:                  "push-codex-skip-noreason-aaaa",
-		Project:               "fleet",
-		Phase:                 PhasePush,
+func stateWithReview(project, slug string, phase Phase, alphaStatus ReviewStatus, alphaEngine, alphaModel, alphaReason string, betaStatus ReviewStatus, betaEngine, betaModel, betaReason string) *State {
+	return &State{
+		Slug:                  slug,
+		Project:               project,
+		Phase:                 phase,
 		StartedAt:             time.Now().UTC(),
 		PID:                   1,
-		ReviewClaudeStatus:    ReviewStatusPassed,
-		ReviewCodexStatus:     ReviewStatusSkipped,
-		ReviewCodexSkipReason: "", // missing
-	}
-	err := WriteState("fleet", s.Slug, s)
-	if !errors.Is(err, ErrCodexSkipNeedsReason) {
-		t.Errorf("got %v; want ErrCodexSkipNeedsReason (empty reason)", err)
-	}
-
-	// Reason outside the allowlist also rejected.
-	s.ReviewCodexSkipReason = "didn't feel like it"
-	err = WriteState("fleet", s.Slug, s)
-	if !errors.Is(err, ErrCodexSkipNeedsReason) {
-		t.Errorf("got %v; want ErrCodexSkipNeedsReason (bad reason)", err)
+		ReviewAlphaStatus:     alphaStatus,
+		ReviewAlphaEngine:     alphaEngine,
+		ReviewAlphaModel:      alphaModel,
+		ReviewAlphaSkipReason: alphaReason,
+		ReviewBetaStatus:      betaStatus,
+		ReviewBetaEngine:      betaEngine,
+		ReviewBetaModel:       betaModel,
+		ReviewBetaSkipReason:  betaReason,
 	}
 }
 
-// TestWorkers_PhasePushAcceptedWithReviewPassedAndCodexSkippedRateLimited:
-// the documented happy path for codex rate-limit. Reviewer ran
-// /review clean, attempted codex (got rate-limited), recorded the
-// terminal state and skip reason. Finisher can now reach push.
-func TestWorkers_PhasePushAcceptedWithReviewPassedAndCodexSkippedRateLimited(t *testing.T) {
-	tmp := t.TempDir()
-	t.Setenv("FLEET_HOME", tmp)
-	for _, reason := range []string{"rate-limited", "unavailable"} {
-		t.Run(reason, func(t *testing.T) {
-			slug := "push-codex-skip-" + reason + "-aaaa"
-			s := &State{
-				Slug:                  slug,
-				Project:               "fleet",
-				Phase:                 PhasePush,
-				StartedAt:             time.Now().UTC(),
-				PID:                   1,
-				ReviewClaudeStatus:    ReviewStatusPassed,
-				ReviewClaudeRounds:    2,
-				ReviewCodexStatus:     ReviewStatusSkipped,
-				ReviewCodexSkipReason: reason,
+func TestValidateReviewGate(t *testing.T) {
+	cases := []struct {
+		name    string
+		gitMode bool
+		state   func(project, slug string) *State
+		wantErr error
+	}{
+		{
+			name:    "both slots passed",
+			gitMode: true,
+			state: func(project, slug string) *State {
+				return stateWithReview(project, slug, PhasePush, ReviewStatusPassed, ReviewEngineClaude, "sonnet-5", "", ReviewStatusPassed, ReviewEngineClaude, "opus-4.8", "")
+			},
+		},
+		{
+			name:    "one slot pending",
+			gitMode: true,
+			state: func(project, slug string) *State {
+				return stateWithReview(project, slug, PhasePush, ReviewStatusPending, ReviewEngineClaude, "sonnet-5", "", ReviewStatusPassed, ReviewEngineClaude, "opus-4.8", "")
+			},
+			wantErr: ErrPhaseRequiresReview,
+		},
+		{
+			name:    "empty slots fail closed",
+			gitMode: true,
+			state: func(project, slug string) *State {
+				return stateWithReview(project, slug, PhasePush, "", "", "", "", "", "", "", "")
+			},
+			wantErr: ErrPhaseRequiresReview,
+		},
+		{
+			name:    "passed slot with empty engine",
+			gitMode: true,
+			state: func(project, slug string) *State {
+				return stateWithReview(project, slug, PhasePush, ReviewStatusPassed, "", "sonnet-5", "", ReviewStatusPassed, ReviewEngineClaude, "opus-4.8", "")
+			},
+			wantErr: ErrReviewSlotIdentity,
+		},
+		{
+			name:    "passed slot with empty model",
+			gitMode: true,
+			state: func(project, slug string) *State {
+				return stateWithReview(project, slug, PhasePush, ReviewStatusPassed, ReviewEngineClaude, "", "", ReviewStatusPassed, ReviewEngineClaude, "opus-4.8", "")
+			},
+			wantErr: ErrReviewSlotIdentity,
+		},
+		{
+			name:    "invalid non-empty engine",
+			gitMode: true,
+			state: func(project, slug string) *State {
+				return stateWithReview(project, slug, PhasePush, ReviewStatusPassed, "gpt", "gpt-5.5", "", ReviewStatusPassed, ReviewEngineClaude, "opus-4.8", "")
+			},
+			wantErr: ErrReviewSlotIdentity,
+		},
+		{
+			name:    "alpha codex skipped git rate limited",
+			gitMode: true,
+			state: func(project, slug string) *State {
+				return stateWithReview(project, slug, PhasePush, ReviewStatusSkipped, ReviewEngineCodex, "codex-default", "rate-limited", ReviewStatusPassed, ReviewEngineClaude, "opus-4.8", "")
+			},
+		},
+		{
+			name:    "alpha claude skipped rejected",
+			gitMode: true,
+			state: func(project, slug string) *State {
+				return stateWithReview(project, slug, PhasePush, ReviewStatusSkipped, ReviewEngineClaude, "sonnet-5", "rate-limited", ReviewStatusPassed, ReviewEngineClaude, "opus-4.8", "")
+			},
+			wantErr: ErrPhaseRequiresReview,
+		},
+		{
+			name:    "alpha codex skipped non-git rejected",
+			gitMode: false,
+			state: func(project, slug string) *State {
+				return stateWithReview(project, slug, PhaseDone, ReviewStatusSkipped, ReviewEngineCodex, "codex-default", "rate-limited", ReviewStatusPassed, ReviewEngineClaude, "opus-4.8", "")
+			},
+			wantErr: ErrPhaseRequiresReview,
+		},
+		{
+			name:    "alpha codex skipped no-git reason rejected",
+			gitMode: true,
+			state: func(project, slug string) *State {
+				return stateWithReview(project, slug, PhasePush, ReviewStatusSkipped, ReviewEngineCodex, "codex-default", "no-git", ReviewStatusPassed, ReviewEngineClaude, "opus-4.8", "")
+			},
+			wantErr: ErrCodexSkipNeedsReason,
+		},
+		{
+			name:    "alpha codex skipped empty reason rejected",
+			gitMode: true,
+			state: func(project, slug string) *State {
+				return stateWithReview(project, slug, PhasePush, ReviewStatusSkipped, ReviewEngineCodex, "codex-default", "", ReviewStatusPassed, ReviewEngineClaude, "opus-4.8", "")
+			},
+			wantErr: ErrCodexSkipNeedsReason,
+		},
+		{
+			name:    "alpha codex skipped garbage reason rejected",
+			gitMode: true,
+			state: func(project, slug string) *State {
+				return stateWithReview(project, slug, PhasePush, ReviewStatusSkipped, ReviewEngineCodex, "codex-default", "garbage", ReviewStatusPassed, ReviewEngineClaude, "opus-4.8", "")
+			},
+			wantErr: ErrCodexSkipNeedsReason,
+		},
+		{
+			name:    "alpha single-claude-degraded accepted",
+			gitMode: true,
+			state: func(project, slug string) *State {
+				return stateWithReview(project, slug, PhasePush, ReviewStatusSingleClaudeDegraded, ReviewEngineClaude, "opus-4.8", "", ReviewStatusPassed, ReviewEngineClaude, "opus-4.8", "")
+			},
+		},
+		{
+			name:    "alpha skipped in single-claude slot rejected",
+			gitMode: true,
+			state: func(project, slug string) *State {
+				return stateWithReview(project, slug, PhasePush, ReviewStatusSkipped, ReviewEngineClaude, "opus-4.8", "rate-limited", ReviewStatusPassed, ReviewEngineClaude, "opus-4.8", "")
+			},
+			wantErr: ErrPhaseRequiresReview,
+		},
+		{
+			name:    "both slots codex skipped rejected",
+			gitMode: true,
+			state: func(project, slug string) *State {
+				return stateWithReview(project, slug, PhasePush, ReviewStatusSkipped, ReviewEngineCodex, "codex-default", "rate-limited", ReviewStatusSkipped, ReviewEngineCodex, "codex-default", "rate-limited")
+			},
+			wantErr: ErrReviewBetaAnchor,
+		},
+		{
+			name:    "beta engine codex rejected",
+			gitMode: true,
+			state: func(project, slug string) *State {
+				return stateWithReview(project, slug, PhasePush, ReviewStatusPassed, ReviewEngineClaude, "sonnet-5", "", ReviewStatusPassed, ReviewEngineCodex, "codex-default", "")
+			},
+			wantErr: ErrReviewBetaAnchor,
+		},
+		{
+			name:    "single-claude-degraded with codex engine rejected",
+			gitMode: true,
+			state: func(project, slug string) *State {
+				return stateWithReview(project, slug, PhasePush, ReviewStatusSingleClaudeDegraded, ReviewEngineCodex, "codex-default", "", ReviewStatusPassed, ReviewEngineClaude, "opus-4.8", "")
+			},
+			wantErr: ErrPhaseRequiresReview,
+		},
+		{
+			name:    "gate does not fire off terminal phase",
+			gitMode: true,
+			state: func(project, slug string) *State {
+				return stateWithReview(project, slug, PhaseReviewDone, "", "", "", "", "", "", "", "")
+			},
+		},
+		{
+			name:    "git done needs only pr url",
+			gitMode: true,
+			state: func(project, slug string) *State {
+				s := stateWithReview(project, slug, PhaseDone, "", "", "", "", "", "", "", "")
+				s.PRURL = "https://github.com/example/repo/pull/123"
+				return s
+			},
+		},
+		{
+			name:    "non-git done is review gated",
+			gitMode: false,
+			state: func(project, slug string) *State {
+				return stateWithReview(project, slug, PhaseDone, "", "", "", "", "", "", "", "")
+			},
+			wantErr: ErrPhaseRequiresReview,
+		},
+		{
+			name:    "non-git push rejected",
+			gitMode: false,
+			state: func(project, slug string) *State {
+				return stateWithReview(project, slug, PhasePush, ReviewStatusPassed, ReviewEngineClaude, "sonnet-5", "", ReviewStatusPassed, ReviewEngineClaude, "opus-4.8", "")
+			},
+			wantErr: ErrPhasePushNonGit,
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			tmp := t.TempDir()
+			t.Setenv("FLEET_HOME", tmp)
+			project := "git-proj"
+			if !c.gitMode {
+				project = "ng-proj"
+				writeNonGitProject(t, project)
 			}
-			if err := WriteState("fleet", slug, s); err != nil {
-				t.Errorf("WriteState: %v; want nil (push with %s skip accepted)", err, reason)
+			slug := "gate-" + sanitizeSlug(c.name) + "-aaaa"
+			err := WriteState(project, slug, c.state(project, slug))
+			if c.wantErr == nil && err != nil {
+				t.Fatalf("WriteState: %v; want nil", err)
+			}
+			if c.wantErr != nil && !errors.Is(err, c.wantErr) {
+				t.Fatalf("WriteState: got %v; want %v", err, c.wantErr)
 			}
 		})
-	}
-}
-
-// TestWorkers_PhasePushAcceptedWithBothPassed: the other happy path —
-// both reviewers ran clean.
-func TestWorkers_PhasePushAcceptedWithBothPassed(t *testing.T) {
-	tmp := t.TempDir()
-	t.Setenv("FLEET_HOME", tmp)
-	s := &State{
-		Slug:               "push-both-passed-aaaa",
-		Project:            "fleet",
-		Phase:              PhasePush,
-		StartedAt:          time.Now().UTC(),
-		PID:                1,
-		ReviewClaudeStatus: ReviewStatusPassed,
-		ReviewClaudeRounds: 2,
-		ReviewCodexStatus:  ReviewStatusPassed,
-		ReviewCodexRounds:  1,
-	}
-	if err := WriteState("fleet", s.Slug, s); err != nil {
-		t.Errorf("WriteState: %v; want nil (both reviewers passed)", err)
 	}
 }
 
@@ -1024,49 +1116,16 @@ func TestWorkers_PhaseDoneStillRequiresPR(t *testing.T) {
 	tmp := t.TempDir()
 	t.Setenv("FLEET_HOME", tmp)
 	s := &State{
-		Slug:               "done-no-pr-aaaa",
-		Project:            "fleet",
-		Phase:              PhaseDone,
-		StartedAt:          time.Now().UTC(),
-		PID:                1,
-		ReviewClaudeStatus: ReviewStatusPassed,
-		ReviewCodexStatus:  ReviewStatusPassed,
-		PRURL:              "", // missing
+		Slug:      "done-no-pr-aaaa",
+		Project:   "fleet",
+		Phase:     PhaseDone,
+		StartedAt: time.Now().UTC(),
+		PID:       1,
+		PRURL:     "", // missing
 	}
 	err := WriteState("fleet", s.Slug, s)
 	if !errors.Is(err, ErrPhaseRequiresPR) {
 		t.Errorf("got %v; want ErrPhaseRequiresPR (done without pr_url, review terminal)", err)
-	}
-}
-
-// TestWorkers_PhaseReviewDoneDoesNotRequireReview: the gate fires on
-// phase=push, NOT phase=review-done. The reviewer subagent writes
-// phase=review-done AFTER its loop completes, so the moment that
-// write happens the review_* fields ARE populated — but the
-// validator should not care, because the reviewer hasn't published
-// review-done yet when it's writing it. Test pins that intermediate
-// phases stay permissive (reviewer iterating with claude=iterating,
-// codex=pending, etc. must round-trip without phase=push gate).
-func TestWorkers_PhaseReviewDoneDoesNotRequireReview(t *testing.T) {
-	tmp := t.TempDir()
-	t.Setenv("FLEET_HOME", tmp)
-	for _, phase := range []Phase{
-		PhaseReviewPending, PhaseReviewClaude, PhaseReviewCodex, PhaseReviewDone,
-	} {
-		t.Run(string(phase), func(t *testing.T) {
-			s := &State{
-				Slug:               "intermediate-" + sanitizeSlug(string(phase)) + "-aaaa",
-				Project:            "fleet",
-				Phase:              phase,
-				StartedAt:          time.Now().UTC(),
-				PID:                1,
-				ReviewClaudeStatus: ReviewStatusIterating,
-				ReviewCodexStatus:  ReviewStatusPending,
-			}
-			if err := WriteState("fleet", s.Slug, s); err != nil {
-				t.Errorf("WriteState phase=%s with iterating reviewers: %v; want nil", phase, err)
-			}
-		})
 	}
 }
 
@@ -1167,171 +1226,6 @@ func writeNonGitProject(t *testing.T, project string) {
 	}
 	if err := projects.Write(project, m); err != nil {
 		t.Fatalf("seed non-git meta: %v", err)
-	}
-}
-
-// TestWorkers_NonGit_PhaseDoneAcceptedWithoutPRURL: non-git project
-// finisher writes phase=done WITHOUT a pr_url. The pr_url precondition
-// applies only when meta.json declares IsGit=true (or is absent, which
-// defaults to git-mode).
-func TestWorkers_NonGit_PhaseDoneAcceptedWithoutPRURL(t *testing.T) {
-	tmp := t.TempDir()
-	t.Setenv("FLEET_HOME", tmp)
-	writeNonGitProject(t, "ng-proj")
-
-	s := &State{
-		Slug:               "nonggit-done-aaaa",
-		Project:            "ng-proj",
-		Phase:              PhaseDone,
-		StartedAt:          time.Now().UTC(),
-		PID:                1,
-		ReviewClaudeStatus: ReviewStatusPassed,
-		ReviewClaudeRounds: 2,
-		ReviewCodexStatus:  ReviewStatusSkipped,
-		// "no-git" is the documented skip reason for non-git projects.
-		ReviewCodexSkipReason: "no-git",
-		// PRURL deliberately empty — there is no PR to point at.
-	}
-	if err := WriteState("ng-proj", s.Slug, s); err != nil {
-		t.Errorf("non-git phase=done without pr_url should be accepted, got: %v", err)
-	}
-}
-
-// TestWorkers_Git_PhaseDoneStillRequiresPRURL: the gate stays intact
-// for git projects. A re-check of the pre-existing invariant (no
-// regression from the gitMode branch).
-func TestWorkers_Git_PhaseDoneStillRequiresPRURL(t *testing.T) {
-	tmp := t.TempDir()
-	t.Setenv("FLEET_HOME", tmp)
-	// No meta.json at all → projectIsGit defaults to git-mode (safe).
-	s := &State{
-		Slug:               "git-done-aaaa",
-		Project:            "git-proj",
-		Phase:              PhaseDone,
-		StartedAt:          time.Now().UTC(),
-		PID:                1,
-		ReviewClaudeStatus: ReviewStatusPassed,
-		ReviewCodexStatus:  ReviewStatusPassed,
-		PRURL:              "", // missing
-	}
-	err := WriteState("git-proj", s.Slug, s)
-	if !errors.Is(err, ErrPhaseRequiresPR) {
-		t.Errorf("git phase=done without pr_url: got %v, want ErrPhaseRequiresPR", err)
-	}
-}
-
-// TestWorkers_NonGit_PhasePushRejected: non-git workers must NEVER
-// transition through phase=push. The error message points the caller
-// at phase=done directly.
-func TestWorkers_NonGit_PhasePushRejected(t *testing.T) {
-	tmp := t.TempDir()
-	t.Setenv("FLEET_HOME", tmp)
-	writeNonGitProject(t, "ng-push")
-
-	s := &State{
-		Slug:               "ng-push-aaaa",
-		Project:            "ng-push",
-		Phase:              PhasePush,
-		StartedAt:          time.Now().UTC(),
-		PID:                1,
-		ReviewClaudeStatus: ReviewStatusPassed,
-		ReviewCodexStatus:  ReviewStatusPassed,
-	}
-	err := WriteState("ng-push", s.Slug, s)
-	if !errors.Is(err, ErrPhasePushNonGit) {
-		t.Errorf("non-git phase=push: got %v, want ErrPhasePushNonGit", err)
-	}
-}
-
-// TestWorkers_NonGit_PhaseDoneRejectedWithoutReview: codex iter-1 [P2]
-// regression. The review-gate validator must fire on the terminal
-// phase for non-git projects (phase=done), not just on phase=push.
-// Without this gate, a buggy worker on a non-git project could jump
-// straight from starting → done with empty review_* fields, bypassing
-// the load-bearing /review enforcement.
-func TestWorkers_NonGit_PhaseDoneRejectedWithoutReview(t *testing.T) {
-	tmp := t.TempDir()
-	t.Setenv("FLEET_HOME", tmp)
-	writeNonGitProject(t, "ng-noreview")
-
-	// phase=done attempt with no review status recorded. Empty
-	// review_claude_status must be rejected — same invariant the
-	// phase=push gate enforces for git projects.
-	s := &State{
-		Slug:               "ng-noreview-aaaa",
-		Project:            "ng-noreview",
-		Phase:              PhaseDone,
-		StartedAt:          time.Now().UTC(),
-		PID:                1,
-		ReviewClaudeStatus: "",                  // missing — must be rejected
-		ReviewCodexStatus:  ReviewStatusSkipped, // present but claude empty
-		// pr_url intentionally empty (non-git mode allows that;
-		// the review gate is the relevant check here).
-	}
-	err := WriteState("ng-noreview", s.Slug, s)
-	if !errors.Is(err, ErrPhaseRequiresReview) {
-		t.Errorf("non-git phase=done with empty review_claude_status: got %v, want ErrPhaseRequiresReview", err)
-	}
-
-	// Even with claude=passed, codex must be in {passed, skipped} —
-	// blocked is not a terminal pass.
-	s.ReviewClaudeStatus = ReviewStatusPassed
-	s.ReviewCodexStatus = ReviewStatusBlocked
-	err = WriteState("ng-noreview", s.Slug, s)
-	if !errors.Is(err, ErrPhaseRequiresReview) {
-		t.Errorf("non-git phase=done with codex=blocked: got %v, want ErrPhaseRequiresReview", err)
-	}
-}
-
-// TestWorkers_Git_PhaseDoneNotGatedByReview: the non-git gate change
-// MUST NOT affect git projects. Git's phase=done has no review-gate
-// (the gate fires on phase=push for git). A git worker that wrote
-// phase=done with pr_url and empty review_* fields must still write
-// successfully — the gate would have fired earlier on phase=push.
-func TestWorkers_Git_PhaseDoneNotGatedByReview(t *testing.T) {
-	tmp := t.TempDir()
-	t.Setenv("FLEET_HOME", tmp)
-	// No meta.json → git mode (default-true).
-	s := &State{
-		Slug:      "git-done-noreview-aaaa",
-		Project:   "git-proj",
-		Phase:     PhaseDone,
-		StartedAt: time.Now().UTC(),
-		PID:       1,
-		// review_* deliberately empty — git's review gate fires on
-		// phase=push only. phase=done's only precondition for git is
-		// pr_url, which we set here.
-		PRURL: "https://github.com/example/repo/pull/123",
-	}
-	if err := WriteState("git-proj", s.Slug, s); err != nil {
-		t.Errorf("git phase=done with empty review_* + pr_url should succeed (gate is on phase=push): %v", err)
-	}
-}
-
-// TestWorkers_CodexSkipReasonNoGitAccepted: the new "no-git" entry in
-// allowedCodexSkipReasons is what the reviewer writes when
-// `codex review --base main` can't operate without a git diff. The
-// validator must accept it for phase=push (git project; reviewer
-// recorded the skip from a sibling tool issue) AND for phase=done
-// (non-git project; finisher carries the field forward).
-func TestWorkers_CodexSkipReasonNoGitAccepted(t *testing.T) {
-	tmp := t.TempDir()
-	t.Setenv("FLEET_HOME", tmp)
-	// non-git project so phase=done is acceptable without pr_url.
-	writeNonGitProject(t, "ng-skip")
-
-	s := &State{
-		Slug:                  "ng-skip-aaaa",
-		Project:               "ng-skip",
-		Phase:                 PhaseDone,
-		StartedAt:             time.Now().UTC(),
-		PID:                   1,
-		ReviewClaudeStatus:    ReviewStatusPassed,
-		ReviewCodexStatus:     ReviewStatusSkipped,
-		ReviewCodexSkipReason: "no-git",
-	}
-	if err := WriteState("ng-skip", s.Slug, s); err != nil {
-		t.Errorf("WriteState with codex skip reason no-git: %v", err)
 	}
 }
 
@@ -1450,8 +1344,8 @@ func TestUpdateStateGen_CAS(t *testing.T) {
 		if err := UpdateStateGen("p", "repair-dddd", 1, 1, func(s *State) {
 			s.Phase = PhaseReviewDone
 			s.PhasesCompleted = []Phase{PhaseBranch, PhaseTDDGreen}
-			s.ReviewClaudeStatus = ReviewStatusPassed
-			s.ReviewCodexStatus = ReviewStatusPassed
+			s.ReviewAlphaStatus = ReviewStatusPassed
+			s.ReviewBetaStatus = ReviewStatusPassed
 		}); err != nil {
 			t.Fatalf("seed prior-gen state: %v", err)
 		}
@@ -1476,9 +1370,9 @@ func TestUpdateStateGen_CAS(t *testing.T) {
 		if got.PRURL != "" {
 			t.Errorf("repair leaked old pr_url %q (must be fresh)", got.PRURL)
 		}
-		if got.ReviewClaudeStatus != "" || got.ReviewCodexStatus != "" {
-			t.Errorf("repair leaked old review status: claude=%q codex=%q",
-				got.ReviewClaudeStatus, got.ReviewCodexStatus)
+		if got.ReviewAlphaStatus != "" || got.ReviewBetaStatus != "" {
+			t.Errorf("repair leaked old review status: alpha=%q beta=%q",
+				got.ReviewAlphaStatus, got.ReviewBetaStatus)
 		}
 		if len(got.PhasesCompleted) != 0 {
 			t.Errorf("repair leaked completed phases: %v", got.PhasesCompleted)
@@ -1598,14 +1492,14 @@ func TestUpdateStateNoPhaseChangeOmitsFleetlog(t *testing.T) {
 	// Seed initial state at review-done.
 	if err := WriteState("proj", "slug-fl3", &State{
 		Slug: "slug-fl3", Project: "proj", Phase: PhaseReviewDone,
-		ReviewClaudeStatus: ReviewStatusPassed,
-		ReviewCodexStatus:  ReviewStatusPassed,
+		ReviewAlphaStatus: ReviewStatusPassed,
+		ReviewBetaStatus:  ReviewStatusPassed,
 	}); err != nil {
 		t.Fatalf("WriteState: %v", err)
 	}
 	// Metadata-only update — phase stays review-done.
 	if err := UpdateState("proj", "slug-fl3", func(s *State) {
-		s.ReviewClaudeRounds = 2 // bump counter; Phase unchanged
+		s.ReviewAlphaRounds = 2 // bump counter; Phase unchanged
 	}); err != nil {
 		t.Fatalf("UpdateState no-phase-change: %v", err)
 	}

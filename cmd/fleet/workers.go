@@ -350,22 +350,32 @@ type workersUpdateOpts struct {
 
 	// Three-stage flow review fields (reviewer-subagent-arch).
 	// Reviewer subagents call `fleet workers update <slug> --phase
-	// review-done --review-claude-status passed --review-claude-rounds
-	// N --review-codex-status {passed|skipped} [--review-codex-rounds
-	// M] [--review-codex-skip-reason rate-limited]` after the /review
-	// + codex loop returns clean. Without these flags the worker's
-	// review_* fields stay empty and the phase=push validator (next
-	// commit's contract) rejects the finisher's phase update.
-	reviewClaudeStatus       string
-	reviewClaudeRounds       int
-	reviewCodexStatus        string
-	reviewCodexRounds        int
-	reviewCodexSkipReason    string
-	reviewClaudeStatusSet    bool
-	reviewClaudeRoundsSet    bool
-	reviewCodexStatusSet     bool
-	reviewCodexRoundsSet     bool
-	reviewCodexSkipReasonSet bool
+	// review-done --review-alpha-status passed --review-alpha-engine
+	// claude --review-alpha-model <model> --review-beta-status passed
+	// --review-beta-engine claude --review-beta-model <model>` after
+	// the two-slot review loop returns clean. Without these flags the
+	// worker's review_* fields stay empty and the terminal review gate
+	// rejects the finisher's phase update.
+	reviewAlphaStatus        string
+	reviewAlphaRounds        int
+	reviewAlphaSkipReason    string
+	reviewAlphaEngine        string
+	reviewAlphaModel         string
+	reviewBetaStatus         string
+	reviewBetaRounds         int
+	reviewBetaSkipReason     string
+	reviewBetaEngine         string
+	reviewBetaModel          string
+	reviewAlphaStatusSet     bool
+	reviewAlphaRoundsSet     bool
+	reviewAlphaSkipReasonSet bool
+	reviewAlphaEngineSet     bool
+	reviewAlphaModelSet      bool
+	reviewBetaStatusSet      bool
+	reviewBetaRoundsSet      bool
+	reviewBetaSkipReasonSet  bool
+	reviewBetaEngineSet      bool
+	reviewBetaModelSet       bool
 
 	// dispatchGeneration is the coord-owned per-slug fence token
 	// (DESIGN §1/§2.2) stamped into this dispatch's worker prompt. When
@@ -388,27 +398,6 @@ type workersUpdateOpts struct {
 var allowedCodexSkipReasonsCLI = map[string]struct{}{
 	"rate-limited": {},
 	"unavailable":  {},
-	// "no-git" mirrors the workers package allowlist for non-git
-	// projects (operator clarification 2026-05-12). The reviewer
-	// subagent records this when `codex review --base main` cannot
-	// operate without a git diff. /review (Claude-side) remains
-	// mandatory regardless.
-	"no-git": {},
-}
-
-// workersReviewStatusValid returns true when s is one of the
-// known-good ReviewStatus values. Empty string is INVALID here — the
-// caller has already gated on cmd.Flags().Changed(), so an explicit
-// flag with an empty value reaches this helper only via shell-escape
-// bugs we want to surface.
-func workersReviewStatusValid(s workers.ReviewStatus) bool {
-	switch s {
-	case workers.ReviewStatusPending, workers.ReviewStatusIterating,
-		workers.ReviewStatusPassed, workers.ReviewStatusSkipped,
-		workers.ReviewStatusBlocked:
-		return true
-	}
-	return false
 }
 
 func newWorkersUpdateCmd() *cobra.Command {
@@ -445,11 +434,16 @@ explicitly when the caller is a wrapper script.`,
 			// boundary writes a fresh transient pid).
 			opts.exitSet = cmd.Flags().Changed("exit")
 			opts.pidSet = cmd.Flags().Changed("pid")
-			opts.reviewClaudeStatusSet = cmd.Flags().Changed("review-claude-status")
-			opts.reviewClaudeRoundsSet = cmd.Flags().Changed("review-claude-rounds")
-			opts.reviewCodexStatusSet = cmd.Flags().Changed("review-codex-status")
-			opts.reviewCodexRoundsSet = cmd.Flags().Changed("review-codex-rounds")
-			opts.reviewCodexSkipReasonSet = cmd.Flags().Changed("review-codex-skip-reason")
+			opts.reviewAlphaStatusSet = cmd.Flags().Changed("review-alpha-status")
+			opts.reviewAlphaRoundsSet = cmd.Flags().Changed("review-alpha-rounds")
+			opts.reviewAlphaSkipReasonSet = cmd.Flags().Changed("review-alpha-skip-reason")
+			opts.reviewAlphaEngineSet = cmd.Flags().Changed("review-alpha-engine")
+			opts.reviewAlphaModelSet = cmd.Flags().Changed("review-alpha-model")
+			opts.reviewBetaStatusSet = cmd.Flags().Changed("review-beta-status")
+			opts.reviewBetaRoundsSet = cmd.Flags().Changed("review-beta-rounds")
+			opts.reviewBetaSkipReasonSet = cmd.Flags().Changed("review-beta-skip-reason")
+			opts.reviewBetaEngineSet = cmd.Flags().Changed("review-beta-engine")
+			opts.reviewBetaModelSet = cmd.Flags().Changed("review-beta-model")
 			opts.dispatchGenerationSet = cmd.Flags().Changed("dispatch-generation")
 			return runWorkersUpdate(args[0], opts, cmd.OutOrStdout())
 		},
@@ -461,16 +455,26 @@ explicitly when the caller is a wrapper script.`,
 	cmd.Flags().StringVar(&opts.reason, "reason", "", "blocked reason (required for phase=blocked)")
 	cmd.Flags().IntVar(&opts.pid, "pid", 0, "worker OS PID (default: os.Getpid())")
 	cmd.Flags().IntVar(&opts.exit, "exit", 0, "worker exit code (set on phase=done|failed)")
-	cmd.Flags().StringVar(&opts.reviewClaudeStatus, "review-claude-status", "",
-		"reviewer subagent: /review terminal status (pending|iterating|passed|blocked)")
-	cmd.Flags().IntVar(&opts.reviewClaudeRounds, "review-claude-rounds", 0,
-		"reviewer subagent: rounds of /review run before terminal status (0..N)")
-	cmd.Flags().StringVar(&opts.reviewCodexStatus, "review-codex-status", "",
-		"reviewer subagent: codex review terminal status (pending|iterating|passed|skipped|blocked)")
-	cmd.Flags().IntVar(&opts.reviewCodexRounds, "review-codex-rounds", 0,
-		"reviewer subagent: rounds of codex review run before terminal status (0..N)")
-	cmd.Flags().StringVar(&opts.reviewCodexSkipReason, "review-codex-skip-reason", "",
-		"reviewer subagent: skip reason — required when --review-codex-status=skipped (allowlist: rate-limited, unavailable, no-git)")
+	cmd.Flags().StringVar(&opts.reviewAlphaStatus, "review-alpha-status", "",
+		"reviewer subagent: alpha slot status (pending|iterating|passed|skipped|blocked|single-claude-degraded)")
+	cmd.Flags().IntVar(&opts.reviewAlphaRounds, "review-alpha-rounds", 0,
+		"reviewer subagent: alpha slot review rounds (0..N)")
+	cmd.Flags().StringVar(&opts.reviewAlphaSkipReason, "review-alpha-skip-reason", "",
+		"reviewer subagent: alpha skip reason — required when status=skipped and engine=codex (allowlist: rate-limited, unavailable)")
+	cmd.Flags().StringVar(&opts.reviewAlphaEngine, "review-alpha-engine", "",
+		"reviewer subagent: alpha slot engine (codex|claude)")
+	cmd.Flags().StringVar(&opts.reviewAlphaModel, "review-alpha-model", "",
+		"reviewer subagent: alpha slot model")
+	cmd.Flags().StringVar(&opts.reviewBetaStatus, "review-beta-status", "",
+		"reviewer subagent: beta slot status (pending|iterating|passed|skipped|blocked|single-claude-degraded)")
+	cmd.Flags().IntVar(&opts.reviewBetaRounds, "review-beta-rounds", 0,
+		"reviewer subagent: beta slot review rounds (0..N)")
+	cmd.Flags().StringVar(&opts.reviewBetaSkipReason, "review-beta-skip-reason", "",
+		"reviewer subagent: beta skip reason — required when status=skipped and engine=codex (allowlist: rate-limited, unavailable)")
+	cmd.Flags().StringVar(&opts.reviewBetaEngine, "review-beta-engine", "",
+		"reviewer subagent: beta slot engine (codex|claude)")
+	cmd.Flags().StringVar(&opts.reviewBetaModel, "review-beta-model", "",
+		"reviewer subagent: beta slot model")
 	cmd.Flags().IntVar(&opts.dispatchGeneration, "dispatch-generation", 0,
 		"coord-owned per-slug fence token (DESIGN §2.2). When set, the update is a CAS against the task row's dispatch_generation: a stale generation is rejected. Omit on legacy/non-worker callers.")
 	_ = cmd.MarkFlagRequired("phase")
@@ -516,44 +520,53 @@ func runWorkersUpdate(slug string, opts *workersUpdateOpts, stdout io.Writer) er
 	}
 
 	// CLI-side review status validation. Empty values pass through
-	// (the flag wasn't set on this invocation; do not clobber what's
-	// already on disk). Non-empty values must be in the enum set.
-	claudeStatus := workers.ReviewStatus(strings.TrimSpace(opts.reviewClaudeStatus))
-	codexStatus := workers.ReviewStatus(strings.TrimSpace(opts.reviewCodexStatus))
-	codexSkipReason := strings.TrimSpace(opts.reviewCodexSkipReason)
-	if opts.reviewClaudeStatusSet {
-		if !workersReviewStatusValid(claudeStatus) {
-			return fmt.Errorf(
-				"--review-claude-status %q: must be one of pending|iterating|passed|blocked (skipped is NOT allowed for /review)",
-				opts.reviewClaudeStatus,
-			)
-		}
-		// /review skip is never allowed.
-		if claudeStatus == workers.ReviewStatusSkipped {
-			return errors.New("--review-claude-status=skipped: /review (gstack skill) cannot be skipped; it is the load-bearing reviewer")
-		}
-	}
-	if opts.reviewCodexStatusSet {
-		if !workersReviewStatusValid(codexStatus) {
-			return fmt.Errorf(
-				"--review-codex-status %q: must be one of pending|iterating|passed|skipped|blocked",
-				opts.reviewCodexStatus,
-			)
-		}
-		if codexStatus == workers.ReviewStatusSkipped {
-			if _, ok := allowedCodexSkipReasonsCLI[codexSkipReason]; !ok {
+	// when the flag was not set. Explicit status flags must be in the
+	// shared non-empty enum set; skip legality is keyed by the slot's
+	// engine value, not the alpha/beta flag name.
+	alphaStatus := workers.ReviewStatus(strings.TrimSpace(opts.reviewAlphaStatus))
+	betaStatus := workers.ReviewStatus(strings.TrimSpace(opts.reviewBetaStatus))
+	alphaSkipReason := strings.TrimSpace(opts.reviewAlphaSkipReason)
+	betaSkipReason := strings.TrimSpace(opts.reviewBetaSkipReason)
+	for _, slot := range []struct {
+		name          string
+		status        workers.ReviewStatus
+		statusRaw     string
+		statusSet     bool
+		engine        string
+		skipReason    string
+		skipReasonSet bool
+	}{
+		{name: "alpha", status: alphaStatus, statusRaw: opts.reviewAlphaStatus, statusSet: opts.reviewAlphaStatusSet, engine: strings.TrimSpace(opts.reviewAlphaEngine), skipReason: alphaSkipReason, skipReasonSet: opts.reviewAlphaSkipReasonSet},
+		{name: "beta", status: betaStatus, statusRaw: opts.reviewBetaStatus, statusSet: opts.reviewBetaStatusSet, engine: strings.TrimSpace(opts.reviewBetaEngine), skipReason: betaSkipReason, skipReasonSet: opts.reviewBetaSkipReasonSet},
+	} {
+		if slot.statusSet {
+			if !workers.ReviewStatusValidNonEmpty(slot.status) {
 				return fmt.Errorf(
-					"--review-codex-status=skipped requires --review-codex-skip-reason in {rate-limited, unavailable, no-git}; got %q",
-					codexSkipReason,
+					"--review-%s-status %q: must be one of pending|iterating|passed|skipped|blocked|single-claude-degraded",
+					slot.name,
+					slot.statusRaw,
 				)
 			}
+			if slot.status == workers.ReviewStatusSkipped {
+				if slot.engine != workers.ReviewEngineCodex {
+					return fmt.Errorf("--review-%s-status=skipped: only a codex-engine slot may be skipped", slot.name)
+				}
+				if _, ok := allowedCodexSkipReasonsCLI[slot.skipReason]; !ok {
+					return fmt.Errorf(
+						"--review-%s-status=skipped requires --review-%s-skip-reason in {rate-limited, unavailable}; got %q",
+						slot.name,
+						slot.name,
+						slot.skipReason,
+					)
+				}
+			}
 		}
-	}
-	// Setting skip reason without status=skipped is a confused call —
-	// reject so the operator notices the mistake rather than silently
-	// persisting a reason that has no terminal status to anchor it.
-	if opts.reviewCodexSkipReasonSet && codexStatus != workers.ReviewStatusSkipped {
-		return errors.New("--review-codex-skip-reason set without --review-codex-status=skipped")
+		// Setting skip reason without status=skipped is a confused call
+		// — reject so the operator notices the mistake rather than
+		// silently persisting a reason that has no terminal status.
+		if slot.skipReasonSet && slot.status != workers.ReviewStatusSkipped {
+			return fmt.Errorf("--review-%s-skip-reason set without --review-%s-status=skipped", slot.name, slot.name)
+		}
 	}
 
 	mutate := func(s *workers.State) {
@@ -570,7 +583,7 @@ func runWorkersUpdate(slug string, opts *workersUpdateOpts, stdout io.Writer) er
 		// (CI-red worker re-dispatched on the same slug), the new
 		// attempt must NOT carry the previous run's review status —
 		// otherwise a re-dispatched worker that bypasses the reviewer
-		// would inherit "review_claude_status=passed" from the prior
+		// would inherit "review_alpha_status=passed" from the prior
 		// attempt and the phase=push validator would let it through.
 		// Phase=starting is the canonical re-dispatch entry point
 		// (worker.go bootstraps fresh state with phase=starting and
@@ -579,39 +592,59 @@ func runWorkersUpdate(slug string, opts *workersUpdateOpts, stdout io.Writer) er
 		// this transition; the reviewer subagent re-populates the
 		// fields on its run.
 		if phase == workers.PhaseStarting {
-			s.ReviewClaudeStatus = ""
-			s.ReviewClaudeRounds = 0
-			s.ReviewCodexStatus = ""
-			s.ReviewCodexRounds = 0
-			s.ReviewCodexSkipReason = ""
+			s.ReviewAlphaStatus = ""
+			s.ReviewAlphaRounds = 0
+			s.ReviewAlphaSkipReason = ""
+			s.ReviewAlphaEngine = ""
+			s.ReviewAlphaModel = ""
+			s.ReviewBetaStatus = ""
+			s.ReviewBetaRounds = 0
+			s.ReviewBetaSkipReason = ""
+			s.ReviewBetaEngine = ""
+			s.ReviewBetaModel = ""
 		}
 		// Apply review-* flag updates. Set-flag semantics: only
 		// overwrite when the operator (or reviewer subagent) passed
 		// the flag explicitly. Otherwise preserve whatever's on disk
 		// — review state is sticky across phase transitions (a
-		// reviewer that wrote review_claude_status=passed at
+		// reviewer that wrote review_alpha_status=passed at
 		// phase=review-done expects the finisher's phase=push
 		// transition to see the same value).
-		if opts.reviewClaudeStatusSet {
-			s.ReviewClaudeStatus = claudeStatus
-		}
-		if opts.reviewClaudeRoundsSet {
-			s.ReviewClaudeRounds = opts.reviewClaudeRounds
-		}
-		if opts.reviewCodexStatusSet {
-			s.ReviewCodexStatus = codexStatus
-			// Clear stale skip reason when transitioning OUT of
-			// skipped — codex passed on retry, the old "rate-limited"
-			// note should not stick around.
-			if codexStatus != workers.ReviewStatusSkipped {
-				s.ReviewCodexSkipReason = ""
+		if opts.reviewAlphaStatusSet {
+			s.ReviewAlphaStatus = alphaStatus
+			if alphaStatus != workers.ReviewStatusSkipped {
+				s.ReviewAlphaSkipReason = ""
 			}
 		}
-		if opts.reviewCodexRoundsSet {
-			s.ReviewCodexRounds = opts.reviewCodexRounds
+		if opts.reviewAlphaRoundsSet {
+			s.ReviewAlphaRounds = opts.reviewAlphaRounds
 		}
-		if opts.reviewCodexSkipReasonSet {
-			s.ReviewCodexSkipReason = codexSkipReason
+		if opts.reviewAlphaSkipReasonSet {
+			s.ReviewAlphaSkipReason = alphaSkipReason
+		}
+		if opts.reviewAlphaEngineSet {
+			s.ReviewAlphaEngine = strings.TrimSpace(opts.reviewAlphaEngine)
+		}
+		if opts.reviewAlphaModelSet {
+			s.ReviewAlphaModel = strings.TrimSpace(opts.reviewAlphaModel)
+		}
+		if opts.reviewBetaStatusSet {
+			s.ReviewBetaStatus = betaStatus
+			if betaStatus != workers.ReviewStatusSkipped {
+				s.ReviewBetaSkipReason = ""
+			}
+		}
+		if opts.reviewBetaRoundsSet {
+			s.ReviewBetaRounds = opts.reviewBetaRounds
+		}
+		if opts.reviewBetaSkipReasonSet {
+			s.ReviewBetaSkipReason = betaSkipReason
+		}
+		if opts.reviewBetaEngineSet {
+			s.ReviewBetaEngine = strings.TrimSpace(opts.reviewBetaEngine)
+		}
+		if opts.reviewBetaModelSet {
+			s.ReviewBetaModel = strings.TrimSpace(opts.reviewBetaModel)
 		}
 		// Only set pid when the caller passed --pid explicitly.
 		// Defaulting to os.Getpid() captured the short-lived
