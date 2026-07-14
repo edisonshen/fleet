@@ -380,8 +380,12 @@ def test_claude_prompt_matches_git_or_non_git_mode(
     with_base_argv = json.loads(with_base_log.read_text())
     without_base_argv = json.loads(without_base_log.read_text())
     assert with_base_argv[-1] == "/review the diff against origin/main"
+    assert "/review" not in without_base_argv[-1]
     assert "the diff against" not in without_base_argv[-1]
     assert "working-tree" in without_base_argv[-1]
+    assert "structured review" in without_base_argv[-1]
+    assert "JSON schema" in without_base_argv[-1]
+    assert '{"clean": bool, "findings":' in without_base_argv[-1]
 
 
 def test_codex_base_flag_is_threaded_only_when_set(

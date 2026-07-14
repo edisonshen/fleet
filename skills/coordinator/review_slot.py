@@ -67,8 +67,12 @@ def run_claude(args: argparse.Namespace) -> subprocess.CompletedProcess[str]:
         prompt = f"/review the diff against {args.base}"
     else:
         prompt = (
-            "/review the current working-tree changes in this project against the task "
-            "acceptance criteria"
+            "Run a raw structured review of the current working-tree changes in this "
+            "project against the task acceptance criteria for correctness, security, "
+            "and quality. Do not invoke any slash command. Return only structured "
+            "JSON output conforming to the provided JSON schema: "
+            '{"clean": bool, "findings": [{"severity": "P0|P1|P2|P3", "...": "..."}]}. '
+            "Do not include prose, markdown, or code fences."
         )
 
     return subprocess.run(
