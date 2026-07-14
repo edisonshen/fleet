@@ -26,7 +26,7 @@ RATE_LIMIT_RE = re.compile(
     re.IGNORECASE,
 )
 UNAVAILABLE_RE = re.compile(
-    r"command not found|not found|unavailable|no such file or directory",
+    r"\bcodex: command not found\b|\bcommand not found: codex\b",
     re.IGNORECASE,
 )
 
@@ -63,9 +63,13 @@ def parse_args() -> argparse.Namespace:
 
 
 def run_claude(args: argparse.Namespace) -> subprocess.CompletedProcess[str]:
-    prompt = "/review the diff"
     if args.base:
-        prompt += f" against {args.base}"
+        prompt = f"/review the diff against {args.base}"
+    else:
+        prompt = (
+            "/review the current working-tree changes in this project against the task "
+            "acceptance criteria"
+        )
 
     return subprocess.run(
         [

@@ -230,6 +230,27 @@ def test_codex_parse_failure_without_skip_signal_retries_then_blocks(
     assert "review slot blocked" in result.stderr
 
 
+def test_codex_missing_ref_error_retries_then_blocks(
+    shim_bin: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    counter = tmp_path / "counter.txt"
+
+    result = run_slot(
+        tmp_path,
+        monkeypatch,
+        ["--engine", "codex", "--model", "gpt-5.5-codex", "--base", "origin/main"],
+        "",
+        stderr_text="fatal: invalid reference: origin/main ... not found\n",
+        exit_code=1,
+        counter=counter,
+    )
+
+    assert result.returncode == 3
+    assert result.stdout == ""
+    assert counter.read_text() == "3"
+    assert "review slot blocked" in result.stderr
+
+
 def test_claude_blocking_finding_preserves_details(
     shim_bin: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -302,6 +323,44 @@ def test_claude_json_schema_is_passed_inline(
     assert "properties" in schema
     assert schema_value.lstrip().startswith("{")
     assert not schema_value.endswith(".json")
+
+
+def test_claude_prompt_matches_git_or_non_git_mode(
+    shim_bin: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    with_base_log = tmp_path / "claude-with-base.argv"
+    without_base_log = tmp_path / "claude-without-base.argv"
+    clean_stdout = json.dumps(
+        {
+            "type": "result",
+            "subtype": "success",
+            "session_id": "sess",
+            "result": json.dumps({"clean": True, "findings": []}),
+        }
+    )
+
+    with_base = run_slot(
+        tmp_path,
+        monkeypatch,
+        ["--engine", "claude", "--model", "claude-opus-4-8", "--base", "origin/main"],
+        clean_stdout,
+        argv_log=with_base_log,
+    )
+    without_base = run_slot(
+        tmp_path,
+        monkeypatch,
+        ["--engine", "claude", "--model", "claude-opus-4-8"],
+        clean_stdout,
+        argv_log=without_base_log,
+    )
+
+    assert with_base.returncode == 0
+    assert without_base.returncode == 0
+    with_base_argv = json.loads(with_base_log.read_text())
+    without_base_argv = json.loads(without_base_log.read_text())
+    assert with_base_argv[-1] == "/review the diff against origin/main"
+    assert "the diff against" not in without_base_argv[-1]
+    assert "working-tree" in without_base_argv[-1]
 
 
 def test_codex_base_flag_is_threaded_only_when_set(
