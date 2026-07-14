@@ -54,8 +54,8 @@ sys.exit(int(os.environ.get("REVIEW_SLOT_EXIT_CODE", "0")))
     return bin_dir
 
 
-def write_output(tmp_path: Path, text: str) -> Path:
-    path = tmp_path / "stdout.txt"
+def write_output(tmp_path: Path, text: str, name: str) -> Path:
+    path = tmp_path / name
     path.write_text(text, encoding="utf-8")
     return path
 
@@ -66,11 +66,17 @@ def run_slot(
     args: list[str],
     stdout_text: str,
     *,
+    stderr_text: str = "",
     exit_code: int = 0,
     counter: Path | None = None,
     argv_log: Path | None = None,
 ) -> subprocess.CompletedProcess[str]:
-    monkeypatch.setenv("REVIEW_SLOT_STDOUT_FILE", str(write_output(tmp_path, stdout_text)))
+    monkeypatch.setenv(
+        "REVIEW_SLOT_STDOUT_FILE", str(write_output(tmp_path, stdout_text, "stdout.txt"))
+    )
+    monkeypatch.setenv(
+        "REVIEW_SLOT_STDERR_FILE", str(write_output(tmp_path, stderr_text, "stderr.txt"))
+    )
     monkeypatch.setenv("REVIEW_SLOT_EXIT_CODE", str(exit_code))
     if counter is not None:
         monkeypatch.setenv("REVIEW_SLOT_COUNTER", str(counter))
@@ -158,6 +164,112 @@ def test_claude_parse_failure_retries_twice_then_blocks(
     assert counter.read_text() == "3"
     assert result.stdout == ""
     assert result.stderr.strip()
+
+
+def test_codex_rate_limited_exits_skip_without_retry(
+    shim_bin: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    counter = tmp_path / "counter.txt"
+
+    result = run_slot(
+        tmp_path,
+        monkeypatch,
+        ["--engine", "codex", "--model", "gpt-5.5-codex"],
+        "",
+        stderr_text="usage limit reached\n",
+        exit_code=1,
+        counter=counter,
+    )
+
+    assert result.returncode == 2
+    assert result.stdout == "rate-limited\n"
+    assert result.stderr == ""
+    assert counter.read_text() == "1"
+
+
+def test_codex_unavailable_exits_skip_without_retry(
+    shim_bin: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    counter = tmp_path / "counter.txt"
+
+    result = run_slot(
+        tmp_path,
+        monkeypatch,
+        ["--engine", "codex", "--model", "gpt-5.5-codex"],
+        "",
+        stderr_text="codex: command not found\n",
+        exit_code=127,
+        counter=counter,
+    )
+
+    assert result.returncode == 2
+    assert result.stdout == "unavailable\n"
+    assert result.stderr == ""
+    assert counter.read_text() == "1"
+
+
+def test_codex_parse_failure_without_skip_signal_retries_then_blocks(
+    shim_bin: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    counter = tmp_path / "counter.txt"
+
+    result = run_slot(
+        tmp_path,
+        monkeypatch,
+        ["--engine", "codex", "--model", "gpt-5.5-codex"],
+        "",
+        stderr_text="ordinary parser failure\n",
+        exit_code=1,
+        counter=counter,
+    )
+
+    assert result.returncode == 3
+    assert result.stdout == ""
+    assert counter.read_text() == "3"
+    assert "review slot blocked" in result.stderr
+
+
+def test_claude_blocking_finding_preserves_details(
+    shim_bin: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    result = run_slot(
+        tmp_path,
+        monkeypatch,
+        ["--engine", "claude", "--model", "claude-opus-4-8"],
+        json.dumps(
+            {
+                "type": "result",
+                "subtype": "success",
+                "session_id": "sess",
+                "result": json.dumps(
+                    {
+                        "clean": False,
+                        "findings": [
+                            {
+                                "severity": "p1",
+                                "title": "Missing guard",
+                                "body": "The mutation can race.",
+                                "file": "skills/coordinator/review_slot.py",
+                                "line": 42,
+                            }
+                        ],
+                    }
+                ),
+            }
+        ),
+    )
+
+    assert result.returncode == 1
+    findings = json.loads(result.stdout)
+    assert findings == [
+        {
+            "severity": "P1",
+            "title": "Missing guard",
+            "body": "The mutation can race.",
+            "file": "skills/coordinator/review_slot.py",
+            "line": 42,
+        }
+    ]
 
 
 def test_codex_base_flag_is_threaded_only_when_set(

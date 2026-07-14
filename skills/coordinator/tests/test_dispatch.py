@@ -463,6 +463,10 @@ def test_build_reviewer_prompt_git_with_codex_threads_slots() -> None:
     assert "--review-beta-status passed" in out
     assert "exit 0 => record that slot passed" in out
     assert "exit 1 => the slot found [P0]/[P1]" in out
+    assert "exit 2 => codex slot skipped" in out
+    assert "--review-alpha-status skipped --review-alpha-engine codex" in out
+    assert "--review-alpha-skip-reason <reason>" in out
+    assert "continue (beta still must pass)" in out
     assert "exit 3 => the slot is BLOCKED" in out
     assert "--phase blocked" in out
     assert "--review-alpha-skip-reason" in out

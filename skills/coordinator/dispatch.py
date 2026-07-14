@@ -476,8 +476,10 @@ def build_reviewer_prompt(
     Contract this prompt enforces (matches CLAUDE.md §4):
       - Each round runs BOTH slots through review_slot.py.
       - exit 0 records that slot passed; exit 1 means P0/P1 findings,
-        so the reviewer fixes and reruns that slot; exit 3 blocks the
-        worker and does not flip review-done.
+        so the reviewer fixes and reruns that slot; exit 2 means a git
+        codex alpha slot was skipped because review_slot.py printed
+        rate-limited|unavailable on stdout; exit 3 blocks the worker and
+        does not flip review-done.
       - Per-iteration fixes are committed (`fix: review iter-N — <line>`)
         on the worker's branch. No squashing.
       - Final action: `fleet workers update <slug> --phase review-done`
@@ -622,11 +624,17 @@ def build_reviewer_prompt(
         f"python3 ~/.claude/skills/coordinator/review_slot.py "
         f"--engine {beta.engine} --model {beta.model} --effort high{base_arg}"
     )
-    if alpha.engine == "codex":
+    if is_git and alpha.engine == "codex":
         alpha_status_arg = "--review-alpha-status {passed|skipped}"
         alpha_skip_note = (
             "     If alpha is skipped only because codex is rate-limited or unavailable, "
             "add `--review-alpha-skip-reason rate-limited|unavailable`."
+        )
+        alpha_exit2_note = (
+            "   - exit 2 => codex slot skipped (helper prints reason on stdout: "
+            "rate-limited|unavailable); record that slot as "
+            "`--review-alpha-status skipped --review-alpha-engine codex "
+            "--review-alpha-skip-reason <reason>` and continue (beta still must pass)."
         )
     elif resolution.single_claude_only:
         alpha_status_arg = "--review-alpha-status single-claude-degraded"
@@ -634,9 +642,11 @@ def build_reviewer_prompt(
             "     Because only one distinct Claude model is available, record alpha "
             "as `single-claude-degraded` after the shared Claude slot passes."
         )
+        alpha_exit2_note = ""
     else:
         alpha_status_arg = "--review-alpha-status passed"
         alpha_skip_note = "     Alpha is a Claude slot and must pass; do not skip it."
+        alpha_exit2_note = ""
     if is_git:
         fix_instruction = (
             "fix all [P0]/[P1] findings, add regression tests, "
@@ -664,6 +674,7 @@ def build_reviewer_prompt(
         f"   - beta ({beta.engine}/{beta.model}): `{beta_cmd}`",
         "   - exit 0 => record that slot passed.",
         f"   - exit 1 => the slot found [P0]/[P1]; {fix_instruction}.",
+        *([alpha_exit2_note] if alpha_exit2_note else []),
         "   - exit 3 => the slot is BLOCKED. Do NOT flip review-done. Run:",
         f"     `fleet workers update {task.slug} {proj_flag} --phase blocked \\",
         "       --reason \"review slot <alpha|beta> blocked: <one line>\"`",
