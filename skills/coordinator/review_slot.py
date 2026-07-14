@@ -140,15 +140,16 @@ def run_codex(args: argparse.Namespace) -> subprocess.CompletedProcess[str]:
 
 
 def parse_codex(stdout: str, returncode: int) -> tuple[list[dict[str, Any]], str | None]:
-    if returncode != 0 and not stdout:
-        return [], "codex produced no usable output"
-
     findings: list[dict[str, Any]] = []
     for line in stdout.splitlines():
         match = FINDING_RE.search(line)
         if match is None:
             continue
         findings.append({"severity": match.group(1).upper(), "line": line})
+    if findings:
+        return findings, None
+    if returncode != 0:
+        return [], "codex exited nonzero with no findings"
     return findings, None
 
 

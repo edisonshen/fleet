@@ -230,6 +230,27 @@ def test_codex_parse_failure_without_skip_signal_retries_then_blocks(
     assert "review slot blocked" in result.stderr
 
 
+def test_codex_nonzero_stdout_without_findings_retries_then_blocks(
+    shim_bin: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    counter = tmp_path / "counter.txt"
+
+    result = run_slot(
+        tmp_path,
+        monkeypatch,
+        ["--engine", "codex", "--model", "gpt-5.5-codex"],
+        "Loading config...\nerror: invalid base branch\n",
+        stderr_text="",
+        exit_code=1,
+        counter=counter,
+    )
+
+    assert result.returncode == 3
+    assert result.stdout == ""
+    assert counter.read_text() == "3"
+    assert "codex exited nonzero with no findings" in result.stderr
+
+
 def test_codex_missing_ref_error_retries_then_blocks(
     shim_bin: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
