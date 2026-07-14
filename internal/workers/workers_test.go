@@ -1024,6 +1024,14 @@ func TestValidateReviewGate(t *testing.T) {
 			},
 		},
 		{
+			name:    "single-claude-degraded with mismatched models rejected",
+			gitMode: true,
+			state: func(project, slug string) *State {
+				return stateWithReview(project, slug, PhasePush, ReviewStatusSingleClaudeDegraded, ReviewEngineClaude, "sonnet-5", "", ReviewStatusPassed, ReviewEngineClaude, "opus-4.8", "")
+			},
+			wantErr: ErrReviewDegradedModelMismatch,
+		},
+		{
 			name:    "alpha skipped in single-claude slot rejected",
 			gitMode: true,
 			state: func(project, slug string) *State {

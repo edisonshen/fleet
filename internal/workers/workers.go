@@ -173,18 +173,19 @@ type State struct {
 
 // Errors.
 var (
-	ErrNotFound             = errors.New("worker state.json not found")
-	ErrInvalidState         = errors.New("invalid worker state")
-	ErrPhaseRequiresPR      = errors.New("phase=done requires pr_url")
-	ErrPhaseRequiresWhy     = errors.New("phase=blocked requires blocked_reason")
-	ErrPhaseRequiresReview  = errors.New("terminal phase requires review slot gate: alpha passed or legal codex skip, and beta claude passed")
-	ErrInvalidPhase         = errors.New("invalid phase")
-	ErrInvalidReviewStat    = errors.New("invalid review status")
-	ErrCodexSkipNeedsReason = errors.New("codex-engine review slot status=skipped requires skip_reason in {rate-limited, unavailable}")
-	ErrReviewSlotIdentity   = errors.New("review slot requires engine in {codex,claude} and non-empty model")
-	ErrReviewBetaAnchor     = errors.New("review beta slot must be engine=claude with status=passed (the Claude anchor)")
-	ErrInvalidSlug          = errors.New("invalid worker slug")
-	ErrPreconditionLive     = errors.New("cannot archive live worker")
+	ErrNotFound                    = errors.New("worker state.json not found")
+	ErrInvalidState                = errors.New("invalid worker state")
+	ErrPhaseRequiresPR             = errors.New("phase=done requires pr_url")
+	ErrPhaseRequiresWhy            = errors.New("phase=blocked requires blocked_reason")
+	ErrPhaseRequiresReview         = errors.New("terminal phase requires review slot gate: alpha passed or legal codex skip, and beta claude passed")
+	ErrInvalidPhase                = errors.New("invalid phase")
+	ErrInvalidReviewStat           = errors.New("invalid review status")
+	ErrCodexSkipNeedsReason        = errors.New("codex-engine review slot status=skipped requires skip_reason in {rate-limited, unavailable}")
+	ErrReviewSlotIdentity          = errors.New("review slot requires engine in {codex,claude} and non-empty model")
+	ErrReviewBetaAnchor            = errors.New("review beta slot must be engine=claude with status=passed (the Claude anchor)")
+	ErrReviewDegradedModelMismatch = errors.New("single-claude-degraded requires review_alpha_model == review_beta_model (only one distinct Claude reviewer)")
+	ErrInvalidSlug                 = errors.New("invalid worker slug")
+	ErrPreconditionLive            = errors.New("cannot archive live worker")
 	// ErrStaleGeneration fires when a `fleet workers update
 	// --dispatch-generation n` carries a generation that does NOT match
 	// the task row's authoritative dispatch_generation — a stale prior
@@ -279,6 +280,9 @@ func validateReviewGate(s *State, gitMode bool) error {
 	if s.ReviewAlphaStatus == ReviewStatusSingleClaudeDegraded {
 		if s.ReviewAlphaEngine != ReviewEngineClaude {
 			return fmt.Errorf("%w: review_alpha_status=%q review_alpha_engine=%q", ErrPhaseRequiresReview, s.ReviewAlphaStatus, s.ReviewAlphaEngine)
+		}
+		if s.ReviewAlphaModel != s.ReviewBetaModel {
+			return fmt.Errorf("%w: review_alpha_model=%q review_beta_model=%q", ErrReviewDegradedModelMismatch, s.ReviewAlphaModel, s.ReviewBetaModel)
 		}
 	} else if s.ReviewAlphaStatus == ReviewStatusPassed {
 		// alpha clean.
