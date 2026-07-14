@@ -32,6 +32,7 @@ import fcntl
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -51,6 +52,7 @@ _FLOG_COORD = fleetlog_mod.COMP_COORD if fleetlog_mod is not None else "coord"
 import parse
 import pr_watch as pr_watch_mod
 import reaper as reaper_mod
+import reviewcfg
 import supervisor as supervisor_mod
 import worktree as worktree_mod
 
@@ -7544,6 +7546,17 @@ def _dispatch_review_handoffs(
     # Git mode is the same per-tick decision as in _dispatch_ready —
     # the reviewer + finisher prompts branch on this.
     is_git = dispatch_mod.project_is_git(project, fleet_home=fleet_home)
+    if isinstance(coord_state, dict) and "has_codex" in coord_state:
+        has_codex = bool(coord_state.get("has_codex"))
+    else:
+        has_codex = shutil.which("codex") is not None
+        if isinstance(coord_state, dict):
+            coord_state["has_codex"] = has_codex
+    resolution = reviewcfg.resolve_slots(
+        has_codex=has_codex,
+        is_git=is_git,
+        unavailable=set(),
+    )
     for t in tasks:
         if t.status != "in-progress":
             continue
@@ -7608,6 +7621,8 @@ def _dispatch_review_handoffs(
                     t, project=project, branch=branch,
                     worktree=worktree or None, is_git=is_git,
                     dispatch_generation=handoff_generation,
+                    has_codex=has_codex,
+                    resolution=resolution,
                 )
                 description = f"fleet reviewer {t.slug}"
             else:

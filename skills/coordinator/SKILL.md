@@ -187,7 +187,7 @@ Implementation is a three-stage flow across separate Agent subagents:
 ```text
 worker                reviewer                  finisher
 ------                --------                  --------
-code + tests       -> /review + codex loop   -> push + PR
+code + tests       -> alpha/beta slot loop   -> push + PR
 local commits         no push                    gated by review state
 phase=review-pending  phase=review-done          phase=done + pr_url
 ```
@@ -195,9 +195,11 @@ phase=review-pending  phase=review-done          phase=done + pr_url
 Rules:
 - The worker exits at `review-pending`; it does not run `/review` and does not
   push.
-- The reviewer loops until `/review` and codex are clean. Codex skip reasons
-  are allowlisted to `rate-limited`, `unavailable`, or `no-git`; `/review` is
-  never skippable.
+- The reviewer runs both resolved slots through `review_slot.py`, fixes P0/P1
+  findings, and records slot-named alpha/beta terminal fields. Beta is the
+  Claude anchor and must pass; the beta review is never skippable.
+- On git projects, an alpha codex slot may be recorded as skipped only for
+  `rate-limited` or `unavailable`; non-git projects resolve to Claude slots.
 - The finisher pushes and opens the PR only when review terminal fields satisfy
   the worker state validator.
 - v0.2 default parallelism is 1. Higher parallelism uses worktrees and conflict
@@ -440,9 +442,9 @@ re-dispatched. `NEW_TASK` is a wake-only sentinel and carries no token.
 
 ## Non-git Projects
 
-Same phases, no branch/commit/push/PR. Reviewer records codex as skipped with
-reason `no-git`; `/review` remains mandatory. Finisher writes `phase=done`
-directly and notes the diff summary.
+Same phases, no branch/commit/push/PR. Reviewer runs two Claude slots through
+`review_slot.py`, records both slots passed, and the finisher writes
+`phase=done` directly with a diff summary.
 
 ## Failure Modes
 

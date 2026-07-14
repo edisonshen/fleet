@@ -428,47 +428,55 @@ def test_fetch_learnings_swallows_missing_binary() -> None:
 
 
 def test_build_reviewer_prompt_contains_review_iter_loop() -> None:
-    """The reviewer subagent's prompt MUST instruct it to iterate
-    /review until two consecutive clean passes. This is the structural
-    invariant — without explicit "loop until clean" wording, a
-    reviewer might run /review once, see [P0] findings, fix one, and
-    declare done."""
+    """The reviewer prompt runs both resolved slots until both pass."""
     t = _make_task()
     out = dispatch.build_reviewer_prompt(t, project="fleet")
     # Section heading + role.
     assert "FLEET REVIEWER" in out.upper()
     assert f"task: {t.slug}" in out
-    # /review iteration loop language.
-    assert "/review" in out
-    assert "TWO consecutive" in out or "two consecutive" in out
+    assert "review_slot.py" in out
+    assert "Loop until BOTH slots exit 0" in out
     assert "P0" in out and "P1" in out
     # Fix-commit pattern.
     assert "fix: review iter-" in out
     # Final terminal write.
     assert "--phase review-done" in out
-    assert "--review-claude-status passed" in out
-    assert "--review-claude-rounds" in out
-    # /review is never skippable.
-    assert "MANDATORY" in out or "mandatory" in out
+    assert "--review-alpha-status" in out
+    assert "--review-beta-status passed" in out
+    assert "--review-alpha-rounds" in out
+    assert "--review-beta-rounds" in out
     # Reviewer does NOT push or open PR.
     assert "do NOT push" in out.lower() or "Do NOT push" in out
 
 
-def test_build_reviewer_prompt_documents_codex_skip_rate_limit() -> None:
-    """Codex review's rate-limit handling is the documented
-    operational escape hatch. The prompt must spell out: try once,
-    wait 60s, retry, on persistent rate-limit MARK SKIPPED with
-    --review-codex-skip-reason rate-limited. Anything else is rejected
-    by the workers CLI."""
+def test_build_reviewer_prompt_git_with_codex_threads_slots() -> None:
     t = _make_task()
-    out = dispatch.build_reviewer_prompt(t, project="fleet")
-    assert "codex" in out.lower()
-    assert "rate-limit" in out.lower() or "rate limit" in out.lower()
-    assert "60s" in out or "60 s" in out or "60 second" in out.lower()
-    assert "--review-codex-skip-reason" in out
+    out = dispatch.build_reviewer_prompt(t, project="fleet", has_codex=True)
+    assert "review_slot.py" in out
+    assert "--engine codex" in out
+    assert "--engine claude" in out
+    assert "--effort high" in out
+    assert "--base origin/main" in out
+    assert dispatch.reviewcfg.CODEX_DEFAULT_MODEL in out
+    assert dispatch.reviewcfg.OPUS_FALLBACK[0] in out
+    assert "--review-alpha-status" in out
+    assert "--review-beta-status passed" in out
+    assert "exit 0 => record that slot passed" in out
+    assert "exit 1 => the slot found [P0]/[P1]" in out
+    assert "exit 3 => the slot is BLOCKED" in out
+    assert "--phase blocked" in out
+    assert "--review-alpha-skip-reason" in out
     assert "rate-limited" in out
-    # Allowlist note: only rate-limited|unavailable are valid.
     assert "unavailable" in out
+
+
+def test_build_reviewer_prompt_git_without_codex_uses_two_claude_slots() -> None:
+    t = _make_task()
+    out = dispatch.build_reviewer_prompt(t, project="fleet", has_codex=False)
+    assert "--engine codex" not in out
+    assert out.count("--engine claude --model") == 2
+    assert dispatch.reviewcfg.SONNET_FALLBACK[0] in out
+    assert dispatch.reviewcfg.OPUS_FALLBACK[0] in out
 
 
 def test_build_reviewer_prompt_does_not_push_or_open_pr() -> None:
@@ -500,7 +508,7 @@ def test_build_reviewer_prompt_codex_coord_adds_diversity_banner() -> None:
     # Reviewer role still claude.
     assert "CLAUDE" in out
     # Existing review-iter contract still in place.
-    assert "/review" in out
+    assert "review_slot.py" in out
     assert "--phase review-done" in out
 
 
@@ -705,35 +713,18 @@ def test_build_worker_prompt_non_git_project_skips_branch_push_pr() -> None:
     assert "reviewer" in out.lower()
 
 
-def test_build_reviewer_prompt_non_git_uses_no_git_skip_reason() -> None:
-    """Non-git reviewer cannot run `codex review --base main` (no diff)
-    so it MUST record skip-reason=no-git. The prompt names that exact
-    reason so the reviewer doesn't invent an alternative.
-    """
+def test_build_reviewer_prompt_non_git_uses_two_claude_slots_without_base() -> None:
     t = _make_task()
-    out = dispatch.build_reviewer_prompt(t, project="scratch", is_git=False)
-    assert "no-git" in out
-    # /review is still mandatory.
-    assert "/review" in out
-    # The non-git reviewer does NOT attempt the `codex review --base
-    # origin/main` invocation — that's the git path. The terminal
-    # update line pins skip-reason=no-git.
-    assert "codex review --base origin/main" not in out
-    assert "--review-codex-skip-reason no-git" in out
-
-
-def test_build_reviewer_prompt_git_keeps_codex_loop() -> None:
-    """Regression: is_git=True (default) keeps the existing reviewer
-    workflow with the codex iteration loop intact.
-    """
-    t = _make_task()
-    out = dispatch.build_reviewer_prompt(t, project="fleet", is_git=True)
-    assert "codex review --base origin/main" in out
-    # Three documented skip reasons (the workers CLI allowlist).
-    assert "rate-limited" in out
-    assert "unavailable" in out
-    # no-git is documented in the allowlist mention but is NOT this
-    # reviewer's intended reason — that's the non-git path.
+    out = dispatch.build_reviewer_prompt(
+        t, project="scratch", is_git=False, has_codex=True,
+    )
+    assert "review_slot.py" in out
+    assert "--engine codex" not in out
+    assert out.count("--engine claude --model") == 2
+    assert "--base" not in out
+    assert "no-git" not in out
+    assert "--review-alpha-status passed" in out
+    assert "--review-beta-status passed" in out
 
 
 def test_build_finisher_prompt_non_git_skips_push_and_pr() -> None:
@@ -754,6 +745,9 @@ def test_build_finisher_prompt_non_git_skips_push_and_pr() -> None:
     # NOT carry --pr-url.
     assert "--phase done --exit 0" in out
     assert "--phase done --pr-url" not in out
+    assert "review_alpha_status=passed" in out
+    assert "review_beta_status=passed" in out
+    assert "no-git" not in out
     # Diff summary is the operator-visible deliverable.
     assert "diff" in out.lower()
 
@@ -767,6 +761,13 @@ def test_build_finisher_prompt_git_keeps_push_and_pr() -> None:
     assert "git push" in out
     assert "gh pr create" in out
     assert "--phase done --pr-url" in out
+    assert ".review_alpha_" in out
+    assert ".review_beta_" in out
+    assert "- alpha (<engine>/<model>):" in out
+    assert "- beta (claude/<model>):" in out
+    assert "--phase blocked" in out
+    assert "review gate rejected" in out
+    assert ".review_codex_" not in out
 
 
 # ---------- acquire_coord_prompt_inbox (PR1 dispatch-lifecycle) ----------
