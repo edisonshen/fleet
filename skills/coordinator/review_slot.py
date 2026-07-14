@@ -90,6 +90,7 @@ def run_claude(args: argparse.Namespace) -> subprocess.CompletedProcess[str]:
             prompt,
         ],
         capture_output=True,
+        stdin=subprocess.DEVNULL,
         text=True,
     )
 
@@ -116,6 +117,11 @@ def validate_claude_inner(inner: Any) -> list[dict[str, Any]]:
         normalized_finding = dict(finding)
         normalized_finding["severity"] = severity
         normalized.append(normalized_finding)
+    has_blocking_finding = any(
+        finding["severity"] in BLOCKING_SEVERITIES for finding in normalized
+    )
+    if inner["clean"] is False and not has_blocking_finding:
+        raise ValueError("inner result is inconsistent: clean=false with no P0/P1 findings")
     return normalized
 
 
@@ -140,7 +146,7 @@ def run_codex(args: argparse.Namespace) -> subprocess.CompletedProcess[str]:
     if args.base:
         command.extend(["--base", args.base])
     command.extend(["--config", 'model_reasoning_effort="high"'])
-    return subprocess.run(command, capture_output=True, text=True)
+    return subprocess.run(command, capture_output=True, stdin=subprocess.DEVNULL, text=True)
 
 
 def parse_codex(stdout: str, returncode: int) -> tuple[list[dict[str, Any]], str | None]:
@@ -157,8 +163,8 @@ def parse_codex(stdout: str, returncode: int) -> tuple[list[dict[str, Any]], str
     return findings, None
 
 
-def codex_skip_reason(stderr: str, error: str | None = None) -> str | None:
-    text = "\n".join(part for part in (stderr, error or "") if part)
+def codex_skip_reason(stdout: str, stderr: str, error: str | None = None) -> str | None:
+    text = "\n".join(part for part in (stdout, stderr, error or "") if part)
     if RATE_LIMIT_RE.search(text):
         return "rate-limited"
     if UNAVAILABLE_RE.search(text):
@@ -173,17 +179,15 @@ def run_once(args: argparse.Namespace) -> tuple[list[dict[str, Any]], str | None
             findings, error = parse_claude(completed.stdout, completed.returncode)
         else:
             completed = run_codex(args)
-            skip_reason = (
-                codex_skip_reason(completed.stderr)
-                if completed.returncode != 0
-                else None
-            )
+            findings, error = parse_codex(completed.stdout, completed.returncode)
+            if findings:
+                return findings, error, completed.stderr, None
+            skip_reason = codex_skip_reason(completed.stdout, completed.stderr)
             if skip_reason is not None:
                 return [], None, completed.stderr, skip_reason
-            findings, error = parse_codex(completed.stdout, completed.returncode)
     except OSError as exc:
         if args.engine == "codex":
-            skip_reason = codex_skip_reason("", str(exc)) or "unavailable"
+            skip_reason = codex_skip_reason("", "", str(exc)) or "unavailable"
             return [], None, "", skip_reason
         return [], str(exc), "", None
     return findings, error, completed.stderr, None

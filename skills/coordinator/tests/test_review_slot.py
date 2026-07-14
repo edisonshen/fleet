@@ -167,6 +167,55 @@ def test_claude_parse_failure_retries_twice_then_blocks(
     assert result.stderr.strip()
 
 
+def test_claude_clean_false_without_blocking_findings_retries_then_blocks(
+    shim_bin: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    counter = tmp_path / "counter.txt"
+
+    result = run_slot(
+        tmp_path,
+        monkeypatch,
+        ["--engine", "claude", "--model", "claude-opus-4-8"],
+        json.dumps(
+            {
+                "type": "result",
+                "subtype": "success",
+                "session_id": "sess",
+                "result": json.dumps({"clean": False, "findings": []}),
+            }
+        ),
+        counter=counter,
+    )
+
+    assert result.returncode == 3
+    assert result.stdout == ""
+    assert counter.read_text() == "3"
+    assert "clean=false with no P0/P1 findings" in result.stderr
+
+
+def test_claude_clean_false_with_blocking_finding_exits_blocking(
+    shim_bin: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    result = run_slot(
+        tmp_path,
+        monkeypatch,
+        ["--engine", "claude", "--model", "claude-opus-4-8"],
+        json.dumps(
+            {
+                "type": "result",
+                "subtype": "success",
+                "session_id": "sess",
+                "result": json.dumps(
+                    {"clean": False, "findings": [{"severity": "P1"}]}
+                ),
+            }
+        ),
+    )
+
+    assert result.returncode == 1
+    assert json.loads(result.stdout) == [{"severity": "P1"}]
+
+
 def test_codex_rate_limited_exits_skip_without_retry(
     shim_bin: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -179,6 +228,26 @@ def test_codex_rate_limited_exits_skip_without_retry(
         "",
         stderr_text="usage limit reached\n",
         exit_code=1,
+        counter=counter,
+    )
+
+    assert result.returncode == 2
+    assert result.stdout == "rate-limited\n"
+    assert result.stderr == ""
+    assert counter.read_text() == "1"
+
+
+def test_codex_rate_limited_on_stdout_exits_skip_without_retry(
+    shim_bin: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    counter = tmp_path / "counter.txt"
+
+    result = run_slot(
+        tmp_path,
+        monkeypatch,
+        ["--engine", "codex", "--model", "gpt-5.5-codex"],
+        "usage limit reached\n",
+        exit_code=0,
         counter=counter,
     )
 
@@ -228,6 +297,24 @@ def test_codex_parse_failure_without_skip_signal_retries_then_blocks(
     assert result.stdout == ""
     assert counter.read_text() == "3"
     assert "review slot blocked" in result.stderr
+
+
+def test_codex_findings_win_over_rate_limit_skip_signal(
+    shim_bin: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    result = run_slot(
+        tmp_path,
+        monkeypatch,
+        ["--engine", "codex", "--model", "gpt-5.5-codex"],
+        "[P0] data loss in reviewer gate\n",
+        stderr_text="usage limit reached\n",
+        exit_code=1,
+    )
+
+    assert result.returncode == 1
+    findings = json.loads(result.stdout)
+    assert [item["severity"] for item in findings] == ["P0"]
+    assert result.stderr == "usage limit reached\n"
 
 
 def test_codex_nonzero_stdout_without_findings_retries_then_blocks(
