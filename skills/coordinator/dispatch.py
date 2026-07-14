@@ -636,6 +636,12 @@ def build_reviewer_prompt(
             "`--review-alpha-status skipped --review-alpha-engine codex "
             "--review-alpha-skip-reason <reason>` and continue (beta still must pass)."
         )
+        loop_termination_line = (
+            "   Loop until BOTH slots are RESOLVED: each slot exits 0 (passed), "
+            "OR the codex alpha exits 2 (skipped) — record it as "
+            "`--review-alpha-status skipped` and stop re-running it (do not keep "
+            "retrying a rate-limited codex). Beta must still reach exit 0 (passed)."
+        )
     elif resolution.single_claude_only:
         alpha_status_arg = "--review-alpha-status single-claude-degraded"
         alpha_skip_note = (
@@ -643,10 +649,12 @@ def build_reviewer_prompt(
             "as `single-claude-degraded` after the shared Claude slot passes."
         )
         alpha_exit2_note = ""
+        loop_termination_line = "   Loop until BOTH slots exit 0."
     else:
         alpha_status_arg = "--review-alpha-status passed"
         alpha_skip_note = "     Alpha is a Claude slot and must pass; do not skip it."
         alpha_exit2_note = ""
+        loop_termination_line = "   Loop until BOTH slots exit 0."
     if is_git:
         fix_instruction = (
             "fix all [P0]/[P1] findings, add regression tests, "
@@ -681,7 +689,7 @@ def build_reviewer_prompt(
         "     and exit.",
         f"   - Mid-loop phase nudge after a fix: `fleet workers update {task.slug} {proj_flag} \\",
         "       --phase review-claude --review-alpha-status iterating`",
-        "   Loop until BOTH slots exit 0.",
+        loop_termination_line,
         "",
         "3. Final terminal write (the load-bearing call):",
         "",

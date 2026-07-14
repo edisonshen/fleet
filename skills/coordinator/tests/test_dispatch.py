@@ -467,6 +467,10 @@ def test_build_reviewer_prompt_git_with_codex_threads_slots() -> None:
     assert "--review-alpha-status skipped --review-alpha-engine codex" in out
     assert "--review-alpha-skip-reason <reason>" in out
     assert "continue (beta still must pass)" in out
+    assert "Loop until BOTH slots are RESOLVED" in out
+    assert "OR the codex alpha exits 2 (skipped)" in out
+    assert "stop re-running it" in out
+    assert "Beta must still reach exit 0 (passed)" in out
     assert "exit 3 => the slot is BLOCKED" in out
     assert "--phase blocked" in out
     assert "--review-alpha-skip-reason" in out
@@ -481,6 +485,9 @@ def test_build_reviewer_prompt_git_without_codex_uses_two_claude_slots() -> None
     assert out.count("--engine claude --model") == 2
     assert dispatch.reviewcfg.SONNET_FALLBACK[0] in out
     assert dispatch.reviewcfg.OPUS_FALLBACK[0] in out
+    assert "Loop until BOTH slots exit 0." in out
+    assert "Loop until BOTH slots are RESOLVED" not in out
+    assert "OR the codex alpha exits 2 (skipped)" not in out
 
 
 def test_build_reviewer_prompt_does_not_push_or_open_pr() -> None:
