@@ -15,7 +15,6 @@ import re
 import shutil
 import subprocess
 import sys
-import tempfile
 from typing import Any
 
 
@@ -68,26 +67,23 @@ def run_claude(args: argparse.Namespace) -> subprocess.CompletedProcess[str]:
     if args.base:
         prompt += f" against {args.base}"
 
-    with tempfile.NamedTemporaryFile("w", encoding="utf-8", suffix=".json") as schema:
-        json.dump(build_inner_schema(), schema)
-        schema.flush()
-        return subprocess.run(
-            [
-                "claude",
-                "-p",
-                "--model",
-                args.model,
-                "--effort",
-                args.effort,
-                "--output-format",
-                "json",
-                "--json-schema",
-                schema.name,
-                prompt,
-            ],
-            capture_output=True,
-            text=True,
-        )
+    return subprocess.run(
+        [
+            "claude",
+            "-p",
+            "--model",
+            args.model,
+            "--effort",
+            args.effort,
+            "--output-format",
+            "json",
+            "--json-schema",
+            json.dumps(build_inner_schema()),
+            prompt,
+        ],
+        capture_output=True,
+        text=True,
+    )
 
 
 def validate_claude_inner(inner: Any) -> list[dict[str, Any]]:

@@ -24,12 +24,13 @@ from __future__ import annotations
 
 import os
 import sys
+import json
 from pathlib import Path
 
 argv_log = os.environ.get("REVIEW_SLOT_ARGV_LOG")
 if argv_log:
     with open(argv_log, "a", encoding="utf-8") as fh:
-        fh.write(" ".join(sys.argv) + "\\n")
+        fh.write(json.dumps(sys.argv) + "\\n")
 
 counter = os.environ.get("REVIEW_SLOT_COUNTER")
 if counter:
@@ -270,6 +271,37 @@ def test_claude_blocking_finding_preserves_details(
             "line": 42,
         }
     ]
+
+
+def test_claude_json_schema_is_passed_inline(
+    shim_bin: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    argv_log = tmp_path / "claude.argv"
+
+    result = run_slot(
+        tmp_path,
+        monkeypatch,
+        ["--engine", "claude", "--model", "claude-opus-4-8"],
+        json.dumps(
+            {
+                "type": "result",
+                "subtype": "success",
+                "session_id": "sess",
+                "result": json.dumps({"clean": True, "findings": []}),
+            }
+        ),
+        argv_log=argv_log,
+    )
+
+    assert result.returncode == 0
+    argv = json.loads(argv_log.read_text())
+    schema_value = argv[argv.index("--json-schema") + 1]
+    schema = json.loads(schema_value)
+    assert isinstance(schema, dict)
+    assert schema["type"] == "object"
+    assert "properties" in schema
+    assert schema_value.lstrip().startswith("{")
+    assert not schema_value.endswith(".json")
 
 
 def test_codex_base_flag_is_threaded_only_when_set(
