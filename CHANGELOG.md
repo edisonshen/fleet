@@ -6,6 +6,20 @@ follows [SemVer](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.16.1] - 2026-07-15
+
+Stop wasting a resuming coordinator's context. On handoff, the `coord-run`
+supervisor re-nudges the replacement session until it acknowledges the resume —
+and each nudge was re-inlining the full handoff decision block (~2 KB), so a
+multi-tick ack piled several identical copies into the live session. The nudge
+now carries only the doc path; the inline copy stays solely at the verified
+primary delivery, which already sends it exactly once.
+
+### Fixed
+
+- Coordinator resume-nudge sends the doc path only, no longer re-inlining the
+  handoff Key Decisions block on every supervisor tick (#282).
+
 ## [0.16.0] - 2026-07-15
 
 Every project gets a real two-reviewer gate. The reviewer stage now
@@ -1249,7 +1263,8 @@ Initial public release.
 - Filesystem packages: `internal/state`, `internal/handoff`,
   `internal/queue`, `internal/spawn`, `internal/tmux`.
 
-[Unreleased]: https://github.com/edisonshen/fleet/compare/v0.16.0...HEAD
+[Unreleased]: https://github.com/edisonshen/fleet/compare/v0.16.1...HEAD
+[0.16.1]: https://github.com/edisonshen/fleet/compare/v0.16.0...v0.16.1
 [0.16.0]: https://github.com/edisonshen/fleet/compare/v0.15.0...v0.16.0
 [0.15.0]: https://github.com/edisonshen/fleet/compare/v0.14.0...v0.15.0
 [0.14.0]: https://github.com/edisonshen/fleet/compare/v0.13.0...v0.14.0
