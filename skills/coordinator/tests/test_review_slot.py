@@ -167,7 +167,7 @@ def test_claude_parse_failure_retries_twice_then_blocks(
     assert result.stderr.strip()
 
 
-def test_claude_clean_false_without_blocking_findings_retries_then_blocks(
+def test_claude_clean_false_without_findings_retries_then_blocks(
     shim_bin: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     counter = tmp_path / "counter.txt"
@@ -190,7 +190,31 @@ def test_claude_clean_false_without_blocking_findings_retries_then_blocks(
     assert result.returncode == 3
     assert result.stdout == ""
     assert counter.read_text() == "3"
-    assert "clean=false with no P0/P1 findings" in result.stderr
+    assert "clean=false with no findings" in result.stderr
+
+
+def test_claude_clean_false_with_nonblocking_finding_exits_clean(
+    shim_bin: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    result = run_slot(
+        tmp_path,
+        monkeypatch,
+        ["--engine", "claude", "--model", "claude-opus-4-8"],
+        json.dumps(
+            {
+                "type": "result",
+                "subtype": "success",
+                "session_id": "sess",
+                "result": json.dumps(
+                    {"clean": False, "findings": [{"severity": "P2"}]}
+                ),
+            }
+        ),
+    )
+
+    assert result.returncode == 0
+    assert result.stdout == ""
+    assert json.loads(result.stderr) == [{"severity": "P2"}]
 
 
 def test_claude_clean_false_with_blocking_finding_exits_blocking(

@@ -117,11 +117,8 @@ def validate_claude_inner(inner: Any) -> list[dict[str, Any]]:
         normalized_finding = dict(finding)
         normalized_finding["severity"] = severity
         normalized.append(normalized_finding)
-    has_blocking_finding = any(
-        finding["severity"] in BLOCKING_SEVERITIES for finding in normalized
-    )
-    if inner["clean"] is False and not has_blocking_finding:
-        raise ValueError("inner result is inconsistent: clean=false with no P0/P1 findings")
+    if inner["clean"] is False and not normalized:
+        raise ValueError("inner result is inconsistent: clean=false with no findings")
     return normalized
 
 
