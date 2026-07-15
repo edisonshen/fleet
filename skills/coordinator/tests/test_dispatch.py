@@ -621,6 +621,29 @@ def test_build_finisher_prompt_documents_push_and_pr() -> None:
     assert "Do NOT run /review" in out or "do NOT run /review" in out.lower()
 
 
+def test_build_finisher_prompt_git_writes_push_phase_before_done() -> None:
+    """Git finisher must trigger the review gate at phase=push before
+    pushing remote code, then write phase=done only after the PR exists."""
+    t = _make_task()
+    out = dispatch.build_finisher_prompt(t, project="fleet", is_git=True)
+    push_update = f"fleet workers update {t.slug} --project fleet --phase push"
+    done_update = f"fleet workers update {t.slug} --project fleet --phase done --pr-url"
+
+    assert push_update in out
+    assert done_update in out
+    assert out.index(push_update) < out.index("git push -u")
+    assert out.index(push_update) < out.index(done_update)
+
+
+def test_build_finisher_prompt_git_blocks_on_push_gate_rejection() -> None:
+    """A phase=push review-gate rejection must block before push/PR."""
+    t = _make_task()
+    out = dispatch.build_finisher_prompt(t, project="fleet", is_git=True)
+    assert "If this phase=push write is REJECTED by the review gate" in out
+    assert "do NOT" in out and "push or open the PR" in out
+    assert "finisher: review gate rejected at phase=push" in out
+
+
 def test_build_finisher_prompt_force_with_lease_only() -> None:
     """A finisher that --force-pushes can blow away co-located changes.
     The prompt must pin --force-with-lease as the only force variant
@@ -762,6 +785,7 @@ def test_build_finisher_prompt_non_git_skips_push_and_pr() -> None:
     # NOT carry --pr-url.
     assert "--phase done --exit 0" in out
     assert "--phase done --pr-url" not in out
+    assert "--phase push" not in out
     assert "review_alpha_status=passed" in out
     assert "review_beta_status=passed" in out
     assert "no-git" not in out

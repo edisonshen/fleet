@@ -749,16 +749,19 @@ def build_finisher_prompt(
     """Assemble the finisher subagent's first-turn prompt.
 
     Three-stage flow: after the reviewer writes phase=review-done +
-    terminal review_*_status, the coord dispatches THIS subagent. The
-    finisher is purely mechanical:
+    terminal review_*_status, the coord dispatches THIS subagent. For
+    git projects the finisher writes phase=push first, which triggers
+    the review gate before any remote push, then writes phase=done after
+    the PR exists. The finisher is otherwise mechanical:
 
-      1. `git push origin <branch>` (or --force-with-lease if a fix
+      1. `fleet workers update <slug> --phase push` (review gate).
+      2. `git push origin <branch>` (or --force-with-lease if a fix
          landed on a remote-existing branch from a prior attempt).
-      2. `gh pr create --base main --head <branch> --title ... --body
+      3. `gh pr create --base main --head <branch> --title ... --body
          ...` with the standard PR body shape (scope summary +
          reviewer iteration counts + test plan).
-      3. `fleet workers update <slug> --phase done --pr-url <url>`.
-      4. Exit.
+      4. `fleet workers update <slug> --phase done --pr-url <url>`.
+      5. Exit.
 
     The finisher does NOT run /review or codex (the reviewer already
     did). The finisher does NOT amend commits or rebase. Any failure
@@ -787,14 +790,14 @@ def build_finisher_prompt(
         proj_flag = f"{proj_flag} --dispatch-generation {int(dispatch_generation)}"
 
     # Push step. When the worker ran in a pre-created worktree, the cd is
-    # folded into step 1 (push + PR must run from the worktree, which
+    # folded into step 2 (push + PR must run from the worktree, which
     # holds the worker + reviewer commits; the main repo HEAD is on a
-    # different branch). Folding it into step 1 keeps the downstream
-    # step numbers (2..5) byte-identical to the in-place path
+    # different branch). Folding it into step 2 keeps the downstream
+    # step numbers byte-identical to the in-place path
     # (dispatch-reviewer-finish-9316).
     if worktree:
         push_step = [
-            f"1. `cd {worktree}` — the worker ran in this pre-created worktree;",
+            f"2. `cd {worktree}` — the worker ran in this pre-created worktree;",
             f"   branch {branch} (worker + reviewer commits) is checked out THERE,",
             "   so push + PR must run from inside it, NOT the main repo (whose",
             "   HEAD is on a different branch). Then:",
@@ -806,7 +809,7 @@ def build_finisher_prompt(
         ]
     else:
         push_step = [
-            f"1. `git push -u origin {branch}` — fresh push. If origin already has",
+            f"2. `git push -u origin {branch}` — fresh push. If origin already has",
             "   a stale prior attempt's tip, use `git push --force-with-lease",
             f"   origin {branch}` (your branch is the only writer; --force-with-",
             "   lease is safe). Never plain `--force`.",
@@ -831,11 +834,21 @@ def build_finisher_prompt(
             "",
             "## Required workflow",
             "",
+            "1. Write phase=push before touching the remote. This is the review",
+            "   gate: it validates the reviewer alpha/beta terminal fields before",
+            "   any unreviewed code can be pushed.",
+            f"   `fleet workers update {task.slug} {proj_flag} --phase push`",
+            "   If this phase=push write is REJECTED by the review gate, do NOT",
+            "   push or open the PR. Run:",
+            f"   `fleet workers update {task.slug} {proj_flag} --phase blocked \\",
+            "     --reason \"finisher: review gate rejected at phase=push — <one-line err>\"`",
+            "   and exit.",
+            "",
             *push_step,
-            "2. Read state.json to extract reviewer counts for the PR body:",
+            "3. Read state.json to extract reviewer counts for the PR body:",
             f"   - `cat {workers_dir}/state.json | jq -r '.review_alpha_status, .review_alpha_engine, .review_alpha_model, .review_alpha_rounds, .review_alpha_skip_reason, .review_beta_status, .review_beta_engine, .review_beta_model, .review_beta_rounds'`",
             "",
-            f"3. `gh pr create --base main --head {branch} --title '<commit-1 message>' \\",
+            f"4. `gh pr create --base main --head {branch} --title '<commit-1 message>' \\",
             "     --body \"$(cat <<'EOF'",
             "## Summary",
             "<1-3 bullets from the worker's commits>",
@@ -850,15 +863,10 @@ def build_finisher_prompt(
             "EOF",
             "     )\"`",
             "",
-            f"4. Capture the PR URL. Then:",
+            f"5. Capture the PR URL. Then:",
             f"   `fleet workers update {task.slug} {proj_flag} --phase done --pr-url <url> --exit 0`",
-            "   If this terminal write is REJECTED by the review gate, do NOT loop",
-            "   or retry. Run:",
-            f"   `fleet workers update {task.slug} {proj_flag} --phase blocked \\",
-            "     --reason \"finisher: review gate rejected — <one-line err>\"`",
-            "   and exit.",
             "",
-            "5. Exit cleanly.",
+            "6. Exit cleanly.",
             "",
             "## On failure",
             "",
