@@ -762,7 +762,12 @@ func sendHandoffResumeNudge(cfg handoffResumeNudgeConfig, rec *agent.Record, doc
 	if session == "" {
 		return fmt.Errorf("agent %s has no tmux session", rec.ID)
 	}
-	prompt := handoff.ResumePromptWithInlineDoc(docPath)
+	// Supervisor re-nudges are path-only: the ~2KB inline decision block is
+	// delivered once by the verified primary handoff.go path. Re-inlining it on
+	// every liveness re-poke wastes the live coord's context (operator observed
+	// three copies of one handoff). The coord already has the path and can read
+	// the doc on demand.
+	prompt := handoff.ResumePrompt(docPath)
 	var lastErr error
 	for i := 0; i < cfg.transportTries; i++ {
 		readyErr := cfg.waitReady(session)
