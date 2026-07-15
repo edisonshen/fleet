@@ -462,11 +462,15 @@ func TestHandoffResumeNudgeLoop_CommonCaseZeroRenudge(t *testing.T) {
 	}
 }
 
-func TestHandoffResumeNudgeLoop_InlinesHandoffSections(t *testing.T) {
+func TestHandoffResumeNudgeLoop_NudgeIsPathOnly(t *testing.T) {
+	// The coord-run supervisor re-nudge sends the durable doc path only. The
+	// ~2KB inline decision block is delivered solely by the verified primary
+	// handoff.go path, once; re-inlining it on every liveness re-poke wastes the
+	// live coord's context (operator observed three copies of one handoff).
 	const (
-		agentID = "hrinline"
-		project = "hr-inline"
-		session = "fleet-hrinline"
+		agentID = "hrpathonly"
+		project = "hr-path-only"
+		session = "fleet-hrpathonly"
 	)
 	docPath := filepath.Join(t.TempDir(), "handoff.md")
 	doc := "## Completed\nold work\n\n" +
@@ -492,13 +496,16 @@ func TestHandoffResumeNudgeLoop_InlinesHandoffSections(t *testing.T) {
 		return true, nil
 	}
 	runHandoffResumeNudgeLoop(context.Background(), cfg)
-	for _, want := range []string{
-		"Read your handoff doc at " + docPath,
-		"## Key Decisions\\n- Path B owns the guarantee",
-		"## Next Steps (prioritized)\\n1. land PR-2",
+	if want := "Read your handoff doc at " + docPath; !strings.Contains(prompt, want) {
+		t.Fatalf("nudge prompt missing path directive %q:\n%s", want, prompt)
+	}
+	for _, notWant := range []string{
+		"Inline handoff sections:",
+		"## Key Decisions",
+		"## Next Steps (prioritized)",
 	} {
-		if !strings.Contains(prompt, want) {
-			t.Fatalf("nudge prompt missing %q:\n%s", want, prompt)
+		if strings.Contains(prompt, notWant) {
+			t.Fatalf("path-only nudge unexpectedly contains inline text %q:\n%s", notWant, prompt)
 		}
 	}
 }
