@@ -240,6 +240,68 @@ def test_claude_clean_false_with_blocking_finding_exits_blocking(
     assert json.loads(result.stdout) == [{"severity": "P1"}]
 
 
+def test_claude_non_git_task_context_is_prepended_to_prompt(
+    shim_bin: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    argv_log = tmp_path / "argv.jsonl"
+
+    result = run_slot(
+        tmp_path,
+        monkeypatch,
+        [
+            "--engine",
+            "claude",
+            "--model",
+            "claude-opus-4-8",
+            "--task-context",
+            "Build X",
+        ],
+        json.dumps(
+            {
+                "type": "result",
+                "subtype": "success",
+                "session_id": "sess",
+                "result": json.dumps({"clean": True, "findings": []}),
+            }
+        ),
+        argv_log=argv_log,
+    )
+
+    assert result.returncode == 0
+    argv = json.loads(argv_log.read_text().splitlines()[0])
+    prompt = argv[-1]
+    assert "Task context (what the worker was asked to build):\nBuild X" in prompt
+    assert "Review the current working-tree changes in this project" in prompt
+    assert "against the acceptance criteria above" in prompt
+
+
+def test_claude_non_git_without_task_context_uses_generic_prompt(
+    shim_bin: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    argv_log = tmp_path / "argv.jsonl"
+
+    result = run_slot(
+        tmp_path,
+        monkeypatch,
+        ["--engine", "claude", "--model", "claude-opus-4-8"],
+        json.dumps(
+            {
+                "type": "result",
+                "subtype": "success",
+                "session_id": "sess",
+                "result": json.dumps({"clean": True, "findings": []}),
+            }
+        ),
+        argv_log=argv_log,
+    )
+
+    assert result.returncode == 0
+    argv = json.loads(argv_log.read_text().splitlines()[0])
+    prompt = argv[-1]
+    assert "Run a raw structured review of the current working-tree changes" in prompt
+    assert "Task context (what the worker was asked to build)" not in prompt
+
+
 def test_codex_rate_limited_exits_skip_without_retry(
     shim_bin: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

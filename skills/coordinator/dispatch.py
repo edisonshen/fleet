@@ -34,6 +34,7 @@ import json
 import os
 import re
 import secrets
+import shlex
 import subprocess
 import tempfile
 from dataclasses import dataclass
@@ -616,13 +617,19 @@ def build_reviewer_prompt(
             "   top.",
         ]
     base_arg = f" --base origin/{base_branch}" if is_git else ""
+    task_context_arg = ""
+    if not is_git:
+        task_context = f"{task.spec}\n\nAcceptance:\n{task.acceptance}"
+        task_context_arg = f" --task-context {shlex.quote(task_context)}"
     alpha_cmd = (
         f"python3 ~/.claude/skills/coordinator/review_slot.py "
-        f"--engine {alpha.engine} --model {alpha.model} --effort high{base_arg}"
+        f"--engine {alpha.engine} --model {alpha.model} --effort high"
+        f"{base_arg}{task_context_arg}"
     )
     beta_cmd = (
         f"python3 ~/.claude/skills/coordinator/review_slot.py "
-        f"--engine {beta.engine} --model {beta.model} --effort high{base_arg}"
+        f"--engine {beta.engine} --model {beta.model} --effort high"
+        f"{base_arg}{task_context_arg}"
     )
     if is_git and alpha.engine == "codex":
         alpha_status_arg = "--review-alpha-status {passed|skipped}"

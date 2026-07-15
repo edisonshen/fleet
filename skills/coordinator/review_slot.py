@@ -59,12 +59,24 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model", required=True)
     parser.add_argument("--effort", default="high")
     parser.add_argument("--base")
+    parser.add_argument("--task-context")
     return parser.parse_args()
 
 
 def run_claude(args: argparse.Namespace) -> subprocess.CompletedProcess[str]:
     if args.base:
         prompt = f"/review the diff against {args.base}"
+    elif args.task_context:
+        prompt = (
+            "Task context (what the worker was asked to build):\n"
+            f"{args.task_context}\n\n"
+            "Review the current working-tree changes in this project against the "
+            "acceptance criteria above for correctness, security, and quality. If "
+            "the tree is large, focus on the files most plausibly changed for this "
+            "task (review at most ~40 files); do not attempt to enumerate an "
+            "unrelated whole tree. Return ONLY structured JSON matching the "
+            "provided schema {clean, findings[]} — no prose/markdown/fences."
+        )
     else:
         prompt = (
             "Run a raw structured review of the current working-tree changes in this "

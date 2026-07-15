@@ -6,6 +6,7 @@ to assert the exact argv we'd send and to drive return-code paths.
 from __future__ import annotations
 
 import os
+import shlex
 import subprocess
 from unittest.mock import patch
 
@@ -457,6 +458,7 @@ def test_build_reviewer_prompt_git_with_codex_threads_slots() -> None:
     assert "--engine claude" in out
     assert "--effort high" in out
     assert "--base origin/main" in out
+    assert "--task-context" not in out
     assert dispatch.reviewcfg.CODEX_DEFAULT_MODEL in out
     assert dispatch.reviewcfg.OPUS_FALLBACK[0] in out
     assert "--review-alpha-status" in out
@@ -726,13 +728,17 @@ def test_build_worker_prompt_non_git_project_skips_branch_push_pr() -> None:
 
 def test_build_reviewer_prompt_non_git_uses_two_claude_slots_without_base() -> None:
     t = _make_task()
+    t.spec = "Fix the quoted 'thing'.\nKeep context intact."
+    t.acceptance = 'Thing is fixed with "quotes".'
     out = dispatch.build_reviewer_prompt(
         t, project="scratch", is_git=False, has_codex=True,
     )
+    context = f"{t.spec}\n\nAcceptance:\n{t.acceptance}"
     assert "review_slot.py" in out
     assert "--engine codex" not in out
     assert out.count("--engine claude --model") == 2
     assert "--base" not in out
+    assert out.count(f"--task-context {shlex.quote(context)}") == 2
     assert "no-git" not in out
     assert "--review-alpha-status passed" in out
     assert "--review-beta-status passed" in out
