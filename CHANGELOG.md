@@ -6,6 +6,37 @@ follows [SemVer](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.16.0] - 2026-07-15
+
+Every project gets a real two-reviewer gate. The reviewer stage now
+always resolves two pinned slots at high effort: **alpha** (diverse —
+codex on a git tree when codex is present, else Claude Sonnet 5) and
+**beta** (a Claude Opus anchor that always runs a real pass and never
+skips). This guarantees at least one genuine review even when codex is
+rate-limited or unavailable, and gives no-codex users two reviewers
+instead of one. Non-git projects now resolve both slots to Claude
+reviewing the working tree, retiring the old `skipped:no-git`
+single-reviewer path. The persisted gate is cleanly renamed (no
+back-compat) from engine-named to slot-named fields.
+
+### Added
+
+- Two-reviewer engine/model selection gate: a pure resolver
+  (`reviewcfg.py`) picks alpha/beta slots (tier 1/2/3 plus fallback
+  lists), and a per-slot runner (`review_slot.py`) does the run with a
+  two-layer parse and bounded retry (#278).
+- Non-git projects get two Claude slots reviewing the working tree,
+  replacing the old single-reviewer no-git path (#278).
+
+### Changed
+
+- Persisted review gate renamed (no back-compat) from engine-named
+  (`review_claude_*` / `review_codex_*`) to slot-named
+  (`review_alpha_*` / `review_beta_*`, each carrying `engine` / `model`
+  / `skip_reason`). The worker-state validator enforces beta as the
+  Claude anchor and permits an alpha codex-skip only on git trees for
+  rate-limit or unavailability (#278).
+
 ## [0.15.0] - 2026-07-13
 
 Coordinator identity becomes lease-only and crash-safe. The three-file
@@ -1218,7 +1249,8 @@ Initial public release.
 - Filesystem packages: `internal/state`, `internal/handoff`,
   `internal/queue`, `internal/spawn`, `internal/tmux`.
 
-[Unreleased]: https://github.com/edisonshen/fleet/compare/v0.15.0...HEAD
+[Unreleased]: https://github.com/edisonshen/fleet/compare/v0.16.0...HEAD
+[0.16.0]: https://github.com/edisonshen/fleet/compare/v0.15.0...v0.16.0
 [0.15.0]: https://github.com/edisonshen/fleet/compare/v0.14.0...v0.15.0
 [0.14.0]: https://github.com/edisonshen/fleet/compare/v0.13.0...v0.14.0
 [0.13.0]: https://github.com/edisonshen/fleet/compare/v0.12.0...v0.13.0
