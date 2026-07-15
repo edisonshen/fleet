@@ -492,6 +492,19 @@ def test_build_reviewer_prompt_git_without_codex_uses_two_claude_slots() -> None
     assert "OR the codex alpha exits 2 (skipped)" not in out
 
 
+def test_build_reviewer_prompt_git_reruns_both_slots_after_fix() -> None:
+    t = _make_task()
+    out = dispatch.build_reviewer_prompt(t, project="fleet", has_codex=False)
+    lower = out.lower()
+    assert "re-run both slots from scratch" in lower
+    assert "a fix changes the reviewed code" in lower
+    assert "any earlier slot pass is stale" in lower
+    assert "re-run that slot" not in lower
+    assert "same final code" in lower
+    assert "no fix commit applied after either slot's passing run" in lower
+    assert "if any fix lands after a slot passed" in lower
+
+
 def test_build_reviewer_prompt_does_not_push_or_open_pr() -> None:
     """The reviewer hands the PR-opening job to the finisher. Its
     prompt must NOT mention `gh pr create` as a step it should run —
@@ -765,6 +778,18 @@ def test_build_reviewer_prompt_non_git_uses_two_claude_slots_without_base() -> N
     assert "no-git" not in out
     assert "--review-alpha-status passed" in out
     assert "--review-beta-status passed" in out
+
+
+def test_build_reviewer_prompt_non_git_reruns_both_slots_after_fix() -> None:
+    t = _make_task()
+    out = dispatch.build_reviewer_prompt(t, project="scratch", is_git=False)
+    lower = out.lower()
+    assert "re-run both slots from scratch" in lower
+    assert "a fix changes the reviewed code" in lower
+    assert "any earlier slot pass is stale" in lower
+    assert "re-run that slot" not in lower
+    assert "same final code" in lower
+    assert "if any fix lands after a slot passed" in lower
 
 
 def test_build_finisher_prompt_non_git_skips_push_and_pr() -> None:

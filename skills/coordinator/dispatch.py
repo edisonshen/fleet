@@ -477,7 +477,7 @@ def build_reviewer_prompt(
     Contract this prompt enforces (matches CLAUDE.md §4):
       - Each round runs BOTH slots through review_slot.py.
       - exit 0 records that slot passed; exit 1 means P0/P1 findings,
-        so the reviewer fixes and reruns that slot; exit 2 means a git
+        so the reviewer fixes and reruns both slots from scratch; exit 2 means a git
         codex alpha slot was skipped because review_slot.py printed
         rate-limited|unavailable on stdout; exit 3 blocks the worker and
         does not flip review-done.
@@ -662,16 +662,27 @@ def build_reviewer_prompt(
         alpha_skip_note = "     Alpha is a Claude slot and must pass; do not skip it."
         alpha_exit2_note = ""
         loop_termination_line = "   Loop until BOTH slots exit 0."
+    terminal_invariant_line = (
+        "   Terminal invariant: record terminal review status ONLY when BOTH "
+        "slots exit 0 (passed) (or the codex alpha exits 2 skipped, where "
+        "applicable) on the SAME final code with NO fix commit applied after "
+        "either slot's passing run. If any fix lands after a slot passed, that "
+        "slot must be re-run before recording terminal status."
+    )
     if is_git:
         fix_instruction = (
             "fix all [P0]/[P1] findings, add regression tests, "
-            "`git commit -m \"fix: review iter-N — <one line>\"`, then re-run that slot"
+            "`git commit -m \"fix: review iter-N — <one line>\"`, then RE-RUN BOTH "
+            "SLOTS from scratch — a fix changes the reviewed code, so any earlier "
+            "slot pass is stale and must be re-obtained on the new code"
         )
         initial_step = step1_lines
         review_target = "the worker's diff against origin/main"
     else:
         fix_instruction = (
-            "fix all [P0]/[P1] findings directly in the files, then re-run that slot"
+            "fix all [P0]/[P1] findings directly in the files, then RE-RUN BOTH "
+            "SLOTS from scratch — a fix changes the reviewed code, so any earlier "
+            "slot pass is stale and must be re-obtained on the new code"
         )
         initial_step = [
             "1. The worker edited project files in place. Inspect the current",
@@ -697,6 +708,7 @@ def build_reviewer_prompt(
         f"   - Mid-loop phase nudge after a fix: `fleet workers update {task.slug} {proj_flag} \\",
         "       --phase review-claude --review-alpha-status iterating`",
         loop_termination_line,
+        terminal_invariant_line,
         "",
         "3. Final terminal write (the load-bearing call):",
         "",
