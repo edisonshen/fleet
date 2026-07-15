@@ -1115,6 +1115,50 @@ def test_handoff_reviewer_prompt_no_worktree_keeps_checkout(
     assert "cd /" not in body
 
 
+@pytest.mark.parametrize(
+    ("is_git", "codex_path", "expect_codex"),
+    [
+        (True, "/usr/local/bin/codex", True),
+        (True, None, False),
+        (False, "/usr/local/bin/codex", False),
+    ],
+)
+def test_dispatch_review_handoffs_wires_resolved_review_slots(
+    fleet_home: Path, project_dir: Path,
+    fleet_run_recorder, dispatch_subprocess, monkeypatch,
+    is_git: bool, codex_path: str | None, expect_codex: bool,
+) -> None:
+    """Review handoff prompt reflects cached/probed codex availability and git mode."""
+    if not is_git:
+        (project_dir / "meta.json").write_text(
+            '{"schema":"v1","repo_path":"/x","is_git":false}',
+            encoding="utf-8",
+        )
+    monkeypatch.setattr(loop.shutil, "which", lambda name: codex_path)
+    _write_tasks(project_dir, [
+        _make_task("slots-aaaa", status="in-progress", worker_pid=0),
+    ])
+    workers_dir = project_dir / "workers" / "slots-aaaa"
+    workers_dir.mkdir(parents=True, exist_ok=True)
+    (workers_dir / "state.json").write_text(
+        json.dumps({"phase": "review-pending"}), encoding="utf-8",
+    )
+    dispatch_subprocess.append("abcddcba")
+
+    loop.tick(
+        "fleet", coord_id="cccccc01", cwd="/repo",
+        fleet_home=str(fleet_home),
+    )
+
+    body = (fleet_home / "inbox" / "abcddcba.md").read_text(encoding="utf-8")
+    if expect_codex:
+        assert "--engine codex" in body
+        assert "--engine claude" in body
+    else:
+        assert "--engine codex" not in body
+        assert body.count("--engine claude --model") == 2
+
+
 # ---------- acquire-prompt failure handling (codex iter-4 [P1]) ----------
 
 

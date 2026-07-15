@@ -87,28 +87,49 @@ func validPhase(p Phase) bool {
 // terminal values to prevent a worker (or a buggy reviewer) from
 // reaching push without recording review outcome.
 //
-// "skipped" is allowed for codex review when the codex CLI is
-// unreachable (rate-limit, network) — see the CLI-side allowlist on
-// `--review-codex-skip-reason`. "skipped" is NEVER allowed for /review
-// (Claude-side gstack skill); the validator below enforces that.
+// "skipped" is allowed only for a codex-engine alpha slot when the
+// codex CLI is unavailable or rate-limited. Claude slots never skip.
 type ReviewStatus string
 
 const (
-	ReviewStatusPending   ReviewStatus = "pending"   // not started
-	ReviewStatusIterating ReviewStatus = "iterating" // in /review or codex loop
-	ReviewStatusPassed    ReviewStatus = "passed"    // terminal — clean
-	ReviewStatusSkipped   ReviewStatus = "skipped"   // terminal — codex only
-	ReviewStatusBlocked   ReviewStatus = "blocked"   // terminal — needs operator
+	ReviewStatusPending              ReviewStatus = "pending"                // not started
+	ReviewStatusIterating            ReviewStatus = "iterating"              // in reviewer loop
+	ReviewStatusPassed               ReviewStatus = "passed"                 // terminal — clean
+	ReviewStatusSkipped              ReviewStatus = "skipped"                // terminal — codex alpha only
+	ReviewStatusBlocked              ReviewStatus = "blocked"                // terminal — needs operator
+	ReviewStatusSingleClaudeDegraded ReviewStatus = "single-claude-degraded" // terminal — one distinct Claude model
 )
 
+const (
+	// ReviewEngineCodex and ReviewEngineClaude are persisted slot engine
+	// values used by the review gate. They are distinct from coordinator
+	// execution engine strings such as "claude-code".
+	ReviewEngineCodex  = "codex"
+	ReviewEngineClaude = "claude"
+)
+
+var nonEmptyReviewStatuses = map[ReviewStatus]struct{}{
+	ReviewStatusPending:              {},
+	ReviewStatusIterating:            {},
+	ReviewStatusPassed:               {},
+	ReviewStatusSkipped:              {},
+	ReviewStatusBlocked:              {},
+	ReviewStatusSingleClaudeDegraded: {},
+}
+
+// ReviewStatusValidNonEmpty reports whether s is a known non-empty
+// ReviewStatus. CLI callers use this shared enum membership while
+// keeping their own empty-string handling.
+func ReviewStatusValidNonEmpty(s ReviewStatus) bool {
+	_, ok := nonEmptyReviewStatuses[s]
+	return ok
+}
+
 func validReviewStatus(s ReviewStatus) bool {
-	switch s {
-	case "", // empty = unset; older workers that pre-date the field
-		ReviewStatusPending, ReviewStatusIterating,
-		ReviewStatusPassed, ReviewStatusSkipped, ReviewStatusBlocked:
+	if s == "" {
 		return true
 	}
-	return false
+	return ReviewStatusValidNonEmpty(s)
 }
 
 // State is the on-disk shape of state.json.
@@ -129,11 +150,16 @@ type State struct {
 	// reviewer subagents populate them via `fleet workers update`
 	// before flipping phase=review-done. The phase=push validator
 	// gates on these (see writeStateLocked).
-	ReviewClaudeStatus    ReviewStatus `json:"review_claude_status,omitempty"`
-	ReviewClaudeRounds    int          `json:"review_claude_rounds,omitempty"`
-	ReviewCodexStatus     ReviewStatus `json:"review_codex_status,omitempty"`
-	ReviewCodexRounds     int          `json:"review_codex_rounds,omitempty"`
-	ReviewCodexSkipReason string       `json:"review_codex_skip_reason,omitempty"`
+	ReviewAlphaStatus     ReviewStatus `json:"review_alpha_status,omitempty"`
+	ReviewAlphaRounds     int          `json:"review_alpha_rounds,omitempty"`
+	ReviewAlphaSkipReason string       `json:"review_alpha_skip_reason,omitempty"`
+	ReviewAlphaEngine     string       `json:"review_alpha_engine,omitempty"`
+	ReviewAlphaModel      string       `json:"review_alpha_model,omitempty"`
+	ReviewBetaStatus      ReviewStatus `json:"review_beta_status,omitempty"`
+	ReviewBetaRounds      int          `json:"review_beta_rounds,omitempty"`
+	ReviewBetaSkipReason  string       `json:"review_beta_skip_reason,omitempty"`
+	ReviewBetaEngine      string       `json:"review_beta_engine,omitempty"`
+	ReviewBetaModel       string       `json:"review_beta_model,omitempty"`
 
 	// DispatchGeneration is the coord-owned per-slug fence token
 	// (DESIGN-coord-worktree-lifecycle §1/§2.2) stamped at the dispatch
@@ -147,16 +173,19 @@ type State struct {
 
 // Errors.
 var (
-	ErrNotFound             = errors.New("worker state.json not found")
-	ErrInvalidState         = errors.New("invalid worker state")
-	ErrPhaseRequiresPR      = errors.New("phase=done requires pr_url")
-	ErrPhaseRequiresWhy     = errors.New("phase=blocked requires blocked_reason")
-	ErrPhaseRequiresReview  = errors.New("terminal phase requires review_claude_status=passed and review_codex_status in {passed,skipped}")
-	ErrInvalidPhase         = errors.New("invalid phase")
-	ErrInvalidReviewStat    = errors.New("invalid review status")
-	ErrCodexSkipNeedsReason = errors.New("review_codex_status=skipped requires review_codex_skip_reason in {rate-limited, unavailable, no-git}")
-	ErrInvalidSlug          = errors.New("invalid worker slug")
-	ErrPreconditionLive     = errors.New("cannot archive live worker")
+	ErrNotFound                    = errors.New("worker state.json not found")
+	ErrInvalidState                = errors.New("invalid worker state")
+	ErrPhaseRequiresPR             = errors.New("phase=done requires pr_url")
+	ErrPhaseRequiresWhy            = errors.New("phase=blocked requires blocked_reason")
+	ErrPhaseRequiresReview         = errors.New("terminal phase requires review slot gate: alpha passed or legal codex skip, and beta claude passed")
+	ErrInvalidPhase                = errors.New("invalid phase")
+	ErrInvalidReviewStat           = errors.New("invalid review status")
+	ErrCodexSkipNeedsReason        = errors.New("codex-engine review slot status=skipped requires skip_reason in {rate-limited, unavailable}")
+	ErrReviewSlotIdentity          = errors.New("review slot requires engine in {codex,claude} and non-empty model")
+	ErrReviewBetaAnchor            = errors.New("review beta slot must be engine=claude with status=passed (the Claude anchor)")
+	ErrReviewDegradedModelMismatch = errors.New("single-claude-degraded requires review_alpha_model == review_beta_model (only one distinct Claude reviewer)")
+	ErrInvalidSlug                 = errors.New("invalid worker slug")
+	ErrPreconditionLive            = errors.New("cannot archive live worker")
 	// ErrStaleGeneration fires when a `fleet workers update
 	// --dispatch-generation n` carries a generation that does NOT match
 	// the task row's authoritative dispatch_generation — a stale prior
@@ -172,23 +201,17 @@ var (
 	ErrPhasePushNonGit = errors.New("non-git project: phase=push is not valid; transition phase=done directly")
 )
 
-// allowedCodexSkipReasons enumerates the only review_codex_skip_reason
-// values the validator accepts. The CLI flag wrapper rejects anything
+// allowedCodexSkipReasons enumerates the only codex-engine slot skip
+// reasons the validator accepts. The CLI flag wrapper rejects anything
 // else upfront, but workers.WriteState is the load-bearing gate that
 // catches direct callers + future skill-side bypasses. Allowed values
 // are intentionally narrow: codex skips are operational concessions
-// (rate-limited at the CLI; binary missing on host; no-git project)
-// — NOT a way to declare "I didn't feel like running codex".
+// (rate-limited at the CLI; binary missing on host) — NOT a way to
+// declare "I didn't feel like running codex".
 // Broadening this set requires explicit operator sign-off (CLAUDE.md §4).
-//
-// "no-git" was added for non-git projects (operator clarification
-// 2026-05-12): `codex review --base main` needs a git diff to operate;
-// for non-git projects the reviewer records skip-reason=no-git and the
-// /review (Claude) reviewer remains mandatory.
 var allowedCodexSkipReasons = map[string]struct{}{
 	"rate-limited": {},
 	"unavailable":  {},
-	"no-git":       {},
 }
 
 // projectIsGit returns true if the project's meta.json declares git
@@ -226,11 +249,6 @@ func projectIsGit(project string) bool {
 // flow exists to prevent. Codex iter-1 [P2]: the original gate fired
 // only on phase=push, leaving non-git projects without any review
 // enforcement at all.
-//
-// "skipped" is allowed for codex (rate-limit / unavailable / no-git)
-// but NEVER for /review — the validator rejects
-// review_claude_status=skipped even if a reviewer subagent were to
-// try it.
 func validateReviewGate(s *State, gitMode bool) error {
 	// Git: gate fires on phase=push. Non-git: gate fires on phase=done
 	// (the finisher's terminal write — there is no push step).
@@ -241,20 +259,40 @@ func validateReviewGate(s *State, gitMode bool) error {
 	if s.Phase != gate {
 		return nil
 	}
-	if s.ReviewClaudeStatus != ReviewStatusPassed {
-		return fmt.Errorf("%w: review_claude_status=%q", ErrPhaseRequiresReview, s.ReviewClaudeStatus)
+	if s.ReviewAlphaStatus == "" || s.ReviewBetaStatus == "" {
+		return fmt.Errorf("%w: review_alpha_status=%q review_beta_status=%q", ErrPhaseRequiresReview, s.ReviewAlphaStatus, s.ReviewBetaStatus)
 	}
-	switch s.ReviewCodexStatus {
-	case ReviewStatusPassed:
-		// codex clean — no skip-reason required.
-	case ReviewStatusSkipped:
-		// skip must carry an allowed reason.
-		reason := strings.TrimSpace(s.ReviewCodexSkipReason)
+	for _, slot := range []struct {
+		name   string
+		engine string
+		model  string
+	}{
+		{name: "alpha", engine: s.ReviewAlphaEngine, model: s.ReviewAlphaModel},
+		{name: "beta", engine: s.ReviewBetaEngine, model: s.ReviewBetaModel},
+	} {
+		if (slot.engine != ReviewEngineCodex && slot.engine != ReviewEngineClaude) || strings.TrimSpace(slot.model) == "" {
+			return fmt.Errorf("%w: %s engine=%q model=%q", ErrReviewSlotIdentity, slot.name, slot.engine, slot.model)
+		}
+	}
+	if s.ReviewBetaEngine != ReviewEngineClaude || s.ReviewBetaStatus != ReviewStatusPassed {
+		return fmt.Errorf("%w: review_beta_engine=%q review_beta_status=%q", ErrReviewBetaAnchor, s.ReviewBetaEngine, s.ReviewBetaStatus)
+	}
+	if s.ReviewAlphaStatus == ReviewStatusSingleClaudeDegraded {
+		if s.ReviewAlphaEngine != ReviewEngineClaude {
+			return fmt.Errorf("%w: review_alpha_status=%q review_alpha_engine=%q", ErrPhaseRequiresReview, s.ReviewAlphaStatus, s.ReviewAlphaEngine)
+		}
+		if s.ReviewAlphaModel != s.ReviewBetaModel {
+			return fmt.Errorf("%w: review_alpha_model=%q review_beta_model=%q", ErrReviewDegradedModelMismatch, s.ReviewAlphaModel, s.ReviewBetaModel)
+		}
+	} else if s.ReviewAlphaStatus == ReviewStatusPassed {
+		// alpha clean.
+	} else if s.ReviewAlphaStatus == ReviewStatusSkipped && s.ReviewAlphaEngine == ReviewEngineCodex && gitMode {
+		reason := strings.TrimSpace(s.ReviewAlphaSkipReason)
 		if _, ok := allowedCodexSkipReasons[reason]; !ok {
 			return fmt.Errorf("%w: got %q", ErrCodexSkipNeedsReason, reason)
 		}
-	default:
-		return fmt.Errorf("%w: review_codex_status=%q", ErrPhaseRequiresReview, s.ReviewCodexStatus)
+	} else {
+		return fmt.Errorf("%w: review_alpha_status=%q review_alpha_engine=%q", ErrPhaseRequiresReview, s.ReviewAlphaStatus, s.ReviewAlphaEngine)
 	}
 	return nil
 }
@@ -350,11 +388,11 @@ func writeStateLocked(project, slug string, s *State) error {
 	if !validPhase(s.Phase) {
 		return fmt.Errorf("%w: %q", ErrInvalidPhase, s.Phase)
 	}
-	if !validReviewStatus(s.ReviewClaudeStatus) {
-		return fmt.Errorf("%w: review_claude_status=%q", ErrInvalidReviewStat, s.ReviewClaudeStatus)
+	if !validReviewStatus(s.ReviewAlphaStatus) {
+		return fmt.Errorf("%w: review_alpha_status=%q", ErrInvalidReviewStat, s.ReviewAlphaStatus)
 	}
-	if !validReviewStatus(s.ReviewCodexStatus) {
-		return fmt.Errorf("%w: review_codex_status=%q", ErrInvalidReviewStat, s.ReviewCodexStatus)
+	if !validReviewStatus(s.ReviewBetaStatus) {
+		return fmt.Errorf("%w: review_beta_status=%q", ErrInvalidReviewStat, s.ReviewBetaStatus)
 	}
 	// Non-git projects skip the push step entirely. Reject phase=push
 	// upfront with a clear error so the dispatch code knows to write
