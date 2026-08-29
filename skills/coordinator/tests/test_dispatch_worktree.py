@@ -369,59 +369,69 @@ def test_split_remote_ref() -> None:
     assert worktree_mod._split_remote_ref("") == ("", "")
 
 
-def test_create_worktree_idempotent_on_already_exists_when_registered(tmp_path) -> None:
-    """Coord crash mid-tick can leave the wt on disk + registered; resume
-    must succeed. We verify the path is registered via `git worktree
-    list --porcelain` before treating "already exists" as idempotent
-    (codex iter-2 [P2])."""
+# Every "the path is already occupied" route ends in one adoption guard
+# (#284), so the matrix below is route x on-disk state rather than a test
+# per pair. Routes differ only in which git stderr gets us there:
+_ADOPT_ROUTES = {
+    # first `worktree add -b` fatals on the path itself
+    "exists": ["fatal: '{wt}' already exists\n"],
+    # same, in git's other phrasing
+    "checked-out": ["fatal: '{wt}' is already checked out at /elsewhere\n"],
+    # branch survived its PR, so add -b fatals on the branch and the
+    # retry without -b then fatals on the path
+    "branch-reuse": [
+        "fatal: A branch named 'worker/alpha-1234' already exists.\n",
+        "Preparing worktree\nfatal: '{wt}' already exists\n",
+    ],
+}
+
+# state -> (porcelain listing, `rev-parse --abbrev-ref HEAD`, expected error)
+_ADOPT_STATES = {
+    # clean resume after a coord crash mid-tick: adopt
+    "registered-on-branch": (
+        "worktree {wt}\nHEAD abc123\nbranch refs/heads/worker/alpha-1234\n\n",
+        "worker/alpha-1234\n",
+        "",
+    ),
+    # a stale plain directory collides the same way but is no checkout —
+    # handing it to a worker fails on its first git step
+    "stale-dir": ("worktree {repo}\n\n", None, "not a registered git worktree"),
+    # someone else's branch: adopting would hand over another task's code
+    "wrong-branch": (
+        "worktree {wt}\n\n", "worker/bravo-5678\n", "expected worker/alpha-1234",
+    ),
+    "detached": ("worktree {wt}\n\n", "HEAD\n", "detached HEAD, expected worker/alpha-1234"),
+    # a timed-out add leaves the entry registered+locked with the
+    # checkout half-written (found by the real-git e2e)
+    "locked": (
+        "worktree {wt}\nHEAD abc123\ndetached\nlocked\n\n", None,
+        "locked (incomplete) worktree",
+    ),
+}
+
+
+@pytest.mark.parametrize("route", sorted(_ADOPT_ROUTES))
+@pytest.mark.parametrize("state", sorted(_ADOPT_STATES))
+def test_create_worktree_adoption_matrix(tmp_path, route, state) -> None:
+    """#284: an existing path is adopted only when git registers it,
+    unlocked, on the expected branch — from every collision route."""
     repo = str(tmp_path / "repo")
     os.makedirs(repo)
     wt = str(tmp_path / "wt" / "alpha-1234")
-    add_err = _err(f"fatal: '{wt}' already exists\n")
-    list_ok = _ok(stdout=f"worktree {wt}\nHEAD abc123\nbranch refs/heads/worker/alpha-1234\n\n")
-    head_ok = _ok(stdout="worker/alpha-1234\n")
-    runs = [add_err, list_ok, head_ok]
+    listing, head, want_err = _ADOPT_STATES[state]
+    runs = [_err(s.format(wt=wt)) for s in _ADOPT_ROUTES[route]]
+    runs.append(_ok(stdout=listing.format(wt=wt, repo=repo)))
+    if head is not None:
+        runs.append(_ok(stdout=head))
+
     with patch.object(worktree_mod.subprocess, "run", side_effect=lambda *a, **k: runs.pop(0)):
         res = worktree_mod.create_worktree(repo, wt, "worker/alpha-1234")
-    assert res.error == ""
-    assert res.path == wt
 
-
-def test_create_worktree_idempotent_on_already_checked_out_when_registered(tmp_path) -> None:
-    """Variant phrasing: `is already checked out at <ref>` is also a
-    worktree-path collision and is idempotent IFF the path is a
-    registered worktree."""
-    repo = str(tmp_path / "repo")
-    os.makedirs(repo)
-    wt = str(tmp_path / "wt" / "alpha-1234")
-    add_err = _err(f"fatal: '{wt}' is already checked out at /elsewhere\n")
-    list_ok = _ok(stdout=f"worktree {wt}\n\n")
-    head_ok = _ok(stdout="worker/alpha-1234\n")
-    runs = [add_err, list_ok, head_ok]
-    with patch.object(worktree_mod.subprocess, "run", side_effect=lambda *a, **k: runs.pop(0)):
-        res = worktree_mod.create_worktree(repo, wt, "worker/alpha-1234")
-    assert res.error == ""
-    assert res.path == wt
-
-
-def test_create_worktree_already_exists_but_not_registered_is_error(tmp_path) -> None:
-    """Codex iter-2 [P2] regress: a stale non-empty directory at wt_path
-    also triggers `'<path>' already exists`, but it's NOT a real
-    worktree. Without the registry verify, we'd hand the worker a
-    non-checkout cwd and the first git step would fail. With the
-    verify, we surface the error so the operator can clean up."""
-    repo = str(tmp_path / "repo")
-    os.makedirs(repo)
-    wt = str(tmp_path / "wt" / "alpha-1234")
-    add_err = _err(f"fatal: '{wt}' already exists\n")
-    # `git worktree list --porcelain` does NOT include wt — confirms the
-    # path is occupied by a stale dir, not a registered worktree.
-    list_no_match = _ok(stdout=f"worktree {repo}\n\n")
-    runs = [add_err, list_no_match]
-    with patch.object(worktree_mod.subprocess, "run", side_effect=lambda *a, **k: runs.pop(0)):
-        res = worktree_mod.create_worktree(repo, wt, "worker/alpha-1234")
-    assert res.path == ""
-    assert "not a registered git worktree" in res.error
+    if want_err == "":
+        assert (res.error, res.path) == ("", wt)
+    else:
+        assert res.path == ""
+        assert want_err in res.error
 
 
 def test_create_worktree_branch_already_exists_retries_without_dash_b(tmp_path) -> None:
@@ -465,97 +475,6 @@ def test_create_worktree_branch_reuse_failure_surfaces_error(tmp_path) -> None:
         res = worktree_mod.create_worktree(repo, wt, "worker/alpha-1234")
     assert res.path == ""
     assert "branch worker/alpha-1234 reuse failed" in res.error
-
-
-def test_create_worktree_branch_reuse_adopts_registered_worktree(tmp_path) -> None:
-    """#284: the branch-reuse retry path gets the SAME idempotency check
-    as the first attempt. A valid, clean, correctly-registered worktree
-    at the expected path+branch is adopted instead of failing the
-    dispatch forever (the pre-fix behavior made the task
-    un-redispatchable on a repo whose checkout can't be recreated)."""
-    repo = str(tmp_path / "repo")
-    os.makedirs(repo)
-    wt = str(tmp_path / "wt" / "alpha-1234")
-    add_err = _err("fatal: A branch named 'worker/alpha-1234' already exists.\n")
-    retry_err = _err(f"Preparing worktree\nfatal: '{wt}' already exists\n")
-    list_ok = _ok(stdout=f"worktree {wt}\n\n")
-    head_ok = _ok(stdout="worker/alpha-1234\n")
-    runs = [add_err, retry_err, list_ok, head_ok]
-    with patch.object(worktree_mod.subprocess, "run", side_effect=lambda *a, **k: runs.pop(0)):
-        res = worktree_mod.create_worktree(repo, wt, "worker/alpha-1234")
-    assert res.error == ""
-    assert res.path == wt
-
-
-def test_create_worktree_branch_reuse_rejects_unregistered_dir(tmp_path) -> None:
-    """#284: adoption is gated on git's registry, not on os.path — a
-    stale directory (e.g. a checkout killed mid-`worktree add`) at the
-    expected path is surfaced for the operator, not handed to a worker."""
-    repo = str(tmp_path / "repo")
-    os.makedirs(repo)
-    wt = str(tmp_path / "wt" / "alpha-1234")
-    add_err = _err("fatal: A branch named 'worker/alpha-1234' already exists.\n")
-    retry_err = _err(f"fatal: '{wt}' already exists\n")
-    list_no_match = _ok(stdout=f"worktree {repo}\n\n")
-    runs = [add_err, retry_err, list_no_match]
-    with patch.object(worktree_mod.subprocess, "run", side_effect=lambda *a, **k: runs.pop(0)):
-        res = worktree_mod.create_worktree(repo, wt, "worker/alpha-1234")
-    assert res.path == ""
-    assert "not a registered git worktree" in res.error
-
-
-def test_create_worktree_branch_reuse_rejects_wrong_branch(tmp_path) -> None:
-    """#284: a REGISTERED worktree at the path holding a different
-    branch is not adoptable — reusing it would hand the worker code
-    from another task."""
-    repo = str(tmp_path / "repo")
-    os.makedirs(repo)
-    wt = str(tmp_path / "wt" / "alpha-1234")
-    add_err = _err("fatal: A branch named 'worker/alpha-1234' already exists.\n")
-    retry_err = _err(f"fatal: '{wt}' already exists\n")
-    list_ok = _ok(stdout=f"worktree {wt}\n\n")
-    head_other = _ok(stdout="worker/bravo-5678\n")
-    runs = [add_err, retry_err, list_ok, head_other]
-    with patch.object(worktree_mod.subprocess, "run", side_effect=lambda *a, **k: runs.pop(0)):
-        res = worktree_mod.create_worktree(repo, wt, "worker/alpha-1234")
-    assert res.path == ""
-    assert "expected worker/alpha-1234" in res.error
-
-
-def test_create_worktree_rejects_locked_worktree(tmp_path) -> None:
-    """#284 (found by the real-git e2e): a `git worktree add` killed by the
-    timeout leaves the entry REGISTERED but LOCKED, with the checkout only
-    half-written. Adopting it dispatches a worker into a tree missing files
-    git's index claims are present, so the lock is a hard refusal."""
-    repo = str(tmp_path / "repo")
-    os.makedirs(repo)
-    wt = str(tmp_path / "wt" / "alpha-1234")
-    add_err = _err(f"fatal: '{wt}' already exists\n")
-    list_locked = _ok(
-        stdout=f"worktree {wt}\nHEAD abc123\ndetached\nlocked\n\n",
-    )
-    runs = [add_err, list_locked]
-    with patch.object(worktree_mod.subprocess, "run", side_effect=lambda *a, **k: runs.pop(0)):
-        res = worktree_mod.create_worktree(repo, wt, "worker/alpha-1234")
-    assert res.path == ""
-    assert "locked (incomplete) worktree" in res.error
-
-
-def test_create_worktree_rejects_wrong_branch_on_first_attempt(tmp_path) -> None:
-    """#284: the first-attempt collision path corroborates the branch too
-    — a registered tree at the path holding someone else's branch (or a
-    detached HEAD left by an interrupted add) is not adoptable."""
-    repo = str(tmp_path / "repo")
-    os.makedirs(repo)
-    wt = str(tmp_path / "wt" / "alpha-1234")
-    add_err = _err(f"fatal: '{wt}' already exists\n")
-    list_ok = _ok(stdout=f"worktree {wt}\n\n")
-    head_detached = _ok(stdout="HEAD\n")
-    runs = [add_err, list_ok, head_detached]
-    with patch.object(worktree_mod.subprocess, "run", side_effect=lambda *a, **k: runs.pop(0)):
-        res = worktree_mod.create_worktree(repo, wt, "worker/alpha-1234")
-    assert res.path == ""
-    assert "detached HEAD, expected worker/alpha-1234" in res.error
 
 
 def test_worktree_record_scopes_flags_to_the_matching_record(tmp_path) -> None:
@@ -1097,47 +1016,38 @@ def test_load_parallelism_handles_malformed_json(tmp_path) -> None:
 # ---------- loop.py: worktree timeout config (#284) ----------
 
 
-def test_load_worktree_timeout_returns_zero_when_unset(tmp_path) -> None:
-    """No config / no field → 0.0 (caller falls through to the module
-    default)."""
-    assert loop._load_worktree_timeout(tmp_path) == 0.0
-    (tmp_path / "coord-config.json").write_text('{"parallelism": 2}\n')
-    assert loop._load_worktree_timeout(tmp_path) == 0.0
+# raw config value -> resolved timeout. 0.0 means "unset": the caller
+# falls through to worktree.CREATE_TIMEOUT_S. Coord misconfig must never
+# crash the tick, so junk is ignored and out-of-range values clamp.
+_MAX = "MAX"
+_MIN = "MIN"
+_HUGE_INT = "1" + "0" * 400  # wider than a double: float() raises OverflowError
+_TIMEOUT_CASES = [
+    ('{"parallelism": 2}', 0.0),            # field absent
+    ('{"worktree_timeout_s": 900}', 900.0),
+    ('{"worktree_timeout_s": 0.5}', _MIN),
+    ('{"worktree_timeout_s": 99999}', _MAX),
+    ('{"worktree_timeout_s": %s}' % _HUGE_INT, _MAX),
+    ('{"worktree_timeout_s": -%s}' % _HUGE_INT, 0.0),
+    ('{"worktree_timeout_s": 1e400}', _MAX),  # json -> inf
+    ('{"worktree_timeout_s": NaN}', 0.0),
+    ('{"worktree_timeout_s": "600"}', 0.0),
+    ('{"worktree_timeout_s": true}', 0.0),
+    ('{"worktree_timeout_s": -5}', 0.0),
+    ("not json", 0.0),
+]
 
 
-def test_load_worktree_timeout_reads_and_clamps(tmp_path) -> None:
-    cfg = tmp_path / "coord-config.json"
-    cfg.write_text('{"worktree_timeout_s": 900}\n')
-    assert loop._load_worktree_timeout(tmp_path) == 900.0
-    cfg.write_text('{"worktree_timeout_s": 0.5}\n')
-    assert loop._load_worktree_timeout(tmp_path) == loop._WORKTREE_TIMEOUT_MIN_S
-    cfg.write_text('{"worktree_timeout_s": 99999}\n')
-    assert loop._load_worktree_timeout(tmp_path) == loop._WORKTREE_TIMEOUT_MAX_S
+@pytest.mark.parametrize("raw,want", _TIMEOUT_CASES)
+def test_load_worktree_timeout(tmp_path, raw, want) -> None:
+    expected = {
+        _MIN: loop._WORKTREE_TIMEOUT_MIN_S, _MAX: loop._WORKTREE_TIMEOUT_MAX_S,
+    }.get(want, want)
+    (tmp_path / "coord-config.json").write_text(raw + "\n")
+    assert loop._load_worktree_timeout(tmp_path) == expected
 
 
-def test_load_worktree_timeout_ignores_junk(tmp_path) -> None:
-    cfg = tmp_path / "coord-config.json"
-    cfg.write_text('{"worktree_timeout_s": "600"}\n')
-    assert loop._load_worktree_timeout(tmp_path) == 0.0
-    cfg.write_text('{"worktree_timeout_s": true}\n')
-    assert loop._load_worktree_timeout(tmp_path) == 0.0
-    cfg.write_text('{"worktree_timeout_s": -5}\n')
-    assert loop._load_worktree_timeout(tmp_path) == 0.0
-    cfg.write_text("not json\n")
-    assert loop._load_worktree_timeout(tmp_path) == 0.0
-
-
-def test_load_worktree_timeout_survives_unfloatable_int(tmp_path) -> None:
-    """A JSON int too wide for a double must clamp, not raise — an
-    OverflowError here aborts the whole tick before any dispatch."""
-    cfg = tmp_path / "coord-config.json"
-    cfg.write_text('{"worktree_timeout_s": 1%s}\n' % ("0" * 400))
-    assert loop._load_worktree_timeout(tmp_path) == loop._WORKTREE_TIMEOUT_MAX_S
-    cfg.write_text('{"worktree_timeout_s": -1%s}\n' % ("0" * 400))
-    assert loop._load_worktree_timeout(tmp_path) == 0.0
-    cfg.write_text('{"worktree_timeout_s": 1e400}\n')  # json -> inf
-    assert loop._load_worktree_timeout(tmp_path) == loop._WORKTREE_TIMEOUT_MAX_S
-    cfg.write_text('{"worktree_timeout_s": NaN}\n')
+def test_load_worktree_timeout_without_config_file(tmp_path) -> None:
     assert loop._load_worktree_timeout(tmp_path) == 0.0
 
 
