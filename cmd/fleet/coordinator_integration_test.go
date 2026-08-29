@@ -989,6 +989,54 @@ func TestCoordParallelDispatch_CreatesWorktrees(t *testing.T) {
 	}
 }
 
+// TestCoordParallelDispatch_DefaultCap covers the shipped default: an
+// unconfigured project (no coord-config.json:parallelism) dispatches
+// parallelismDefault workers into their own worktrees and holds the
+// rest back. The cap=2 test above pins an explicit cap; this one pins
+// the number operators actually get.
+func TestCoordParallelDispatch_DefaultCap(t *testing.T) {
+	env := setupCoordIntegration(t, "wt-default")
+	env.plantCoord(t)
+	initGitRepo(t, env.repoCwd)
+	env.bindRepo(t)
+
+	// Disjoint Files: scopes — overlapping (or absent) scopes make the
+	// conflict-aware loop serialize regardless of cap.
+	slugs := make([]string, 0, parallelismDefault+1)
+	for i := 0; i <= parallelismDefault; i++ {
+		slug := fmt.Sprintf("wt-def-%d", i)
+		slugs = append(slugs, env.addReadyTask(t, slug,
+			fmt.Sprintf("default cap task %d.\nFiles: %s.go", i, slug)))
+	}
+
+	out := env.runTickCap(t, parallelismDefault)
+	if !strings.Contains(out, fmt.Sprintf(`"dispatched": %d`, parallelismDefault)) {
+		t.Fatalf("default cap tick dispatched != %d: %s", parallelismDefault, out)
+	}
+	assertNoTickErrors(t, out)
+
+	for i, slug := range slugs {
+		wt := filepath.Join(env.fleetHome, "projects", env.project, "worktrees", slug)
+		_, err := os.Stat(wt)
+		if i < parallelismDefault {
+			if err != nil {
+				t.Errorf("worktree dir missing for %s: %v", slug, err)
+			}
+			if task := env.readTask(t, slug); task.Branch != "worker/"+slug {
+				t.Errorf("%s branch=%q want worker/%s", slug, task.Branch, slug)
+			}
+			continue
+		}
+		if !os.IsNotExist(err) {
+			t.Errorf("task beyond the cap got a worktree: %s (err=%v)", wt, err)
+		}
+	}
+
+	for _, rec := range listAllAgents(t) {
+		_ = tmux.Kill(rec.TmuxSession)
+	}
+}
+
 // TestCoordParallelDispatch_Cap1Mode_NoWorktreeCreated regression-
 // guards single-worker mode: with cap=1, the dispatch path must not
 // create any worktree dir even if the project has multiple ready

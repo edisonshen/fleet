@@ -16,6 +16,7 @@ per module under test) so the wrong mock can't mask a regression.
 """
 from __future__ import annotations
 
+import dataclasses
 import inspect
 import os
 import shutil
@@ -776,6 +777,40 @@ def test_dispatch_ready_cap2_creates_worktree_and_passes_cwd(tmp_path) -> None:
     # the Agent tool — must point at the inbox under fleet_home.
     assert str(tmp_path) in block
     assert "/inbox/" in block
+
+
+def test_dispatch_ready_default_cap_dispatches_three_worktrees(tmp_path) -> None:
+    """At the shipped default cap, 3 workers dispatch, each into its own
+    worktree, and the 4th ready task is held back."""
+    # Disjoint file scopes — the conflict heuristic is conservative and
+    # would serialize tasks that share (or omit) a Files line.
+    tasks = []
+    for i in range(4):
+        t = _ready_task(f"task-{i}")
+        tasks.append(dataclasses.replace(t, spec=f"Files: pkg/mod{i}/x.go"))
+    repo = "/repo"
+    wt_root = tmp_path / ".fleet" / "projects" / "proj" / "worktrees"
+
+    def _run(cmd, *_args, **kwargs):
+        if cmd[1:3] == ["workers", "worktree-path"]:
+            return _ok(stdout=str(wt_root / cmd[-1]) + "\n")
+        return _make_subprocess_router({})(cmd, *_args, **kwargs)
+
+    with patch.object(dispatch_mod, "fetch_standards", return_value="# Standards"), \
+         patch.object(dispatch_mod, "fetch_learnings", return_value=""), \
+         patch.object(dispatch_mod.subprocess, "run", side_effect=_run):
+        actions = loop._dispatch_ready(
+            tasks=tasks, project="proj", cwd=repo, cap=loop.DEFAULT_CAP,
+            fleet_bin="/usr/local/bin/fleet",
+            fleet_home=str(tmp_path),
+        )
+
+    dispatched = [a for a in actions if a.error == ""]
+    assert len(dispatched) == loop.DEFAULT_CAP == 3, f"actions: {actions}"
+    assert [a.slug for a in dispatched] == ["task-0", "task-1", "task-2"]
+    assert [a.worktree for a in dispatched] == [
+        str(wt_root / f"task-{i}") for i in range(3)
+    ], "each worker must get its own worktree"
 
 
 def test_dispatch_ready_cap2_marks_prompt_worktree_pre_created(tmp_path) -> None:
