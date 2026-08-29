@@ -1127,6 +1127,20 @@ def test_load_worktree_timeout_ignores_junk(tmp_path) -> None:
     assert loop._load_worktree_timeout(tmp_path) == 0.0
 
 
+def test_load_worktree_timeout_survives_unfloatable_int(tmp_path) -> None:
+    """A JSON int too wide for a double must clamp, not raise — an
+    OverflowError here aborts the whole tick before any dispatch."""
+    cfg = tmp_path / "coord-config.json"
+    cfg.write_text('{"worktree_timeout_s": 1%s}\n' % ("0" * 400))
+    assert loop._load_worktree_timeout(tmp_path) == loop._WORKTREE_TIMEOUT_MAX_S
+    cfg.write_text('{"worktree_timeout_s": -1%s}\n' % ("0" * 400))
+    assert loop._load_worktree_timeout(tmp_path) == 0.0
+    cfg.write_text('{"worktree_timeout_s": 1e400}\n')  # json -> inf
+    assert loop._load_worktree_timeout(tmp_path) == loop._WORKTREE_TIMEOUT_MAX_S
+    cfg.write_text('{"worktree_timeout_s": NaN}\n')
+    assert loop._load_worktree_timeout(tmp_path) == 0.0
+
+
 def test_dispatch_ready_passes_worktree_timeout_to_git(tmp_path) -> None:
     """#284: the configured timeout reaches the `git worktree add`
     subprocess; unset falls back to worktree.CREATE_TIMEOUT_S."""

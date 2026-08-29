@@ -3423,8 +3423,15 @@ def _load_worktree_timeout(project_dir: Path) -> float:
     raw = data.get("worktree_timeout_s")
     if isinstance(raw, bool) or not isinstance(raw, (int, float)):
         return 0.0
-    value = float(raw)
-    if value <= 0:
+    if raw <= 0:
+        return 0.0
+    try:
+        value = float(raw)
+    except OverflowError:
+        # A JSON int wider than a double ("as long as possible") clamps
+        # like any other oversized value.
+        return _WORKTREE_TIMEOUT_MAX_S
+    if value != value:  # NaN
         return 0.0
     return max(_WORKTREE_TIMEOUT_MIN_S, min(_WORKTREE_TIMEOUT_MAX_S, value))
 
