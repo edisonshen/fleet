@@ -68,7 +68,9 @@ def test_tick_emits_coord_events_and_dispatch(home, monkeypatch):
     monkeypatch.setattr(loop, "_run_fleet", lambda cmd, timeout_s=30.0: None)
     _stub_acquire(monkeypatch, home, "abcdef01")
 
-    result = loop.tick(project, coord_id="", cwd=str(pdir), fleet_home=str(home))
+    result = loop.tick(
+        project, coord_id="", cwd=str(pdir), fleet_home=str(home), cap=1,
+    )
     assert result.dispatched == 1
 
     logdir = home / "logs"
@@ -110,7 +112,9 @@ def test_tick_emits_coord_events_under_single_shot_poll(home, monkeypatch):
 
     monkeypatch.setattr(loop, "_run_supervisor", _spy)
 
-    result = loop.tick(project, coord_id="", cwd=str(pdir), fleet_home=str(home))
+    result = loop.tick(
+        project, coord_id="", cwd=str(pdir), fleet_home=str(home), cap=1,
+    )
     assert result.dispatched == 1
     assert sup_seen["n"] == 0  # single-shot default: supervisor not entered
 
@@ -221,7 +225,9 @@ def test_tick_survives_logging_failure(home, monkeypatch):
     monkeypatch.setattr(loop.fleetlog_mod, "log", _boom)
     monkeypatch.setattr(loop.fleetlog_mod, "maybe_prune_daily", _boom)
 
-    result = loop.tick(project, coord_id="", cwd=str(pdir), fleet_home=str(home))
+    result = loop.tick(
+        project, coord_id="", cwd=str(pdir), fleet_home=str(home), cap=1,
+    )
     assert result.dispatched == 1
     assert not result.skipped
 

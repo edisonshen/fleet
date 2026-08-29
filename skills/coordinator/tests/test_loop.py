@@ -221,6 +221,7 @@ def test_tick_dispatches_ready_task(
     result = loop.tick(
         "fleet", coord_id="cccccc01", cwd="/repo",
         fleet_home=str(fleet_home),
+        cap=1,
     )
 
     assert not result.skipped
@@ -293,6 +294,7 @@ def test_tick_dispatch_records_session_task(
     result = loop.tick(
         "fleet", coord_id="cccccc01", cwd="/repo",
         fleet_home=str(fleet_home),
+        cap=1,
     )
     assert result.dispatched == 1
     cs = json.loads((project_dir / "coord-state.json").read_text())
@@ -433,6 +435,7 @@ def test_tick_dispatch_does_not_record_completion(
     result = loop.tick(
         "fleet", coord_id="cccccc01", cwd="/repo",
         fleet_home=str(fleet_home),
+        cap=1,
     )
 
     assert result.dispatched == 1
@@ -1218,6 +1221,7 @@ def test_acquire_failure_persists_pending_agent_id_for_retry(
     loop.tick(
         "fleet", coord_id="cccccc01", cwd="/repo",
         fleet_home=str(fleet_home),
+        cap=1,
     )
     coord_state = json.loads(
         (project_dir / "coord-state.json").read_text(encoding="utf-8")
@@ -1258,6 +1262,7 @@ def test_acquire_retry_reuses_pending_agent_id(
     result = loop.tick(
         "fleet", coord_id="cccccc01", cwd="/repo",
         fleet_home=str(fleet_home),
+        cap=1,
     )
     assert result.dispatched == 1
     # The acquire-prompt argv must carry the pending id, not the
@@ -1294,6 +1299,7 @@ def test_acquire_success_clears_pending_acquire_entry(
     loop.tick(
         "fleet", coord_id="cccccc01", cwd="/repo",
         fleet_home=str(fleet_home),
+        cap=1,
     )
     state_after = json.loads(state_path.read_text())
     assert state_after.get("pending_acquire_agent_ids", {}) == {}
@@ -1368,6 +1374,7 @@ def test_apply_failure_after_acquire_success_persists_pending(
     loop.tick(
         "fleet", coord_id="cccccc01", cwd="/repo",
         fleet_home=str(fleet_home),
+        cap=1,
     )
 
     state = json.loads((project_dir / "coord-state.json").read_text())
@@ -1393,6 +1400,7 @@ def test_apply_success_clears_pending_acquire(
     loop.tick(
         "fleet", coord_id="cccccc01", cwd="/repo",
         fleet_home=str(fleet_home),
+        cap=1,
     )
     state = json.loads((project_dir / "coord-state.json").read_text())
     # Apply succeeded → pending cleared.
@@ -1469,6 +1477,7 @@ def test_remember_agent_id_persists_before_apply(
     loop.tick(
         "fleet", coord_id="cccccc01", cwd="/repo",
         fleet_home=str(fleet_home),
+        cap=1,
     )
 
     state = json.loads((project_dir / "coord-state.json").read_text())
@@ -1502,6 +1511,7 @@ def test_sweep_releases_ready_with_worker_mapping(
     loop.tick(
         "fleet", coord_id="cccccc01", cwd="/repo",
         fleet_home=str(fleet_home),
+        cap=1,
     )
 
     # Old id was released.
@@ -1546,6 +1556,7 @@ def test_ready_reset_sweep_preserves_pending_acquire(
     loop.tick(
         "fleet", coord_id="cccccc01", cwd="/repo",
         fleet_home=str(fleet_home),
+        cap=1,
     )
 
     # Stale worker id was released.
@@ -1629,6 +1640,7 @@ def test_sweep_ready_with_only_pending_does_not_release(
     loop.tick(
         "fleet", coord_id="cccccc01", cwd="/repo",
         fleet_home=str(fleet_home),
+        cap=1,
     )
 
     # The sweep did NOT release the pending id — dispatch reused it.
@@ -1841,6 +1853,7 @@ def test_sweep_non_inflight_does_not_touch_ready_slugs(
     loop.tick(
         "fleet", coord_id="cccccc01", cwd="/repo",
         fleet_home=str(fleet_home),
+        cap=1,
     )
 
     # No spurious release for the ready slug.
@@ -2129,6 +2142,7 @@ def test_apply_dispatch_failure_preserves_pending_acquire(
     result = loop.tick(
         "fleet", coord_id="cccccc01", cwd="/repo",
         fleet_home=str(fleet_home),
+        cap=1,
     )
     # _apply_dispatch raised, so the try/except in the consumer logged
     # an error and did NOT count this as dispatched.
@@ -2419,6 +2433,7 @@ def test_tick_writes_coord_state_on_dispatch_only(
     result = loop.tick(
         "fleet", coord_id="cccccc01", cwd="/repo",
         fleet_home=str(fleet_home),
+        cap=1,
     )
 
     assert not result.skipped
@@ -2885,6 +2900,9 @@ def test_main_writes_json_summary_on_run(
     fleet_run_recorder, monkeypatch, capsys,
 ) -> None:
     _write_tasks(project_dir, [_make_task("ready-aaaa")])
+    # main() takes no cap argument; pin single-worker mode on disk so the
+    # dispatch runs in-place instead of reaching for a git worktree.
+    (project_dir / "coord-config.json").write_text('{"parallelism": 1}\n')
     monkeypatch.setenv("FLEET_HOME", str(fleet_home))
     monkeypatch.setenv("FLEET_AGENT_ID", "cccccc01")
     monkeypatch.setenv("FLEET_PROJECT", "fleet")
@@ -3093,6 +3111,7 @@ def test_wedged_tick_releases_lock_so_next_tick_recovers(
         busy = loop.tick(
             "fleet", coord_id="cccccc01", cwd="/repo",
             fleet_home=str(fleet_home),
+            cap=1,
         )
         assert busy.skipped is True
         assert busy.reason == "lock-busy"
@@ -3110,6 +3129,7 @@ def test_wedged_tick_releases_lock_so_next_tick_recovers(
     recovered = loop.tick(
         "fleet", coord_id="cccccc01", cwd="/repo",
         fleet_home=str(fleet_home),
+        cap=1,
     )
     assert recovered.skipped is False
     assert recovered.reason == ""
@@ -4593,6 +4613,7 @@ def test_tick_checkpoint_schema_matches_synth_fixture(
     loop.tick(
         "fleet", coord_id="cccccc01", cwd="/repo",
         fleet_home=str(fleet_home),
+        cap=1,
     )
 
     body = _checkpoint_path(project_dir).read_text(encoding="utf-8")

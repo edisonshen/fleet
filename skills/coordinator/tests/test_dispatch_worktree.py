@@ -16,6 +16,7 @@ per module under test) so the wrong mock can't mask a regression.
 """
 from __future__ import annotations
 
+import inspect
 import os
 import shutil
 import subprocess
@@ -887,6 +888,12 @@ def test_dispatch_ready_cap2_skips_when_git_worktree_add_fails(tmp_path) -> None
 
 
 # ---------- loop.py: parallelism config ----------
+
+
+def test_default_cap_is_three() -> None:
+    """Unconfigured projects dispatch 3 workers in worktree mode."""
+    assert loop.DEFAULT_CAP == 3
+    assert inspect.signature(loop.tick).parameters["cap"].default == 3
 
 
 def test_load_parallelism_returns_zero_when_missing(tmp_path) -> None:
