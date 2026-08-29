@@ -112,6 +112,24 @@ task promoted
 This is the structural kill for tautology: a different agent, with a
 different context, wrote the oracle — and the oracle was observed failing.
 
+The RED commit is also the **audit boundary** for every commit that follows:
+
+```
+  <red_sha>            impl commit         impl commit        HEAD
+  tests only  ─────────▶ prod code ─────────▶ prod code ────────▶
+  (all T RED)            (no test edits)      (no test edits)
+
+  git diff <red_sha>..HEAD -- '*_test.go' 'skills/**/tests/'  MUST be empty
+  non-empty ⟹ a matching amendment row in the Test Contract, else P0
+```
+
+A mid-flight test change is legal only through the amendment path: the worker
+reports `ORACLE_DISPUTE <T> <argument>` (existing oracle is wrong) or
+`NEW_CASE <what>` (a case the contract missed), the coord amends the contract,
+and the change lands as its own `tests: amend T<n>` commit that is proven RED
+**before** the commit that makes it green. Invariant: every oracle in the
+branch has a commit where it was observed failing.
+
 **3. Level policy: one contract per test, the cheapest level that can hold it.**
 
 ```
@@ -168,12 +186,15 @@ one testable behavior per R — if an R needs "and", split it.
 
 ### Q3 — Separate test-author subagent, or the worker writes tests first?
 
-**Separate subagent for P0/P1 and for every bug fix; same-worker
-test-first-then-code is acceptable for P2/P3 and doc-only tasks.** The role
-split is the strongest anti-tautology measure available, but it costs one
-extra dispatch and one extra context. Spend it where a wrong-but-green test
-actually hurts. Fleet's IMPLEMENT flow already has three roles; this adds a
-fourth stage in front, reusing the same dispatch machinery:
+**Separate subagent (operator decision, 2026-08-29), and a coord-authored
+Test Contract is mandatory in both cases.** The role split is the strongest
+anti-tautology measure available: a different agent, with a different context,
+writes the oracle. It costs one extra dispatch and one extra context per task.
+Same-worker test-first-then-code remains acceptable for P2/P3 and doc-only
+tasks, where a wrong-but-green test is cheap; the RED-commit audit boundary
+above applies identically in that mode, so the enforcement surface does not
+fork. Fleet's IMPLEMENT flow already has three roles; this adds a fourth stage
+in front, reusing the same dispatch machinery:
 
 ```
 test-author ─▶ worker ─▶ reviewer(alpha/beta) ─▶ finisher
@@ -202,7 +223,8 @@ not a gate.
 
 ### Q6 — Do we gate traceability in CI, or only in review?
 
-**Review first, CI after it is quiet.** Phase 1: the reviewer prompt gets a
+**Reviewer-only first (operator default), CI after it is quiet — the finisher
+does not block on it.** Phase 1: the reviewer prompt gets a
 mechanical checklist (every T present, every R covered or NO-TEST, no
 un-amended oracle change, level policy respected). Phase 3: a
 `scripts/lint-test-traceability.sh` step fails a PR whose linked task plan has
@@ -286,12 +308,24 @@ confirm-red` creates a worktree at the parent, applies only the test files,
 runs the scoped test, and requires a failure. That is the mechanical form of
 the existing standards rule.
 
+The RED commit SHA is recorded in the worker's `state.json`
+(`tests_red_sha`) and echoed in the PR body, so the reviewer's audit diff and
+a later CI check read the same boundary rather than re-deriving it.
+
+### Rendered docs
+
+`.md` is the spec and the only committed artifact (operator decision,
+2026-08-29). `docs/*.html` stays gitignored and local — the PLAN-DOC /
+TASK-PLAN-DOC render+open steps remain a local reviewer convenience, not a
+committed output.
+
 ### Gate: reviewer checklist additions (mechanical, in order)
 
 1. Every T ID in the contract appears in the diff; every R is covered or
    explicitly NO-TEST. → missing = P0.
-2. No test file changed between the test-author commit and the worker's HEAD
-   without an amendment row. → unexplained change = P0.
+2. `git diff <tests_red_sha>..HEAD -- '*_test.go' 'skills/**/tests/'` is empty,
+   or every hunk maps to an amendment row that was itself proven RED in a
+   `tests: amend T<n>` commit. → unexplained change = P0.
 3. Level policy: integration test present iff the trigger list fires; each
    integration test asserts one operator-visible arc, not one function. → P1.
 4. Shape: T rows sharing a driver arrived as rows, not functions; every test
