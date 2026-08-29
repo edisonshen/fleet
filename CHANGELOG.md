@@ -6,6 +6,41 @@ follows [SemVer](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.16.2] - 2026-08-29
+
+Dispatch stops breaking on big repos. `git worktree add` is I/O-bound in tracked
+file count, so a monorepo checkout ran past the hardcoded 30s subprocess timeout
+and the task never dispatched — and the kill left a registered, locked, detached
+half-written tree that the next tick happily adopted, dropping a worker into a
+broken checkout. The timeout is now 300s and configurable per project
+(`coord-config.json: worktree_timeout_s`, clamped 5..3600s), and both
+path-collision routes — first attempt and the branch-already-exists retry —
+adopt an existing path only when git registers it, unlocked, on the expected
+branch. Coordinator parallelism now defaults to 3 instead of a serialized 1, and
+`fleet init` asks for it (`--parallelism N` for non-interactive runs).
+
+### Added
+
+- `coord-config.json: worktree_timeout_s` to raise the worktree-creation timeout
+  on large repos; unset means the 300s default (#284, #285).
+- `fleet init` prompts for coordinator parallelism on a TTY and accepts
+  `--parallelism N`, persisting the answer to `~/.fleet/coord-config.json` (#286).
+
+### Changed
+
+- Worktree-creation timeout raised from a hardcoded 30s to 300s (#285).
+- Default coordinator parallelism is 3; project `coord-config.json` still wins,
+  and `parallelism: 1` keeps the serialized in-place dispatch (#286).
+
+### Fixed
+
+- The branch-exists retry path now runs the same adoption guard as the first
+  attempt, so a stale directory, a worktree on the wrong branch, a detached one,
+  or a locked half-written tree is refused instead of reused (#285).
+- An oversized `worktree_timeout_s` integer no longer raises `OverflowError` and
+  aborts every coordinator tick; out-of-range and non-numeric values clamp or
+  fall back to the default (#285).
+
 ## [0.16.1] - 2026-07-15
 
 Stop wasting a resuming coordinator's context. On handoff, the `coord-run`
@@ -1263,7 +1298,8 @@ Initial public release.
 - Filesystem packages: `internal/state`, `internal/handoff`,
   `internal/queue`, `internal/spawn`, `internal/tmux`.
 
-[Unreleased]: https://github.com/edisonshen/fleet/compare/v0.16.1...HEAD
+[Unreleased]: https://github.com/edisonshen/fleet/compare/v0.16.2...HEAD
+[0.16.2]: https://github.com/edisonshen/fleet/compare/v0.16.1...v0.16.2
 [0.16.1]: https://github.com/edisonshen/fleet/compare/v0.16.0...v0.16.1
 [0.16.0]: https://github.com/edisonshen/fleet/compare/v0.15.0...v0.16.0
 [0.15.0]: https://github.com/edisonshen/fleet/compare/v0.14.0...v0.15.0
