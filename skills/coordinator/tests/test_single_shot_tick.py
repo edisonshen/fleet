@@ -741,6 +741,7 @@ def test_dispatch_block_emitted_under_single_shot(
     result = loop.tick(
         "fleet", coord_id="cccccc01", cwd="/repo",
         fleet_home=str(fleet_home),
+        cap=1,
     )
 
     assert seen["n"] == 0

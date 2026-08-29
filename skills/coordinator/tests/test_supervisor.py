@@ -1585,6 +1585,7 @@ def test_loop_dispatch_persists_agent_id_mapping(
     res = loop.tick(
         "fleet", coord_id="cccccc01", cwd=str(tmp_path),
         fleet_home=str(home),
+        cap=1,
     )
     assert res.dispatched == 1
 

@@ -202,8 +202,11 @@ Rules:
   `rate-limited` or `unavailable`; non-git projects resolve to Claude slots.
 - The finisher pushes and opens the PR only when review terminal fields satisfy
   the worker state validator.
-- v0.2 default parallelism is 1. Higher parallelism uses worktrees and conflict
-  checks.
+- Default parallelism is 3. Resolution order: the project's
+  `coord-config.json:parallelism`, then `~/.fleet/coord-config.json:parallelism`
+  (what `fleet init` prompts for / `fleet init --parallelism N` writes), then 3.
+  Parallelism above 1 uses worktrees and conflict checks; set `parallelism: 1`
+  for serialized in-place dispatch.
 - `coord-config.json:worktree_timeout_s` bounds `git worktree add` (default
   300s, clamped to 5..3600). Raise it on repos whose full checkout takes longer
   than that — a timeout kills the add mid-checkout.

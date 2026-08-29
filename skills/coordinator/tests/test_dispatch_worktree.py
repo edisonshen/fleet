@@ -16,6 +16,8 @@ per module under test) so the wrong mock can't mask a regression.
 """
 from __future__ import annotations
 
+import dataclasses
+import inspect
 import os
 import shutil
 import subprocess
@@ -909,6 +911,40 @@ def test_dispatch_ready_cap2_creates_worktree_and_passes_cwd(tmp_path) -> None:
     assert "/inbox/" in block
 
 
+def test_dispatch_ready_default_cap_dispatches_three_worktrees(tmp_path) -> None:
+    """At the shipped default cap, 3 workers dispatch, each into its own
+    worktree, and the 4th ready task is held back."""
+    # Disjoint file scopes — the conflict heuristic is conservative and
+    # would serialize tasks that share (or omit) a Files line.
+    tasks = []
+    for i in range(4):
+        t = _ready_task(f"task-{i}")
+        tasks.append(dataclasses.replace(t, spec=f"Files: pkg/mod{i}/x.go"))
+    repo = "/repo"
+    wt_root = tmp_path / ".fleet" / "projects" / "proj" / "worktrees"
+
+    def _run(cmd, *_args, **kwargs):
+        if cmd[1:3] == ["workers", "worktree-path"]:
+            return _ok(stdout=str(wt_root / cmd[-1]) + "\n")
+        return _make_subprocess_router({})(cmd, *_args, **kwargs)
+
+    with patch.object(dispatch_mod, "fetch_standards", return_value="# Standards"), \
+         patch.object(dispatch_mod, "fetch_learnings", return_value=""), \
+         patch.object(dispatch_mod.subprocess, "run", side_effect=_run):
+        actions = loop._dispatch_ready(
+            tasks=tasks, project="proj", cwd=repo, cap=loop.DEFAULT_CAP,
+            fleet_bin="/usr/local/bin/fleet",
+            fleet_home=str(tmp_path),
+        )
+
+    dispatched = [a for a in actions if a.error == ""]
+    assert len(dispatched) == loop.DEFAULT_CAP == 3, f"actions: {actions}"
+    assert [a.slug for a in dispatched] == ["task-0", "task-1", "task-2"]
+    assert [a.worktree for a in dispatched] == [
+        str(wt_root / f"task-{i}") for i in range(3)
+    ], "each worker must get its own worktree"
+
+
 def test_dispatch_ready_cap2_marks_prompt_worktree_pre_created(tmp_path) -> None:
     """Codex iter-1 [P1] regress guard: cap > 1 dispatch must pass
     `worktree_pre_created=True` to build_worker_prompt so the worker's
@@ -1021,6 +1057,12 @@ def test_dispatch_ready_cap2_skips_when_git_worktree_add_fails(tmp_path) -> None
 # ---------- loop.py: parallelism config ----------
 
 
+def test_default_cap_is_three() -> None:
+    """Unconfigured projects dispatch 3 workers in worktree mode."""
+    assert loop.DEFAULT_CAP == 3
+    assert inspect.signature(loop.tick).parameters["cap"].default == 3
+
+
 def test_load_parallelism_returns_zero_when_missing(tmp_path) -> None:
     """No coord-config.json → 0 (caller falls through to DEFAULT_CAP)."""
     assert loop._load_parallelism(tmp_path) == 0
@@ -1124,6 +1166,27 @@ def test_dispatch_ready_passes_worktree_timeout_to_git(tmp_path) -> None:
 
     assert _timeouts(1200.0) == [1200.0]
     assert _timeouts(0.0) == [worktree_mod.CREATE_TIMEOUT_S]
+
+
+def test_load_parallelism_falls_back_to_fleet_home(tmp_path) -> None:
+    """`fleet init` writes ~/.fleet/coord-config.json; a project with no
+    parallelism of its own inherits it."""
+    home = tmp_path / "home"
+    project_dir = tmp_path / "projects" / "p"
+    home.mkdir()
+    project_dir.mkdir(parents=True)
+    (home / "coord-config.json").write_text('{"parallelism": 4}\n')
+    assert loop._load_parallelism(project_dir, home) == 4
+
+
+def test_load_parallelism_project_wins_over_fleet_home(tmp_path) -> None:
+    home = tmp_path / "home"
+    project_dir = tmp_path / "projects" / "p"
+    home.mkdir()
+    project_dir.mkdir(parents=True)
+    (home / "coord-config.json").write_text('{"parallelism": 4}\n')
+    (project_dir / "coord-config.json").write_text('{"parallelism": 1}\n')
+    assert loop._load_parallelism(project_dir, home) == 1
 
 
 # ---------- loop.py: terminal-state worktree cleanup ----------
