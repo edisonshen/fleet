@@ -610,7 +610,7 @@ def tick(
     # DEFAULT_CAP — that way a caller can pin cap explicitly while
     # production deployments rely on the on-disk config.
     if cap == DEFAULT_CAP:
-        configured = _load_parallelism(project_dir)
+        configured = _load_parallelism(project_dir, home)
         if configured > 0:
             cap = configured
     # RE-FENCE before the mutation phase (codex PR4 [P1]). The step-0.5 proof
@@ -3357,16 +3357,23 @@ def _load_coord_state(path: Path) -> dict:
     return {}
 
 
-def _load_parallelism(project_dir: Path) -> int:
-    """Read coord-config.json's `parallelism` field. Defaults to 0
-    (caller falls through to DEFAULT_CAP).
+def _load_parallelism(project_dir: Path, home: Path | None = None) -> int:
+    """Resolve `parallelism`: the project's coord-config.json wins, then
+    the operator-wide ~/.fleet/coord-config.json (written by `fleet
+    init`), else 0 (caller falls through to DEFAULT_CAP).
 
     Schema: `{"parallelism": <int>}`. Out-of-range values (<1 or >50)
     are clamped to the legal window — coord misconfig should never
     crash the tick. v0.2.x ships parallelism only; future fields will
     live alongside without breaking the loader.
     """
-    cfg_path = project_dir / COORD_CONFIG_FILE
+    configured = _parallelism_from_file(project_dir / COORD_CONFIG_FILE)
+    if configured > 0 or home is None:
+        return configured
+    return _parallelism_from_file(home / COORD_CONFIG_FILE)
+
+
+def _parallelism_from_file(cfg_path: Path) -> int:
     try:
         with open(cfg_path, "r", encoding="utf-8") as fh:
             data = json.load(fh)

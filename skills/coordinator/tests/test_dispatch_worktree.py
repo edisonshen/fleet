@@ -927,6 +927,27 @@ def test_load_parallelism_handles_malformed_json(tmp_path) -> None:
     assert loop._load_parallelism(tmp_path) == 0
 
 
+def test_load_parallelism_falls_back_to_fleet_home(tmp_path) -> None:
+    """`fleet init` writes ~/.fleet/coord-config.json; a project with no
+    parallelism of its own inherits it."""
+    home = tmp_path / "home"
+    project_dir = tmp_path / "projects" / "p"
+    home.mkdir()
+    project_dir.mkdir(parents=True)
+    (home / "coord-config.json").write_text('{"parallelism": 4}\n')
+    assert loop._load_parallelism(project_dir, home) == 4
+
+
+def test_load_parallelism_project_wins_over_fleet_home(tmp_path) -> None:
+    home = tmp_path / "home"
+    project_dir = tmp_path / "projects" / "p"
+    home.mkdir()
+    project_dir.mkdir(parents=True)
+    (home / "coord-config.json").write_text('{"parallelism": 4}\n')
+    (project_dir / "coord-config.json").write_text('{"parallelism": 1}\n')
+    assert loop._load_parallelism(project_dir, home) == 1
+
+
 # ---------- loop.py: terminal-state worktree cleanup ----------
 
 

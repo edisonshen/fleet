@@ -202,7 +202,9 @@ Rules:
   `rate-limited` or `unavailable`; non-git projects resolve to Claude slots.
 - The finisher pushes and opens the PR only when review terminal fields satisfy
   the worker state validator.
-- Default parallelism is 3 (`coord-config.json:parallelism` overrides it).
+- Default parallelism is 3. Resolution order: the project's
+  `coord-config.json:parallelism`, then `~/.fleet/coord-config.json:parallelism`
+  (what `fleet init` prompts for / `fleet init --parallelism N` writes), then 3.
   Parallelism above 1 uses worktrees and conflict checks; set `parallelism: 1`
   for serialized in-place dispatch.
 - Record: when dispatching a worker for a task, run

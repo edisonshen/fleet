@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"encoding/json"
 	"errors"
@@ -10,8 +11,10 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 
+	"github.com/mattn/go-isatty"
 	"github.com/spf13/cobra"
 
 	fleet "github.com/edisonshen/fleet"
@@ -26,9 +29,19 @@ import (
 // without that hook the flag would set true on Stop and never clear.
 var hookEvents = []string{"Stop", "PreCompact", "SessionStart", "UserPromptSubmit"}
 
+// parallelismDefault mirrors skills/coordinator/loop.py::DEFAULT_CAP —
+// what a coord runs when nothing is configured. Used here only as the
+// prompt's suggested answer.
+const parallelismDefault = 3
+
+// parallelismMax mirrors loop.py's clamp: past it a coord saturates
+// tmux + fsnotify long before it saturates the box.
+const parallelismMax = 50
+
 func newInitCmd() *cobra.Command {
 	var force bool
 	var upgrade bool
+	var parallelism int
 	cmd := &cobra.Command{
 		Use:   "init",
 		Short: "Install bundled skills into ~/.claude/skills/ and register hooks",
@@ -45,14 +58,96 @@ newer fleet binary auto-refreshes the install) but never overwrites
 ~/.fleet/standards.md (operator edits to the bar are preserved). --force
 is the legacy alias for --upgrade.`,
 		RunE: func(c *cobra.Command, _ []string) error {
-			return runInit(c.OutOrStdout(), force || upgrade, "")
+			if err := runInit(c.OutOrStdout(), force || upgrade, ""); err != nil {
+				return err
+			}
+			return seedParallelism(c.OutOrStdout(), os.Stdin, parallelism)
 		},
 	}
 	cmd.Flags().BoolVar(&force, "force", false,
 		"alias for --upgrade (kept for compat with v0.1 muscle memory)")
 	cmd.Flags().BoolVar(&upgrade, "upgrade", false,
 		"refresh bundled skill files from the binary (settings.json is always merged; ~/.fleet/standards.md is preserved)")
+	cmd.Flags().IntVar(&parallelism, "parallelism", 0,
+		"workers a coord runs in parallel (1 = serialized in-place); skips the interactive prompt")
 	return cmd
+}
+
+// seedParallelism records the operator-wide default parallelism in
+// ~/.fleet/coord-config.json, which loop.py::_load_parallelism reads
+// when the project's own coord-config.json says nothing.
+//
+// Precedence, and why each branch exists:
+//   - key already present → leave it (re-running init must not re-ask a
+//     question the operator already answered)
+//   - --parallelism N → write N (the scripted / CI path)
+//   - stdin is a tty → ask, defaulting to parallelismDefault
+//   - otherwise → write nothing and stay silent; an init inside a
+//     pipeline must never block on a reader, and the coord's built-in
+//     default already covers it
+func seedParallelism(stdout io.Writer, stdin *os.File, flagVal int) error {
+	if flagVal < 0 || flagVal > parallelismMax {
+		return fmt.Errorf("--parallelism %d out of range (1..%d)", flagVal, parallelismMax)
+	}
+	root, err := state.Bootstrap()
+	if err != nil {
+		return fmt.Errorf("bootstrap ~/.fleet: %w", err)
+	}
+	cfgPath := filepath.Join(root, "coord-config.json")
+	// Unreadable/malformed reads as empty, matching loop.py's loader —
+	// a busted config must not wedge `fleet init`.
+	cfg := map[string]any{}
+	if raw, rerr := os.ReadFile(cfgPath); rerr == nil {
+		var existing map[string]any
+		if json.Unmarshal(raw, &existing) == nil && existing != nil {
+			cfg = existing
+		}
+	}
+	if _, ok := cfg["parallelism"]; ok {
+		_, _ = fmt.Fprintf(stdout, "skip (existing parallelism): %s\n", cfgPath)
+		return nil
+	}
+
+	n := flagVal
+	if n == 0 {
+		if stdin == nil || !isatty.IsTerminal(stdin.Fd()) {
+			return nil
+		}
+		n = promptParallelism(stdout, stdin)
+	}
+
+	cfg["parallelism"] = n
+	blob, err := json.MarshalIndent(cfg, "", "  ")
+	if err != nil {
+		return fmt.Errorf("encode coord-config: %w", err)
+	}
+	if err := state.WriteAtomic(cfgPath, append(blob, '\n')); err != nil {
+		return fmt.Errorf("write %s: %w", cfgPath, err)
+	}
+	_, _ = fmt.Fprintf(stdout, "parallelism %d: %s\n", n, cfgPath)
+	return nil
+}
+
+// promptParallelism asks once. Empty input, junk, or a closed stdin all
+// take the default — init is a setup command, not a form, and the value
+// is a one-line edit away in coord-config.json.
+func promptParallelism(stdout io.Writer, stdin io.Reader) int {
+	_, _ = fmt.Fprintf(stdout,
+		"How many workers should a coord run in parallel? "+
+			"(1 = serialized in place, >1 = one git worktree per worker) [%d]: ",
+		parallelismDefault)
+	line, _ := bufio.NewReader(stdin).ReadString('\n')
+	answer := strings.TrimSpace(line)
+	if answer == "" {
+		return parallelismDefault
+	}
+	n, err := strconv.Atoi(answer)
+	if err != nil || n < 1 || n > parallelismMax {
+		_, _ = fmt.Fprintf(stdout, "not a number in 1..%d — using %d\n",
+			parallelismMax, parallelismDefault)
+		return parallelismDefault
+	}
+	return n
 }
 
 // runInit copies every embedded skill into ~/.claude/skills/<name>/,
