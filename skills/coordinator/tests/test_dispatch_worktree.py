@@ -377,7 +377,8 @@ def test_create_worktree_idempotent_on_already_exists_when_registered(tmp_path) 
     wt = str(tmp_path / "wt" / "alpha-1234")
     add_err = _err(f"fatal: '{wt}' already exists\n")
     list_ok = _ok(stdout=f"worktree {wt}\nHEAD abc123\nbranch refs/heads/worker/alpha-1234\n\n")
-    runs = [add_err, list_ok]
+    head_ok = _ok(stdout="worker/alpha-1234\n")
+    runs = [add_err, list_ok, head_ok]
     with patch.object(worktree_mod.subprocess, "run", side_effect=lambda *a, **k: runs.pop(0)):
         res = worktree_mod.create_worktree(repo, wt, "worker/alpha-1234")
     assert res.error == ""
@@ -393,7 +394,8 @@ def test_create_worktree_idempotent_on_already_checked_out_when_registered(tmp_p
     wt = str(tmp_path / "wt" / "alpha-1234")
     add_err = _err(f"fatal: '{wt}' is already checked out at /elsewhere\n")
     list_ok = _ok(stdout=f"worktree {wt}\n\n")
-    runs = [add_err, list_ok]
+    head_ok = _ok(stdout="worker/alpha-1234\n")
+    runs = [add_err, list_ok, head_ok]
     with patch.object(worktree_mod.subprocess, "run", side_effect=lambda *a, **k: runs.pop(0)):
         res = worktree_mod.create_worktree(repo, wt, "worker/alpha-1234")
     assert res.error == ""
@@ -516,6 +518,63 @@ def test_create_worktree_branch_reuse_rejects_wrong_branch(tmp_path) -> None:
         res = worktree_mod.create_worktree(repo, wt, "worker/alpha-1234")
     assert res.path == ""
     assert "expected worker/alpha-1234" in res.error
+
+
+def test_create_worktree_rejects_locked_worktree(tmp_path) -> None:
+    """#284 (found by the real-git e2e): a `git worktree add` killed by the
+    timeout leaves the entry REGISTERED but LOCKED, with the checkout only
+    half-written. Adopting it dispatches a worker into a tree missing files
+    git's index claims are present, so the lock is a hard refusal."""
+    repo = str(tmp_path / "repo")
+    os.makedirs(repo)
+    wt = str(tmp_path / "wt" / "alpha-1234")
+    add_err = _err(f"fatal: '{wt}' already exists\n")
+    list_locked = _ok(
+        stdout=f"worktree {wt}\nHEAD abc123\ndetached\nlocked\n\n",
+    )
+    runs = [add_err, list_locked]
+    with patch.object(worktree_mod.subprocess, "run", side_effect=lambda *a, **k: runs.pop(0)):
+        res = worktree_mod.create_worktree(repo, wt, "worker/alpha-1234")
+    assert res.path == ""
+    assert "locked (incomplete) worktree" in res.error
+
+
+def test_create_worktree_rejects_wrong_branch_on_first_attempt(tmp_path) -> None:
+    """#284: the first-attempt collision path corroborates the branch too
+    — a registered tree at the path holding someone else's branch (or a
+    detached HEAD left by an interrupted add) is not adoptable."""
+    repo = str(tmp_path / "repo")
+    os.makedirs(repo)
+    wt = str(tmp_path / "wt" / "alpha-1234")
+    add_err = _err(f"fatal: '{wt}' already exists\n")
+    list_ok = _ok(stdout=f"worktree {wt}\n\n")
+    head_detached = _ok(stdout="HEAD\n")
+    runs = [add_err, list_ok, head_detached]
+    with patch.object(worktree_mod.subprocess, "run", side_effect=lambda *a, **k: runs.pop(0)):
+        res = worktree_mod.create_worktree(repo, wt, "worker/alpha-1234")
+    assert res.path == ""
+    assert "detached HEAD, expected worker/alpha-1234" in res.error
+
+
+def test_worktree_record_scopes_flags_to_the_matching_record(tmp_path) -> None:
+    """Porcelain records are newline-separated blocks; a `locked` flag on a
+    SIBLING worktree must not leak onto the one we're asking about."""
+    repo = str(tmp_path / "repo")
+    os.makedirs(repo)
+    wt = str(tmp_path / "wt" / "alpha-1234")
+    other = str(tmp_path / "wt" / "bravo-5678")
+    listing = _ok(
+        stdout=(
+            f"worktree {other}\nHEAD abc\nlocked\n\n"
+            f"worktree {wt}\nHEAD def\nbranch refs/heads/worker/alpha-1234\n\n"
+        ),
+    )
+    with patch.object(worktree_mod.subprocess, "run", return_value=listing):
+        assert worktree_mod._worktree_record(repo, wt) == {"HEAD", "branch"}
+    with patch.object(worktree_mod.subprocess, "run", return_value=listing):
+        assert worktree_mod._worktree_record(repo, other) == {"HEAD", "locked"}
+    with patch.object(worktree_mod.subprocess, "run", return_value=listing):
+        assert worktree_mod._worktree_record(repo, str(tmp_path / "nope")) is None
 
 
 def test_create_worktree_default_timeout_is_create_timeout_s(tmp_path) -> None:

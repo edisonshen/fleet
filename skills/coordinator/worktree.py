@@ -482,56 +482,76 @@ def create_worktree(
         if proc2.returncode == 0:
             return WorktreeResult(path=wt_path)
         stderr2 = (proc2.stderr or proc2.stdout or "").strip()
-        # Same idempotency check the first-attempt path runs below: a
+        # Same adoption guard the first-attempt path runs below: a
         # worktree ALREADY sitting at wt_path (previous tick crashed after
-        # the add, or timed out mid-checkout and was repaired by hand) is
-        # reusable, not a permanent failure. Without this, a valid, clean,
-        # correctly-registered worktree at the exact expected path+branch
-        # could never be adopted and the task was un-redispatchable.
-        # Corroborate the branch too: unlike the `-b` path, reuse targets
-        # an EXISTING branch, so a registered tree holding a different
-        # branch would hand the worker the wrong code.
+        # the add) is reusable, not a permanent failure. Without this, a
+        # valid, clean, correctly-registered worktree at the exact expected
+        # path+branch could never be adopted and the task was
+        # un-redispatchable.
         if _is_worktree_path_collision(stderr2, wt_path):
-            if not _is_registered_worktree(repo, wt_path):
-                return WorktreeResult(
-                    error=(
-                        f"create_worktree: {wt_path} exists on disk but is not "
-                        f"a registered git worktree; remove it and retry"
-                    ),
-                )
-            checked_out = worktree_branch(wt_path, timeout_s=_VERIFY_TIMEOUT_S)
-            if checked_out == branch:
-                return WorktreeResult(path=wt_path)
-            return WorktreeResult(
-                error=(
-                    f"create_worktree: {wt_path} is a registered worktree on "
-                    f"branch {checked_out or 'detached HEAD'}, expected "
-                    f"{branch}; remove it and retry"
-                ),
-            )
+            return _adopt_existing_worktree(repo, wt_path, branch)
         # Retry path can also hit "already checked out" if the branch is
         # checked out elsewhere — that's a real conflict, surface it.
         return WorktreeResult(
             error=f"create_worktree: branch {branch} reuse failed: {stderr2}",
         )
-    # Worktree-path collision path: git already has wt_path registered as
-    # a worktree (most often because a previous tick crashed mid-add but
-    # after the wt-dir landed on disk). Verify wt_path is a REGISTERED
-    # worktree before returning success — a stale non-empty directory at
-    # the same path also produces "already exists" but is NOT a real
-    # checkout, and handing it to the worker would crash the first git
-    # step (codex iter-2 [P2]). The verify call goes through git, not
-    # os.path checks, so it can't be fooled by a directory drop-in.
+    # Worktree-path collision path: something is already sitting at
+    # wt_path (most often a previous tick that crashed mid-add but after
+    # the wt-dir landed on disk). _adopt_existing_worktree decides whether
+    # it is a checkout we can resume on or wreckage we must refuse.
     if _is_worktree_path_collision(stderr, wt_path):
-        if _is_registered_worktree(repo, wt_path):
-            return WorktreeResult(path=wt_path)
+        return _adopt_existing_worktree(repo, wt_path, branch)
+    return WorktreeResult(error=f"create_worktree: git worktree add: {stderr}")
+
+
+def _adopt_existing_worktree(
+    repo: str, wt_path: str, branch: str,
+) -> WorktreeResult:
+    """Decide whether the tree already sitting at wt_path is reusable.
+
+    Both `git worktree add` paths (`-b <branch>` and the existing-branch
+    retry) can fail with "already exists" for three very different
+    reasons, and only one of them is safe to dispatch into:
+
+      registered + unlocked + on <branch>  → adopt (a previous tick
+          crashed after the add landed; resuming on it is correct)
+      not registered                       → a stale directory drop-in,
+          not a checkout at all
+      locked                               → `git worktree add` did not
+          finish (killed mid-checkout by the subprocess timeout — the
+          #284 case). The tree is missing files git believes are there
+      wrong branch / detached HEAD         → hands the worker code from
+          another task
+
+    The verification goes through git rather than os.path checks so a
+    directory drop-in can't fool it.
+    """
+    record = _worktree_record(repo, wt_path)
+    if record is None:
         return WorktreeResult(
             error=(
                 f"create_worktree: {wt_path} exists on disk but is not a "
                 f"registered git worktree; remove it and retry"
             ),
         )
-    return WorktreeResult(error=f"create_worktree: git worktree add: {stderr}")
+    if "locked" in record:
+        return WorktreeResult(
+            error=(
+                f"create_worktree: {wt_path} is a locked (incomplete) "
+                f"worktree — a previous `git worktree add` was interrupted; "
+                f"remove it and retry"
+            ),
+        )
+    checked_out = worktree_branch(wt_path, timeout_s=_VERIFY_TIMEOUT_S)
+    if checked_out == branch:
+        return WorktreeResult(path=wt_path)
+    return WorktreeResult(
+        error=(
+            f"create_worktree: {wt_path} is a registered worktree on "
+            f"branch {checked_out or 'detached HEAD'}, expected "
+            f"{branch}; remove it and retry"
+        ),
+    )
 
 
 def _is_worktree_path_collision(stderr: str, wt_path: str) -> bool:
@@ -577,44 +597,57 @@ def _is_branch_already_exists(stderr: str, branch: str) -> bool:
     return branch.lower() in low
 
 
-def _is_registered_worktree(
+def _worktree_record(
     repo: str, wt_path: str, *, timeout_s: float = _VERIFY_TIMEOUT_S,
-) -> bool:
-    """Return True iff git lists wt_path among <repo>'s registered
-    worktrees.
+) -> set[str] | None:
+    """Return the flags git records for wt_path, or None if git doesn't
+    list it among <repo>'s worktrees at all.
 
-    Runs `git -C <repo> worktree list --porcelain` and parses the
-    `worktree <abs-path>` lines. Comparison uses os.path.realpath on
-    both sides because git emits the canonical absolute path even
-    when the caller passed a symlinked or trailing-slash variant.
+    Runs `git -C <repo> worktree list --porcelain` and returns the first
+    token of every attribute line in wt_path's record — `{"bare"}`,
+    `{"detached"}`, `{"branch", "locked"}`, ... — so callers can ask both
+    "is it registered?" (record is not None) and "is it locked?" off one
+    subprocess. Comparison uses os.path.realpath on both sides because
+    git emits the canonical absolute path even when the caller passed a
+    symlinked or trailing-slash variant.
 
-    Treats subprocess errors as "not registered" — caller surfaces a
+    Treats subprocess errors as "not registered": the caller surfaces a
     helpful error so the operator can clean the path manually.
     """
     if not repo or not wt_path:
-        return False
+        return None
     try:
         proc = subprocess.run(
             ["git", "-C", repo, "worktree", "list", "--porcelain"],
             capture_output=True, text=True, timeout=timeout_s, check=False,
         )
     except (FileNotFoundError, subprocess.TimeoutExpired):
-        return False
+        return None
     if proc.returncode != 0:
-        return False
+        return None
     target = os.path.realpath(wt_path)
+    flags: set[str] | None = None
     for line in (proc.stdout or "").splitlines():
-        if not line.startswith("worktree "):
+        if line.startswith("worktree "):
+            if flags is not None:
+                return flags
+            listed = line[len("worktree "):].strip()
+            try:
+                if listed and os.path.realpath(listed) == target:
+                    flags = set()
+            except OSError:
+                pass
             continue
-        listed = line[len("worktree "):].strip()
-        if not listed:
-            continue
-        try:
-            if os.path.realpath(listed) == target:
-                return True
-        except OSError:
-            continue
-    return False
+        if flags is not None and line.strip():
+            flags.add(line.split(" ", 1)[0])
+    return flags
+
+
+def _is_registered_worktree(
+    repo: str, wt_path: str, *, timeout_s: float = _VERIFY_TIMEOUT_S,
+) -> bool:
+    """Return True iff git lists wt_path among <repo>'s worktrees."""
+    return _worktree_record(repo, wt_path, timeout_s=timeout_s) is not None
 
 
 def worktree_is_dirty(
