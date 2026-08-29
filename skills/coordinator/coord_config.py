@@ -3,8 +3,9 @@
 Schema (additive — new fields land alongside without breaking the loader):
 
     {
-        "parallelism": <int>,    # _load_parallelism (loop.py)
-        "repo":        <str>     # absolute path to project's git checkout
+        "parallelism":        <int>,    # _load_parallelism (loop.py)
+        "worktree_timeout_s": <number>, # _load_worktree_timeout (loop.py)
+        "repo":               <str>     # absolute path to project's git checkout
     }
 
 Repo binding is owned by Go (Design 3,

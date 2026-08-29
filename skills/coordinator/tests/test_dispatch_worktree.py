@@ -463,6 +463,79 @@ def test_create_worktree_branch_reuse_failure_surfaces_error(tmp_path) -> None:
     assert "branch worker/alpha-1234 reuse failed" in res.error
 
 
+def test_create_worktree_branch_reuse_adopts_registered_worktree(tmp_path) -> None:
+    """#284: the branch-reuse retry path gets the SAME idempotency check
+    as the first attempt. A valid, clean, correctly-registered worktree
+    at the expected path+branch is adopted instead of failing the
+    dispatch forever (the pre-fix behavior made the task
+    un-redispatchable on a repo whose checkout can't be recreated)."""
+    repo = str(tmp_path / "repo")
+    os.makedirs(repo)
+    wt = str(tmp_path / "wt" / "alpha-1234")
+    add_err = _err("fatal: A branch named 'worker/alpha-1234' already exists.\n")
+    retry_err = _err(f"Preparing worktree\nfatal: '{wt}' already exists\n")
+    list_ok = _ok(stdout=f"worktree {wt}\n\n")
+    head_ok = _ok(stdout="worker/alpha-1234\n")
+    runs = [add_err, retry_err, list_ok, head_ok]
+    with patch.object(worktree_mod.subprocess, "run", side_effect=lambda *a, **k: runs.pop(0)):
+        res = worktree_mod.create_worktree(repo, wt, "worker/alpha-1234")
+    assert res.error == ""
+    assert res.path == wt
+
+
+def test_create_worktree_branch_reuse_rejects_unregistered_dir(tmp_path) -> None:
+    """#284: adoption is gated on git's registry, not on os.path — a
+    stale directory (e.g. a checkout killed mid-`worktree add`) at the
+    expected path is surfaced for the operator, not handed to a worker."""
+    repo = str(tmp_path / "repo")
+    os.makedirs(repo)
+    wt = str(tmp_path / "wt" / "alpha-1234")
+    add_err = _err("fatal: A branch named 'worker/alpha-1234' already exists.\n")
+    retry_err = _err(f"fatal: '{wt}' already exists\n")
+    list_no_match = _ok(stdout=f"worktree {repo}\n\n")
+    runs = [add_err, retry_err, list_no_match]
+    with patch.object(worktree_mod.subprocess, "run", side_effect=lambda *a, **k: runs.pop(0)):
+        res = worktree_mod.create_worktree(repo, wt, "worker/alpha-1234")
+    assert res.path == ""
+    assert "not a registered git worktree" in res.error
+
+
+def test_create_worktree_branch_reuse_rejects_wrong_branch(tmp_path) -> None:
+    """#284: a REGISTERED worktree at the path holding a different
+    branch is not adoptable — reusing it would hand the worker code
+    from another task."""
+    repo = str(tmp_path / "repo")
+    os.makedirs(repo)
+    wt = str(tmp_path / "wt" / "alpha-1234")
+    add_err = _err("fatal: A branch named 'worker/alpha-1234' already exists.\n")
+    retry_err = _err(f"fatal: '{wt}' already exists\n")
+    list_ok = _ok(stdout=f"worktree {wt}\n\n")
+    head_other = _ok(stdout="worker/bravo-5678\n")
+    runs = [add_err, retry_err, list_ok, head_other]
+    with patch.object(worktree_mod.subprocess, "run", side_effect=lambda *a, **k: runs.pop(0)):
+        res = worktree_mod.create_worktree(repo, wt, "worker/alpha-1234")
+    assert res.path == ""
+    assert "expected worker/alpha-1234" in res.error
+
+
+def test_create_worktree_default_timeout_is_create_timeout_s(tmp_path) -> None:
+    """#284: 30s killed `git worktree add` mid-checkout on large repos.
+    The default is now CREATE_TIMEOUT_S and reaches the subprocess."""
+    repo = str(tmp_path / "repo")
+    os.makedirs(repo)
+    wt = str(tmp_path / "wt" / "alpha-1234")
+    seen: list = []
+
+    def _run(cmd, *a, **k):
+        seen.append(k.get("timeout"))
+        return _ok()
+
+    with patch.object(worktree_mod.subprocess, "run", side_effect=_run):
+        assert worktree_mod.create_worktree(repo, wt, "worker/alpha-1234").error == ""
+    assert seen == [worktree_mod.CREATE_TIMEOUT_S]
+    assert worktree_mod.CREATE_TIMEOUT_S > 30.0
+
+
 def test_create_worktree_surfaces_real_git_error(tmp_path) -> None:
     repo = str(tmp_path / "repo")
     os.makedirs(repo)
@@ -918,6 +991,80 @@ def test_load_parallelism_handles_malformed_json(tmp_path) -> None:
     cfg = tmp_path / "coord-config.json"
     cfg.write_text("not json\n")
     assert loop._load_parallelism(tmp_path) == 0
+
+
+# ---------- loop.py: worktree timeout config (#284) ----------
+
+
+def test_load_worktree_timeout_returns_zero_when_unset(tmp_path) -> None:
+    """No config / no field → 0.0 (caller falls through to the module
+    default)."""
+    assert loop._load_worktree_timeout(tmp_path) == 0.0
+    (tmp_path / "coord-config.json").write_text('{"parallelism": 2}\n')
+    assert loop._load_worktree_timeout(tmp_path) == 0.0
+
+
+def test_load_worktree_timeout_reads_and_clamps(tmp_path) -> None:
+    cfg = tmp_path / "coord-config.json"
+    cfg.write_text('{"worktree_timeout_s": 900}\n')
+    assert loop._load_worktree_timeout(tmp_path) == 900.0
+    cfg.write_text('{"worktree_timeout_s": 0.5}\n')
+    assert loop._load_worktree_timeout(tmp_path) == loop._WORKTREE_TIMEOUT_MIN_S
+    cfg.write_text('{"worktree_timeout_s": 99999}\n')
+    assert loop._load_worktree_timeout(tmp_path) == loop._WORKTREE_TIMEOUT_MAX_S
+
+
+def test_load_worktree_timeout_ignores_junk(tmp_path) -> None:
+    cfg = tmp_path / "coord-config.json"
+    cfg.write_text('{"worktree_timeout_s": "600"}\n')
+    assert loop._load_worktree_timeout(tmp_path) == 0.0
+    cfg.write_text('{"worktree_timeout_s": true}\n')
+    assert loop._load_worktree_timeout(tmp_path) == 0.0
+    cfg.write_text('{"worktree_timeout_s": -5}\n')
+    assert loop._load_worktree_timeout(tmp_path) == 0.0
+    cfg.write_text("not json\n")
+    assert loop._load_worktree_timeout(tmp_path) == 0.0
+
+
+def test_dispatch_ready_passes_worktree_timeout_to_git(tmp_path) -> None:
+    """#284: the configured timeout reaches the `git worktree add`
+    subprocess; unset falls back to worktree.CREATE_TIMEOUT_S."""
+    wt_path = str(tmp_path / ".fleet" / "projects" / "proj" / "worktrees" / "alpha-1234")
+    repo = "/repo"
+    routes = {
+        ("/usr/local/bin/fleet", "workers", "worktree-path"):
+            _ok(stdout=wt_path + "\n"),
+        ("git", "-C", repo, "symbolic-ref", "--short", "-q", "HEAD"): _ok(stdout="main\n"),
+        ("git", "-C", repo, "rev-parse", "--abbrev-ref",
+         "--symbolic-full-name"): _ok(stdout="origin/main\n"),
+        ("git", "-C", repo, "fetch"): _ok(),
+        ("git", "-C", repo, "rev-parse", "--verify"): _ok(stdout="deadbeef\n"),
+        ("git", "-C", repo, "merge-base", "--is-ancestor"): _ok(),
+        ("git", "-C", repo, "worktree", "add"): _ok(),
+    }
+
+    def _timeouts(worktree_timeout_s: float) -> list:
+        seen: list = []
+        router = _make_subprocess_router(routes)
+
+        def _run(cmd, *a, **k):
+            if list(cmd[:5]) == ["git", "-C", repo, "worktree", "add"]:
+                seen.append(k.get("timeout"))
+            return router(cmd, *a, **k)
+
+        with patch.object(dispatch_mod, "fetch_standards", return_value="# Standards"), \
+             patch.object(dispatch_mod, "fetch_learnings", return_value=""), \
+             patch.object(dispatch_mod.subprocess, "run", side_effect=_run):
+            actions = loop._dispatch_ready(
+                tasks=[_ready_task("alpha-1234")], project="proj", cwd=repo, cap=2,
+                fleet_bin="/usr/local/bin/fleet", fleet_home=str(tmp_path),
+                worktree_timeout_s=worktree_timeout_s,
+            )
+        assert actions and actions[0].error == "", actions
+        return seen
+
+    assert _timeouts(1200.0) == [1200.0]
+    assert _timeouts(0.0) == [worktree_mod.CREATE_TIMEOUT_S]
 
 
 # ---------- loop.py: terminal-state worktree cleanup ----------

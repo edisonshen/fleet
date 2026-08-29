@@ -64,6 +64,18 @@ class WorktreeResult:
     outcome: str = ""
 
 
+# Default subprocess timeout for `git worktree add` (seconds). The add
+# is I/O-bound in tracked-file count, not CPU: a ~300K-file monorepo
+# checkout routinely runs 60-90s+, so the old 30s killed every dispatch
+# mid-checkout and left a half-written tree behind. Callers override per
+# project via coord-config.json's `worktree_timeout_s`.
+CREATE_TIMEOUT_S = 300.0
+
+# Timeout for the read-only `git worktree list --porcelain` verify. It is
+# independent of the (possibly minutes-long) create timeout — listing the
+# registry never scales with repo size.
+_VERIFY_TIMEOUT_S = 10.0
+
 # Paths outside this prefix are NEVER subject to worktree removal.
 # Defense-in-depth: if a caller bug routes a bare repo path or the
 # project's main checkout into remove_worktree(), we refuse.
@@ -408,7 +420,7 @@ def create_worktree(
     branch: str,
     *,
     base: str = "",
-    timeout_s: float = 30.0,
+    timeout_s: float = CREATE_TIMEOUT_S,
 ) -> WorktreeResult:
     """`git -C <repo> worktree add <wt_path> -b <branch> [<base>]`.
 
@@ -420,6 +432,11 @@ def create_worktree(
     exists" we still return success: the most common reason is a
     previous tick crashed after `git worktree add` but before the
     tasks.md update; resuming on the same path is correct.
+
+    timeout_s bounds the `git worktree add` subprocess. It defaults to
+    CREATE_TIMEOUT_S; the coord passes coord-config.json's
+    `worktree_timeout_s` when the operator sets one (a checkout on a
+    very large repo is I/O-bound and can exceed even the default).
 
     Caller MUST resolve wt_path via compute_worktree_path first — this
     function does no validation of the destination's safety. The
@@ -465,6 +482,33 @@ def create_worktree(
         if proc2.returncode == 0:
             return WorktreeResult(path=wt_path)
         stderr2 = (proc2.stderr or proc2.stdout or "").strip()
+        # Same idempotency check the first-attempt path runs below: a
+        # worktree ALREADY sitting at wt_path (previous tick crashed after
+        # the add, or timed out mid-checkout and was repaired by hand) is
+        # reusable, not a permanent failure. Without this, a valid, clean,
+        # correctly-registered worktree at the exact expected path+branch
+        # could never be adopted and the task was un-redispatchable.
+        # Corroborate the branch too: unlike the `-b` path, reuse targets
+        # an EXISTING branch, so a registered tree holding a different
+        # branch would hand the worker the wrong code.
+        if _is_worktree_path_collision(stderr2, wt_path):
+            if not _is_registered_worktree(repo, wt_path):
+                return WorktreeResult(
+                    error=(
+                        f"create_worktree: {wt_path} exists on disk but is not "
+                        f"a registered git worktree; remove it and retry"
+                    ),
+                )
+            checked_out = worktree_branch(wt_path, timeout_s=_VERIFY_TIMEOUT_S)
+            if checked_out == branch:
+                return WorktreeResult(path=wt_path)
+            return WorktreeResult(
+                error=(
+                    f"create_worktree: {wt_path} is a registered worktree on "
+                    f"branch {checked_out or 'detached HEAD'}, expected "
+                    f"{branch}; remove it and retry"
+                ),
+            )
         # Retry path can also hit "already checked out" if the branch is
         # checked out elsewhere — that's a real conflict, surface it.
         return WorktreeResult(
@@ -479,7 +523,7 @@ def create_worktree(
     # step (codex iter-2 [P2]). The verify call goes through git, not
     # os.path checks, so it can't be fooled by a directory drop-in.
     if _is_worktree_path_collision(stderr, wt_path):
-        if _is_registered_worktree(repo, wt_path, timeout_s=timeout_s):
+        if _is_registered_worktree(repo, wt_path):
             return WorktreeResult(path=wt_path)
         return WorktreeResult(
             error=(
@@ -534,7 +578,7 @@ def _is_branch_already_exists(stderr: str, branch: str) -> bool:
 
 
 def _is_registered_worktree(
-    repo: str, wt_path: str, *, timeout_s: float = 10.0,
+    repo: str, wt_path: str, *, timeout_s: float = _VERIFY_TIMEOUT_S,
 ) -> bool:
     """Return True iff git lists wt_path among <repo>'s registered
     worktrees.

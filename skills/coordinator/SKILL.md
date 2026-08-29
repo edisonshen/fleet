@@ -204,6 +204,9 @@ Rules:
   the worker state validator.
 - v0.2 default parallelism is 1. Higher parallelism uses worktrees and conflict
   checks.
+- `coord-config.json:worktree_timeout_s` bounds `git worktree add` (default
+  300s, clamped to 5..3600). Raise it on repos whose full checkout takes longer
+  than that — a timeout kills the add mid-checkout.
 - Record: when dispatching a worker for a task, run
   `fleet checkpoint doc --role implementing docs/TASK-PLAN-<slug>.md` so the
   handoff's "Docs (this session)" shows what this coord is actively

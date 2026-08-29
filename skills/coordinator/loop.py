@@ -61,10 +61,16 @@ import worktree as worktree_mod
 # skill"). cap=1 serializes everything; cap > 1 enables worktree-mode
 # parallel dispatch (one git worktree per worker; v0.2.x).
 DEFAULT_CAP = 1
-# Filename under projects/<name>/ holding the per-project parallelism
-# config. Schema: {"parallelism": <int>}. Missing or unparseable file →
-# DEFAULT_CAP. Single tunable for now — v0.3 may grow more knobs.
+# Filename under projects/<name>/ holding the per-project coord config.
+# Schema: {"parallelism": <int>, "worktree_timeout_s": <number>}.
+# Missing or unparseable file → DEFAULT_CAP + the worktree module's
+# default create timeout.
 COORD_CONFIG_FILE = "coord-config.json"
+# Legal window for coord-config.json's `worktree_timeout_s`. Floor keeps
+# a typo'd 0.1 from failing every dispatch; ceiling keeps a runaway
+# `git worktree add` from pinning the tick for an hour+.
+_WORKTREE_TIMEOUT_MIN_S = 5.0
+_WORKTREE_TIMEOUT_MAX_S = 3600.0
 # Hard cap on archive files scanned per tick — prevents a runaway tick
 # when the inbox archive grows unbounded across coord crashes. Files
 # beyond this just wait for the next tick.
@@ -1280,6 +1286,7 @@ def _tick_locked(
         fleet_bin=fleet_bin,
         fleet_home=str(home),
         coord_state=state,
+        worktree_timeout_s=_load_worktree_timeout(project_dir),
     )
     for action in dispatched:
         # Codex iter-4 [P1]: an acquire-prompt failure populates
@@ -1875,6 +1882,7 @@ def _run_supervisor(
             fleet_bin=fleet_bin,
             fleet_home=str(home),
             coord_state=cs,
+            worktree_timeout_s=_load_worktree_timeout(project_dir),
         )
         for action in new_dispatched:
             # Codex iter-4 [P1]: gate on action.error so an
@@ -3383,6 +3391,34 @@ def _load_parallelism(project_dir: Path) -> int:
     if raw > 50:
         return 50
     return raw
+
+
+def _load_worktree_timeout(project_dir: Path) -> float:
+    """Read coord-config.json's `worktree_timeout_s` field. Defaults to
+    0.0 (caller falls through to worktree.CREATE_TIMEOUT_S).
+
+    `git worktree add` is I/O-bound in tracked-file count: a monorepo
+    checkout can run minutes, and a subprocess timeout kills it
+    mid-checkout, leaving a half-written tree the next tick has to
+    refuse. Operators on such repos raise this knob. Out-of-range and
+    non-numeric values are clamped / ignored — coord misconfig should
+    never crash the tick.
+    """
+    cfg_path = project_dir / COORD_CONFIG_FILE
+    try:
+        with open(cfg_path, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return 0.0
+    if not isinstance(data, dict):
+        return 0.0
+    raw = data.get("worktree_timeout_s")
+    if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+        return 0.0
+    value = float(raw)
+    if value <= 0:
+        return 0.0
+    return max(_WORKTREE_TIMEOUT_MIN_S, min(_WORKTREE_TIMEOUT_MAX_S, value))
 
 
 def _save_coord_state(path: Path, state: dict) -> None:
@@ -7104,6 +7140,7 @@ def _dispatch_ready(
     fleet_bin: str,
     fleet_home: str,
     coord_state: dict | None = None,
+    worktree_timeout_s: float = 0.0,
 ) -> list[_DispatchAction]:
     """Filter to dispatchable candidates, sort by priority, dispatch
     under cap. Returns the actions we successfully (or unsuccessfully)
@@ -7119,6 +7156,10 @@ def _dispatch_ready(
     path (NOT the main repo). A failed worktree create aborts that one
     dispatch — the loop continues with the next candidate so a stale
     on-disk worktree doesn't block all of cap.
+
+    worktree_timeout_s (0 = use worktree.CREATE_TIMEOUT_S) bounds the
+    `git worktree add` subprocess; operators raise it via
+    coord-config.json on repos whose checkout is slower than the default.
 
     Single-worker mode (cap == 1): unchanged from v0.2.0 — every
     worker uses the project's main repo as its cwd, no worktree, no
@@ -7245,6 +7286,9 @@ def _dispatch_ready(
                 )
             wt_result = worktree_mod.create_worktree(
                 cwd, wt_path, worker_branch, base=base_ref,
+                timeout_s=(
+                    worktree_timeout_s or worktree_mod.CREATE_TIMEOUT_S
+                ),
             )
             if wt_result.error:
                 actions.append(_DispatchAction(
