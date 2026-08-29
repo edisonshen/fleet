@@ -672,6 +672,27 @@ def test_prune_worktrees_empty_repo_is_noop(tmp_path) -> None:
 # ---------- loop.py: cap=1 single-worker mode (regression guard) ----------
 
 
+def _dispatch(tasks, *, cap, fleet_home, cwd="/repo", runner=None, **kwargs):
+    """Run `loop._dispatch_ready` with the standards/learnings fetches and
+    subprocess stubbed — the scaffolding every dispatch test needs.
+
+    `runner` is the subprocess.run side_effect; pass a bare
+    `_make_subprocess_router(...)` unless the test needs to observe the
+    calls itself.
+    """
+    with patch.object(dispatch_mod, "fetch_standards", return_value="# Standards"), \
+         patch.object(dispatch_mod, "fetch_learnings", return_value=""), \
+         patch.object(
+             dispatch_mod.subprocess, "run",
+             side_effect=runner or _make_subprocess_router({}),
+         ):
+        return loop._dispatch_ready(
+            tasks=tasks, project="proj", cwd=cwd, cap=cap,
+            fleet_bin="/usr/local/bin/fleet", fleet_home=str(fleet_home),
+            **kwargs,
+        )
+
+
 def _ready_task(slug: str = "alpha-1234") -> parse.Task:
     return parse.Task(
         slug=slug, status="ready", priority="P1",
@@ -700,14 +721,7 @@ def test_dispatch_ready_cap1_does_not_invoke_worktree(tmp_path) -> None:
             return emu
         return _ok()
 
-    with patch.object(dispatch_mod, "fetch_standards", return_value="# Standards"), \
-         patch.object(dispatch_mod, "fetch_learnings", return_value=""), \
-         patch.object(dispatch_mod.subprocess, "run", side_effect=_runner):
-        actions = loop._dispatch_ready(
-            tasks=[t], project="proj", cwd="/repo", cap=1,
-            fleet_bin="/usr/local/bin/fleet",
-            fleet_home=str(tmp_path),
-        )
+    actions = _dispatch([t], cap=1, fleet_home=tmp_path, runner=_runner)
     assert len(actions) == 1
     assert actions[0].error == ""
     assert actions[0].worktree == ""  # cap=1 → no worktree field
@@ -785,17 +799,10 @@ def test_dispatch_ready_cap2_creates_worktree_and_passes_cwd(tmp_path) -> None:
     }
     calls: list = []
 
-    with patch.object(dispatch_mod, "fetch_standards", return_value="# Standards"), \
-         patch.object(dispatch_mod, "fetch_learnings", return_value=""), \
-         patch.object(
-             dispatch_mod.subprocess, "run",
-             side_effect=_make_subprocess_router(routes, calls),
-         ):
-        actions = loop._dispatch_ready(
-            tasks=[t], project="proj", cwd=repo, cap=2,
-            fleet_bin="/usr/local/bin/fleet",
-            fleet_home=str(tmp_path),
-        )
+    actions = _dispatch(
+        [t], cap=2, cwd=repo, fleet_home=tmp_path,
+        runner=_make_subprocess_router(routes, calls),
+    )
 
     assert len(actions) == 1, f"expected one action, got: {actions}"
     assert actions[0].error == ""
@@ -842,19 +849,16 @@ def test_dispatch_ready_default_cap_dispatches_three_worktrees(tmp_path) -> None
     repo = "/repo"
     wt_root = tmp_path / ".fleet" / "projects" / "proj" / "worktrees"
 
+    fallback = _make_subprocess_router({})
+
     def _run(cmd, *_args, **kwargs):
         if cmd[1:3] == ["workers", "worktree-path"]:
             return _ok(stdout=str(wt_root / cmd[-1]) + "\n")
-        return _make_subprocess_router({})(cmd, *_args, **kwargs)
+        return fallback(cmd, *_args, **kwargs)
 
-    with patch.object(dispatch_mod, "fetch_standards", return_value="# Standards"), \
-         patch.object(dispatch_mod, "fetch_learnings", return_value=""), \
-         patch.object(dispatch_mod.subprocess, "run", side_effect=_run):
-        actions = loop._dispatch_ready(
-            tasks=tasks, project="proj", cwd=repo, cap=loop.DEFAULT_CAP,
-            fleet_bin="/usr/local/bin/fleet",
-            fleet_home=str(tmp_path),
-        )
+    actions = _dispatch(
+        tasks, cap=loop.DEFAULT_CAP, cwd=repo, fleet_home=tmp_path, runner=_run,
+    )
 
     dispatched = [a for a in actions if a.error == ""]
     assert len(dispatched) == loop.DEFAULT_CAP == 3, f"actions: {actions}"
@@ -883,17 +887,10 @@ def test_dispatch_ready_cap2_marks_prompt_worktree_pre_created(tmp_path) -> None
     }
     fleet_home_dir = str(tmp_path / "fleet_home")
 
-    with patch.object(dispatch_mod, "fetch_standards", return_value="# Standards"), \
-         patch.object(dispatch_mod, "fetch_learnings", return_value=""), \
-         patch.object(
-             dispatch_mod.subprocess, "run",
-             side_effect=_make_subprocess_router(routes),
-         ):
-        actions = loop._dispatch_ready(
-            tasks=[t], project="proj", cwd=repo, cap=2,
-            fleet_bin="/usr/local/bin/fleet",
-            fleet_home=fleet_home_dir,
-        )
+    actions = _dispatch(
+        [t], cap=2, cwd=repo, fleet_home=fleet_home_dir,
+        runner=_make_subprocess_router(routes),
+    )
     assert len(actions) == 1
     assert actions[0].error == ""
     # Read the inbox file the dispatch path wrote (issue #84 Phase A:
@@ -917,17 +914,10 @@ def test_dispatch_ready_cap2_skips_when_worktree_path_unresolvable(tmp_path) -> 
         ("/usr/local/bin/fleet", "workers", "worktree-path"): _err("boom"),
     }
     calls: list = []
-    with patch.object(dispatch_mod, "fetch_standards", return_value="# Standards"), \
-         patch.object(dispatch_mod, "fetch_learnings", return_value=""), \
-         patch.object(
-             dispatch_mod.subprocess, "run",
-             side_effect=_make_subprocess_router(routes, calls),
-         ):
-        actions = loop._dispatch_ready(
-            tasks=[t], project="proj", cwd="/repo", cap=2,
-            fleet_bin="/usr/local/bin/fleet",
-            fleet_home=str(tmp_path),
-        )
+    actions = _dispatch(
+        [t], cap=2, fleet_home=tmp_path,
+        runner=_make_subprocess_router(routes, calls),
+    )
     assert len(actions) == 1
     assert "worktree-path resolution failed" in actions[0].error
     # Issue #84 Phase A: the path bails out before minting an
@@ -951,17 +941,10 @@ def test_dispatch_ready_cap2_skips_when_git_worktree_add_fails(tmp_path) -> None
             _err("fatal: not a git repository\n"),
     }
     calls: list = []
-    with patch.object(dispatch_mod, "fetch_standards", return_value="# Standards"), \
-         patch.object(dispatch_mod, "fetch_learnings", return_value=""), \
-         patch.object(
-             dispatch_mod.subprocess, "run",
-             side_effect=_make_subprocess_router(routes, calls),
-         ):
-        actions = loop._dispatch_ready(
-            tasks=[t], project="proj", cwd="/repo", cap=2,
-            fleet_bin="/usr/local/bin/fleet",
-            fleet_home=str(tmp_path),
-        )
+    actions = _dispatch(
+        [t], cap=2, fleet_home=tmp_path,
+        runner=_make_subprocess_router(routes, calls),
+    )
     assert len(actions) == 1
     assert "not a git repository" in actions[0].error
     # Issue #84 Phase A: no DISPATCH instruction when worktree create
@@ -982,34 +965,25 @@ def test_default_cap_is_three() -> None:
     assert inspect.signature(loop.tick).parameters["cap"].default == 3
 
 
-def test_load_parallelism_returns_zero_when_missing(tmp_path) -> None:
-    """No coord-config.json → 0 (caller falls through to DEFAULT_CAP)."""
-    assert loop._load_parallelism(tmp_path) == 0
+# raw project coord-config.json -> resolved cap. 0 means "unset": the
+# caller falls through to DEFAULT_CAP.
+_PARALLELISM_CASES = [
+    ('{"parallelism": 3}', 3),
+    ('{"parallelism": 9999}', 50),        # clamped
+    ('{"parallelism": "two"}', 0),
+    ('{"parallelism": true}', 0),         # bool is an int subclass
+    ("not json", 0),
+    ("{}", 0),
+]
 
 
-def test_load_parallelism_reads_valid_int(tmp_path) -> None:
-    cfg = tmp_path / "coord-config.json"
-    cfg.write_text('{"parallelism": 3}\n')
-    assert loop._load_parallelism(tmp_path) == 3
+@pytest.mark.parametrize("raw,want", _PARALLELISM_CASES)
+def test_load_parallelism(tmp_path, raw, want) -> None:
+    (tmp_path / "coord-config.json").write_text(raw + "\n")
+    assert loop._load_parallelism(tmp_path) == want
 
 
-def test_load_parallelism_clamps_high(tmp_path) -> None:
-    cfg = tmp_path / "coord-config.json"
-    cfg.write_text('{"parallelism": 9999}\n')
-    assert loop._load_parallelism(tmp_path) == 50
-
-
-def test_load_parallelism_rejects_non_int(tmp_path) -> None:
-    cfg = tmp_path / "coord-config.json"
-    cfg.write_text('{"parallelism": "two"}\n')
-    assert loop._load_parallelism(tmp_path) == 0
-    cfg.write_text('{"parallelism": true}\n')  # bool subclass of int
-    assert loop._load_parallelism(tmp_path) == 0
-
-
-def test_load_parallelism_handles_malformed_json(tmp_path) -> None:
-    cfg = tmp_path / "coord-config.json"
-    cfg.write_text("not json\n")
+def test_load_parallelism_without_config_file(tmp_path) -> None:
     assert loop._load_parallelism(tmp_path) == 0
 
 
@@ -1077,14 +1051,10 @@ def test_dispatch_ready_passes_worktree_timeout_to_git(tmp_path) -> None:
                 seen.append(k.get("timeout"))
             return router(cmd, *a, **k)
 
-        with patch.object(dispatch_mod, "fetch_standards", return_value="# Standards"), \
-             patch.object(dispatch_mod, "fetch_learnings", return_value=""), \
-             patch.object(dispatch_mod.subprocess, "run", side_effect=_run):
-            actions = loop._dispatch_ready(
-                tasks=[_ready_task("alpha-1234")], project="proj", cwd=repo, cap=2,
-                fleet_bin="/usr/local/bin/fleet", fleet_home=str(tmp_path),
-                worktree_timeout_s=worktree_timeout_s,
-            )
+        actions = _dispatch(
+            [_ready_task("alpha-1234")], cap=2, cwd=repo, fleet_home=tmp_path,
+            runner=_run, worktree_timeout_s=worktree_timeout_s,
+        )
         assert actions and actions[0].error == "", actions
         return seen
 
@@ -1384,14 +1354,10 @@ def test_real_git_dispatch_falls_back_to_local_head_without_origin(tmp_path):
     # Real git for worktree ops; only stub the fleet CLI (worktree-path)
     # and the dispatch helpers (shared _git_router shells real git so
     # current_branch / fetch / ref_exists / worktree add hit the repo).
-    with patch.object(dispatch_mod, "fetch_standards", return_value="# Standards"), \
-         patch.object(dispatch_mod, "fetch_learnings", return_value=""), \
-         patch.object(dispatch_mod.subprocess, "run", side_effect=_git_router(repo, wt_path)):
-        actions = loop._dispatch_ready(
-            tasks=[t], project="proj", cwd=repo, cap=2,
-            fleet_bin="/usr/local/bin/fleet",
-            fleet_home=str(tmp_path),
-        )
+    actions = _dispatch(
+        [t], cap=2, cwd=repo, fleet_home=tmp_path,
+        runner=_git_router(repo, wt_path),
+    )
 
     assert len(actions) == 1, f"expected one action, got: {actions}"
     assert actions[0].error == "", f"dispatch wedged: {actions[0].error}"
@@ -1466,14 +1432,10 @@ def test_real_git_dispatch_honors_stacked_integration_branch(tmp_path):
 
     t = _ready_task("alpha-1234")
     wt_path = str(tmp_path / "wt" / "alpha-1234")
-    with patch.object(dispatch_mod, "fetch_standards", return_value="# Standards"), \
-         patch.object(dispatch_mod, "fetch_learnings", return_value=""), \
-         patch.object(dispatch_mod.subprocess, "run", side_effect=_git_router(clone, wt_path)):
-        actions = loop._dispatch_ready(
-            tasks=[t], project="proj", cwd=clone, cap=2,
-            fleet_bin="/usr/local/bin/fleet",
-            fleet_home=str(tmp_path),
-        )
+    actions = _dispatch(
+        [t], cap=2, cwd=clone, fleet_home=tmp_path,
+        runner=_git_router(clone, wt_path),
+    )
 
     assert len(actions) == 1 and actions[0].error == "", f"actions: {actions}"
     # (b) Fresh: the dependency merged to origin/integration is present.
@@ -1524,14 +1486,10 @@ def test_real_git_dispatch_honors_differently_named_upstream(tmp_path):
 
     t = _ready_task("alpha-1234")
     wt_path = str(tmp_path / "wt" / "alpha-1234")
-    with patch.object(dispatch_mod, "fetch_standards", return_value="# Standards"), \
-         patch.object(dispatch_mod, "fetch_learnings", return_value=""), \
-         patch.object(dispatch_mod.subprocess, "run", side_effect=_git_router(clone, wt_path)):
-        actions = loop._dispatch_ready(
-            tasks=[t], project="proj", cwd=clone, cap=2,
-            fleet_bin="/usr/local/bin/fleet",
-            fleet_home=str(tmp_path),
-        )
+    actions = _dispatch(
+        [t], cap=2, cwd=clone, fleet_home=tmp_path,
+        runner=_git_router(clone, wt_path),
+    )
 
     assert len(actions) == 1 and actions[0].error == "", f"actions: {actions}"
     # The dependency from the REAL upstream (origin/main) is present — proves
@@ -1570,14 +1528,10 @@ def test_real_git_dispatch_preserves_local_commits_ahead_of_upstream(tmp_path):
 
     t = _ready_task("alpha-1234")
     wt_path = str(tmp_path / "wt" / "alpha-1234")
-    with patch.object(dispatch_mod, "fetch_standards", return_value="# Standards"), \
-         patch.object(dispatch_mod, "fetch_learnings", return_value=""), \
-         patch.object(dispatch_mod.subprocess, "run", side_effect=_git_router(clone, wt_path)):
-        actions = loop._dispatch_ready(
-            tasks=[t], project="proj", cwd=clone, cap=2,
-            fleet_bin="/usr/local/bin/fleet",
-            fleet_home=str(tmp_path),
-        )
+    actions = _dispatch(
+        [t], cap=2, cwd=clone, fleet_home=tmp_path,
+        runner=_git_router(clone, wt_path),
+    )
 
     assert len(actions) == 1 and actions[0].error == "", f"actions: {actions}"
     # The operator's local-only commit survives in the worker tree.
@@ -1608,19 +1562,9 @@ def test_dispatch_ready_legacy_pending_NOT_reused_on_gen_gt0(tmp_path) -> None:
     legacy_id = "0ff10001"
     coord_state = _legacy_pending_coord_state("legdisp-aaaa", legacy_id)
 
-    def _runner(cmd, *args, **kwargs):
-        emu = _maybe_claims_emulator(cmd, kwargs)
-        return emu if emu is not None else _ok()
-
-    with patch.object(dispatch_mod, "fetch_standards", return_value="# S"), \
-         patch.object(dispatch_mod, "fetch_learnings", return_value=""), \
-         patch.object(dispatch_mod.subprocess, "run", side_effect=_runner):
-        actions = loop._dispatch_ready(
-            tasks=[t], project="proj", cwd="/repo", cap=1,
-            fleet_bin="/usr/local/bin/fleet",
-            fleet_home=str(tmp_path),
-            coord_state=coord_state,
-        )
+    actions = _dispatch(
+        [t], cap=1, fleet_home=tmp_path, coord_state=coord_state,
+    )
 
     assert len(actions) == 1 and actions[0].error == "", f"actions: {actions}"
     # The fresh dispatch reaches gen 2 (next_gen = 1 + 1), NOT the legacy
@@ -1641,19 +1585,9 @@ def test_dispatch_ready_legacy_pending_reused_on_gen0(tmp_path) -> None:
     legacy_id = "0ff10002"
     coord_state = _legacy_pending_coord_state("legdisp-bbbb", legacy_id)
 
-    def _runner(cmd, *args, **kwargs):
-        emu = _maybe_claims_emulator(cmd, kwargs)
-        return emu if emu is not None else _ok()
-
-    with patch.object(dispatch_mod, "fetch_standards", return_value="# S"), \
-         patch.object(dispatch_mod, "fetch_learnings", return_value=""), \
-         patch.object(dispatch_mod.subprocess, "run", side_effect=_runner):
-        actions = loop._dispatch_ready(
-            tasks=[t], project="proj", cwd="/repo", cap=1,
-            fleet_bin="/usr/local/bin/fleet",
-            fleet_home=str(tmp_path),
-            coord_state=coord_state,
-        )
+    actions = _dispatch(
+        [t], cap=1, fleet_home=tmp_path, coord_state=coord_state,
+    )
 
     assert len(actions) == 1 and actions[0].error == "", f"actions: {actions}"
     assert actions[0].dispatch_generation == 0, "legacy gen-0 reuse must keep gen 0"
