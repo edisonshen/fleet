@@ -57,10 +57,11 @@ import supervisor as supervisor_mod
 import worktree as worktree_mod
 
 
-# Defaults tuned for the v0.2 single-worker mode (PLAN §"Coordinator
-# skill"). cap=1 serializes everything; cap > 1 enables worktree-mode
-# parallel dispatch (one git worktree per worker; v0.2.x).
-DEFAULT_CAP = 1
+# cap=1 serializes everything; cap > 1 enables worktree-mode parallel
+# dispatch (one git worktree per worker; v0.2.x). The default is 3 —
+# projects that want serialized dispatch set `parallelism: 1` in
+# coord-config.json.
+DEFAULT_CAP = 3
 # Filename under projects/<name>/ holding the per-project parallelism
 # config. Schema: {"parallelism": <int>}. Missing or unparseable file →
 # DEFAULT_CAP. Single tunable for now — v0.3 may grow more knobs.
@@ -322,7 +323,7 @@ def tick(
               coord's archive files only.
     cwd:      where to spawn workers (cap=1 mode). Defaults to current
               working directory.
-    cap:      max parallel in-progress workers. Default 1.
+    cap:      max parallel in-progress workers. Defaults to DEFAULT_CAP.
     fleet_home: override ~/.fleet for tests.
     fleet_bin:  override `fleet` binary path for tests.
     now_unix:   override time.time() for deterministic tests.
@@ -606,10 +607,10 @@ def tick(
     cwd = resolved_repo
     # Load per-project parallelism config (cap>1 → worktree mode).
     # Caller-provided cap overrides only when it differs from
-    # DEFAULT_CAP — that way tests can pin cap=2 explicitly while
+    # DEFAULT_CAP — that way a caller can pin cap explicitly while
     # production deployments rely on the on-disk config.
     if cap == DEFAULT_CAP:
-        configured = _load_parallelism(project_dir)
+        configured = _load_parallelism(project_dir, home)
         if configured > 0:
             cap = configured
     # RE-FENCE before the mutation phase (codex PR4 [P1]). The step-0.5 proof
@@ -3356,16 +3357,23 @@ def _load_coord_state(path: Path) -> dict:
     return {}
 
 
-def _load_parallelism(project_dir: Path) -> int:
-    """Read coord-config.json's `parallelism` field. Defaults to 0
-    (caller falls through to DEFAULT_CAP).
+def _load_parallelism(project_dir: Path, home: Path | None = None) -> int:
+    """Resolve `parallelism`: the project's coord-config.json wins, then
+    the operator-wide ~/.fleet/coord-config.json (written by `fleet
+    init`), else 0 (caller falls through to DEFAULT_CAP).
 
     Schema: `{"parallelism": <int>}`. Out-of-range values (<1 or >50)
     are clamped to the legal window — coord misconfig should never
     crash the tick. v0.2.x ships parallelism only; future fields will
     live alongside without breaking the loader.
     """
-    cfg_path = project_dir / COORD_CONFIG_FILE
+    configured = _parallelism_from_file(project_dir / COORD_CONFIG_FILE)
+    if configured > 0 or home is None:
+        return configured
+    return _parallelism_from_file(home / COORD_CONFIG_FILE)
+
+
+def _parallelism_from_file(cfg_path: Path) -> int:
     try:
         with open(cfg_path, "r", encoding="utf-8") as fh:
             data = json.load(fh)

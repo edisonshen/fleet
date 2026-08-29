@@ -48,7 +48,10 @@ loop._resolve_repo_fn = lambda project, *, home, fleet_bin="fleet", cwd=None: (c
 loop._lease_check_fn = lambda project, *, home, fleet_bin="fleet": "owner"
 loop._run_fleet = lambda cmd, timeout_s=30.0: None
 
-result = loop.tick(project, coord_id="", cwd=cwd, fleet_home=fleet_home)
+# cap=1: the log-lifecycle assertions only need one in-place dispatch, and
+# the driver's cwd is a plain temp dir — the default (worktree mode) would
+# need a real git checkout.
+result = loop.tick(project, coord_id="", cwd=cwd, fleet_home=fleet_home, cap=1)
 sys.stderr.write(
     f"dispatched={result.dispatched} skipped={result.skipped} "
     f"reason={result.reason}\n"
