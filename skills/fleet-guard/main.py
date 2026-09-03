@@ -1,11 +1,14 @@
 #!/usr/bin/env python3
 """fleet-guard hook entry point.
 
-Wired into ~/.claude/settings.json by `fleet init` for three hooks:
-Stop, PreCompact, SessionStart. Reads the JSON payload on stdin, dispatches
-to the right handler, prints any injection text to stdout, returns 0.
+Wired into ~/.claude/settings.json by `fleet init` for five hooks:
+Stop, PreCompact, SessionStart, UserPromptSubmit, PreToolUse. Reads the
+JSON payload on stdin, dispatches to the right handler, prints any
+injection text to stdout, returns 0.
 
 Failure contract (SKILL.md): the hook must never block the agent's turn.
+The one deliberate exception is PreToolUse in a coordinator session,
+where coordguard denies individual source-mutating tool calls.
 Every code path is wrapped in a try/except that logs to stderr and returns 0.
 A skill crash leaves the agent running with stale health data; the TUI
 polling fallback (1s) is the safety net.
@@ -25,6 +28,7 @@ _SKILL_DIR = os.path.dirname(os.path.abspath(__file__))
 if _SKILL_DIR not in sys.path:
     sys.path.insert(0, _SKILL_DIR)
 
+import coordguard  # noqa: E402
 import handoff  # noqa: E402
 import health   # noqa: E402
 import inbox    # noqa: E402
@@ -53,6 +57,11 @@ def main(stdin: TextIO | None = None) -> int:
     injections: list[str] = []
 
     try:
+        if hook_name == "PreToolUse":
+            out = coordguard.on_pre_tool_use(payload, agent_id)
+            if out is not None:
+                print(json.dumps(out))
+            return 0
         if hook_name == "Stop":
             _on_stop(payload, agent_id, session, injections)
         elif hook_name == "PreCompact":
@@ -150,6 +159,11 @@ def _on_stop(payload: dict, agent_id: str, session: str,
         # state of disk.
         if inbox.archive(agent_id):
             health.update_record(agent_id, inbox_pending=False)
+
+    if coordguard.is_coord_session():
+        nag = coordguard.stop_nag(agent_id)
+        if nag is not None:
+            injections.append(nag)
 
     handoff_inject = handoff.maybe_trigger(
         payload, agent_id=agent_id, session=session,
@@ -264,6 +278,10 @@ def _on_session_start(agent_id: str, injections: list[str]) -> None:
         needs_input=(len(injections) == 0),
         has_pending_question=False,
     )
+    # The role reminder is context, not work: appended after the
+    # needs_input settle so a coord with nothing queued still reads idle.
+    if coordguard.is_coord_session():
+        injections.insert(0, coordguard.ROLE_REMINDER)
 
 
 if __name__ == "__main__":

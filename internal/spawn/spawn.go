@@ -275,6 +275,15 @@ func coordRCArgv(execArgv []string, project, agentID string, isCoord bool) []str
 	return CoordRCInjector(project, agentID, execArgv)
 }
 
+// roleEnvValue is the FLEET_ROLE value stamped into an agent's env:
+// "coord" for coordinator spawns, "worker" for everything else.
+func roleEnvValue(isCoord bool) string {
+	if isCoord {
+		return "coord"
+	}
+	return "worker"
+}
+
 func coordRunSeparator(argv []string) int {
 	for i, arg := range argv {
 		if arg == "--" {
@@ -1017,6 +1026,12 @@ func Spawn(opts Options) (*agent.Record, error) {
 	if spawnProject != "" {
 		extraEnv = append(extraEnv, "FLEET_PROJECT="+spawnProject)
 	}
+	// FLEET_ROLE lets fleet-guard's PreToolUse hook tell a coordinator
+	// session apart from a worker without re-deriving isCoordSpawn from
+	// the agent record on every tool call. Agent-tool subagents inherit
+	// the coord's env, so the hook additionally keys on the payload's
+	// agent_id to exempt them.
+	extraEnv = append(extraEnv, "FLEET_ROLE="+roleEnvValue(spawnIsCoord))
 	// Propagate operator-set FLEET_* knobs. FLEET_ENGINE is a special
 	// case on the handoff branch: the replacement agent inherits
 	// OldRecord.Engine (set below), so its env must match the record
