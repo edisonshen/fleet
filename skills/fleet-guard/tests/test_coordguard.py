@@ -1,9 +1,9 @@
-"""Tests for skills/fleet-guard/coordguard.py — the coordinator delegation
-guard (PreToolUse deny + Stop nag).
+"""Coordinator delegation guard — user-scenario tests.
 
-Layout: one shared coord environment (fixture below) plus a fake repo tree;
-each test class is a single parametrized table where a row states only the
-condition that differs (tool/path/command/env) and the expected verdict.
+Everything goes through the real hook entrypoint (main.main with a
+PreToolUse / Stop / SessionStart payload), the way Claude Code drives it.
+Three scenarios: a coord that tries to implement, a coord doing its actual
+job, and sessions the guard must leave alone.
 """
 from __future__ import annotations
 
@@ -21,235 +21,138 @@ AGENT = "c0ffee01"
 
 @pytest.fixture(autouse=True)
 def home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
-    """Coord session env: FLEET_HOME under tmp, FLEET_ROLE=coord, guard on."""
+    """A live coord session: FLEET_HOME under tmp, FLEET_ROLE=coord, guard on,
+    agent record present, and a fake checkout with a docs/ symlink escape."""
     home = tmp_path / "fleet"
     monkeypatch.setenv("FLEET_HOME", str(home))
     monkeypatch.setenv("FLEET_AGENT_ID", AGENT)
     monkeypatch.setenv("FLEET_ROLE", "coord")
     monkeypatch.delenv("FLEET_COORD_GUARD", raising=False)
-    return home
-
-
-@pytest.fixture
-def repo(tmp_path: Path) -> Path:
-    """Fake checkout: repo/docs, repo/internal, repo/docs/src -> ../internal."""
+    (home / "agents").mkdir(parents=True)
+    (home / "agents" / f"{AGENT}.json").write_text(
+        json.dumps({"id": AGENT, "is_coord": True, "needs_input": False}))
     repo = tmp_path / "repo"
     (repo / "docs").mkdir(parents=True)
     (repo / "internal").mkdir()
     (repo / "docs" / "src").symlink_to(repo / "internal")
-    return repo
+    monkeypatch.chdir(repo)
+    return home
 
 
-def _payload(tool: str, **tool_input: object) -> dict:
-    return {"hook_event_name": "PreToolUse", "tool_name": tool, "tool_input": tool_input}
-
-
-def _write_record(home: Path, **fields: object) -> Path:
-    rec = home / "agents" / f"{AGENT}.json"
-    rec.parent.mkdir(parents=True, exist_ok=True)
-    rec.write_text(json.dumps({"id": AGENT, **fields}))
-    return rec
-
-
-def _run_hook(payload: dict, capsys: pytest.CaptureFixture[str]) -> str:
+def hook(event: str, tool: str = "", capsys=None, **tool_input: object) -> str:
+    """Run one hook event through main.py the way Claude Code does; return
+    stdout (PreToolUse/Stop emit JSON, SessionStart emits plain text)."""
+    payload: dict = {"hook_event_name": event}
+    if tool:
+        payload |= {"tool_name": tool, "tool_input": tool_input}
     assert fleet_main.main(io.StringIO(json.dumps(payload))) == 0
-    return capsys.readouterr().out
+    return capsys.readouterr().out.strip()
 
 
-# -- classify: edit tools ------------------------------------------------------
-# (tool, path template, denied). Templates may reference {repo} and {home}.
+def denied(out: str) -> bool:
+    return bool(out) and json.loads(out)["hookSpecificOutput"]["permissionDecision"] == "deny"
 
-EDIT_CASES = [
-    *[(t, "/repo/internal/spawn/spawn.go", True) for t in sorted(coordguard.EDIT_TOOLS)],
-    ("Write", "/repo/docs/DESIGN-x.md", False),
-    ("Edit", "docs/TASK-PLAN-y.md", False),
-    ("Write", "{home}/inbox/abc.md", False),
-    ("Read", "/repo/main.go", False),
-    # docs/ escapes: `..`, symlink out of docs, docs as leaf or filename prefix
-    ("Write", "/repo/docs/../main.go", True),
-    ("Write", "/repo/docs/./../internal/x.go", True),
-    ("Write", "docs/../cmd/fleet/main.go", True),
-    ("Write", "{repo}/docs/src/x.go", True),
-    ("Write", "/repo/docs", True),
-    ("Write", "/repo/docs.go", True),
-    ("Write", "/repo/internal/docs_test.go", True),
-    # a repo living under the system tmp dir is still source
-    ("Write", "{repo}/main.go", True),
+
+# -- Scenario 1: coord tries to do a worker's job --------------------------------
+
+IMPLEMENTATION_ATTEMPTS = [
+    ("Edit", {"file_path": "internal/spawn/spawn.go"}),
+    ("Write", {"file_path": "docs/../cmd/fleet/main.go"}),   # `..` out of docs
+    ("Write", {"file_path": "docs/src/x.go"}),               # symlink out of docs
+    ("Write", {"file_path": "internal/docs_test.go"}),       # "docs" only in filename
+    ("Bash", {"command": "go test -race ./..."}),
+    ("Bash", {"command": "cd repo && python3 -m pytest skills/ -q"}),
+    ("Bash", {"command": "git add -A && git commit -m fix && git push"}),
+    ("Bash", {"command": "git checkout -- internal/x.go"}),
+    ("Bash", {"command": "sed -i 's/a/b/' internal/x.go"}),
+    ("Bash", {"command": "gofmt -w ."}),
+    ("Bash", {"command": "echo a > docs/x.md; echo b > internal/x.go"}),
+    ("Bash", {"command": "sudo rm -rf internal/"}),
+    ("Bash", {"command": "env FOO=1 go test ./..."}),
+    ("Bash", {"command": "find . -name '*.go' | xargs rm"}),
+    ("Bash", {"command": "python3 -c 'open(\"x.go\",\"w\")'"}),
 ]
 
 
-class TestEditTools:
-    @pytest.mark.parametrize("tool,path,denied", EDIT_CASES)
-    def test_verdict(self, tool: str, path: str, denied: bool,
-                     repo: Path, home: Path) -> None:
-        path = path.format(repo=repo, home=home)
-        got = coordguard.classify(_payload(tool, file_path=path))
-        assert (got is not None) == denied, got
-        if denied:
-            assert Path(path).name in got
+def test_coord_implementing_is_denied_logged_and_nagged(home: Path, capsys) -> None:
+    for tool, tool_input in IMPLEMENTATION_ATTEMPTS:
+        out = hook("PreToolUse", tool, capsys, **tool_input)
+        assert denied(out), (tool, tool_input, out)
+        assert "fleet tasks add" in out
 
-    def test_grep_tool_allowed(self) -> None:
-        assert coordguard.classify(_payload("Grep", pattern="x")) is None
+    log = (home / "coord-violations" / f"{AGENT}.jsonl").read_text().splitlines()
+    assert len(log) == len(IMPLEMENTATION_ATTEMPTS)
+    assert all(json.loads(line)["denied"] for line in log)
 
-    def test_subagent_exempt(self) -> None:
-        payload = _payload("Edit", file_path="/repo/main.go")
-        payload["agent_id"] = "sub-123"
-        assert coordguard.classify(payload) is None
+    # Stop nags exactly once for the batch, then goes quiet.
+    n = len(IMPLEMENTATION_ATTEMPTS)
+    stop = json.loads(hook("Stop", capsys=capsys))
+    assert stop["decision"] == "block" and f"blocked {n} attempt(s)" in stop["reason"]
+    assert hook("Stop", capsys=capsys) == ""
 
 
-# -- classify: bash ------------------------------------------------------------
+def test_coord_denial_is_advisory_when_guard_off(home: Path, monkeypatch, capsys) -> None:
+    monkeypatch.setenv("FLEET_COORD_GUARD", "off")
+    assert hook("PreToolUse", "Edit", capsys, file_path="internal/x.go") == ""
+    assert coordguard.count_violations(AGENT) == 1  # still visible to the operator
 
-BASH_DENIED = [
-    "go test ./...",
-    "cd repo && go test -race ./internal/...",
-    "python3 -m pytest skills/ -q",
-    "pytest -q",
-    "npm test",
-    "git add -A && git commit -m 'x'",
-    "git push origin HEAD",
-    "git rebase main",
-    "git checkout -- internal/x.go",
-    "git checkout -b feature",
-    "git switch main",
-    "git clean -fd",
-    "git -C /repo commit -m x",
-    "sed -i 's/a/b/' internal/x.go",
-    "gofmt -w internal/x.go",
-    "gofmt -l -w .",
-    "goimports -w .",
-    "black skills/",
-    "ruff check --fix skills/",
-    "prettier --write src/",
-    "rm -rf internal/tmp",
-    "sudo rm -rf internal/",
-    "touch internal/new.go",
-    "find . -name '*.go' | xargs rm",
-    "cat body | tee cmd/x.go",
-    "echo hi > internal/x.go",
-    "cat a >> cmd/fleet/main.go",
-    "echo a > docs/x.md; echo b > internal/x.go",
-    "echo a > docs/x.md && echo b > docs/../main.go",
-    "python3 -c 'open(\"x.go\",\"w\").write(\"\")'",
-    "node -e 'require(\"fs\").writeFileSync(\"x.js\",\"\")'",
-    "env FOO=1 go test ./...",
-    "x=$(go test ./... 2>&1)",
-]
 
-BASH_ALLOWED = [
-    "fleet tasks list --project p",
-    "fleet tasks add --project p 'run go test in CI'",
-    "fleet tasks note --project p slug --section spec 'Task plan: docs/TASK-PLAN-slug.md'",
-    "fleet tasks note --project p slug --section spec 'worker: rm -rf build/ first'",
-    'fleet tasks note --project p slug --section spec "then: go test ./... > out.txt"',
-    "fleet rm c0ffee02",
-    "fleet checkpoint decision 'Stopped rebase of PR #224 — superseded'",
-    "fleet checkpoint decision 'worker ran `go test`; passed'",
-    "git status",
-    "git log --oneline -5",
-    "git log --grep=merge --oneline",
-    "git log --oneline -- internal/am",
-    "git diff main...HEAD --stat",
-    "git diff --stat main..add-feature",
-    "gh pr view 12 --json state",
-    "rg -n 'foo' internal/",
-    "rg -n 'go test' .",
-    "rg -n 'pytest|npm test' skills/",
-    "grep -rn 'git commit' docs/",
-    "go build ./... 2>&1 | head",
-    "go vet ./...",
-    "gofmt -l .",
-    "python3 x.py > /dev/null",
-    "python3 skills/coordinator/loop.py",
-    "pip install -q pytest",
-    "mkdir -p docs/plans",
-    "echo plan > docs/TASK-PLAN-slug.md",
-    "echo a > docs/x.md && echo b > docs/y.md",
-    "pandoc docs/DESIGN-x.md -o docs/DESIGN-x.html && open docs/DESIGN-x.html",
+# -- Scenario 2: coord doing its actual job -------------------------------------
+
+COORD_WORKFLOW = [
+    ("Read", {"file_path": "internal/spawn/spawn.go"}),
+    ("Grep", {"pattern": "go test"}),
+    ("Write", {"file_path": "docs/DESIGN-x.md"}),
+    ("Edit", {"file_path": "docs/TASK-PLAN-y.md"}),
+    ("Write", {"file_path": "{home}/inbox/abc.md"}),
+    ("Bash", {"command": "fleet tasks add --project p 'run go test in CI'"}),
+    ("Bash", {"command": "fleet tasks note --project p slug --section spec "
+                         "'worker: rm -rf build/ first, then go test > out.txt'"}),
+    ("Bash", {"command": "fleet rm c0ffee02"}),
+    ("Bash", {"command": "git status && git log --grep=merge --oneline -- internal/am"}),
+    ("Bash", {"command": "gh pr view 12 --json state"}),
+    ("Bash", {"command": "rg -n 'pytest|npm test' skills/"}),
+    ("Bash", {"command": "go build ./... 2>&1 | head"}),
+    ("Bash", {"command": "mkdir -p docs/plans && echo plan > docs/plans/x.md"}),
+    ("Bash", {"command": "python3 x.py > /dev/null"}),
 ]
 
 
-class TestBash:
-    @pytest.mark.parametrize("cmd,denied",
-                             [(c, True) for c in BASH_DENIED] + [(c, False) for c in BASH_ALLOWED])
-    def test_verdict(self, cmd: str, denied: bool) -> None:
-        got = coordguard.classify(_payload("Bash", command=cmd))
-        assert (got is not None) == denied, got
+def test_coord_planning_workflow_is_untouched(home: Path, capsys) -> None:
+    for tool, tool_input in COORD_WORKFLOW:
+        tool_input = {k: str(v).format(home=home) for k, v in tool_input.items()}
+        assert hook("PreToolUse", tool, capsys, **tool_input) == "", (tool, tool_input)
+    assert coordguard.count_violations(AGENT) == 0
+    assert hook("Stop", capsys=capsys) == ""
 
 
-# -- on_pre_tool_use gating: role x escape hatch --------------------------------
-# (env overrides, expect deny output, expect violation logged)
-
-GATING_CASES = [
-    pytest.param({}, True, True, id="coord"),
-    pytest.param({"FLEET_ROLE": "worker"}, False, False, id="worker"),
-    pytest.param({"FLEET_COORD_GUARD": "off"}, False, True, id="coord-guard-off"),
-    pytest.param({"FLEET_ROLE": None}, True, True, id="coord-via-record"),
-    pytest.param({"FLEET_ROLE": None, "_record_is_coord": False}, False, False,
-                 id="worker-via-record"),
-]
+def test_coord_resume_gets_role_reminder_and_stays_idle(home: Path, capsys) -> None:
+    assert "coordinator" in hook("SessionStart", capsys=capsys)
+    rec = json.loads((home / "agents" / f"{AGENT}.json").read_text())
+    assert rec["needs_input"] is True
 
 
-class TestGating:
-    @pytest.mark.parametrize("env,denies,logs", GATING_CASES)
-    def test_verdict(self, env: dict, denies: bool, logs: bool,
-                     home: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-        _write_record(home, is_coord=env.pop("_record_is_coord", True))
-        for k, v in env.items():
-            monkeypatch.delenv(k) if v is None else monkeypatch.setenv(k, v)
+# -- Scenario 3: sessions the guard must leave alone ----------------------------
 
-        out = coordguard.on_pre_tool_use(_payload("Edit", file_path="/r/a.go"), AGENT)
-
-        assert (out is not None) == denies
-        assert coordguard.count_violations(AGENT) == (1 if logs else 0)
-        if denies:
-            hso = out["hookSpecificOutput"]
-            assert hso["hookEventName"] == "PreToolUse"
-            assert hso["permissionDecision"] == "deny"
-            assert "fleet tasks add" in hso["permissionDecisionReason"]
-        if logs:
-            line = coordguard.violations_path(AGENT).read_text().splitlines()[0]
-            assert json.loads(line)["denied"] is denies
+@pytest.mark.parametrize("env", [
+    pytest.param({"FLEET_ROLE": "worker"}, id="worker"),
+    pytest.param({"FLEET_AGENT_ID": None, "FLEET_ROLE": None}, id="plain-claude"),
+])
+def test_non_coord_sessions_untouched(env: dict, monkeypatch, capsys) -> None:
+    for k, v in env.items():
+        monkeypatch.delenv(k) if v is None else monkeypatch.setenv(k, v)
+    assert hook("PreToolUse", "Edit", capsys, file_path="internal/x.go") == ""
+    assert hook("PreToolUse", "Bash", capsys, command="go test ./... && git push") == ""
+    assert hook("SessionStart", capsys=capsys) == ""
 
 
-# -- Stop nag ------------------------------------------------------------------
-
-class TestStopNag:
-    def test_nags_once_per_batch(self) -> None:
-        assert coordguard.stop_nag(AGENT) is None
-        coordguard.on_pre_tool_use(_payload("Edit", file_path="/r/a.go"), AGENT)
-        coordguard.on_pre_tool_use(_payload("Bash", command="go test ./..."), AGENT)
-        nag = coordguard.stop_nag(AGENT)
-        assert nag is not None and "blocked 2 attempt(s)" in nag
-        assert coordguard.stop_nag(AGENT) is None
+def test_agent_subagent_inside_coord_may_implement(capsys) -> None:
+    payload = {"hook_event_name": "PreToolUse", "agent_id": "sub-1",
+               "tool_name": "Edit", "tool_input": {"file_path": "internal/x.go"}}
+    assert fleet_main.main(io.StringIO(json.dumps(payload))) == 0
+    assert capsys.readouterr().out == ""
 
 
-# -- main.py wiring ------------------------------------------------------------
-
-class TestMainWiring:
-    @pytest.mark.parametrize("env,payload,denies", [
-        pytest.param({}, _payload("Write", file_path="/r/a.go"), True, id="coord-write"),
-        pytest.param({}, _payload("Read", file_path="/r/a.go"), False, id="coord-read"),
-        pytest.param({"FLEET_AGENT_ID": None}, _payload("Write", file_path="/r/a.go"), False,
-                     id="outside-fleet"),
-    ])
-    def test_pre_tool_use(self, env: dict, payload: dict, denies: bool,
-                          monkeypatch: pytest.MonkeyPatch,
-                          capsys: pytest.CaptureFixture[str]) -> None:
-        for k, v in env.items():
-            monkeypatch.delenv(k) if v is None else monkeypatch.setenv(k, v)
-        out = _run_hook(payload, capsys)
-        if denies:
-            assert json.loads(out)["hookSpecificOutput"]["permissionDecision"] == "deny"
-        else:
-            assert out == ""
-
-    @pytest.mark.parametrize("role,reminds", [("coord", True), ("worker", False)])
-    def test_session_start_role_reminder(self, role: str, reminds: bool, home: Path,
-                                         monkeypatch: pytest.MonkeyPatch,
-                                         capsys: pytest.CaptureFixture[str]) -> None:
-        monkeypatch.setenv("FLEET_ROLE", role)
-        rec = _write_record(home, needs_input=False)
-        out = _run_hook({"hook_event_name": "SessionStart"}, capsys)
-        assert ("coordinator" in out) == reminds
-        # the reminder is context, not a prompt: coord still settles to idle
-        assert json.loads(rec.read_text())["needs_input"] is True
+def test_role_falls_back_to_agent_record(monkeypatch, capsys) -> None:
+    monkeypatch.delenv("FLEET_ROLE")
+    assert denied(hook("PreToolUse", "Edit", capsys, file_path="internal/x.go"))
