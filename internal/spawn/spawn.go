@@ -212,6 +212,12 @@ var propagatedRuntimeEnv = []string{
 	// recover-to-legacy path would silently no-op (codex [P1]). Unset in
 	// production → no-op, so spawned coords stay single-shot by default.
 	"FLEET_COORD_IN_TURN_SUPERVISOR",
+	// FLEET_COORD_GUARD=off is the escape hatch for fleet-guard's PreToolUse
+	// delegation guard (coordguard.py). The hook reads it from the coord's
+	// process env, so it must ride the tmux -e flight or an existing tmux
+	// server would strip it and the documented off switch would silently
+	// stay enforced.
+	"FLEET_COORD_GUARD",
 }
 
 // leaseSupervisorAvailable gates whether Spawn can wrap a coord in the
@@ -273,6 +279,15 @@ func coordRCArgv(execArgv []string, project, agentID string, isCoord bool) []str
 		return append(out, rewrittenInner...)
 	}
 	return CoordRCInjector(project, agentID, execArgv)
+}
+
+// roleEnvValue is the FLEET_ROLE value stamped into an agent's env:
+// "coord" for coordinator spawns, "worker" for everything else.
+func roleEnvValue(isCoord bool) string {
+	if isCoord {
+		return "coord"
+	}
+	return "worker"
 }
 
 func coordRunSeparator(argv []string) int {
@@ -1017,6 +1032,12 @@ func Spawn(opts Options) (*agent.Record, error) {
 	if spawnProject != "" {
 		extraEnv = append(extraEnv, "FLEET_PROJECT="+spawnProject)
 	}
+	// FLEET_ROLE lets fleet-guard's PreToolUse hook tell a coordinator
+	// session apart from a worker without re-deriving isCoordSpawn from
+	// the agent record on every tool call. Agent-tool subagents inherit
+	// the coord's env, so the hook additionally keys on the payload's
+	// agent_id to exempt them.
+	extraEnv = append(extraEnv, "FLEET_ROLE="+roleEnvValue(spawnIsCoord))
 	// Propagate operator-set FLEET_* knobs. FLEET_ENGINE is a special
 	// case on the handoff branch: the replacement agent inherits
 	// OldRecord.Engine (set below), so its env must match the record

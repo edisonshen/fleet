@@ -19,6 +19,7 @@ Registration lives in `~/.claude/settings.json` and is written by `fleet init`. 
 | `PreCompact` | Just before context compaction | Emergency handoff: write doc + queue immediately, no MILESTONE wait |
 | `SessionStart` | Session begins (resume or fresh) | Deliver any pending operator inbox message |
 | `UserPromptSubmit` | Operator submits a prompt to the agent | Clear `needs_input` (agent transitions waiting → working) |
+| `PreToolUse` | Before every tool call | Coordinator delegation guard (`coordguard.py`): in a `FLEET_ROLE=coord` session, deny `Edit`/`Write`/`MultiEdit`/`NotebookEdit` outside `docs/`, and `Bash` that runs test suites, mutates git, or writes files. Agent-tool subagents (payload carries `agent_id`) are exempt. No-op for workers. |
 
 The original DESIGN.md referenced a `PostResponse` hook; that hook does not exist in Claude Code. `Stop` is the real binding and is what the spike validated (67 fires, 100% transcript availability, p95 18ms).
 
@@ -28,6 +29,8 @@ Set by `fleet dispatch` and inherited via `tmux new-session -e`:
 
 - `FLEET_AGENT_ID` — the 8-hex-char ID. Without it, the skill exits silently (the agent is not under Fleet supervision).
 - `FLEET_HOME` — defaults to `~/.fleet/`. Override for sandboxed tests and CI.
+- `FLEET_ROLE` — `coord` or `worker`, stamped by `fleet dispatch`. Enables the PreToolUse delegation guard and the coord role reminder on `SessionStart`. Falls back to the agent record's `is_coord` when unset.
+- `FLEET_COORD_GUARD=off` — escape hatch: log coord violations to `~/.fleet/coord-violations/<id>.jsonl` but do not deny.
 
 ## Required tools
 

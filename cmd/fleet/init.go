@@ -27,7 +27,9 @@ import (
 // SKILL.md's Hook bindings table. UserPromptSubmit was added alongside
 // the needs_input flag so the TUI can surface "waiting on operator" —
 // without that hook the flag would set true on Stop and never clear.
-var hookEvents = []string{"Stop", "PreCompact", "SessionStart", "UserPromptSubmit"}
+// PreToolUse is the coordinator delegation guard: it denies source
+// edits / mutating shell commands in a FLEET_ROLE=coord session.
+var hookEvents = []string{"Stop", "PreCompact", "SessionStart", "UserPromptSubmit", "PreToolUse"}
 
 // parallelismDefault mirrors skills/coordinator/loop.py::DEFAULT_CAP —
 // what a coord runs when nothing is configured. Used here only as the
