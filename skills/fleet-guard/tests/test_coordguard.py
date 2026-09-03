@@ -46,6 +46,29 @@ class TestEditTools:
         p = coord_env / "inbox" / "abc.md"
         assert coordguard.classify(_payload("Write", file_path=str(p))) is None
 
+    @pytest.mark.parametrize("path", [
+        "/repo/docs/../main.go",
+        "/repo/docs/./../internal/x.go",
+        "docs/../cmd/fleet/main.go",
+        "/repo/docs",  # the dir itself is not a doc file
+        "/repo/docs.go",
+        "/repo/internal/docs_test.go",
+    ])
+    def test_docs_escape_denied(self, path: str) -> None:
+        assert coordguard.classify(_payload("Write", file_path=path)) is not None
+
+    def test_docs_symlink_escape_denied(self, tmp_path: Path) -> None:
+        repo = tmp_path / "repo"
+        (repo / "docs").mkdir(parents=True)
+        (repo / "internal").mkdir()
+        (repo / "docs" / "src").symlink_to(repo / "internal")
+        target = repo / "docs" / "src" / "x.go"
+        assert coordguard.classify(_payload("Write", file_path=str(target))) is not None
+
+    def test_repo_under_tmp_still_guarded(self, tmp_path: Path) -> None:
+        assert coordguard.classify(
+            _payload("Write", file_path=str(tmp_path / "repo" / "main.go"))) is not None
+
     def test_subagent_exempt(self) -> None:
         payload = _payload("Edit", file_path="/repo/main.go")
         payload["agent_id"] = "sub-123"
@@ -73,6 +96,26 @@ class TestBash:
         "echo hi > internal/x.go",
         "cat a >> cmd/fleet/main.go",
         "cat body | tee cmd/x.go",
+        "gofmt -w internal/x.go",
+        "gofmt -l -w .",
+        "goimports -w .",
+        "black skills/",
+        "ruff check --fix skills/",
+        "prettier --write src/",
+        "touch internal/new.go",
+        "git checkout -- internal/x.go",
+        "git checkout -b feature",
+        "git switch main",
+        "git clean -fd",
+        "git -C /repo commit -m x",
+        "python3 -c 'open(\"x.go\",\"w\").write(\"\")'",
+        "node -e 'require(\"fs\").writeFileSync(\"x.js\",\"\")'",
+        "echo a > docs/x.md; echo b > internal/x.go",
+        "echo a > docs/x.md && echo b > docs/../main.go",
+        "sudo rm -rf internal/",
+        "env FOO=1 go test ./...",
+        "x=$(go test ./... 2>&1)",
+        "find . -name '*.go' | xargs rm",
     ])
     def test_denied(self, cmd: str) -> None:
         assert coordguard.classify(_payload("Bash", command=cmd)) is not None
@@ -91,7 +134,22 @@ class TestBash:
         "python3 x.py > /dev/null",
         "pandoc docs/DESIGN-x.md -o docs/DESIGN-x.html && open docs/DESIGN-x.html",
         "echo plan > docs/TASK-PLAN-slug.md",
-        "ls > /tmp/listing.txt",
+        "echo a > docs/x.md && echo b > docs/y.md",
+        "rg -n 'go test' .",
+        "rg -n 'pytest|npm test' skills/",
+        "grep -rn 'git commit' docs/",
+        'fleet tasks note --project p slug --section spec "then: go test ./... > out.txt"',
+        "fleet checkpoint decision 'worker ran `go test`; passed'",
+        "fleet tasks add --project p 'run go test in CI'",
+        "fleet tasks note --project p slug --section spec 'worker: rm -rf build/ first'",
+        "git log --grep=merge --oneline",
+        "git log --oneline -- internal/am",
+        "git diff --stat main..add-feature",
+        "gofmt -l .",
+        "go vet ./...",
+        "mkdir -p docs/plans",
+        "pip install -q pytest",
+        "python3 skills/coordinator/loop.py",
     ])
     def test_allowed(self, cmd: str) -> None:
         assert coordguard.classify(_payload("Bash", command=cmd)) is None

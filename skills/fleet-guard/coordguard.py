@@ -29,7 +29,6 @@ import json
 import os
 import re
 import sys
-import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -39,20 +38,43 @@ EDIT_TOOLS = frozenset({"Edit", "Write", "MultiEdit", "NotebookEdit"})
 
 DOCS_DIR_NAMES = frozenset({"docs", "doc"})
 
-# Bash patterns a coordinator has no business running. Anchored on word
-# boundaries so `go test` matches but `go-testing-helper` does not. File
-# writers are matched only in command position (start of line / after
-# `;`, `&&`, `|`, `$(`) so `fleet rm <agent>` is not mistaken for `rm`.
-_CMD_POS = r"(?:^|[;&|(]\s*|\n\s*)(?:sudo\s+)?"
+# Bash patterns a coordinator has no business running. Every pattern is
+# matched only in command position (start of line / after `;`, `&&`, `|`,
+# `$(`, backtick, optional `sudo`/`env`/`time`), so `fleet rm <agent>` is
+# not mistaken for `rm` and `rg -n 'go test' .` is not mistaken for a test
+# run. Word-bounded so `go test` matches but `go-testing-helper` does not.
+_CMD_POS = (r"(?:^|[;&|(`]\s*|\n\s*)"
+            r"(?:(?:sudo|env|time|nice|xargs)(?:\s+-\S+)*\s+)*(?:\w+=\S*\s+)*")
+
+# Shell metacharacters inside a quoted string are data, not structure:
+# `rg -n 'pytest|npm test'` must not put `npm test` in command position.
+_QUOTED = re.compile(r"'[^']*'|\"(?:\\.|[^\"\\])*\"")
+_META_IN_QUOTES = re.compile(r"[;&|()`<>\n]")
+
+
+def _neutralize_quotes(command: str) -> str:
+    return _QUOTED.sub(lambda m: _META_IN_QUOTES.sub(" ", m.group(0)), command)
+
+
 _BASH_DENY: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("test runner", re.compile(
-        r"\b(go\s+test|pytest|python3?\s+-m\s+pytest|npm\s+(run\s+)?test|"
-        r"yarn\s+test|pnpm\s+test|cargo\s+test|make\s+test|bun\s+test)\b")),
+        _CMD_POS + r"(go\s+test|pytest|python3?\s+-m\s+(pytest|unittest)|"
+        r"npm\s+(run\s+)?test|yarn\s+test|pnpm\s+test|cargo\s+test|"
+        r"make\s+(test|check)|bun\s+test)\b")),
     ("git mutation", re.compile(
-        _CMD_POS + r"git\b[^|;&\n]*\b(add|commit|push|rebase|merge|cherry-pick|"
-        r"stash|reset|restore|revert|apply|am|rm|mv)\b")),
+        _CMD_POS + r"git\s+(?:-[cC]\s+\S+\s+|--\S+\s+)*(add|commit|push|rebase|merge|cherry-pick|"
+        r"stash|reset|restore|revert|apply|am|rm|mv|checkout|switch|clean|"
+        r"worktree|filter-branch|update-ref|symbolic-ref)\b")),
     ("in-place edit", re.compile(_CMD_POS + r"(sed|perl)\s+(-[a-zA-Z]*i|--in-place)")),
-    ("file write", re.compile(_CMD_POS + r"(tee|patch|rm|mv|cp|truncate)\s")),
+    ("formatter write", re.compile(
+        _CMD_POS + r"(gofmt|goimports|gofumpt)\s+[^|;&\n]*-[wl]*w\b|"
+        + _CMD_POS + r"(black|isort|ruff\s+format|ruff\s+check[^|;&\n]*--fix|"
+        r"prettier[^|;&\n]*--write|eslint[^|;&\n]*--fix|cargo\s+fmt|rustfmt)\b")),
+    ("file write", re.compile(
+        _CMD_POS + r"(tee|patch|rm|mv|cp|truncate|touch|install|ln|rmdir|"
+        r"dd|rsync|chmod|chown|unzip|tar)(?:\s|$)")),
+    ("scripted write", re.compile(
+        _CMD_POS + r"(python3?|node|ruby|perl)\s+-[ec]\s")),
 )
 
 # `>` redirect that targets a real file (not /dev/null, not fd dup).
@@ -96,32 +118,35 @@ def violations_path(agent_id: str) -> Path:
 
 
 def _scratch_roots() -> list[Path]:
-    roots = [health.fleet_home(), Path(tempfile.gettempdir())]
-    return [r.resolve() for r in roots]
+    return [health.fleet_home().resolve()]
 
 
 def _is_docs_path(raw: str) -> bool:
-    """True for paths a coord may write: anything under a docs/ folder,
-    FLEET_HOME, or the system temp dir."""
+    """True for paths a coord may write: anything under a docs/ folder or
+    under FLEET_HOME. Judged on the fully resolved path (symlinks followed,
+    `..` collapsed), so `docs/../main.go` or a `docs/link -> ../src` escape
+    is still a source write. The docs check requires a real directory
+    component, not just a filename prefix."""
     if not raw:
         return False
     p = Path(raw).expanduser()
     try:
         resolved = p.resolve()
-        if any(resolved.is_relative_to(root) for root in _scratch_roots()):
-            return True
     except Exception:
-        pass
-    return any(part in DOCS_DIR_NAMES for part in p.parts)
+        resolved = Path(os.path.normpath(str(p)))
+    if any(resolved.is_relative_to(root) for root in _scratch_roots()):
+        return True
+    return any(part in DOCS_DIR_NAMES for part in resolved.parts[:-1])
 
 
 def _bash_offense(command: str) -> str | None:
+    command = _neutralize_quotes(command)
     for label, pat in _BASH_DENY:
         if pat.search(command):
             return label
-    m = _REDIRECT.search(command)
-    if m and not _is_docs_path(m.group(1)):
-        return "file write (redirect)"
+    for m in _REDIRECT.finditer(command):
+        if not _is_docs_path(m.group(1)):
+            return "file write (redirect)"
     return None
 
 

@@ -212,6 +212,12 @@ var propagatedRuntimeEnv = []string{
 	// recover-to-legacy path would silently no-op (codex [P1]). Unset in
 	// production → no-op, so spawned coords stay single-shot by default.
 	"FLEET_COORD_IN_TURN_SUPERVISOR",
+	// FLEET_COORD_GUARD=off is the escape hatch for fleet-guard's PreToolUse
+	// delegation guard (coordguard.py). The hook reads it from the coord's
+	// process env, so it must ride the tmux -e flight or an existing tmux
+	// server would strip it and the documented off switch would silently
+	// stay enforced.
+	"FLEET_COORD_GUARD",
 }
 
 // leaseSupervisorAvailable gates whether Spawn can wrap a coord in the
