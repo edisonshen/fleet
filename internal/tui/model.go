@@ -2391,7 +2391,8 @@ func groupKeyFor(r *agent.Record, cache map[string]string) string {
 func renderAlertBanner(records []*agent.Record, alive map[string]bool) string {
 	var blocked, asking, idle, review, hot, dead int
 	for _, r := range records {
-		switch deriveStatus(r, alive) {
+		status := deriveStatus(r, alive)
+		switch status {
 		case "blocked":
 			blocked++
 		case "asking":
@@ -2403,7 +2404,7 @@ func renderAlertBanner(records []*agent.Record, alive map[string]bool) string {
 		case "dead":
 			dead++
 		}
-		if r.ContextPct != nil && *r.ContextPct >= contextRedThreshold {
+		if status != "dead" && r.ContextPct != nil && *r.ContextPct >= contextRedThreshold {
 			hot++
 		}
 	}
