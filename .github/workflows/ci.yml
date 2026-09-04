@@ -31,7 +31,7 @@ jobs:
     # package's full default suite):
     #   - default `go test -race ./...`     : 5m
     #   - integration internal/spawn        : 5m  (2 scoped tests)
-    #   - integration cmd/fleet             : 5m  (13 scoped tests)
+    #   - integration cmd/fleet             : 5m  (15 scoped tests)
     #   - integration internal/tui          : 5m  (3 scoped tests)
     #   (internal/handoffop has no integration-only tests → no step)
     # Worst-case sum if every step burns its full timeout = 20m, plus the
@@ -157,7 +157,7 @@ jobs:
       - name: Integration lane — cmd/fleet
         run: >-
           FLEET_STANDBY_TIMEOUT=3s go test -tags=integration -count=1 -timeout=5m
-          -run '^(TestCoordLeaderCheck|TestCoordRun_Lease_Integration_RealFlockHeldThenReleased|TestCoordRun_Lease_Integration_StandDownArchivesRecord|TestDeliverHandoffResumePrompt_NoLeaseOwner_FallsBackToDirectSend|TestHandoff_GracefulRoute_SwapsViaBarrier|TestHandoff_GracefulRouteError_PreservesQueueAndOld|TestHandoff_LeaseFailoverCoordHandoffFinalizesDeliveredLockOwner|TestHandoff_LeaseFailoverCoordHandoffRefusesBeforeRetiringOld|TestRunDispatch_DeadCoordRecovery_AdvertisesLockWinner|TestE2E_DeadCoordRecovery_ReplacementInheritsAndReapsPredecessor|TestE2E_DeadCoordRecovery_ReplacementDiesAtStartup_NextAttemptRecovers|TestE2E_DeadCoordRecovery_LiveCoordIsNeverDuplicated|TestE2E_DeadCoordRecovery_BareLegacyRecordIsKept)$'
+          -run '^(TestCoordLeaderCheck|TestCoordRun_Lease_Integration_RealFlockHeldThenReleased|TestCoordRun_Lease_Integration_StandDownArchivesRecord|TestDeliverHandoffResumePrompt_NoLeaseOwner_FallsBackToDirectSend|TestHandoff_GracefulRoute_SwapsViaBarrier|TestHandoff_GracefulRouteError_PreservesQueueAndOld|TestHandoff_LeaseFailoverCoordHandoffFinalizesDeliveredLockOwner|TestHandoff_LeaseFailoverCoordHandoffRefusesBeforeRetiringOld|TestHandoffResumeNudger_Integration_EnterSwallowed_TypesPromptOnce|TestHandoffResumeNudger_Integration_BusyPane_TypesNothingUntilSettled|TestRunDispatch_DeadCoordRecovery_AdvertisesLockWinner|TestE2E_DeadCoordRecovery_ReplacementInheritsAndReapsPredecessor|TestE2E_DeadCoordRecovery_ReplacementDiesAtStartup_NextAttemptRecovers|TestE2E_DeadCoordRecovery_LiveCoordIsNeverDuplicated|TestE2E_DeadCoordRecovery_BareLegacyRecordIsKept)$'
           ./cmd/fleet
 
       - name: Integration lane — internal/tui

@@ -161,12 +161,13 @@ type coordRunOpts struct {
 	handoffResumeReadMarker      func(string) (string, error)
 	handoffResumeWaitReady       func(string) error
 	handoffResumeSendVerified    func(string, string) (bool, error)
+	handoffResumePromptPending   func(string, string) bool
+	handoffResumeResubmit        func(string, string) (bool, error)
 	handoffResumeInitialDelay    time.Duration
 	handoffResumeInitialDelayC   <-chan time.Time
 	handoffResumeRecheckInterval time.Duration
 	handoffResumeWakeC           <-chan time.Time
 	handoffResumeMaxAttempts     int
-	handoffResumeTransportTries  int
 }
 
 // coordLease is the minimal lease surface runCoordRun needs. The real
@@ -214,7 +215,6 @@ var errStandbyTimedOut = errors.New("coord-run: standby timed out")
 
 const (
 	defaultHandoffResumeMaxAttempts       = 4
-	defaultHandoffResumeTransportTries    = 3
 	defaultHandoffResumeInitialDelay      = 5 * time.Second
 	defaultHandoffResumeRecheckInterval   = 30 * time.Second
 	resumedHandoffPathCoordStateKey       = "resumed_handoff_path"
@@ -581,19 +581,24 @@ func runCoordRun(ctx context.Context, opts coordRunOpts, stdout, stderr io.Write
 }
 
 type handoffResumeNudgeConfig struct {
-	agentID        string
-	project        string
-	session        string
-	loadAgent      func(string) (*agent.Record, error)
-	readMarker     func(string) (string, error)
-	waitReady      func(string) error
-	sendVerified   func(string, string) (bool, error)
-	initialDelayC  <-chan time.Time
-	wakeC          <-chan time.Time
-	maxAttempts    int
-	transportTries int
-	stderr         io.Writer
+	agentID       string
+	project       string
+	session       string
+	loadAgent     func(string) (*agent.Record, error)
+	readMarker    func(string) (string, error)
+	waitReady     func(string) error
+	sendVerified  func(string, string) (bool, error)
+	promptPending func(string, string) bool
+	resubmit      func(string, string) (bool, error)
+	initialDelayC <-chan time.Time
+	wakeC         <-chan time.Time
+	maxAttempts   int
+	stderr        io.Writer
 }
+
+// errHandoffResumeChildBusy: the child's pane never settled inside the
+// readiness window, so nothing was typed. Not counted as an attempt.
+var errHandoffResumeChildBusy = errors.New("child pane not ready for input")
 
 func startHandoffResumeNudger(parent context.Context, opts coordRunOpts, stderr io.Writer) func() {
 	interval := opts.handoffResumeRecheckInterval
@@ -633,13 +638,17 @@ func startHandoffResumeNudger(parent context.Context, opts coordRunOpts, stderr 
 	if sendVerified == nil {
 		sendVerified = spawnSendPromptKeysVerified
 	}
+	promptPending := opts.handoffResumePromptPending
+	if promptPending == nil {
+		promptPending = spawnPromptPendingInInputBox
+	}
+	resubmit := opts.handoffResumeResubmit
+	if resubmit == nil {
+		resubmit = spawnResubmitPendingPrompt
+	}
 	maxAttempts := opts.handoffResumeMaxAttempts
 	if maxAttempts <= 0 {
 		maxAttempts = defaultHandoffResumeMaxAttempts
-	}
-	transportTries := opts.handoffResumeTransportTries
-	if transportTries <= 0 {
-		transportTries = defaultHandoffResumeTransportTries
 	}
 
 	ctx, cancel := context.WithCancel(parent)
@@ -647,18 +656,19 @@ func startHandoffResumeNudger(parent context.Context, opts coordRunOpts, stderr 
 	go func() {
 		defer close(done)
 		runHandoffResumeNudgeLoop(ctx, handoffResumeNudgeConfig{
-			agentID:        opts.agentID,
-			project:        opts.project,
-			session:        opts.session,
-			loadAgent:      loadAgent,
-			readMarker:     readMarker,
-			waitReady:      waitReady,
-			sendVerified:   sendVerified,
-			initialDelayC:  initialDelayC,
-			wakeC:          wakeC,
-			maxAttempts:    maxAttempts,
-			transportTries: transportTries,
-			stderr:         stderr,
+			agentID:       opts.agentID,
+			project:       opts.project,
+			session:       opts.session,
+			loadAgent:     loadAgent,
+			readMarker:    readMarker,
+			waitReady:     waitReady,
+			sendVerified:  sendVerified,
+			promptPending: promptPending,
+			resubmit:      resubmit,
+			initialDelayC: initialDelayC,
+			wakeC:         wakeC,
+			maxAttempts:   maxAttempts,
+			stderr:        stderr,
 		})
 	}()
 	return func() {
@@ -679,8 +689,10 @@ func startHandoffResumeNudger(parent context.Context, opts coordRunOpts, stderr 
 }
 
 var (
-	spawnWaitForReadyToPrompt   = spawn.WaitForReadyToPrompt
-	spawnSendPromptKeysVerified = spawn.SendPromptKeysVerified
+	spawnWaitForReadyToPrompt    = spawn.WaitForReadyToPrompt
+	spawnSendPromptKeysVerified  = spawn.SendPromptKeysVerified
+	spawnPromptPendingInInputBox = spawn.PromptPendingInInputBox
+	spawnResubmitPendingPrompt   = spawn.ResubmitPendingPrompt
 )
 
 func runHandoffResumeNudgeLoop(ctx context.Context, cfg handoffResumeNudgeConfig) {
@@ -701,18 +713,24 @@ func runHandoffResumeNudgeLoop(ctx context.Context, cfg handoffResumeNudgeConfig
 			emitHandoffResumeDiagnostic(cfg, rec, path, attempts)
 			return
 		}
-		attempts++
-		if err := sendHandoffResumeNudge(cfg, rec, path); err != nil && cfg.stderr != nil {
-			_, _ = fmt.Fprintf(cfg.stderr,
-				"coord-run: warning: resume nudge %d/%d for handoff %s to %s failed: %v\n",
-				attempts, cfg.maxAttempts, path, rec.ID, err)
-		}
-		if marker, err := cfg.readMarker(cfg.project); err == nil && marker == path {
-			return
-		}
-		if attempts >= cfg.maxAttempts {
-			emitHandoffResumeDiagnostic(cfg, rec, path, attempts)
-			return
+		err := sendHandoffResumeNudge(cfg, rec, path)
+		if !errors.Is(err, errHandoffResumeChildBusy) {
+			// A busy child (pane still changing, e.g. mid-turn on the handoff
+			// doc) is not a failed delivery; wait for the next wake and re-check
+			// the marker instead of burning the bounded attempt budget.
+			attempts++
+			if err != nil && cfg.stderr != nil {
+				_, _ = fmt.Fprintf(cfg.stderr,
+					"coord-run: warning: resume nudge %d/%d for handoff %s to %s failed: %v\n",
+					attempts, cfg.maxAttempts, path, rec.ID, err)
+			}
+			if marker, err := cfg.readMarker(cfg.project); err == nil && marker == path {
+				return
+			}
+			if attempts >= cfg.maxAttempts {
+				emitHandoffResumeDiagnostic(cfg, rec, path, attempts)
+				return
+			}
 		}
 		select {
 		case <-ctx.Done():
@@ -768,36 +786,36 @@ func sendHandoffResumeNudge(cfg handoffResumeNudgeConfig, rec *agent.Record, doc
 	// three copies of one handoff). The coord already has the path and can read
 	// the doc on demand.
 	prompt := handoff.ResumePrompt(docPath)
-	var lastErr error
-	for i := 0; i < cfg.transportTries; i++ {
-		readyErr := cfg.waitReady(session)
-		submitted, err := cfg.sendVerified(session, prompt)
+
+	// One nudge types the prompt AT MOST once. The input box is a buffer:
+	// text that was typed but whose Enter was swallowed stays there, and
+	// typing again appends a second copy (operator observed the directive
+	// three times in a single message). So:
+	//
+	//   pane not settled  -> type nothing, report busy (retry on next wake)
+	//   prompt in box     -> Enter only
+	//   box clear         -> type prompt + Enter
+	if err := cfg.waitReady(session); err != nil {
+		return fmt.Errorf("%w: %s: %v", errHandoffResumeChildBusy, session, err)
+	}
+	if cfg.promptPending(session, prompt) {
+		submitted, err := cfg.resubmit(session, prompt)
 		if err != nil {
-			lastErr = fmt.Errorf("send verified prompt to %s: %w", session, err)
-			if readyErr != nil {
-				lastErr = fmt.Errorf("readiness did not converge for %s: %w; %v",
-					session, readyErr, lastErr)
-			}
-			continue
+			return fmt.Errorf("resubmit pending prompt in %s: %w", session, err)
 		}
 		if !submitted {
-			lastErr = fmt.Errorf("prompt remained unsubmitted in %s", session)
-			if readyErr != nil {
-				lastErr = fmt.Errorf("readiness did not converge for %s: %w; %v",
-					session, readyErr, lastErr)
-			}
-			continue
-		}
-		if readyErr != nil {
-			lastErr = fmt.Errorf("readiness did not converge for %s: %w", session, readyErr)
-			continue
+			return fmt.Errorf("pending prompt remained unsubmitted in %s", session)
 		}
 		return nil
 	}
-	if lastErr == nil {
-		lastErr = errors.New("transport attempts exhausted")
+	submitted, err := cfg.sendVerified(session, prompt)
+	if err != nil {
+		return fmt.Errorf("send verified prompt to %s: %w", session, err)
 	}
-	return lastErr
+	if !submitted {
+		return fmt.Errorf("prompt remained unsubmitted in %s", session)
+	}
+	return nil
 }
 
 func emitHandoffResumeDiagnostic(cfg handoffResumeNudgeConfig, rec *agent.Record, docPath string, attempts int) {

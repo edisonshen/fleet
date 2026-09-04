@@ -22,6 +22,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/edisonshen/fleet/internal/agent"
 	"github.com/edisonshen/fleet/internal/fleetlog"
@@ -564,6 +565,39 @@ func SendPromptKeysVerified(session, prompt string) (submitted bool, err error) 
 	return verifyAndRetry(session, prompt), nil
 }
 
+// PromptPendingInInputBox reports whether prompt is still sitting,
+// unsubmitted, in the bottom band of the session's pane (i.e. a prior
+// send typed it but Enter never registered). Callers that would
+// otherwise re-send the whole prompt use this to fall back to
+// ResubmitPendingPrompt so the input box never accumulates a second
+// copy of the same text.
+//
+// Capture errors report false (nothing known to be pending).
+func PromptPendingInInputBox(session, prompt string) bool {
+	if prompt == "" {
+		return false
+	}
+	pane, err := tmux.CapturePane(session)
+	if err != nil {
+		return false
+	}
+	return promptInTail(pane, prompt)
+}
+
+// ResubmitPendingPrompt presses Enter for a prompt that is already
+// typed into the session's input box (see PromptPendingInInputBox)
+// and runs the same verify + one-shot-retry as SendPromptKeysVerified.
+// It never re-types the prompt text.
+func ResubmitPendingPrompt(session, prompt string) (submitted bool, err error) {
+	if prompt == "" {
+		return true, nil
+	}
+	if err := tmux.SendKeys(session, "Enter"); err != nil {
+		return false, err
+	}
+	return verifyAndRetry(session, prompt), nil
+}
+
 // verifyAndRetry runs the post-send verification + one-shot retry
 // using the production tmux send-keys / capture-pane primitives. See
 // verifyAndRetryWithDeps for the testable inner core.
@@ -648,8 +682,30 @@ func promptSubmittedWithDeps(
 	if err != nil {
 		return true
 	}
-	tail := tailLines(pane, unsubmittedTailLines)
-	return !bytes.Contains(tail, []byte(prompt))
+	return !promptInTail(pane, prompt)
+}
+
+// promptInTail reports whether prompt appears in the bottom
+// unsubmittedTailLines lines of pane. The comparison ignores all
+// whitespace: the input box soft-wraps long prompts at the pane width
+// and indents continuation lines, so a byte-exact substring match
+// fails for any prompt longer than one terminal row.
+func promptInTail(pane []byte, prompt string) bool {
+	tail := stripSpace(tailLines(pane, unsubmittedTailLines))
+	needle := stripSpace([]byte(prompt))
+	if len(needle) == 0 {
+		return false
+	}
+	return bytes.Contains(tail, needle)
+}
+
+func stripSpace(b []byte) []byte {
+	return bytes.Map(func(r rune) rune {
+		if unicode.IsSpace(r) {
+			return -1
+		}
+		return r
+	}, b)
 }
 
 // tailLines returns the last n lines of buf. n <= 0 returns buf
