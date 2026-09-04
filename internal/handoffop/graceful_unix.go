@@ -358,7 +358,7 @@ var (
 )
 
 // GracefulCoordSwap is the production composition the live-coord handoff
-// paths (manual `fleet handoff`, drain-of-live, auto 50/70% — via
+// paths (manual `fleet handoff`, drain-of-live, auto 40/50% — via
 // cmd/fleet/handoff.go and retireOldAgent) route through, retiring the
 // bespoke "AtomicCoordSwap then separately deliver" sequence PR2 added:
 //

@@ -186,7 +186,7 @@ THINKING_MODES = frozenset({"plan", "review", "fix"})
 
 # Stuck-pending watchdog: re-inject HANDOFF REQUESTED if Yellow has
 # lingered for this long without a MILESTONE. Without re-injection the
-# agent stays wedged at auto-yellow until Red fires at 70% or operator
+# agent stays wedged at auto-yellow until Red fires at 50% or operator
 # presses [h] — observed in dogfood as "agent at 53% for >1 day, no
 # handoff action, 'hello' didn't wake it." The most common root cause
 # is a lost prior injection (pre-v0.1.1 stdout-only Stop-hook output);
@@ -207,7 +207,7 @@ def inject_handoff_requested() -> str:
     and writes the handoff doc.
     """
     return (
-        f"{HANDOFF_REQUESTED}: context window is over 50%. "
+        f"{HANDOFF_REQUESTED}: context window is over 40%. "
         f"Wrap up the current sub-task at the next safe boundary, "
         f"then on its own line write a single token:\n\n"
         f"{MILESTONE}\n\n"
@@ -271,7 +271,7 @@ def find_milestone(session: str) -> bool:
     HANDOFF REQUESTED handling"), and anchoring there would admit
     pre-cycle MILESTONE lines. A historical quote of the FULL injected
     phrase can still false-anchor — accepted residual; the blast radius
-    is a premature-but-valid handoff, and Red at 70% remains the
+    is a premature-but-valid handoff, and Red at 50% remains the
     safety net.
 
     Match tolerates a leading turn-glyph / bullet prefix
@@ -289,7 +289,7 @@ def find_milestone(session: str) -> bool:
     the HANDOFF REQUESTED injection and finally emitting MILESTONE —
     still finds both markers. Without scrollback the visible 50-line
     pane window outruns busy agents and find_milestone returns False
-    forever, leaving the handoff stuck in auto-yellow until 70% / Red.
+    forever, leaving the handoff stuck in auto-yellow until 50% / Red.
     """
     out = _capture_pane(session, lines=10000)
     if not out:
@@ -317,7 +317,7 @@ def find_milestone(session: str) -> bool:
         # in maybe_trigger would have called this only when the record
         # already had handoff_type=auto-yellow set, so the injection
         # DID fire on a prior turn; if it scrolled off, the agent
-        # eventually crosses 70% and emergency triggers via Red.
+        # eventually crosses 50% and emergency triggers via Red.
         return False
     for line in lines[first_request + 1:]:
         if _MILESTONE_LINE_RE.match(line):
@@ -437,7 +437,7 @@ def maybe_trigger(payload: dict[str, Any], *, agent_id: str,
             # Bail only if the doc + queue already exist (drain owns it
             # now). auto-yellow is NOT committed: Yellow injected
             # HANDOFF REQUESTED but the agent ignored/missed MILESTONE
-            # and is now over 70%. Red is the documented safety net —
+            # and is now over 50%. Red is the documented safety net —
             # write the emergency auto-red handoff and overwrite the
             # auto-yellow mark.
             if committed:

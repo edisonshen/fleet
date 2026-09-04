@@ -6,6 +6,13 @@ follows [SemVer](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed
+
+- fleet-guard auto-handoff thresholds tightened from 50% (Yellow) / 70% (Red)
+  to **40% (Yellow, graceful `HANDOFF REQUESTED` + `MILESTONE`) / 50% (Red,
+  hard forced handoff)**. The TUI context chip, hot-count pills, and alert
+  banner use the same 40/50 zones.
+
 ## [0.16.2] - 2026-08-29
 
 Dispatch stops breaking on big repos. `git worktree add` is I/O-bound in tracked

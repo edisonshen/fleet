@@ -14,8 +14,8 @@ manager. The agents do the work.
 
 ## Why Fleet
 
-- **50% context handoff, with context.** `fleet-guard` watches every
-  agent's context usage and triggers a handoff at 50% / 70% thresholds.
+- **40% context handoff, with context.** `fleet-guard` watches every
+  agent's context usage and triggers a handoff at 40% / 50% thresholds.
   The successor receives a structured doc carrying prior state,
   decisions made, files modified, and next steps. You don't babysit
   context.

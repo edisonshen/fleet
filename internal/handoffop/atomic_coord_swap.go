@@ -19,9 +19,9 @@ package handoffop
 // point here; steps 4-6 never fence or kill a live coord.
 //
 // Cases currently wired in production callers:
-//   1. Auto-handoff 50% (Yellow) — fleet-guard MILESTONE drain via
+//   1. Auto-handoff 40% (Yellow) — fleet-guard MILESTONE drain via
 //      internal/handoffop.retireOldAgent (non-graceful branch).
-//   2. Auto-handoff 70% (Red) — same drain path.
+//   2. Auto-handoff 50% (Red) — same drain path.
 //   3. Manual `fleet handoff <id>` — cmd/fleet/handoff.go runHandoff
 //      + resumeHandoff (crash-recovery), non-graceful branch.
 //   5. Engine swap — implicit, same path as case 3 plus new Engine.

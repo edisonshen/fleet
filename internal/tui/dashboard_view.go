@@ -117,7 +117,7 @@ func renderDashboardHeader(m Model, usable int) string {
 
 	// Hot-count chips (issue #89): "<N> yellow · <M> red" appears
 	// after "workers active" when at least one alive agent or worker
-	// has crossed the 50%/70% threshold. Skipped when both are zero so
+	// has crossed the 40%/50% threshold. Skipped when both are zero so
 	// the strip stays clean for the all-green common case.
 	var workers []*WorkerRow
 	if snap != nil {

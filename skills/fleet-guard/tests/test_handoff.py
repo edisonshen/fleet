@@ -742,7 +742,7 @@ class TestFindMilestone:
             "earlier work\n"
             "MILESTONE\n"                 # historical, must be ignored
             "more work\n"
-            f"{handoff.HANDOFF_REQUESTED}: context window over 50%\n"
+            f"{handoff.HANDOFF_REQUESTED}: context window over 40%\n"
             "agent is wrapping up...\n"
         )
         assert handoff.find_milestone("fleet-abc") is False
@@ -751,7 +751,7 @@ class TestFindMilestone:
         self, fake_tmux: _FakeTmux,
     ) -> None:
         fake_tmux.output = (
-            f"{handoff.HANDOFF_REQUESTED}: context window over 50%\n"
+            f"{handoff.HANDOFF_REQUESTED}: context window over 40%\n"
             "wrapping...\n"
             "MILESTONE\n"
         )
@@ -767,7 +767,7 @@ class TestFindMilestone:
         the handoff."""
         for bullet in ("- MILESTONE", "* MILESTONE", "• MILESTONE"):
             fake_tmux.output = (
-                f"{handoff.HANDOFF_REQUESTED}: context window over 50%\n"
+                f"{handoff.HANDOFF_REQUESTED}: context window over 40%\n"
                 "plan:\n"
                 f"{bullet}\n"
             )
@@ -784,7 +784,7 @@ class TestFindMilestone:
             "the docs mention HANDOFF REQUESTED handling\n"  # narration
             "MILESTONE\n"                                     # pre-cycle
             "more work\n"
-            f"{handoff.HANDOFF_REQUESTED}: context window over 50%\n"
+            f"{handoff.HANDOFF_REQUESTED}: context window over 40%\n"
             "agent is wrapping up...\n"
         )
         assert handoff.find_milestone("fleet-abc") is False
@@ -797,7 +797,7 @@ class TestFindMilestone:
         find_milestone must strip ANSI before matching or auto-yellow
         stays pending until Red."""
         fake_tmux.output = (
-            f"{handoff.HANDOFF_REQUESTED}: context window over 50%\n"
+            f"{handoff.HANDOFF_REQUESTED}: context window over 40%\n"
             "wrapping...\n"
             "\x1b[33m\u23fa\x1b[0m MILESTONE\n"
         )
@@ -825,7 +825,7 @@ class TestFindMilestone:
         where agent 89ebf034 sat at 64% / auto-yellow without
         handing off."""
         fake_tmux.output = (
-            f"{handoff.HANDOFF_REQUESTED}: context window over 50%\n"
+            f"{handoff.HANDOFF_REQUESTED}: context window over 40%\n"
             "MILESTONE\n"
         )
         handoff.find_milestone("fleet-abc")
@@ -875,7 +875,7 @@ class TestFindMilestone:
         # Real captured-pane shape: injected user prompt (>-quoted, contains
         # the instruction's own MILESTONE line), then the agent's turn.
         fake_tmux.output = (
-            "> HANDOFF REQUESTED: context window is over 50%. Wrap up the\n"
+            "> HANDOFF REQUESTED: context window is over 40%. Wrap up the\n"
             ">   current sub-task at the next safe boundary, then on its own\n"
             ">   line write a single token:\n"
             ">\n"
@@ -910,7 +910,7 @@ class TestFindMilestone:
         work. Only the injection echo is present here (no agent ⏺ MILESTONE),
         so the result must be False."""
         fake_tmux.output = (
-            "> HANDOFF REQUESTED: context window is over 50%. ...token:\n"
+            "> HANDOFF REQUESTED: context window is over 40%. ...token:\n"
             ">\n"
             "> MILESTONE\n"
             ">\n"
@@ -932,13 +932,13 @@ class TestFindMilestone:
         fix anchors on the FIRST HANDOFF REQUESTED, so the MILESTONE in this
         cycle is still found even after a re-injection landed below it."""
         fake_tmux.output = (
-            "> HANDOFF REQUESTED: context window is over 50%. ...\n"   # inj #1
+            "> HANDOFF REQUESTED: context window is over 40%. ...\n"   # inj #1
             "\n"
             "⏺ Wrapped up. Writing the marker.\n"
             "\n"
             "⏺ MILESTONE\n"                                            # valid
             "\n"
-            "> HANDOFF REQUESTED: context window is over 50%. ...\n"   # inj #2
+            "> HANDOFF REQUESTED: context window is over 40%. ...\n"   # inj #2
             ">\n"
             "> MILESTONE\n"                                            # echo
         )
@@ -966,7 +966,7 @@ class TestFindMilestone:
         fake_tmux.output = (
             "⏺ MILESTONE\n"                                  # historical
             "⏺ more work after the old marker\n"
-            "> HANDOFF REQUESTED: context window over 50%\n"  # cycle opens
+            "> HANDOFF REQUESTED: context window over 40%\n"  # cycle opens
             "⏺ agent is still wrapping up, no new marker yet\n"
         )
         assert handoff.find_milestone("fleet-abc") is False
@@ -1071,8 +1071,8 @@ class TestMaybeTrigger:
     ) -> None:
         record_path = _seed_record(fleet_home_tmp, "agent03")
         result = handoff.maybe_trigger(
-            # 110_000 / 200_000 = 55% → yellow
-            {"transcript_path": str(_transcript(tmp_path, input_tokens=110_000))},
+            # 90_000 / 200_000 = 45% → yellow
+            {"transcript_path": str(_transcript(tmp_path, input_tokens=90_000))},
             agent_id="agent03", session="fleet-agent03",
         )
         assert result is not None
@@ -1101,7 +1101,7 @@ class TestMaybeTrigger:
             "MILESTONE\n"
         )
         result = handoff.maybe_trigger(
-            {"transcript_path": str(_transcript(tmp_path, input_tokens=110_000))},
+            {"transcript_path": str(_transcript(tmp_path, input_tokens=90_000))},
             agent_id="agent04", session="fleet-agent04",
         )
         assert result is None  # silent on the "doc-written" path
@@ -1137,7 +1137,7 @@ class TestMaybeTrigger:
         # Real captured-pane shape: >-quoted injection (with its echoed
         # MILESTONE instruction line) + the agent's glyph-rendered marker.
         fake_tmux.output = (
-            "> HANDOFF REQUESTED: context window is over 50%. ...token:\n"
+            "> HANDOFF REQUESTED: context window is over 40%. ...token:\n"
             ">\n"
             "> MILESTONE\n"
             ">\n"
@@ -1148,7 +1148,7 @@ class TestMaybeTrigger:
             "⏺ MILESTONE\n"
         )
         result = handoff.maybe_trigger(
-            {"transcript_path": str(_transcript(tmp_path, input_tokens=110_000))},
+            {"transcript_path": str(_transcript(tmp_path, input_tokens=90_000))},
             agent_id="agent_e2e", session="fleet-agent_e2e",
         )
         assert result is None  # silent on the doc-written path
@@ -1177,7 +1177,7 @@ class TestMaybeTrigger:
                      handoff_type_at=health.now_rfc3339())
         fake_tmux.output = "still working...\n"
         result = handoff.maybe_trigger(
-            {"transcript_path": str(_transcript(tmp_path, input_tokens=110_000))},
+            {"transcript_path": str(_transcript(tmp_path, input_tokens=90_000))},
             agent_id="agent05", session="fleet-agent05",
         )
         assert result is None
@@ -1200,7 +1200,7 @@ class TestMaybeTrigger:
                                    handoff_type_at=stale)
         fake_tmux.output = "still working...\n"
         result = handoff.maybe_trigger(
-            {"transcript_path": str(_transcript(tmp_path, input_tokens=110_000))},
+            {"transcript_path": str(_transcript(tmp_path, input_tokens=90_000))},
             agent_id="stuck1", session="fleet-stuck1",
         )
         assert result is not None, "watchdog must re-inject when stuck"
@@ -1231,7 +1231,7 @@ class TestMaybeTrigger:
         assert "handoff_type_at" not in seeded
         fake_tmux.output = "still working...\n"
         result = handoff.maybe_trigger(
-            {"transcript_path": str(_transcript(tmp_path, input_tokens=110_000))},
+            {"transcript_path": str(_transcript(tmp_path, input_tokens=90_000))},
             agent_id="legacy1", session="fleet-legacy1",
         )
         assert result is not None
@@ -1288,7 +1288,7 @@ class TestPendingDistinguishesAutoFromManual:
         skip straight to MILESTONE grep."""
         _seed_record(fleet_home_tmp, "successor1", handoff_type="manual")
         result = handoff.maybe_trigger(
-            {"transcript_path": str(_transcript(tmp_path, input_tokens=110_000))},
+            {"transcript_path": str(_transcript(tmp_path, input_tokens=90_000))},
             agent_id="successor1", session="fleet-successor1",
         )
         # Injection MUST fire — successor was a fresh agent, not pending.
@@ -1443,7 +1443,7 @@ class TestYellowToRedEscalation:
         _seed_record(fleet_home_tmp, "ycom1",
                      handoff_type=handoff.TYPE_AUTO_RED)
         result = handoff.maybe_trigger(
-            {"transcript_path": str(_transcript(tmp_path, input_tokens=110_000))},
+            {"transcript_path": str(_transcript(tmp_path, input_tokens=90_000))},
             agent_id="ycom1", session="fleet-ycom1",
         )
         assert result is None, \
@@ -1549,7 +1549,7 @@ class TestWedgeRecovery:
         )
         monkeypatch.setattr(handoff, "write_doc", lambda **_: "")
         handoff.maybe_trigger(
-            {"transcript_path": str(_transcript(tmp_path, input_tokens=110_000))},
+            {"transcript_path": str(_transcript(tmp_path, input_tokens=90_000))},
             agent_id="wedgeY1", session="fleet-wedgeY1",
         )
         record = json.loads(record_path.read_text(encoding="utf-8"))
@@ -1672,7 +1672,7 @@ class TestKickDrain:
             f"{handoff.HANDOFF_REQUESTED}: wrap up\nMILESTONE\n"
         )
         handoff.maybe_trigger(
-            {"transcript_path": str(_transcript(tmp_path, input_tokens=110_000))},
+            {"transcript_path": str(_transcript(tmp_path, input_tokens=90_000))},
             agent_id="kick1", session="fleet-kick1",
         )
         # Caller (main._on_stop) invokes the kick after its own writes

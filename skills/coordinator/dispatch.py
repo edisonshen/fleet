@@ -1529,7 +1529,7 @@ def write_worker_inbox(agent_id: str, prompt: str, *, fleet_home: str | None = N
 #
 # The coord writes ~/.fleet/projects/<p>/coord-checkpoint.md every N
 # ticks (N = FLEET_COORD_CHECKPOINT_EVERY, default 5). The checkpoint
-# bounds the recovery window between fleet-guard's 50%/70% context
+# bounds the recovery window between fleet-guard's 40%/50% context
 # handoffs: a coord that dies mid-handoff is resumable from the most
 # recent checkpoint (~2.5min stale on defaults) rather than the last
 # handoff doc (potentially hours stale).

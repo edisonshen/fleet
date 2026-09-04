@@ -1,6 +1,6 @@
 ---
 name: fleet-guard
-description: Watches the host Claude Code agent's context window. Writes health JSON to ~/.fleet/agents/<id>.json on every turn, triggers structured handoffs at 50% (Yellow) and 70% (Red) thresholds, delivers operator messages from ~/.fleet/inbox/<id>.md, and enqueues handoff requests at ~/.fleet/queue/ for the fleet binary to drain. Agent-side half of Fleet (producer); the fleet TUI / `fleet drain` is the consumer.
+description: Watches the host Claude Code agent's context window. Writes health JSON to ~/.fleet/agents/<id>.json on every turn, triggers structured handoffs at 40% (Yellow) and 50% (Red) thresholds, delivers operator messages from ~/.fleet/inbox/<id>.md, and enqueues handoff requests at ~/.fleet/queue/ for the fleet binary to drain. Agent-side half of Fleet (producer); the fleet TUI / `fleet drain` is the consumer.
 ---
 
 # fleet-guard
@@ -41,7 +41,7 @@ Set by `fleet dispatch` and inherited via `tmux new-session -e`:
 
 ### `Stop`
 
-Stdin is a JSON payload containing at least `transcript_path`, `session_id`, and `hook_event_name`. The skill walks the transcript JSONL to find the most-recent `message.usage` and `message.model`, then computes `context_pct = (input + cache_read + cache_creation) / CONTEXT_LIMITS[model] * 100` (`output_tokens` excluded — they don't carry into the next turn's context). The model lookup table mirrors `spike/stop-hook.py:CONTEXT_LIMITS`; an unknown model id defaults to a 1,000,000-token window with a loud stderr flag naming the unresolved id (operator directive 2026-06-10: "if you dont know you should flag it, and set default value to 1 million, dont let it silo" — a silently-null `context_pct` disables the 50/70 auto-handoff with no warning). A transcript with no `message.usage` blocks also flags loudly (transcript path + "no usage found") instead of freezing silently; `main.py` additionally emits a `context_pct unresolved` stderr diagnostic on any Stop fire that would write a null.
+Stdin is a JSON payload containing at least `transcript_path`, `session_id`, and `hook_event_name`. The skill walks the transcript JSONL to find the most-recent `message.usage` and `message.model`, then computes `context_pct = (input + cache_read + cache_creation) / CONTEXT_LIMITS[model] * 100` (`output_tokens` excluded — they don't carry into the next turn's context). The model lookup table mirrors `spike/stop-hook.py:CONTEXT_LIMITS`; an unknown model id defaults to a 1,000,000-token window with a loud stderr flag naming the unresolved id (operator directive 2026-06-10: "if you dont know you should flag it, and set default value to 1 million, dont let it silo" — a silently-null `context_pct` disables the 40/50 auto-handoff with no warning). A transcript with no `message.usage` blocks also flags loudly (transcript path + "no usage found") instead of freezing silently; `main.py` additionally emits a `context_pct unresolved` stderr diagnostic on any Stop fire that would write a null.
 
 The `payload.model` field is unreliable on `Stop` (often empty). Authoritative model name comes from the transcript walk (`message.model` on the most-recent `assistant` line), matching `spike/stop-hook.py:118-141`.
 
@@ -70,9 +70,9 @@ Stdin contains the operator-submitted prompt and metadata. Stdout is ignored (th
 
 | context_pct | State | Action |
 |-------------|-------|--------|
-| < 50% | Green | Update health JSON only. |
-| ≥ 50% | Yellow | Inject `HANDOFF REQUESTED` once. Mark `handoff_type: "auto-yellow"` and `handoff_type_at: <RFC3339>` in agent record. On subsequent fires, grep tmux pane for `MILESTONE` on its own line; when found, write doc + queue with `handoff_type: "auto-yellow"`. If MILESTONE never lands and `handoff_type_at` is older than 30 min (or missing — legacy migration), re-inject `HANDOFF REQUESTED` and bump the timestamp. |
-| ≥ 70% | Red | Emergency: write doc + queue immediately with `handoff_type: "auto-red"`. No MILESTONE wait. |
+| < 40% | Green | Update health JSON only. |
+| ≥ 40% | Yellow | Inject `HANDOFF REQUESTED` once. Mark `handoff_type: "auto-yellow"` and `handoff_type_at: <RFC3339>` in agent record. On subsequent fires, grep tmux pane for `MILESTONE` on its own line; when found, write doc + queue with `handoff_type: "auto-yellow"`. If MILESTONE never lands and `handoff_type_at` is older than 30 min (or missing — legacy migration), re-inject `HANDOFF REQUESTED` and bump the timestamp. |
+| ≥ 50% | Red | Hard force: write doc + queue immediately with `handoff_type: "auto-red"`. No MILESTONE wait. |
 
 `PreCompact` writes its handoff doc with `handoff_type: "precompact"`.
 

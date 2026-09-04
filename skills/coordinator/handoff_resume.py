@@ -1,6 +1,6 @@
 """Coord handoff resume — Phase B2 (issue #93) + v0.8.3 rich-state.
 
-When fleet-guard hands off the coord at 50/70% context, any in-flight
+When fleet-guard hands off the coord at 40/50% context, any in-flight
 worker subagents the coord had spawned via Claude's Agent tool die with
 the parent process. Phase B2 carries enough state in the handoff doc
 that the successor coord can re-issue the Agent calls on its first

@@ -82,8 +82,8 @@ const Placeholder = "_(operator-triggered handoff — fill in before resuming)_"
 // Type values for the frontmatter handoff_type field.
 const (
 	TypeManual     = "manual"      // 4a: operator hit `fleet handoff`
-	TypeAutoYellow = "auto-yellow" // 4b/c: ≥50% context, doing modes
-	TypeAutoRed    = "auto-red"    // 4b/c: ≥70% context, doing modes
+	TypeAutoYellow = "auto-yellow" // 4b/c: ≥40% context, doing modes
+	TypeAutoRed    = "auto-red"    // 4b/c: ≥50% context, doing modes
 	TypePreCompact = "precompact"  // 4b/c: PreCompact hook fired
 )
 

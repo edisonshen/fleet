@@ -146,8 +146,8 @@ class TestStopHook:
         _seed_record(fleet_home_tmp)
         rc, out, _ = _run({
             "hook_event_name": "Stop",
-            # 110k / 200k = 55% → yellow first fire
-            "transcript_path": str(_transcript(tmp_path, input_tokens=110_000)),
+            # 90k / 200k = 45% → yellow first fire
+            "transcript_path": str(_transcript(tmp_path, input_tokens=90_000)),
         }, capsys)
         assert rc == 0
         assert "HANDOFF REQUESTED" in out
@@ -188,7 +188,7 @@ class TestStopHook:
                                                 encoding="utf-8")
         rc, out, _ = _run({
             "hook_event_name": "Stop",
-            "transcript_path": str(_transcript(tmp_path, input_tokens=110_000)),
+            "transcript_path": str(_transcript(tmp_path, input_tokens=90_000)),
         }, capsys)
         assert rc == 0
         op_idx = out.index("[OPERATOR]")
@@ -415,8 +415,8 @@ class TestNeedsInputFlag:
         record_path = _seed_record(fleet_home_tmp, needs_input=False)
         rc, out, _ = _run({
             "hook_event_name": "Stop",
-            # 110k / 200k = 55% → yellow injects HANDOFF REQUESTED
-            "transcript_path": str(_transcript(tmp_path, input_tokens=110_000)),
+            # 90k / 200k = 45% → yellow injects HANDOFF REQUESTED
+            "transcript_path": str(_transcript(tmp_path, input_tokens=90_000)),
         }, capsys)
         assert rc == 0
         assert "HANDOFF REQUESTED" in out
