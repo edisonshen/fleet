@@ -9,8 +9,10 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
+	"io"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -2003,6 +2005,7 @@ func TestRunDispatch_DeadCoordRecovery_StandDownDeliversRecoveryDoc(t *testing.T
 		return winnerRec, nil
 	}
 	t.Cleanup(func() { deliverToCurrentOwner = prevDeliver })
+	reaped := stubArchiveDeadCoordPredecessors(t)
 
 	deadRec := agent.New("deadc0d4")
 	deadRec.TaskID = "coord-myproj"
@@ -2053,5 +2056,86 @@ func TestRunDispatch_DeadCoordRecovery_StandDownDeliversRecoveryDoc(t *testing.T
 	}
 	if !strings.Contains(out.String(), "recovery doc delivered to live coord "+winnerID) {
 		t.Errorf("expected stand-down recovery-delivery confirmation for %s; got:\n%s", winnerID, out.String())
+	}
+	// Once the winner provably owns the lease, the dead predecessor's
+	// record is handed to the pid-proof reap so the operator does not
+	// have to [x] it by hand.
+	if got := *reaped; !reflect.DeepEqual(got, []string{"myproj"}) {
+		t.Errorf("archiveDeadCoordPredecessors calls = %v, want [myproj]", got)
+	}
+}
+
+// stubArchiveDeadCoordPredecessors captures the projects the post-recovery
+// reap was asked to sweep, without running the real gc classifier.
+func stubArchiveDeadCoordPredecessors(t *testing.T) *[]string {
+	t.Helper()
+	calls := &[]string{}
+	prev := archiveDeadCoordPredecessorsFn
+	archiveDeadCoordPredecessorsFn = func(project string, _, _ io.Writer) {
+		*calls = append(*calls, project)
+	}
+	t.Cleanup(func() { archiveDeadCoordPredecessorsFn = prev })
+	return calls
+}
+
+// TestRunDispatch_CoordSpawn_NoDeadRecordSkipsPredecessorReap pins that the
+// reap is a RECOVERY-path step only: a plain cold-start coord spawn (no dead
+// record to recover) never sweeps the project's coord records.
+func TestRunDispatch_CoordSpawn_NoDeadRecordSkipsPredecessorReap(t *testing.T) {
+	requireFakeTmux(t)
+	setupFleetHome(t)
+	prevPrompt := sendInitialPrompt
+	sendInitialPrompt = func(string, string) (bool, error) { return true, nil }
+	t.Cleanup(func() { sendInitialPrompt = prevPrompt })
+	reaped := stubArchiveDeadCoordPredecessors(t)
+	root := os.Getenv("FLEET_HOME")
+	seedRecoveryRepo(t, root, "myproj")
+
+	opts := &dispatchOpts{
+		taskID:          "coord-myproj",
+		project:         "myproj",
+		projectExplicit: true,
+		coordSpawn:      true,
+		command:         []string{"sleep", "60"},
+		commandExplicit: true,
+		prompt:          "boot",
+	}
+	var out bytes.Buffer
+	if err := runDispatch(opts, &out); err != nil {
+		t.Fatalf("runDispatch: %v\n%s", err, out.String())
+	}
+	live, _ := agent.List()
+	for _, r := range live {
+		if r.TaskID == "coord-myproj" && r.Project == "myproj" {
+			t.Cleanup(func() { _ = tmux.Kill(r.TmuxSession) })
+		}
+	}
+	if len(*reaped) != 0 {
+		t.Errorf("fresh coord spawn must not run the predecessor reap; got calls %v", *reaped)
+	}
+}
+
+// TestArchiveDeadCoordPredecessors_NoLeaseOwnerIsNoop pins the safety floor
+// of the real reap: with no active lease owner there is no successor proof,
+// so the classifier reaps nothing and the dead record stays on disk.
+func TestArchiveDeadCoordPredecessors_NoLeaseOwnerIsNoop(t *testing.T) {
+	setupFleetHome(t)
+	deadRec := agent.New("deadc0d4")
+	deadRec.TaskID = "coord-myproj"
+	deadRec.Project = "myproj"
+	deadRec.IsCoord = true
+	deadRec.LeaseWrapped = true
+	deadRec.PID = 99999
+	deadRec.TmuxSession = "fleet-deadc0d4"
+	if err := deadRec.Write(); err != nil {
+		t.Fatalf("seed dead record: %v", err)
+	}
+	var stdout, stderr bytes.Buffer
+	archiveDeadCoordPredecessors("myproj", &stdout, &stderr)
+	if strings.Contains(stdout.String(), "reaped stale coord") {
+		t.Errorf("no lease owner → nothing may be archived; stdout:\n%s", stdout.String())
+	}
+	if _, err := agent.Load("deadc0d4"); err != nil {
+		t.Errorf("dead record must survive a reap with no successor proof: %v", err)
 	}
 }

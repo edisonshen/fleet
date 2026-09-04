@@ -1017,6 +1017,7 @@ func runDispatch(opts *dispatchOpts, stdout io.Writer) error {
 				_, _ = fmt.Fprintf(stdout,
 					"recovery doc delivered to live coord %s for project %s after lease stand-down\n",
 					ownerRec.ID, opts.project)
+				archiveDeadCoordPredecessorsFn(opts.project, stdout, os.Stderr)
 			case errors.Is(derr, handoffdelivery.ErrNoOwnerObserved):
 				// No lease owner converged (legacy/bare leader). The durable
 				// doc stays pending; the next [a] attach recovers from it.
@@ -1056,25 +1057,28 @@ func runDispatch(opts *dispatchOpts, stdout io.Writer) error {
 		return err
 	}
 
-	// Recovery-path bookkeeping (codex review iter-11 P1): we
-	// deliberately DO NOT archive the dead record here. Local tmux
-	// probes cannot rule out a live coord on a different tmux
-	// socket — if findRecoveryCandidate misclassified a still-live
-	// coord as dead, archiving its record pre-emptively would
+	// Recovery-path bookkeeping (codex review iter-11 P1): the dead
+	// record is NOT archived here on the strength of the local tmux
+	// probe alone. That probe cannot rule out a live coord on a
+	// different tmux socket — if findRecoveryCandidate misclassified a
+	// still-live coord as dead, archiving its record pre-emptively would
 	// disappear the live coord from `fleet status` and the TUI even
-	// though the duplicate-recovery's coord skill will lose the
-	// coordinator.lock race and exit. Leaving the dead record on
-	// disk is the safe default:
+	// though the duplicate successor loses the coordinator.flock race
+	// and stands down. Archival happens only AFTER the successor is
+	// confirmed as the lease owner (delivery below), and only for a
+	// predecessor whose supervisor pid+pid_start is provably gone
+	// (archiveDeadCoordPredecessors) — a socket-independent proof.
+	// Records that fail that proof (bare/legacy, or a live competitor
+	// elsewhere) stay on disk:
 	//
-	//   - if the recovery was correct (dead coord truly gone): the
+	//   - if the recovery was correct but the record is bare: the
 	//     successor is now live; the dead record sits unarchived on
 	//     the dashboard until the operator hits [x] (matches the v0.1
 	//     cleanup UX for crashed agents).
 	//   - if the recovery misclassified (live coord on different
-	//     socket): the duplicate successor's coord skill loses the
-	//     NB-flock race and exits cleanly; both records remain;
-	//     dashboard truthfully shows both; operator decides what's
-	//     stale.
+	//     socket): the duplicate successor loses the NB-flock race and
+	//     exits cleanly; both records remain; dashboard truthfully
+	//     shows both; operator decides what's stale.
 	//
 	// Idempotency: a subsequent dispatch sees the same dead record
 	// and re-runs recovery. spawn.Spawn's OldRecord-branch fields
@@ -1083,7 +1087,6 @@ func runDispatch(opts *dispatchOpts, stdout io.Writer) error {
 	// findRecoveryCandidate's newest-wins tiebreaker (codex iter-7
 	// P2) picks the most-recent dead record if multiple recoveries
 	// accumulate, so successive recoveries don't fork lineages.
-	_ = oldRecord // archive intentionally skipped; see comment block.
 
 	_, _ = fmt.Fprintf(stdout, "agent %s spawned\n", rec.ID)
 	_, _ = fmt.Fprintf(stdout, "  task:    %s\n", rec.TaskID)
@@ -1174,6 +1177,11 @@ func runDispatch(opts *dispatchOpts, stdout io.Writer) error {
 					// (codex iter-27 P1).
 					_, _ = fmt.Fprintf(stdout, "agent %s spawned\n", ownerRec.ID)
 				}
+				// The successor provably owns the lease now: reap the
+				// dead predecessor(s) this recovery superseded. Runs
+				// after the authoritative "agent <id> spawned" line so
+				// the TUI's last-match parse is unaffected.
+				archiveDeadCoordPredecessorsFn(rec.Project, stdout, os.Stderr)
 			}
 			if errors.Is(perr, handoffdelivery.ErrNoOwnerObserved) {
 				// This branch is gated on rec.LeaseWrapped=true, so

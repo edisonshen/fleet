@@ -16,7 +16,8 @@ package main
 //	2. writeRecoveryHandoffDoc(deadRec, now)
 //	   → docPath, err
 //	3. spawn.Spawn(spawn.Options{OldRecord: deadRec, NewDocPath: docPath, ...})
-//	4. archive deadRec (the caller's existing post-spawn cleanup path)
+//	4. archiveDeadCoordPredecessors once the successor owns the lease
+//	   (pid+pid_start proof — see the helper; bare records stay)
 //
 // Step 3's OldRecord branch in spawn.Spawn already does the lineage
 // inheritance: handoff_number ++, last_handoff_path = NewDocPath, taskID
@@ -26,6 +27,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -35,6 +37,7 @@ import (
 	"time"
 
 	"github.com/edisonshen/fleet/internal/agent"
+	"github.com/edisonshen/fleet/internal/gc"
 	"github.com/edisonshen/fleet/internal/handoff"
 	"github.com/edisonshen/fleet/internal/state"
 	"github.com/edisonshen/fleet/internal/tasks"
@@ -179,6 +182,52 @@ func findRecoveryCandidate(
 		}
 	}
 	return best
+}
+
+// archiveDeadCoordPredecessorsFn is a var so tests can stub the
+// post-recovery reap. Production runs the gc stale-coords classifier.
+var archiveDeadCoordPredecessorsFn = archiveDeadCoordPredecessors
+
+// archiveDeadCoordPredecessors archives the dead coord records a
+// recovery just superseded, once the successor owns the lease.
+//
+// Local tmux probes cannot prove a coord dead (the operator may be on a
+// different tmux socket), so recovery itself never archives. The proof
+// used HERE is socket-independent: gc's stale-coords class (a) reaps a
+// LEASE-WRAPPED record only when (1) the project's coordinator.flock is
+// stamped by a DIFFERENT active owner pid — the successor — and (2) the
+// record's supervisor pid+pid_start is gone (pid-reuse safe). A live
+// competitor is surfaced, never signaled; bare/legacy records (no
+// supervisor stamp) stay on disk for the operator's [x].
+//
+// Best-effort: a failure here leaves the record on the dashboard exactly
+// as before — never a recovery failure.
+func archiveDeadCoordPredecessors(project string, stdout, stderr io.Writer) {
+	deps := gc.DefaultDeps()
+	wireGCCoordDeps(&deps)
+	report, err := gc.Reconcile(gc.Options{
+		Apply:   true,
+		Kinds:   []gc.Kind{gc.KindStaleCoords},
+		Project: project,
+	}, deps)
+	if err != nil {
+		_, _ = fmt.Fprintf(stderr,
+			"warning: dead coord predecessor reap for project %s failed (%v) — stale record stays on the dashboard; archive with [x]\n",
+			project, err)
+	}
+	for _, a := range report.Actions {
+		if a.Kind != gc.KindStaleCoords {
+			continue
+		}
+		switch a.Verb {
+		case gc.VerbKilled:
+			_, _ = fmt.Fprintf(stdout, "reaped stale coord %s: %s\n", a.Target, a.Reason)
+		case gc.VerbSurface:
+			_, _ = fmt.Fprintf(stderr, "note: coord record %s kept: %s\n", a.Target, a.Reason)
+		default:
+			_, _ = fmt.Fprintf(stderr, "warning: coord record %s not archived (%s): %s\n", a.Target, a.Verb, a.Reason)
+		}
+	}
 }
 
 // coordStateFresh reports whether

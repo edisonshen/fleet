@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -11,6 +12,8 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 
 	"github.com/edisonshen/fleet/internal/agent"
+	"github.com/edisonshen/fleet/internal/coordlock"
+	"github.com/edisonshen/fleet/internal/coordreconcile"
 	"github.com/edisonshen/fleet/internal/projects"
 	"github.com/edisonshen/fleet/internal/state"
 	"github.com/edisonshen/fleet/internal/tasks"
@@ -2568,62 +2571,214 @@ func TestKeyA_ProjectRow_InitErrShowsBanner(t *testing.T) {
 	}
 }
 
-// TestKeyA_ProjectRow_DeadSessionAfterSpawn_FlashesNoAttach pins codex
-// iter-1 P2: dispatch returns 0 with the agent-ID line, but the new
-// tmux session is dead by the time coordSpawnDoneMsg arrives (claude
-// exited at startup — bad --command flag, OOM, missing binary). We
-// must NOT pendingAttach + tea.Quit and exec tmux against a dead
-// session — surface a flash and stay in the TUI.
-func TestKeyA_ProjectRow_DeadSessionAfterSpawn_FlashesNoAttach(t *testing.T) {
-	withFleetHome(t)
-	seedProjectMeta(t, "demo", t.TempDir()) // resolver binds via meta (PR3)
-	// Spawn writes a session name, but our liveness probe says it's
-	// already dead — claude exited between dispatch returning and the
-	// coordSpawnDoneMsg arriving in Update.
-	(&stubSessionAlive{dead: map[string]bool{"fleet-deadbeef": true}}).install(t)
-	stubTUIResolveSpawn(t, "demo")
+// -- [a] dead coord after spawn: auto-recovery ---------------------------
+//
+// dispatch exits 0 naming a coord whose tmux session this TUI finds
+// definitively gone (a corpse dispatch's fast path promoted, or claude
+// exited at startup). The TUI must neither attach to the dead session
+// nor dead-end on an "archive then re-press [a]" flash: it re-enters the
+// lease-aware spawn path ONCE (`fleet dispatch --coord-spawn`, whose
+// recovery branch hands the dead coord's work to a replacement) and then
+// either attaches to the live replacement or surfaces a diagnosis.
 
-	stub := &stubFleetCmd{
-		stubbed: func(args []string) tea.Msg {
-			out := "agent deadbeef spawned\n  tmux: fleet-deadbeef\n"
-			return coordSpawnDoneMsgFromArgs(args, out, nil)
-		},
+// deadCoordRun drives one [a] press through successive coordSpawnDoneMsgs.
+// dispatch is stubbed to name ids[i] on its i-th call (last id repeats);
+// sessions listed in dead read as definitively gone.
+type deadCoordRun struct {
+	m    Model
+	cmd  tea.Cmd
+	stub *stubFleetCmd
+}
+
+func newDeadCoordRun(t *testing.T, dead []string, ids ...string) *deadCoordRun {
+	t.Helper()
+	withFleetHome(t)
+	seedProjectMeta(t, "demo", t.TempDir())
+	deadSet := map[string]bool{}
+	for _, s := range dead {
+		deadSet[s] = true
+	}
+	(&stubSessionAlive{dead: deadSet}).install(t)
+	stub := &stubFleetCmd{}
+	stub.stubbed = func(args []string) tea.Msg {
+		id := ids[len(ids)-1]
+		if n := len(stub.calls) - 1; n < len(ids) {
+			id = ids[n]
+		}
+		return coordSpawnDoneMsgFromArgs(args, fmt.Sprintf("agent %s spawned\n  tmux: fleet-%s\n", id, id), nil)
 	}
 	stub.install(t)
+	return &deadCoordRun{m: New("test"), stub: stub}
+}
 
-	m := New("test")
-	m.dashboard = &Snapshot{Projects: []*ProjectRow{{Name: "demo"}}}
-	for i, r := range m.dashboardRows() {
-		if r.kind == rowProject {
-			m.dashCursor = i
+func (r *deadCoordRun) pressA(t *testing.T) {
+	t.Helper()
+	r.m.dashboard = &Snapshot{Projects: []*ProjectRow{{Name: "demo"}}}
+	for i, row := range r.m.dashboardRows() {
+		if row.kind == rowProject {
+			r.m.dashCursor = i
 			break
 		}
 	}
-	_, cmd := m.Update(keyMsg("a"))
-	doneMsg := cmd().(coordSpawnDoneMsg)
-	if doneMsg.err != nil {
-		t.Fatalf("expected dispatch ok; got err %v", doneMsg.err)
-	}
-	updated, cmd2 := m.Update(doneMsg)
-	mm := updated.(Model)
+	updated, cmd := r.m.Update(keyMsg("a"))
+	r.m, r.cmd = updated.(Model), cmd
+}
 
-	if mm.pendingAttach != "" {
-		t.Errorf("pendingAttach must NOT be set when post-spawn session is dead; got %q", mm.pendingAttach)
+// step runs the pending cmd (a dispatch) and feeds its result to Update.
+func (r *deadCoordRun) step(t *testing.T) {
+	t.Helper()
+	if r.cmd == nil {
+		t.Fatal("expected a pending dispatch cmd")
 	}
-	if mm.flash == nil || !mm.flash.isErr {
-		t.Fatalf("expected error flash; got %+v", mm.flash)
+	updated, cmd := r.m.Update(r.cmd())
+	r.m, r.cmd = updated.(Model), cmd
+}
+
+func (r *deadCoordRun) wantCalls(t *testing.T, n int) {
+	t.Helper()
+	if len(r.stub.calls) != n {
+		t.Fatalf("dispatch calls = %d, want %d: %v", len(r.stub.calls), n, r.stub.calls)
 	}
-	if !strings.Contains(mm.flash.text, "not alive") {
-		t.Errorf("flash should mention 'not alive'; got %q", mm.flash.text)
+}
+
+func (r *deadCoordRun) wantFlash(t *testing.T, isErr bool, wants ...string) {
+	t.Helper()
+	if r.m.flash == nil || r.m.flash.isErr != isErr {
+		t.Fatalf("flash = %+v, want isErr=%v", r.m.flash, isErr)
 	}
-	// Refresh cmd is fine (loadAgentsCmd) — operator can investigate
-	// via the right-column row. Just must not be tea.Quit.
-	if cmd2 != nil {
-		msg := cmd2()
-		if _, isQuit := msg.(tea.QuitMsg); isQuit {
-			t.Error("expected loadAgentsCmd refresh, NOT tea.Quit on dead post-spawn session")
+	for _, w := range wants {
+		if !strings.Contains(r.m.flash.text, w) {
+			t.Errorf("flash missing %q; got %q", w, r.m.flash.text)
 		}
 	}
+}
+
+// wantAttach asserts the run ended by attaching to session (tea.Quit) or,
+// for session == "", that it stayed in the TUI with no pending attach.
+func (r *deadCoordRun) wantAttach(t *testing.T, session string) {
+	t.Helper()
+	if r.m.pendingAttach != session {
+		t.Errorf("pendingAttach = %q, want %q", r.m.pendingAttach, session)
+	}
+	isQuit := false
+	if r.cmd != nil {
+		_, isQuit = r.cmd().(tea.QuitMsg)
+	}
+	if isQuit != (session != "") {
+		t.Errorf("tea.Quit = %v, want %v", isQuit, session != "")
+	}
+}
+
+func TestKeyA_ProjectRow_DeadSessionAfterSpawn_AutoRecovers(t *testing.T) {
+	r := newDeadCoordRun(t, []string{"fleet-deadbeef"}, "deadbeef", "cafef00d")
+	stubTUIResolveSpawn(t, "demo")
+	r.pressA(t)
+	r.step(t) // deadbeef spawned, session gone → recovery re-dispatch
+	r.wantCalls(t, 2)
+	r.wantFlash(t, false, "deadbeef", "is dead", "recovering", "handoff")
+	if !slices.Contains(r.stub.calls[1], "--coord-spawn") {
+		t.Errorf("recovery must be a --coord-spawn (recovery lives in dispatch); got %v", r.stub.calls[1])
+	}
+	if got := r.m.coordDeadRespawn["demo"]; got != "deadbeef" {
+		t.Errorf("recovery bound marker = %q, want deadbeef", got)
+	}
+	if _, inFlight := r.m.inFlightOp("demo"); !inFlight {
+		t.Error("recovery re-dispatch must hold the op gate so a second [a] can't double-spawn")
+	}
+	if r.m.pendingAttach != "" {
+		t.Errorf("must not attach to the dead session; pendingAttach=%q", r.m.pendingAttach)
+	}
+	r.step(t) // cafef00d spawned, alive → attach
+	r.wantAttach(t, "fleet-cafef00d")
+	if _, still := r.m.coordDeadRespawn["demo"]; still {
+		t.Error("bound marker must be consumed by the replacement's done msg")
+	}
+}
+
+// Loop bound: a replacement that is ALSO gone is surfaced after exactly
+// one automatic respawn; a fresh operator [a] resets the bound.
+func TestKeyA_ProjectRow_DeadSessionAfterSpawn_ReplacementDeadToo_Surfaces(t *testing.T) {
+	r := newDeadCoordRun(t, []string{"fleet-deadbeef", "fleet-cafef00d"}, "deadbeef", "cafef00d")
+	stubTUIResolveSpawn(t, "demo")
+	r.pressA(t)
+	r.step(t)
+	r.step(t)
+	r.wantCalls(t, 2)
+	r.wantAttach(t, "")
+	r.wantFlash(t, true, "cafef00d", "deadbeef", "also exited at startup", "press [a] again")
+	if _, still := r.m.coordDeadRespawn["demo"]; still {
+		t.Error("bound marker must be cleared once the failure is surfaced")
+	}
+	if _, inFlight := r.m.inFlightOp("demo"); inFlight {
+		t.Error("op gate must be released after the surfaced failure")
+	}
+
+	r.pressA(t)
+	r.step(t)
+	r.wantCalls(t, 4)
+	r.wantFlash(t, false, "recovering")
+}
+
+// dispatch keeps promoting the SAME id whose session this TUI cannot see:
+// a tmux-socket mismatch, not a startup crash — say so, never spawn beside it.
+func TestKeyA_ProjectRow_DeadSessionAfterSpawn_SameIDTwice_SocketHint(t *testing.T) {
+	r := newDeadCoordRun(t, []string{"fleet-deadbeef"}, "deadbeef")
+	stubTUIResolveSpawn(t, "demo")
+	r.pressA(t)
+	r.step(t)
+	r.step(t)
+	r.wantCalls(t, 2)
+	r.wantAttach(t, "")
+	r.wantFlash(t, true, "deadbeef", "socket mismatch", "FLEET_TMUX_SOCKET", "[x]")
+}
+
+// After the dead-session finding the re-resolve says the lease IS held by
+// a process-live coord (e.g. another tmux socket): route to the
+// attach-owner refusal, never dispatch a duplicate.
+func TestKeyA_ProjectRow_DeadSessionAfterSpawn_LiveOwnerElsewhere_NoRespawn(t *testing.T) {
+	r := newDeadCoordRun(t, []string{"fleet-deadbeef"}, "deadbeef")
+	resolves := 0
+	prevResolve := tuiCoordResolveFn
+	tuiCoordResolveFn = func(project, agentID string) (coordreconcile.Verdict, error) {
+		resolves++
+		if resolves == 1 {
+			return coordreconcile.Verdict{Decision: coordreconcile.Spawn, Reason: "test spawn"}, nil
+		}
+		return coordreconcile.Verdict{
+			Decision: coordreconcile.Attach,
+			Owner:    coordlock.Owner{AgentID: "deadbeef", PID: 1},
+			Reason:   "live flock holder deadbeef",
+		}, nil
+	}
+	t.Cleanup(func() { tuiCoordResolveFn = prevResolve })
+	owner := sampleAgent("deadbeef")
+	owner.Project, owner.TaskID = "demo", coordTaskID("demo")
+	r.m.records = []*agent.Record{owner}
+
+	r.pressA(t)
+	r.step(t)
+	r.wantCalls(t, 1)
+	r.wantAttach(t, "")
+	r.wantFlash(t, true, "Do not respawn beside it")
+	if _, marked := r.m.coordDeadRespawn["demo"]; marked {
+		t.Error("no recovery dispatch started → no bound marker")
+	}
+}
+
+// Tristate gate: a tmux PROBE FAILURE is not proof of death — attach as
+// before, never treat it as a dead coord and respawn.
+func TestKeyA_ProjectRow_ProbeErrorAfterSpawn_AttachesAnyway(t *testing.T) {
+	r := newDeadCoordRun(t, nil, "deadbeef")
+	stubTUIResolveSpawn(t, "demo")
+	prevAlive, prevProbe := sessionAliveFn, sessionProbeFn
+	sessionAliveFn = func(string) bool { return false }
+	sessionProbeFn = func(string) (bool, error) { return false, fmt.Errorf("tmux: socket unreachable") }
+	t.Cleanup(func() { sessionAliveFn, sessionProbeFn = prevAlive, prevProbe })
+
+	r.pressA(t)
+	r.step(t)
+	r.wantCalls(t, 1)
+	r.wantAttach(t, "fleet-deadbeef")
 }
 
 // (Deleted: TestFindExistingCoordForProject_AlivePastBootWindow_MarkerPresent.

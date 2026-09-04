@@ -31,21 +31,22 @@ jobs:
     # package's full default suite):
     #   - default `go test -race ./...`     : 5m
     #   - integration internal/spawn        : 5m  (2 scoped tests)
-    #   - integration cmd/fleet             : 5m  (9 scoped tests)
+    #   - integration cmd/fleet             : 5m  (15 scoped tests)
+    #   - integration internal/tui          : 5m  (3 scoped tests)
     #   (internal/handoffop has no integration-only tests → no step)
-    # Worst-case sum if every step burns its full timeout = 15m, plus the
+    # Worst-case sum if every step burns its full timeout = 20m, plus the
     # UNBUDGETED steps that sit between/after the timed lanes and the always()
     # cleanup: ~2m setup/build/lint, the two test-isolation lints + leak
     # sentinel (~1m), the Python `pytest skills/ scripts/` step (~1m), and ~2m
-    # always() cleanup/leak headroom = ~21m. The cap MUST sit above that so the
+    # always() cleanup/leak headroom = ~26m. The cap MUST sit above that so the
     # per-step `-timeout` reliably fires first and the cleanup steps survive — a
     # GitHub job timeout CANCELS the job and skips always(). EXPECTED (green) run
     # is far smaller — default lane ~3m + each scoped integration step well under
-    # a minute ≈ 7m wall — the caps are a backstop, not the normal run. 30 =
-    # ~21m worst-case + ~9m margin; still far below the GitHub-hosted runner's
+    # a minute ≈ 8m wall — the caps are a backstop, not the normal run. 35 =
+    # ~26m worst-case + ~9m margin; still far below the GitHub-hosted runner's
     # multi-hour default, so a true hang OUTSIDE a test process (e.g. a wedged
     # lint) is still bounded instead of running away as PR #232 did.
-    timeout-minutes: 30
+    timeout-minutes: 35
     steps:
       - uses: actions/checkout@v4
 
@@ -156,8 +157,16 @@ jobs:
       - name: Integration lane — cmd/fleet
         run: >-
           FLEET_STANDBY_TIMEOUT=3s go test -tags=integration -count=1 -timeout=5m
-          -run '^(TestCoordLeaderCheck|TestCoordRun_Lease_Integration_RealFlockHeldThenReleased|TestCoordRun_Lease_Integration_StandDownArchivesRecord|TestDeliverHandoffResumePrompt_NoLeaseOwner_FallsBackToDirectSend|TestHandoff_GracefulRoute_SwapsViaBarrier|TestHandoff_GracefulRouteError_PreservesQueueAndOld|TestHandoff_LeaseFailoverCoordHandoffFinalizesDeliveredLockOwner|TestHandoff_LeaseFailoverCoordHandoffRefusesBeforeRetiringOld|TestHandoffResumeNudger_Integration_EnterSwallowed_TypesPromptOnce|TestHandoffResumeNudger_Integration_BusyPane_TypesNothingUntilSettled|TestRunDispatch_DeadCoordRecovery_AdvertisesLockWinner)$'
+          -run '^(TestCoordLeaderCheck|TestCoordRun_Lease_Integration_RealFlockHeldThenReleased|TestCoordRun_Lease_Integration_StandDownArchivesRecord|TestDeliverHandoffResumePrompt_NoLeaseOwner_FallsBackToDirectSend|TestHandoff_GracefulRoute_SwapsViaBarrier|TestHandoff_GracefulRouteError_PreservesQueueAndOld|TestHandoff_LeaseFailoverCoordHandoffFinalizesDeliveredLockOwner|TestHandoff_LeaseFailoverCoordHandoffRefusesBeforeRetiringOld|TestHandoffResumeNudger_Integration_EnterSwallowed_TypesPromptOnce|TestHandoffResumeNudger_Integration_BusyPane_TypesNothingUntilSettled|TestRunDispatch_DeadCoordRecovery_AdvertisesLockWinner|TestE2E_DeadCoordRecovery_ReplacementInheritsAndReapsPredecessor|TestE2E_DeadCoordRecovery_ReplacementDiesAtStartup_NextAttemptRecovers|TestE2E_DeadCoordRecovery_LiveCoordIsNeverDuplicated|TestE2E_DeadCoordRecovery_BareLegacyRecordIsKept)$'
           ./cmd/fleet
+
+      - name: Integration lane — internal/tui
+        # [a] dead-coord recovery driven through the real Bubble Tea model
+        # against the built fleet binary + real coord-run/tmux subprocesses.
+        run: >-
+          FLEET_STANDBY_TIMEOUT=3s go test -tags=integration -count=1 -timeout=5m
+          -run '^(TestE2E_KeyA_DaysDeadCoord_RecoversAndAttachesReplacement|TestE2E_KeyA_ReplacementDiesAfterDispatch_AutoRespawnsOnce|TestE2E_KeyA_ReplacementDiesTwice_BoundedThenFreshPressRecovers)$'
+          ./internal/tui
 
       - name: Python tests
         run: python3 -m pytest skills/ scripts/ -q

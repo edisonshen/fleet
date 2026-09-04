@@ -175,6 +175,15 @@ type Model struct {
 	// arrives regardless of success/error.
 	projectAddCoordSpawn map[string]bool
 
+	// coordDeadRespawn bounds the automatic dead-coord recovery to ONE
+	// respawn per [a] press. Key is project name; value is the id of the
+	// coord whose session was already found dead after dispatch reported
+	// it. Set when recoverDeadCoordAfterSpawn re-enters the lease-aware
+	// spawn path; consumed by the next coordSpawnDoneMsg for that project
+	// and reset by every operator [a] press, so a second dead session in
+	// the same press is surfaced instead of looping.
+	coordDeadRespawn map[string]string
+
 	// upgradeBanner is the rendered "⬆ vX.Y.Z — brew upgrade fleet"
 	// chip when a newer release is on disk in the version cache.
 	// Empty means no banner — every failure mode in the version
@@ -1028,6 +1037,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.projectAddCoordSpawn != nil {
 			delete(m.projectAddCoordSpawn, msg.projectName)
 		}
+		priorDeadID := m.coordDeadRespawn[msg.projectName]
+		if m.coordDeadRespawn != nil {
+			delete(m.coordDeadRespawn, msg.projectName)
+		}
 		// Exit-75 attach-the-live-leader path (project-row [a] on a
 		// project whose coord already holds the lease). The callback
 		// already re-resolved the live coord from disk, so we ONLY
@@ -1132,15 +1145,13 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// restarting tmux server). Treating those as dead would skip
 		// a perfectly good attach. sessionProbeOrAliveFn returns true
 		// on probe error so we err toward attempting attach — the
-		// operator gets tmux's own clear error if it fails.
+		// operator gets tmux's own clear error if it fails. A
+		// definitively-dead session is NOT a dead end: the record is a
+		// corpse dispatch promoted, so re-enter the lease-aware spawn
+		// path, which recovers it (synth handoff → replacement) or
+		// attaches to whoever really holds the lease.
 		if msg.session != "" && !sessionProbeOrAliveFn(msg.session) {
-			m.flash = &flashMsg{
-				text: fmt.Sprintf(
-					"coord %s spawned for project %s but session %s is not alive — claude likely exited at startup; check the agent record (right column) and re-press [a] to respawn after archiving",
-					msg.agentID, msg.projectName, msg.session),
-				isErr: true,
-			}
-			return m, loadAgentsCmd()
+			return m.recoverDeadCoordAfterSpawn(msg, priorDeadID)
 		}
 		// PR-2 (D2/D4): there is no `starting` lease record to claim any more —
 		// acquiring coordinator.flock IS becoming the coordinator, and the
