@@ -9,9 +9,9 @@
 //
 //	rendering shape
 //	────────────────────────────────────────────────────────────
-//	pct:  32%         ← green zone (<50%)
-//	      50%         ← amber threshold (50%-69%)
-//	      95%         ← red threshold (≥70%)
+//	pct:  32%         ← green zone (<40%)
+//	      40%         ← amber threshold (40%-49%)
+//	      95%         ← red threshold (≥50%)
 //	tag:  ◐ HANDOFF   ← when HandoffType is set
 //	      ◐ COMPACT   ← when HandoffType is "precompact"
 //
@@ -20,7 +20,7 @@
 // Layer 3 (renderHandoffTag): small handoff tag right of the percent.
 // Layer 4 (worker coverage):  workerContextRecord lookup heuristic.
 //
-// Color thresholds match fleet-guard's Yellow (50%) / Red (70%) zones
+// Color thresholds match fleet-guard's Yellow (40%) / Red (50%) zones
 // (skills/fleet-guard/health.py:YELLOW_THRESHOLD/RED_THRESHOLD) so the
 // dashboard reads the same colors fleet-guard uses to trigger handoffs.
 package tui
@@ -38,8 +38,8 @@ import (
 // Context-pct thresholds. Mirror fleet-guard so what the dashboard
 // shows is the same gradient that triggers auto-handoffs in the agent.
 const (
-	contextYellowThreshold = 50.0
-	contextRedThreshold    = 70.0
+	contextYellowThreshold = 40.0
+	contextRedThreshold    = 50.0
 )
 
 // Per-zone label styles. Foreground only — no bold, so the chip reads
@@ -71,10 +71,10 @@ var (
 //	nil           → ""
 //	0%            → "0%"   green (still green zone)
 //	12%           → "12%"  green
-//	48%           → "48%"  green (still <50)
-//	50%           → "50%"  amber (yellow threshold)
-//	69%           → "69%"  amber
-//	70%           → "70%"  red   (red threshold)
+//	38%           → "38%"  green (still <40)
+//	40%           → "40%"  amber (yellow threshold)
+//	49%           → "49%"  amber
+//	50%           → "50%"  red   (red threshold)
 //	95%           → "95%"  red
 //	100%          → "100%" red
 //	negative/NaN  → defensive clamp to 0
@@ -109,9 +109,9 @@ func renderContextBar(pct *float64) string {
 // stripped in non-TTY runs, so palette-string assertions don't work
 // inside `go test`.
 //
-//	pct < 50          → "green"
-//	50 ≤ pct < 70     → "amber"
-//	pct ≥ 70          → "red"
+//	pct < 40          → "green"
+//	40 ≤ pct < 50     → "amber"
+//	pct ≥ 50          → "red"
 func contextZone(pct float64) string {
 	switch {
 	case pct >= contextRedThreshold:
@@ -124,7 +124,7 @@ func contextZone(pct float64) string {
 }
 
 // contextBarStyleFor picks the percent-label color based on threshold
-// zone. Mirrors fleet-guard's Yellow (50%) / Red (70%) zones exactly.
+// zone. Mirrors fleet-guard's Yellow (40%) / Red (50%) zones exactly.
 func contextBarStyleFor(pct float64) lipgloss.Style {
 	switch contextZone(pct) {
 	case "red":
@@ -185,7 +185,7 @@ func renderHandoffTag(handoffType *string) string {
 
 // hotCounts walks every alive agent + worker on the dashboard and
 // returns (yellow, red) counters: agents/workers whose effective
-// context_pct sits in the 50%-69% zone or the ≥70% zone respectively.
+// context_pct sits in the 40%-49% zone or the ≥50% zone respectively.
 //
 // "Effective" means: for agent rows, the agent record's own
 // ContextPct; for worker rows, the context_pct of the agent record
@@ -263,7 +263,7 @@ func renderSubagentCount(n int) string {
 
 // renderHotCounts formats the (yellow, red) counts as bold pills. Returns
 // "" when both are zero so the top status line stays clean for the
-// happy-path "every agent under 50%" case.
+// happy-path "every agent under 40%" case.
 //
 //	(0, 0) → ""                    no chip
 //	(3, 0) → "3 yellow"            amber bold

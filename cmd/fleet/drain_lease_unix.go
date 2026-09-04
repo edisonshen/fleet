@@ -860,7 +860,7 @@ func takeoverAndRecover(req queue.SpawnFresh, path string, cachedOld *agent.Reco
 	// KP7 DEAD-TARGETS-ONLY PRECONDITION (DESIGN-coord-no-auto-kill). This
 	// escalation was reached via a staleness/timeout heuristic (barrier
 	// timeout, no-successor budget) — reachable autonomously from the
-	// fleet-guard 50/70 auto-handoff — and a staleness heuristic may never
+	// fleet-guard 40/50 auto-handoff — and a staleness heuristic may never
 	// fence or kill a LIVE coordinator. Proceed only when OLD's supervisor
 	// is PROVABLY dead by pid + pid_start identity:
 	//   - record unloadable (cachedOld nil)     -> not provably dead -> abort;

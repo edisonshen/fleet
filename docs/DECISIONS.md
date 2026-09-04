@@ -7,6 +7,29 @@ For the full context behind a decision, see the referenced doc section.
 
 ---
 
+## 2026-09-04
+
+### Threshold revision: 40/50 across all modes (supersedes 50/70)
+
+Operator directive: graceful handoff at **40%** of the context window,
+hard forced handoff at **50%**. Same enforcement split as before —
+doing modes inject `HANDOFF REQUESTED` at Yellow and wait for
+`MILESTONE`; Red writes the doc + queue immediately with no wait.
+Thinking modes still get reminders only.
+
+- Yellow (graceful): 50% → 40%.
+- Red (hard force): 70% → 50%.
+
+**Why:** act earlier. The old Red at 70% let an agent that missed its
+MILESTONE run well past the 50% "act" line from Premise 4; the new pair
+keeps the whole handoff window under 50%.
+
+**Where:** `skills/fleet-guard/health.py:YELLOW_THRESHOLD/RED_THRESHOLD`
+(the trigger); `internal/tui/context_bar.go:contextYellowThreshold/
+contextRedThreshold` (dashboard colors + hot counts, kept in lockstep);
+`skills/fleet-guard/SKILL.md` Handoff thresholds table; `docs/DESIGN.md`
+Health thresholds table.
+
 ## 2026-04-26
 
 ### v1.1 engine adapter — minimal v1 hooks

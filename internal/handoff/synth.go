@@ -82,7 +82,7 @@ func SynthesizeRecovery(agentID, project string, ts time.Time) (*Doc, error) {
 // is newer than lastHandoffPath. The rolling checkpoint is written by
 // the coord skill every N ticks (dispatch.write_coord_checkpoint /
 // FLEET_COORD_CHECKPOINT_EVERY) and bounds the recovery window between
-// fleet-guard's 50%/70% handoffs.
+// fleet-guard's 40%/50% handoffs.
 //
 // Preference order:
 //

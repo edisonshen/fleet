@@ -31,7 +31,7 @@ from typing import Any
 # LOUD stderr flag — operator directive 2026-06-10: "if you dont know you
 # should flag it, and set default value to 1 million, dont let it silo."
 # (Supersedes the old no-guess-None policy: a silently-null context_pct kills
-# the 50/70 auto-handoff with no warning — bug D of
+# the 40/50 auto-handoff with no warning — bug D of
 # docs/DESIGN-handoff-lifecycle-hardening.md, live coord 80de593d.)
 CONTEXT_LIMITS: dict[str, int] = {
     "claude-fable-5":    1_000_000,
@@ -125,7 +125,7 @@ def _resolve_limit(raw: str | None) -> int | None:
     loud stderr flag naming the unresolved id, per the operator directive of
     2026-06-10 ("if you dont know you should flag it, and set default value
     to 1 million, dont let it silo"). A silently-null context_pct disables
-    the 50/70 auto-handoff with no warning (bug D, coord 80de593d).
+    the 40/50 auto-handoff with no warning (bug D, coord 80de593d).
 
     Empty/None input still returns None: there is no id to flag, and
     read_context_pct handles the no-model case on its own explicit path.
@@ -139,7 +139,7 @@ def _resolve_limit(raw: str | None) -> int | None:
         f"fleet-guard: unknown model id '{raw}' — defaulting context limit "
         f"to {DEFAULT_CONTEXT_LIMIT} (1M). Add it to CONTEXT_LIMITS in "
         f"skills/fleet-guard/health.py AND spike/stop-hook.py (byte-"
-        f"consistent pair) so the 50/70 handoff uses the real window.",
+        f"consistent pair) so the 40/50 handoff uses the real window.",
         file=sys.stderr,
     )
     return DEFAULT_CONTEXT_LIMIT
@@ -165,8 +165,11 @@ OWNED_FIELDS: frozenset[str] = frozenset({
     "handoff_type_at",
 })
 
-YELLOW_THRESHOLD = 50.0
-RED_THRESHOLD = 70.0
+# Yellow = graceful handoff (inject HANDOFF REQUESTED, wait for MILESTONE);
+# Red = hard forced handoff (doc + queue immediately). Mirrored by
+# internal/tui/context_bar.go so the dashboard colors match the trigger.
+YELLOW_THRESHOLD = 40.0
+RED_THRESHOLD = 50.0
 
 
 def fleet_home() -> Path:

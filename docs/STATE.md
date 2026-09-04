@@ -329,13 +329,13 @@ to refuse than to do it right.
 
 Threshold effects depend on `FLEET_MODE`. Modes split into two families:
 
-- **Doing modes** (`execute`, `fix`) — graceful handoff at 50% via
-  `MILESTONE` boundary; emergency kill at 70%.
-- **Thinking modes** (`plan`, `review`) — reminder-only at 50/70;
+- **Doing modes** (`execute`, `fix`) — graceful handoff at 40% via
+  `MILESTONE` boundary; hard forced handoff at 50%.
+- **Thinking modes** (`plan`, `review`) — reminder-only at 40/50;
   operator decides. Claude Code's own `/compact` at ~95% is the
   backstop.
 
-The 50/70 numbers are shared across mode families for operator sanity
+The 40/50 numbers are shared across mode families for operator sanity
 (one pair of numbers to remember). Only the enforcement differs.
 
 **Schema.** Every `agents/<id>.json` carries `mode: "plan" | "execute"
@@ -344,9 +344,9 @@ role is for project-level chat sessions, which have no thresholds at
 all). The fleet binary inspects `mode` when deciding what the Red
 threshold does.
 
-### F3a — Graceful handoff at 50% (doing modes)
+### F3a — Graceful handoff at 40% (doing modes)
 
-At 50% context, fleet-guard injects into the agent's next turn:
+At 40% context, fleet-guard injects into the agent's next turn:
 
 ```
 HANDOFF REQUESTED — finalize current milestone (commit if stable),
@@ -364,31 +364,34 @@ normal operation; when `HANDOFF REQUESTED` has been injected, the next
 `MILESTONE` is the exit trigger. Same token, context-dependent meaning.
 Keeps the CLAUDE.md snippet minimal.
 
-**Rationale for 50% (not 60% or 75%).** Cutting mid-work unit loses
-coherent progress. 50% is early enough that the agent has roughly half
-its context budget still available to finish a milestone (commit, pass
-tests, finish a sub-step) before handing off. Aligns with Premise 4's
-"act at 50%" and with Hermes/OpenClaw's auto-compact threshold.
+**Rationale for 40% (not 50% or 60%).** Cutting mid-work unit loses
+coherent progress. 40% is early enough that the agent has well over
+half its context budget still available to finish a milestone (commit,
+pass tests, finish a sub-step) before handing off, and keeps the whole
+handoff cycle inside the window where model quality is still high.
+Aligns with Premise 4's "act at 40%". (Shipped at 50% — the
+Hermes/OpenClaw auto-compact threshold — and tightened 2026-09-04; see
+DECISIONS.md.)
 
-### F3b — Emergency threshold at 70% (doing modes)
+### F3b — Hard forced handoff at 50% (doing modes)
 
-If context exceeds 70% without `MILESTONE` firing (agent ignored the
+If context exceeds 50% without `MILESTONE` firing (agent ignored the
 queued handoff or couldn't reach a stable boundary), fleet-guard
 triggers immediate kill-and-respawn. Same mechanics as the existing
 handoff flow, re-purposed as the safety net.
 
-20% runway between graceful queue (50%) and emergency kill (70%) is
-the design's bet that any bounded work unit wraps in under 20% of
+10% runway between graceful queue (40%) and hard force (50%) is
+the design's bet that any bounded work unit wraps in under 10% of
 context. Larger wraps indicate the task's mini-tasks are too coarse —
 operator should re-plan with finer steps.
 
-### F3c — Plan and review: reminder-only at 50/70
+### F3c — Plan and review: reminder-only at 40/50
 
 `FLEET_MODE=plan` and `FLEET_MODE=review` are thinking modes. The
 thresholds fire as operator-facing reminders only:
 
-- 50%: `⚡` warning in the TUI alerts banner
-- 70%: `⚠` urgent reminder
+- 40%: `⚡` warning in the TUI alerts banner
+- 50%: `⚠` urgent reminder
 - No automatic handoff at any threshold
 
 **Rationale.** Plan-mode sessions accumulate reasoning about a specific
@@ -444,9 +447,9 @@ fi
 
 | Phase    | `FLEET_ROLE` | `FLEET_MODE` | Threshold family |
 |----------|--------------|--------------|------------------|
-| execute  | executor     | execute      | doing (50%/70%)  |
-| review-N | executor     | review       | thinking (50/70 reminder) |
-| fix-N    | executor     | fix          | doing (50%/70%)  |
+| execute  | executor     | execute      | doing (40%/50%)  |
+| review-N | executor     | review       | thinking (40/50 reminder) |
+| fix-N    | executor     | fix          | doing (40%/50%)  |
 
 Review is "thinking" (reminder-only); fix is "doing" (graceful + emergency).
 
@@ -732,10 +735,11 @@ Not in vault yet; hardcode for now.
   a separate mechanism.
 - Don't hold flock while calling out to tmux; tmux can block and a held
   flock blocks everyone else. Read manifest, release lock, then spawn.
-- The 50% / 70% thresholds: 50% is validated against prior art —
-  Hermes Agent's `ContextCompressor` auto-compacts at 50%, OpenClaw
-  auto-compacts at similar-order thresholds. 70% is Fleet's own choice
-  for the emergency runway (20% from graceful queue to hard kill).
+- The 40% / 50% thresholds: shipped at 50%/70% (50% validated against
+  prior art — Hermes Agent's `ContextCompressor` auto-compacts at 50%,
+  OpenClaw at similar-order thresholds; 70% was Fleet's own emergency
+  runway). Tightened to 40%/50% on 2026-09-04 by operator directive:
+  graceful at 40%, hard force at 50% (10% runway). See DECISIONS.md.
 - Agents are peers, not children. No ID parent/child tracking in v1.
   `previous_handoff` in frontmatter is enough to reconstruct a task's agent
   chain for human-readable timelines.

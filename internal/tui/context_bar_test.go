@@ -33,7 +33,7 @@ func TestContextBar_NoBarGlyphsRendered(t *testing.T) {
 	// Issue #95: the bar (▰/▱) was dropped. Make sure no rendered
 	// chip ever carries either glyph again — guards against a
 	// regression that re-introduces the segment chunks.
-	for _, v := range []float64{0, 12, 48, 50, 69, 70, 95, 100} {
+	for _, v := range []float64{0, 12, 38, 40, 49, 50, 95, 100} {
 		got := renderContextBar(floatPtr(v))
 		if strings.ContainsAny(got, "▰▱") { // ▰ ▱
 			t.Errorf("%v%%: chip should not contain bar glyphs, got %q", v, got)
@@ -43,8 +43,8 @@ func TestContextBar_NoBarGlyphsRendered(t *testing.T) {
 
 func TestContextBar_ZonesAndLabels(t *testing.T) {
 	// Folded 8 per-point permutations into one table. Pins the integer
-	// label + threshold zone at both edges of each flip (49/50 green→amber,
-	// 69/70 amber→red) plus the 0% and 100% boundary labels. Zone gating
+	// label + threshold zone at both edges of each flip (39/40 green→amber,
+	// 49/50 amber→red) plus the 0% and 100% boundary labels. Zone gating
 	// is asserted via contextZone() because lipgloss strips ANSI in
 	// non-TTY test runs so the palette isn't substring-able.
 	cases := []struct {
@@ -54,10 +54,10 @@ func TestContextBar_ZonesAndLabels(t *testing.T) {
 	}{
 		{0, "0%", "green"},   // low boundary, still renders a chip
 		{12, "12%", "green"}, // interior green
-		{48, "48%", "green"}, // just under the 50% flip
-		{50, "50%", "amber"}, // exact yellow threshold
-		{69, "69%", "amber"}, // just under the 70% flip
-		{70, "70%", "red"},   // exact red threshold
+		{38, "38%", "green"}, // just under the 40% flip
+		{40, "40%", "amber"}, // exact yellow threshold
+		{49, "49%", "amber"}, // just under the 50% flip
+		{50, "50%", "red"},   // exact red threshold
 		{95, "95%", "red"},   // interior red
 		{100, "100%", "red"}, // 3-digit label, high boundary
 	}
@@ -146,7 +146,7 @@ func TestHotCounts_AllGreenZero(t *testing.T) {
 	r1 := agent.New("aaa11111")
 	r1.ContextPct = floatPtr(10)
 	r2 := agent.New("bbb22222")
-	r2.ContextPct = floatPtr(48)
+	r2.ContextPct = floatPtr(38)
 	y, r := hotCounts([]*agent.Record{r1, r2}, map[string]bool{r1.ID: true, r2.ID: true}, nil)
 	if y != 0 || r != 0 {
 		t.Errorf("all green: want (0,0); got (%d,%d)", y, r)
@@ -155,9 +155,9 @@ func TestHotCounts_AllGreenZero(t *testing.T) {
 
 func TestHotCounts_YellowCounted(t *testing.T) {
 	r1 := agent.New("aaa11111")
-	r1.ContextPct = floatPtr(55)
+	r1.ContextPct = floatPtr(42)
 	r2 := agent.New("bbb22222")
-	r2.ContextPct = floatPtr(65)
+	r2.ContextPct = floatPtr(47)
 	r3 := agent.New("ccc33333")
 	r3.ContextPct = floatPtr(20)
 	y, r := hotCounts(
@@ -448,7 +448,7 @@ func TestRows_HandoffTagRendersForAutoYellow(t *testing.T) {
 	r := agent.New("aaaa1111")
 	r.Project = "demo"
 	r.TaskID = "feat-1a2b"
-	r.ContextPct = floatPtr(55)
+	r.ContextPct = floatPtr(45)
 	r.HandoffType = strPtr(handoff.TypeAutoYellow)
 	out := strings.Join(agentBlockLines(r, map[string]bool{r.ID: true}, 80, false), "\n")
 	if !strings.Contains(out, "HANDOFF") {
@@ -491,7 +491,7 @@ func TestDashboard_TopStatusShowsYellowCount(t *testing.T) {
 	m.height = 30
 	r := agent.New("aaaa1111")
 	r.Project = "demo"
-	r.ContextPct = floatPtr(55)
+	r.ContextPct = floatPtr(45)
 	m.records = []*agent.Record{r}
 	m.aliveByID = map[string]bool{r.ID: true}
 	out := renderDashboardHeader(m, 120)

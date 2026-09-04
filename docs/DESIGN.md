@@ -161,8 +161,8 @@ handoff trigger). **Threshold effects are mode-aware.**
 
 Modes split into two families:
 
-- **Doing modes** (`execute`, `fix`) — graceful handoff at 50% fires at
-  the next `MILESTONE`; emergency kill-and-respawn at 70% if agent
+- **Doing modes** (`execute`, `fix`) — graceful handoff at 40% fires at
+  the next `MILESTONE`; hard forced handoff at 50% if agent
   ignored the queued handoff.
 - **Thinking modes** (`plan`, `review`) — reminder-only; operator
   decides when to handoff. Claude Code's own `/compact` at ~95% is the
@@ -170,9 +170,9 @@ Modes split into two families:
 
 | Band        | Doing (execute, fix)                                    | Thinking (plan, review)               |
 |-------------|---------------------------------------------------------|---------------------------------------|
-| Green       | < 50%, active ≤ 60s, not blocked                        | same                                  |
-| Yellow      | **≥ 50% — handoff queued; fires at next `MILESTONE`**   | 50-70% — `⚡` reminder in TUI        |
-| Red         | ≥ 70% — **hard kill-and-respawn** (safety net)          | ≥ 70% — `⚠` urgent reminder         |
+| Green       | < 40%, active ≤ 60s, not blocked                        | same                                  |
+| Yellow      | **≥ 40% — handoff queued; fires at next `MILESTONE`**   | 40-50% — `⚡` reminder in TUI        |
+| Red         | ≥ 50% — **hard forced handoff** (safety net)            | ≥ 50% — `⚠` urgent reminder         |
 | Backstop    | —                                                       | ~95% — Claude Code's own `/compact`   |
 
 In doing modes, one token (`MILESTONE`) serves double duty: progress
@@ -180,13 +180,14 @@ signal in normal operation; exit trigger when `HANDOFF REQUESTED` has
 been injected into the agent's context. Clean CLAUDE.md snippet, no
 special-case handoff token.
 
-Premise 4 ("act at 50%") holds exactly: 50% is the action threshold in
-both mode families. Doing modes queue a graceful handoff at 50% (agent
+Premise 4 ("act before 50%") holds: 40% is the action threshold in
+both mode families. Doing modes queue a graceful handoff at 40% (agent
 finishes current milestone, then hands off); thinking modes fire a `⚡`
-reminder. Hard kill-and-respawn sits at 70% as the safety net for doing
-modes — 20% runway from graceful queue to emergency kill is the
-design's bet that any bounded work unit wraps in under 20% of context.
-Same 50/70 numbers across mode families; only the enforcement differs.
+reminder. The hard forced handoff sits at 50% as the safety net for doing
+modes — 10% runway from graceful queue to forced handoff is the
+design's bet that any bounded work unit wraps in under 10% of context
+(revised 2026-09-04 from 50/70; see DECISIONS.md).
+Same 40/50 numbers across mode families; only the enforcement differs.
 
 Note: `[r]eview` (as in "review queues — operator's TODO review") was dropped from v1 keybinds. The post-execute *code* review loop (Phase 4 §4.7 in FLOW.md) is a different concept, orchestrated by Fleet itself and requires no operator keybind.
 
@@ -309,8 +310,8 @@ A Claude Code skill installed at `~/.claude/skills/fleet-guard/SKILL.md`. Runs v
 
 - Reads `context_pct` from Claude Code's hook payload if available. If the hook does not expose token counts, falls back to a proxy: `messages_since_spawn × avg_tokens_per_turn / model_context_limit`. The spike determines which mode is used; both write the same health JSON shape.
 - Writes `~/.fleet/agents/<id>.json` with `{id, pid, tmux_session, task_id, context_pct, context_source: "hook"|"proxy", last_activity_ts, blocked, needs_input}`.
-- At context_pct ≥ 50% (Yellow, doing modes): injects `HANDOFF REQUESTED` into the agent's next turn. Agent wraps the current bounded work unit and emits `MILESTONE`; fleet-guard writes the handoff doc and enters the 3s grace window. Thinking modes (plan, review) get a `⚡` reminder only — operator decides.
-- At context_pct ≥ 70% (Red, doing modes only): emergency kill-and-respawn without grace. Thinking modes get a `⚠` reminder — still no enforcement; Claude Code's own `/compact` at ~95% is the backstop.
+- At context_pct ≥ 40% (Yellow, doing modes): injects `HANDOFF REQUESTED` into the agent's next turn. Agent wraps the current bounded work unit and emits `MILESTONE`; fleet-guard writes the handoff doc and enters the 3s grace window. Thinking modes (plan, review) get a `⚡` reminder only — operator decides.
+- At context_pct ≥ 50% (Red, doing modes only): hard forced handoff without grace. Thinking modes get a `⚠` reminder — still no enforcement; Claude Code's own `/compact` at ~95% is the backstop.
 - "Signals Fleet" = writes to `~/.fleet/queue/` directory. Fleet watches this via fsnotify. No sockets, no IPC beyond the filesystem.
 
 Skill lives in this same repo under `skills/fleet-guard/` and is copied into `~/.claude/skills/` by `fleet init`.
@@ -323,10 +324,10 @@ Skill lives in this same repo under `skills/fleet-guard/` and is copied into `~/
 - **Stale detection:** If health file's `last_activity_ts` is older than 30 minutes AND tmux session is gone, auto-archive. If tmux session is alive but `last_activity_ts` is old, show as idle (not crashed) — agent is just waiting on user input.
 - **Reconciliation:** Task file frontmatter `assigned: <agent_id>` is the source of truth for *who owns* the task; `~/.fleet/agents/<id>.json` is the source of truth for *agent health*. On conflict (task file says assigned to `a1` but no health file exists), Fleet shows the task as "assigned but agent missing" and offers `fleet recover <task>`. On crash, Fleet clears the `assigned` field from the task file after archival.
 - **Restart on handoff (no race, no mid-response kill):** Flow is cooperative, not coercive:
-  1. `fleet-guard` PostResponse hook detects Yellow threshold (50%, doing modes) OR operator-initiated handoff (`[h]` key). Injects `HANDOFF REQUESTED` into the agent's context. For emergency (70%, doing modes), skips the injection and goes straight to step 2.
+  1. `fleet-guard` PostResponse hook detects Yellow threshold (40%, doing modes) OR operator-initiated handoff (`[h]` key). Injects `HANDOFF REQUESTED` into the agent's context. For emergency (50%, doing modes), skips the injection and goes straight to step 2.
   2. Agent finishes the current bounded work unit (commit, test pass, sub-step), emits `MILESTONE` on its own line. Skill greps the tmux pane capture for `MILESTONE` while `HANDOFF REQUESTED` is pending. On match, skill writes the handoff doc to `~/.fleet/handoffs/<id>-<ts>.md`. Only after fsync succeeds does it write the trigger `~/.fleet/queue/handoff-<id>.json` with `{handoff_path, agent_id, task_id}`.
   3. Fleet's TUI watches `~/.fleet/queue/` via fsnotify. On `handoff-<id>.json`, it shows the agent row as `handoff: saving...` (amber) → `handoff: 3s` countdown. `[c]` during the countdown cancels (doc moves to `~/.fleet/handoffs/archive/.cancelled-<ts>.md`, agent resumes).
-  4. After the 3s grace, Fleet sends `/exit` to the Claude session. Emergency handoffs skip the grace entirely — immediate `/exit` on the 70% trigger.
+  4. After the 3s grace, Fleet sends `/exit` to the Claude session. Emergency handoffs skip the grace entirely — immediate `/exit` on the 50% trigger.
   5. Fleet sends tmux `send-keys` with `/exit` to the Claude session — a graceful shutdown, not SIGKILL. 3-second grace window in the TUI where operator can press `c` to cancel before the fresh spawn starts.
   6. Fleet spawns the fresh agent via `fleet dispatch --from-handoff <path>`. This is mechanically a regular spawn with two extras: (a) a temp `CLAUDE.md` snippet added via env var `FLEET_EXTRA_CLAUDE_MD=<tmpfile>` that says *"You are resuming work. Read the handoff doc at <path> first before responding."*, and (b) the first user-message prefill is piped in via `claude --initial-prompt "Read and continue from <handoff_path>"`. No mid-response termination, no lost state.
 - **Agent ID changes on handoff; task `assigned` field updates atomically.** TUI shows the handoff as a single transition, not two separate agents, to preserve the "fleet never dies" narrative.
@@ -440,12 +441,14 @@ mutating `fleet` subcommands. (2) The `fleet` binary, when it detects
 `FLEET_AGENT_ID` is set, allowlists only read-only subcommands (`status`,
 `peek`, `version`, `--help`) and refuses mutations with a clear error.
 
-**Derivation note on the 50%/70% thresholds (Premise 4).** Independent
+**Derivation note on the 40%/50% thresholds (Premise 4).** Independent
 evidence from Hermes Agent (`ContextCompressor` auto-compacts at 50%) and
-OpenClaw (auto-compaction triggers at similar-order thresholds) validates
-Fleet's Yellow threshold at 50%. Red at 70% is Fleet's own design bet —
-20% runway from graceful queue (50%) to emergency kill (70%) accommodates
-a bounded work unit wrapping up. They are not guesses.
+OpenClaw (auto-compaction triggers at similar-order thresholds) puts 50%
+at the point where degradation is measurable; Fleet's hard force sits
+there. Yellow at 40% is Fleet's own design bet — 10% runway from graceful
+queue (40%) to forced handoff (50%) accommodates a bounded work unit
+wrapping up before the 50% degradation line. Revised 2026-09-04 from the
+original 50/70 pair by operator directive (see DECISIONS.md).
 
 See `docs/STATE.md` for the full schemas, shell patterns, and crash-
 recovery details.
@@ -542,7 +545,7 @@ machine-readable output (`fleet status --json`).
 
 | Glyph | Meaning              | Color   | Source field                       |
 |-------|----------------------|---------|------------------------------------|
-| `●`   | active agent         | green   | `agents/<id>.json` live, context < 50% |
+| `●`   | active agent         | green   | `agents/<id>.json` live, context < 40% |
 | `○`   | todo task            | dim     | manifest `tasks[].status == todo`  |
 | `⚠`   | unhealthy task       | red     | manifest `tasks[].status == unhealthy` |
 | `⏸`   | blocked / queued     | amber   | `agents/<id>.json blocked == true` OR `tasks[].status == queued` (status column disambiguates) |
@@ -790,9 +793,9 @@ Feeds the TUI's aggregate views:
 
 | Trigger | Source | Behavior |
 |---------|--------|----------|
-| Context ≥ 50% (Yellow, doing modes) | `fleet-guard` PostResponse | Inject `HANDOFF REQUESTED`; next `MILESTONE` triggers graceful handoff |
-| Context ≥ 70% (Red, doing modes)   | `fleet-guard` PostResponse | Emergency kill-and-respawn; no grace window |
-| Context ≥ 50% / ≥ 70% (thinking modes) | `fleet-guard` PostResponse | Reminder only (`⚡` / `⚠`) in TUI alerts banner |
+| Context ≥ 40% (Yellow, doing modes) | `fleet-guard` PostResponse | Inject `HANDOFF REQUESTED`; next `MILESTONE` triggers graceful handoff |
+| Context ≥ 50% (Red, doing modes)   | `fleet-guard` PostResponse | Hard forced handoff; no grace window |
+| Context ≥ 40% / ≥ 50% (thinking modes) | `fleet-guard` PostResponse | Reminder only (`⚡` / `⚠`) in TUI alerts banner |
 | PreCompact hook | Claude Code auto-compaction | Emergency handoff — fire before compaction, save state even if context measurement is unavailable |
 | Human-triggered | TUI `h` key or `fleet handoff <id>` | Immediate handoff, same flow as Red |
 | Idle timeout (>30min) | Fleet liveness probe | Mark agent stale, prompt operator: handoff or kill? |
@@ -817,7 +820,7 @@ When Fleet spawns a fresh agent (via `fleet dispatch` or handoff restart):
 
 ## Open Questions
 
-- **Health metric calibration.** The 50%/70% thresholds are the current design bet (50% validated against Hermes/OpenClaw; 70% is Fleet's own choice for the emergency runway). v1 ships with them, instruments usage, and adjusts in v1.1 based on real data.
+- **Health metric calibration.** The thresholds shipped at 50%/70% (50% validated against Hermes/OpenClaw; 70% was Fleet's own choice for the emergency runway) and were tightened to 40%/50% on 2026-09-04 by operator directive. Further adjustment stays data-driven.
 - **tmux requirement.** Users who don't have tmux installed get a clear error + install hint. Alternative spawn modes (screen, new terminal window) are deferred.
 - **Multi-user future.** `~/.fleet/` is single-user. Shared team dashboards are explicitly out of scope for v1.
 - **Cost tracking.** Should Fleet surface token cost per agent? Useful but adds API integration. Defer to v1.1.

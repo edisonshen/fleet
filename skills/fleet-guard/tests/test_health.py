@@ -112,11 +112,11 @@ def _seed_record(home: Path, agent_id: str, **overrides) -> Path:
 class TestThreshold:
     @pytest.mark.parametrize("pct,expected", [
         (0.0, "green"),
-        (49.99, "green"),
-        (50.0, "yellow"),
-        (50.01, "yellow"),
-        (69.99, "yellow"),
-        (70.0, "red"),
+        (39.99, "green"),
+        (40.0, "yellow"),
+        (40.01, "yellow"),
+        (49.99, "yellow"),
+        (50.0, "red"),
         (100.0, "red"),
     ])
     def test_boundaries(self, pct: float, expected: str) -> None:
@@ -256,7 +256,7 @@ class TestOpus48HandoffFires:
     """REGRESSION (fleet-guard-model-limit-db14, P0): before the fix,
     CONTEXT_LIMITS topped out at claude-opus-4-7 and the live model id is
     "claude-opus-4-8[1m]" (1M context). read_context_pct returned None ->
-    threshold(None)="unknown" -> the 50/70 auto-handoff NEVER fired and the
+    threshold(None)="unknown" -> the 40/50 auto-handoff NEVER fired and the
     agent ran to 100% into native auto-compact. These tests prove the proactive
     handoff would now fire on opus-4-8."""
 
@@ -284,11 +284,11 @@ class TestOpus48HandoffFires:
         assert model == "claude-opus-4-8[1m]"  # raw id surfaced verbatim
         assert health.threshold(pct) == "red"
 
-    def test_opus_4_8_bracket_variant_over_50_is_yellow(self, tmp_path: Path) -> None:
-        # 600k / 1_000_000 = 60% -> YELLOW.
-        tp = self._write_transcript(tmp_path, "claude-opus-4-8[1m]", 600_000)
+    def test_opus_4_8_bracket_variant_over_40_is_yellow(self, tmp_path: Path) -> None:
+        # 450k / 1_000_000 = 45% -> YELLOW.
+        tp = self._write_transcript(tmp_path, "claude-opus-4-8[1m]", 450_000)
         pct, _ = health.read_context_pct({"transcript_path": tp})
-        assert pct == 60.0
+        assert pct == 45.0
         assert health.threshold(pct) == "yellow"
 
     def test_opus_4_8_plain_resolves_to_1m(self, tmp_path: Path) -> None:
@@ -448,20 +448,20 @@ class TestResolveLimit:
         assert model == "claude-sonnet-4-6[1m]"
         assert health.threshold(pct) == "red"
 
-    def test_sonnet_1m_under_50_is_green(self, tmp_path: Path) -> None:
-        """The bug's user-visible symptom: a [1m]-base-200k model at 40% of 1M
-        (400k tokens) must read green, not the 200% the strip-to-base bug
+    def test_sonnet_1m_under_40_is_green(self, tmp_path: Path) -> None:
+        """The bug's user-visible symptom: a [1m]-base-200k model at 30% of 1M
+        (300k tokens) must read green, not the 150% the strip-to-base bug
         would produce (which would spuriously trigger handoff)."""
         path = tmp_path / "t.jsonl"
         path.write_text(json.dumps({
             "type": "assistant",
             "message": {
                 "model": "claude-sonnet-4-6[1m]",
-                "usage": {"input_tokens": 400_000},
+                "usage": {"input_tokens": 300_000},
             },
         }) + "\n", encoding="utf-8")
         pct, _ = health.read_context_pct({"transcript_path": str(path)})
-        assert pct == 40.0
+        assert pct == 30.0
         assert health.threshold(pct) == "green"
 
 
