@@ -6,12 +6,54 @@ follows [SemVer](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.17.0] - 2026-09-04
+
+Coordinators stop needing babysitting. A coord that died days ago no longer
+strands its project behind "re-press [a] to respawn after archiving": pressing
+`[a]` detects the dead session, starts a replacement through the lease-aware
+`coord-run --standby` path with a synthesized handoff of the dead coord's
+in-flight worker state, attaches to it, and archives the corpse only once the
+successor provably owns the project lease. A coord that is still alive is never
+duplicated, and a replacement that also dies at startup is surfaced after one
+bounded retry rather than looped. fleet-guard now enforces the coordinator's
+delegate-don't-implement rule mechanically, and its context-handoff thresholds
+tighten to 40%/50%.
+
+### Added
+
+- `[a]` on a project whose coord is dead auto-recovers: `fleet dispatch
+  --coord-spawn` writes a synthetic handoff doc for the dead coord, spawns a
+  replacement (`predecessor_id`, `handoff_count+1`), delivers the resume prompt
+  to the lease owner, then reaps the predecessor via the stale-coord GC — only
+  after a confirmed successor holds the lease. The TUI bounds the automatic
+  respawn to one per `[a]` press; a replacement that also exits at startup, or a
+  session invisible from this TUI's tmux server (socket mismatch), is surfaced
+  with a specific diagnosis instead of a retry loop (#292).
+- Real-subprocess e2e integration lanes for dead-coord recovery in `cmd/fleet`
+  and `internal/tui` (real `coord-run` supervisors, tmux, flock, fake `claude`)
+  plus the shared `internal/testutil/coorde2e` fixtures (#292).
+- fleet-guard coordinator delegation guard: in a `FLEET_ROLE=coord` session the
+  PreToolUse hook denies inline implementation (Edit/Write outside docs,
+  test-running or file-mutating Bash) and logs every violation to
+  `FLEET_HOME/coord-violations/<agent_id>.jsonl`; subagents are exempt.
+  `FLEET_COORD_GUARD=off` disables the deny (#289).
+
 ### Changed
 
 - fleet-guard auto-handoff thresholds tightened from 50% (Yellow) / 70% (Red)
   to **40% (Yellow, graceful `HANDOFF REQUESTED` + `MILESTONE`) / 50% (Red,
   hard forced handoff)**. The TUI context chip, hot-count pills, and alert
-  banner use the same 40/50 zones.
+  banner use the same 40/50 zones; dead agents are excluded from the hot-context
+  banner (#290).
+
+### Fixed
+
+- Coordinator resume nudge types the handoff prompt at most once per wake: a
+  busy pane gets nothing, a prompt already pending in the input box gets Enter
+  only, so successors no longer receive the directive concatenated 2-3x (#291).
+- A tmux probe *error* (unreachable socket) after a coord spawn is no longer
+  treated as a dead session — the TUI attaches as before instead of respawning
+  beside a coord it cannot see (#292).
 
 ## [0.16.2] - 2026-08-29
 
@@ -1305,7 +1347,8 @@ Initial public release.
 - Filesystem packages: `internal/state`, `internal/handoff`,
   `internal/queue`, `internal/spawn`, `internal/tmux`.
 
-[Unreleased]: https://github.com/edisonshen/fleet/compare/v0.16.2...HEAD
+[Unreleased]: https://github.com/edisonshen/fleet/compare/v0.17.0...HEAD
+[0.17.0]: https://github.com/edisonshen/fleet/compare/v0.16.2...v0.17.0
 [0.16.2]: https://github.com/edisonshen/fleet/compare/v0.16.1...v0.16.2
 [0.16.1]: https://github.com/edisonshen/fleet/compare/v0.16.0...v0.16.1
 [0.16.0]: https://github.com/edisonshen/fleet/compare/v0.15.0...v0.16.0
