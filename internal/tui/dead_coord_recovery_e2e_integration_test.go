@@ -59,6 +59,7 @@ func newTUIE2E(t *testing.T, project string) *tuiE2E {
 	bin := buildFleetBinaryForTUI(t) // before PATH is narrowed: needs `go`
 	tmuxtest.RequireTmux(t)
 	t.Setenv("FLEET_HOME", t.TempDir())
+	t.Setenv("FLEET_GC_SCAN_DIR", t.TempDir()) // dispatch's OrphanTmux pass must not walk /tmp
 	t.Setenv("FLEET_MAX_SESSIONS", "100000")
 	t.Setenv("FLEET_STANDBY_TIMEOUT", "3s")
 	t.Setenv("FLEET_INITIAL_PROMPT_STABLE_MS", "100")
