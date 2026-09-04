@@ -61,6 +61,18 @@ def _producer_not_fenced_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 @pytest.fixture(autouse=True)
+def _stub_enrich_doc(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Default: the post-write narrative enrichment (`fleet handoff-enrich`)
+    is a no-op. It shells out to the real `fleet` binary when one is on
+    PATH and rewrites the doc in place; unrelated handoff-write tests
+    assert on the bytes `write_doc` produced. test_enrich_doc.py re-patches
+    per-test to exercise the real subprocess wiring."""
+    import handoff  # noqa: WPS433 — sibling skill module on sys.path
+
+    monkeypatch.setattr(handoff, "_enrich_doc", lambda _doc_path: False)
+
+
+@pytest.fixture(autouse=True)
 def _silence_kick_drain(monkeypatch: pytest.MonkeyPatch) -> None:
     """Producer-triggers-drain (`main._on_stop` / `_on_precompact` call
     `kick_drain_if_pending` after their tail writes) launches a real

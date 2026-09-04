@@ -133,6 +133,8 @@ All string values are double-quoted (Go `%q` form) so YAML metacharacters in ope
 
 Body sections that the skill cannot populate use the canonical placeholder string from `internal/handoff.go:Placeholder`: `_(operator-triggered handoff — fill in before resuming)_`. Do NOT invent alternate sentinels — 4a's chain reader and any future loader recognize only this exact string. Per plan D3, the tmux-pane capture from `capture-pane -t <session>` is dumped into one of the existing sections (e.g., "Completed") rather than added as a new section or marked with a custom placeholder.
 
+For COORD handoffs the skill then runs `fleet handoff-enrich <doc>` (before writing the queue file) so the placeholder narrative sections — Key Decisions, Docs (this session), Open Questions, Next Steps — are filled from `coord-state.json` / `tasks.md` / `coord-checkpoint.md` by the same Go collectors `fleet handoff <id>` uses, and checkpoint completions are prepended above the pane capture in Completed. Best-effort: a missing or too-old binary leaves the doc as rendered.
+
 ### `~/.fleet/queue/spawn-fresh-<old_id>.json` — drain trigger
 
 Schema is `queue.SpawnFresh` in `internal/queue/queue.go:49-62`:

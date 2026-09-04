@@ -629,6 +629,13 @@ def _do_handoff(record: dict[str, Any], session: str,
     )
     if not doc_path:
         return False
+    # Fill the narrative sections (Key Decisions / Docs / Open Questions /
+    # Next Steps, plus checkpoint completions above the pane capture) from
+    # durable coord state via the Go collectors — the same brief `fleet
+    # handoff <id>` gives a successor. Must land BEFORE the queue write so
+    # the doc is complete by the time drain spawns the successor.
+    if is_coord:
+        _enrich_doc(doc_path)
     if not write_queue(
         old_id=agent_id,
         new_id=new_id,
@@ -1368,6 +1375,43 @@ def _producer_fenced(project: str) -> bool:
         f"(exit {proc.returncode}): {detail}; treating as FENCED",
         file=sys.stderr,
     )
+    return True
+
+
+_ENRICH_TIMEOUT_S = 15.0
+
+
+def _enrich_doc(doc_path: str) -> bool:
+    """Shell `fleet handoff-enrich <doc>` to fill the narrative sections of a
+    just-written coord handoff doc from durable state (coord-state.json,
+    tasks.md, coord-checkpoint.md). Returns True iff the helper exited 0.
+    Best-effort: a missing/too-old binary, a timeout, or any non-zero exit
+    leaves the doc exactly as `write_doc` rendered it — the handoff still
+    proceeds."""
+    env = dict(os.environ)
+    env["FLEET_HOME"] = str(health.fleet_home())
+    fleet_bin = os.environ.get("FLEET_BIN")
+    if not fleet_bin or not os.access(fleet_bin, os.X_OK):
+        fleet_bin = shutil.which("fleet")
+    if not fleet_bin:
+        return False
+    try:
+        proc = subprocess.run(
+            [fleet_bin, "handoff-enrich", doc_path],
+            capture_output=True, text=True,
+            timeout=_ENRICH_TIMEOUT_S, check=False, env=env,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    if proc.returncode != 0:
+        detail = (proc.stderr or proc.stdout or "").strip()
+        if not _lease_check_unknown_command(detail):
+            print(
+                f"fleet-guard: handoff-enrich for {doc_path} failed "
+                f"(exit {proc.returncode}): {detail}; doc left as rendered",
+                file=sys.stderr,
+            )
+        return False
     return True
 
 
