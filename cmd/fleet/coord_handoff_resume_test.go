@@ -72,18 +72,19 @@ func readTestCoordState(t *testing.T, project string) map[string]any {
 
 func baseHandoffResumeConfig(agentID, project, session string, wakeC <-chan time.Time, stderr *bytes.Buffer) handoffResumeNudgeConfig {
 	return handoffResumeNudgeConfig{
-		agentID:        agentID,
-		project:        project,
-		session:        session,
-		loadAgent:      agent.Load,
-		readMarker:     readResumedHandoffPath,
-		waitReady:      func(string) error { return nil },
-		sendVerified:   func(string, string) (bool, error) { return true, nil },
-		initialDelayC:  closedTimeChan(),
-		wakeC:          wakeC,
-		maxAttempts:    4,
-		transportTries: 3,
-		stderr:         stderr,
+		agentID:       agentID,
+		project:       project,
+		session:       session,
+		loadAgent:     agent.Load,
+		readMarker:    readResumedHandoffPath,
+		waitReady:     func(string) error { return nil },
+		sendVerified:  func(string, string) (bool, error) { return true, nil },
+		promptPending: func(string, string) bool { return false },
+		resubmit:      func(string, string) (bool, error) { return true, nil },
+		initialDelayC: closedTimeChan(),
+		wakeC:         wakeC,
+		maxAttempts:   4,
+		stderr:        stderr,
 	}
 }
 
@@ -276,7 +277,13 @@ func TestHandoffResumeNudgeLoop_DoesNotWriteMarker(t *testing.T) {
 	}
 }
 
-func TestHandoffResumeNudgeLoop_TransportRetryUntilReady(t *testing.T) {
+// TestHandoffResumeNudgeLoop_BusyChildTypesNothing pins the fix for the
+// operator-observed "Read your handoff doc at ..." x3 in ONE input
+// message: while the child's pane is still changing (booting, or mid-turn
+// on the pushed handoff), the nudger must not type anything, and the
+// busy wake must not consume the bounded attempt budget. Once the pane
+// settles, exactly one verified send goes out.
+func TestHandoffResumeNudgeLoop_BusyChildTypesNothing(t *testing.T) {
 	const (
 		agentID = "hrretry"
 		project = "hr-retry"
@@ -287,38 +294,54 @@ func TestHandoffResumeNudgeLoop_TransportRetryUntilReady(t *testing.T) {
 	writeTestCoordState(t, project, map[string]any{
 		resumedHandoffPathCoordStateKey: "",
 	})
+	wakeC := make(chan time.Time)
+	readyCh := make(chan struct{}, 3)
+	sendCh := make(chan struct{}, 1)
 	var readyCalls int32
 	var sends int32
 	var stderr bytes.Buffer
-	cfg := baseHandoffResumeConfig(agentID, project, session, nil, &stderr)
+	cfg := baseHandoffResumeConfig(agentID, project, session, wakeC, &stderr)
 	cfg.maxAttempts = 1
-	cfg.transportTries = 3
 	cfg.waitReady = func(string) error {
-		if atomic.AddInt32(&readyCalls, 1) < 3 {
-			return errors.New("booting")
+		n := atomic.AddInt32(&readyCalls, 1)
+		readyCh <- struct{}{}
+		if n < 3 {
+			return errors.New("pane still changing")
 		}
 		return nil
 	}
 	cfg.sendVerified = func(string, string) (bool, error) {
 		atomic.AddInt32(&sends, 1)
-		if atomic.LoadInt32(&readyCalls) >= 3 {
-			writeTestCoordState(t, project, map[string]any{
-				resumedHandoffPathCoordStateKey: docPath,
-			})
-			return true, nil
-		}
-		return false, nil
+		writeTestCoordState(t, project, map[string]any{
+			resumedHandoffPathCoordStateKey: docPath,
+		})
+		sendCh <- struct{}{}
+		return true, nil
 	}
-	runHandoffResumeNudgeLoop(context.Background(), cfg)
+	_, done := runHandoffResumeLoopAsync(t, cfg)
+	waitHandoffResumeSend(t, readyCh)
+	wakeC <- time.Now()
+	waitHandoffResumeSend(t, readyCh)
+	wakeC <- time.Now()
+	waitHandoffResumeSend(t, readyCh)
+	waitHandoffResumeSend(t, sendCh)
+	waitHandoffResumeDone(t, done)
 	if got := atomic.LoadInt32(&readyCalls); got != 3 {
 		t.Fatalf("ready calls = %d, want 3", got)
 	}
-	if got := atomic.LoadInt32(&sends); got != 3 {
-		t.Fatalf("send calls = %d, want 3 re-issued sends while readiness converges", got)
+	if got := atomic.LoadInt32(&sends); got != 1 {
+		t.Fatalf("send calls = %d, want exactly 1 (nothing typed while the pane was busy)", got)
+	}
+	if strings.Contains(stderr.String(), "not applied") {
+		t.Fatalf("busy wakes consumed the attempt budget:\n%s", stderr.String())
 	}
 }
 
-func TestHandoffResumeNudgeLoop_TransportRetryUntilReadinessSucceedsEvenIfSubmitted(t *testing.T) {
+// TestHandoffResumeNudgeLoop_UnsubmittedNeverRetypes: when the typed
+// prompt is still sitting in the input box (Enter swallowed), the next
+// nudge presses Enter only. The prompt text is typed exactly once no
+// matter how many wakes it takes to submit it.
+func TestHandoffResumeNudgeLoop_UnsubmittedNeverRetypes(t *testing.T) {
 	const (
 		agentID = "hrready"
 		project = "hr-ready"
@@ -329,33 +352,50 @@ func TestHandoffResumeNudgeLoop_TransportRetryUntilReadinessSucceedsEvenIfSubmit
 	writeTestCoordState(t, project, map[string]any{
 		resumedHandoffPathCoordStateKey: "",
 	})
-	var readyCalls int32
-	var sends int32
+	wakeC := make(chan time.Time)
+	sendCh := make(chan struct{}, 1)
+	resubmitCh := make(chan struct{}, 2)
+	var sends, resubmits int32
+	var typed string
 	var stderr bytes.Buffer
-	cfg := baseHandoffResumeConfig(agentID, project, session, nil, &stderr)
-	cfg.maxAttempts = 1
-	cfg.transportTries = 3
-	cfg.waitReady = func(string) error {
-		if atomic.AddInt32(&readyCalls, 1) < 3 {
-			return errors.New("ready prompt not visible yet")
-		}
-		return nil
-	}
-	cfg.sendVerified = func(string, string) (bool, error) {
+	cfg := baseHandoffResumeConfig(agentID, project, session, wakeC, &stderr)
+	cfg.sendVerified = func(_ string, prompt string) (bool, error) {
 		atomic.AddInt32(&sends, 1)
-		if atomic.LoadInt32(&readyCalls) >= 3 {
+		typed += prompt
+		sendCh <- struct{}{}
+		return false, nil // Enter swallowed; prompt stays in the box
+	}
+	cfg.promptPending = func(_ string, prompt string) bool {
+		return strings.Contains(typed, prompt)
+	}
+	cfg.resubmit = func(_ string, prompt string) (bool, error) {
+		n := atomic.AddInt32(&resubmits, 1)
+		if n == 2 {
+			typed = ""
 			writeTestCoordState(t, project, map[string]any{
 				resumedHandoffPathCoordStateKey: docPath,
 			})
+			resubmitCh <- struct{}{}
+			return true, nil
 		}
-		return true, nil
+		resubmitCh <- struct{}{}
+		return false, nil
 	}
-	runHandoffResumeNudgeLoop(context.Background(), cfg)
-	if got := atomic.LoadInt32(&readyCalls); got != 3 {
-		t.Fatalf("ready calls = %d, want retry until readiness succeeds", got)
+	_, done := runHandoffResumeLoopAsync(t, cfg)
+	waitHandoffResumeSend(t, sendCh)
+	wakeC <- time.Now()
+	waitHandoffResumeSend(t, resubmitCh)
+	wakeC <- time.Now()
+	waitHandoffResumeSend(t, resubmitCh)
+	waitHandoffResumeDone(t, done)
+	if got := atomic.LoadInt32(&sends); got != 1 {
+		t.Fatalf("prompt typed %d times, want exactly 1", got)
 	}
-	if got := atomic.LoadInt32(&sends); got != 3 {
-		t.Fatalf("send calls = %d, want 3 verified sends", got)
+	if got := atomic.LoadInt32(&resubmits); got != 2 {
+		t.Fatalf("resubmits = %d, want 2 Enter-only retries", got)
+	}
+	if !strings.Contains(stderr.String(), "prompt remained unsubmitted") {
+		t.Fatalf("unsubmitted attempt not surfaced in stderr:\n%s", stderr.String())
 	}
 }
 
@@ -582,6 +622,7 @@ func TestCoordRun_HandoffResumeNudge_FlockWinnerStartsNudger(t *testing.T) {
 		handoffResumeInitialDelayC: closedTimeChan(),
 		handoffResumeWakeC:         make(chan time.Time),
 		handoffResumeWaitReady:     func(string) error { return nil },
+		handoffResumePromptPending: func(string, string) bool { return false },
 		handoffResumeSendVerified: func(string, string) (bool, error) {
 			if atomic.AddInt32(&sends, 1) == 1 {
 				writeTestCoordState(t, project, map[string]any{

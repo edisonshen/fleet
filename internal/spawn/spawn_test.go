@@ -1350,6 +1350,35 @@ func TestPromptSubmitted_BottomBandHeuristic(t *testing.T) {
 	}
 }
 
+// TestPromptInTail_IgnoresSoftWrap: the input box wraps a long prompt
+// at the pane width and indents continuation lines, so a byte-exact
+// substring match never sees a prompt longer than one row. The tail
+// match must be whitespace-insensitive or the verifier reports
+// "submitted" for every wrapped prompt and the nudger retypes it.
+func TestPromptInTail_IgnoresSoftWrap(t *testing.T) {
+	const prompt = "Read your handoff doc at /Users/pinkbear/.fleet/handoffs/e509aead-20260904-061851-99be.md and continue the task. Do not wait for further operator input."
+	wrapped := []byte(
+		"filler\n" +
+			"> Read your handoff doc at\n" +
+			"  /Users/pinkbear/.fleet/handoffs/e509aead-20260904-061851-99be.md and continue the task. Do not wait for further\n" +
+			"  operator input.\n" +
+			"────────────\n")
+	if !promptInTail(wrapped, prompt) {
+		t.Fatal("soft-wrapped prompt in input box not detected as pending")
+	}
+	if promptSubmittedWithDeps("x", prompt,
+		func(string) ([]byte, error) { return wrapped, nil }) {
+		t.Fatal("soft-wrapped prompt in input box reported as submitted")
+	}
+	empty := []byte("filler\n> \n────────────\n")
+	if promptInTail(empty, prompt) {
+		t.Fatal("empty input box reported as pending")
+	}
+	if promptInTail(wrapped, "") {
+		t.Fatal("empty prompt must never be pending")
+	}
+}
+
 func TestSpawn_InjectsFleetProject_FreshDispatch(t *testing.T) {
 	requireTmux(t)
 	setupFleetHome(t)

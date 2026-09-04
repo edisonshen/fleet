@@ -257,9 +257,13 @@ when every keystroke is lost. A is a UX/latency improvement on top.
   piece depends on no CLI-delivered keystroke. Composes with the supervisor-in-daemon
   **turn-nudge** (`DESIGN-coord-supervisor-in-daemon.md` §6) when that lands.
   - **Nudge cadence — two levels, both bounded (resolves the "retry until applied"
-    guarantee).** (1) *Transport retry within one nudge:* poll child readiness and
-    re-issue the send until the child takes a turn (handles the booting-drop, Failure
-    B). (2) *Applied retry across the marker:* the nudge is (re-)driven whenever
+    guarantee).** (1) *Transport gate within one nudge:* poll child readiness; type
+    the prompt **at most once per nudge**, and only when the pane has settled. A pane
+    that never settles (booting, mid-turn) types nothing and does not consume the
+    applied-retry budget; a prompt already sitting unsubmitted in the input box gets
+    Enter only. The input box is a buffer — re-issuing the full send appends a second
+    copy rather than replacing the first (operator observed the directive three times
+    in one message). (2) *Applied retry across the marker:* the nudge is (re-)driven whenever
     `record.last_handoff_path != resumed_handoff_path` — i.e. the handoff is not yet
     applied — evaluated on flock-acquire **and on a resident re-check.** Note
     `coord-run`'s leader path today just blocks on `child.Wait()` with no periodic
