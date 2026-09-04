@@ -61,6 +61,7 @@ func TestRunDispatch_DeadCoordRecovery_AdvertisesLockWinner(t *testing.T) {
 		return winnerRec, nil
 	}
 	t.Cleanup(func() { deliverToCurrentOwner = prevDeliver })
+	reaped := stubArchiveDeadCoordPredecessors(t)
 
 	deadRec := agent.New("deadc0d3")
 	deadRec.TaskID = "coord-myproj"
@@ -136,5 +137,10 @@ func TestRunDispatch_DeadCoordRecovery_AdvertisesLockWinner(t *testing.T) {
 	if idx := strings.LastIndex(got, "agent "); !strings.HasPrefix(got[idx:], winnerSpawn) {
 		t.Errorf("the LAST 'agent ... spawned' line must name the winner %s (TUI takes last match); got tail:\n%s",
 			winnerID, got[idx:])
+	}
+	// With the winner confirmed as lease owner, the dead predecessor is
+	// handed to the pid-proof reap (once, for this project).
+	if got := *reaped; len(got) != 1 || got[0] != "myproj" {
+		t.Errorf("archiveDeadCoordPredecessors calls = %v, want [myproj]", got)
 	}
 }

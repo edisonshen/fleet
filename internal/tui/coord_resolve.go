@@ -70,7 +70,65 @@ func (m Model) beginResolvedCoordAttach(projectName, context string) (Model, tea
 		}
 		return m, nil
 	}
+	if m.coordDeadRespawn != nil {
+		delete(m.coordDeadRespawn, projectName)
+	}
 	return m.consumeResolvedCoord(projectName, agentID, context, tuiCoordResolveMaxAttempts)
+}
+
+// recoverDeadCoordAfterSpawn handles a coord-spawn dispatch that exited 0
+// naming agentID, whose tmux session this TUI then found definitively
+// absent (tristate probe: gone, not a transport error). Two ways there:
+//
+//	dispatch fast-path promoted a stale record whose coord died long ago
+//	   (the record is a corpse the operator would otherwise have to [x])
+//	the freshly spawned claude exited during startup
+//
+// Either way the fix is the same lease-aware path an [a] press takes:
+// coordreconcile decides Attach (a coord IS process-live somewhere —
+// e.g. another tmux socket — so never spawn beside it), Wait (a handoff
+// is mid-swap) or Spawn (lease free). Spawn goes through `fleet dispatch
+// --coord-spawn`, whose findRecoveryCandidate sees the dead record,
+// synthesizes a handoff doc from its in-flight worker state, and starts
+// a replacement primed with the resume prompt; once the replacement
+// owns the lease dispatch archives the provably-dead predecessor.
+//
+// Bounded to ONE automatic respawn per [a] press via m.coordDeadRespawn:
+// a replacement that also comes up dead is a startup failure (or a tmux
+// socket mismatch when dispatch keeps naming the same id) and is
+// surfaced with that diagnosis rather than respawned again.
+func (m Model) recoverDeadCoordAfterSpawn(msg coordSpawnDoneMsg, priorDeadID string) (Model, tea.Cmd) {
+	if priorDeadID != "" {
+		var text string
+		if msg.agentID == priorDeadID {
+			text = fmt.Sprintf(
+				"project %s: dispatch keeps promoting coord %s but its session %s is not visible from this TUI's tmux server — likely a tmux socket mismatch (FLEET_TMUX_SOCKET / `fleet status`); if it is truly dead, archive it with [x] and press [a] again",
+				msg.projectName, msg.agentID, msg.session)
+		} else {
+			text = fmt.Sprintf(
+				"project %s: replacement coord %s (recovering dead %s) also exited at startup — session %s is gone; claude is failing to start, check the agent record (right column) and its handoff doc, then press [a] again",
+				msg.projectName, msg.agentID, priorDeadID, msg.session)
+		}
+		m.flash = &flashMsg{text: text, isErr: true}
+		return m, loadAgentsCmd()
+	}
+	m.flash = &flashMsg{
+		text: fmt.Sprintf(
+			"coord %s for project %s is dead (session %s gone) — recovering: starting a replacement with a handoff of its in-flight work",
+			msg.agentID, msg.projectName, msg.session),
+	}
+	updated, cmd := m.beginResolvedCoordAttach(msg.projectName, "")
+	if updated.flash != nil && updated.flash.isErr {
+		// Re-entry did not start anything (resolve/init/cwd failure
+		// already flashed with its own retry hint); leave no marker so
+		// the operator's next [a] gets a full recovery attempt.
+		return updated, cmd
+	}
+	if updated.coordDeadRespawn == nil {
+		updated.coordDeadRespawn = map[string]string{}
+	}
+	updated.coordDeadRespawn[msg.projectName] = msg.agentID
+	return updated, cmd
 }
 
 func (m Model) consumeResolvedCoord(projectName, agentID, context string, attemptsLeft int) (Model, tea.Cmd) {
