@@ -102,7 +102,7 @@ Engine selection:
 	root.AddCommand(newAttachCmd())
 	root.AddCommand(newStatusCmd())
 	root.AddCommand(newHandoffCmd())
-	root.AddCommand(newHandoffEnrichCmd())
+	root.AddCommand(newHandoffWriteCmd())
 	root.AddCommand(newCheckpointCmd())
 	root.AddCommand(newInitCmd())
 	root.AddCommand(newDrainCmd())

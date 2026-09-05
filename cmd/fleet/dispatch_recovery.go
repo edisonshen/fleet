@@ -654,7 +654,7 @@ func writeRecoveryHandoffDoc(deadRec *agent.Record, ts time.Time) (string, error
 	// PR shepherd until-loops. Without this enrichment, every
 	// recovery-synth doc renders _(no open PRs)_ and the successor
 	// drops in-review PRs on the floor — no worker re-dispatch, no
-	// shepherd. Mirrors skills/fleet-guard/handoff.py:_collect_open_prs.
+	// shepherd. Same query as handoff.CollectOpenPRs.
 	//
 	// Failures are silent (best-effort): gh missing, auth issue, or
 	// timeout returns an empty slice and the doc renders the
@@ -701,7 +701,7 @@ func writeRecoveryHandoffDoc(deadRec *agent.Record, ts time.Time) (string, error
 // parsed list as handoff.OpenPR entries. Used by the recovery path
 // to pre-populate the synth doc's ## Open PRs section so the
 // successor coord re-spawns shepherd until-loops for in-review
-// workers. Mirrors skills/fleet-guard/handoff.py:_collect_open_prs.
+// workers. Same query as handoff.CollectOpenPRs.
 //
 // cwd: optional directory to run gh in. The gh CLI needs a git
 // repo to discover the upstream — passing the dead coord's recorded

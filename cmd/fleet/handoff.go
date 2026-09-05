@@ -745,38 +745,9 @@ func runHandoff(opts *handoffOpts, stdout, stderr io.Writer) error {
 	//    itself inherited from. The next handoff increments by 1
 	//    inside spawn.Spawn.
 	now := time.Now().UTC()
-	docPath, err := state.HandoffPath(oldRec.ID, now)
+	docPath, err := writeHandoffDoc(oldRec, handoff.TypeManual, nil, "", cwd, now, stderr)
 	if err != nil {
 		return err
-	}
-	doc := handoff.NewManualStub(
-		oldRec.ID, oldRec.TaskID, oldRec.Project,
-		oldRec.HandoffNumber, oldRec.LastHandoffPath, now,
-	)
-	// Fill the doc from durable on-disk state so the successor coord
-	// resumes immediately instead of rediscovering all in-flight work by
-	// hand: Active Subagents + Open PRs (coord-state.json + `gh`),
-	// Completed (checkpoint buffer), Key Decisions + Docs (this session)
-	// (live coord-state.json recent_decisions / session_docs), Next Steps
-	// + Open Questions (tasks.md). Best-effort: any failure (panic, gh
-	// down, parse error) leaves the section's placeholder and the handoff
-	// still succeeds — enrichment NEVER fails a handoff. agentID =
-	// oldRec.ID drives the checkpoint generation guard; lastHandoffPath
-	// threads through nil→"".
-	//
-	// COORD ONLY: Active Subagents + Open PRs are coord-owned project
-	// state. A worker handoff has none, and enriching a worker's doc
-	// would pull the live coord's coord-state.json / open PRs into a
-	// section that must stay empty for non-coord docs — resuming the
-	// worker with unrelated project-wide state. `cwd` is the handed-off
-	// coord's repo checkout (resolved in step 4), so `gh pr list` binds
-	// to the right repo regardless of the operator's shell CWD.
-	if spawn.IsCoordSpawn(oldRec.TaskID, oldRec.Project) {
-		handoff.EnrichManualDoc(doc, oldRec.Project, oldRec.ID, cwd, oldRec.LastHandoffPath,
-			func(msg string) { _, _ = fmt.Fprintln(stderr, msg) })
-	}
-	if err := handoff.Write(doc, docPath); err != nil {
-		return fmt.Errorf("write handoff doc: %w", err)
 	}
 
 	// 6. Pre-allocate the replacement's agent ID so we can journal

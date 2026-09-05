@@ -31,11 +31,10 @@ State machine on every Stop hook fire (delegated to maybe_trigger):
 PreCompact hook fires emergency_trigger directly — same write path as Red,
 no threshold check.
 
-Frontmatter byte-shape MUST match internal/handoff.Render exactly: 8 keys
-in fixed order, all string values double-quoted with Go strconv.Quote-
-compatible escapes. The chain reader and resume probe parse this with
-line-prefix matching, so reordering or formatting drift breaks 4a's
-reader silently.
+"write doc + queue" is `fleet handoff-write` (cmd/fleet/handoff_write.go):
+the skill captures the tmux pane and hands identity + type + pane to Go,
+which renders the doc from durable coord state and enqueues the successor
+exactly as `fleet handoff <id>` does. No doc bytes are produced here.
 """
 from __future__ import annotations
 
@@ -45,13 +44,10 @@ import re
 import shutil
 import subprocess
 import sys
-import tempfile
 from datetime import datetime, timezone
-from pathlib import Path
 from typing import Any
 
 import health
-import ids
 
 HANDOFF_REQUESTED = "HANDOFF REQUESTED"
 MILESTONE = "MILESTONE"
@@ -106,80 +102,6 @@ TYPE_PRECOMPACT = "precompact"
 # documents this as the explicit Yellow→Red guarantee.
 _PENDING_TYPES = frozenset({TYPE_AUTO_YELLOW, TYPE_AUTO_RED, TYPE_PRECOMPACT})
 _COMMITTED_TYPES = frozenset({TYPE_AUTO_RED, TYPE_PRECOMPACT})
-
-# Canonical placeholder string for unfilled body sections. MUST match
-# internal/handoff.Placeholder byte-for-byte — alternate sentinels would
-# break 4a's chain reader. The em dash is U+2014.
-PLACEHOLDER = "_(operator-triggered handoff — fill in before resuming)_"
-
-# first_action(project) returns the body of the "First Action (auto)"
-# section for the given project.
-#
-# Native-RC model (rc-default-native-startup): replacement coords are
-# spawned with `--remote-control "fleet-coord-<id>-<project>"` baked
-# into their claude argv, so mobile / claude.ai pairing carries
-# through the handoff automatically. The section is a status note plus
-# the opt-out escape hatch (`fleet rc up <project>` after a prior
-# `fleet rc down`), followed by the load-bearing /coordinator
-# paragraph that resumes the per-project supervisor loop.
-#
-# Slash commands run in chat (not bash). NO bash block — the "exec
-# arbitrary bash from a markdown file" semantics stays gone (v0.12).
-#
-# Issue #31, #56 lineage. MUST stay byte-identical with
-# internal/handoff.FirstAction (Go side) — auto-handoffs (this file) and
-# operator-triggered handoffs (Go) emit the same doc shape, and
-# renderers are tested for byte-equality.
-
-
-def _escape_project_for_pgrep(s: str) -> str:
-    """Escape regex metacharacters in the project-scoped daemon prefix
-    when used as a pgrep -f pattern. ValidateProjectName allows
-    `[a-z0-9._-]`; among those only `.` is a regex metacharacter
-    (matches any char). Hyphens are special only inside character
-    classes; underscores are always literal.
-
-    Mirror of internal/handoff.escapeProjectForPgrep on the Go side —
-    keeping the two renderers byte-equal is a load-bearing invariant
-    (test_handoff.TestRenderByteGolden).
-    """
-    return s.replace(".", "\\.")
-
-
-def first_action(project: str) -> str:
-    """Return the native-RC status body for the "First Action (auto)"
-    handoff section.
-
-    Native model (rc-default-native-startup): the replacement coord is
-    spawned with `--remote-control` baked into its claude argv —
-    pairing carries through automatically; nothing to re-attach. The
-    body is a status note + the opt-out escape hatch, then the
-    /coordinator resume paragraph.
-
-    Empty project falls back to `<project>` placeholder text so legacy
-    records / tests produce well-formed output.
-
-    MUST stay byte-identical with internal/handoff.FirstAction (Go).
-    Both renderers are tested for byte-equality
-    (TestRender_SkillByteGolden + EXPECTED_GOLDEN here in Python).
-    """
-    display = project if project else "<project>"
-    return (
-        "Mobile/web pairing (Remote Control) is native: this replacement coord\n"
-        "was spawned with `--remote-control` baked into its claude argv, so\n"
-        "pairing carries through automatically — nothing to re-attach. If\n"
-        "pairing looks broken, check:\n"
-        "\n"
-        f"    fleet rc status {display}\n"
-        "\n"
-        f"If RC was disabled for this project (`fleet rc down {display}`),\n"
-        f"re-enable it with `fleet rc up {display}` — it takes effect on the\n"
-        "next coord spawn (`fleet handoff <coord-id>` respawns the live coord).\n"
-        "\n"
-        "Then run the slash command `/coordinator` (in the chat, not bash) to resume the per-project supervisor tick loop. The /coordinator skill is idempotent — running it on a coord session that already holds the NB-flock is a no-op (the flock skips when held), and on a non-coord lineage it exits cleanly with no project to supervise.\n"
-        "\n"
-        "Then continue with the sections below."
-    )
 
 # Modes where auto-handoff is disabled — see SKILL.md Handoff thresholds.
 THINKING_MODES = frozenset({"plan", "review", "fix"})
@@ -524,24 +446,19 @@ def emergency_trigger(payload: dict[str, Any], *, agent_id: str,
 
 def _do_handoff(record: dict[str, Any], session: str,
                 handoff_type: str, pct: float | None) -> bool:
-    """Capture the pane, render + write the doc, write the queue file.
+    """Capture the pane, then hand `fleet handoff-write` the doc + queue
+    write (the same Go path `fleet handoff <id>` uses).
 
     Returns True on success (both doc and queue durable on disk),
-    False on any I/O failure. Caller is responsible for clearing the
+    False on any failure. Caller is responsible for clearing the
     pre-marked handoff_type when this returns False — without that
     rollback, the agent stays pending forever and is_handoff_pending
     short-circuits every subsequent fire (no retry, no successor,
     wedged until manual repair).
-
-    Pure best-effort otherwise: any failure aborts the chain so we
-    don't leave a queue file pointing at a doc that didn't render.
     """
     agent_id = record["id"]
     task_id = record.get("task_id", "")
     project = record.get("project", "")
-    number = int(record.get("handoff_number", 1) or 1)
-    prev_raw = record.get("last_handoff_path")
-    prev_path: str | None = prev_raw if isinstance(prev_raw, str) and prev_raw else None
 
     # (a) FENCE (correctness — DESIGN-handoff-drain-storm-leak PR4 item 10a).
     # A COORD that was FENCED (a successor took over its lease) must NOT write
@@ -581,30 +498,14 @@ def _do_handoff(record: dict[str, Any], session: str,
         return True  # treat as success: the handoff is already happening
 
     recent = capture_recent(session)
-    # Issue #93 Phase B2: when the outgoing agent is a coord, harvest
-    # its in-flight worker subagents so the successor can re-dispatch
-    # them. Coord identity convention is task_id="coord-<project>"
-    # (mirrors internal/tui.coordTaskID). Best-effort: any read failure
-    # falls through to an empty list; the section still renders with
-    # the canonical placeholder body and the successor parser sees
-    # zero entries.
-    active_subagents = _collect_active_subagents(task_id, project)
-    # v0.8.3: capture open worker PRs via `gh pr list`. The successor
-    # coord re-spawns one shepherd per URL listed. Best-effort: gh
-    # missing / network failure / non-zero exit all produce [] and the
-    # `_(no open PRs)_` placeholder renders.
-    open_prs = _collect_open_prs()
-
-    new_id = ids.new_id()
-    ts = datetime.now(timezone.utc)
 
     # RE-FENCE immediately before publishing (codex PR4 [P1]). capture_recent
-    # + the subagent/PR collectors above take real wall-clock time (tmux
-    # capture, `gh` shellouts); a successor could take the lease in that
-    # window. Re-proving ownership right before write_doc/write_queue narrows
-    # the fenced-producer race to the minimum — without it a fenced old coord
-    # could still publish a zombie handoff doc/queue (the exact corruption
-    # this guard prevents). Coord producers only (workers don't hold the lease).
+    # takes real wall-clock time (tmux capture); a successor could take the
+    # lease in that window. Re-proving ownership right before the write
+    # narrows the fenced-producer race to the minimum — without it a fenced
+    # old coord could still publish a zombie handoff doc/queue (the exact
+    # corruption this guard prevents). Coord producers only (workers don't
+    # hold the lease).
     if is_coord and _producer_fenced(project):
         print(
             f"fleet-guard: handoff producer for coord agent {agent_id} "
@@ -614,35 +515,11 @@ def _do_handoff(record: dict[str, Any], session: str,
         )
         return False
 
-    doc_path = write_doc(
+    if not _write_handoff(
         agent_id=agent_id,
-        task_id=task_id,
-        project=project,
         handoff_type=handoff_type,
-        number=number,
-        prev_path=prev_path,
-        context_pct=pct,
-        ts=ts,
+        pct=pct,
         recent_activity=recent,
-        active_subagents=active_subagents,
-        open_prs=open_prs,
-    )
-    if not doc_path:
-        return False
-    # Fill the narrative sections (Key Decisions / Docs / Open Questions /
-    # Next Steps, plus checkpoint completions above the pane capture) from
-    # durable coord state via the Go collectors — the same brief `fleet
-    # handoff <id>` gives a successor. Must land BEFORE the queue write so
-    # the doc is complete by the time drain spawns the successor.
-    if is_coord:
-        _enrich_doc(doc_path)
-    if not write_queue(
-        old_id=agent_id,
-        new_id=new_id,
-        doc_path=doc_path,
-        project=project,
-        task_id=task_id,
-        ts=ts,
     ):
         return False
     # NOTE: drain is NOT kicked here. main._on_stop() still has tail
@@ -749,9 +626,7 @@ def _kick_drain() -> bool:
     3. Noop, return False. Queue file stays on disk and any later
        drain run consumes it. The skill must never raise.
     """
-    fleet_bin = os.environ.get("FLEET_BIN")
-    if not fleet_bin or not os.access(fleet_bin, os.X_OK):
-        fleet_bin = shutil.which("fleet")
+    fleet_bin = _fleet_binary()
     if not fleet_bin:
         return False
     try:
@@ -770,9 +645,94 @@ def _kick_drain() -> bool:
         return False
 
 
+def _fleet_binary() -> str | None:
+    """Resolve the fleet binary: `FLEET_BIN` (stamped by spawn) when it
+    points at an executable, else `fleet` on PATH, else None."""
+    fleet_bin = os.environ.get("FLEET_BIN")
+    if not fleet_bin or not os.access(fleet_bin, os.X_OK):
+        fleet_bin = shutil.which("fleet")
+    return fleet_bin or None
+
+
+# -- doc + queue write (delegated to Go) ------------------------------------
+
+# Coord identity convention: task_id == "coord-<project>" EXACTLY (mirrors
+# internal/spawn.IsCoordSpawn). A prefix match would misclassify a worker
+# whose slug merely starts with "coord-".
+_COORD_TASK_ID_PREFIX = "coord-"
+
+# `fleet handoff-write` reads coord-state.json / tasks.md / the checkpoint
+# and shells `gh pr list` (10s cap on the Go side); leave headroom so a
+# slow gh degrades inside Go (checkpoint fallback) rather than being
+# killed here and dropping the whole handoff.
+_HANDOFF_WRITE_TIMEOUT_S = 30.0
+
+
+def _write_handoff(*, agent_id: str, handoff_type: str, pct: float | None,
+                   recent_activity: str) -> str:
+    """Run `fleet handoff-write --agent <id> --type <t> [--context-pct <p>]`
+    with the pane capture on stdin. Go builds the doc (frontmatter, First
+    Action, Active Subagents, Open PRs, Key Decisions, Docs, Open Questions,
+    Next Steps from durable coord state; the capture appended to
+    Completed), writes it atomically, then writes the spawn-fresh queue
+    file — the same path `fleet handoff <id>` takes.
+
+    Returns the doc path on success, "" on any failure (no binary, too-old
+    binary without the subcommand, timeout, non-zero exit, unparseable
+    output). The queue file is the durable commit point and is written
+    by Go only after the doc is complete on disk."""
+    fleet_bin = _fleet_binary()
+    if not fleet_bin:
+        print(
+            f"fleet-guard: no fleet binary (FLEET_BIN / PATH); cannot write "
+            f"handoff for {agent_id}",
+            file=sys.stderr,
+        )
+        return ""
+    argv = [fleet_bin, "handoff-write", "--agent", agent_id, "--type", handoff_type]
+    if pct is not None:
+        argv += ["--context-pct", repr(float(pct))]
+    env = dict(os.environ)
+    env["FLEET_HOME"] = str(health.fleet_home())
+    try:
+        proc = subprocess.run(
+            argv,
+            input=recent_activity,
+            capture_output=True, text=True,
+            timeout=_HANDOFF_WRITE_TIMEOUT_S, check=False, env=env,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        print(
+            f"fleet-guard: handoff-write for {agent_id} did not run: {exc!r}",
+            file=sys.stderr,
+        )
+        return ""
+    if proc.returncode != 0:
+        detail = (proc.stderr or proc.stdout or "").strip()
+        print(
+            f"fleet-guard: handoff-write for {agent_id} failed "
+            f"(exit {proc.returncode}): {detail}",
+            file=sys.stderr,
+        )
+        return ""
+    try:
+        result = json.loads(proc.stdout)
+    except ValueError:
+        result = None
+    doc_path = result.get("doc_path") if isinstance(result, dict) else None
+    if not isinstance(doc_path, str) or not doc_path:
+        print(
+            f"fleet-guard: handoff-write for {agent_id} returned no doc_path: "
+            f"{proc.stdout.strip()!r}",
+            file=sys.stderr,
+        )
+        return ""
+    return doc_path
+
+
 def _clear_pending(agent_id: str) -> None:
     """Roll back a pre-marked handoff_type when _do_handoff failed
-    on the producer side (write_doc or write_queue I/O failure).
+    on the producer side (`fleet handoff-write` failure).
     Without this rollback, the next Stop fire sees pending=True and
     Red short-circuits forever. Best-effort — if this update_record
     also fails, the agent stays wedged, but at that point disk I/O
@@ -806,511 +766,6 @@ def _yellow_stuck_too_long(record: dict[str, Any]) -> bool:
         ts = ts.replace(tzinfo=timezone.utc)
     elapsed = (datetime.now(timezone.utc) - ts).total_seconds()
     return elapsed >= _YELLOW_RESEND_THRESHOLD_SEC
-
-
-# -- doc rendering -----------------------------------------------------------
-
-# Issue #93 Phase B2: Active Subagents section pinned by
-# internal/handoff.ActiveSubagentsNonePlaceholder. Both sides MUST
-# stay byte-identical — the Go byte-golden test (TestRender_SkillByteGolden)
-# and the Python golden (test_render_byte_golden) cross-verify this.
-ACTIVE_SUBAGENTS_NONE_PLACEHOLDER = "_(none)_"
-
-# v0.8.3: Open PRs snapshot section. Pinned by
-# internal/handoff.OpenPRsNonePlaceholder. Empty list / None renders the
-# placeholder; non-empty renders one bullet per PR.
-OPEN_PRS_NONE_PLACEHOLDER = "_(no open PRs)_"
-
-
-def write_doc(*, agent_id: str, task_id: str, project: str,
-              handoff_type: str, number: int, prev_path: str | None,
-              context_pct: float | None, ts: datetime,
-              recent_activity: str,
-              active_subagents: list[dict] | None = None,
-              open_prs: list[dict] | None = None) -> str:
-    """Render and atomically write the handoff doc. Returns the absolute
-    path on success, "" on failure. Body has the captured tmux pane in
-    `## Completed` (per plan D3 / SKILL.md) and Placeholder in the other
-    four sections — the operator or successor agent fills those before
-    resuming.
-
-    active_subagents (issue #93 Phase B2): list of in-flight worker
-    subagents the outgoing coord had spawned via the Agent tool. Each
-    entry is a dict with keys task, branch, phase, status, pr_url,
-    agent_id, subagent_id (any may be empty string). Defaults to None
-    which renders the `_(none)_` placeholder.
-
-    open_prs (v0.8.3): list of open worker PRs at handoff time. Each
-    entry is a dict with keys number, title, head, url. Defaults to
-    None which renders the `_(no open PRs)_` placeholder. The successor
-    coord re-spawns one shepherd until-loop per URL listed."""
-    path = _handoff_path(agent_id, ts)
-    body = _render_doc(
-        agent_id=agent_id,
-        task_id=task_id,
-        project=project,
-        handoff_type=handoff_type,
-        number=number,
-        prev_path=prev_path,
-        context_pct=context_pct,
-        ts=ts,
-        recent_activity=recent_activity,
-        active_subagents=active_subagents,
-        open_prs=open_prs,
-    )
-    if not _atomic_write_bytes(path, body):
-        return ""
-    return str(path)
-
-
-def _handoff_path(agent_id: str, ts: datetime) -> Path:
-    """Reproduce internal/state.HandoffPath: <id>-<UTC YYYYMMDD-HHMMSS>-<4hex>.md"""
-    stamp = ts.astimezone(timezone.utc).strftime("%Y%m%d-%H%M%S")
-    rnd = os.urandom(2).hex()
-    return health.fleet_home() / "handoffs" / f"{agent_id}-{stamp}-{rnd}.md"
-
-
-def _render_doc(*, agent_id: str, task_id: str, project: str,
-                handoff_type: str, number: int, prev_path: str | None,
-                context_pct: float | None, ts: datetime,
-                recent_activity: str,
-                active_subagents: list[dict] | None = None,
-                open_prs: list[dict] | None = None) -> bytes:
-    """Render the handoff doc bytes. Frontmatter ordering and quoting must
-    match internal/handoff.Render byte-for-byte.
-
-    active_subagents: optional list of {task, branch, phase, status,
-    pr_url, agent_id, subagent_id} dicts; missing keys default to "".
-    None or empty list renders the `_(none)_` placeholder body. See
-    internal/handoff/handoff.go renderActiveSubagents for the matching
-    Go-side shape.
-
-    open_prs (v0.8.3): optional list of {number, title, head, url}
-    dicts capturing open worker PRs at handoff time. None / empty list
-    renders the `_(no open PRs)_` placeholder. The successor coord
-    re-spawns one shepherd until-loop per URL."""
-    out: list[str] = ["---\n"]
-    out.append(f"agent_id: {_go_quote(agent_id)}\n")
-    out.append(f"task_id: {_go_quote(task_id)}\n")
-    out.append(f"project: {_go_quote(project)}\n")
-    if context_pct is None:
-        out.append("context_pct_at_handoff: null\n")
-    else:
-        out.append(
-            f"context_pct_at_handoff: {_format_float_go(context_pct)}\n",
-        )
-    if prev_path is None:
-        out.append("previous_handoff: null\n")
-    else:
-        out.append(f"previous_handoff: {_go_quote(prev_path)}\n")
-    out.append(f"handoff_number: {number}\n")
-    out.append(f"timestamp: {_go_quote(ts.astimezone(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ'))}\n")
-    out.append(f"handoff_type: {_go_quote(handoff_type)}\n")
-    out.append("---\n\n")
-
-    completed = recent_activity.strip() if recent_activity.strip() else PLACEHOLDER
-    out.append(f"## First Action (auto)\n{first_action(project)}\n\n")
-    out.append(f"## Completed\n{completed}\n\n")
-    out.append(f"## Key Decisions\n{PLACEHOLDER}\n\n")
-    out.append(f"## Docs (this session)\n{PLACEHOLDER}\n\n")
-    out.append(f"## Open Questions\n{PLACEHOLDER}\n\n")
-    out.append(f"## Next Steps (prioritized)\n{PLACEHOLDER}\n\n")
-    out.append(
-        f"## Active Subagents\n{_render_active_subagents(active_subagents)}\n\n",
-    )
-    out.append(
-        f"## Open PRs\n{_render_open_prs(open_prs)}\n",
-    )
-    return "".join(out).encode("utf-8")
-
-
-def _render_open_prs(prs: list[dict] | None) -> str:
-    """Mirror of internal/handoff.renderOpenPRs. Empty list / None
-    renders the canonical `_(no open PRs)_` placeholder; non-empty
-    renders one `- #<num> <title> — <head> — <url>` bullet per entry,
-    input order preserved.
-
-    Embedded newlines / carriage returns in titles are replaced with
-    spaces so each entry stays one physical line — the bullet-per-PR
-    contract must hold even when the upstream `gh pr list` returns a
-    title with embedded whitespace control codes.
-    """
-    if not prs:
-        return OPEN_PRS_NONE_PLACEHOLDER
-    lines: list[str] = []
-    for p in prs:
-        try:
-            num = int(p.get("number", 0) or 0)
-        except (TypeError, ValueError):
-            num = 0
-        title = str(p.get("title", "") or "").replace("\n", " ").replace("\r", " ")
-        head = str(p.get("head", "") or p.get("headRefName", "") or "")
-        url = str(p.get("url", "") or "")
-        lines.append(f"- #{num} {title} — {head} — {url}")
-    return "\n".join(lines)
-
-
-def _collect_open_prs() -> list[dict]:
-    """Run `gh pr list --state open --search "head:worker/" --json
-    number,title,headRefName,url` and return the parsed list. Best-
-    effort: any gh failure, missing binary, json parse error, or
-    timeout returns []. The handoff doc still writes; the
-    `_(no open PRs)_` placeholder body renders.
-
-    Search filter `head:worker/` matches any branch whose name starts
-    with `worker/` — the convention for fleet worker branches. Other
-    in-flight branches (release-prep, hotfix, etc.) are intentionally
-    excluded; the successor coord only re-spawns shepherds for
-    worker-track PRs.
-    """
-    gh = shutil.which("gh")
-    if not gh:
-        return []
-    try:
-        result = subprocess.run(
-            [
-                gh, "pr", "list",
-                "--state", "open",
-                "--search", "head:worker/",
-                "--json", "number,title,headRefName,url",
-            ],
-            capture_output=True, text=True, timeout=10, check=False,
-        )
-    except Exception:
-        return []
-    if result.returncode != 0 or not result.stdout.strip():
-        return []
-    try:
-        data = json.loads(result.stdout)
-    except json.JSONDecodeError:
-        return []
-    if not isinstance(data, list):
-        return []
-    out: list[dict] = []
-    for item in data:
-        if not isinstance(item, dict):
-            continue
-        out.append({
-            "number": item.get("number", 0),
-            "title": item.get("title", ""),
-            "head": item.get("headRefName", ""),
-            "url": item.get("url", ""),
-        })
-    return out
-
-
-def _render_active_subagents(subs: list[dict] | None) -> str:
-    """Mirror of internal/handoff.renderActiveSubagents. Empty list
-    renders the canonical placeholder; non-empty renders one
-    `- task=<q> branch=<q> phase=<q> status=<q> pr_url=<q> agent_id=<q>
-    subagent_id=<q>` line per entry (v0.8.3+ 7-field shape),
-    deterministic order (input order preserved).
-
-    Each value is Go-quoted via _go_quote so the Go-side parser's
-    strconv.Unquote round-trips unchanged. Missing keys default to
-    empty string — the field set is uniform across rows so the parser
-    can rely on positional layout if needed.
-
-    status + pr_url are sourced from tasks.md per slug
-    (_collect_active_subagents reads them); legacy callers passing
-    dicts without these keys get the empty-string default, which the
-    successor parser treats as "no PR yet, re-dispatch Agent" — the
-    pre-enrichment behavior.
-    """
-    if not subs:
-        return ACTIVE_SUBAGENTS_NONE_PLACEHOLDER
-    lines: list[str] = []
-    for s in subs:
-        task = str(s.get("task", "") or "")
-        branch = str(s.get("branch", "") or "")
-        phase = str(s.get("phase", "") or "")
-        status = str(s.get("status", "") or "")
-        pr_url = str(s.get("pr_url", "") or "")
-        agent_id = str(s.get("agent_id", "") or "")
-        subagent_id = str(s.get("subagent_id", "") or "")
-        lines.append(
-            "- task={t} branch={b} phase={p} status={st} pr_url={u} "
-            "agent_id={a} subagent_id={s}".format(
-                t=_go_quote(task), b=_go_quote(branch),
-                p=_go_quote(phase), st=_go_quote(status),
-                u=_go_quote(pr_url), a=_go_quote(agent_id),
-                s=_go_quote(subagent_id),
-            )
-        )
-    return "\n".join(lines)
-
-
-# Coord identity convention: task_id="coord-<project>" mirrors
-# internal/tui.coordTaskID. fleet-guard never ran on a coord pre-v0.2 so
-# this constant is new — adding it here keeps the lookup contained
-# (no additional cross-module imports).
-_COORD_TASK_ID_PREFIX = "coord-"
-
-
-def _collect_active_subagents(task_id: str, project: str) -> list[dict]:
-    """Read the coord's coord-state.json and return one active-subagent
-    entry per in-flight worker. Returns [] when the agent isn't a coord
-    or any read step fails (best-effort: handoff doc still writes).
-
-    Worker identity comes from coord-state.json's `worker_agent_ids`
-    map (slug → 8-hex Fleet agent_id; written by the coord skill on
-    every dispatch). subagent_id stays empty when the coord skill
-    hasn't captured it (Phase A's DISPATCH-block flow doesn't feed
-    captured Claude IDs back to the skill); in that case the
-    successor re-dispatches via the AgentID's inbox file regardless.
-
-    Phase (last-known) comes from each worker's
-    workers/<slug>/state.json. Missing/unparseable state.json yields
-    phase="" — the entry is still emitted because the agent_id
-    + slug are enough to drive a re-dispatch.
-
-    status + pr_url are sourced from tasks.md per slug (v0.8.3+: the
-    successor coord branches its re-dispatch decision on these so we
-    skip Agent re-dispatch when the worker already has an open PR in
-    review). Read failures default both to ""; the successor falls
-    back to "always re-dispatch Agent" — the pre-enrichment behavior.
-    """
-    if not task_id or not task_id.startswith(_COORD_TASK_ID_PREFIX):
-        return []
-    if not project:
-        return []
-    try:
-        coord_state_path = (
-            health.fleet_home() / "projects" / project / "coord-state.json"
-        )
-        with open(coord_state_path, "r", encoding="utf-8") as fh:
-            coord_state = json.load(fh)
-    except (FileNotFoundError, NotADirectoryError, PermissionError, json.JSONDecodeError):
-        return []
-    if not isinstance(coord_state, dict):
-        return []
-    worker_map = coord_state.get("worker_agent_ids", {})
-    if not isinstance(worker_map, dict):
-        return []
-    # Future-proof: a Phase B follow-up may add a parallel slug →
-    # claude-subagent-id map. Read it if present so an upgrade adds
-    # data without changing this function's signature.
-    subagent_map = coord_state.get("worker_subagent_ids", {})
-    if not isinstance(subagent_map, dict):
-        subagent_map = {}
-    # Read tasks.md once per handoff write, not once per slug — 50-task
-    # projects would re-scan the same file 50 times otherwise. The
-    # helper returns {slug: (status, pr_url)} with empty defaults for
-    # any unread slug.
-    task_meta = _read_tasks_meta(project)
-    out: list[dict] = []
-    # Sort by slug for deterministic doc shape — the byte-golden test
-    # cares about ordering, and operators reading the doc benefit from
-    # alphabetic stability across handoffs.
-    for slug in sorted(worker_map.keys()):
-        agent_id = worker_map.get(slug, "")
-        if not isinstance(slug, str) or not isinstance(agent_id, str):
-            continue
-        if not slug or not agent_id:
-            continue
-        phase = _read_worker_phase(project, slug)
-        sub_id = subagent_map.get(slug, "")
-        if not isinstance(sub_id, str):
-            sub_id = ""
-        status, pr_url = task_meta.get(slug, ("", ""))
-        out.append({
-            "task": slug,
-            "branch": f"worker/{slug}",
-            "phase": phase,
-            "status": status,
-            "pr_url": pr_url,
-            "agent_id": agent_id,
-            "subagent_id": sub_id,
-        })
-    return out
-
-
-def _read_tasks_meta(project: str) -> dict[str, tuple[str, str]]:
-    """Read ~/.fleet/projects/<project>/tasks.md and return
-    {slug: (status, pr_url)} for every parseable task block.
-
-    Minimal inline reader (no import of the coord skill's parse.py
-    because that lives in a sibling skill directory and fleet-guard
-    runs with sys.path scoped to its own folder). We only need two
-    bullet lines per task block — status + pr_url — and the bullet
-    grammar is simple enough that a hand-rolled scan beats pulling
-    in a yaml/regex dependency.
-
-    Tolerant: any I/O, parse, or schema failure returns {}; the
-    handoff doc renders with empty status/pr_url and the successor
-    falls back to pre-enrichment "always re-dispatch" semantics.
-    """
-    if not project:
-        return {}
-    try:
-        tasks_path = (
-            health.fleet_home() / "projects" / project / "tasks.md"
-        )
-        with open(tasks_path, "r", encoding="utf-8") as fh:
-            text = fh.read()
-    except (FileNotFoundError, NotADirectoryError, PermissionError, OSError):
-        return {}
-
-    out: dict[str, tuple[str, str]] = {}
-    current_slug: str | None = None
-    status = ""
-    pr_url = ""
-    # Bullet section ends on the first blank line OR the next H2/H3.
-    # Past that, we're in body sections that may contain `- ` markdown
-    # bullets unrelated to task fields. Track in_bullets to avoid
-    # mis-reading a Spec/Acceptance/Notes bullet as a task field.
-    in_bullets = False
-    for raw in text.replace("\r\n", "\n").split("\n"):
-        if raw.startswith("## task: "):
-            # Flush previous block.
-            if current_slug:
-                out[current_slug] = (status, pr_url)
-            current_slug = raw[len("## task: "):].strip() or None
-            status = ""
-            pr_url = ""
-            in_bullets = False
-            continue
-        if raw.startswith("## "):
-            # Non-task H2 (e.g. footer). Flush + stop scanning.
-            if current_slug:
-                out[current_slug] = (status, pr_url)
-                current_slug = None
-            break
-        if current_slug is None:
-            continue
-        stripped = raw.strip()
-        if stripped == "":
-            # First blank line after bullets closes the bullet section.
-            if in_bullets:
-                in_bullets = False
-            continue
-        if raw.startswith("### "):
-            # H3 (Spec/Acceptance/Notes) — no more task bullets.
-            in_bullets = False
-            continue
-        if raw.startswith("- ") and not in_bullets:
-            # First bullet seen for this block opens the bullet section.
-            in_bullets = True
-        if not in_bullets or not raw.startswith("- "):
-            continue
-        # Parse "- key: value" — split on first colon only.
-        body = raw[2:]
-        colon = body.find(":")
-        if colon < 0:
-            continue
-        key = body[:colon].strip()
-        val = body[colon + 1:].strip()
-        if val == "null":
-            val = ""
-        if key == "status":
-            status = val
-        elif key == "pr_url":
-            pr_url = val
-    # EOF flush.
-    if current_slug:
-        out[current_slug] = (status, pr_url)
-    return out
-
-
-def _read_worker_phase(project: str, slug: str) -> str:
-    """Read workers/<slug>/state.json and return its `phase` field.
-    Returns "" on any error; the active-subagents entry still renders
-    with empty phase, and the successor coord's re-dispatch logic
-    relies on WIP-file existence + tasks.md status — phase is triage
-    context only."""
-    try:
-        path = (
-            health.fleet_home() / "projects" / project /
-            "workers" / slug / "state.json"
-        )
-        with open(path, "r", encoding="utf-8") as fh:
-            data = json.load(fh)
-    except (FileNotFoundError, NotADirectoryError, PermissionError, json.JSONDecodeError):
-        return ""
-    if not isinstance(data, dict):
-        return ""
-    phase = data.get("phase", "")
-    return phase if isinstance(phase, str) else ""
-
-
-def _go_quote(s: str) -> str:
-    """Reproduce Go's strconv.Quote (used by fmt %q for strings) for the
-    ASCII subset the skill writes. Wraps in double quotes; escapes \\ " and
-    common control chars as Go does. Non-ASCII unicode passes through (Go's
-    %q without + flag), so the em dash in PLACEHOLDER round-trips intact.
-
-    Coverage is intentional, not exhaustive — agent_id is hex, task_id is
-    a slug, project is a name, paths are filesystem paths. The escape set
-    below covers all characters these fields contain in practice plus the
-    danger characters (quote, backslash, newline) that would otherwise
-    break the line-prefix-matching parsers in cmd/fleet/handoff.go.
-    """
-    out = ['"']
-    for ch in s:
-        cp = ord(ch)
-        if ch == '"':
-            out.append('\\"')
-        elif ch == '\\':
-            out.append('\\\\')
-        elif ch == '\n':
-            out.append('\\n')
-        elif ch == '\r':
-            out.append('\\r')
-        elif ch == '\t':
-            out.append('\\t')
-        elif cp < 0x20 or cp == 0x7f:
-            out.append(f'\\x{cp:02x}')
-        else:
-            out.append(ch)
-    out.append('"')
-    return "".join(out)
-
-
-def _format_float_go(v: float) -> str:
-    """Match Go's strconv.FormatFloat(v, 'f', -1, 64): whole numbers omit
-    the trailing '.0' (so 25.0 → '25'); fractional values use shortest
-    round-trip representation."""
-    if v == int(v):
-        return str(int(v))
-    s = repr(v)
-    if s.endswith(".0"):
-        return s[:-2]
-    return s
-
-
-# -- queue writing -----------------------------------------------------------
-
-def write_queue(*, old_id: str, new_id: str, doc_path: str,
-                project: str, task_id: str, ts: datetime) -> bool:
-    """Write ~/.fleet/queue/spawn-fresh-<old_id>.json. Returns True on
-    success.
-
-    Both new_agent_id AND new_session are pre-populated so the recovery
-    probe in cmd/fleet/handoff.go (iter-13 fix) can detect crashed-mid-
-    spawn replacements on retry. Omitting new_session makes the
-    `tmux has-session` check no-op and produces orphaned auto-handoffs.
-    """
-    payload = {
-        # v2 added DisableAutoResume for the per-handoff auto-resume
-        # override (codex review iter-12 P2). fleet-guard never sets
-        # an override — auto-handoff inherits from the outgoing record
-        # — but writing the current schema version means the consumer
-        # can distinguish v2 (auto-resume aware) from v1 (legacy, no
-        # auto-resume; consumer skips the prompt for safety).
-        "schema_version": 2,
-        "old_agent_id": old_id,
-        "handoff_doc": doc_path,
-        "project": project,
-        "task_id": task_id,
-        "new_agent_id": new_id,
-        "new_session": f"fleet-{new_id}",
-        "enqueued_at": ts.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-    }
-    path = health.fleet_home() / "queue" / f"spawn-fresh-{old_id}.json"
-    return _atomic_write_bytes(
-        path,
-        (json.dumps(payload, indent=2) + "\n").encode("utf-8"),
-    )
 
 
 # -- lease fence + storm back-off (PR4) --------------------------------------
@@ -1378,43 +833,6 @@ def _producer_fenced(project: str) -> bool:
     return True
 
 
-_ENRICH_TIMEOUT_S = 15.0
-
-
-def _enrich_doc(doc_path: str) -> bool:
-    """Shell `fleet handoff-enrich <doc>` to fill the narrative sections of a
-    just-written coord handoff doc from durable state (coord-state.json,
-    tasks.md, coord-checkpoint.md). Returns True iff the helper exited 0.
-    Best-effort: a missing/too-old binary, a timeout, or any non-zero exit
-    leaves the doc exactly as `write_doc` rendered it — the handoff still
-    proceeds."""
-    env = dict(os.environ)
-    env["FLEET_HOME"] = str(health.fleet_home())
-    fleet_bin = os.environ.get("FLEET_BIN")
-    if not fleet_bin or not os.access(fleet_bin, os.X_OK):
-        fleet_bin = shutil.which("fleet")
-    if not fleet_bin:
-        return False
-    try:
-        proc = subprocess.run(
-            [fleet_bin, "handoff-enrich", doc_path],
-            capture_output=True, text=True,
-            timeout=_ENRICH_TIMEOUT_S, check=False, env=env,
-        )
-    except (OSError, subprocess.SubprocessError):
-        return False
-    if proc.returncode != 0:
-        detail = (proc.stderr or proc.stdout or "").strip()
-        if not _lease_check_unknown_command(detail):
-            print(
-                f"fleet-guard: handoff-enrich for {doc_path} failed "
-                f"(exit {proc.returncode}): {detail}; doc left as rendered",
-                file=sys.stderr,
-            )
-        return False
-    return True
-
-
 def _handoff_already_in_flight(agent_id: str) -> bool:
     """True iff a handoff for agent_id is already enqueued (a successor is
     live / being spawned). The durable signal is the consumer queue file
@@ -1426,34 +844,4 @@ def _handoff_already_in_flight(agent_id: str) -> bool:
         qpath = health.fleet_home() / "queue" / f"spawn-fresh-{agent_id}.json"
         return qpath.exists()
     except OSError:
-        return False
-
-
-# -- atomic file write -------------------------------------------------------
-
-def _atomic_write_bytes(path: Path, data: bytes) -> bool:
-    """Same pattern as health._atomic_write_json: tempfile in the same
-    directory, fsync, os.replace. Returns False on any I/O failure."""
-    tmp_path: str | None = None
-    try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with tempfile.NamedTemporaryFile(
-            mode="wb",
-            dir=path.parent,
-            prefix=f".{path.name}.",
-            suffix=".tmp",
-            delete=False,
-        ) as tf:
-            tf.write(data)
-            tf.flush()
-            os.fsync(tf.fileno())
-            tmp_path = tf.name
-        os.replace(tmp_path, path)
-        return True
-    except Exception:
-        if tmp_path:
-            try:
-                os.unlink(tmp_path)
-            except Exception:
-                pass
         return False

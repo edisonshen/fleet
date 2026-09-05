@@ -10,6 +10,7 @@ from __future__ import annotations
 import io
 import json
 import os
+import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -17,6 +18,26 @@ from typing import Any
 import pytest
 
 import main as fleet_main
+
+_REAL_POPEN = subprocess.Popen
+
+
+def _record_drain_kicks(monkeypatch: pytest.MonkeyPatch) -> list[list[str]]:
+    """Capture `fleet drain` kicks without swallowing every subprocess:
+    `subprocess.run` (tmux capture, `fleet handoff-write`) is built on
+    Popen and must still reach the real one."""
+    import handoff as fleet_handoff  # noqa: WPS433
+
+    calls: list[list[str]] = []
+
+    def _popen(argv: Any, *rest: Any, **kwargs: Any) -> Any:
+        if isinstance(argv, (list, tuple)) and list(argv)[-1:] == ["drain"]:
+            calls.append(list(argv))
+            return object()
+        return _REAL_POPEN(argv, *rest, **kwargs)
+
+    monkeypatch.setattr(fleet_handoff.subprocess, "Popen", _popen)
+    return calls
 
 
 @pytest.fixture(autouse=True)
@@ -261,9 +282,7 @@ class TestStopHook:
         (inbox_dir / "agent7777.md").write_text("ship by friday",
                                                 encoding="utf-8")
 
-        popen_calls: list[Any] = []
-        monkeypatch.setattr(fleet_handoff.subprocess, "Popen",
-                            lambda argv, **_: popen_calls.append(argv) or object())
+        popen_calls = _record_drain_kicks(monkeypatch)
         monkeypatch.setattr(fleet_handoff.shutil, "which",
                             lambda name: "/usr/local/bin/fleet"
                             if name == "fleet" else None)
@@ -319,9 +338,7 @@ class TestPreCompactHook:
         import handoff as fleet_handoff  # noqa: WPS433
 
         _seed_record(fleet_home_tmp)
-        popen_calls: list[Any] = []
-        monkeypatch.setattr(fleet_handoff.subprocess, "Popen",
-                            lambda argv, **_: popen_calls.append(argv) or object())
+        popen_calls = _record_drain_kicks(monkeypatch)
         monkeypatch.setattr(fleet_handoff.shutil, "which",
                             lambda name: "/usr/local/bin/fleet"
                             if name == "fleet" else None)

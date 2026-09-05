@@ -50,11 +50,18 @@ def _record(agent_id: str = "abc12345", project: str = "myproj",
 
 
 def _stub_collectors(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Neuter the slow/external side-collectors so _do_handoff's WRITE
-    behavior is what's under test, not pane capture or gh."""
+    """Neuter the tmux pane capture so _do_handoff's fence / back-off
+    decision is what's under test, not the capture."""
     monkeypatch.setattr(handoff, "capture_recent", lambda *_a, **_k: "recent")
-    monkeypatch.setattr(handoff, "_collect_active_subagents", lambda *_a, **_k: [])
-    monkeypatch.setattr(handoff, "_collect_open_prs", lambda *_a, **_k: [])
+
+
+def _record_writes(monkeypatch: pytest.MonkeyPatch, doc: str) -> dict[str, str]:
+    """Stub `fleet handoff-write` (the Go doc + queue writer) to a recorder
+    so the tests assert on WHETHER the producer publishes, not on bytes."""
+    wrote: dict[str, str] = {}
+    monkeypatch.setattr(handoff, "_write_handoff",
+                        lambda **k: wrote.setdefault("doc", doc) or doc)
+    return wrote
 
 
 # ---------- (a) fence ----------
@@ -65,8 +72,8 @@ def test_fenced_producer_refuses_to_write(
 ) -> None:
     _stub_collectors(monkeypatch)
     monkeypatch.setattr(handoff, "_producer_fenced", lambda _p: True)
-    # Sentinel: prove write_doc is never reached.
-    monkeypatch.setattr(handoff, "write_doc", lambda **_k: pytest.fail(
+    # Sentinel: prove the doc write is never reached.
+    monkeypatch.setattr(handoff, "_write_handoff", lambda **_k: pytest.fail(
         "a fenced producer must NOT write a handoff doc"))
 
     ok = handoff._do_handoff(_record(), "fleet-abc12345", handoff.TYPE_AUTO_YELLOW, 55.0)
@@ -80,10 +87,7 @@ def test_unfenced_producer_proceeds(
 ) -> None:
     _stub_collectors(monkeypatch)
     monkeypatch.setattr(handoff, "_producer_fenced", lambda _p: False)
-    wrote = {}
-    monkeypatch.setattr(handoff, "write_doc",
-                        lambda **k: wrote.setdefault("doc", "/tmp/doc.md") or "/tmp/doc.md")
-    monkeypatch.setattr(handoff, "write_queue", lambda **k: True)
+    wrote = _record_writes(monkeypatch, "/tmp/doc.md")
 
     ok = handoff._do_handoff(_record(), "fleet-abc12345", handoff.TYPE_AUTO_YELLOW, 55.0)
     assert ok is True
@@ -103,10 +107,7 @@ def test_worker_handoff_not_fenced_by_coord_lease(
     fenced_calls = []
     monkeypatch.setattr(handoff, "_producer_fenced",
                         lambda p: fenced_calls.append(p) or True)
-    wrote = {}
-    monkeypatch.setattr(handoff, "write_doc",
-                        lambda **k: wrote.setdefault("doc", "/w") or "/w")
-    monkeypatch.setattr(handoff, "write_queue", lambda **k: True)
+    wrote = _record_writes(monkeypatch, "/w")
 
     worker = _record(agent_id="w0000001", task_id="some-worker-task")
     ok = handoff._do_handoff(worker, "fleet-w0000001", handoff.TYPE_AUTO_YELLOW, 55.0)
@@ -125,8 +126,7 @@ def test_coord_prefix_worker_not_treated_as_coord(
     fenced_calls = []
     monkeypatch.setattr(handoff, "_producer_fenced",
                         lambda p: fenced_calls.append(p) or True)
-    monkeypatch.setattr(handoff, "write_doc", lambda **k: "/w")
-    monkeypatch.setattr(handoff, "write_queue", lambda **k: True)
+    _record_writes(monkeypatch, "/w")
     # task_id "coord-helper" with project "myproj" -> NOT "coord-myproj".
     worker = _record(agent_id="w0000002", task_id="coord-helper", project="myproj")
     ok = handoff._do_handoff(worker, "fleet-w0000002", handoff.TYPE_AUTO_YELLOW, 55.0)
@@ -145,7 +145,7 @@ def test_backoff_when_handoff_in_flight(
     # A queue file already enqueued for this agent -> a successor is live.
     qf = fleet_home_tmp / "queue" / "spawn-fresh-abc12345.json"
     qf.write_text(json.dumps({"old_agent_id": "abc12345"}))
-    monkeypatch.setattr(handoff, "write_doc", lambda **_k: pytest.fail(
+    monkeypatch.setattr(handoff, "_write_handoff", lambda **_k: pytest.fail(
         "must NOT write doc #2 while a handoff is already in flight (storm)"))
 
     ok = handoff._do_handoff(_record(), "fleet-abc12345", handoff.TYPE_AUTO_YELLOW, 55.0)
@@ -160,10 +160,7 @@ def test_no_backoff_when_no_queue_file(
 ) -> None:
     _stub_collectors(monkeypatch)
     monkeypatch.setattr(handoff, "_producer_fenced", lambda _p: False)
-    wrote = {}
-    monkeypatch.setattr(handoff, "write_doc",
-                        lambda **k: wrote.setdefault("doc", "/d") or "/d")
-    monkeypatch.setattr(handoff, "write_queue", lambda **k: True)
+    wrote = _record_writes(monkeypatch, "/d")
     ok = handoff._do_handoff(_record(), "fleet-abc12345", handoff.TYPE_AUTO_YELLOW, 55.0)
     assert ok is True
     assert wrote.get("doc") == "/d", "no in-flight handoff -> must write the first doc"
