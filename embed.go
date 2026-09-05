@@ -25,7 +25,7 @@ import (
 // explicitly so a stray new file (e.g., __pycache__, editor backups)
 // doesn't silently bloat the binary.
 //
-//go:embed skills/fleet-guard/SKILL.md skills/fleet-guard/main.py skills/fleet-guard/health.py skills/fleet-guard/handoff.py skills/fleet-guard/inbox.py skills/fleet-guard/ids.py skills/fleet-guard/jetsam.py skills/fleet-guard/coordguard.py
+//go:embed skills/fleet-guard/SKILL.md skills/fleet-guard/main.py skills/fleet-guard/health.py skills/fleet-guard/handoff.py skills/fleet-guard/inbox.py skills/fleet-guard/jetsam.py skills/fleet-guard/coordguard.py
 var fleetGuardRaw embed.FS
 
 // coordinator runtime files. Mirrors fleet-guard's explicit-file

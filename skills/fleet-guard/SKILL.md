@@ -99,7 +99,15 @@ EVERY OTHER field (`schema_version`, `id`, `pid`, `tmux_session`, `engine`, `rol
 
 ### `~/.fleet/handoffs/<id>-<utc-iso>-<short-uuid>.md` — handoff doc
 
-Frontmatter shape MUST match `internal/handoff.Render` byte-for-byte. Order and quoting matter — the chain reader and the resume probe parse this with simple line-prefix matching, not a full YAML parser:
+The skill does NOT render this file. It runs
+
+```
+fleet handoff-write --agent <id> --type auto-yellow|auto-red|precompact [--context-pct <float>]
+```
+
+with the tmux pane capture on stdin, and the Go binary builds the whole doc via the SAME `handoff.NewStub` → `handoff.EnrichManualDoc` (coord only) → `handoff.Render` path that `fleet handoff <id>` uses, writes it atomically, then writes the spawn-fresh queue file. One renderer, one set of collectors — there is nothing in Python that can drift from the manual path. `FLEET_BIN` (stamped by spawn) is preferred, then `fleet` on PATH. If `FLEET_BIN` predates `handoff-write` (its response is an unknown-command error — nothing was written) the skill retries once with a *distinct* `fleet` from PATH; any other non-zero exit is final, since a doc/queue may already be on disk. If no binary exists or the final attempt exits non-zero / prints no `doc_path`, the skill treats the handoff as failed and rolls back `handoff_type` so the next fire retries. For coord agents, Go re-proves the coordinator lease (same ancestry check as `fleet lease-check`) immediately before the queue file is written — enrichment can take up to 10s (`gh pr list`), and a successor taking the flock in that window must not receive a zombie handoff; workers hold no lease and skip this check.
+
+For reference, the frontmatter `internal/handoff.Render` produces (the chain reader and the resume probe parse this with simple line-prefix matching, not a full YAML parser):
 
 ```
 ---
@@ -129,9 +137,11 @@ handoff_type: "auto-yellow" | "auto-red" | "precompact"
 <body>
 ```
 
-All string values are double-quoted (Go `%q` form) so YAML metacharacters in operator-supplied values (colons, newlines) cannot inject. The skill's Python writer reproduces this exactly.
+All string values are double-quoted (Go `%q` form) so YAML metacharacters in operator-supplied values (colons, newlines) cannot inject.
 
-Body sections that the skill cannot populate use the canonical placeholder string from `internal/handoff.go:Placeholder`: `_(operator-triggered handoff — fill in before resuming)_`. Do NOT invent alternate sentinels — 4a's chain reader and any future loader recognize only this exact string. Per plan D3, the tmux-pane capture from `capture-pane -t <session>` is dumped into one of the existing sections (e.g., "Completed") rather than added as a new section or marked with a custom placeholder.
+Body sections Go cannot populate use the canonical placeholder string from `internal/handoff.go:Placeholder`: `_(operator-triggered handoff — fill in before resuming)_`. Do NOT invent alternate sentinels — 4a's chain reader and any future loader recognize only this exact string. Per plan D3, the tmux-pane capture from `capture-pane -t <session>` is appended to "Completed" (below any checkpoint completions) rather than added as a new section or marked with a custom placeholder.
+
+For COORD handoffs (exact `task_id == "coord-" + project`) Active Subagents, Open PRs, Key Decisions, Docs (this session), Open Questions and Next Steps are filled from `coord-state.json` / `workers/*/state.json` / `tasks.md` / `coord-checkpoint.md` / `gh pr list` by `handoff.EnrichManualDoc` — the collectors `fleet handoff <id>` uses. Worker handoffs are never enriched: a worker must not resume against project-wide coord state. Enrichment is best-effort — missing or malformed state degrades a section to its placeholder, never fails the handoff.
 
 ### `~/.fleet/queue/spawn-fresh-<old_id>.json` — drain trigger
 

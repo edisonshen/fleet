@@ -32,10 +32,9 @@ import (
 //     archived; verify the queue file is gone.
 //
 // What this catches that unit tests don't:
-//   - byte-for-byte mismatch between Python's _render_doc and Go's
-//     handoff.Render (both have golden tests, but they could drift
-//     individually without paired regression unless the skill output
-//     is fed through a real drain).
+//   - the skill's `fleet handoff-write` shellout (binary resolution,
+//     argv, stdin capture, JSON result) producing a doc + queue file
+//     that a real drain actually consumes.
 //   - sys.path / import resolution in main.py when invoked from a
 //     real install path (not the in-tree dev location).
 //   - Python version compatibility on the operator's machine.
@@ -48,6 +47,9 @@ func TestSmoke_AutoHandoffEndToEnd(t *testing.T) {
 		t.Skip("python3 not available; skipping smoke test")
 	}
 	requireTmux(t)
+	// The skill delegates the doc + queue write to `fleet handoff-write`;
+	// spawn stamps FLEET_BIN into every agent's env, so do the same here.
+	fleetBin := buildFleetBinary(t)
 
 	// Sandboxed homes so the test can't pollute the operator's real
 	// ~/.fleet or ~/.claude.
@@ -113,6 +115,7 @@ func TestSmoke_AutoHandoffEndToEnd(t *testing.T) {
 	cmd.Env = append(os.Environ(),
 		"FLEET_HOME="+fleetHome,
 		"FLEET_AGENT_ID="+old.ID,
+		"FLEET_BIN="+fleetBin,
 	)
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout

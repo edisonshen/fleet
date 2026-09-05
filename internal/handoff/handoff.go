@@ -199,20 +199,47 @@ type ActiveSubagent struct {
 // LastHandoffPath; the caller (cmd/fleet/handoff.go) reads them from
 // the agent record before calling here.
 func NewManualStub(agentID, taskID, project string, number int, prev *string, ts time.Time) *Doc {
+	return NewStub(TypeManual, agentID, taskID, project, number, prev, nil, ts)
+}
+
+// NewStub builds a Doc of the given handoff type with all five body
+// sections set to Placeholder. Every producer (operator `fleet handoff`,
+// fleet-guard's `fleet handoff-write`) starts here and then fills the
+// sections from durable state via EnrichManualDoc, so a doc's shape
+// never depends on which path triggered the handoff.
+func NewStub(typ, agentID, taskID, project string, number int, prev *string, contextPct *float64, ts time.Time) *Doc {
 	return &Doc{
-		AgentID:       agentID,
-		TaskID:        taskID,
-		Project:       project,
-		Type:          TypeManual,
-		Number:        number,
-		PreviousPath:  prev,
-		Timestamp:     ts.UTC(),
-		Completed:     Placeholder,
-		KeyDecisions:  Placeholder,
-		SessionDocs:   Placeholder,
-		OpenQuestions: Placeholder,
-		NextSteps:     Placeholder,
+		AgentID:             agentID,
+		TaskID:              taskID,
+		Project:             project,
+		Type:                typ,
+		Number:              number,
+		PreviousPath:        prev,
+		ContextPctAtHandoff: contextPct,
+		Timestamp:           ts.UTC(),
+		Completed:           Placeholder,
+		KeyDecisions:        Placeholder,
+		SessionDocs:         Placeholder,
+		OpenQuestions:       Placeholder,
+		NextSteps:           Placeholder,
 	}
+}
+
+// AppendRecentActivity adds the outgoing agent's tmux pane capture to
+// Completed. Durable checkpoint completions (set by EnrichManualDoc)
+// stay on top; the raw capture follows as the freshest, least-structured
+// evidence of what the agent was doing at the instant of handoff. A blank
+// capture leaves the section untouched.
+func AppendRecentActivity(d *Doc, recent string) {
+	recent = strings.TrimSpace(recent)
+	if recent == "" {
+		return
+	}
+	if d.Completed == "" || d.Completed == Placeholder {
+		d.Completed = recent
+		return
+	}
+	d.Completed += "\n\n" + recent
 }
 
 // FirstAction is the body of the "First Action (auto)" section that

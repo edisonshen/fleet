@@ -275,7 +275,7 @@ func TestCoordStateFresh_MissingFileReturnsFalse(t *testing.T) {
 // until-loops for in-review workers. Without this, handoff_resume.py
 // skips re-dispatching in-review workers (their status says skip)
 // AND there's no shepherd hint either — the PR is dropped on the floor.
-// Mirrors skills/fleet-guard/handoff.py:_collect_open_prs.
+// Same query as handoff.CollectOpenPRs.
 func TestWriteRecoveryHandoffDoc_PopulatesOpenPRsFromGH(t *testing.T) {
 	root := t.TempDir()
 	t.Setenv("FLEET_HOME", root)

@@ -1,16 +1,13 @@
 """Tests for skills/fleet-guard/handoff.py.
 
-The byte-shape of the rendered doc is the load-bearing contract. A drift
-here breaks 4a's chain reader silently. Two-sided verification:
-
-- The Python golden (test_render_byte_golden) pins the exact bytes Python
-  produces.
-- A Go test in internal/handoff (added in this PR) pins the same bytes
-  from Render. If either drifts, both must change.
-
-Other tests cover the state machine (maybe_trigger / emergency_trigger)
-with monkey-patched tmux + a seeded record, plus _go_quote / _format_float
-edge cases. See test_health.py for the FLEET_HOME redirect fixture.
+The doc + queue write is delegated to `fleet handoff-write` (Go), so there
+is no Python renderer to pin — internal/handoff owns the byte-shape and
+its own goldens. The state-machine tests here (maybe_trigger /
+emergency_trigger) run against the REAL binary built from this checkout
+(conftest `fleet_bin` → FLEET_BIN) with monkey-patched tmux + a seeded
+record, so they assert on the bytes Go actually writes. TestWriteHandoff
+covers the subprocess boundary itself. See test_health.py for the
+FLEET_HOME redirect fixture.
 """
 from __future__ import annotations
 
@@ -26,7 +23,6 @@ import pytest
 
 import handoff
 import health
-import ids
 
 
 # -- shared fixtures ---------------------------------------------------------
@@ -89,16 +85,23 @@ def _transcript(tmp_path: Path, *, model: str = "claude-sonnet-4-6",
     return path
 
 
+_REAL_SUBPROCESS_RUN = subprocess.run
+
+
 class _FakeTmux:
     """Stand-in for subprocess.run that drives tmux capture-pane output.
     Test sets `output` (full pane) and asserts on `calls` to verify the
-    skill invoked tmux with the right session / -S flag."""
+    skill invoked tmux with the right session / -S flag. Anything that is
+    NOT tmux (the `fleet handoff-write` shellout) passes through to the
+    real subprocess.run so the Go binary does the doc + queue write."""
     def __init__(self) -> None:
         self.output: str = ""
         self.returncode: int = 0
         self.calls: list[list[str]] = []
 
     def __call__(self, cmd, **kwargs):  # mimics subprocess.run signature
+        if os.path.basename(cmd[0]) != "tmux":
+            return _REAL_SUBPROCESS_RUN(cmd, **kwargs)
         self.calls.append(list(cmd))
         return subprocess.CompletedProcess(
             args=cmd, returncode=self.returncode,
@@ -111,593 +114,6 @@ def fake_tmux(monkeypatch: pytest.MonkeyPatch) -> _FakeTmux:
     fake = _FakeTmux()
     monkeypatch.setattr(handoff.subprocess, "run", fake)
     return fake
-
-
-# -- _go_quote ---------------------------------------------------------------
-
-class TestGoQuote:
-    def test_simple_ascii(self) -> None:
-        assert handoff._go_quote("hello") == '"hello"'
-
-    def test_empty(self) -> None:
-        assert handoff._go_quote("") == '""'
-
-    def test_quote_escaped(self) -> None:
-        assert handoff._go_quote('foo"bar') == r'"foo\"bar"'
-
-    def test_backslash_escaped(self) -> None:
-        assert handoff._go_quote("foo\\bar") == r'"foo\\bar"'
-
-    def test_newline_escaped(self) -> None:
-        assert handoff._go_quote("foo\nbar") == r'"foo\nbar"'
-
-    def test_em_dash_passes_through(self) -> None:
-        # Go's %q (without +) leaves printable Unicode unescaped. The
-        # canonical PLACEHOLDER contains an em dash and MUST round-trip.
-        assert handoff._go_quote("a — b") == '"a — b"'
-
-    def test_yaml_metacharacter_quoted_safely(self) -> None:
-        # Operator-supplied paths can contain colons. Quoting with Go %q
-        # makes them YAML-flow-scalar-safe, which is the whole point of
-        # handoff.go's quoting strategy.
-        out = handoff._go_quote("/path/with: colon")
-        assert out == '"/path/with: colon"'
-
-
-# -- _format_float_go --------------------------------------------------------
-
-class TestFormatFloatGo:
-    @pytest.mark.parametrize("value,expected", [
-        (0.0, "0"),
-        (50.0, "50"),
-        (100.0, "100"),
-        (25.17, "25.17"),
-        (0.5, "0.5"),
-        (49.99, "49.99"),
-        (70.001, "70.001"),
-    ])
-    def test_matches_go_format(self, value: float, expected: str) -> None:
-        assert handoff._format_float_go(value) == expected
-
-
-# -- _render_doc byte golden -------------------------------------------------
-
-# This golden MUST match what internal/handoff.Render produces for the same
-# inputs. A paired Go test (handoff_test.go:TestRender_SkillByteGolden) asserts
-# the same bytes from the Go side. If either drifts, both fail.
-EXPECTED_GOLDEN = (
-    b"---\n"
-    b'agent_id: "abcd1234"\n'
-    b'task_id: "demo-task"\n'
-    b'project: "myproj"\n'
-    b"context_pct_at_handoff: 50\n"
-    b'previous_handoff: "/home/op/.fleet/handoffs/prev.md"\n'
-    b"handoff_number: 2\n"
-    b'timestamp: "2026-04-28T12:34:56Z"\n'
-    b'handoff_type: "auto-yellow"\n'
-    b"---\n"
-    b"\n"
-    b"## First Action (auto)\n"
-    b"Mobile/web pairing (Remote Control) is native: this replacement coord\n"
-    b"was spawned with `--remote-control` baked into its claude argv, so\n"
-    b"pairing carries through automatically \xe2\x80\x94 nothing to re-attach. If\n"
-    b"pairing looks broken, check:\n"
-    b"\n"
-    b"    fleet rc status myproj\n"
-    b"\n"
-    b"If RC was disabled for this project (`fleet rc down myproj`),\n"
-    b"re-enable it with `fleet rc up myproj` \xe2\x80\x94 it takes effect on the\n"
-    b"next coord spawn (`fleet handoff <coord-id>` respawns the live coord).\n"
-    b"\n"
-    b"Then run the slash command `/coordinator` (in the chat, not bash) to resume the per-project supervisor tick loop. The /coordinator skill is idempotent \xe2\x80\x94 running it on a coord session that already holds the NB-flock is a no-op (the flock skips when held), and on a non-coord lineage it exits cleanly with no project to supervise.\n"
-    b"\n"
-    b"Then continue with the sections below.\n"
-    b"\n"
-    b"## Completed\n"
-    b"Wrote tests for foo\n"
-    b"\n"
-    b"## Key Decisions\n"
-    b"_(operator-triggered handoff \xe2\x80\x94 fill in before resuming)_\n"
-    b"\n"
-    b"## Docs (this session)\n"
-    b"_(operator-triggered handoff \xe2\x80\x94 fill in before resuming)_\n"
-    b"\n"
-    b"## Open Questions\n"
-    b"_(operator-triggered handoff \xe2\x80\x94 fill in before resuming)_\n"
-    b"\n"
-    b"## Next Steps (prioritized)\n"
-    b"_(operator-triggered handoff \xe2\x80\x94 fill in before resuming)_\n"
-    b"\n"
-    b"## Active Subagents\n"
-    b"_(none)_\n"
-    b"\n"
-    b"## Open PRs\n"
-    b"_(no open PRs)_\n"
-)
-
-
-class TestRenderByteGolden:
-    def test_byte_for_byte_match(self) -> None:
-        ts = datetime(2026, 4, 28, 12, 34, 56, tzinfo=timezone.utc)
-        got = handoff._render_doc(
-            agent_id="abcd1234",
-            task_id="demo-task",
-            project="myproj",
-            handoff_type="auto-yellow",
-            number=2,
-            prev_path="/home/op/.fleet/handoffs/prev.md",
-            context_pct=50.0,
-            ts=ts,
-            recent_activity="Wrote tests for foo",
-        )
-        assert got == EXPECTED_GOLDEN, _diff_first_byte(got, EXPECTED_GOLDEN)
-
-    def test_null_context_pct_and_prev_path(self) -> None:
-        ts = datetime(2026, 4, 28, 12, 34, 56, tzinfo=timezone.utc)
-        got = handoff._render_doc(
-            agent_id="abcd1234",
-            task_id="demo-task",
-            project="myproj",
-            handoff_type="precompact",
-            number=1,
-            prev_path=None,
-            context_pct=None,
-            ts=ts,
-            recent_activity="",
-        )
-        assert b"context_pct_at_handoff: null\n" in got
-        assert b"previous_handoff: null\n" in got
-        # Empty recent_activity falls back to the canonical placeholder so
-        # the body never has a literal blank section.
-        assert handoff.PLACEHOLDER.encode("utf-8") in got
-
-    def test_first_action_carries_native_rc_status_note(self) -> None:
-        """Native contract: the First Action body is a status note —
-        pairing is native at coord spawn — with `fleet rc status` as
-        the diagnostic and `fleet rc up` as the re-enable path. The
-        retired `fleet rc connect` must not reappear. The byte-golden
-        above covers exact-byte verification; this test gives a
-        focused regression signal.
-        """
-        body = handoff.first_action("myproj").encode("utf-8")
-        for want in (
-            b"--remote-control",
-            b"fleet rc status myproj",
-            b"fleet rc up myproj",
-        ):
-            assert want in body, f"first_action body missing {want!r}"
-        assert b"fleet rc connect" not in body
-        # Also confirm the rendered doc carries it.
-        ts = datetime(2026, 4, 28, 12, 34, 56, tzinfo=timezone.utc)
-        got = handoff._render_doc(
-            agent_id="abcd1234",
-            task_id="demo-task",
-            project="myproj",
-            handoff_type="auto-yellow",
-            number=1,
-            prev_path=None,
-            context_pct=50.0,
-            ts=ts,
-            recent_activity="x",
-        )
-        assert b"fleet rc status myproj" in got
-
-    def test_first_action_instructs_coordinator_run(self) -> None:
-        """handoff-coord-spawn-prompt-fix regression: first_action
-        must include a /coordinator slash command paragraph so
-        replacement coord sessions resume the supervisor tick loop.
-        Without it, ~/.fleet/projects/<p>/.locks/coordinator.lock
-        retains the predecessor's 8-hex agent ID and the TUI
-        dashboard's project row shows the OLD coord's name.
-        """
-        body = handoff.first_action("myproj")
-        want = b"Then run the slash command `/coordinator`"
-        assert want in body.encode("utf-8")
-        # Idempotency note must accompany the instruction so a
-        # successor agent inspecting the doc understands why running
-        # /coordinator on a non-coord lineage is safe.
-        assert b"idempotent" in body.encode("utf-8")
-        # Native model: there is no /remote-control instruction left in
-        # the body — pairing is attached at spawn via the baked-in
-        # --remote-control flag, so the old ordering pin is moot.
-        assert "`/remote-control`" not in body
-
-
-class TestActiveSubagentsRender:
-    """Issue #93 Phase B2: the Active Subagents section shape MUST
-    match internal/handoff.renderActiveSubagents byte-for-byte. The
-    Go-side parser (handoff.ParseActiveSubagents) round-trips against
-    this exact format, so any drift breaks coord-handoff continuity."""
-
-    def test_none_renders_placeholder(self) -> None:
-        ts = datetime(2026, 4, 28, 12, 34, 56, tzinfo=timezone.utc)
-        got = handoff._render_doc(
-            agent_id="abcd1234", task_id="t", project="p",
-            handoff_type="auto-yellow", number=1, prev_path=None,
-            context_pct=None, ts=ts, recent_activity="",
-            active_subagents=None,
-        )
-        assert b"## Active Subagents\n_(none)_\n" in got
-
-    def test_empty_list_renders_placeholder(self) -> None:
-        ts = datetime(2026, 4, 28, 12, 34, 56, tzinfo=timezone.utc)
-        got = handoff._render_doc(
-            agent_id="abcd1234", task_id="t", project="p",
-            handoff_type="auto-yellow", number=1, prev_path=None,
-            context_pct=None, ts=ts, recent_activity="",
-            active_subagents=[],
-        )
-        assert b"## Active Subagents\n_(none)_\n" in got
-
-    def test_single_entry(self) -> None:
-        ts = datetime(2026, 4, 28, 12, 34, 56, tzinfo=timezone.utc)
-        got = handoff._render_doc(
-            agent_id="abcd1234", task_id="t", project="p",
-            handoff_type="auto-yellow", number=1, prev_path=None,
-            context_pct=None, ts=ts, recent_activity="",
-            active_subagents=[{
-                "task": "fix-foo",
-                "branch": "worker/fix-foo",
-                "phase": "tdd-green",
-                "status": "in-progress",
-                "pr_url": "",
-                "agent_id": "11112222",
-                "subagent_id": "claude-sub-1",
-            }],
-        )
-        line = (
-            b'- task="fix-foo" branch="worker/fix-foo" phase="tdd-green"'
-            b' status="in-progress" pr_url="" '
-            b'agent_id="11112222" subagent_id="claude-sub-1"'
-        )
-        assert line in got
-
-    def test_multiple_entries_input_order_preserved(self) -> None:
-        ts = datetime(2026, 4, 28, 12, 34, 56, tzinfo=timezone.utc)
-        got = handoff._render_doc(
-            agent_id="abcd1234", task_id="t", project="p",
-            handoff_type="auto-yellow", number=1, prev_path=None,
-            context_pct=None, ts=ts, recent_activity="",
-            active_subagents=[
-                {"task": "a", "branch": "worker/a", "phase": "push",
-                 "agent_id": "11111111", "subagent_id": ""},
-                {"task": "b", "branch": "worker/b", "phase": "tdd-red",
-                 "agent_id": "22222222", "subagent_id": "claude-sub-2"},
-            ],
-        )
-        idx_a = got.find(b'task="a"')
-        idx_b = got.find(b'task="b"')
-        assert idx_a >= 0 and idx_b >= 0
-        assert idx_a < idx_b
-
-    def test_missing_keys_default_to_empty(self) -> None:
-        """Worker entries with missing optional fields render as empty
-        strings — the field set is uniform across rows."""
-        ts = datetime(2026, 4, 28, 12, 34, 56, tzinfo=timezone.utc)
-        got = handoff._render_doc(
-            agent_id="abcd1234", task_id="t", project="p",
-            handoff_type="auto-yellow", number=1, prev_path=None,
-            context_pct=None, ts=ts, recent_activity="",
-            active_subagents=[{"task": "minimal", "agent_id": "33333333"}],
-        )
-        line = (
-            b'- task="minimal" branch="" phase="" '
-            b'status="" pr_url="" '
-            b'agent_id="33333333" subagent_id=""'
-        )
-        assert line in got
-
-
-class TestCollectActiveSubagents:
-    """Coord identity gate + coord-state.json reading."""
-
-    def test_non_coord_returns_empty(self, tmp_path, monkeypatch) -> None:
-        monkeypatch.setenv("FLEET_HOME", str(tmp_path))
-        got = handoff._collect_active_subagents("auth-fix", "myproj")
-        assert got == []
-
-    def test_empty_project_returns_empty(self, tmp_path, monkeypatch) -> None:
-        monkeypatch.setenv("FLEET_HOME", str(tmp_path))
-        got = handoff._collect_active_subagents("coord-myproj", "")
-        assert got == []
-
-    def test_coord_with_no_state_file_returns_empty(self, tmp_path, monkeypatch) -> None:
-        monkeypatch.setenv("FLEET_HOME", str(tmp_path))
-        (tmp_path / "projects" / "myproj").mkdir(parents=True)
-        got = handoff._collect_active_subagents("coord-myproj", "myproj")
-        assert got == []
-
-    def test_coord_with_workers_emits_entries(self, tmp_path, monkeypatch) -> None:
-        monkeypatch.setenv("FLEET_HOME", str(tmp_path))
-        proj_dir = tmp_path / "projects" / "myproj"
-        (proj_dir / "workers" / "fix-bar").mkdir(parents=True)
-        (proj_dir / "workers" / "fix-foo").mkdir(parents=True)
-        coord_state = {
-            "worker_agent_ids": {
-                "fix-foo": "abcd1234",
-                "fix-bar": "11112222",
-            },
-        }
-        (proj_dir / "coord-state.json").write_text(json.dumps(coord_state))
-        (proj_dir / "workers" / "fix-foo" / "state.json").write_text(
-            json.dumps({"phase": "tdd-green"})
-        )
-        (proj_dir / "workers" / "fix-bar" / "state.json").write_text(
-            json.dumps({"phase": "push"})
-        )
-        got = handoff._collect_active_subagents("coord-myproj", "myproj")
-        # No tasks.md → status/pr_url default to "" — successor falls
-        # back to "always re-dispatch Agent" (pre-enrichment behavior).
-        assert got == [
-            {"task": "fix-bar", "branch": "worker/fix-bar",
-             "phase": "push", "status": "", "pr_url": "",
-             "agent_id": "11112222", "subagent_id": ""},
-            {"task": "fix-foo", "branch": "worker/fix-foo",
-             "phase": "tdd-green", "status": "", "pr_url": "",
-             "agent_id": "abcd1234", "subagent_id": ""},
-        ]
-
-    def test_subagent_ids_threaded_through_when_present(self, tmp_path, monkeypatch) -> None:
-        """worker_subagent_ids (forward-compat parallel map) is read
-        if present — Phase A doesn't capture these IDs yet but the
-        skill must be ready when the upgrade lands."""
-        monkeypatch.setenv("FLEET_HOME", str(tmp_path))
-        proj_dir = tmp_path / "projects" / "myproj"
-        proj_dir.mkdir(parents=True)
-        coord_state = {
-            "worker_agent_ids": {"fix-foo": "abcd1234"},
-            "worker_subagent_ids": {"fix-foo": "claude-sub-1"},
-        }
-        (proj_dir / "coord-state.json").write_text(json.dumps(coord_state))
-        got = handoff._collect_active_subagents("coord-myproj", "myproj")
-        assert len(got) == 1
-        assert got[0]["subagent_id"] == "claude-sub-1"
-
-    def test_collect_active_subagents_reads_pr_url_and_status(
-        self, tmp_path, monkeypatch,
-    ) -> None:
-        """v0.8.3: when tasks.md is present, _collect_active_subagents
-        threads status + pr_url through per slug. Successor coord
-        branches its re-dispatch on these (status=in-review with a
-        pr_url means skip Agent + just re-spawn shepherd)."""
-        monkeypatch.setenv("FLEET_HOME", str(tmp_path))
-        proj_dir = tmp_path / "projects" / "myproj"
-        proj_dir.mkdir(parents=True)
-        coord_state = {
-            "worker_agent_ids": {
-                "fix-foo": "abcd1234",
-                "fix-bar": "11112222",
-            },
-        }
-        (proj_dir / "coord-state.json").write_text(json.dumps(coord_state))
-        # Minimal tasks.md with two task blocks: one in-review with a
-        # PR (skip re-dispatch path), one in-progress without (re-
-        # dispatch path).
-        tasks_md = (
-            "---\n"
-            "schema: v1\n"
-            "---\n"
-            "\n"
-            "## task: fix-bar\n"
-            "\n"
-            "- status: in-progress\n"
-            "- priority: P1\n"
-            "- worker_pid: 0\n"
-            "- worktree:\n"
-            "- pr_url:\n"
-            "- branch:\n"
-            "- created: 2026-05-12T00:00:00Z\n"
-            "- updated: 2026-05-12T00:00:00Z\n"
-            "- depends_on: []\n"
-            "- spawned_by: user\n"
-            "\n"
-            "### Spec\n\n"
-            "x\n\n"
-            "### Acceptance\n\n"
-            "### Notes\n\n"
-            "## task: fix-foo\n"
-            "\n"
-            "- status: in-review\n"
-            "- priority: P1\n"
-            "- worker_pid: 0\n"
-            "- worktree:\n"
-            "- pr_url: https://github.com/edisonshen/fleet/pull/999\n"
-            "- branch: worker/fix-foo\n"
-            "- created: 2026-05-12T00:00:00Z\n"
-            "- updated: 2026-05-12T00:00:00Z\n"
-            "- depends_on: []\n"
-            "- spawned_by: user\n"
-            "\n"
-            "### Spec\n\n"
-            "y\n\n"
-            "### Acceptance\n\n"
-            "### Notes\n\n"
-        )
-        (proj_dir / "tasks.md").write_text(tasks_md)
-        got = handoff._collect_active_subagents("coord-myproj", "myproj")
-        # Sorted alphabetically, so fix-bar then fix-foo.
-        assert len(got) == 2
-        assert got[0]["task"] == "fix-bar"
-        assert got[0]["status"] == "in-progress"
-        assert got[0]["pr_url"] == ""
-        assert got[1]["task"] == "fix-foo"
-        assert got[1]["status"] == "in-review"
-        assert got[1]["pr_url"] == "https://github.com/edisonshen/fleet/pull/999"
-
-    def test_legacy_state_no_worker_agent_ids_returns_empty(self, tmp_path, monkeypatch) -> None:
-        """A coord-state.json missing worker_agent_ids (e.g. v0.2.0
-        layout) gracefully renders zero entries instead of crashing."""
-        monkeypatch.setenv("FLEET_HOME", str(tmp_path))
-        proj_dir = tmp_path / "projects" / "myproj"
-        proj_dir.mkdir(parents=True)
-        (proj_dir / "coord-state.json").write_text(json.dumps({"other": 1}))
-        got = handoff._collect_active_subagents("coord-myproj", "myproj")
-        assert got == []
-
-
-class TestOpenPRsRender:
-    """v0.8.3: the `## Open PRs` section must render byte-identical to
-    internal/handoff.renderOpenPRs. Pinned shape: one
-    `- #<num> <title> — <head> — <url>` bullet per entry; empty list
-    renders the `_(no open PRs)_` placeholder."""
-
-    def test_none_renders_placeholder(self) -> None:
-        ts = datetime(2026, 4, 28, 12, 34, 56, tzinfo=timezone.utc)
-        got = handoff._render_doc(
-            agent_id="a", task_id="t", project="p",
-            handoff_type="auto-yellow", number=1, prev_path=None,
-            context_pct=None, ts=ts, recent_activity="",
-            open_prs=None,
-        )
-        assert b"## Open PRs\n_(no open PRs)_\n" in got
-
-    def test_empty_list_renders_placeholder(self) -> None:
-        ts = datetime(2026, 4, 28, 12, 34, 56, tzinfo=timezone.utc)
-        got = handoff._render_doc(
-            agent_id="a", task_id="t", project="p",
-            handoff_type="auto-yellow", number=1, prev_path=None,
-            context_pct=None, ts=ts, recent_activity="",
-            open_prs=[],
-        )
-        assert b"## Open PRs\n_(no open PRs)_\n" in got
-
-    def test_handoff_doc_includes_open_prs_section(self) -> None:
-        """Spec test: with two open PRs fed in, both must appear as
-        bullets in the rendered `## Open PRs` section."""
-        ts = datetime(2026, 4, 28, 12, 34, 56, tzinfo=timezone.utc)
-        got = handoff._render_doc(
-            agent_id="a", task_id="t", project="p",
-            handoff_type="auto-yellow", number=1, prev_path=None,
-            context_pct=None, ts=ts, recent_activity="",
-            open_prs=[
-                {"number": 137, "title": "feat: rich state",
-                 "head": "worker/a",
-                 "url": "https://example/pr/137"},
-                {"number": 138, "title": "fix: next slice",
-                 "head": "worker/b",
-                 "url": "https://example/pr/138"},
-            ],
-        )
-        assert b"- #137 feat: rich state \xe2\x80\x94 worker/a \xe2\x80\x94 https://example/pr/137" in got
-        assert b"- #138 fix: next slice \xe2\x80\x94 worker/b \xe2\x80\x94 https://example/pr/138" in got
-
-    def test_headRefName_alias_supported(self) -> None:
-        """gh pr list --json headRefName returns the field as
-        headRefName; our renderer accepts both `head` and
-        `headRefName` to keep the pipeline tolerant."""
-        ts = datetime(2026, 4, 28, 12, 34, 56, tzinfo=timezone.utc)
-        got = handoff._render_doc(
-            agent_id="a", task_id="t", project="p",
-            handoff_type="auto-yellow", number=1, prev_path=None,
-            context_pct=None, ts=ts, recent_activity="",
-            open_prs=[{"number": 1, "title": "x",
-                       "headRefName": "worker/x",
-                       "url": "https://example/pr/1"}],
-        )
-        assert b"worker/x" in got
-
-    def test_newline_in_title_sanitized(self) -> None:
-        """Line-per-entry contract: embedded newlines in titles become
-        spaces so the bullet stays one physical line."""
-        ts = datetime(2026, 4, 28, 12, 34, 56, tzinfo=timezone.utc)
-        got = handoff._render_doc(
-            agent_id="a", task_id="t", project="p",
-            handoff_type="auto-yellow", number=1, prev_path=None,
-            context_pct=None, ts=ts, recent_activity="",
-            open_prs=[{"number": 1,
-                       "title": "line one\nline two\rline three",
-                       "head": "worker/x",
-                       "url": "https://example/pr/1"}],
-        )
-        assert b"- #1 line one line two line three \xe2\x80\x94 worker/x \xe2\x80\x94 https://example/pr/1" in got
-
-
-class TestCollectOpenPRs:
-    """`gh pr list` invocation. We monkey-patch subprocess.run + shutil.which
-    so tests don't need a real gh binary."""
-
-    def test_no_gh_returns_empty(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setattr(handoff.shutil, "which", lambda _: None)
-        assert handoff._collect_open_prs() == []
-
-    def test_gh_failure_returns_empty(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setattr(handoff.shutil, "which", lambda _: "/usr/bin/gh")
-
-        class _R:
-            returncode = 1
-            stdout = ""
-            stderr = "auth failure"
-
-        monkeypatch.setattr(
-            handoff.subprocess, "run",
-            lambda *args, **kwargs: _R(),
-        )
-        assert handoff._collect_open_prs() == []
-
-    def test_gh_success_parses_json(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setattr(handoff.shutil, "which", lambda _: "/usr/bin/gh")
-        payload = json.dumps([
-            {"number": 137, "title": "feat: rich state",
-             "headRefName": "worker/a",
-             "url": "https://example/pr/137"},
-            {"number": 138, "title": "fix: next",
-             "headRefName": "worker/b",
-             "url": "https://example/pr/138"},
-        ])
-
-        class _R:
-            returncode = 0
-            stdout = payload
-            stderr = ""
-
-        monkeypatch.setattr(
-            handoff.subprocess, "run",
-            lambda *args, **kwargs: _R(),
-        )
-        got = handoff._collect_open_prs()
-        assert len(got) == 2
-        assert got[0]["number"] == 137
-        assert got[0]["head"] == "worker/a"
-        assert got[1]["url"] == "https://example/pr/138"
-
-    def test_gh_malformed_json_returns_empty(
-        self, monkeypatch: pytest.MonkeyPatch,
-    ) -> None:
-        monkeypatch.setattr(handoff.shutil, "which", lambda _: "/usr/bin/gh")
-
-        class _R:
-            returncode = 0
-            stdout = "not json {"
-            stderr = ""
-
-        monkeypatch.setattr(
-            handoff.subprocess, "run",
-            lambda *args, **kwargs: _R(),
-        )
-        assert handoff._collect_open_prs() == []
-
-    def test_gh_timeout_returns_empty(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setattr(handoff.shutil, "which", lambda _: "/usr/bin/gh")
-
-        def _raise(*args, **kwargs):
-            raise subprocess.TimeoutExpired(cmd="gh", timeout=10)
-
-        monkeypatch.setattr(handoff.subprocess, "run", _raise)
-        assert handoff._collect_open_prs() == []
-
-
-def _diff_first_byte(got: bytes, want: bytes) -> str:
-    """Format a useful diff message: index + context around first divergence."""
-    n = min(len(got), len(want))
-    for i in range(n):
-        if got[i] != want[i]:
-            return (
-                f"first diff at byte {i}: "
-                f"got {got[max(0,i-20):i+20]!r} vs want {want[max(0,i-20):i+20]!r}"
-            )
-    if len(got) != len(want):
-        return f"length mismatch: got {len(got)} vs want {len(want)}"
-    return "no diff"
 
 
 # -- find_milestone ----------------------------------------------------------
@@ -1256,6 +672,225 @@ class TestMaybeTrigger:
         queue_files = list((fleet_home_tmp / "queue").glob("spawn-fresh-*.json"))
         assert len(queue_files) == 1
 
+    def test_coord_red_while_waiting_on_e2e_worker_carries_context(
+        self, fleet_home_tmp: Path, fake_tmux: _FakeTmux, tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """THE bug: a coord auto-handed-off while waiting on a worker's
+        e2e run used to hand its successor a doc with every narrative
+        section at the placeholder — nothing to continue from. Through
+        the unified `fleet handoff-write` path the successor doc carries
+        the live worker, the recorded decision and the next step, all
+        from the same durable coord state `fleet handoff` reads."""
+        monkeypatch.setenv("PATH", str(tmp_path / "empty-path"))  # no `gh`
+        _seed_record(fleet_home_tmp, "c0ffee11",
+                     task_id="coord-myproj", project="myproj")
+        pdir = fleet_home_tmp / "projects" / "myproj"
+        wdir = pdir / "workers" / "e2e-login-1234"
+        wdir.mkdir(parents=True)
+        (pdir / "coord-state.json").write_text(json.dumps({
+            "worker_agent_ids": {"e2e-login-1234": "beefcafe"},
+            "recent_decisions": ["wait for e2e-login-1234 before merging #42"],
+            "recent_decisions_owner": "c0ffee11",
+            "session_next_steps": [{
+                "text": "merge #42 once e2e-login-1234 reports green",
+                "coord_id": "c0ffee11", "ts": "2026-09-05T00:00:00Z",
+            }],
+        }), encoding="utf-8")
+        (wdir / "state.json").write_text(json.dumps({
+            "slug": "e2e-login-1234", "project": "myproj", "phase": "e2e",
+            "pid": 0, "pr_url": "https://github.com/o/r/pull/42",
+        }), encoding="utf-8")
+        fake_tmux.output = "⏺ Waiting for e2e-login-1234's browser run…\n"
+
+        handoff.maybe_trigger(
+            {"transcript_path": str(_transcript(tmp_path, input_tokens=145_000))},
+            agent_id="c0ffee11", session="fleet-c0ffee11",
+        )
+        docs = list((fleet_home_tmp / "handoffs").glob("c0ffee11-*.md"))
+        assert len(docs) == 1
+        body = docs[0].read_text(encoding="utf-8")
+        assert 'task="e2e-login-1234"' in body and 'agent_id="beefcafe"' in body
+        assert "wait for e2e-login-1234 before merging #42" in body
+        assert "merge #42 once e2e-login-1234 reports green" in body
+        assert "Waiting for e2e-login-1234's browser run" in body
+        # Worker in the SAME project: none of the coord's state leaks in.
+        _seed_record(fleet_home_tmp, "0000beef",
+                     task_id="e2e-login-1234", project="myproj")
+        handoff.maybe_trigger(
+            {"transcript_path": str(_transcript(tmp_path, input_tokens=145_000))},
+            agent_id="0000beef", session="fleet-0000beef",
+        )
+        wdocs = list((fleet_home_tmp / "handoffs").glob("0000beef-*.md"))
+        assert len(wdocs) == 1
+        wbody = wdocs[0].read_text(encoding="utf-8")
+        assert "beefcafe" not in wbody
+        assert "merge #42" not in wbody
+
+
+# -- _write_handoff: the subprocess boundary to `fleet handoff-write` -------
+
+class TestWriteHandoff:
+    def _capture_run(self, monkeypatch: pytest.MonkeyPatch,
+                     *, returncode: int = 0,
+                     stdout: str = '{"doc_path": "/h/d.md", "queue_path": "/q", "new_agent_id": "deadbeef"}\n',
+                     ) -> list[dict[str, Any]]:
+        calls: list[dict[str, Any]] = []
+
+        def fake_run(argv, **kwargs):
+            calls.append({"argv": list(argv), **kwargs})
+            return subprocess.CompletedProcess(
+                args=argv, returncode=returncode, stdout=stdout, stderr="boom")
+        monkeypatch.setattr(handoff.subprocess, "run", fake_run)
+        return calls
+
+    def test_argv_stdin_and_env(self, fleet_home_tmp: Path,
+                                monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("FLEET_BIN", "/opt/fleet")
+        monkeypatch.setattr(handoff.os, "access", lambda p, m: p == "/opt/fleet")
+        calls = self._capture_run(monkeypatch)
+        got = handoff._write_handoff(
+            agent_id="agent01", handoff_type=handoff.TYPE_AUTO_YELLOW,
+            pct=41.5, recent_activity="pane\n")
+        assert got == "/h/d.md"
+        assert len(calls) == 1
+        c = calls[0]
+        assert c["argv"] == ["/opt/fleet", "handoff-write", "--agent", "agent01",
+                             "--type", "auto-yellow", "--context-pct", "41.5"]
+        assert c["input"] == "pane\n"
+        assert c["env"]["FLEET_HOME"] == str(fleet_home_tmp)
+        assert c["timeout"] == handoff._HANDOFF_WRITE_TIMEOUT_S
+
+    def test_omits_context_pct_when_unknown(
+            self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("FLEET_BIN", "/opt/fleet")
+        monkeypatch.setattr(handoff.os, "access", lambda p, m: p == "/opt/fleet")
+        calls = self._capture_run(monkeypatch)
+        handoff._write_handoff(agent_id="a", handoff_type=handoff.TYPE_PRECOMPACT,
+                               pct=None, recent_activity="")
+        assert "--context-pct" not in calls[0]["argv"]
+
+    def test_nonzero_exit_returns_empty(
+            self, monkeypatch: pytest.MonkeyPatch,
+            capsys: pytest.CaptureFixture) -> None:
+        monkeypatch.setenv("FLEET_BIN", "/opt/fleet")
+        monkeypatch.setattr(handoff.os, "access", lambda p, m: p == "/opt/fleet")
+        self._capture_run(monkeypatch, returncode=1, stdout="")
+        assert handoff._write_handoff(
+            agent_id="a", handoff_type=handoff.TYPE_AUTO_RED,
+            pct=None, recent_activity="") == ""
+        assert "boom" in capsys.readouterr().err
+
+    def test_old_binary_without_doc_path_returns_empty(
+            self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A stale `fleet` that doesn't know handoff-write (or prints
+        something else) must read as failure so _do_handoff rolls back
+        instead of believing a doc exists."""
+        monkeypatch.setenv("FLEET_BIN", "/opt/fleet")
+        monkeypatch.setattr(handoff.os, "access", lambda p, m: p == "/opt/fleet")
+        self._capture_run(monkeypatch, stdout="not json\n")
+        assert handoff._write_handoff(
+            agent_id="a", handoff_type=handoff.TYPE_AUTO_RED,
+            pct=None, recent_activity="") == ""
+
+    def test_missing_binary_returns_empty_without_spawning(
+            self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delenv("FLEET_BIN", raising=False)
+        monkeypatch.setattr(handoff.shutil, "which", lambda _n: None)
+        monkeypatch.setattr(handoff.subprocess, "run",
+                            lambda *a, **k: pytest.fail("must not spawn"))
+        assert handoff._write_handoff(
+            agent_id="a", handoff_type=handoff.TYPE_AUTO_RED,
+            pct=None, recent_activity="") == ""
+
+    def test_subprocess_error_returns_empty(
+            self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("FLEET_BIN", "/opt/fleet")
+        monkeypatch.setattr(handoff.os, "access", lambda p, m: p == "/opt/fleet")
+
+        def boom(*_a, **_k):
+            raise subprocess.TimeoutExpired(cmd="fleet", timeout=1)
+        monkeypatch.setattr(handoff.subprocess, "run", boom)
+        assert handoff._write_handoff(
+            agent_id="a", handoff_type=handoff.TYPE_AUTO_RED,
+            pct=None, recent_activity="") == ""
+
+    # -- upgrade: FLEET_BIN predates handoff-write, PATH has the new one ----
+
+    @staticmethod
+    def _script(path: Path, body: str) -> str:
+        path.write_text("#!/bin/sh\n" + body)
+        path.chmod(0o755)
+        return str(path)
+
+    def _old_and_new(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+                     *, old_body: str) -> tuple[str, str, Path]:
+        """FLEET_BIN -> `old` (stamped at spawn); PATH -> a dir whose `fleet`
+        is the upgraded binary. Both log their argv so the test can see who
+        ran."""
+        log = tmp_path / "calls.log"
+        old = self._script(tmp_path / "old-fleet",
+                           f'echo "old $*" >> "{log}"\n' + old_body)
+        newdir = tmp_path / "bin"
+        newdir.mkdir()
+        new = self._script(
+            newdir / "fleet",
+            f'echo "new $*" >> "{log}"\n'
+            'echo \'{"doc_path": "/h/new.md", "queue_path": "/q", '
+            '"new_agent_id": "deadbeef"}\'\n')
+        monkeypatch.setenv("FLEET_BIN", old)
+        monkeypatch.setenv("PATH", str(newdir))
+        return old, new, log
+
+    def test_unknown_command_retries_newer_binary_on_path(
+            self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+            capsys: pytest.CaptureFixture) -> None:
+        _old, _new, log = self._old_and_new(
+            tmp_path, monkeypatch,
+            old_body='echo \'Error: unknown command "handoff-write" for "fleet"\' >&2\nexit 1\n')
+        got = handoff._write_handoff(
+            agent_id="a1", handoff_type=handoff.TYPE_AUTO_RED,
+            pct=55.0, recent_activity="pane\n")
+        assert got == "/h/new.md"
+        lines = log.read_text().splitlines()
+        assert lines == [
+            "old handoff-write --agent a1 --type auto-red --context-pct 55.0",
+            "new handoff-write --agent a1 --type auto-red --context-pct 55.0",
+        ]
+        assert "lacks handoff-write; retrying" in capsys.readouterr().err
+
+    def test_ordinary_failure_is_not_retried(
+            self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A handoff-write that ran and failed may already have written a
+        doc; a second binary must not produce a second doc/queue pair."""
+        _old, _new, log = self._old_and_new(
+            tmp_path, monkeypatch,
+            old_body='echo "handoff-write: enqueue spawn-fresh: disk full" >&2\nexit 1\n')
+        assert handoff._write_handoff(
+            agent_id="a1", handoff_type=handoff.TYPE_AUTO_RED,
+            pct=None, recent_activity="") == ""
+        assert [ln.split()[0] for ln in log.read_text().splitlines()] == ["old"]
+
+    def test_unknown_command_not_retried_against_same_binary(
+            self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """PATH resolving to FLEET_BIN itself (or a symlink to it) is not
+        an alternative — one attempt, then fail."""
+        log = tmp_path / "calls.log"
+        bindir = tmp_path / "bin"
+        bindir.mkdir()
+        real = self._script(
+            bindir / "fleet",
+            f'echo "run $*" >> "{log}"\n'
+            'echo \'Error: unknown command "handoff-write" for "fleet"\' >&2\nexit 1\n')
+        link = tmp_path / "fleet-link"
+        link.symlink_to(real)
+        monkeypatch.setenv("FLEET_BIN", str(link))
+        monkeypatch.setenv("PATH", str(bindir))
+        assert handoff._write_handoff(
+            agent_id="a1", handoff_type=handoff.TYPE_AUTO_RED,
+            pct=None, recent_activity="") == ""
+        assert len(log.read_text().splitlines()) == 1
+
 
 # -- successor agent must not start "pending" (codex P1.A) -----------------
 
@@ -1336,28 +971,27 @@ class TestRefireProtection:
         self, fleet_home_tmp: Path, fake_tmux: _FakeTmux,
         tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """Pre-mark must land BEFORE write_doc so a re-fire racing
+        """Pre-mark must land BEFORE the doc write so a re-fire racing
         _do_handoff sees pending=True and short-circuits. Test by
-        sniffing the order of calls via monkey-patching write_doc to
-        record the record's handoff_type at the moment write_doc is
-        invoked."""
+        sniffing the order of calls via monkey-patching _write_handoff to
+        record the record's handoff_type at the moment it is invoked."""
         record_path = _seed_record(fleet_home_tmp, "agentR2")
         observed: dict = {}
 
-        real_write_doc = handoff.write_doc
+        real_write_handoff = handoff._write_handoff
 
-        def spy_write_doc(**kwargs):
+        def spy_write_handoff(**kwargs):
             current = json.loads(record_path.read_text(encoding="utf-8"))
             observed["handoff_type_at_write"] = current.get("handoff_type")
-            return real_write_doc(**kwargs)
-        monkeypatch.setattr(handoff, "write_doc", spy_write_doc)
+            return real_write_handoff(**kwargs)
+        monkeypatch.setattr(handoff, "_write_handoff", spy_write_handoff)
 
         handoff.maybe_trigger(
             {"transcript_path": str(_transcript(tmp_path, input_tokens=145_000))},
             agent_id="agentR2", session="fleet-agentR2",
         )
         assert observed.get("handoff_type_at_write") == handoff.TYPE_AUTO_RED, \
-            "handoff_type was not pre-marked on disk before write_doc"
+            "handoff_type was not pre-marked on disk before the doc write"
 
 
 # -- Yellow → Red escalation safety net (codex iter-3 P1) ------------------
@@ -1453,7 +1087,7 @@ class TestYellowToRedEscalation:
 # -- wedge protection: clear pending on producer failure (codex P1) -------
 
 class TestWedgeRecovery:
-    """If write_doc or write_queue fails after handoff_type was pre-marked,
+    """If `fleet handoff-write` fails after handoff_type was pre-marked,
     the rollback in _clear_pending must restore handoff_type=None so the
     next fire retries instead of being silently wedged in pending state.
     Without rollback, is_handoff_pending stays True and Red short-circuits
@@ -1464,8 +1098,8 @@ class TestWedgeRecovery:
         monkeypatch: pytest.MonkeyPatch,
     ) -> Path:
         record_path = _seed_record(fleet_home_tmp, agent_id)
-        # Make write_doc return "" (failure sentinel from the function).
-        monkeypatch.setattr(handoff, "write_doc", lambda **_: "")
+        # Make _write_handoff return "" (failure sentinel from the function).
+        monkeypatch.setattr(handoff, "_write_handoff", lambda **_: "")
         return record_path
 
     def test_red_failure_clears_handoff_type(
@@ -1493,15 +1127,15 @@ class TestWedgeRecovery:
         circuit — it has to write fresh doc + queue."""
         _seed_record(fleet_home_tmp, "wedgeR2")
 
-        real_write_doc = handoff.write_doc
+        real_write_handoff = handoff._write_handoff
         call_count = {"n": 0}
 
-        def write_doc_first_fails(**kwargs):
+        def write_handoff_first_fails(**kwargs):
             call_count["n"] += 1
             if call_count["n"] == 1:
                 return ""  # fail
-            return real_write_doc(**kwargs)
-        monkeypatch.setattr(handoff, "write_doc", write_doc_first_fails)
+            return real_write_handoff(**kwargs)
+        monkeypatch.setattr(handoff, "_write_handoff", write_handoff_first_fails)
 
         payload = {"transcript_path": str(
             _transcript(tmp_path, input_tokens=145_000))}
@@ -1547,7 +1181,7 @@ class TestWedgeRecovery:
             f"{handoff.HANDOFF_REQUESTED}: wrap up\n"
             "MILESTONE\n"
         )
-        monkeypatch.setattr(handoff, "write_doc", lambda **_: "")
+        monkeypatch.setattr(handoff, "_write_handoff", lambda **_: "")
         handoff.maybe_trigger(
             {"transcript_path": str(_transcript(tmp_path, input_tokens=90_000))},
             agent_id="wedgeY1", session="fleet-wedgeY1",
@@ -1555,22 +1189,28 @@ class TestWedgeRecovery:
         record = json.loads(record_path.read_text(encoding="utf-8"))
         assert record["handoff_type"] is None
 
-    def test_queue_write_failure_also_clears(
+    def test_binary_failure_also_clears(
         self, fleet_home_tmp: Path, fake_tmux: _FakeTmux, tmp_path: Path,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """write_doc succeeds but write_queue fails — rollback still
-        fires. (Without this, an orphan doc lingers AND the agent is
-        wedged.)"""
+        """The REAL shellout fails (binary exits non-zero) — rollback
+        still fires and nothing is left on disk. (Without this, the agent
+        is wedged.)"""
         record_path = _seed_record(fleet_home_tmp, "wedgeQ1")
-        monkeypatch.setattr(handoff, "write_queue",
-                            lambda **_: False)
+        bad = tmp_path / "fleet-bad"
+        bad.write_text("#!/bin/sh\necho boom >&2\nexit 1\n", encoding="utf-8")
+        bad.chmod(0o755)
+        monkeypatch.setenv("FLEET_BIN", str(bad))
         handoff.maybe_trigger(
             {"transcript_path": str(_transcript(tmp_path, input_tokens=145_000))},
             agent_id="wedgeQ1", session="fleet-wedgeQ1",
         )
         record = json.loads(record_path.read_text(encoding="utf-8"))
         assert record["handoff_type"] is None
+        assert not (fleet_home_tmp / "handoffs").exists() or \
+            list((fleet_home_tmp / "handoffs").glob("wedgeQ1-*.md")) == []
+        assert not (fleet_home_tmp / "queue").exists() or \
+            list((fleet_home_tmp / "queue").iterdir()) == []
 
 
 # -- emergency_trigger -------------------------------------------------------
@@ -1657,7 +1297,24 @@ class TestKickDrain:
             return _FakeProc()
 
         monkeypatch.setattr(handoff.subprocess, "Popen", fake_popen)
+        self._stub_write_handoff(monkeypatch)
         return calls
+
+    @staticmethod
+    def _stub_write_handoff(monkeypatch: pytest.MonkeyPatch) -> None:
+        """These tests stub binary resolution (FLEET_BIN / which) to assert
+        on the `fleet drain` argv, which also starves the real `fleet
+        handoff-write` shellout. Stand in for a SUCCESSFUL write by
+        dropping the spawn-fresh queue file kick_drain_if_pending keys
+        on — the doc/queue bytes themselves are covered elsewhere against
+        the real binary."""
+        def fake_write(*, agent_id: str, **_kw: Any) -> str:
+            queue_dir = health.fleet_home() / "queue"
+            queue_dir.mkdir(parents=True, exist_ok=True)
+            (queue_dir / f"spawn-fresh-{agent_id}.json").write_text(
+                json.dumps({"old_agent_id": agent_id}), encoding="utf-8")
+            return f"/stub/{agent_id}.md"
+        monkeypatch.setattr(handoff, "_write_handoff", fake_write)
 
     def test_yellow_milestone_kicks_drain(
         self, fleet_home_tmp: Path, fake_tmux: _FakeTmux, tmp_path: Path,
@@ -1718,18 +1375,18 @@ class TestKickDrain:
         self, fleet_home_tmp: Path, fake_tmux: _FakeTmux, tmp_path: Path,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """If write_queue fails, _do_handoff returns False and the kick
-        must NOT fire. Otherwise drain runs against a missing queue
-        file and either errors or silently noops — both are wasted
+        """If `fleet handoff-write` fails, _do_handoff returns False and
+        the kick must NOT fire. Otherwise drain runs against a missing
+        queue file and either errors or silently noops — both are wasted
         work and noise."""
         calls = self._mock_drain_calls(monkeypatch)
         _seed_record(fleet_home_tmp, "kick4")
-        monkeypatch.setattr(handoff, "write_queue", lambda **_: False)
+        monkeypatch.setattr(handoff, "_write_handoff", lambda **_: "")
         handoff.maybe_trigger(
             {"transcript_path": str(_transcript(tmp_path, input_tokens=145_000))},
             agent_id="kick4", session="fleet-kick4",
         )
-        # write_queue returned False → no queue file on disk → kick noops.
+        # _write_handoff returned "" → no queue file on disk → kick noops.
         handoff.kick_drain_if_pending("kick4")
         assert calls == [], f"drain must not kick on queue-write failure, got: {calls}"
 
@@ -1746,6 +1403,7 @@ class TestKickDrain:
         popen_calls: list[Any] = []
         monkeypatch.setattr(handoff.subprocess, "Popen",
                             lambda *a, **kw: popen_calls.append(a) or None)
+        self._stub_write_handoff(monkeypatch)
         _seed_record(fleet_home_tmp, "kick5")
         handoff.maybe_trigger(
             {"transcript_path": str(_transcript(tmp_path, input_tokens=145_000))},
@@ -1777,6 +1435,7 @@ class TestKickDrain:
         monkeypatch.setattr(handoff.subprocess, "Popen",
                             lambda argv, **_kw: calls.append(argv) or object())
 
+        self._stub_write_handoff(monkeypatch)
         _seed_record(fleet_home_tmp, "kickbin1")
         handoff.maybe_trigger(
             {"transcript_path": str(_transcript(tmp_path, input_tokens=145_000))},
@@ -1803,6 +1462,7 @@ class TestKickDrain:
         monkeypatch.setattr(handoff.subprocess, "Popen",
                             lambda argv, **_kw: calls.append(argv) or object())
 
+        self._stub_write_handoff(monkeypatch)
         _seed_record(fleet_home_tmp, "kickbin2")
         handoff.maybe_trigger(
             {"transcript_path": str(_transcript(tmp_path, input_tokens=145_000))},
@@ -1832,6 +1492,7 @@ class TestKickDrain:
         monkeypatch.setattr(handoff.subprocess, "Popen",
                             lambda argv, **_kw: calls.append(argv) or object())
 
+        self._stub_write_handoff(monkeypatch)
         _seed_record(fleet_home_tmp, "kickbin3")
         handoff.maybe_trigger(
             {"transcript_path": str(_transcript(tmp_path, input_tokens=145_000))},
@@ -1856,6 +1517,7 @@ class TestKickDrain:
             raise OSError("simulated Popen failure")
         monkeypatch.setattr(handoff.subprocess, "Popen", boom)
 
+        self._stub_write_handoff(monkeypatch)
         _seed_record(fleet_home_tmp, "kick6")
         # Should not raise; the queue file is what matters.
         handoff.maybe_trigger(
@@ -2011,21 +1673,3 @@ class TestKickDrain:
         # No queue file → kick_drain_if_pending noops AND cleans up.
         handoff.kick_drain_if_pending("cleanup")
         assert not sentinel.exists()
-
-
-# -- write_queue schema ------------------------------------------------------
-
-class TestWriteQueue:
-    def test_includes_new_session(self, fleet_home_tmp: Path) -> None:
-        ts = datetime(2026, 4, 28, 12, 34, 56, tzinfo=timezone.utc)
-        ok = handoff.write_queue(
-            old_id="aaaa1111", new_id="bbbb2222",
-            doc_path="/tmp/doc.md", project="proj", task_id="t",
-            ts=ts,
-        )
-        assert ok is True
-        path = fleet_home_tmp / "queue" / "spawn-fresh-aaaa1111.json"
-        q = json.loads(path.read_text(encoding="utf-8"))
-        assert q["new_agent_id"] == "bbbb2222"
-        assert q["new_session"] == "fleet-bbbb2222"
-        assert q["enqueued_at"] == "2026-04-28T12:34:56Z"
