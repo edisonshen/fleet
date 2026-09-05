@@ -815,6 +815,82 @@ class TestWriteHandoff:
             agent_id="a", handoff_type=handoff.TYPE_AUTO_RED,
             pct=None, recent_activity="") == ""
 
+    # -- upgrade: FLEET_BIN predates handoff-write, PATH has the new one ----
+
+    @staticmethod
+    def _script(path: Path, body: str) -> str:
+        path.write_text("#!/bin/sh\n" + body)
+        path.chmod(0o755)
+        return str(path)
+
+    def _old_and_new(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+                     *, old_body: str) -> tuple[str, str, Path]:
+        """FLEET_BIN -> `old` (stamped at spawn); PATH -> a dir whose `fleet`
+        is the upgraded binary. Both log their argv so the test can see who
+        ran."""
+        log = tmp_path / "calls.log"
+        old = self._script(tmp_path / "old-fleet",
+                           f'echo "old $*" >> "{log}"\n' + old_body)
+        newdir = tmp_path / "bin"
+        newdir.mkdir()
+        new = self._script(
+            newdir / "fleet",
+            f'echo "new $*" >> "{log}"\n'
+            'echo \'{"doc_path": "/h/new.md", "queue_path": "/q", '
+            '"new_agent_id": "deadbeef"}\'\n')
+        monkeypatch.setenv("FLEET_BIN", old)
+        monkeypatch.setenv("PATH", str(newdir))
+        return old, new, log
+
+    def test_unknown_command_retries_newer_binary_on_path(
+            self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+            capsys: pytest.CaptureFixture) -> None:
+        _old, _new, log = self._old_and_new(
+            tmp_path, monkeypatch,
+            old_body='echo \'Error: unknown command "handoff-write" for "fleet"\' >&2\nexit 1\n')
+        got = handoff._write_handoff(
+            agent_id="a1", handoff_type=handoff.TYPE_AUTO_RED,
+            pct=55.0, recent_activity="pane\n")
+        assert got == "/h/new.md"
+        lines = log.read_text().splitlines()
+        assert lines == [
+            "old handoff-write --agent a1 --type auto-red --context-pct 55.0",
+            "new handoff-write --agent a1 --type auto-red --context-pct 55.0",
+        ]
+        assert "lacks handoff-write; retrying" in capsys.readouterr().err
+
+    def test_ordinary_failure_is_not_retried(
+            self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A handoff-write that ran and failed may already have written a
+        doc; a second binary must not produce a second doc/queue pair."""
+        _old, _new, log = self._old_and_new(
+            tmp_path, monkeypatch,
+            old_body='echo "handoff-write: enqueue spawn-fresh: disk full" >&2\nexit 1\n')
+        assert handoff._write_handoff(
+            agent_id="a1", handoff_type=handoff.TYPE_AUTO_RED,
+            pct=None, recent_activity="") == ""
+        assert [ln.split()[0] for ln in log.read_text().splitlines()] == ["old"]
+
+    def test_unknown_command_not_retried_against_same_binary(
+            self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """PATH resolving to FLEET_BIN itself (or a symlink to it) is not
+        an alternative — one attempt, then fail."""
+        log = tmp_path / "calls.log"
+        bindir = tmp_path / "bin"
+        bindir.mkdir()
+        real = self._script(
+            bindir / "fleet",
+            f'echo "run $*" >> "{log}"\n'
+            'echo \'Error: unknown command "handoff-write" for "fleet"\' >&2\nexit 1\n')
+        link = tmp_path / "fleet-link"
+        link.symlink_to(real)
+        monkeypatch.setenv("FLEET_BIN", str(link))
+        monkeypatch.setenv("PATH", str(bindir))
+        assert handoff._write_handoff(
+            agent_id="a1", handoff_type=handoff.TYPE_AUTO_RED,
+            pct=None, recent_activity="") == ""
+        assert len(log.read_text().splitlines()) == 1
+
 
 # -- successor agent must not start "pending" (codex P1.A) -----------------
 

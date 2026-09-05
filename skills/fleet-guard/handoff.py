@@ -689,26 +689,33 @@ def _write_handoff(*, agent_id: str, handoff_type: str, pct: float | None,
             file=sys.stderr,
         )
         return ""
-    argv = [fleet_bin, "handoff-write", "--agent", agent_id, "--type", handoff_type]
+    args = ["handoff-write", "--agent", agent_id, "--type", handoff_type]
     if pct is not None:
-        argv += ["--context-pct", repr(float(pct))]
-    env = dict(os.environ)
-    env["FLEET_HOME"] = str(health.fleet_home())
-    try:
-        proc = subprocess.run(
-            argv,
-            input=recent_activity,
-            capture_output=True, text=True,
-            timeout=_HANDOFF_WRITE_TIMEOUT_S, check=False, env=env,
-        )
-    except (OSError, subprocess.SubprocessError) as exc:
-        print(
-            f"fleet-guard: handoff-write for {agent_id} did not run: {exc!r}",
-            file=sys.stderr,
-        )
+        args += ["--context-pct", repr(float(pct))]
+    proc = _run_handoff_write(fleet_bin, args, recent_activity, agent_id)
+    if proc is None:
         return ""
+    detail = ""
     if proc.returncode != 0:
         detail = (proc.stderr or proc.stdout or "").strip()
+        # FLEET_BIN is stamped at spawn; an agent spawned by a binary that
+        # predates `handoff-write` keeps pointing at it after an upgrade
+        # while the new binary sits on PATH. An unknown command wrote
+        # nothing, so retrying a DIFFERENT executable is safe — any other
+        # failure is not retried (durable artifacts may already exist).
+        alt = shutil.which("fleet")
+        if (_lease_check_unknown_command(detail) and alt
+                and not _same_executable(alt, fleet_bin)):
+            print(
+                f"fleet-guard: {fleet_bin} lacks handoff-write; retrying "
+                f"with {alt}",
+                file=sys.stderr,
+            )
+            proc = _run_handoff_write(alt, args, recent_activity, agent_id)
+            if proc is None:
+                return ""
+            detail = (proc.stderr or proc.stdout or "").strip()
+    if proc.returncode != 0:
         print(
             f"fleet-guard: handoff-write for {agent_id} failed "
             f"(exit {proc.returncode}): {detail}",
@@ -728,6 +735,39 @@ def _write_handoff(*, agent_id: str, handoff_type: str, pct: float | None,
         )
         return ""
     return doc_path
+
+
+def _run_handoff_write(fleet_bin: str, args: list[str], recent_activity: str,
+                       agent_id: str) -> subprocess.CompletedProcess[str] | None:
+    """Run `<fleet_bin> handoff-write ...` with the pane capture on stdin and
+    FLEET_HOME pinned. None when the process could not run at all (missing /
+    non-executable binary, timeout)."""
+    env = dict(os.environ)
+    env["FLEET_HOME"] = str(health.fleet_home())
+    try:
+        return subprocess.run(
+            [fleet_bin, *args],
+            input=recent_activity,
+            capture_output=True, text=True,
+            timeout=_HANDOFF_WRITE_TIMEOUT_S, check=False, env=env,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        print(
+            f"fleet-guard: handoff-write for {agent_id} did not run "
+            f"({fleet_bin}): {exc!r}",
+            file=sys.stderr,
+        )
+        return None
+
+
+def _same_executable(a: str, b: str) -> bool:
+    """True when both paths resolve to the same file (symlinks followed), so
+    a PATH lookup that lands on FLEET_BIN itself is not treated as an
+    alternative binary."""
+    try:
+        return os.path.samefile(a, b)
+    except OSError:
+        return os.path.realpath(a) == os.path.realpath(b)
 
 
 def _clear_pending(agent_id: str) -> None:

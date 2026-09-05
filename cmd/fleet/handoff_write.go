@@ -24,6 +24,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"os"
 	"strconv"
 	"time"
 
@@ -111,8 +112,12 @@ func newHandoffWriteCmd() *cobra.Command {
 // stdin, write the doc, then the queue file. The queue file is the
 // durable commit point — it lands only after the doc is complete on disk,
 // so `fleet drain` never spawns a successor against a half-written brief.
-// Fencing (lease-check) and storm back-off stay in the caller: they are
-// hook-lifecycle decisions, not document ones.
+// Storm back-off stays in the caller (a hook-lifecycle decision); the
+// coord lease fence is re-proved HERE, immediately before the queue file,
+// because enrichment (gh pr list, up to 10s) runs between the caller's
+// last `fleet lease-check` and the publish — a successor can take the
+// flock in that window and this process would otherwise enqueue a zombie
+// handoff from stale coord state.
 func runHandoffWrite(opts *handoffWriteOpts, stdin io.Reader, stdout, stderr io.Writer) error {
 	if !autoHandoffTypes[opts.typ] {
 		return fmt.Errorf("handoff-write: --type must be one of auto-yellow, auto-red, precompact (got %q)", opts.typ)
@@ -157,6 +162,14 @@ func runHandoffWrite(opts *handoffWriteOpts, stdin io.Reader, stdout, stderr io.
 		return fmt.Errorf("handoff-write: %w", err)
 	}
 
+	if spawn.IsCoordSpawn(rec.TaskID, rec.Project) {
+		if err := coordProducerFence(rec.Project); err != nil {
+			// Doc is on disk but unreferenced (no queue file → drain never
+			// sees it); the caller clears its pending mark and stands down.
+			return fmt.Errorf("handoff-write: %w", err)
+		}
+	}
+
 	// Pre-allocated successor ID + session, as `fleet handoff` does, so the
 	// drain-side recovery probe can detect a crashed-mid-spawn replacement
 	// on retry. No DisableAutoResume override (inherit from rec) and no
@@ -183,4 +196,22 @@ func runHandoffWrite(opts *handoffWriteOpts, stdin io.Reader, stdout, stderr io.
 	}
 	_, _ = fmt.Fprintln(stdout, string(out))
 	return nil
+}
+
+// coordProducerFence is the in-process form of the skill's
+// `fleet lease-check --project <p>`: prove that this process's parent (the
+// fleet-guard hook, a descendant of the coord's `coord-run` supervisor)
+// still descends from the live flock holder. Same policy as the skill's
+// _producer_fenced — a definitive not-owner AND an inconclusive internal
+// error both refuse (fail closed); only "no lease in play" proceeds.
+func coordProducerFence(project string) error {
+	outcome, err := leaseCheckOwnership(project, os.Getppid())
+	switch outcome {
+	case leaseCheckOK:
+		return nil
+	case leaseCheckNotOwner:
+		return fmt.Errorf("coord producer for %q FENCED before publish (a successor holds the lease); refusing to enqueue a zombie handoff: %w", project, err)
+	default:
+		return fmt.Errorf("coord producer for %q could not prove lease ownership before publish; refusing to enqueue: %w", project, err)
+	}
 }
