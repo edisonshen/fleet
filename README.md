@@ -21,14 +21,26 @@ manager. The agents do the work.
   context.
 - **One coordinator per project.** Each project gets a dedicated coord
   session that owns `tasks.md`, dispatches workers, and shepherds PRs.
-  Your single point of contact per repo.
+  Your single point of contact per repo. Coord identity is a
+  crash-safe file lease: no staleness heuristic can ever kill a live
+  coord, and a coord that died is recovered by pressing `[a]` — Fleet
+  spawns a replacement with a synthesized handoff of the dead coord's
+  in-flight worker state and archives the corpse only once the
+  successor holds the lease.
+- **Coords delegate, they don't implement.** `fleet-guard` enforces
+  the coordinator's delegate-don't-implement rule mechanically: a
+  PreToolUse hook denies inline edits outside `docs/` and test-running
+  or file-mutating shell in a coord session, logging each violation
+  under `~/.fleet/coord-violations/`. Subagents are exempt;
+  `FLEET_COORD_GUARD=off` disables the deny.
 - **Coord designs and splits the work.** Describe a problem, the coord
   runs a planning conversation (scope, edge cases, testing plan), then
   splits it into tasks and dispatches workers — only after you approve.
   No surprise scope.
-- **Tasks run in parallel.** Above parallelism 1, every worker runs in
-  its own git worktree on its own branch. Multiple PRs open at once,
-  all independently progressing.
+- **Tasks run in parallel.** Coords run 3 workers at a time by default
+  (`fleet init` asks; `parallelism: 1` keeps serialized in-place
+  dispatch). Every worker runs in its own git worktree on its own
+  branch. Multiple PRs open at once, all independently progressing.
 - **Per-task status tracking.** `tasks.md` is the source of truth —
   status, priority, lifecycle timestamps, PR URL, notes. Visible in the
   TUI, mutable via `fleet tasks`.
@@ -38,15 +50,22 @@ manager. The agents do the work.
   every subsequent dispatch prompt — so the next worker inherits prior
   workers' hard-won lessons without operator re-onboarding. Project
   intelligence compounds.
+- **Two reviewers on every task.** The reviewer stage always resolves
+  two slots at high effort: **alpha** (diverse — `codex` on a git tree
+  when it is installed, else Claude Sonnet) and **beta** (a Claude Opus
+  anchor that never skips). At least one genuine review lands even when
+  codex is rate-limited or absent.
 - **PR autopilot.** Each worker watches its own PR. CI fails →
   retry-fix subagent. PR goes BEHIND or DIRTY → rebase subagent on an
   isolated worktree. Trivial review comments addressed inline.
   Substantive Go conflicts raise to the operator.
-- **Remote control.** Mobile claude.ai can pair with running coord and
-  worker sessions via the bundled remote-control daemon. Shepherd work
-  from your phone.
+- **Remote control, native and default-on.** Every coord spawn bakes
+  `claude --remote-control` into its own argv, so mobile claude.ai can
+  pair the moment the coord starts — no listener daemon. Opt a project
+  out with `fleet rc down <project>`.
 - **Clear install.** Brew tap, one runtime dep (`tmux`), one external
-  CLI (`claude`), one bootstrap step (`fleet init`). No hidden config.
+  CLI (`claude`; `codex` optional as the second-opinion reviewer), one
+  bootstrap step (`fleet init`). No hidden config.
 
 ## Install
 
@@ -67,7 +86,11 @@ fleet init
 ```
 
 `fleet init` installs the bundled `fleet-guard` and `coordinator`
-skills under `~/.claude/skills/` and seeds `~/.fleet/standards.md`.
+skills under `~/.claude/skills/`, merges the hook registrations into
+`~/.claude/settings.json`, seeds `~/.fleet/standards.md`, and asks how
+many workers a coord should run in parallel (default 3; pass
+`--parallelism N` to skip the prompt). Re-run with `--upgrade` after
+installing a newer binary to refresh the skill copies.
 
 ### Skill install shape: copy vs symlink
 
@@ -104,13 +127,15 @@ behavior, or `fleet skills sync --force` to convert back to a pinned copy.
 
 `fleet skills status` reports each skill's shape and **flags a copy that
 has diverged from the repo** (a merged fix the running coord can't see),
-exiting non-zero so CI/scripts catch the drift — it is the reliable drift
-gate today. A coord launched through the `fleet coord-run` supervisor also
-warns to stderr at startup; the default dispatch wrapper does not yet route
-through that supervisor, so run `fleet skills status` to be sure.
+exiting non-zero so CI/scripts catch the drift. Every coord spawn runs
+under the `fleet coord-run` supervisor, which also warns to stderr at
+startup when the installed copy has diverged.
 
 Runtime deps: `tmux` (brew pulls it transitively) and the
 [Claude Code](https://docs.anthropic.com/en/docs/claude-code) CLI.
+Optional: the `codex` CLI — when present it takes the alpha reviewer
+slot, and `fleet --codex` runs coord, workers, and finisher on codex
+for the session (the reviewer still runs claude for a second opinion).
 
 > The brew tap path matters on upgrade: a JetBrains IDE is also
 > distributed as a cask named `fleet`, so `brew upgrade fleet`
@@ -130,7 +155,9 @@ From the dashboard:
 1. Press `[+]` to register the current repo (or any cloned repo) as a
    Fleet project.
 2. Move the cursor to the project row and press `[a]` to spawn its
-   coordinator.
+   coordinator. `[a]` also attaches to a live coord, and auto-recovers
+   a dead one (spawns a replacement with a synthesized handoff, then
+   archives the corpse once the successor owns the lease).
 3. In the coord's tmux session, describe a problem in plain English.
    The coord runs DISCUSS → PLAN-DOC → SPLIT → TASK LIST →
    TASK-PLAN-DOC with you.
@@ -138,35 +165,46 @@ From the dashboard:
    under the project's `docs/` folder, writes `tasks.md`, saves
    per-task plan docs, then starts the worker/reviewer/finisher flow on
    its next tick.
-5. Watch progress in the dashboard. Press `[a]` on a worker row to
-   peek at its heartbeat; press `[h]` to force a handoff if context
-   is hot.
+5. Watch progress in the dashboard. Coords appear in the agents list
+   with a live context %. Press `[a]` on a worker row to peek at its
+   heartbeat; press `[h]` on the project row to force a coord handoff
+   if context is hot; press `[n]` to queue a new task for the project.
 
 ## Hotkeys
 
-| Key       | Action                                                |
-|-----------|-------------------------------------------------------|
-| `j` / `k` | Move cursor (wraps)                                   |
-| `enter`   | Expand/collapse row, or open detail                   |
-| `a`       | Attach: coord (project), tmux (agent), peek (worker)  |
-| `d`       | Dispatch a new agent (opens repo picker)              |
-| `+`       | Register a cloned repo as a fleet project             |
-| `h`       | Handoff the selected agent to a fresh replacement     |
-| `x`       | Archive the selected agent                            |
-| `/`       | Filter dashboard rows by substring                    |
-| `?`       | Help                                                  |
-| `q`       | Quit                                                  |
+| Key       | Action                                                        |
+|-----------|---------------------------------------------------------------|
+| `j` / `k` | Move cursor (wraps); `←` / `→` jump between panels             |
+| `enter`   | Expand/collapse row, or open detail                           |
+| `a`       | Attach: coord (project, auto-recovers a dead one), tmux (agent), peek (worker/task) |
+| `n`       | Add a new task to the current project's `tasks.md`            |
+| `d`       | Dispatch a new agent (opens repo picker)                      |
+| `+`       | Register a cloned repo as a fleet project                     |
+| `h`       | Handoff the project's coord to a fresh replacement            |
+| `r`       | Reset a project: reap tangled/dead-locked coord state, respawn |
+| `x`       | Archive the selected agent                                    |
+| `c`       | Hide/unhide a project (on row); toggle show-hidden (off row)  |
+| `/`       | Filter dashboard rows by substring (`esc` clears)             |
+| `?`       | Help                                                          |
+| `q`       | Quit                                                          |
 
 Full surface: `fleet --help`.
 
 ## Architecture
 
 A **project** is a repo Fleet has seen. A **coordinator** is a
-per-project Claude Code session that owns `tasks.md` (one coord per
-project, NB-flocked). A **worker** is a Claude Code agent in a detached
-tmux session running one task in its own worktree. A **handoff** fires
-when an agent's context % gets hot — `fleet-guard` writes a structured
-doc and a fresh agent picks the work up.
+per-project Claude Code session that owns `tasks.md`; its identity is
+a three-file lease (flock) that is the single source of truth for who
+owns the project, so attach, handoff delivery, and recovery all
+resolve through it. Each coord tick is single-shot — reconcile, drain,
+dispatch, hand off, exit — run under the `fleet coord-run` supervisor.
+A **worker** is a Claude Code (or codex) agent in a detached tmux
+session running one task in its own worktree, validated by a
+two-reviewer gate before its PR is finished. A **handoff** fires when
+an agent's context % gets hot — `fleet-guard` writes a structured doc
+(completed work, decisions, files modified, next steps, open
+questions, active subagents, open PRs) and a fresh agent picks the
+work up on its first tick.
 
 See [docs/DESIGN.md](docs/DESIGN.md) for the design rationale and
 [docs/COORDINATOR-WORKFLOW.md](docs/COORDINATOR-WORKFLOW.md) for the
@@ -176,8 +214,11 @@ TASK-PLAN-DOC → IMPLEMENT → PR-TRACK → DONE).
 ## More
 
 - `fleet --help` — full CLI surface (`dispatch`, `attach`, `handoff`,
-  `drain`, `tasks`, `workers`, `learnings`, `standards`, `peek`,
-  `maintenance`).
+  `drain`, `status`, `tasks`, `workers`, `learnings`, `standards`,
+  `peek`, `project`, `rc`, `skills`, `gc`, `maintenance`).
+- `~/.fleet/coord-config.json` / `<project>/coord-config.json` —
+  `parallelism` and `worktree_timeout_s` (default 300s, for monorepos
+  where `git worktree add` is slow).
 - [CHANGELOG.md](CHANGELOG.md) — release history.
 - [skills/fleet-guard/SKILL.md](skills/fleet-guard/SKILL.md) — agent-side
   context watcher and handoff trigger.
