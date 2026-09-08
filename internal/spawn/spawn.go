@@ -1477,9 +1477,9 @@ func Spawn(opts Options) (*agent.Record, error) {
 		// tick never reads it as a resolution authority (PR4).
 		fhome := fleetHomeForSpawn()
 		if fhome != "" {
-			if werr := writeCoordConfigRepoIdempotent(fhome, rec.Project, cwd); werr != nil {
+			if werr := writeCoordConfigStamp(fhome, rec.Project, cwd, rec.Engine); werr != nil {
 				_, _ = fmt.Fprintf(os.Stderr,
-					"warning: write coord-config.json::repo for %s failed: %v "+
+					"warning: write coord-config.json::repo/engine for %s failed: %v "+
 						"(coord skill will fall back to cwd-derived worktree base)\n",
 					rec.Project, werr)
 			}

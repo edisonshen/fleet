@@ -12,7 +12,9 @@ import (
 	"github.com/edisonshen/fleet/internal/install"
 )
 
-// `fleet skills` owns how the bundled skills land in ~/.claude/skills/.
+// `fleet skills` owns how the bundled skills land in the selected engine's
+// skill home (~/.claude/skills/ for claude-code, ~/.agents/skills/ for
+// codex — see installPaths).
 //
 // The deploy gap this subcommand closes: `fleet init` copies the embedded
 // skill bytes to disk. For an operator developing ON fleet, that copy is a
@@ -39,7 +41,7 @@ func newSkillsCmd() *cobra.Command {
 		Long: `Inspect and control the install shape of Fleet's bundled skills.
 
 A skill can sit on disk two ways:
-  symlink — ~/.claude/skills/<name> points at a repo checkout; edits/merges
+  symlink — <skill-home>/skills/<name> points at a repo checkout; edits/merges
             in the checkout go live for the next coord spawn (best for
             developing ON fleet).
   copy    — the embedded skill bytes are written to disk; self-contained but
@@ -48,7 +50,10 @@ A skill can sit on disk two ways:
 
   fleet skills status              show each skill's install shape + drift
   fleet skills link [--from REPO]  symlink skills at a repo checkout (live)
-  fleet skills sync                re-copy embedded skill bytes (copy mode)`,
+  fleet skills sync                re-copy embedded skill bytes (copy mode)
+
+The skill home follows the engine flag: ~/.claude for the default
+claude-code engine, ~/.agents under "fleet -codex skills ...".`,
 	}
 	cmd.AddCommand(newSkillsStatusCmd())
 	cmd.AddCommand(newSkillsLinkCmd())
@@ -56,16 +61,15 @@ A skill can sit on disk two ways:
 	return cmd
 }
 
-// resolveClaudeHome returns ~/.claude (or the override, for tests).
+// resolveClaudeHome returns the selected engine's skill home (or the
+// override, for tests). The name is historical: it is ~/.claude only for
+// the claude-code engine.
 func resolveClaudeHome(override string) (string, error) {
-	if override != "" {
-		return override, nil
-	}
-	home, err := os.UserHomeDir()
+	paths, err := resolveInstallPaths(override)
 	if err != nil {
-		return "", fmt.Errorf("resolve home: %w", err)
+		return "", err
 	}
-	return filepath.Join(home, ".claude"), nil
+	return paths.skillHome, nil
 }
 
 func newSkillsStatusCmd() *cobra.Command {
@@ -132,7 +136,7 @@ func newSkillsLinkCmd() *cobra.Command {
 	var force bool
 	cmd := &cobra.Command{
 		Use:   "link",
-		Short: "Symlink ~/.claude/skills/<name> at the repo checkout (fixes go live)",
+		Short: "Symlink <skill-home>/skills/<name> at the repo checkout (fixes go live)",
 		Long: `Replaces the copied skill install with a symlink to the repo
 checkout's skills/<name>/ directory, so merged skill fixes reach the next
 coord spawn without a re-copy.
@@ -205,7 +209,7 @@ func newSkillsSyncCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "sync",
 		Short: "Re-copy embedded skill bytes (copy-mode installs)",
-		Long: `Writes the binary's embedded skill bytes to ~/.claude/skills/<name>/,
+		Long: `Writes the binary's embedded skill bytes to <skill-home>/skills/<name>/,
 refreshing a copy install after a ` + "`brew upgrade`" + `. A symlinked skill is
 left intact (it is already live) unless --force converts it back to a copy.`,
 		Args: cobra.NoArgs,

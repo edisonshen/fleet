@@ -2130,33 +2130,31 @@ def test_idle_agent_archive_pass_skips_fresh(
     assert [c for c in calls if "rm" in c] == []
 
 
-def test_idle_agent_archive_pass_skips_non_claude_engine(
+def test_idle_agent_archive_pass_trusts_heartbeat_engines_only(
     fleet_home: Path, monkeypatch,
 ) -> None:
-    """Multi-engine MVP (memory project_codex_multi_engine.md): codex
-    agents never run Claude Code's Stop hook, so fleet-guard never
-    updates their last_activity_ts. An actively-running codex agent
-    would look "stale-since-spawn" to the idle-archive sweep, and
-    without an engine gate the sweep would `fleet rm` it out from
-    under the operator. Engine-gate: skip records where
-    engine != "claude-code" until a sibling skill writes heartbeats
-    for them.
+    """Both claude-code and codex run fleet-guard hooks, so a stale
+    last_activity_ts is a real idle signal for either and both get
+    archived. An engine with no guard adapter never heartbeats — it
+    would look "stale-since-spawn" — so the sweep must skip it rather
+    than `fleet rm` a live agent out from under the operator.
     """
-    # Codex agent with ancient last_activity_ts (would normally be
-    # eligible for archive based on staleness alone).
     _write_agent_record(
         fleet_home, "cccc1234",
         project="fleet",
         engine="codex",
         last_activity_ts="2020-01-01T00:00:00Z",
     )
-    # And a claude-code control: same staleness, but engine=claude-code
-    # so it SHOULD be archived. This pins the engine-gate as the only
-    # axis the new branch toggles on.
     _write_agent_record(
         fleet_home, "ccaa1234",
         project="fleet",
         engine="claude-code",
+        last_activity_ts="2020-01-01T00:00:00Z",
+    )
+    _write_agent_record(
+        fleet_home, "ccbb1234",
+        project="fleet",
+        engine="mystery-engine",
         last_activity_ts="2020-01-01T00:00:00Z",
     )
     calls: list[list[str]] = []
@@ -2174,11 +2172,10 @@ def test_idle_agent_archive_pass_skips_non_claude_engine(
         project="fleet", home=fleet_home, fleet_bin="fleet",
         now_unix=2000000000.0, log_stream=io.StringIO(),
     )
-    # Only the claude-code agent was archived; codex was skipped.
-    assert archived == 1
-    rm_ids = [c[2] for c in calls if c[1:2] == ["rm"]]
-    assert rm_ids == ["ccaa1234"], (
-        f"only claude-code agent should be archived; got: {rm_ids}"
+    assert archived == 2
+    rm_ids = sorted(c[2] for c in calls if c[1:2] == ["rm"])
+    assert rm_ids == ["ccaa1234", "cccc1234"], (
+        f"claude-code + codex archived, unknown engine skipped; got: {rm_ids}"
     )
 
 

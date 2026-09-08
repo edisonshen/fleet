@@ -504,9 +504,12 @@ func TestF7_ProjectFlag_OrphanTmux_ReapsAndRespawns(t *testing.T) {
 func TestBuildCoordSpawnArgs_ShapeAndTaskID(t *testing.T) {
 	tmp := t.TempDir()
 	t.Setenv("FLEET_HOME", tmp)
+	// A plain `fleet attach` (no engine flag) must NOT pin --engine: the
+	// child dispatch resolves the project's stamped engine itself.
+	t.Setenv(FleetEngineExplicitEnv, "")
+	t.Setenv(FleetEngineEnv, "claude-code")
 	// Codex iter-6 P1: the spawned coord MUST receive the bootstrap
-	// prompt (so /coordinator runs) AND be forced to engine claude-code
-	// (so DISPATCH blocks work). The full argv shape is asserted below.
+	// prompt (so /coordinator runs). The full argv shape is asserted below.
 	wantPrompt := projectlookup.CoordSpawnPrompt("projects-fleet")
 	// DESIGN-coord-repo-binding-from-project.md PR3: buildCoordSpawnArgs
 	// now resolves via the shared resolver. No meta.json + no worktrees =
@@ -537,11 +540,28 @@ func TestBuildCoordSpawnArgs_ShapeAndTaskID(t *testing.T) {
 		"dispatch", "coord-projects-fleet",
 		"--coord-spawn", "--project", "projects-fleet",
 		"--prompt", wantPrompt,
-		"--engine", "claude-code",
 		"--cwd", repo,
 	}
 	if !stringSlicesEqual(got, want) {
 		t.Errorf("buildCoordSpawnArgs(with meta): got %v want %v", got, want)
+	}
+	// `fleet -codex attach ...`: the root command marks the choice as
+	// explicit and the Tier 3 spawn forwards it so the coord runs codex.
+	t.Setenv(FleetEngineExplicitEnv, "1")
+	t.Setenv(FleetEngineEnv, "codex")
+	got, err = buildCoordSpawnArgs("projects-fleet")
+	if err != nil {
+		t.Fatalf("buildCoordSpawnArgs(explicit codex) err: %v", err)
+	}
+	want = []string{
+		"dispatch", "coord-projects-fleet",
+		"--coord-spawn", "--project", "projects-fleet",
+		"--prompt", wantPrompt,
+		"--engine", "codex",
+		"--cwd", repo,
+	}
+	if !stringSlicesEqual(got, want) {
+		t.Errorf("buildCoordSpawnArgs(explicit codex): got %v want %v", got, want)
 	}
 	// Sanity-check the prompt content — it MUST contain "/coordinator"
 	// (the operator-visible cue that the agent will run the supervisor

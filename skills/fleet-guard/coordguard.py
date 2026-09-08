@@ -6,15 +6,20 @@ but prose drifts under long contexts and post-handoff resumes. This
 module is the mechanical backstop: on every PreToolUse fire in a coord
 session it denies
 
-  * Edit / Write / MultiEdit / NotebookEdit outside an approved docs
-    location (any path with a `docs` component, or under FLEET_HOME);
+  * Edit / Write / MultiEdit / NotebookEdit (claude-code) outside an
+    approved docs location (any path with a `docs` component, or under
+    FLEET_HOME);
+  * apply_patch (codex) whose patch touches any file outside those
+    locations;
   * Bash commands that run test suites, mutate git history, or write
-    to files (sed -i, redirects, tee, patch, ...).
+    to files (sed -i, redirects, tee, patch, ...) — both engines call
+    the shell tool `Bash` with a `command` input.
 
-Agent-tool subagents (workers / reviewers / finishers) run inside the
-coord's process and inherit its env, so FLEET_ROLE alone can't tell
-them apart. Claude Code stamps `agent_id` into hook payloads that fire
-inside a subagent; its presence exempts the call.
+Subagents (workers / reviewers / finishers) run inside the coord's
+process and inherit its env, so FLEET_ROLE alone can't tell them apart.
+Both Claude Code (Agent tool) and Codex (spawn_agent) stamp `agent_id`
+into hook payloads that fire inside a subagent; its presence exempts
+the call.
 
 Every denial is appended to FLEET_HOME/coord-violations/<agent_id>.jsonl
 so the Stop hook can nag once per turn and operators can grep how often
@@ -35,6 +40,13 @@ from typing import Any
 import health
 
 EDIT_TOOLS = frozenset({"Edit", "Write", "MultiEdit", "NotebookEdit"})
+
+# Codex's file-mutation tool. tool_input.command is the patch text; every
+# `*** Add File: / Update File: / Delete File: / Move to:` header names a
+# target path.
+PATCH_TOOL = "apply_patch"
+_PATCH_PATH_RE = re.compile(
+    r"^\*\*\* (?:Add File|Update File|Delete File|Move to): (.+?)\s*$", re.M)
 
 DOCS_DIR_NAMES = frozenset({"docs", "doc"})
 
@@ -83,7 +95,7 @@ _REDIRECT = re.compile(r"(?<![0-9&<>])>{1,2}\s*(?!&|/dev/null)([^\s;|&]+)")
 DENY_REASON = (
     "[fleet coord-guard] Coordinators delegate. This session is a "
     "coordinator (FLEET_ROLE=coord): it discusses, saves plan docs under "
-    "docs/, files tasks with `fleet tasks add`, and dispatches Agent "
+    "docs/, files tasks with `fleet tasks add`, and dispatches worker "
     "subagents. It never edits source, runs tests, or mutates git inline. "
     "File a task and let a worker do this: {what}"
 )
@@ -93,7 +105,7 @@ ROLE_REMINDER = (
     "[FLEET] You are the coordinator for this project. Discuss, plan, save "
     "docs under docs/, file tasks, dispatch and shepherd workers. NEVER edit "
     "source, run test suites, or mutate git yourself — the coord-guard hook "
-    "denies those tool calls. Implementation belongs to Agent subagents."
+    "denies those tool calls. Implementation belongs to dispatched subagents."
 )
 
 
@@ -163,6 +175,15 @@ def classify(payload: dict[str, Any]) -> str | None:
         if _is_docs_path(path):
             return None
         return f"{tool} {path or '<unknown path>'}"
+    if tool == PATCH_TOOL:
+        patch = str(tool_input.get("command") or tool_input.get("patch") or "")
+        paths = _PATCH_PATH_RE.findall(patch)
+        if not paths:
+            return f"{tool} <unparseable patch>"
+        for path in paths:
+            if not _is_docs_path(path):
+                return f"{tool} {path}"
+        return None
     if tool == "Bash":
         command = str(tool_input.get("command") or "")
         label = _bash_offense(command)

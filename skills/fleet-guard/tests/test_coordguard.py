@@ -71,6 +71,11 @@ IMPLEMENTATION_ATTEMPTS = [
     ("Bash", {"command": "env FOO=1 go test ./..."}),
     ("Bash", {"command": "find . -name '*.go' | xargs rm"}),
     ("Bash", {"command": "python3 -c 'open(\"x.go\",\"w\")'"}),
+    # codex: apply_patch is the file-mutation tool; the patch names its targets
+    ("apply_patch", {"command": "*** Begin Patch\n*** Update File: internal/x.go\n@@\n-a\n+b\n*** End Patch"}),
+    ("apply_patch", {"command": "*** Begin Patch\n*** Add File: docs/plan.md\n+x\n*** Add File: cmd/fleet/y.go\n+y\n*** End Patch"}),
+    ("apply_patch", {"command": "*** Begin Patch\n*** Delete File: docs/src/x.go\n*** End Patch"}),
+    ("apply_patch", {"command": "garbage"}),
 ]
 
 
@@ -115,6 +120,9 @@ COORD_WORKFLOW = [
     ("Bash", {"command": "go build ./... 2>&1 | head"}),
     ("Bash", {"command": "mkdir -p docs/plans && echo plan > docs/plans/x.md"}),
     ("Bash", {"command": "python3 x.py > /dev/null"}),
+    # codex coord saving a plan doc via apply_patch
+    ("apply_patch", {"command": "*** Begin Patch\n*** Add File: docs/plans/x.md\n+plan\n*** End Patch"}),
+    ("apply_patch", {"command": "*** Begin Patch\n*** Update File: {home}/notes.md\n@@\n+x\n*** End Patch"}),
 ]
 
 
@@ -149,6 +157,15 @@ def test_non_coord_sessions_untouched(env: dict, monkeypatch, capsys) -> None:
 def test_agent_subagent_inside_coord_may_implement(capsys) -> None:
     payload = {"hook_event_name": "PreToolUse", "agent_id": "sub-1",
                "tool_name": "Edit", "tool_input": {"file_path": "internal/x.go"}}
+    assert fleet_main.main(io.StringIO(json.dumps(payload))) == 0
+    assert capsys.readouterr().out == ""
+
+
+def test_codex_subagent_inside_coord_may_implement(capsys) -> None:
+    """Codex spawn_agent children stamp agent_id/agent_type the same way."""
+    payload = {"hook_event_name": "PreToolUse", "agent_id": "01a07e5c-0000",
+               "agent_type": "default", "tool_name": "apply_patch",
+               "tool_input": {"command": "*** Begin Patch\n*** Update File: internal/x.go\n@@\n+x\n*** End Patch"}}
     assert fleet_main.main(io.StringIO(json.dumps(payload))) == 0
     assert capsys.readouterr().out == ""
 

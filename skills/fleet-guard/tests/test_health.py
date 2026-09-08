@@ -252,6 +252,78 @@ class TestReadContextPct:
 
 # -- opus-4-8 1M-context regression (fleet-guard-model-limit-db14) -----------
 
+class TestReadContextPctCodex:
+    """Codex rollouts carry the window in-band (model_context_window) and
+    report usage as event_msg/token_count records, not message.usage."""
+
+    @staticmethod
+    def _token_count(input_tokens: int, cached: int, output: int,
+                     window: int | None = 258_400) -> str:
+        info: dict = {
+            "total_token_usage": {"input_tokens": input_tokens * 3},
+            "last_token_usage": {
+                "input_tokens": input_tokens,
+                "cached_input_tokens": cached,
+                "cache_write_input_tokens": 0,
+                "output_tokens": output,
+                "reasoning_output_tokens": 0,
+                "total_tokens": input_tokens + output,
+            },
+        }
+        if window is not None:
+            info["model_context_window"] = window
+        return json.dumps({"timestamp": "2026-09-08T00:41:45.771Z", "ordinal": 16,
+                           "type": "event_msg",
+                           "payload": {"type": "token_count", "info": info,
+                                       "rate_limits": {"primary": {"used_percent": 3.0}}}})
+
+    def _rollout(self, tmp_path: Path, *records: str) -> Path:
+        path = tmp_path / "rollout-2026-09-08T00-41-39-abc.jsonl"
+        meta = json.dumps({"type": "session_meta", "payload": {
+            "session_id": "abc", "cli_version": "0.153.4", "model_provider": "openai"}})
+        turn = json.dumps({"type": "event_msg", "payload": {"type": "task_started",
+                                                             "model_context_window": 258_400}})
+        path.write_text("\n".join([meta, turn, *records]) + "\n", encoding="utf-8")
+        return path
+
+    def test_uses_in_band_window_and_hook_model(self, tmp_path: Path) -> None:
+        path = self._rollout(tmp_path, self._token_count(129_200, 100_000, 5_000))
+        pct, model = health.read_context_pct(
+            {"transcript_path": str(path), "model": "gpt-6-astra"})
+        # 129_200 / 258_400 = 50.0%; cached tokens are a subset of input,
+        # output tokens excluded — exactly the red threshold.
+        assert pct == 50.0
+        assert model == "gpt-6-astra"
+        assert health.threshold(pct) == "red"
+
+    def test_last_token_count_wins(self, tmp_path: Path) -> None:
+        path = self._rollout(tmp_path,
+                             self._token_count(15_571, 0, 73),
+                             self._token_count(25_840, 15_360, 29))
+        pct, _ = health.read_context_pct({"transcript_path": str(path), "model": "m"})
+        assert pct == 10.0
+
+    def test_no_window_falls_back_to_default_with_flag(self, tmp_path: Path, capsys) -> None:
+        path = self._rollout(tmp_path, self._token_count(100_000, 0, 0, window=None))
+        pct, model = health.read_context_pct(
+            {"transcript_path": str(path), "model": "gpt-future"})
+        assert pct == 10.0  # 100k / 1M default
+        assert model == "gpt-future"
+        assert "gpt-future" in capsys.readouterr().err
+
+    def test_rollout_without_token_count_is_loud_none(self, tmp_path: Path, capsys) -> None:
+        path = self._rollout(tmp_path)
+        pct, _ = health.read_context_pct({"transcript_path": str(path), "model": "m"})
+        assert pct is None
+        assert "no usage found" in capsys.readouterr().err
+
+    def test_claude_transcript_unaffected(self, transcript_with_usage: Path) -> None:
+        pct, model = health.read_context_pct(
+            {"transcript_path": str(transcript_with_usage), "model": "gpt-6-astra"})
+        assert pct == 25.0
+        assert model == "claude-sonnet-4-6"
+
+
 class TestOpus48HandoffFires:
     """REGRESSION (fleet-guard-model-limit-db14, P0): before the fix,
     CONTEXT_LIMITS topped out at claude-opus-4-7 and the live model id is

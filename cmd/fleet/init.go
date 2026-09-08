@@ -22,9 +22,11 @@ import (
 	"github.com/edisonshen/fleet/internal/state"
 )
 
-// hookEvents are the Claude Code hook event names fleet-guard listens on.
-// Order is fixed for deterministic settings.json output and matches
-// SKILL.md's Hook bindings table. UserPromptSubmit was added alongside
+// hookEvents are the hook event names fleet-guard listens on. Claude Code
+// and Codex share these names and the same nested registration shape, so
+// one list serves both engines. Order is fixed for deterministic
+// settings.json / hooks.json output and matches SKILL.md's Hook bindings
+// table. UserPromptSubmit was added alongside
 // the needs_input flag so the TUI can surface "waiting on operator" —
 // without that hook the flag would set true on Stop and never clear.
 // PreToolUse is the coordinator delegation guard: it denies source
@@ -46,13 +48,19 @@ func newInitCmd() *cobra.Command {
 	var parallelism int
 	cmd := &cobra.Command{
 		Use:   "init",
-		Short: "Install bundled skills into ~/.claude/skills/ and register hooks",
-		Long: `Writes the embedded skills (fleet-guard, coordinator) to
-~/.claude/skills/<name>/ and merges Stop / PreCompact / SessionStart /
-UserPromptSubmit hook registrations into ~/.claude/settings.json. Also
-seeds a canonical ~/.fleet/standards.md when one is missing — that file
-is the operator-edited "the bar" the v0.2 coordinator inlines into
-worker prompts.
+		Short: "Install bundled skills for the selected engine and register hooks",
+		Long: `Writes the embedded skills (fleet-guard, coordinator) into the
+selected engine's skill home and merges Stop / PreCompact / SessionStart /
+UserPromptSubmit / PreToolUse hook registrations into its hooks file:
+
+  fleet init            claude-code: ~/.claude/skills/<name>/ + ~/.claude/settings.json
+  fleet -codex init     codex:       ~/.agents/skills/<name>/ + ~/.codex/hooks.json
+
+Only the dominant engine needs the skills; the other engine (optional
+review helper) is driven through its non-interactive CLI. Also seeds a
+canonical ~/.fleet/standards.md when one is missing — that file is the
+operator-edited "the bar" the v0.2 coordinator inlines into worker
+prompts.
 
 Idempotent: re-running on an installed skill prints "skip (up to date)"
 for each existing file. --upgrade overwrites bundled skill files (so a
@@ -152,23 +160,21 @@ func promptParallelism(stdout io.Writer, stdin io.Reader) int {
 	return n
 }
 
-// runInit copies every embedded skill into ~/.claude/skills/<name>/,
-// merges hook registrations into ~/.claude/settings.json, and seeds
-// ~/.fleet/standards.md from the bundled template when missing.
+// runInit copies every embedded skill into the selected engine's
+// <skillHome>/skills/<name>/, merges hook registrations into its hooks
+// file, and seeds ~/.fleet/standards.md from the bundled template when
+// missing. See installPaths for the per-engine locations.
 //
-// claudeHomeOverride lets tests redirect ~/.claude/. Production passes "".
-// fleet-guard remains the source of the hook command — coordinator runs
-// as a slash skill the coord agent invokes itself, not via Claude Code
+// skillHomeOverride lets tests redirect the skill home. Production passes
+// "". fleet-guard remains the source of the hook command — coordinator
+// runs as a slash skill the coord agent invokes itself, not via engine
 // hooks (matches SKILL.md "Hook bindings" section).
-func runInit(stdout io.Writer, force bool, claudeHomeOverride string) error {
-	claudeHome := claudeHomeOverride
-	if claudeHome == "" {
-		home, err := os.UserHomeDir()
-		if err != nil {
-			return fmt.Errorf("resolve home: %w", err)
-		}
-		claudeHome = filepath.Join(home, ".claude")
+func runInit(stdout io.Writer, force bool, skillHomeOverride string) error {
+	paths, err := resolveInstallPaths(skillHomeOverride)
+	if err != nil {
+		return err
 	}
+	skillHome := paths.skillHome
 
 	// Walk every bundled skill in a stable order so install output is
 	// deterministic across runs (fleet-guard first, coordinator second).
@@ -183,12 +189,12 @@ func runInit(stdout io.Writer, force bool, claudeHomeOverride string) error {
 		// with stale embedded bytes — corrupting their checkout. Leave the
 		// link intact; `fleet skills sync --force` is the explicit opt-out
 		// for converting back to a copy.
-		if install.IsSymlink(claudeHome, name) {
+		if install.IsSymlink(skillHome, name) {
 			_, _ = fmt.Fprintf(stdout, "skip (symlinked, live): %s\n",
-				filepath.Join(claudeHome, "skills", name))
+				filepath.Join(skillHome, "skills", name))
 			continue
 		}
-		skillRoot := filepath.Join(claudeHome, "skills", name)
+		skillRoot := filepath.Join(skillHome, "skills", name)
 		if err := installSkillFilesFS(stdout, skills[name], skillRoot, force); err != nil {
 			return fmt.Errorf("install %s: %w", name, err)
 		}
@@ -199,8 +205,8 @@ func runInit(stdout io.Writer, force bool, claudeHomeOverride string) error {
 	// bindings". Adding coordinator here would double-fire on every
 	// Stop / PreCompact and run loop.tick() inside fleet-guard's hook
 	// payload, which the skill explicitly does not want.
-	mainPath := filepath.Join(claudeHome, "skills", "fleet-guard", "main.py")
-	if err := mergeHookRegistrations(stdout, claudeHome, mainPath); err != nil {
+	mainPath := filepath.Join(paths.skillDir("fleet-guard"), "main.py")
+	if err := mergeHookRegistrations(stdout, paths.hooksFile, mainPath); err != nil {
 		return err
 	}
 
@@ -312,13 +318,13 @@ func seedStandardsTemplate(stdout io.Writer) error {
 	return nil
 }
 
-// mergeHookRegistrations adds Stop / PreCompact / SessionStart entries to
-// ~/.claude/settings.json that invoke the installed main.py. Existing
-// entries (e.g., the spike's stop-hook.py) are preserved — fleet-guard
-// is appended, never replaces. Idempotent: re-running with the same
+// mergeHookRegistrations adds the hookEvents entries to settingsPath
+// (~/.claude/settings.json or ~/.codex/hooks.json) that invoke the
+// installed main.py. Existing entries (e.g., the spike's stop-hook.py)
+// and every unrelated top-level key are preserved — fleet-guard is
+// appended, never replaces. Idempotent: re-running with the same
 // mainPath does not duplicate.
-func mergeHookRegistrations(stdout io.Writer, claudeHome, mainPath string) error {
-	settingsPath := filepath.Join(claudeHome, "settings.json")
+func mergeHookRegistrations(stdout io.Writer, settingsPath, mainPath string) error {
 	command := "/usr/bin/env python3 " + mainPath
 
 	settings, err := loadSettings(settingsPath)
@@ -336,8 +342,8 @@ func mergeHookRegistrations(stdout io.Writer, claudeHome, mainPath string) error
 		typed, ok := raw.(map[string]any)
 		if !ok {
 			return fmt.Errorf(
-				"settings.json: 'hooks' is %T, expected JSON object — refusing to overwrite; repair %s manually",
-				raw, filepath.Join(claudeHome, "settings.json"))
+				"%s: 'hooks' is %T, expected JSON object — refusing to overwrite; repair it manually",
+				filepath.Base(settingsPath), raw)
 		}
 		hooks = typed
 	} else {
@@ -367,7 +373,7 @@ func mergeHookRegistrations(stdout io.Writer, claudeHome, mainPath string) error
 		return fmt.Errorf("write settings.json: %w", err)
 	}
 	if added == 0 {
-		_, _ = fmt.Fprintln(stdout, "settings.json already up to date")
+		_, _ = fmt.Fprintf(stdout, "%s already up to date\n", filepath.Base(settingsPath))
 	}
 	return nil
 }
@@ -397,7 +403,8 @@ func loadSettings(path string) (map[string]any, error) {
 // none of the existing entries already invoke that exact command.
 // Returns true if the entry was added (false = already present).
 //
-// Schema follows the live shape in ~/.claude/settings.json:
+// Schema follows the live shape in ~/.claude/settings.json (Codex's
+// ~/.codex/hooks.json uses the identical nesting):
 //
 //	hooks.<Event>: [
 //	  { "hooks": [{ "type": "command", "command": "..." }] }

@@ -7,6 +7,8 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+
+	"github.com/edisonshen/fleet/internal/projects"
 )
 
 // coordTaskIDPrefix matches cmd/fleet/dispatch.go's CoordTaskIDPrefix.
@@ -44,22 +46,34 @@ func IsCoordSpawn(taskID, project string) bool {
 	return isCoordSpawn(taskID, project)
 }
 
-// writeCoordConfigRepoIdempotent stamps the resolved repo path into
-// ~/.fleet/projects/<project>/coord-config.json under the `repo` key.
+// CoordConfigPath is projects.CoordConfigPath; kept here so spawn-side
+// callers and tests keep one import.
+func CoordConfigPath(fleetHome, project string) string {
+	return projects.CoordConfigPath(fleetHome, project)
+}
+
+// ReadCoordConfigEngine is projects.ReadCoordConfigEngine.
+func ReadCoordConfigEngine(fleetHome, project string) string {
+	return projects.ReadCoordConfigEngine(fleetHome, project)
+}
+
+// writeCoordConfigStamp stamps the resolved repo path and the coord's
+// engine into ~/.fleet/projects/<project>/coord-config.json.
 //
 // Schema (additive — never break existing readers):
 //
 //	{
 //	    "parallelism": <int>,   // loop.py _load_parallelism
-//	    "repo":        <str>    // fleet#175 — coord's project checkout
+//	    "repo":        <str>,   // fleet#175 — coord's project checkout
+//	    "engine":      <str>    // dominant engine of the last coord spawn
 //	}
 //
-// Idempotency:
-//   - file missing → create with {"repo": repo}
-//   - file present, `repo` missing or whitespace-only → merge (preserve
-//     parallelism + every other field)
-//   - file present, `repo` non-empty → leave untouched (operator may
-//     have set this to a fork/out-of-tree checkout)
+// Both keys are overwritten unconditionally; every other field is
+// preserved. `engine` is what lets a later `fleet` (TUI [a], `fleet
+// attach` Tier 3) with no engine flag respawn the project's coord under
+// the engine the operator originally chose — the per-project memory of
+// `fleet -codex` / `fleet -claude`. An explicit flag on the respawn
+// always wins over it (cmd/fleet/dispatch.go).
 //
 // Atomic: write to a tempfile in the same directory, fsync, rename.
 // On any non-recoverable error returns it for the caller to log; we
@@ -67,15 +81,15 @@ func IsCoordSpawn(taskID, project string) bool {
 // coord skill falls through to its legacy cwd-derived behavior + emits
 // a warning into TickResult.errors. A failed write here is a
 // breadcrumb, not a blocker.
-func writeCoordConfigRepoIdempotent(fleetHome, project, repo string) error {
+func writeCoordConfigStamp(fleetHome, project, repo, engine string) error {
 	if fleetHome == "" || project == "" || repo == "" {
-		return errors.New("writeCoordConfigRepoIdempotent: empty input")
+		return errors.New("writeCoordConfigStamp: empty input")
 	}
 	projDir := filepath.Join(fleetHome, "projects", project)
 	if err := os.MkdirAll(projDir, 0o755); err != nil {
 		return fmt.Errorf("mkdir project dir: %w", err)
 	}
-	cfgPath := filepath.Join(projDir, "coord-config.json")
+	cfgPath := CoordConfigPath(fleetHome, project)
 
 	// Read existing config (if any). Treat unreadable/malformed as
 	// empty — we'll write a clean one. Matches the Python helper's
@@ -105,6 +119,9 @@ func writeCoordConfigRepoIdempotent(fleetHome, project, repo string) error {
 	// lives in meta.json::repo_path (set via `fleet project add`), which
 	// the resolver reads first (tier 1) on every bind.
 	data["repo"] = repo
+	if engine != "" {
+		data["engine"] = engine
+	}
 
 	// Atomic write: tmp + fsync + rename in the same directory.
 	tmp, err := os.CreateTemp(projDir, "coord-config.json.tmp.*")
