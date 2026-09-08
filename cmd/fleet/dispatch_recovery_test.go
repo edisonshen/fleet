@@ -1069,6 +1069,10 @@ func TestRunDispatch_DeadCoord_CodexRecoveryInheritsEngine(t *testing.T) {
 		t.Fatalf("write tasks.md: %v", err)
 	}
 
+	// lint-test-isolation:command-exempt — this test asserts the
+	// engine-wrapper swap itself (claude default → inherited codex), which
+	// fires only on the CLI default-command path. requireFakeTmux above
+	// guarantees the swapped argv never reaches a real tmux/codex.
 	opts := &dispatchOpts{
 		taskID:          "coord-myproj",
 		project:         "myproj",
@@ -1515,6 +1519,10 @@ func TestRunDispatch_CoordSpawnCodexEngine(t *testing.T) {
 	root := os.Getenv("FLEET_HOME")
 	seedRecoveryRepo(t, root, "myproj")
 
+	// lint-test-isolation:command-exempt — this test asserts the engine
+	// wrapper selection (codex argv) and the coord-config.json stamp that a
+	// flag-less respawn resolves, both of which live on the CLI default-
+	// command path. requireFakeTmux above keeps the spawn fake.
 	opts := &dispatchOpts{
 		taskID:          "coord-myproj",
 		project:         "myproj",
