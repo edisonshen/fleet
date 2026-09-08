@@ -190,20 +190,17 @@ def test_skill_md_resume_section_names_helper_module():
 
 
 def test_skill_md_dispatch_protocol_pins_one_call_per_block():
-    """The contract is exactly one Agent call per DISPATCH block — N
-    blocks → N calls. Drift to "one call per tick" would silently
-    drop workers under cap > 1 dispatch."""
-    body = _read_skill_md()
+    """The contract is exactly one spawn call (Claude Agent tool / Codex
+    spawn_agent) per DISPATCH block — N blocks → N calls. Drift to "one
+    call per tick" would silently drop workers under cap > 1 dispatch."""
+    body = _read_skill_md().lower()
     # Look for the explicit framing the coord is expected to follow.
-    assert "One Agent call per DISPATCH block" in body or \
-        "one Agent call per DISPATCH block" in body or \
-        "One Agent call per block" in body or \
-        "one Agent call per block" in body or \
-        "one per dispatch block" in body.lower() or \
-        "one Agent call per" in body, (
-            "SKILL.md must pin 'one Agent call per DISPATCH block' so "
+    assert "one spawn call per dispatch block" in body or \
+        "one agent call per dispatch block" in body or \
+        "one per dispatch block" in body, (
+            "SKILL.md must pin 'one spawn call per DISPATCH block' so "
             "the coord agent doesn't collapse multi-block ticks into a "
-            "single Agent call (issue #84 Phase A)."
+            "single spawn call (issue #84 Phase A)."
         )
 
 
@@ -259,8 +256,8 @@ def test_skill_md_step6_documents_three_stage_flow():
 
 def test_skill_md_step5_documents_task_plan_review_sop():
     """Step 5 must carry the dual-review SOP: the coord never reviews
-    inline, every TASK-PLAN doc set gets a dispatched codex + Claude
-    dual review before promote (reviewers launched in parallel, per-plan
+    inline, every TASK-PLAN doc set gets a dispatched dominant-engine +
+    helper dual review before promote (reviewers launched in parallel, per-plan
     reviewers fanned out in parallel), the fix/re-review loop runs until
     both are P0/P1-clean, and reviews-clean never auto-promotes. Drift here
     lets a handed-off coord regress to inline self-review or skip the
@@ -295,17 +292,19 @@ def test_skill_md_step5_documents_task_plan_review_sop():
         # The dual review is a pre-promote gate, via dispatched subagents,
         # launched in parallel (operator amendment 2026-06-11).
         "Before promote, every TASK-PLAN doc set gets one dual review via "
-        "dispatched subagents, launched in parallel (codex and Claude "
-        "concurrently)",
+        "dispatched subagents, launched in parallel (dominant engine and "
+        "helper concurrently)",
         # Per-plan reviewers fan out in parallel; only the seam pass needs
         # the full plan set in one context.
         "Fan-out: with many task plans, per-plan reviewers also dispatch "
         "in parallel; only the cross-task-seam pass needs the full plan "
         "set in one reviewer's context",
-        "a codex reviewer (codex exec, high reasoning) — design-fidelity, "
-        "code-reality, implementability",
-        "an independent Claude reviewer — cross-task seams between the "
-        "plans, testability, plus the same lenses",
+        "a helper-engine reviewer (the other provider's CLI, high reasoning) "
+        "— design-fidelity, code-reality, implementability; when no helper "
+        "is installed, a second independent dominant-engine reviewer takes "
+        "this seat",
+        "an independent dominant-engine reviewer — cross-task seams between "
+        "the plans, testability, plus the same lenses",
         # Fix/re-review loop until both reviewers are P0/P1-clean.
         "the coord applies doc-level fixes (plan docs are its only allowed "
         "write surface) and re-dispatches confirm reviews until BOTH "

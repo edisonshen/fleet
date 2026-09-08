@@ -87,26 +87,63 @@ func validPhase(p Phase) bool {
 // terminal values to prevent a worker (or a buggy reviewer) from
 // reaching push without recording review outcome.
 //
-// "skipped" is allowed only for a codex-engine alpha slot when the
-// codex CLI is unavailable or rate-limited. Claude slots never skip.
+// "skipped" is allowed only for the HELPER alpha slot (the engine that
+// is not the project's dominant engine) when that CLI is unavailable or
+// rate-limited. The dominant-engine beta anchor never skips.
 type ReviewStatus string
 
 const (
-	ReviewStatusPending              ReviewStatus = "pending"                // not started
-	ReviewStatusIterating            ReviewStatus = "iterating"              // in reviewer loop
-	ReviewStatusPassed               ReviewStatus = "passed"                 // terminal — clean
-	ReviewStatusSkipped              ReviewStatus = "skipped"                // terminal — codex alpha only
-	ReviewStatusBlocked              ReviewStatus = "blocked"                // terminal — needs operator
-	ReviewStatusSingleClaudeDegraded ReviewStatus = "single-claude-degraded" // terminal — one distinct Claude model
+	ReviewStatusPending   ReviewStatus = "pending"   // not started
+	ReviewStatusIterating ReviewStatus = "iterating" // in reviewer loop
+	ReviewStatusPassed    ReviewStatus = "passed"    // terminal — clean
+	ReviewStatusSkipped   ReviewStatus = "skipped"   // terminal — helper alpha only
+	ReviewStatusBlocked   ReviewStatus = "blocked"   // terminal — needs operator
+	// ReviewStatusSingleEngineDegraded: terminal — the helper engine is
+	// not installed and the dominant engine had only one distinct
+	// reviewer model, so alpha re-used beta's engine+model.
+	ReviewStatusSingleEngineDegraded ReviewStatus = "single-engine-degraded"
+	// ReviewStatusSingleClaudeDegraded is the pre-mirroring spelling of
+	// ReviewStatusSingleEngineDegraded (claude was the only anchor).
+	// Accepted on read for state.json files written by older reviewers;
+	// new writes use ReviewStatusSingleEngineDegraded.
+	ReviewStatusSingleClaudeDegraded ReviewStatus = "single-claude-degraded"
 )
 
 const (
 	// ReviewEngineCodex and ReviewEngineClaude are persisted slot engine
 	// values used by the review gate. They are distinct from coordinator
-	// execution engine strings such as "claude-code".
+	// execution engine strings such as "claude-code"; see
+	// ReviewEngineForDominant for the mapping.
 	ReviewEngineCodex  = "codex"
 	ReviewEngineClaude = "claude"
 )
+
+// ReviewEngineForDominant maps a coordinator execution engine
+// (enginecfg.EngineClaudeCode / EngineCodex) to the review-slot engine
+// that anchors its beta slot. Unknown or empty input maps to claude,
+// the pre-mirroring default.
+func ReviewEngineForDominant(engine string) string {
+	if engine == "codex" {
+		return ReviewEngineCodex
+	}
+	return ReviewEngineClaude
+}
+
+// ProjectReviewAnchor returns the review engine the project's beta slot
+// must be: the review engine of the dominant engine stamped into
+// coord-config.json by the last coord spawn, or claude when no coord
+// has stamped one (legacy / never-coordinated projects).
+func ProjectReviewAnchor(project string) string {
+	root, err := state.Root()
+	if err != nil {
+		return ReviewEngineClaude
+	}
+	return ReviewEngineForDominant(projects.ReadCoordConfigEngine(root, project))
+}
+
+func isDegradedStatus(s ReviewStatus) bool {
+	return s == ReviewStatusSingleEngineDegraded || s == ReviewStatusSingleClaudeDegraded
+}
 
 var nonEmptyReviewStatuses = map[ReviewStatus]struct{}{
 	ReviewStatusPending:              {},
@@ -114,6 +151,7 @@ var nonEmptyReviewStatuses = map[ReviewStatus]struct{}{
 	ReviewStatusPassed:               {},
 	ReviewStatusSkipped:              {},
 	ReviewStatusBlocked:              {},
+	ReviewStatusSingleEngineDegraded: {},
 	ReviewStatusSingleClaudeDegraded: {},
 }
 
@@ -177,13 +215,13 @@ var (
 	ErrInvalidState                = errors.New("invalid worker state")
 	ErrPhaseRequiresPR             = errors.New("phase=done requires pr_url")
 	ErrPhaseRequiresWhy            = errors.New("phase=blocked requires blocked_reason")
-	ErrPhaseRequiresReview         = errors.New("terminal phase requires review slot gate: alpha passed or legal codex skip, and beta claude passed")
+	ErrPhaseRequiresReview         = errors.New("terminal phase requires review slot gate: alpha passed or legal helper skip, and beta (dominant engine) passed")
 	ErrInvalidPhase                = errors.New("invalid phase")
 	ErrInvalidReviewStat           = errors.New("invalid review status")
-	ErrCodexSkipNeedsReason        = errors.New("codex-engine review slot status=skipped requires skip_reason in {rate-limited, unavailable}")
+	ErrCodexSkipNeedsReason        = errors.New("helper review slot status=skipped requires skip_reason in {rate-limited, unavailable}")
 	ErrReviewSlotIdentity          = errors.New("review slot requires engine in {codex,claude} and non-empty model")
-	ErrReviewBetaAnchor            = errors.New("review beta slot must be engine=claude with status=passed (the Claude anchor)")
-	ErrReviewDegradedModelMismatch = errors.New("single-claude-degraded requires review_alpha_model == review_beta_model (only one distinct Claude reviewer)")
+	ErrReviewBetaAnchor            = errors.New("review beta slot must be the project's dominant engine with status=passed (the anchor)")
+	ErrReviewDegradedModelMismatch = errors.New("single-engine-degraded requires review_alpha_engine/model == review_beta_engine/model (only one distinct reviewer)")
 	ErrInvalidSlug                 = errors.New("invalid worker slug")
 	ErrPreconditionLive            = errors.New("cannot archive live worker")
 	// ErrStaleGeneration fires when a `fleet workers update
@@ -201,13 +239,13 @@ var (
 	ErrPhasePushNonGit = errors.New("non-git project: phase=push is not valid; transition phase=done directly")
 )
 
-// allowedCodexSkipReasons enumerates the only codex-engine slot skip
-// reasons the validator accepts. The CLI flag wrapper rejects anything
-// else upfront, but workers.WriteState is the load-bearing gate that
-// catches direct callers + future skill-side bypasses. Allowed values
-// are intentionally narrow: codex skips are operational concessions
+// allowedCodexSkipReasons enumerates the only helper-slot skip reasons
+// the validator accepts. The CLI flag wrapper rejects anything else
+// upfront, but workers.WriteState is the load-bearing gate that catches
+// direct callers + future skill-side bypasses. Allowed values are
+// intentionally narrow: helper skips are operational concessions
 // (rate-limited at the CLI; binary missing on host) — NOT a way to
-// declare "I didn't feel like running codex".
+// declare "I didn't feel like running the second engine".
 // Broadening this set requires explicit operator sign-off (CLAUDE.md §4).
 var allowedCodexSkipReasons = map[string]struct{}{
 	"rate-limited": {},
@@ -249,7 +287,18 @@ func projectIsGit(project string) bool {
 // flow exists to prevent. Codex iter-1 [P2]: the original gate fired
 // only on phase=push, leaving non-git projects without any review
 // enforcement at all.
-func validateReviewGate(s *State, gitMode bool) error {
+//
+// Slot roles mirror the dominant engine (anchor = its review engine):
+//
+//	beta  = anchor engine, must be passed
+//	alpha = helper engine (the other one): passed, or skipped with an
+//	        allowlisted reason (rate-limited|unavailable); a codex
+//	        helper may only skip on git projects (codex review needs
+//	        a diff base)
+//	      = anchor engine again when the helper is not installed:
+//	        passed on a second distinct model, or
+//	        single-engine-degraded on the same model as beta
+func validateReviewGate(s *State, gitMode bool, anchor string) error {
 	// Git: gate fires on phase=push. Non-git: gate fires on phase=done
 	// (the finisher's terminal write — there is no push step).
 	gate := PhasePush
@@ -274,19 +323,20 @@ func validateReviewGate(s *State, gitMode bool) error {
 			return fmt.Errorf("%w: %s engine=%q model=%q", ErrReviewSlotIdentity, slot.name, slot.engine, slot.model)
 		}
 	}
-	if s.ReviewBetaEngine != ReviewEngineClaude || s.ReviewBetaStatus != ReviewStatusPassed {
-		return fmt.Errorf("%w: review_beta_engine=%q review_beta_status=%q", ErrReviewBetaAnchor, s.ReviewBetaEngine, s.ReviewBetaStatus)
+	if s.ReviewBetaEngine != anchor || s.ReviewBetaStatus != ReviewStatusPassed {
+		return fmt.Errorf("%w: anchor=%q review_beta_engine=%q review_beta_status=%q", ErrReviewBetaAnchor, anchor, s.ReviewBetaEngine, s.ReviewBetaStatus)
 	}
-	if s.ReviewAlphaStatus == ReviewStatusSingleClaudeDegraded {
-		if s.ReviewAlphaEngine != ReviewEngineClaude {
-			return fmt.Errorf("%w: review_alpha_status=%q review_alpha_engine=%q", ErrPhaseRequiresReview, s.ReviewAlphaStatus, s.ReviewAlphaEngine)
+	helperSlot := s.ReviewAlphaEngine != anchor
+	if isDegradedStatus(s.ReviewAlphaStatus) {
+		if helperSlot {
+			return fmt.Errorf("%w: review_alpha_status=%q review_alpha_engine=%q anchor=%q", ErrPhaseRequiresReview, s.ReviewAlphaStatus, s.ReviewAlphaEngine, anchor)
 		}
 		if s.ReviewAlphaModel != s.ReviewBetaModel {
 			return fmt.Errorf("%w: review_alpha_model=%q review_beta_model=%q", ErrReviewDegradedModelMismatch, s.ReviewAlphaModel, s.ReviewBetaModel)
 		}
 	} else if s.ReviewAlphaStatus == ReviewStatusPassed {
 		// alpha clean.
-	} else if s.ReviewAlphaStatus == ReviewStatusSkipped && s.ReviewAlphaEngine == ReviewEngineCodex && gitMode {
+	} else if s.ReviewAlphaStatus == ReviewStatusSkipped && helperSlot && (gitMode || s.ReviewAlphaEngine != ReviewEngineCodex) {
 		reason := strings.TrimSpace(s.ReviewAlphaSkipReason)
 		if _, ok := allowedCodexSkipReasons[reason]; !ok {
 			return fmt.Errorf("%w: got %q", ErrCodexSkipNeedsReason, reason)
@@ -403,7 +453,7 @@ func writeStateLocked(project, slug string, s *State) error {
 	if !gitMode && s.Phase == PhasePush {
 		return ErrPhasePushNonGit
 	}
-	if err := validateReviewGate(s, gitMode); err != nil {
+	if err := validateReviewGate(s, gitMode, ProjectReviewAnchor(project)); err != nil {
 		return err
 	}
 	// phase=done's pr_url precondition applies only to git projects.

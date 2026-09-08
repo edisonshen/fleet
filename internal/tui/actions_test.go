@@ -1831,58 +1831,67 @@ func argString(args []string, i int) string {
 	return args[i]
 }
 
-// TestKeyA_CoordSpawn_AlwaysClaudeCodeEngine regresses codex review
-// iter-2 [P1]: an operator running `fleet -codex` who clicks [a] on
-// a project row must NOT spawn a codex coordinator, because the
-// coordinator skill emits Claude-Agent-tool DISPATCH blocks that
-// only a claude-code session can consume. The auto-spawn argv must
-// always carry `--engine claude-code` regardless of FLEET_ENGINE.
+// TestKeyA_CoordSpawn_EngineFollowsOperatorChoice pins the dominant-
+// engine contract for the TUI's [a] auto-spawn:
 //
-// Operators who want a codex coord explicitly invoke `fleet
-// --engine codex dispatch coord-<project> --coord-spawn --project
-// <project>` from the shell once the coord skill grows codex
-// support (MVP scope, memory project_codex_multi_engine.md).
-func TestKeyA_CoordSpawn_AlwaysClaudeCodeEngine(t *testing.T) {
-	withFleetHome(t)
-	seedProjectMeta(t, "demo", t.TempDir()) // resolver binds via meta (PR3)
-	(&stubSessionAlive{}).install(t)
-	// Operator launched fleet with -codex.
-	t.Setenv("FLEET_ENGINE", "codex")
+//   - `fleet -codex` (root marks FLEET_ENGINE_EXPLICIT=1) → the spawn
+//     argv carries `--engine codex`, so the coord and everything it
+//     fans out run codex.
+//   - plain `fleet` (FLEET_ENGINE holds the default, no explicit mark)
+//     → NO --engine flag, so dispatch resolves the project's stamped
+//     coord-config.json::engine instead of forcing the default.
+func TestKeyA_CoordSpawn_EngineFollowsOperatorChoice(t *testing.T) {
+	cases := []struct {
+		name       string
+		explicit   string
+		env        string
+		wantEngine string
+	}{
+		{name: "fleet -codex", explicit: "1", env: "codex", wantEngine: "codex"},
+		{name: "fleet -claude", explicit: "1", env: "claude-code", wantEngine: "claude-code"},
+		{name: "plain fleet", explicit: "", env: "claude-code", wantEngine: ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			withFleetHome(t)
+			seedProjectMeta(t, "demo", t.TempDir()) // resolver binds via meta (PR3)
+			(&stubSessionAlive{}).install(t)
+			t.Setenv("FLEET_ENGINE_EXPLICIT", tc.explicit)
+			t.Setenv("FLEET_ENGINE", tc.env)
 
-	stub := &stubFleetCmd{
-		stubbed: func(args []string) tea.Msg {
-			out := "agent abcd1234 spawned\n  task: coord-demo\n  project: demo\n  tmux: fleet-abcd1234\n"
-			return coordSpawnDoneMsgFromArgs(args, out, nil)
-		},
-	}
-	stub.install(t)
+			stub := &stubFleetCmd{
+				stubbed: func(args []string) tea.Msg {
+					out := "agent abcd1234 spawned\n  task: coord-demo\n  project: demo\n  tmux: fleet-abcd1234\n"
+					return coordSpawnDoneMsgFromArgs(args, out, nil)
+				},
+			}
+			stub.install(t)
 
-	m := New("test")
-	m.dashboard = &Snapshot{
-		Projects: []*ProjectRow{{Name: "demo"}},
-	}
-	for i, r := range m.dashboardRows() {
-		if r.kind == rowProject {
-			m.dashCursor = i
-			break
-		}
-	}
+			m := New("test")
+			m.dashboard = &Snapshot{
+				Projects: []*ProjectRow{{Name: "demo"}},
+			}
+			for i, r := range m.dashboardRows() {
+				if r.kind == rowProject {
+					m.dashCursor = i
+					break
+				}
+			}
 
-	_, cmd := m.Update(keyMsg("a"))
-	if cmd == nil {
-		t.Fatal("[a] on project with no coord should produce a spawn cmd")
-	}
-	_ = cmd() // drain to fire the stub
+			_, cmd := m.Update(keyMsg("a"))
+			if cmd == nil {
+				t.Fatal("[a] on project with no coord should produce a spawn cmd")
+			}
+			_ = cmd() // drain to fire the stub
 
-	if len(stub.calls) != 1 {
-		t.Fatalf("expected 1 fleet call; got %d", len(stub.calls))
-	}
-	args := stub.calls[0]
-	engine := argValue(args, "--engine")
-	if engine != "claude-code" {
-		t.Errorf("auto-spawn --engine = %q; want claude-code "+
-			"(coord skill is claude-only in v0.9 MVP; codex would stall)",
-			engine)
+			if len(stub.calls) != 1 {
+				t.Fatalf("expected 1 fleet call; got %d", len(stub.calls))
+			}
+			args := stub.calls[0]
+			if got := argValue(args, "--engine"); got != tc.wantEngine {
+				t.Errorf("auto-spawn --engine = %q; want %q (argv %v)", got, tc.wantEngine, args)
+			}
+		})
 	}
 }
 

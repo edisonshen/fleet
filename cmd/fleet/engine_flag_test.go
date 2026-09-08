@@ -202,6 +202,48 @@ func TestRootEngineConflict_PassesThroughDispatch(t *testing.T) {
 	}
 }
 
+// TestRootEngineExplicitMarker pins FLEET_ENGINE_EXPLICIT: set to "1"
+// only when an engine flag was passed on this invocation, cleared
+// otherwise (so a stale value from the parent shell can't make a plain
+// `fleet` behave like `fleet -codex`). The TUI's [a] and attach's Tier 3
+// read it to decide whether to pin --engine on their dispatch shell-out.
+func TestRootEngineExplicitMarker(t *testing.T) {
+	cases := []struct {
+		name     string
+		args     []string
+		preset   string
+		wantMark string
+		wantEng  string
+	}{
+		{name: "-codex sets mark", args: []string{"--codex", "noop"}, preset: "", wantMark: "1", wantEng: "codex"},
+		{name: "--engine sets mark", args: []string{"--engine", "claude-code", "noop"}, preset: "", wantMark: "1", wantEng: "claude-code"},
+		{name: "no flag clears stale mark", args: []string{"noop"}, preset: "1", wantMark: "", wantEng: "claude-code"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv(FleetEngineEnv, "")
+			t.Setenv(FleetEngineExplicitEnv, tc.preset)
+			root := newRootCmd()
+			// A side-effect-free child so PersistentPreRunE runs without
+			// launching the TUI or touching FLEET_HOME.
+			root.AddCommand(&cobra.Command{Use: "noop", RunE: func(*cobra.Command, []string) error { return nil }})
+			root.SetArgs(tc.args)
+			var buf bytes.Buffer
+			root.SetOut(&buf)
+			root.SetErr(&buf)
+			if err := root.Execute(); err != nil {
+				t.Fatalf("root.Execute(%v): %v", tc.args, err)
+			}
+			if got := os.Getenv(FleetEngineExplicitEnv); got != tc.wantMark {
+				t.Errorf("%s = %q; want %q", FleetEngineExplicitEnv, got, tc.wantMark)
+			}
+			if got := os.Getenv(FleetEngineEnv); got != tc.wantEng {
+				t.Errorf("%s = %q; want %q", FleetEngineEnv, got, tc.wantEng)
+			}
+		})
+	}
+}
+
 // TestDispatch_FleetEngineEnvStamped regresses the second half of
 // codex review iter-1 [P1]: runDispatch must re-stamp FLEET_ENGINE
 // with the resolved engine BEFORE spawn so the spawned tmux process

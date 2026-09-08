@@ -183,10 +183,7 @@ the record. A full project manifest model lands later (see docs/DESIGN.md
 			// actually requested a different engine. Without this gate,
 			// every plain `fleet dispatch --coord-spawn` would silently
 			// rewrite a recovered codex coord back to claude-code.
-			root := cmd.Root()
-			opts.engineExplicit = root.PersistentFlags().Changed("engine") ||
-				root.PersistentFlags().Changed("codex") ||
-				root.PersistentFlags().Changed("claude")
+			opts.engineExplicit = engineFlagChanged(cmd.Root())
 			finish := fleetlog.CLIStart(fleetlog.Fields{Proj: opts.project}, "dispatch", opts.taskID)
 			err := runDispatch(opts, cmd.OutOrStdout())
 			finish(err)
@@ -355,10 +352,16 @@ func runDispatch(opts *dispatchOpts, stdout io.Writer) error {
 	// record's engine field is settled when spawn runs. Precedence:
 	//   1. opts.engine (programmatic only — tests + Options struct;
 	//      NOT a CLI flag, see newDispatchCmd for why)
-	//   2. FLEET_ENGINE env (root's PersistentPreRunE always sets this
-	//      after running resolveEngineFlags, which conflict-checks the
-	//      --engine / -codex / -claude root flags)
-	//   3. enginecfg.DefaultEngine
+	//   2. FLEET_ENGINE env when the operator chose it on THIS
+	//      invocation (root --engine / -codex / -claude; engineExplicit)
+	//   3. coord-spawn only: the engine stamped into the project's
+	//      coord-config.json by the previous coord spawn. This is the
+	//      per-project memory of `fleet -codex` — a flag-less TUI [a] /
+	//      `fleet attach` respawn keeps the operator's original choice
+	//      instead of falling back to the claude-code default.
+	//   4. FLEET_ENGINE env (root's PersistentPreRunE always sets this,
+	//      to the default when no flag was passed)
+	//   5. enginecfg.DefaultEngine
 	//
 	// Once resolved we also stamp FLEET_ENGINE so the spawned tmux
 	// session (and any subprocess spawn calls out to, e.g. the workers
@@ -374,6 +377,14 @@ func runDispatch(opts *dispatchOpts, stdout io.Writer) error {
 	if opts.engine != "" {
 		opts.engineExplicit = true
 	}
+	if engineName == "" && opts.engineExplicit {
+		engineName = os.Getenv(FleetEngineEnv)
+	}
+	if engineName == "" && opts.coordSpawn {
+		if fhome, ferr := state.Root(); ferr == nil {
+			engineName = spawn.ReadCoordConfigEngine(fhome, opts.project)
+		}
+	}
 	if engineName == "" {
 		engineName = os.Getenv(FleetEngineEnv)
 	}
@@ -385,22 +396,15 @@ func runDispatch(opts *dispatchOpts, stdout io.Writer) error {
 			"--engine %q is unknown (known: claude-code, codex)",
 			engineName)
 	}
-	// Coord-spawn engine guard (codex review iter-9 P2): the Python
-	// /coordinator skill emits Claude-Agent-tool DISPATCH blocks that
-	// ONLY claude-code sessions can consume. The TUI's startCoordSpawn
-	// hardcodes --engine claude-code as a self-protective measure, but
-	// the direct CLI path (`fleet --engine codex dispatch coord-X
-	// --coord-spawn --project X`) would otherwise spawn a codex
-	// session that can't fan out workers / reviewers / finishers —
-	// the project row would stall the first time it needed a subagent.
-	// Fail loud at the CLI to match the TUI's safety guarantee.
-	if opts.coordSpawn && engineName != enginecfg.EngineClaudeCode {
-		return fmt.Errorf(
-			"--coord-spawn requires --engine %s (got %q); the coordinator skill needs Claude's Agent tool to fan out workers/reviewers/finishers",
-			enginecfg.EngineClaudeCode, engineName)
-	}
+	preResolveEngine := os.Getenv(FleetEngineEnv)
 	if err := os.Setenv(FleetEngineEnv, engineName); err != nil {
 		return fmt.Errorf("set %s=%s: %w", FleetEngineEnv, engineName, err)
+	}
+	// The entry autoinit ran against the pre-resolution engine; a
+	// flag-less respawn of a codex project resolves to codex only here,
+	// so re-check its skill home (idempotent, no-op when installed).
+	if engineName != preResolveEngine {
+		maybeAutoInit(stdout, "")
 	}
 	// When the operator did NOT pass --command, swap the cobra default
 	// (built for claude-code) for the engine-appropriate wrapper. This
@@ -434,6 +438,7 @@ func runDispatch(opts *dispatchOpts, stdout io.Writer) error {
 	// it alone. Pre-fix the guard only checked commandExplicit, which
 	// stomped programmatically-injected commands on CI (see
 	// TestDispatch_ProgrammaticCommandNotOverriddenByEngine).
+	commandFromEngine := false
 	if !opts.commandExplicit &&
 		(len(opts.command) == 0 || sameCommand(opts.command, defaultClaudeCommand)) {
 		argv, err := enginecfg.BuildWrapperCommand(engineName)
@@ -442,6 +447,7 @@ func runDispatch(opts *dispatchOpts, stdout io.Writer) error {
 			return fmt.Errorf("resolve engine %q: %w", engineName, err)
 		}
 		opts.command = argv
+		commandFromEngine = true
 	}
 	// Reject project names with path separators / "..": they'd
 	// silently misbehave at handoff time when they're used as a lock
@@ -792,27 +798,39 @@ func runDispatch(opts *dispatchOpts, stdout io.Writer) error {
 				// coord would silently inherit claude-code from the
 				// FLEET_ENGINE default and rewrite the recovered
 				// lineage's engine — breaking dead-coord recovery for
-				// non-default engines. The TUI's auto-spawn path
-				// always passes --engine claude-code on the shell-out,
-				// so engineExplicit is true there and the clamp still
-				// fires as intended.
+				// non-default engines. The TUI's auto-spawn / attach
+				// shell-outs pass --engine only when the operator chose
+				// one on their `fleet` invocation, so the clamp fires
+				// exactly when the operator meant to switch engines.
 				if opts.engineExplicit && oldRecord.Engine != engineName {
 					oldRecord.Engine = engineName
 				}
-				// Coord-spawn back-door guard (codex review iter-9 P2):
-				// the front-door check above rejects an operator
-				// running `fleet --engine codex dispatch coord-X
-				// --coord-spawn`, but the recovery path can still
-				// inherit a dead codex coord's Engine when the caller
-				// didn't set engineExplicit. Block that here so the
-				// CLI's coord-spawn contract holds end-to-end: every
-				// successful --coord-spawn produces a claude-code
-				// successor that can fan out workers.
-				if oldRecord.Engine != "" && oldRecord.Engine != enginecfg.EngineClaudeCode {
-					return fmt.Errorf(
-						"--coord-spawn recovery refused: dead coord %s ran engine %q but the coordinator skill only works under claude-code. "+
-							"either pass --engine claude-code to force-migrate the recovery, or archive the dead record (`fleet rm %s`) and start fresh",
-						oldRecord.ID, oldRecord.Engine, oldRecord.ID)
+				// Engine inheritance: with no explicit flag the
+				// successor keeps the dead coord's engine (spawn copies
+				// OldRecord.Engine onto the new record). engineName and
+				// the default wrapper were resolved before we knew
+				// which record we were recovering, so re-align them
+				// here — otherwise a codex lineage recovered from a
+				// project whose coord-config.json predates the engine
+				// stamp would get a record saying codex on top of the
+				// claude wrapper.
+				if !opts.engineExplicit && oldRecord.Engine != "" && oldRecord.Engine != engineName {
+					if !enginecfg.Known(oldRecord.Engine) {
+						return fmt.Errorf(
+							"--coord-spawn recovery refused: dead coord %s ran unknown engine %q; pass --engine to force-migrate the recovery, or archive the dead record (`fleet rm %s`) and start fresh",
+							oldRecord.ID, oldRecord.Engine, oldRecord.ID)
+					}
+					engineName = oldRecord.Engine
+					if err := os.Setenv(FleetEngineEnv, engineName); err != nil {
+						return fmt.Errorf("set %s=%s: %w", FleetEngineEnv, engineName, err)
+					}
+					if commandFromEngine {
+						argv, err := enginecfg.BuildWrapperCommand(engineName)
+						if err != nil {
+							return fmt.Errorf("resolve engine %q: %w", engineName, err)
+						}
+						opts.command = argv
+					}
 				}
 				// Command inheritance (codex review iter-7 P2,
 				// refined iter-8 P1 + iter-12 P2): when the operator

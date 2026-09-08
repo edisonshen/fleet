@@ -32,6 +32,11 @@ if argv_log:
     with open(argv_log, "a", encoding="utf-8") as fh:
         fh.write(json.dumps(sys.argv) + "\\n")
 
+schema_copy = os.environ.get("REVIEW_SLOT_SCHEMA_COPY")
+if schema_copy and "--output-schema" in sys.argv:
+    src = sys.argv[sys.argv.index("--output-schema") + 1]
+    Path(schema_copy).write_text(Path(src).read_text())
+
 counter = os.environ.get("REVIEW_SLOT_COUNTER")
 if counter:
     path = Path(counter)
@@ -71,6 +76,7 @@ def run_slot(
     exit_code: int = 0,
     counter: Path | None = None,
     argv_log: Path | None = None,
+    schema_copy: Path | None = None,
 ) -> subprocess.CompletedProcess[str]:
     monkeypatch.setenv(
         "REVIEW_SLOT_STDOUT_FILE", str(write_output(tmp_path, stdout_text, "stdout.txt"))
@@ -87,6 +93,10 @@ def run_slot(
         monkeypatch.setenv("REVIEW_SLOT_ARGV_LOG", str(argv_log))
     else:
         monkeypatch.delenv("REVIEW_SLOT_ARGV_LOG", raising=False)
+    if schema_copy is not None:
+        monkeypatch.setenv("REVIEW_SLOT_SCHEMA_COPY", str(schema_copy))
+    else:
+        monkeypatch.delenv("REVIEW_SLOT_SCHEMA_COPY", raising=False)
 
     return subprocess.run(
         [sys.executable, str(SCRIPT), *args],
@@ -517,6 +527,17 @@ def test_claude_json_schema_is_passed_inline(
     assert "properties" in schema
     assert schema_value.lstrip().startswith("{")
     assert not schema_value.endswith(".json")
+    assert_strict_schema(schema)
+
+
+def assert_strict_schema(schema: dict) -> None:
+    """Codex structured output rejects open objects / optional properties."""
+    assert schema["additionalProperties"] is False
+    assert sorted(schema["required"]) == sorted(schema["properties"])
+    item = schema["properties"]["findings"]["items"]
+    assert item["additionalProperties"] is False
+    assert sorted(item["required"]) == sorted(item["properties"])
+    assert {"severity", "file", "line", "summary"} <= set(item["properties"])
 
 
 def test_claude_prompt_matches_git_or_non_git_mode(
@@ -589,3 +610,159 @@ def test_codex_base_flag_is_threaded_only_when_set(
     assert "--base" in with_base_argv
     assert "origin/main" in with_base_argv
     assert "--base" not in without_base_argv
+    assert "exec" not in without_base_argv
+
+
+def codex_exec_args(*extra: str) -> list[str]:
+    return [
+        "--engine", "codex", "--model", "gpt-5.5-codex",
+        "--task-context", "Spec: add a guard\n\nAcceptance:\n- no race",
+        *extra,
+    ]
+
+
+def test_codex_non_git_uses_exec_with_strict_schema(
+    shim_bin: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    argv_log = tmp_path / "codex.argv"
+    schema_copy = tmp_path / "schema-seen.json"
+
+    result = run_slot(
+        tmp_path,
+        monkeypatch,
+        codex_exec_args(),
+        json.dumps({"clean": True, "findings": []}),
+        argv_log=argv_log,
+        schema_copy=schema_copy,
+    )
+
+    assert result.returncode == 0, result.stderr
+    argv = json.loads(argv_log.read_text())
+    assert argv[1:3] == ["exec", "--skip-git-repo-check"]
+    assert "review" not in argv
+    assert argv[argv.index("--sandbox") + 1] == "read-only"
+    assert "-m" not in argv and "--model" not in argv
+    assert "Spec: add a guard" in argv[-1]
+    assert "Return ONLY structured JSON" in argv[-1]
+    assert_strict_schema(json.loads(schema_copy.read_text()))
+
+
+def test_codex_non_git_exec_blocking_findings(
+    shim_bin: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    result = run_slot(
+        tmp_path,
+        monkeypatch,
+        codex_exec_args(),
+        json.dumps(
+            {
+                "clean": False,
+                "findings": [
+                    {"severity": "P1", "file": "a.py", "line": 3, "summary": "race"},
+                    {"severity": "P3", "file": "a.py", "line": 9, "summary": "nit"},
+                ],
+            }
+        ),
+    )
+
+    assert result.returncode == 1
+    assert [f["severity"] for f in json.loads(result.stdout)] == ["P1", "P3"]
+
+
+def test_codex_non_git_exec_garbage_retries_then_blocks(
+    shim_bin: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    counter = tmp_path / "count"
+    result = run_slot(
+        tmp_path, monkeypatch, codex_exec_args(), "no json here", counter=counter,
+    )
+
+    assert result.returncode == 3
+    assert counter.read_text() == "3"
+
+
+def test_codex_non_git_exec_rate_limited_skips(
+    shim_bin: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    counter = tmp_path / "count"
+    result = run_slot(
+        tmp_path,
+        monkeypatch,
+        codex_exec_args(),
+        "",
+        stderr_text='ERROR: {"status":429,"message":"You have hit your usage limit"}',
+        exit_code=1,
+        counter=counter,
+    )
+
+    assert result.returncode == 2
+    assert result.stdout.strip() == "rate-limited"
+    assert counter.read_text() == "1"
+
+
+def test_codex_git_base_still_uses_review_even_with_task_context(
+    shim_bin: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    argv_log = tmp_path / "codex.argv"
+    result = run_slot(
+        tmp_path,
+        monkeypatch,
+        codex_exec_args("--base", "origin/main"),
+        "",
+        argv_log=argv_log,
+    )
+
+    assert result.returncode == 0
+    argv = json.loads(argv_log.read_text())
+    assert argv[1] == "review"
+    assert argv[argv.index("--base") + 1] == "origin/main"
+
+
+def test_claude_helper_missing_binary_skips_unavailable(
+    shim_bin: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (shim_bin / "claude").unlink()
+    monkeypatch.setenv("PATH", str(shim_bin))
+
+    result = run_slot(
+        tmp_path, monkeypatch, ["--engine", "claude", "--model", "claude-opus-4-8"], "",
+    )
+
+    assert result.returncode == 2
+    assert result.stdout.strip() == "unavailable"
+
+
+def test_claude_helper_rate_limited_skips(
+    shim_bin: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    counter = tmp_path / "count"
+    result = run_slot(
+        tmp_path,
+        monkeypatch,
+        ["--engine", "claude", "--model", "claude-opus-4-8"],
+        "",
+        stderr_text="API Error: 429 rate limit reached for claude-opus-4-8",
+        exit_code=1,
+        counter=counter,
+    )
+
+    assert result.returncode == 2
+    assert result.stdout.strip() == "rate-limited"
+    assert counter.read_text() == "1"
+
+
+def test_claude_parse_failure_without_limit_signal_still_blocks(
+    shim_bin: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    counter = tmp_path / "count"
+    result = run_slot(
+        tmp_path,
+        monkeypatch,
+        ["--engine", "claude", "--model", "claude-opus-4-8"],
+        "not json",
+        exit_code=1,
+        counter=counter,
+    )
+
+    assert result.returncode == 3
+    assert counter.read_text() == "3"

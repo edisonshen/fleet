@@ -1,6 +1,8 @@
 package enginecfg
 
 import (
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -15,7 +17,7 @@ func TestResolveDefaults(t *testing.T) {
 	}{
 		{"", "claude", "claude --dangerously-skip-permissions"},
 		{EngineClaudeCode, "claude", "claude --dangerously-skip-permissions"},
-		{EngineCodex, "codex", "codex"},
+		{EngineCodex, "codex", "codex --dangerously-bypass-approvals-and-sandbox --dangerously-bypass-hook-trust"},
 	}
 	for _, tc := range tests {
 		inv, err := Resolve(tc.in)
@@ -76,8 +78,8 @@ func TestCodexWrapperShape(t *testing.T) {
 	body := argv[2]
 	// Must start with the bare invocation so the survive-clean-exit
 	// shell wrapper executes codex first.
-	if !strings.HasPrefix(body, "codex;") {
-		t.Errorf("codex wrapper body should start with 'codex;': %q", body)
+	if !strings.HasPrefix(body, "codex --dangerously-bypass-approvals-and-sandbox --dangerously-bypass-hook-trust;") {
+		t.Errorf("codex wrapper body should start with the unattended codex invocation: %q", body)
 	}
 	// Banner uses the bare binary name.
 	if !strings.Contains(body, `[fleet] codex exited code`) {
@@ -87,7 +89,7 @@ func TestCodexWrapperShape(t *testing.T) {
 		t.Errorf("codex wrapper missing clean-exit banner: %q", body)
 	}
 	// Rerun hint reproduces the actual invocation.
-	if !strings.Contains(body, `rerun codex or Ctrl-b`) {
+	if !strings.Contains(body, `rerun codex --dangerously-bypass-approvals-and-sandbox --dangerously-bypass-hook-trust or Ctrl-b`) {
 		t.Errorf("codex wrapper missing rerun hint: %q", body)
 	}
 	// Survive-clean-exit branch present.
@@ -104,5 +106,58 @@ func TestKnown(t *testing.T) {
 	}
 	if Known("nope") {
 		t.Errorf("Known(\"nope\") = true, want false")
+	}
+}
+
+func TestHelper(t *testing.T) {
+	tests := map[string]string{
+		"":               EngineCodex,
+		EngineClaudeCode: EngineCodex,
+		EngineCodex:      EngineClaudeCode,
+		"nope":           "",
+	}
+	for in, want := range tests {
+		if got := Helper(in); got != want {
+			t.Errorf("Helper(%q) = %q want %q", in, got, want)
+		}
+	}
+}
+
+func TestInstalled(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("PATH", dir)
+	if Installed(EngineCodex) || Installed(EngineClaudeCode) {
+		t.Fatal("nothing on PATH, yet Installed reported true")
+	}
+	if err := os.WriteFile(filepath.Join(dir, "codex"), []byte("#!/bin/sh\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if !Installed(EngineCodex) {
+		t.Error("Installed(codex) = false with codex on PATH")
+	}
+	if Installed(EngineClaudeCode) {
+		t.Error("Installed(claude-code) = true with only codex on PATH")
+	}
+	if Installed("nope") {
+		t.Error("Installed(unknown) must be false")
+	}
+}
+
+func TestSkillHomeAndHooksFile(t *testing.T) {
+	home := "/h"
+	cases := []struct {
+		engine, wantSkill, wantHooks string
+	}{
+		{"", "/h/.claude", "/h/.claude/settings.json"},
+		{EngineClaudeCode, "/h/.claude", "/h/.claude/settings.json"},
+		{EngineCodex, "/h/.agents", "/h/.codex/hooks.json"},
+	}
+	for _, tc := range cases {
+		if got := SkillHome(home, tc.engine); got != filepath.FromSlash(tc.wantSkill) {
+			t.Errorf("SkillHome(%q) = %q want %q", tc.engine, got, tc.wantSkill)
+		}
+		if got := HooksFile(home, tc.engine); got != filepath.FromSlash(tc.wantHooks) {
+			t.Errorf("HooksFile(%q) = %q want %q", tc.engine, got, tc.wantHooks)
+		}
 	}
 }

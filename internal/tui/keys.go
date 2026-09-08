@@ -1976,6 +1976,16 @@ func dispatchAgentID(out string) string {
 // TestDispatch_PromptFailureWarningShape pins the literal text.
 const dispatchPromptFailedMarker = "initial prompt not delivered"
 
+// explicitSessionEngine returns FLEET_ENGINE when the root `fleet`
+// command recorded that the operator chose it via a flag on this
+// invocation (FLEET_ENGINE_EXPLICIT=1, see cmd/fleet/main.go), else "".
+func explicitSessionEngine() string {
+	if os.Getenv("FLEET_ENGINE_EXPLICIT") != "1" {
+		return ""
+	}
+	return os.Getenv("FLEET_ENGINE")
+}
+
 // startCoordSpawn shells out to `fleet dispatch` with the coord
 // auto-prompt and returns immediately (issue #63: no lock-poll). On
 // success the resulting coordSpawnDoneMsg carries the new agent's ID
@@ -1999,30 +2009,17 @@ func (m Model) startCoordSpawn(projectName, cwd string) tea.Cmd {
 	if cwd != "" {
 		args = append(args, "--cwd", cwd)
 	}
-	// Engine propagation gated to claude-code (codex review iter-2 P1):
-	// the TUI's `[a]` auto-spawn path bootstraps a project's coordinator,
-	// and the coordinator skill (skills/coordinator/loop.py +
-	// dispatch.py:format_dispatch_instruction) emits Claude-Agent-tool
-	// DISPATCH blocks that ONLY a claude-code session can consume. If we
-	// forwarded FLEET_ENGINE=codex unfiltered, an operator running `fleet
-	// -codex` who clicks `[a]` would silently spawn a codex coord that
-	// can't fan out workers/reviewers/finishers — the project row would
-	// stall the first time it needed a subagent.
-	//
-	// MVP scope (memory project_codex_multi_engine.md): `fleet --engine
-	// codex dispatch ...` works for explicit worker dispatches today;
-	// codex-aware coord skill is a follow-up. Until then the TUI's auto-
-	// spawn always launches a claude-code coord regardless of the
-	// operator's session engine. Operators who want a codex coord
-	// explicitly can `fleet --engine codex dispatch coord-<project>
-	// --coord-spawn --project <project>` from the shell once the skill
-	// supports it.
-	//
-	// We keep the explicit --engine claude-code stamp (rather than
-	// letting it default) so the audit trail / process listing makes the
-	// gating decision obvious and a future regression that drops this
-	// guard is caught by reviewer eyeballs.
-	args = append(args, "--engine", "claude-code")
+	// Engine propagation: pass --engine only when the operator chose one
+	// on this `fleet` invocation (`fleet -codex` / `-claude`; the root
+	// command marks it via FLEET_ENGINE_EXPLICIT). Flag-less, dispatch
+	// resolves the project's stamped coord-config.json::engine, so a
+	// project whose coord was first spawned under codex respawns under
+	// codex from a plain `fleet` too. FLEET_ENGINE itself is always set
+	// (to the default when no flag was passed), which is why it can't be
+	// forwarded as an explicit choice unconditionally.
+	if eng := explicitSessionEngine(); eng != "" {
+		args = append(args, "--engine", eng)
+	}
 	return runFleetCmd(args, func(out string, err error) tea.Msg {
 		if err != nil {
 			// Exit 75 (EX_TEMPFAIL) is NOT a failure: a healthy coord

@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """fleet-guard hook entry point.
 
-Wired into ~/.claude/settings.json by `fleet init` for five hooks:
+Wired into the dominant engine's hooks file (~/.claude/settings.json or
+~/.codex/hooks.json) by `fleet init` for five hooks:
 Stop, PreCompact, SessionStart, UserPromptSubmit, PreToolUse. Reads the
 JSON payload on stdin, dispatches to the right handler, prints any
 injection text to stdout, returns 0.

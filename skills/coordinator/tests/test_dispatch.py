@@ -274,8 +274,24 @@ def test_format_dispatch_instruction_shape() -> None:
     assert lines[4] == "  prompt_file: /tmp/inbox/abcdef01.md"
     assert lines[5] == "  run_in_background: true"
     assert lines[6] == "  subagent_type: general-purpose"
-    assert lines[7] == "END_DISPATCH"
-    assert len(lines) == 8
+    assert lines[7] == "  engine: claude-code"
+    assert lines[8] == "END_DISPATCH"
+    assert len(lines) == 9
+
+
+def test_format_dispatch_instruction_engine_follows_fleet_engine(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A codex-dominant coord must tell the coord agent to spawn via
+    Codex's spawn_agent, not Claude's Agent tool; the block carries
+    the dominant engine so the protocol branch is unambiguous."""
+    monkeypatch.setenv("FLEET_ENGINE", "codex")
+    out = dispatch.format_dispatch_instruction(
+        agent_id="abcdef01",
+        slug="ready-aaaa",
+        prompt_file="/tmp/inbox/abcdef01.md",
+    )
+    assert "  engine: codex" in out.splitlines()
 
 
 def test_format_dispatch_instruction_carries_generation() -> None:
@@ -452,7 +468,7 @@ def test_build_reviewer_prompt_contains_review_iter_loop() -> None:
 
 def test_build_reviewer_prompt_git_with_codex_threads_slots() -> None:
     t = _make_task()
-    out = dispatch.build_reviewer_prompt(t, project="fleet", has_codex=True)
+    out = dispatch.build_reviewer_prompt(t, project="fleet", has_helper=True)
     assert "review_slot.py" in out
     assert "--engine codex" in out
     assert "--engine claude" in out
@@ -478,11 +494,13 @@ def test_build_reviewer_prompt_git_with_codex_threads_slots() -> None:
     assert "--review-alpha-skip-reason" in out
     assert "rate-limited" in out
     assert "unavailable" in out
+    assert "~/.claude/skills/coordinator/review_slot.py" in out
+    assert "Beta is the claude anchor" in out
 
 
 def test_build_reviewer_prompt_git_without_codex_uses_two_claude_slots() -> None:
     t = _make_task()
-    out = dispatch.build_reviewer_prompt(t, project="fleet", has_codex=False)
+    out = dispatch.build_reviewer_prompt(t, project="fleet", has_helper=False)
     assert "--engine codex" not in out
     assert out.count("--engine claude --model") == 2
     assert dispatch.reviewcfg.SONNET_FALLBACK[0] in out
@@ -490,11 +508,54 @@ def test_build_reviewer_prompt_git_without_codex_uses_two_claude_slots() -> None
     assert "Loop until BOTH slots exit 0." in out
     assert "Loop until BOTH slots are RESOLVED" not in out
     assert "OR the codex alpha exits 2 (skipped)" not in out
+    # Claude-only host: the prompt never names the codex binary.
+    assert "codex" not in out.lower()
+
+
+def test_build_reviewer_prompt_codex_dominant_with_claude_helper() -> None:
+    """fleet -codex on a host that also has claude: beta = codex anchor
+    (must pass), alpha = claude helper (may skip). The reviewer
+    orchestrator itself runs codex and finds review_slot.py under the
+    codex skill home (~/.agents)."""
+    t = _make_task()
+    out = dispatch.build_reviewer_prompt(
+        t, project="fleet", coord_engine="codex", has_helper=True,
+    )
+    assert "~/.agents/skills/coordinator/review_slot.py" in out
+    assert "~/.claude/" not in out
+    assert f"--engine codex --model {dispatch.reviewcfg.CODEX_DEFAULT_MODEL}" in out
+    assert f"--engine claude --model {dispatch.reviewcfg.OPUS_FALLBACK[0]}" in out
+    assert "--review-beta-status passed --review-beta-engine codex" in out
+    assert "--review-alpha-status skipped --review-alpha-engine claude" in out
+    assert "OR the claude alpha exits 2 (skipped)" in out
+    assert "Beta is the codex anchor" in out
+    assert "You are running as a Fleet-dispatched CODEX session" in out
+    assert "single-engine-degraded" not in out
+
+
+def test_build_reviewer_prompt_codex_only_degrades_without_claude() -> None:
+    """Codex-only host (the operator's single-subscription case): both
+    slots are codex, alpha is recorded single-engine-degraded, and the
+    prompt never mentions the claude binary."""
+    t = _make_task()
+    for is_git in (True, False):
+        out = dispatch.build_reviewer_prompt(
+            t, project="fleet", coord_engine="codex", has_helper=False,
+            is_git=is_git,
+        )
+        assert out.count("--engine codex --model") == 2
+        assert "--engine claude" not in out
+        # `--phase review-claude` is a persisted phase name shared with
+        # the Go side; everything else claude-flavored must be absent.
+        assert "claude" not in out.lower().replace("review-claude", "")
+        assert "--review-alpha-status single-engine-degraded" in out
+        assert "--review-beta-status passed --review-beta-engine codex" in out
+        assert "Loop until BOTH slots exit 0." in out
 
 
 def test_build_reviewer_prompt_git_reruns_both_slots_after_fix() -> None:
     t = _make_task()
-    out = dispatch.build_reviewer_prompt(t, project="fleet", has_codex=False)
+    out = dispatch.build_reviewer_prompt(t, project="fleet", has_helper=False)
     lower = out.lower()
     assert "re-run both slots from scratch" in lower
     assert "a fix changes the reviewed code" in lower
@@ -517,36 +578,29 @@ def test_build_reviewer_prompt_does_not_push_or_open_pr() -> None:
     assert "Do NOT `gh pr create`" in out or "Do NOT gh pr create" in out
 
 
-def test_build_reviewer_prompt_codex_coord_adds_diversity_banner() -> None:
-    """When coord_engine = codex, the reviewer prompt must include the
-    cross-engine diversity banner so the (claude) reviewer knows it's
-    pinch-hitting for a codex-written worker diff. The banner labels
-    the role split explicitly — memory project_codex_multi_engine.md
-    Approach A."""
+def test_build_reviewer_prompt_codex_coord_banner_names_dominant_engine() -> None:
+    """When coord_engine = codex the banner documents that the worker AND
+    the reviewer orchestrator run codex (the dominant engine), and that
+    beta is the codex anchor."""
     t = _make_task()
     out = dispatch.build_reviewer_prompt(
         t, project="fleet", coord_engine="codex",
     )
-    # Banner present.
     assert "coord engine = codex" in out.lower()
-    # Worker engine documented.
-    assert "CODEX" in out
-    # Reviewer role still claude.
-    assert "CLAUDE" in out
-    # Existing review-iter contract still in place.
+    assert "was running CODEX" in out
+    assert "You are running CODEX as the review orchestrator" in out
     assert "review_slot.py" in out
     assert "--phase review-done" in out
 
 
-def test_build_reviewer_prompt_claude_coord_omits_diversity_banner() -> None:
-    """Default coord_engine = claude-code is the v0 path. The diversity
-    banner must NOT appear in this case so the prompt body matches the
-    pre-v0.9 byte shape on the happy path."""
+def test_build_reviewer_prompt_claude_coord_banner_names_claude() -> None:
     t = _make_task()
     out = dispatch.build_reviewer_prompt(
         t, project="fleet", coord_engine="claude-code",
     )
+    assert "coord engine = claude-code" in out.lower()
     assert "coord engine = codex" not in out.lower()
+    assert "You are running CLAUDE as the review orchestrator" in out
 
 
 def test_build_reviewer_prompt_reads_engine_from_env(monkeypatch) -> None:
@@ -767,7 +821,7 @@ def test_build_reviewer_prompt_non_git_uses_two_claude_slots_without_base() -> N
     t.spec = "Fix the quoted 'thing'.\nKeep context intact."
     t.acceptance = 'Thing is fixed with "quotes".'
     out = dispatch.build_reviewer_prompt(
-        t, project="scratch", is_git=False, has_codex=True,
+        t, project="scratch", is_git=False, has_helper=True,
     )
     context = f"{t.spec}\n\nAcceptance:\n{t.acceptance}"
     assert "review_slot.py" in out
@@ -830,7 +884,7 @@ def test_build_finisher_prompt_git_keeps_push_and_pr() -> None:
     assert ".review_alpha_" in out
     assert ".review_beta_" in out
     assert "- alpha (<engine>/<model>):" in out
-    assert "- beta (claude/<model>):" in out
+    assert "- beta (<engine>/<model>):" in out
     assert "--phase blocked" in out
     assert "review gate rejected" in out
     assert ".review_codex_" not in out
