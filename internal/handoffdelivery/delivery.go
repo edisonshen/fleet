@@ -21,6 +21,16 @@ import (
 // failed — that one must stay pending so a real owner can pick it up.
 var ErrNoOwnerObserved = errors.New("handoff delivery: no active lock owner observed before timeout")
 
+// errUnsubmitted marks a verified send whose prompt reached the pane but was
+// never accepted (Enter swallowed by a busy / mid-render TUI). It is retried
+// with backoff until the delivery deadline rather than aborting the handoff.
+var errUnsubmitted = errors.New("prompt was not submitted")
+
+const (
+	unsubmittedBackoffMin = 500 * time.Millisecond
+	unsubmittedBackoffMax = 5 * time.Second
+)
+
 // Deps are the delivery seams. Tests inject these to avoid real lease/tmux
 // polling; production callers use DefaultDeps.
 type Deps struct {
@@ -34,8 +44,14 @@ type Deps struct {
 	WaitReady         func(session string) error
 	SessionAlive      func(session string) (bool, error)
 	SendVerified      func(session, prompt string) (bool, error)
-	Now               func() time.Time
-	Sleep             func(time.Duration)
+	// PromptPending / Resubmit make an unsubmitted-send retry idempotent: when
+	// the prompt text is still sitting in the target's input box, the retry
+	// presses Enter alone instead of typing a second copy. Both optional; when
+	// either is nil every retry goes through SendVerified.
+	PromptPending func(session, prompt string) bool
+	Resubmit      func(session, prompt string) (bool, error)
+	Now           func() time.Time
+	Sleep         func(time.Duration)
 }
 
 // DefaultDeps returns the production delivery dependencies.
@@ -47,6 +63,8 @@ func DefaultDeps() Deps {
 		WaitReady:         spawn.WaitForReadyToPrompt,
 		SessionAlive:      tmux.SessionAlive,
 		SendVerified:      spawn.SendPromptKeysVerified,
+		PromptPending:     spawn.PromptPendingInInputBox,
+		Resubmit:          spawn.ResubmitPendingPrompt,
 		Now:               time.Now,
 		Sleep:             time.Sleep,
 	}
@@ -114,7 +132,13 @@ func DeliverToCurrentOwner(opts Options, deps Deps) (*agent.Record, error) {
 	var lastErr error
 	ownerObserved := false
 	leaseSeen := false
+	backoff := unsubmittedBackoffMin
+	// Sessions the prompt text has already been typed into. A retry against
+	// one of these presses Enter only, even when the pane capture behind
+	// PromptPending fails and cannot confirm the pending copy.
+	typed := map[string]bool{}
 	for {
+		unsubmitted := false
 		// A live lease record (even one whose owner is momentarily unhealthy)
 		// means this is NOT a legacy/bare coord: keep the doc pending for the
 		// healthy takeover owner rather than fall back to a direct send.
@@ -141,10 +165,16 @@ func DeliverToCurrentOwner(opts Options, deps Deps) (*agent.Record, error) {
 								"warning: readiness poll for delivery target %s (lock owner %s) did not converge: %v (sending anyway)\n",
 								session, owner.AgentID, werr)
 						}
-						if delivered, ferr := finishDelivery(opts, deps, owner, rec, prompt); ferr != nil {
-							return nil, ferr
-						} else if delivered {
+						delivered, ferr := finishDelivery(opts, deps, owner, rec, prompt, typed)
+						if delivered {
 							return rec, nil
+						}
+						if ferr != nil && !errors.Is(ferr, errUnsubmitted) {
+							return nil, ferr
+						}
+						if ferr != nil {
+							lastErr = ferr
+							unsubmitted = true
 						}
 					}
 				} else {
@@ -157,10 +187,16 @@ func DeliverToCurrentOwner(opts Options, deps Deps) (*agent.Record, error) {
 								"warning: post-readiness probe for delivery target %s (lock owner %s) failed: %v (sending anyway)\n",
 								session, owner.AgentID, perr)
 						}
-						if delivered, ferr := finishDelivery(opts, deps, owner, rec, prompt); ferr != nil {
-							return nil, ferr
-						} else if delivered {
+						delivered, ferr := finishDelivery(opts, deps, owner, rec, prompt, typed)
+						if delivered {
 							return rec, nil
+						}
+						if ferr != nil && !errors.Is(ferr, errUnsubmitted) {
+							return nil, ferr
+						}
+						if ferr != nil {
+							lastErr = ferr
+							unsubmitted = true
 						}
 					}
 				}
@@ -200,6 +236,22 @@ func DeliverToCurrentOwner(opts Options, deps Deps) (*agent.Record, error) {
 			return nil, fmt.Errorf("%w for project %s", ErrNoOwnerObserved, opts.Project)
 		}
 		wait := poll
+		if unsubmitted {
+			// The target TUI ate Enter; give it room to finish rendering before
+			// the next attempt instead of hammering it at the owner-poll cadence.
+			if wait < backoff {
+				wait = backoff
+			}
+			if opts.Stderr != nil {
+				_, _ = fmt.Fprintf(opts.Stderr,
+					"warning: resume prompt for project %s not yet submitted; retrying in %s\n",
+					opts.Project, wait)
+			}
+			backoff *= 2
+			if backoff > unsubmittedBackoffMax {
+				backoff = unsubmittedBackoffMax
+			}
+		}
 		if rem := deadline.Sub(deps.Now()); rem < wait {
 			wait = rem
 		}
@@ -222,7 +274,8 @@ func deliverySession(opts Options, owner coordlock.Owner, rec *agent.Record) str
 	return rec.TmuxSession
 }
 
-func finishDelivery(opts Options, deps Deps, owner coordlock.Owner, rec *agent.Record, prompt string) (bool, error) {
+func finishDelivery(opts Options, deps Deps, owner coordlock.Owner, rec *agent.Record, prompt string,
+	typed map[string]bool) (bool, error) {
 	current, ok := deps.CurrentOwner(opts.Project)
 	if !ok || current.AgentID != owner.AgentID || current.PID != owner.PID ||
 		current.PidStart != owner.PidStart {
@@ -230,14 +283,21 @@ func finishDelivery(opts Options, deps Deps, owner coordlock.Owner, rec *agent.R
 	}
 	session := deliverySession(opts, owner, rec)
 	if prompt != "" {
-		submitted, serr := deps.SendVerified(session, prompt)
+		send := deps.SendVerified
+		if deps.Resubmit != nil &&
+			(typed[session] || (deps.PromptPending != nil && deps.PromptPending(session, prompt))) {
+			send = deps.Resubmit
+		} else {
+			typed[session] = true
+		}
+		submitted, serr := send(session, prompt)
 		if serr != nil {
 			return false, fmt.Errorf("send resume prompt to %s (lock owner %s): %w",
 				session, owner.AgentID, serr)
 		}
 		if !submitted {
-			return false, fmt.Errorf("send resume prompt to %s (lock owner %s): prompt was not submitted",
-				session, owner.AgentID)
+			return false, fmt.Errorf("send resume prompt to %s (lock owner %s): %w",
+				session, owner.AgentID, errUnsubmitted)
 		}
 		current, ok = deps.CurrentOwner(opts.Project)
 		if !ok || current.AgentID != owner.AgentID || current.PID != owner.PID ||
