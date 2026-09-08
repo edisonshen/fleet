@@ -6,6 +6,49 @@ follows [SemVer](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.18.0] - 2026-09-08
+
+Handoffs stop losing their payload. An auto-handoff (40/50% context) used to
+hand the successor a doc whose Key Decisions / Docs / Open Questions / Next
+Steps were placeholders, because fleet-guard rendered it through a Python
+mirror of the Go manual-handoff path that had drifted; there is now exactly one
+producer. And a resume prompt whose Enter was swallowed by a busy successor TUI
+used to abort the whole graceful handoff (`handoff failed: exit status 1`) —
+and `fleet drain` reported the pending doc as failed — even though the
+successor was alive and the prompt was sitting in its input box. Delivery now
+retries with Enter only until its deadline instead of giving up on the first
+attempt.
+
+### Added
+
+- Hidden `fleet handoff-write --agent <id> --type auto-yellow|auto-red|precompact
+  [--context-pct N]` — the single Go producer for handoff docs. fleet-guard
+  captures the pane and shells out; Go builds the stub, enriches coord docs from
+  durable state (Active Subagents, Open PRs, checkpoint completions, decisions,
+  next steps), writes atomically, re-proves the coord lease at the publish
+  point, and only then enqueues the spawn-fresh request (#294).
+- Real-tmux integration lane for lock-owner resume delivery
+  (`TestHandoffDelivery_Integration_*`): the production transport against an
+  Enter-swallowing input box (#298).
+
+### Changed
+
+- Manual `fleet handoff <id>` and the auto path share `writeHandoffDoc`; the
+  Python renderer, `_collect_active_subagents`, `_collect_open_prs`, and
+  `skills/fleet-guard/ids.py` are deleted. fleet-guard retries `handoff-write`
+  once with a distinct `fleet` from PATH when the spawn-stamped `FLEET_BIN`
+  predates the subcommand (#294).
+
+### Fixed
+
+- Graceful handoff / `fleet drain` no longer abort when the resume prompt is
+  typed but not accepted by the successor's TUI: `DeliverToCurrentOwner`
+  retries with Enter only (0.5s → 5s backoff) until its 30s deadline, never
+  retypes the prompt into a session it already typed into — even when the pane
+  capture behind the pending check fails — and on the deadline leaves the
+  queue/doc pending for the next drain instead of failing the handoff
+  (#297, #298; delivery half of #299).
+
 ## [0.17.0] - 2026-09-04
 
 Coordinators stop needing babysitting. A coord that died days ago no longer
@@ -1347,7 +1390,8 @@ Initial public release.
 - Filesystem packages: `internal/state`, `internal/handoff`,
   `internal/queue`, `internal/spawn`, `internal/tmux`.
 
-[Unreleased]: https://github.com/edisonshen/fleet/compare/v0.17.0...HEAD
+[Unreleased]: https://github.com/edisonshen/fleet/compare/v0.18.0...HEAD
+[0.18.0]: https://github.com/edisonshen/fleet/compare/v0.17.0...v0.18.0
 [0.17.0]: https://github.com/edisonshen/fleet/compare/v0.16.2...v0.17.0
 [0.16.2]: https://github.com/edisonshen/fleet/compare/v0.16.1...v0.16.2
 [0.16.1]: https://github.com/edisonshen/fleet/compare/v0.16.0...v0.16.1
