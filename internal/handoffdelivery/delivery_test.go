@@ -208,12 +208,19 @@ func TestDeliverToCurrentOwner_OwnerFlipAfterSend_StaysPending(t *testing.T) {
 	}
 }
 
+// A prompt that is never accepted must NOT report success, but it is retried
+// with backoff until the deadline (issue #297) rather than aborting on the
+// first swallowed Enter.
 func TestDeliverToCurrentOwnerUnsubmittedIsNotDelivered(t *testing.T) {
+	now, sleep := fakeClock()
+	sends := 0
+	var stderr strings.Builder
 	_, err := DeliverToCurrentOwner(Options{
 		Project: "rainier",
 		Prompt:  "read the doc",
-		Timeout: time.Second,
+		Timeout: 10 * time.Second,
 		Poll:    time.Millisecond,
+		Stderr:  &stderr,
 	}, Deps{
 		CurrentOwner: func(string) (coordlock.Owner, bool) {
 			return coordlock.Owner{AgentID: "winner1", PID: 4242, PidStart: 99}, true
@@ -224,16 +231,75 @@ func TestDeliverToCurrentOwnerUnsubmittedIsNotDelivered(t *testing.T) {
 		WaitReady:    func(string) error { return nil },
 		SessionAlive: func(string) (bool, error) { return true, nil },
 		SendVerified: func(string, string) (bool, error) {
+			sends++
 			return false, nil
 		},
-		Now:   time.Now,
-		Sleep: func(time.Duration) {},
+		Now:   now,
+		Sleep: sleep,
 	})
 	if err == nil {
 		t.Fatal("expected unsubmitted prompt to be an error")
 	}
 	if !strings.Contains(err.Error(), "not submitted") {
 		t.Fatalf("error = %v, want not submitted", err)
+	}
+	if errors.Is(err, ErrNoOwnerObserved) {
+		t.Fatalf("error = %v, must NOT be ErrNoOwnerObserved", err)
+	}
+	// 0.5+1+2+4+5... backoff inside a 10s window → a handful of attempts,
+	// not one (old behavior) and not thousands (poll cadence).
+	if sends < 3 || sends > 10 {
+		t.Fatalf("sends = %d, want bounded backoff retries", sends)
+	}
+	if !strings.Contains(stderr.String(), "not yet submitted; retrying") {
+		t.Fatalf("stderr = %q, want retry warning", stderr.String())
+	}
+}
+
+// issue #297: the first verified send lands the text but the standby's TUI
+// eats Enter. The retry must see the prompt pending in the input box and press
+// Enter alone (Resubmit) instead of typing a duplicate copy, then succeed.
+func TestDeliverToCurrentOwnerUnsubmittedRetriesViaResubmit(t *testing.T) {
+	now, sleep := fakeClock()
+	winner := &agent.Record{ID: "winner1", TmuxSession: "fleet-winner1"}
+	sends, resubmits := 0, 0
+	rec, err := DeliverToCurrentOwner(Options{
+		Project: "rainier",
+		Prompt:  "read the doc",
+		Timeout: 30 * time.Second,
+		Poll:    time.Millisecond,
+	}, Deps{
+		CurrentOwner: func(string) (coordlock.Owner, bool) {
+			return coordlock.Owner{AgentID: "winner1", PID: 4242, PidStart: 99}, true
+		},
+		LoadAgent:    func(string) (*agent.Record, error) { return winner, nil },
+		WaitReady:    func(string) error { return nil },
+		SessionAlive: func(string) (bool, error) { return true, nil },
+		SendVerified: func(string, string) (bool, error) {
+			sends++
+			return false, nil
+		},
+		PromptPending: func(session, prompt string) bool {
+			return sends > 0 && session == "fleet-winner1" && prompt == "read the doc"
+		},
+		Resubmit: func(string, string) (bool, error) {
+			resubmits++
+			return resubmits >= 2, nil
+		},
+		Now:   now,
+		Sleep: sleep,
+	})
+	if err != nil {
+		t.Fatalf("DeliverToCurrentOwner: %v", err)
+	}
+	if rec != winner {
+		t.Fatalf("rec = %+v, want winner", rec)
+	}
+	if sends != 1 {
+		t.Fatalf("SendVerified calls = %d, want exactly 1 (retries must not retype the prompt)", sends)
+	}
+	if resubmits != 2 {
+		t.Fatalf("Resubmit calls = %d, want 2", resubmits)
 	}
 }
 
