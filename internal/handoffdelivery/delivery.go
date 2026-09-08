@@ -133,6 +133,10 @@ func DeliverToCurrentOwner(opts Options, deps Deps) (*agent.Record, error) {
 	ownerObserved := false
 	leaseSeen := false
 	backoff := unsubmittedBackoffMin
+	// Sessions the prompt text has already been typed into. A retry against
+	// one of these presses Enter only, even when the pane capture behind
+	// PromptPending fails and cannot confirm the pending copy.
+	typed := map[string]bool{}
 	for {
 		unsubmitted := false
 		// A live lease record (even one whose owner is momentarily unhealthy)
@@ -161,7 +165,7 @@ func DeliverToCurrentOwner(opts Options, deps Deps) (*agent.Record, error) {
 								"warning: readiness poll for delivery target %s (lock owner %s) did not converge: %v (sending anyway)\n",
 								session, owner.AgentID, werr)
 						}
-						delivered, ferr := finishDelivery(opts, deps, owner, rec, prompt)
+						delivered, ferr := finishDelivery(opts, deps, owner, rec, prompt, typed)
 						if delivered {
 							return rec, nil
 						}
@@ -183,7 +187,7 @@ func DeliverToCurrentOwner(opts Options, deps Deps) (*agent.Record, error) {
 								"warning: post-readiness probe for delivery target %s (lock owner %s) failed: %v (sending anyway)\n",
 								session, owner.AgentID, perr)
 						}
-						delivered, ferr := finishDelivery(opts, deps, owner, rec, prompt)
+						delivered, ferr := finishDelivery(opts, deps, owner, rec, prompt, typed)
 						if delivered {
 							return rec, nil
 						}
@@ -270,7 +274,8 @@ func deliverySession(opts Options, owner coordlock.Owner, rec *agent.Record) str
 	return rec.TmuxSession
 }
 
-func finishDelivery(opts Options, deps Deps, owner coordlock.Owner, rec *agent.Record, prompt string) (bool, error) {
+func finishDelivery(opts Options, deps Deps, owner coordlock.Owner, rec *agent.Record, prompt string,
+	typed map[string]bool) (bool, error) {
 	current, ok := deps.CurrentOwner(opts.Project)
 	if !ok || current.AgentID != owner.AgentID || current.PID != owner.PID ||
 		current.PidStart != owner.PidStart {
@@ -279,8 +284,11 @@ func finishDelivery(opts Options, deps Deps, owner coordlock.Owner, rec *agent.R
 	session := deliverySession(opts, owner, rec)
 	if prompt != "" {
 		send := deps.SendVerified
-		if deps.PromptPending != nil && deps.Resubmit != nil && deps.PromptPending(session, prompt) {
+		if deps.Resubmit != nil &&
+			(typed[session] || (deps.PromptPending != nil && deps.PromptPending(session, prompt))) {
 			send = deps.Resubmit
+		} else {
+			typed[session] = true
 		}
 		submitted, serr := send(session, prompt)
 		if serr != nil {

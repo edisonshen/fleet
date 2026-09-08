@@ -303,6 +303,48 @@ func TestDeliverToCurrentOwnerUnsubmittedRetriesViaResubmit(t *testing.T) {
 	}
 }
 
+// The pane capture behind PromptPending can fail (reports false) right after
+// an unsubmitted send. The retry must still press Enter only — the loop knows
+// it already typed into that session — never a second copy of the prompt.
+func TestDeliverToCurrentOwnerUnsubmittedRetryNeverRetypesWhenPendingCheckFails(t *testing.T) {
+	now, sleep := fakeClock()
+	winner := &agent.Record{ID: "winner1", TmuxSession: "fleet-winner1"}
+	sends, resubmits := 0, 0
+	rec, err := DeliverToCurrentOwner(Options{
+		Project: "rainier",
+		Prompt:  "read the doc",
+		Timeout: 30 * time.Second,
+		Poll:    time.Millisecond,
+	}, Deps{
+		CurrentOwner: func(string) (coordlock.Owner, bool) {
+			return coordlock.Owner{AgentID: "winner1", PID: 4242, PidStart: 99}, true
+		},
+		LoadAgent:    func(string) (*agent.Record, error) { return winner, nil },
+		WaitReady:    func(string) error { return nil },
+		SessionAlive: func(string) (bool, error) { return true, nil },
+		SendVerified: func(string, string) (bool, error) {
+			sends++
+			return false, nil
+		},
+		PromptPending: func(string, string) bool { return false }, // capture failed
+		Resubmit: func(string, string) (bool, error) {
+			resubmits++
+			return true, nil
+		},
+		Now:   now,
+		Sleep: sleep,
+	})
+	if err != nil {
+		t.Fatalf("DeliverToCurrentOwner: %v", err)
+	}
+	if rec != winner {
+		t.Fatalf("rec = %+v, want winner", rec)
+	}
+	if sends != 1 || resubmits != 1 {
+		t.Fatalf("SendVerified=%d Resubmit=%d, want 1/1 (no duplicate typing)", sends, resubmits)
+	}
+}
+
 // codex P2 regression: an owner is observed every pass but ownership flips in
 // the pre-send recheck window (finishDelivery returns (false,nil)) until the
 // deadline. The error must NOT be ErrNoOwnerObserved — owners DID exist, so the
