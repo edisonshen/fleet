@@ -1117,6 +1117,130 @@ func TestValidateReviewGate(t *testing.T) {
 	}
 }
 
+// writeCoordEngine stamps coord-config.json::engine for project under
+// FLEET_HOME, the way a `fleet -codex` coord spawn does.
+func writeCoordEngine(t *testing.T, project, engine string) {
+	t.Helper()
+	root, err := state.Root()
+	if err != nil {
+		t.Fatalf("state.Root: %v", err)
+	}
+	p := projects.CoordConfigPath(root, project)
+	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(p, []byte(`{"engine":"`+engine+`","repo":"/tmp/x"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestWorkers_ReviewGate_CodexAnchor mirrors TestWorkers_ReviewGate for a
+// project whose coord runs `fleet -codex`: beta must be codex+passed,
+// claude is the optional helper that may skip, and a claude-only state
+// (the pre-mirroring shape) is REJECTED because the anchor moved.
+func TestWorkers_ReviewGate_CodexAnchor(t *testing.T) {
+	cases := []struct {
+		name    string
+		gitMode bool
+		state   func(project, slug string) *State
+		wantErr error
+	}{
+		{
+			name:    "codex beta + claude alpha both passed",
+			gitMode: true,
+			state: func(project, slug string) *State {
+				return stateWithReview(project, slug, PhasePush, ReviewStatusPassed, ReviewEngineClaude, "opus-4.8", "", ReviewStatusPassed, ReviewEngineCodex, "gpt-5.5-codex", "")
+			},
+		},
+		{
+			name:    "claude helper skipped unavailable (codex-only host)",
+			gitMode: true,
+			state: func(project, slug string) *State {
+				return stateWithReview(project, slug, PhasePush, ReviewStatusSkipped, ReviewEngineClaude, "opus-4.8", "unavailable", ReviewStatusPassed, ReviewEngineCodex, "gpt-5.5-codex", "")
+			},
+		},
+		{
+			name:    "claude helper skipped on non-git project accepted",
+			gitMode: false,
+			state: func(project, slug string) *State {
+				return stateWithReview(project, slug, PhaseDone, ReviewStatusSkipped, ReviewEngineClaude, "opus-4.8", "rate-limited", ReviewStatusPassed, ReviewEngineCodex, "gpt-5.5-codex", "")
+			},
+		},
+		{
+			name:    "claude helper skipped without reason rejected",
+			gitMode: true,
+			state: func(project, slug string) *State {
+				return stateWithReview(project, slug, PhasePush, ReviewStatusSkipped, ReviewEngineClaude, "opus-4.8", "", ReviewStatusPassed, ReviewEngineCodex, "gpt-5.5-codex", "")
+			},
+			wantErr: ErrCodexSkipNeedsReason,
+		},
+		{
+			name:    "codex alpha skipped rejected (anchor engine never skips)",
+			gitMode: true,
+			state: func(project, slug string) *State {
+				return stateWithReview(project, slug, PhasePush, ReviewStatusSkipped, ReviewEngineCodex, "gpt-5.5-codex", "rate-limited", ReviewStatusPassed, ReviewEngineCodex, "gpt-5.5-codex", "")
+			},
+			wantErr: ErrPhaseRequiresReview,
+		},
+		{
+			name:    "single-engine-degraded codex accepted",
+			gitMode: true,
+			state: func(project, slug string) *State {
+				return stateWithReview(project, slug, PhasePush, ReviewStatusSingleEngineDegraded, ReviewEngineCodex, "gpt-5.5-codex", "", ReviewStatusPassed, ReviewEngineCodex, "gpt-5.5-codex", "")
+			},
+		},
+		{
+			name:    "single-engine-degraded on helper engine rejected",
+			gitMode: true,
+			state: func(project, slug string) *State {
+				return stateWithReview(project, slug, PhasePush, ReviewStatusSingleEngineDegraded, ReviewEngineClaude, "opus-4.8", "", ReviewStatusPassed, ReviewEngineCodex, "gpt-5.5-codex", "")
+			},
+			wantErr: ErrPhaseRequiresReview,
+		},
+		{
+			name:    "claude beta rejected under codex anchor",
+			gitMode: true,
+			state: func(project, slug string) *State {
+				return stateWithReview(project, slug, PhasePush, ReviewStatusPassed, ReviewEngineCodex, "gpt-5.5-codex", "", ReviewStatusPassed, ReviewEngineClaude, "opus-4.8", "")
+			},
+			wantErr: ErrReviewBetaAnchor,
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			tmp := t.TempDir()
+			t.Setenv("FLEET_HOME", tmp)
+			project := "git-proj"
+			if !c.gitMode {
+				project = "ng-proj"
+				writeNonGitProject(t, project)
+			}
+			writeCoordEngine(t, project, "codex")
+			slug := "cgate-" + sanitizeSlug(c.name) + "-aaaa"
+			err := WriteState(project, slug, c.state(project, slug))
+			if c.wantErr == nil && err != nil {
+				t.Fatalf("WriteState: %v; want nil", err)
+			}
+			if c.wantErr != nil && !errors.Is(err, c.wantErr) {
+				t.Fatalf("WriteState: got %v; want %v", err, c.wantErr)
+			}
+		})
+	}
+}
+
+func TestReviewEngineForDominant(t *testing.T) {
+	for in, want := range map[string]string{
+		"":            ReviewEngineClaude,
+		"claude-code": ReviewEngineClaude,
+		"codex":       ReviewEngineCodex,
+		"bogus":       ReviewEngineClaude,
+	} {
+		if got := ReviewEngineForDominant(in); got != want {
+			t.Errorf("ReviewEngineForDominant(%q) = %q; want %q", in, got, want)
+		}
+	}
+}
+
 // TestWorkers_PhaseDoneStillRequiresPR: phase=done's pr_url
 // precondition is unchanged. The new review gate fires only on
 // phase=push; phase=done's gate is independent.

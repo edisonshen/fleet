@@ -4,17 +4,33 @@
 Exit codes:
   0 = no P0/P1 findings
   1 = P0/P1 findings (JSON stdout)
-  2 = codex slot skipped (reason on stdout)
+  2 = helper slot skipped (reason on stdout: rate-limited|unavailable)
   3 = blocked
+
+Engines:
+  claude  `claude -p` with an inline JSON schema. `--base` => `/review`,
+          otherwise a raw structured working-tree review.
+  codex   `codex review [--base]` when no --task-context (git); with
+          --task-context and no --base (non-git project) `codex review`
+          has no diff to work from, so run `codex exec --output-schema`
+          for a raw structured review instead.
+
+Either engine may be the dominant anchor or the optional helper; this
+script only ever execs the ONE binary named by --engine. Exit 2 is
+reported for a missing/rate-limited binary regardless of engine — the
+reviewer prompt decides whether that is acceptable (helper) or blocks
+(anchor).
 """
 from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import shutil
 import subprocess
 import sys
+import tempfile
 from typing import Any
 
 
@@ -26,12 +42,19 @@ RATE_LIMIT_RE = re.compile(
     re.IGNORECASE,
 )
 UNAVAILABLE_RE = re.compile(
-    r"\bcodex: command not found\b|\bcommand not found: codex\b",
+    r"\b(?:codex|claude): command not found\b|\bcommand not found: (?:codex|claude)\b",
     re.IGNORECASE,
 )
 
 
 def build_inner_schema() -> dict[str, Any]:
+    """Strict schema shared by both engines.
+
+    Codex's structured-output API rejects schemas that leave
+    `additionalProperties` open or have optional properties (HTTP 400),
+    so every object is closed and every property is required. Claude
+    accepts the same shape.
+    """
     return {
         "type": "object",
         "properties": {
@@ -42,15 +65,40 @@ def build_inner_schema() -> dict[str, Any]:
                     "type": "object",
                     "properties": {
                         "severity": {"type": "string", "enum": ["P0", "P1", "P2", "P3"]},
+                        "file": {"type": "string"},
+                        "line": {"type": "integer"},
+                        "summary": {"type": "string"},
                     },
-                    "required": ["severity"],
-                    "additionalProperties": True,
+                    "required": ["severity", "file", "line", "summary"],
+                    "additionalProperties": False,
                 },
             },
         },
         "required": ["clean", "findings"],
-        "additionalProperties": True,
+        "additionalProperties": False,
     }
+
+
+def structured_review_prompt(task_context: str | None) -> str:
+    if task_context:
+        return (
+            "Task context (what the worker was asked to build):\n"
+            f"{task_context}\n\n"
+            "Review the current working-tree changes in this project against the "
+            "acceptance criteria above for correctness, security, and quality. If "
+            "the tree is large, focus on the files most plausibly changed for this "
+            "task (review at most ~40 files); do not attempt to enumerate an "
+            "unrelated whole tree. Return ONLY structured JSON matching the "
+            "provided schema {clean, findings[]} — no prose/markdown/fences."
+        )
+    return (
+        "Run a raw structured review of the current working-tree changes in this "
+        "project against the task acceptance criteria for correctness, security, "
+        "and quality. Do not invoke any slash command. Return only structured "
+        "JSON output conforming to the provided JSON schema: "
+        '{"clean": bool, "findings": [{"severity": "P0|P1|P2|P3", "...": "..."}]}. '
+        "Do not include prose, markdown, or code fences."
+    )
 
 
 def parse_args() -> argparse.Namespace:
@@ -64,28 +112,12 @@ def parse_args() -> argparse.Namespace:
 
 
 def run_claude(args: argparse.Namespace) -> subprocess.CompletedProcess[str]:
+    if shutil.which("claude") is None:
+        raise FileNotFoundError("claude binary not found")
     if args.base:
         prompt = f"/review the diff against {args.base}"
-    elif args.task_context:
-        prompt = (
-            "Task context (what the worker was asked to build):\n"
-            f"{args.task_context}\n\n"
-            "Review the current working-tree changes in this project against the "
-            "acceptance criteria above for correctness, security, and quality. If "
-            "the tree is large, focus on the files most plausibly changed for this "
-            "task (review at most ~40 files); do not attempt to enumerate an "
-            "unrelated whole tree. Return ONLY structured JSON matching the "
-            "provided schema {clean, findings[]} — no prose/markdown/fences."
-        )
     else:
-        prompt = (
-            "Run a raw structured review of the current working-tree changes in this "
-            "project against the task acceptance criteria for correctness, security, "
-            "and quality. Do not invoke any slash command. Return only structured "
-            "JSON output conforming to the provided JSON schema: "
-            '{"clean": bool, "findings": [{"severity": "P0|P1|P2|P3", "...": "..."}]}. '
-            "Do not include prose, markdown, or code fences."
-        )
+        prompt = structured_review_prompt(args.task_context)
 
     return subprocess.run(
         [
@@ -107,7 +139,7 @@ def run_claude(args: argparse.Namespace) -> subprocess.CompletedProcess[str]:
     )
 
 
-def validate_claude_inner(inner: Any) -> list[dict[str, Any]]:
+def validate_inner(inner: Any) -> list[dict[str, Any]]:
     if not isinstance(inner, dict):
         raise ValueError("inner result is not an object")
     if not isinstance(inner.get("clean"), bool):
@@ -143,19 +175,58 @@ def parse_claude(stdout: str, returncode: int) -> tuple[list[dict[str, Any]], st
         result = envelope["result"]
         if not isinstance(result, str):
             raise ValueError("envelope result is not a string")
-        return validate_claude_inner(json.loads(result)), None
+        return validate_inner(json.loads(result)), None
     except Exception as exc:
         return [], str(exc)
+
+
+def codex_uses_exec(args: argparse.Namespace) -> bool:
+    """Non-git slot: `codex review` needs a diff base, so use `codex exec`."""
+    return not args.base and bool(args.task_context)
 
 
 def run_codex(args: argparse.Namespace) -> subprocess.CompletedProcess[str]:
     if shutil.which("codex") is None:
         raise FileNotFoundError("codex binary not found")
+    effort_cfg = ["--config", f'model_reasoning_effort="{args.effort}"']
+    if codex_uses_exec(args):
+        # The schema must be a file for codex; keep it next to nothing
+        # persistent (tmp dir, removed after the run). No -m: `codex review`
+        # also ignores --model and lets config.toml pick the model, and a
+        # ChatGPT-plan account rejects explicit model ids it does not own.
+        with tempfile.TemporaryDirectory(prefix="fleet-review-") as tmp:
+            schema_path = os.path.join(tmp, "schema.json")
+            with open(schema_path, "w", encoding="utf-8") as fh:
+                json.dump(build_inner_schema(), fh)
+            command = [
+                "codex", "exec",
+                "--skip-git-repo-check",
+                "--sandbox", "read-only",
+                "--output-schema", schema_path,
+                *effort_cfg,
+                structured_review_prompt(args.task_context),
+            ]
+            return subprocess.run(
+                command, capture_output=True, stdin=subprocess.DEVNULL, text=True,
+            )
     command = ["codex", "review"]
     if args.base:
         command.extend(["--base", args.base])
-    command.extend(["--config", 'model_reasoning_effort="high"'])
+    command.extend(effort_cfg)
     return subprocess.run(command, capture_output=True, stdin=subprocess.DEVNULL, text=True)
+
+
+def parse_codex_exec(stdout: str, returncode: int) -> tuple[list[dict[str, Any]], str | None]:
+    """`codex exec --output-schema` prints the final JSON message on stdout."""
+    del returncode
+    text = stdout.strip()
+    start = text.find("{")
+    if start < 0:
+        return [], "codex exec produced no JSON object"
+    try:
+        return validate_inner(json.loads(text[start:])), None
+    except Exception as exc:
+        return [], str(exc)
 
 
 def parse_codex(stdout: str, returncode: int) -> tuple[list[dict[str, Any]], str | None]:
@@ -172,7 +243,7 @@ def parse_codex(stdout: str, returncode: int) -> tuple[list[dict[str, Any]], str
     return findings, None
 
 
-def codex_skip_reason(stdout: str, stderr: str, error: str | None = None) -> str | None:
+def skip_reason_for(stdout: str, stderr: str, error: str | None = None) -> str | None:
     text = "\n".join(part for part in (stdout, stderr, error or "") if part)
     if RATE_LIMIT_RE.search(text):
         return "rate-limited"
@@ -186,19 +257,27 @@ def run_once(args: argparse.Namespace) -> tuple[list[dict[str, Any]], str | None
         if args.engine == "claude":
             completed = run_claude(args)
             findings, error = parse_claude(completed.stdout, completed.returncode)
+            # claude's stdout is a JSON envelope; only a failed run (parse
+            # error / nonzero exit) can carry a rate-limit or missing-binary
+            # signal worth turning into a skip.
+            if not findings and error is not None:
+                skip_reason = skip_reason_for(completed.stdout, completed.stderr, error)
+                if skip_reason is not None:
+                    return [], None, completed.stderr, skip_reason
         else:
             completed = run_codex(args)
-            findings, error = parse_codex(completed.stdout, completed.returncode)
+            if codex_uses_exec(args):
+                findings, error = parse_codex_exec(completed.stdout, completed.returncode)
+            else:
+                findings, error = parse_codex(completed.stdout, completed.returncode)
             if findings:
                 return findings, error, completed.stderr, None
-            skip_reason = codex_skip_reason(completed.stdout, completed.stderr)
+            skip_reason = skip_reason_for(completed.stdout, completed.stderr)
             if skip_reason is not None:
                 return [], None, completed.stderr, skip_reason
     except OSError as exc:
-        if args.engine == "codex":
-            skip_reason = codex_skip_reason("", "", str(exc)) or "unavailable"
-            return [], None, "", skip_reason
-        return [], str(exc), "", None
+        skip_reason = skip_reason_for("", "", str(exc)) or "unavailable"
+        return [], None, "", skip_reason
     return findings, error, completed.stderr, None
 
 

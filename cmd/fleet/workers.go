@@ -456,21 +456,21 @@ explicitly when the caller is a wrapper script.`,
 	cmd.Flags().IntVar(&opts.pid, "pid", 0, "worker OS PID (default: os.Getpid())")
 	cmd.Flags().IntVar(&opts.exit, "exit", 0, "worker exit code (set on phase=done|failed)")
 	cmd.Flags().StringVar(&opts.reviewAlphaStatus, "review-alpha-status", "",
-		"reviewer subagent: alpha slot status (pending|iterating|passed|skipped|blocked|single-claude-degraded)")
+		"reviewer subagent: alpha slot status (pending|iterating|passed|skipped|blocked|single-engine-degraded)")
 	cmd.Flags().IntVar(&opts.reviewAlphaRounds, "review-alpha-rounds", 0,
 		"reviewer subagent: alpha slot review rounds (0..N)")
 	cmd.Flags().StringVar(&opts.reviewAlphaSkipReason, "review-alpha-skip-reason", "",
-		"reviewer subagent: alpha skip reason — required when status=skipped and engine=codex (allowlist: rate-limited, unavailable)")
+		"reviewer subagent: alpha skip reason — required when status=skipped (helper engine only; allowlist: rate-limited, unavailable)")
 	cmd.Flags().StringVar(&opts.reviewAlphaEngine, "review-alpha-engine", "",
 		"reviewer subagent: alpha slot engine (codex|claude)")
 	cmd.Flags().StringVar(&opts.reviewAlphaModel, "review-alpha-model", "",
 		"reviewer subagent: alpha slot model")
 	cmd.Flags().StringVar(&opts.reviewBetaStatus, "review-beta-status", "",
-		"reviewer subagent: beta slot status (pending|iterating|passed|skipped|blocked|single-claude-degraded)")
+		"reviewer subagent: beta slot status (pending|iterating|passed|skipped|blocked|single-engine-degraded)")
 	cmd.Flags().IntVar(&opts.reviewBetaRounds, "review-beta-rounds", 0,
 		"reviewer subagent: beta slot review rounds (0..N)")
 	cmd.Flags().StringVar(&opts.reviewBetaSkipReason, "review-beta-skip-reason", "",
-		"reviewer subagent: beta skip reason — required when status=skipped and engine=codex (allowlist: rate-limited, unavailable)")
+		"reviewer subagent: beta skip reason — required when status=skipped (helper engine only; allowlist: rate-limited, unavailable)")
 	cmd.Flags().StringVar(&opts.reviewBetaEngine, "review-beta-engine", "",
 		"reviewer subagent: beta slot engine (codex|claude)")
 	cmd.Flags().StringVar(&opts.reviewBetaModel, "review-beta-model", "",
@@ -522,7 +522,9 @@ func runWorkersUpdate(slug string, opts *workersUpdateOpts, stdout io.Writer) er
 	// CLI-side review status validation. Empty values pass through
 	// when the flag was not set. Explicit status flags must be in the
 	// shared non-empty enum set; skip legality is keyed by the slot's
-	// engine value, not the alpha/beta flag name.
+	// engine value (only the helper engine — the one that is NOT the
+	// project's dominant anchor — may skip), not the alpha/beta flag name.
+	anchor := workers.ProjectReviewAnchor(project)
 	alphaStatus := workers.ReviewStatus(strings.TrimSpace(opts.reviewAlphaStatus))
 	betaStatus := workers.ReviewStatus(strings.TrimSpace(opts.reviewBetaStatus))
 	alphaSkipReason := strings.TrimSpace(opts.reviewAlphaSkipReason)
@@ -542,14 +544,14 @@ func runWorkersUpdate(slug string, opts *workersUpdateOpts, stdout io.Writer) er
 		if slot.statusSet {
 			if !workers.ReviewStatusValidNonEmpty(slot.status) {
 				return fmt.Errorf(
-					"--review-%s-status %q: must be one of pending|iterating|passed|skipped|blocked|single-claude-degraded",
+					"--review-%s-status %q: must be one of pending|iterating|passed|skipped|blocked|single-engine-degraded",
 					slot.name,
 					slot.statusRaw,
 				)
 			}
 			if slot.status == workers.ReviewStatusSkipped {
-				if slot.engine != workers.ReviewEngineCodex {
-					return fmt.Errorf("--review-%s-status=skipped: only a codex-engine slot may be skipped", slot.name)
+				if slot.engine == "" || slot.engine == anchor {
+					return fmt.Errorf("--review-%s-status=skipped: only the helper-engine slot may be skipped (project anchor is %s; got engine %q)", slot.name, anchor, slot.engine)
 				}
 				if _, ok := allowedCodexSkipReasonsCLI[slot.skipReason]; !ok {
 					return fmt.Errorf(

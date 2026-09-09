@@ -306,12 +306,11 @@ func notifyCoordRun(opts coordRunOpts, stdout, stderr io.Writer) error {
 	// Surface-dont-silo: a coord running on a stale skill COPY is exactly
 	// how a merged P0 fix gets silently neutered (#182). Shout to stderr
 	// with a remediation command BEFORE the child starts — best-effort, it
-	// never blocks the spawn. Resolves ~/.claude itself; on resolution
-	// failure WarnIfStale's Status call simply finds nothing and stays
-	// quiet.
-	if home, herr := os.UserHomeDir(); herr == nil {
-		_ = install.WarnIfStale(stderr,
-			filepath.Join(home, ".claude"), fleet.SkillFS())
+	// never blocks the spawn. Resolves the engine's skill home itself; on
+	// resolution failure WarnIfStale's Status call simply finds nothing
+	// and stays quiet.
+	if paths, perr := resolveInstallPaths(""); perr == nil {
+		_ = install.WarnIfStale(stderr, paths.skillHome, fleet.SkillFS())
 	}
 
 	ctx, cancel := signal.NotifyContext(context.Background(),

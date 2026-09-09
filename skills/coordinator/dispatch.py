@@ -35,6 +35,7 @@ import os
 import re
 import secrets
 import shlex
+import shutil
 import subprocess
 import tempfile
 from dataclasses import dataclass
@@ -215,7 +216,7 @@ def build_worker_prompt(
         f"Project: {project}",
         f"Branch: {branch}",
         "",
-        "You are running as a Fleet-dispatched Claude session. The operator",
+        f"You are running as a Fleet-dispatched {engine_label(coord_engine_from_env())} session. The operator",
         "is NOT watching this terminal — communicate progress via",
         "`fleet workers update <slug> --phase <p>` after every phase",
         "boundary. Exit cleanly (Ctrl-D / /exit) once you reach phase=done",
@@ -451,6 +452,34 @@ class PromptTooLargeError(Exception):
 ENGINE_CLAUDE_CODE = "claude-code"
 ENGINE_CODEX = "codex"
 
+# Where each engine discovers Fleet's skills (mirrors internal/install).
+# Claude Code reads ~/.claude/skills/<name>; Codex reads ~/.agents/skills.
+_SKILL_HOME = {ENGINE_CLAUDE_CODE: "~/.claude", ENGINE_CODEX: "~/.agents"}
+_ENGINE_BINARY = {ENGINE_CLAUDE_CODE: "claude", ENGINE_CODEX: "codex"}
+
+
+def coord_engine_from_env() -> str:
+    """Dominant engine of this coord: FLEET_ENGINE, default claude-code."""
+    return os.environ.get("FLEET_ENGINE", "") or ENGINE_CLAUDE_CODE
+
+
+def engine_label(engine: str) -> str:
+    return "CODEX" if engine == ENGINE_CODEX else "CLAUDE"
+
+
+def skill_home_for(engine: str) -> str:
+    return _SKILL_HOME.get(engine, _SKILL_HOME[ENGINE_CLAUDE_CODE])
+
+
+def helper_installed(coord_engine: str) -> bool:
+    """True when the OTHER engine's CLI is on PATH (optional review helper).
+
+    Never probes the dominant engine's own binary: a single-engine install
+    must resolve to has_helper=False without any error.
+    """
+    helper = reviewcfg.helper_engine(coord_engine)
+    return shutil.which(_ENGINE_BINARY[helper]) is not None
+
 
 def build_reviewer_prompt(
     task: parse.Task,
@@ -462,7 +491,7 @@ def build_reviewer_prompt(
     is_git: bool = True,
     coord_engine: str | None = None,
     dispatch_generation: int = 0,
-    has_codex: bool = False,
+    has_helper: bool = False,
     resolution: reviewcfg.Resolution | None = None,
 ) -> str:
     """Assemble the reviewer subagent's first-turn prompt.
@@ -487,19 +516,20 @@ def build_reviewer_prompt(
         with terminal --review-alpha-* and --review-beta-* flags. Then
         exit. The reviewer does NOT push or open the PR.
 
-    coord_engine: the engine the coord session was launched with
-                  (claude-code | codex). Defaults to FLEET_ENGINE env or
-                  claude-code. APPROACH A (memory project_codex_multi_
-                  engine.md): regardless of coord_engine, the reviewer
-                  subagent ALWAYS runs claude. When the coord is codex,
-                  the worker + finisher subagents also run codex; the
-                  reviewer pinch-hits as claude for cross-engine
-                  diversity (different model, different blind spots).
-                  The prompt body is identical for both cases — it's
-                  always written for a claude orchestrator running the
-                  resolved review slots against the worker diff — but a
-                  banner up top documents the diversity setup so the
-                  reviewer subagent understands the role split.
+    coord_engine: the DOMINANT engine — the one the coord session was
+                  launched with (claude-code | codex). Defaults to
+                  FLEET_ENGINE env or claude-code. The reviewer subagent
+                  runs the dominant engine too (it is spawned by the
+                  coord's own fan-out tool); it is an orchestrator that
+                  shells out to review_slot.py for each slot. Slots
+                  mirror the dominant engine (reviewcfg.resolve_slots):
+                  beta = dominant engine's anchor model (must pass),
+                  alpha = the other engine when `has_helper` (optional:
+                  may be skipped when rate-limited/unavailable), else a
+                  second dominant-engine model or single-engine-degraded.
+    has_helper:   the helper engine's CLI is installed on this host.
+                  False on a single-engine install; the prompt then never
+                  names the other engine's binary.
     worktree:     absolute path to the worker's pre-created git worktree
                   (cap > 1 mode), or None for in-place (cap=1) dispatch.
                   When set, step 1 becomes `cd <worktree>` +
@@ -516,15 +546,18 @@ def build_reviewer_prompt(
     if workers_dir is None:
         workers_dir = f"~/.fleet/projects/{project}/workers/{task.slug}"
     if coord_engine is None:
-        coord_engine = os.environ.get("FLEET_ENGINE", "") or ENGINE_CLAUDE_CODE
+        coord_engine = coord_engine_from_env()
     if resolution is None:
         resolution = reviewcfg.resolve_slots(
-            has_codex=has_codex,
+            dominant=coord_engine,
+            has_helper=has_helper,
             is_git=is_git,
             unavailable=set(),
         )
     alpha = resolution.alpha
     beta = resolution.beta
+    label = engine_label(coord_engine)
+    skill_home = skill_home_for(coord_engine)
 
     proj_flag = f"--project {project}"
     # Handoffs INHERIT the dispatching attempt's gen (DESIGN §3) — no
@@ -559,25 +592,30 @@ def build_reviewer_prompt(
         state_block.append("Project dir: non-git; worker edited files in place. There is no")
         state_block.append("             branch, no `origin/`, no commits — just the working tree.")
 
-    # Engine-diversity banner (Approach A): when coord = codex, the
-    # worker was codex; the reviewer is the cross-engine second opinion
-    # (claude). The resolved slots provide the review engines/models.
-    # Either way, the reviewer subagent process
-    # itself is always claude — that's the structural decision Approach
-    # A locks in for the v0.9 MVP. Banner applies to both git and
-    # non-git modes — codex coord can run against either project type.
-    if coord_engine == ENGINE_CODEX:
-        engine_banner = [
-            "Cross-engine review diversity (coord engine = codex):",
-            "  The worker subagent that wrote the diff was running CODEX.",
-            "  You are running CLAUDE as the second-opinion reviewer —",
-            "  same role split the operator gets when coord is claude and",
-            "  the resolved slots provide the cross-engine view, just",
-            "  reversed. Treat the worker's commits as you would any other diff.",
-            "",
-        ]
+    # Engine banner: names the dominant engine (which the worker, this
+    # reviewer, and the finisher all run) and how the two slots mirror
+    # it. Applies to both git and non-git modes.
+    if resolution.alpha_is_helper:
+        slot_split = (
+            f"  beta ({beta.engine}) is the dominant-engine anchor and must pass; "
+            f"alpha ({alpha.engine}) is the optional cross-engine helper."
+        )
+    elif resolution.single_engine_only:
+        slot_split = (
+            f"  Only {beta.engine} is installed and it has one reviewer model, so "
+            "alpha re-uses beta (single-engine-degraded)."
+        )
     else:
-        engine_banner = []
+        slot_split = (
+            f"  Both slots run {beta.engine} on two distinct models; both must pass."
+        )
+    engine_banner = [
+        f"Review slots (coord engine = {coord_engine}):",
+        f"  The worker subagent that wrote the diff was running {label}.",
+        f"  You are running {label} as the review orchestrator.",
+        slot_split,
+        "",
+    ]
 
     lines: list[str] = [
         f"You are a Fleet REVIEWER subagent for task: {task.slug}",
@@ -585,7 +623,7 @@ def build_reviewer_prompt(
         header_branch_line,
         "",
         *engine_banner,
-        "You are running as a Fleet-dispatched Claude session. The previous",
+        f"You are running as a Fleet-dispatched {label} session. The previous",
         "subagent (the worker) wrote the implementation + tests and exited at",
         "phase=review-pending. Your job is to run the two review slots on",
         handoff_summary,
@@ -622,49 +660,49 @@ def build_reviewer_prompt(
         task_context = f"{task.spec}\n\nAcceptance:\n{task.acceptance}"
         task_context_arg = f" --task-context {shlex.quote(task_context)}"
     alpha_cmd = (
-        f"python3 ~/.claude/skills/coordinator/review_slot.py "
+        f"python3 {skill_home}/skills/coordinator/review_slot.py "
         f"--engine {alpha.engine} --model {alpha.model} --effort high"
         f"{base_arg}{task_context_arg}"
     )
     beta_cmd = (
-        f"python3 ~/.claude/skills/coordinator/review_slot.py "
+        f"python3 {skill_home}/skills/coordinator/review_slot.py "
         f"--engine {beta.engine} --model {beta.model} --effort high"
         f"{base_arg}{task_context_arg}"
     )
-    if is_git and alpha.engine == "codex":
+    if resolution.alpha_is_helper:
         alpha_status_arg = "--review-alpha-status {passed|skipped}"
         alpha_skip_note = (
-            "     If alpha is skipped only because codex is rate-limited or unavailable, "
+            f"     If alpha is skipped only because {alpha.engine} is rate-limited or unavailable, "
             "add `--review-alpha-skip-reason rate-limited|unavailable`."
         )
         alpha_exit2_note = (
-            "   - exit 2 => codex slot skipped (helper prints reason on stdout: "
+            f"   - exit 2 => {alpha.engine} slot skipped (helper prints reason on stdout: "
             "rate-limited|unavailable); record that slot as "
-            "`--review-alpha-status skipped --review-alpha-engine codex "
+            f"`--review-alpha-status skipped --review-alpha-engine {alpha.engine} "
             "--review-alpha-skip-reason <reason>` and continue (beta still must pass)."
         )
         loop_termination_line = (
             "   Loop until BOTH slots are RESOLVED: each slot exits 0 (passed), "
-            "OR the codex alpha exits 2 (skipped) — record it as "
+            f"OR the {alpha.engine} alpha exits 2 (skipped) — record it as "
             "`--review-alpha-status skipped` and stop re-running it (do not keep "
-            "retrying a rate-limited codex). Beta must still reach exit 0 (passed)."
+            f"retrying a rate-limited {alpha.engine}). Beta must still reach exit 0 (passed)."
         )
-    elif resolution.single_claude_only:
-        alpha_status_arg = "--review-alpha-status single-claude-degraded"
+    elif resolution.single_engine_only:
+        alpha_status_arg = "--review-alpha-status single-engine-degraded"
         alpha_skip_note = (
-            "     Because only one distinct Claude model is available, record alpha "
-            "as `single-claude-degraded` after the shared Claude slot passes."
+            f"     Because only one distinct {beta.engine} model is available, record alpha "
+            f"as `single-engine-degraded` after the shared {beta.engine} slot passes."
         )
         alpha_exit2_note = ""
         loop_termination_line = "   Loop until BOTH slots exit 0."
     else:
         alpha_status_arg = "--review-alpha-status passed"
-        alpha_skip_note = "     Alpha is a Claude slot and must pass; do not skip it."
+        alpha_skip_note = f"     Alpha is a {alpha.engine} slot and must pass; do not skip it."
         alpha_exit2_note = ""
         loop_termination_line = "   Loop until BOTH slots exit 0."
     terminal_invariant_line = (
         "   Terminal invariant: record terminal review status ONLY when BOTH "
-        "slots exit 0 (passed) (or the codex alpha exits 2 skipped, where "
+        "slots exit 0 (passed) (or the helper alpha exits 2 skipped, where "
         "applicable) on the SAME final code with NO fix commit applied after "
         "either slot's passing run. If any fix lands after a slot passed, that "
         "slot must be re-run before recording terminal status."
@@ -701,6 +739,8 @@ def build_reviewer_prompt(
         "   - exit 0 => record that slot passed.",
         f"   - exit 1 => the slot found [P0]/[P1]; {fix_instruction}.",
         *([alpha_exit2_note] if alpha_exit2_note else []),
+        f"   - exit 2 from a {beta.engine} slot (the anchor) is NOT skippable: treat it",
+        "     exactly like exit 3 below (rate-limited/unavailable anchor => blocked).",
         "   - exit 3 => the slot is BLOCKED. Do NOT flip review-done. Run:",
         f"     `fleet workers update {task.slug} {proj_flag} --phase blocked \\",
         "       --reason \"review slot <alpha|beta> blocked: <one line>\"`",
@@ -718,7 +758,7 @@ def build_reviewer_prompt(
         f"     --review-beta-status passed --review-beta-engine {beta.engine} \\",
         f"     --review-beta-model {beta.model} --review-beta-rounds <M>`",
         alpha_skip_note,
-        "     Beta is the Claude anchor and must be recorded as passed.",
+        f"     Beta is the {beta.engine} anchor (the dominant engine) and must be recorded as passed.",
         "",
         "4. Exit cleanly (Ctrl-D / /exit) once you wrote --phase review-done.",
         "   The coord polls state.json on the next tick and dispatches the",
@@ -834,7 +874,7 @@ def build_finisher_prompt(
             f"Project: {project}",
             f"Branch to push: {branch}",
             "",
-            "You are running as a Fleet-dispatched Claude session. The reviewer",
+            f"You are running as a Fleet-dispatched {engine_label(coord_engine_from_env())} session. The reviewer",
             "subagent ran the alpha/beta review slots on the worker's diff, recorded",
             "terminal review_alpha_* + review_beta_* fields, and flipped the phase to",
             "review-done. Your job is mechanical: push, open the PR, update the",
@@ -866,8 +906,8 @@ def build_finisher_prompt(
             "<1-3 bullets from the worker's commits>",
             "",
             "## Review",
-            "- alpha (<engine>/<model>): passed|skipped:<reason>|single-claude-degraded (rounds: <N>)",
-            "- beta (claude/<model>): passed (rounds: <M>)",
+            "- alpha (<engine>/<model>): passed|skipped:<reason>|single-engine-degraded (rounds: <N>)",
+            "- beta (<engine>/<model>): passed (rounds: <M>)",
             "",
             "## Test plan",
             "- [ ] CI green",
@@ -916,7 +956,7 @@ def build_finisher_prompt(
             f"Project: {project}",
             "Mode: non-git (no branches, no commits, no push, no PR)",
             "",
-            "You are running as a Fleet-dispatched Claude session. The reviewer",
+            f"You are running as a Fleet-dispatched {engine_label(coord_engine_from_env())} session. The reviewer",
             "subagent ran both Claude review slots on the worker's in-place diff,",
             "recorded review_alpha_status=passed + review_beta_status=passed,",
             "and flipped the phase to review-done. Your job is purely mechanical:",
@@ -1419,13 +1459,15 @@ def format_dispatch_instruction(
     generation: int = 0,
     register: bool = True,
 ) -> str:
-    """Render the DISPATCH block the coord agent (Claude) will act on.
+    """Render the DISPATCH block the coord agent will act on.
 
-    Phase A — the Python skill cannot invoke Claude's Agent tool
-    directly. Instead, /coordinator emits structured DISPATCH blocks
-    on stdout and SKILL.md's "Worker dispatch protocol" section
-    instructs the coord agent to invoke `Agent(...)` for each block
-    on its NEXT assistant turn (one Agent call per block).
+    Phase A — the Python skill cannot invoke the host engine's spawn
+    tool directly. Instead, /coordinator emits structured DISPATCH
+    blocks on stdout and SKILL.md's "Worker dispatch protocol" section
+    instructs the coord agent to spawn one subagent per block on its
+    NEXT assistant turn (Claude Code: `Agent(...)`; Codex:
+    `spawn_agent(...)`). `engine` names the dominant engine so the
+    coord picks the matching tool; workers inherit it via FLEET_ENGINE.
 
     Block format:
 
@@ -1436,6 +1478,7 @@ def format_dispatch_instruction(
           prompt_file: <abs path>
           run_in_background: true
           subagent_type: general-purpose
+          engine: claude-code|codex
         END_DISPATCH
 
     `generation` is the launch token (dispatch-durability #184). Before
@@ -1472,6 +1515,7 @@ def format_dispatch_instruction(
         f"  prompt_file: {prompt_file}",
         "  run_in_background: true",
         "  subagent_type: general-purpose",
+        f"  engine: {coord_engine_from_env()}",
     ]
     # `register: false` marks a dispatch whose agent_id is NOT a tasks.md
     # worker slug (PR-watch auto-fix/rebase — slug is a synthetic

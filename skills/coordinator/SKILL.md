@@ -1,6 +1,6 @@
 ---
 name: coordinator
-description: Per-project coordinator that owns tasks.md, saves approved plan docs, dispatches worker/reviewer/finisher Agent subagents, monitors PR/CI, and raises hand only when human input is needed. Mutates task state only through fleet CLI. One coordinator per project is enforced by coordinator.lock.
+description: Per-project coordinator that owns tasks.md, saves approved plan docs, dispatches worker/reviewer/finisher subagents on the dominant engine (Claude Code Agent tool or Codex spawn_agent), monitors PR/CI, and raises hand only when human input is needed. Mutates task state only through fleet CLI. One coordinator per project is enforced by coordinator.lock.
 ---
 
 # coordinator
@@ -23,9 +23,27 @@ lives in `docs/COORDINATOR-WORKFLOW.md`, `docs/PLAN-v0.2-coordinator.md`, and
 
 ## Coord agent role
 
-The Claude Code session running this skill is a **coordinator**, not a worker.
-It discusses design, writes approved plan docs, files tasks, dispatches Agent
+The agent session running this skill is a **coordinator**, not a worker. It
+discusses design, writes approved plan docs, files tasks, dispatches
 subagents, and shepherds PRs. It does not implement features inline.
+
+### Dominant engine
+
+The operator picks the engine with `fleet -claude` / `fleet -codex` /
+`fleet --engine <name>` (default `claude-code`; persisted per project in
+`coord-config.json`). That engine is the **dominant** engine: it runs the
+coord, every worker/reviewer/finisher subagent, and the review anchor.
+`FLEET_ENGINE` tells you which one you are:
+
+| `FLEET_ENGINE` | you are      | spawn tool            | skill home   |
+|----------------|--------------|-----------------------|--------------|
+| `claude-code`  | Claude Code  | `Agent(...)`          | `~/.claude`  |
+| `codex`        | Codex        | `spawn_agent(...)`    | `~/.agents`  |
+
+The *other* provider is an optional **helper**: it only ever runs the alpha
+review slot, and only when its binary is installed. Fleet must work with a
+single subscription in either direction — never shell out to the helper's
+binary for anything but that slot, and never assume it exists.
 
 **ROLE — discuss design with the operator, save approved plan docs, file tasks, dispatch workers.**
 
@@ -147,11 +165,12 @@ Before any task is promoted to ready, save its worker-ready task plan doc.
   debug / investigation / PR-review work is DISPATCHED to subagents; the coord
   only talks to the operator, dispatches, and enforces return contracts.
 - Before promote, every TASK-PLAN doc set gets one dual review via dispatched
-  subagents, launched in parallel (codex and Claude concurrently):
-  1. a codex reviewer (codex exec, high reasoning) — design-fidelity,
-     code-reality, implementability;
-  2. an independent Claude reviewer — cross-task seams between the plans,
-     testability, plus the same lenses.
+  subagents, launched in parallel (dominant engine and helper concurrently):
+  1. a helper-engine reviewer (the other provider's CLI, high reasoning) —
+     design-fidelity, code-reality, implementability; when no helper is
+     installed, a second independent dominant-engine reviewer takes this seat;
+  2. an independent dominant-engine reviewer — cross-task seams between the
+     plans, testability, plus the same lenses.
 - Fan-out: with many task plans, per-plan reviewers also dispatch in parallel;
   only the cross-task-seam pass needs the full plan set in one reviewer's
   context.
@@ -189,7 +208,8 @@ technical decision — preserve every invariant verbatim in meaning.
 
 ### Step 6 — IMPLEMENT
 
-Implementation is a three-stage flow across separate Agent subagents:
+Implementation is a three-stage flow across separate subagents, all on the
+dominant engine:
 
 ```text
 worker                reviewer                  finisher
@@ -204,9 +224,16 @@ Rules:
   push.
 - The reviewer runs both resolved slots through `review_slot.py`, fixes P0/P1
   findings, and records slot-named alpha/beta terminal fields. Beta is the
-  Claude anchor and must pass; the beta review is never skippable.
-- On git projects, an alpha codex slot may be recorded as skipped only for
-  `rate-limited` or `unavailable`; non-git projects resolve to Claude slots.
+  **dominant-engine anchor** and must pass; the beta review is
+  NEVER skippable (a rate-limited/unavailable anchor is `blocked`, not skipped).
+- Alpha is the optional helper slot (the other provider) when its binary is
+  installed; it may be recorded as skipped only for `rate-limited` or
+  `unavailable`. Without a helper, alpha is a second dominant-engine model,
+  or `single-engine-degraded` when only one model is available.
+- Non-git projects: Claude slots run a raw structured review; Codex slots run
+  `codex exec --output-schema` (there is no diff base for `codex review`).
+  `review_slot.py` picks this per slot; the reviewer never calls engines
+  directly.
 - The finisher pushes and opens the PR only when review terminal fields satisfy
   the worker state validator.
 - Default parallelism is 3. Resolution order: the project's
@@ -282,8 +309,8 @@ of auto-dispatching backlog work.
 
 ## Worker dispatch protocol
 
-`loop.py` cannot invoke the host Agent tool. It emits DISPATCH blocks and the
-coord agent must act on them immediately.
+`loop.py` cannot invoke the host engine's spawn tool. It emits DISPATCH blocks
+and the coord agent must act on them immediately.
 
 Block shape:
 
@@ -295,8 +322,12 @@ DISPATCH: <slug>
   prompt_file: <abs path>
   run_in_background: true
   subagent_type: general-purpose
+  engine: claude-code|codex
 END_DISPATCH
 ```
+
+`engine` is the dominant engine (same as your `FLEET_ENGINE`). It selects the
+spawn tool in step 3; the worker inherits it through its environment.
 
 For each block:
 1. Read `prompt_file`. Note the block's `agent_id` and `generation` (the
@@ -319,10 +350,18 @@ For each block:
    - **`contention`** (exit 21) → the per-id flock could not be taken in
      time. **TRANSIENT** → **do NOT launch, do NOT mark it done; the next
      tick re-emits the same block. NEVER treat contention as a skip.**
-3. Invoke the Agent tool ONCE. Use `description`, full prompt body,
-   `subagent_type=general-purpose`, and `run_in_background=true`.
-4. Capture the returned `subagent_id` and best-effort register it (this
-   also flips the journal `launch_attempted → acked`):
+3. Spawn the subagent ONCE, with the tool for the block's `engine`:
+   - `engine: claude-code` — invoke the Agent tool. Use `description`, full
+     prompt body, `subagent_type=general-purpose`, and
+     `run_in_background=true`.
+   - `engine: codex` — invoke `spawn_agent` with `task_name=<slug>` and
+     `message=<full prompt body>`. It is non-blocking and returns a task
+     handle (`{"task_name": "/root/<slug>"}`); do NOT `wait_agent` on it in
+     the same turn — the supervisor loop tracks the worker through its
+     Fleet agent record. `send_message` is for follow-ups only.
+4. Capture the returned handle (`subagent_id` for Claude, the `task_name`
+   path for Codex) and best-effort register it (this also flips the journal
+   `launch_attempted → acked`):
 
 ```bash
 python3 /path/to/skills/coordinator/register_subagent.py \
@@ -332,14 +371,14 @@ python3 /path/to/skills/coordinator/register_subagent.py \
    **EXCEPTION — `register: false` blocks.** A DISPATCH block carrying a
    `register: false` line is a PR-watch auto-fix/rebase dispatch whose
    `slug` is a synthetic `pr-fix-<n>` / `pr-rebase-<n>` label, NOT a
-   tasks.md worker. Do the `mark-launch-attempted` gate + the Agent call as
+   tasks.md worker. Do the `mark-launch-attempted` gate + the spawn call as
    normal, but SKIP `register_subagent.py` for it: that script keys on the
    worker slug→agent_id map and would pollute worker state with a non-worker
    label. The coordinator tick reaps these journals/inboxes itself via the
    PR-watch lease lifecycle.
 
-One Agent call per DISPATCH block whose `mark-launch-attempted` returned
-`ok`. If a tick emits N blocks, run the step-2 gate then the Agent call for
+One spawn call per DISPATCH block whose `mark-launch-attempted` returned
+`ok`. If a tick emits N blocks, run the step-2 gate then the spawn call for
 each before doing anything else. Skip registration only if no `subagent_id`
 is available or the brief register call hits lock contention; the worker
 still runs (the residual-crash repair handles a never-acked launch, and
@@ -359,9 +398,9 @@ a stale block and a replay block both arrive.
 
 ## Remote control (native, default-on)
 
-Remote control is NATIVE: `fleet dispatch --coord-spawn` (and the handoff / drain replacement paths) bake `claude --remote-control "fleet-coord-<id>-<project>"` into the coord's own claude argv, so mobile / claude.ai pairing is live the moment the coord starts. There is NO standalone `claude remote-control` listener daemon, NO per-tick respawn (`remote_control.spawn_daemon_if_needed` is a retired no-op shim), and NO send-keys injection. The gate is opt-OUT: the per-project `~/.fleet/projects/<p>/rc-disabled` marker (written by `fleet rc down`) suppresses the flag on the next coord spawn.
+Remote control is Claude-Code-only in v1 (a codex-dominant coord has no RC; the flag is engine-gated at every inject site). Remote control is NATIVE: `fleet dispatch --coord-spawn` (and the handoff / drain replacement paths) bake `claude --remote-control "fleet-coord-<id>-<project>"` into the coord's own claude argv, so mobile / claude.ai pairing is live the moment the coord starts. There is NO standalone `claude remote-control` listener daemon, NO per-tick respawn (`remote_control.spawn_daemon_if_needed` is a retired no-op shim), and NO send-keys injection. The gate is opt-OUT: the per-project `~/.fleet/projects/<p>/rc-disabled` marker (written by `fleet rc down`) suppresses the flag on the next coord spawn.
 
-Workers and Agent-tool subagents NEVER carry the flag — every inject site is gated on coord-ness (`--coord-spawn` / coord-spawn marker). That call-site carve-out is the architectural fix that retires the 5,620-mobile-push reviewer-loop hazard: there is no listener to respawn and no path that attaches RC to a reviewer loop.
+Workers and in-session subagents NEVER carry the flag — every inject site is gated on coord-ness (`--coord-spawn` / coord-spawn marker). That call-site carve-out is the architectural fix that retires the 5,620-mobile-push reviewer-loop hazard: there is no listener to respawn and no path that attaches RC to a reviewer loop.
 
 Operator commands:
 - `fleet rc up <project>` — re-enable: remove the rc-disabled opt-out marker (takes effect on next coord spawn).
@@ -455,9 +494,11 @@ re-dispatched. `NEW_TASK` is a wake-only sentinel and carries no token.
 
 ## Non-git Projects
 
-Same phases, no branch/commit/push/PR. Reviewer runs two Claude slots through
-`review_slot.py`, records both slots passed, and the finisher writes
-`phase=done` directly with a diff summary.
+Same phases, no branch/commit/push/PR. Reviewer runs both resolved slots
+through `review_slot.py` as raw structured reviews (a Codex helper is not
+offered here — `codex review` needs a diff base; a Claude helper still is),
+records both slots passed (or `single-engine-degraded`), and the finisher
+writes `phase=done` directly with a diff summary.
 
 ## Failure Modes
 
@@ -496,7 +537,10 @@ Same phases, no branch/commit/push/PR. Reviewer runs two Claude slots through
 - `dispatch.py` — worker/reviewer/finisher prompt builders and inbox writes.
 - `workflow_state.py` — atomic `workflow.md` writer.
 - `handoff_resume.py` — successor coord resume helper.
-- `register_subagent.py` — records host Agent `subagent_id`.
+- `register_subagent.py` — records the host engine's subagent handle
+  (Claude `subagent_id` / Codex `spawn_agent` task path).
+- `reviewcfg.py` — resolves alpha/beta slots from the dominant engine +
+  helper availability.
 - `remote_control.py`, `supervisor.py`, `reaper.py`, `worktree.py` — runtime
   helpers.
 

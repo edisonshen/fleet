@@ -578,35 +578,40 @@ _PENDING_ACQUIRE_IDS_KEY = "pending_acquire_agent_ids"
 # list; a slug with an empty list is dropped from the map.
 _PENDING_RELEASE_IDS_KEY = "pending_release_agent_ids"
 
-# Claude Agent-tool subagent IDs are opaque strings produced by the host
-# Claude Code session. Phase C only needs them as display tokens — we
+# Subagent handles are opaque strings produced by the host engine:
+# Claude Code's Agent tool returns a subagent_id, Codex's spawn_agent
+# returns a task slug like `/root/<name>` (and later a UUID agent_id in
+# hook payloads). Phase C only needs them as display tokens — we
 # truncate to the first 8 chars on the TUI — so we don't pin a strict
 # shape here. Defensive bounds keep a malformed coord-state from blowing
 # up the supervisor: empty / over-long / non-printable rejected.
 _SUBAGENT_ID_MAX_LEN = 128
 
+# Engines whose fleet-guard hook adapter refreshes last_activity_ts.
+# Idle-TTL auto-archive trusts the heartbeat only for these.
+_HEARTBEAT_ENGINES = frozenset({"claude-code", "codex"})
+
 
 def _is_subagent_id(s: str) -> bool:
-    """Loose validation for an Agent-tool subagent_id token. The host
-    Claude doesn't document the exact shape, so we accept any non-empty
-    printable string under the length cap. Whitespace is rejected (the
-    coord agent strips before passing the token in).
+    """Loose validation for a subagent handle. Neither engine documents
+    the exact shape, so we accept any non-empty printable string under
+    the length cap (Codex's `/root/<name>` slugs included). Whitespace
+    is rejected (the coord agent strips before passing the token in).
 
     Defense-in-depth: shell metacharacters (`;`, `|`, `&`, `$`, backtick,
     `(`, `)`, `<`, `>`, `\\`, single+double quotes) are rejected. The
     coord agent passes this id into a Bash tool invocation (per
     SKILL.md's Worker dispatch protocol step 3); rejecting the
     metacharacter set blocks shell-injection-via-LLM-output even when
-    the operator's Bash invocation forgets to quote the value. Host
-    Claude's Agent-tool subagent_id format in practice is alphanumeric
-    with hyphens / underscores, so this filter never trips on a
-    legitimate id."""
+    the operator's Bash invocation forgets to quote the value. In
+    practice ids are alphanumeric with hyphens / underscores / slashes,
+    so this filter never trips on a legitimate id."""
     if not isinstance(s, str):
         return False
     if not s or len(s) > _SUBAGENT_ID_MAX_LEN:
         return False
     # Shell-metacharacter blocklist. We use a blocklist (not allowlist)
-    # because the host Claude could in principle return any printable
+    # because the host engine could in principle return any printable
     # subagent_id format and we don't want to over-fit. The blocklist
     # covers the operator-visible shell injection vectors.
     _SHELL_META = "$`;|&<>()\\\"'"
@@ -1953,17 +1958,14 @@ def _run_idle_agent_archive_pass(
             continue
         if bool(rec.get("blocked", False)):
             continue
-        # Multi-engine MVP (memory project_codex_multi_engine.md):
-        # non-claude-code engines (currently just "codex") don't run
-        # Claude Code hooks, so fleet-guard never updates their
-        # last_activity_ts. A codex agent that the operator dispatched
-        # an hour ago and is actively running would look "idle since
-        # spawn" to this sweep — and idle-TTL auto-archive would `fleet
-        # rm` it out from under the operator. Skip non-claude-code
-        # engines until a sibling skill writes heartbeats for them.
+        # Both supported engines run fleet-guard hooks (Claude Code via
+        # ~/.claude/settings.json, Codex via ~/.codex/hooks.json), so
+        # last_activity_ts is a real heartbeat for either. An engine we
+        # don't know never heartbeats — it would look "idle since spawn"
+        # and get `fleet rm`'d out from under the operator, so skip it.
         # Empty engine field defaults to claude-code (legacy records).
         engine = str(rec.get("engine", "") or "claude-code")
-        if engine != "claude-code":
+        if engine not in _HEARTBEAT_ENGINES:
             continue
         last_ts = _parse_rfc3339(str(rec.get("last_activity_ts", "") or ""))
         if last_ts is None:

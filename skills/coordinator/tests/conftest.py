@@ -146,3 +146,11 @@ def _disable_supervisor_by_default(monkeypatch):
     """
     monkeypatch.setenv("FLEET_COORD_POLL_INTERVAL_S", "0")
     monkeypatch.setenv("FLEET_COORD_POLL_BASE_INTERVAL_S", "0")
+
+
+@pytest.fixture(autouse=True)
+def _default_engine(monkeypatch):
+    """Tests assume the claude-code default unless they set FLEET_ENGINE
+    themselves; a codex-dominant developer shell must not leak in."""
+    monkeypatch.delenv("FLEET_ENGINE", raising=False)
+    monkeypatch.delenv("FLEET_ENGINE_EXPLICIT", raising=False)

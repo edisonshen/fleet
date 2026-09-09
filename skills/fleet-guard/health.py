@@ -186,7 +186,20 @@ def agent_record_path(agent_id: str) -> Path:
 
 def read_context_pct(payload: dict[str, Any]) -> tuple[float | None, str | None]:
     """Walk the transcript JSONL referenced by payload['transcript_path'] and
-    compute context_pct from the most-recent message.usage.
+    compute context_pct from the most-recent usage record.
+
+    Two engines write two transcript shapes; both are handled here so the
+    threshold engine, handoff queue and health JSON stay engine-neutral:
+
+      claude-code  ~/.claude/projects/.../<session>.jsonl
+                   per-message `message.usage` blocks + `message.model`;
+                   window from CONTEXT_LIMITS (model-id table).
+      codex        ~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl
+                   `event_msg` records with payload.type == "token_count"
+                   carrying `info.last_token_usage` AND
+                   `info.model_context_window` — the window is in-band, so
+                   no per-model table is needed (model id from the hook
+                   payload, for diagnostics only).
 
     Returns (context_pct, model_name). pct is None only when the transcript
     yields no usage/model data at all (missing path, unreadable file, no
@@ -208,6 +221,8 @@ def read_context_pct(payload: dict[str, Any]) -> tuple[float | None, str | None]
 
     last_usage: dict[str, Any] | None = None
     last_model = ""
+    codex_usage: dict[str, Any] | None = None
+    codex_window: int | None = None
     try:
         with tp.open("r", encoding="utf-8", errors="replace") as f:
             for line in f:
@@ -217,6 +232,12 @@ def read_context_pct(payload: dict[str, Any]) -> tuple[float | None, str | None]
                 try:
                     obj = json.loads(line)
                 except Exception:
+                    continue
+                if not isinstance(obj, dict):
+                    continue
+                tc = _codex_token_count(obj)
+                if tc is not None:
+                    codex_usage, codex_window = tc
                     continue
                 msg = obj.get("message") or {}
                 if obj.get("type") == "assistant":
@@ -228,6 +249,9 @@ def read_context_pct(payload: dict[str, Any]) -> tuple[float | None, str | None]
                     last_usage = u
     except Exception:
         return (None, None)
+
+    if codex_usage is not None:
+        return _codex_pct(codex_usage, codex_window, payload)
 
     if not last_usage:
         # Loud flag, not a silent freeze: a transcript with zero usage blocks
@@ -260,6 +284,43 @@ def read_context_pct(payload: dict[str, Any]) -> tuple[float | None, str | None]
         return (None, model)
     pct = round(total * 100.0 / limit, 2)
     return (pct, model)
+
+
+def _codex_token_count(obj: dict[str, Any]) -> tuple[dict[str, Any], int | None] | None:
+    """Match a Codex rollout `token_count` event and return
+    (last_token_usage, model_context_window). None for any other record."""
+    if obj.get("type") != "event_msg":
+        return None
+    p = obj.get("payload")
+    if not isinstance(p, dict) or p.get("type") != "token_count":
+        return None
+    info = p.get("info")
+    if not isinstance(info, dict):
+        return None
+    usage = info.get("last_token_usage")
+    if not isinstance(usage, dict):
+        return None
+    window = info.get("model_context_window")
+    return (usage, window if isinstance(window, int) and window > 0 else None)
+
+
+def _codex_pct(usage: dict[str, Any], window: int | None,
+               payload: dict[str, Any]) -> tuple[float | None, str | None]:
+    """Codex context_pct: last_token_usage.input_tokens is the full prompt
+    of the most recent turn (cached_input_tokens is a SUBSET of it in the
+    OpenAI usage shape, so it is not added again); output tokens are
+    excluded to match the Claude path. The window comes from the rollout;
+    a rollout that omits it falls back to the model table / 1M default so
+    the 40/50 handoff never goes blind."""
+    model_raw = payload.get("model")
+    model = model_raw if isinstance(model_raw, str) and model_raw else None
+    in_t = int(usage.get("input_tokens", 0) or 0)
+    limit = window
+    if limit is None:
+        limit = _resolve_limit(model) if model else DEFAULT_CONTEXT_LIMIT
+    if not limit:
+        return (None, model)
+    return (round(in_t * 100.0 / limit, 2), model)
 
 
 def threshold(context_pct: float | None) -> str:

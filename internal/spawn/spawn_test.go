@@ -1617,6 +1617,69 @@ func TestSpawn_WritesCoordConfigRepo_OnFreshProject(t *testing.T) {
 	}
 }
 
+// TestSpawn_WritesCoordConfigEngine pins the per-project engine memory:
+// a coord spawned under codex stamps coord-config.json::engine=codex so
+// a later flag-less respawn (TUI [a], attach Tier 3) picks the same
+// engine instead of the claude-code default.
+func TestSpawn_WritesCoordConfigEngine(t *testing.T) {
+	requireTmux(t)
+	home := setupFleetHome(t)
+
+	rec, err := Spawn(Options{
+		TaskID:           "coord-projects-rainier",
+		Project:          "projects-rainier",
+		Cwd:              t.TempDir(),
+		Command:          []string{"sleep", "30"},
+		Engine:           "codex",
+		DisableLeaseWrap: true,
+	})
+	if err != nil {
+		t.Fatalf("Spawn: %v", err)
+	}
+	t.Cleanup(func() { _ = tmux.Kill(rec.TmuxSession) })
+
+	data := readCoordConfig(t, home, "projects-rainier")
+	if data["engine"] != "codex" {
+		t.Errorf("coord-config.json::engine: got %v want codex", data["engine"])
+	}
+	if got := ReadCoordConfigEngine(home, "projects-rainier"); got != "codex" {
+		t.Errorf("ReadCoordConfigEngine = %q want codex", got)
+	}
+}
+
+func TestReadCoordConfigEngine_MissingOrMalformed(t *testing.T) {
+	home := setupFleetHome(t)
+	if got := ReadCoordConfigEngine(home, "nope"); got != "" {
+		t.Errorf("missing file: got %q want empty", got)
+	}
+	if got := ReadCoordConfigEngine("", "nope"); got != "" {
+		t.Errorf("empty home: got %q want empty", got)
+	}
+	projDir := filepath.Join(home, "projects", "p")
+	if err := os.MkdirAll(projDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	cfgPath := filepath.Join(projDir, "coord-config.json")
+	if err := os.WriteFile(cfgPath, []byte(`{"parallelism": 3}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if got := ReadCoordConfigEngine(home, "p"); got != "" {
+		t.Errorf("no engine key: got %q want empty", got)
+	}
+	if err := os.WriteFile(cfgPath, []byte(`{not json`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if got := ReadCoordConfigEngine(home, "p"); got != "" {
+		t.Errorf("malformed: got %q want empty", got)
+	}
+	if err := os.WriteFile(cfgPath, []byte(`{"repo": "/x", "engine": "claude-code"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if got := ReadCoordConfigEngine(home, "p"); got != "claude-code" {
+		t.Errorf("stamped: got %q want claude-code", got)
+	}
+}
+
 func TestSpawn_WritesCoordConfigRepo_PreservesParallelism(t *testing.T) {
 	requireTmux(t)
 	home := setupFleetHome(t)

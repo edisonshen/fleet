@@ -7605,14 +7605,26 @@ def _dispatch_review_handoffs(
     # Git mode is the same per-tick decision as in _dispatch_ready —
     # the reviewer + finisher prompts branch on this.
     is_git = dispatch_mod.project_is_git(project, fleet_home=fleet_home)
-    if isinstance(coord_state, dict) and "has_codex" in coord_state:
-        has_codex = bool(coord_state.get("has_codex"))
+    coord_engine = dispatch_mod.coord_engine_from_env()
+    # The helper is the OTHER engine's CLI. Its presence is probed once
+    # per coord lifetime and cached in coord-state (has_helper); the
+    # legacy `has_codex` key is honored for claude-dominant coords so a
+    # mid-flight upgrade does not flip the slot layout.
+    if isinstance(coord_state, dict) and "has_helper" in coord_state:
+        has_helper = bool(coord_state.get("has_helper"))
+    elif (
+        isinstance(coord_state, dict)
+        and coord_engine == dispatch_mod.ENGINE_CLAUDE_CODE
+        and "has_codex" in coord_state
+    ):
+        has_helper = bool(coord_state.get("has_codex"))
     else:
-        has_codex = shutil.which("codex") is not None
+        has_helper = dispatch_mod.helper_installed(coord_engine)
         if isinstance(coord_state, dict):
-            coord_state["has_codex"] = has_codex
+            coord_state["has_helper"] = has_helper
     resolution = reviewcfg.resolve_slots(
-        has_codex=has_codex,
+        dominant=coord_engine,
+        has_helper=has_helper,
         is_git=is_git,
         unavailable=set(),
     )
@@ -7680,7 +7692,8 @@ def _dispatch_review_handoffs(
                     t, project=project, branch=branch,
                     worktree=worktree or None, is_git=is_git,
                     dispatch_generation=handoff_generation,
-                    has_codex=has_codex,
+                    coord_engine=coord_engine,
+                    has_helper=has_helper,
                     resolution=resolution,
                 )
                 description = f"fleet reviewer {t.slug}"
