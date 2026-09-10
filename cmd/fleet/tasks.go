@@ -1343,9 +1343,9 @@ todo + spawned_by=<agent-slug> precisely so the coordinator skips them
 until an operator promotes (PLAN failure-mode "worker fires recursive
 bug-files"). This is the operator-side gate.
 
-If the task is already ready, promote is a no-op and prints a notice.
-Other statuses are rejected (use ` + "`fleet tasks set <slug> status=...`" + `
-to override explicitly).`,
+Any other status is rejected with a non-zero exit — including an already-ready
+task, since a repeat promote means the caller's view is stale. Use
+` + "`fleet tasks set <slug> status=...`" + ` to override explicitly.`,
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return runTasksPromote(opts, args[0], cmd.OutOrStdout())
@@ -1393,8 +1393,7 @@ func runTasksPromote(opts *tasksPromoteOpts, slug string, stdout io.Writer) erro
 			promoted = true
 			return nil
 		case tasks.StatusReady:
-			_, _ = fmt.Fprintf(stdout, "%s already ready (no-op)\n", slug)
-			return nil
+			return fmt.Errorf("tasks promote: %s is already ready — nothing to promote", slug)
 		default:
 			return fmt.Errorf("tasks promote: %s has status=%s — only todo→ready is allowed (use `fleet tasks set` for other transitions)", slug, t.Status)
 		}

@@ -13,6 +13,11 @@ the exchange automatically:
     assistant: "<final reply>"                      -> coord: <reply>",
     (Stop fires)                           "coord_id": ..., "ts": ...}
 
+Capture runs only when the shell is stamped FLEET_ROLE=coord (spawn sets it
+on every coord); the agent-record `is_coord` fallback coordguard uses for
+its write-guard is deliberately NOT honoured here, so a hook fired from an
+unstamped shell can never write another coord's decision buffer.
+
 Only OPERATOR turns are captured — a human prompt, or an `[OPERATOR]`
 inbox delivery — never the coord's own tool-result churn or fleet-guard's
 own injections (HANDOFF REQUESTED, [FLEET] nags). Operator turns are rare
@@ -36,7 +41,6 @@ import subprocess
 import sys
 from pathlib import Path
 
-import coordguard
 import health
 
 OPERATOR_PREFIX = "[OPERATOR]"
@@ -210,11 +214,15 @@ def record(line: str) -> bool:
     return True
 
 
+def role_is_coord() -> bool:
+    return os.environ.get("FLEET_ROLE", "").strip().lower() == "coord"
+
+
 def capture(payload: dict, agent_id: str) -> str | None:
     """Stop-hook entry: record the latest operator↔coord exchange once.
-    Coord sessions only. Returns the recorded line, or None when nothing
-    new was captured."""
-    if not coordguard.is_coord_session():
+    Explicit FLEET_ROLE=coord shells only. Returns the recorded line, or
+    None when nothing new was captured."""
+    if not role_is_coord():
         return None
     found = last_exchange(str(payload.get("transcript_path") or ""))
     if found is None:

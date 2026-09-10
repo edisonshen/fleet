@@ -87,6 +87,22 @@ def test_record_decision_writes_into_state():
     assert state["recent_decisions"] == ["dispatched worker s-1111 (gen 1)"]
 
 
+def test_record_decision_claims_rolling_buffer_on_succession():
+    state = {"recent_decisions": ["pred line"], "recent_decisions_owner": "aaaa1111"}
+    act = _dispatch(agent_id="a", dispatch_instruction="x", dispatch_generation=1)
+    # Same coord: append.
+    loop._record_decision(state, act, coord_id="aaaa1111")
+    assert state["recent_decisions"] == ["pred line", "dispatched worker s-1111 (gen 1)"]
+    # No coord_id (operator-shell shape): append, stamp untouched.
+    loop._record_decision(state, _sentinel("worker_failed"))
+    assert len(state["recent_decisions"]) == 3
+    assert state["recent_decisions_owner"] == "aaaa1111"
+    # Successor: predecessor's rolling lines are dropped, stamp flips.
+    loop._record_decision(state, act, coord_id="bbbb2222")
+    assert state["recent_decisions"] == ["dispatched worker s-1111 (gen 1)"]
+    assert state["recent_decisions_owner"] == "bbbb2222"
+
+
 def test_record_decision_noop_action_writes_nothing():
     state = {}
     loop._record_decision(state, _dispatch(error="boom"))

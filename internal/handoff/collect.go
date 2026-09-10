@@ -210,9 +210,11 @@ func CollectSessionDocs(coordStatePath, agentID string) string {
 // buffer's agent lines belong to another generation (predecessor leftovers
 // after succession, or a live sibling during a recovery misclassification).
 // In that case return nil — the caller falls back to the checkpoint value,
-// which loadCheckpointIfFresher already generation-guards. An empty stamp
-// (tick-only buffer, no CLI write yet) or empty agentID passes: that is the
-// pre-existing tick-producer exposure, unchanged.
+// which loadCheckpointIfFresher already generation-guards. Writers with a
+// coord id (CLI and tick) also CLAIM the buffer — a stamp change drops the
+// previous generation's lines — so once this coord has written anything the
+// buffer holds only its own lines. An empty stamp (legacy tick-only buffer,
+// never claimed) or empty agentID passes.
 //
 // Never errors: missing / malformed coord-state.json, an empty
 // coordStatePath, or an absent/empty recent_decisions key returns nil so the

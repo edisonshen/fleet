@@ -29,7 +29,7 @@ Set by `fleet dispatch` and inherited via `tmux new-session -e`:
 
 - `FLEET_AGENT_ID` — the 8-hex-char ID. Without it, the skill exits silently (the agent is not under Fleet supervision).
 - `FLEET_HOME` — defaults to `~/.fleet/`. Override for sandboxed tests and CI.
-- `FLEET_ROLE` — `coord` or `worker`, stamped by `fleet dispatch`. Enables the PreToolUse delegation guard and the coord role reminder on `SessionStart`. Falls back to the agent record's `is_coord` when unset.
+- `FLEET_ROLE` — `coord` or `worker`, stamped by `fleet dispatch`. Enables the PreToolUse delegation guard and the coord role reminder on `SessionStart`. Falls back to the agent record's `is_coord` when unset (delegation guard only — the Stop-hook decision capture requires the explicit `coord` stamp).
 - `FLEET_COORD_GUARD=off` — escape hatch: log coord violations to `~/.fleet/coord-violations/<id>.jsonl` but do not deny.
 
 ## Required tools
@@ -54,7 +54,7 @@ The skill emits at most two concatenated injections per fire, joined by a blank 
 1. Operator inbox message — `[OPERATOR] <body>` (if `~/.fleet/inbox/<id>.md` is present).
 2. `HANDOFF REQUESTED` — Yellow-threshold prompt directing the agent to wrap with `MILESTONE` on its own line so the next turn can write a clean handoff doc.
 
-On COORD sessions (`FLEET_ROLE=coord`) the Stop hook also captures the conversation into Key Decisions (`decisions.py`): it walks the transcript for the LAST operator turn (a human `user` entry or an `[OPERATOR]` inbox delivery — never tool results, `isMeta` entries, or the hook's own `HANDOFF REQUESTED` / `[FLEET]` injections) and pairs it with the coord's final assistant text after it, then shells `fleet checkpoint decision "operator: <prompt> → coord: <reply>"` (each half flattened and truncated to 240 chars). A cursor at `~/.fleet/coord-decisions/<id>.cursor` holds the recorded turn's uuid so a blocked-and-continued turn records once; a failed CLI write leaves the cursor alone and retries on the next Stop. This runs BEFORE the handoff trigger so a doc written on the same fire already carries the exchange.
+On COORD sessions (explicit `FLEET_ROLE=coord`; the agent-record fallback is not honoured here) the Stop hook also captures the conversation into Key Decisions (`decisions.py`): it walks the transcript for the LAST operator turn (a human `user` entry or an `[OPERATOR]` inbox delivery — never tool results, `isMeta` entries, or the hook's own `HANDOFF REQUESTED` / `[FLEET]` injections) and pairs it with the coord's final assistant text after it, then shells `fleet checkpoint decision "operator: <prompt> → coord: <reply>"` (each half flattened and truncated to 240 chars). A cursor at `~/.fleet/coord-decisions/<id>.cursor` holds the recorded turn's uuid so a blocked-and-continued turn records once; a failed CLI write leaves the cursor alone and retries on the next Stop. This runs BEFORE the handoff trigger so a doc written on the same fire already carries the exchange.
 
 ### `PreCompact`
 

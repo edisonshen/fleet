@@ -768,7 +768,7 @@ def _record_decision(state: dict, action, coord_id: str = "") -> None:
     try:
         line = _decision_line(action)
         if line:
-            dispatch_mod.record_checkpoint_decision(state, line)
+            dispatch_mod.record_checkpoint_decision(state, line, coord_id)
             if not isinstance(action, _DispatchAction):
                 dispatch_mod.record_session_decision(state, line, coord_id)
     except Exception:  # noqa: BLE001 — a decision-log fault must not wedge a tick

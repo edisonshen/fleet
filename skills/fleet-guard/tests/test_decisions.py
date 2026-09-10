@@ -149,10 +149,15 @@ def test_capture_records_once_per_operator_turn(tmp_path, recorded):
 
 
 def test_capture_skips_non_coord_sessions(tmp_path, recorded, monkeypatch):
-    monkeypatch.setenv("FLEET_ROLE", "worker")
     tp = write_transcript(tmp_path, _user("hi"), _assistant({"type": "text", "text": "yo"}))
+    monkeypatch.setenv("FLEET_ROLE", "worker")
+    assert decisions.capture({"transcript_path": tp}, AGENT) is None
+    # Role unset: the agent record says is_coord=true (see `home` fixture),
+    # but capture requires the explicit spawn stamp — no record fallback.
+    monkeypatch.delenv("FLEET_ROLE")
     assert decisions.capture({"transcript_path": tp}, AGENT) is None
     assert recorded == []
+    assert not decisions.cursor_path(AGENT).exists()
 
 
 def test_capture_keeps_cursor_when_record_fails(tmp_path, monkeypatch):

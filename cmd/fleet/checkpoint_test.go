@@ -245,6 +245,47 @@ func TestCheckpoint_StampsCoordGeneration(t *testing.T) {
 	}
 }
 
+// Succession: a different coord's first write claims recent_decisions —
+// the predecessor's rolling lines are dropped, the stamp flips. Same-coord
+// writes and operator-shell writes append without touching the buffer.
+func TestCheckpointDecision_SuccessorClaimsRollingBuffer(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("FLEET_HOME", home)
+	if _, err := state.Bootstrap(); err != nil {
+		t.Fatalf("Bootstrap: %v", err)
+	}
+	t.Setenv("FLEET_AGENT_ID", "aaaa1111")
+	for _, l := range []string{"pred one", "pred two"} {
+		if err := runCheckpoint(t, "decision", "--project", "myproj", l); err != nil {
+			t.Fatalf("pred decision: %v", err)
+		}
+	}
+	t.Setenv("FLEET_AGENT_ID", "")
+	if err := runCheckpoint(t, "decision", "--project", "myproj", "operator line"); err != nil {
+		t.Fatalf("operator decision: %v", err)
+	}
+	m := readCoordState(t, home, "myproj")
+	if got := toStringSlice(m["recent_decisions"]); len(got) != 3 {
+		t.Fatalf("operator-shell write must append, not reset: %#v", got)
+	}
+
+	t.Setenv("FLEET_AGENT_ID", "bbbb2222")
+	if err := runCheckpoint(t, "decision", "--project", "myproj", "succ one"); err != nil {
+		t.Fatalf("succ decision: %v", err)
+	}
+	m = readCoordState(t, home, "myproj")
+	if got := toStringSlice(m["recent_decisions"]); len(got) != 1 || got[0] != "succ one" {
+		t.Errorf("successor's first write must drop predecessor lines: %#v", got)
+	}
+	if m["recent_decisions_owner"] != "bbbb2222" {
+		t.Errorf("owner not flipped: %#v", m["recent_decisions_owner"])
+	}
+	// Durable buffer is per-entry stamped and untouched by the claim.
+	if got := sessionDecisionTexts(t, home, "myproj"); len(got) != 4 {
+		t.Errorf("session_decisions must be untouched by the claim: %#v", got)
+	}
+}
+
 // Test 7 — `fleet checkpoint decision` appends to recent_decisions.
 func TestCheckpointDecision_AppendsBuffer(t *testing.T) {
 	home := t.TempDir()

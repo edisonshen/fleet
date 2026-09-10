@@ -416,6 +416,10 @@ func TestTasksPromote_TodoToReady(t *testing.T) {
 	if !strings.Contains(out.String(), "todo → ready") {
 		t.Errorf("promote output missing transition: %s", out.String())
 	}
+	// Already ready: refuse (non-zero), not a silent no-op.
+	if err := runTasksPromote(&tasksPromoteOpts{project: project}, slug, &bytes.Buffer{}); err == nil || !strings.Contains(err.Error(), "already ready") {
+		t.Errorf("expected repeat promote to refuse, got %v", err)
+	}
 
 	// Now status=in-progress; promote should refuse.
 	if err := runTasksSet(&tasksSetOpts{project: project}, slug, "status=in-progress", &bytes.Buffer{}); err != nil {

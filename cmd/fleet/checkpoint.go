@@ -379,6 +379,7 @@ func recordDecision(project, flat string) error {
 		// Rolling copy too: recent_decisions is what the tick round-trips
 		// into coord-checkpoint.md, so the rationale also shows up in the
 		// operator-visible checkpoint until the cap evicts it.
+		claimRecentDecisions(cs, os.Getenv("FLEET_AGENT_ID"))
 		raw := toStringSlice(cs["recent_decisions"])
 		raw = append(raw, flat)
 		if capN > 0 && len(raw) > capN {
@@ -390,21 +391,29 @@ func recordDecision(project, flat string) error {
 			out[i] = s
 		}
 		cs["recent_decisions"] = out
-		// Generation stamp for the LIVE read. recent_decisions is a plain-
-		// strings buffer shared with the Python tick producer (per-entry
-		// stamping would break the coord-checkpoint.md round-trip), so the
-		// stamp is a top-level sibling key: the last CLI writer's coord
-		// generation. CollectRecentDecisionsLive suppresses the live
-		// override when this stamp belongs to a different coord — the
-		// checkpoint fallback then applies its own coord_id guard. The tick
-		// preserves unknown keys through load-mutate-save, so the stamp
-		// rides through heartbeats untouched. Empty FLEET_AGENT_ID
-		// (operator shell) leaves any prior stamp in place rather than
-		// erasing attribution.
-		if id := os.Getenv("FLEET_AGENT_ID"); id != "" {
-			cs["recent_decisions_owner"] = id
-		}
 	})
+}
+
+// claimRecentDecisions stamps recent_decisions_owner with the writing coord.
+// recent_decisions is a plain-strings buffer shared with the Python tick
+// producer (per-entry stamping would break the coord-checkpoint.md
+// round-trip), so ownership is a top-level sibling key. A stamp from a
+// DIFFERENT coord means the buffer's lines are that generation's: they are
+// dropped before this coord's first write, so a successor's Key Decisions
+// never surfaces a predecessor's rolling tail once the successor starts
+// writing (CollectRecentDecisionsLive already hides the buffer while the
+// foreign stamp is still in place). The tick preserves unknown keys through
+// load-mutate-save and applies the same rule from its own seam
+// (dispatch.py claim_recent_decisions). Empty id (operator shell) leaves
+// buffer and stamp untouched rather than erasing attribution.
+func claimRecentDecisions(cs map[string]any, id string) {
+	if id == "" {
+		return
+	}
+	if prev, _ := cs["recent_decisions_owner"].(string); prev != "" && prev != id {
+		cs["recent_decisions"] = []any{}
+	}
+	cs["recent_decisions_owner"] = id
 }
 
 // withCoordState resolves the project, takes coordinator.lock (bounded by
