@@ -919,7 +919,11 @@ func runTasksSet(opts *tasksSetOpts, slug, kv string, stdout io.Writer) error {
 	// status. (Adjusts the mechanism of design D2 — session_tasks captured by
 	// the tick, not the CLI — to eliminate the verified heartbeat-spoof; the
 	// feature intent is preserved.)
-	return withTasksLock(project, func() error {
+	// Decision text is composed under the lock (needs the pre-mutation
+	// value) but written AFTER it is released: recordAutoDecision takes
+	// coordinator.lock, and the two locks must never nest.
+	var decision string
+	err = withTasksLock(project, func() error {
 		f, path, err := readTasks(project)
 		if err != nil {
 			return err
@@ -932,8 +936,12 @@ func runTasksSet(opts *tasksSetOpts, slug, kv string, stdout io.Writer) error {
 		// the lifecycle stamping rules below. Other key= mutations leave
 		// status unchanged and skip the stamping path.
 		oldStatus := t.Status
+		before := decisionFieldValue(t, key)
 		if err := setTaskField(t, key, value); err != nil {
 			return err
+		}
+		if after := decisionFieldValue(t, key); before != after {
+			decision = fmt.Sprintf("set %s %s %s → %s", slug, key, before, after)
 		}
 		now := time.Now().UTC()
 		// Lifecycle transitions stamp started_at / finished_at in the
@@ -959,6 +967,29 @@ func runTasksSet(opts *tasksSetOpts, slug, kv string, stdout io.Writer) error {
 		_, _ = fmt.Fprintf(stdout, "set %s.%s = %s\n", slug, key, value)
 		return nil
 	})
+	if err != nil {
+		return err
+	}
+	if decision != "" {
+		recordAutoDecision(project, decision, os.Stderr)
+	}
+	return nil
+}
+
+// decisionFieldValue renders the task fields whose CLI mutation counts as a
+// coord decision (a lifecycle, priority, or park flip). Other keys
+// (pr_url, worker_pid, worktree, …) are bookkeeping the tick or worker
+// already narrates, so they render "" and never produce a decision.
+func decisionFieldValue(t *tasks.Task, key string) string {
+	switch key {
+	case "status":
+		return string(t.Status)
+	case "priority":
+		return string(t.Priority)
+	case "parked":
+		return t.Parked
+	}
+	return ""
 }
 
 // stampLifecycleTransition applies the lifecycle stamping rules in one
@@ -1341,7 +1372,8 @@ func runTasksPromote(opts *tasksPromoteOpts, slug string, stdout io.Writer) erro
 	// legitimately owns the heartbeat write — so a coord-driven promote is
 	// captured there. (Adjusts design D2's mechanism to remove the verified
 	// heartbeat-spoof while preserving the session-scoped Next Steps intent.)
-	return withTasksLock(project, func() error {
+	promoted := false
+	err = withTasksLock(project, func() error {
 		f, path, err := readTasks(project)
 		if err != nil {
 			return err
@@ -1358,6 +1390,7 @@ func runTasksPromote(opts *tasksPromoteOpts, slug string, stdout io.Writer) erro
 				return fmt.Errorf("write: %w", err)
 			}
 			_, _ = fmt.Fprintf(stdout, "promoted %s: todo → ready\n", slug)
+			promoted = true
 			return nil
 		case tasks.StatusReady:
 			_, _ = fmt.Fprintf(stdout, "%s already ready (no-op)\n", slug)
@@ -1366,4 +1399,11 @@ func runTasksPromote(opts *tasksPromoteOpts, slug string, stdout io.Writer) erro
 			return fmt.Errorf("tasks promote: %s has status=%s — only todo→ready is allowed (use `fleet tasks set` for other transitions)", slug, t.Status)
 		}
 	})
+	if err != nil {
+		return err
+	}
+	if promoted {
+		recordAutoDecision(project, fmt.Sprintf("promoted %s todo → ready", slug), os.Stderr)
+	}
+	return nil
 }

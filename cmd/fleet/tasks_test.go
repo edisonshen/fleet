@@ -1300,3 +1300,86 @@ func TestTasksList_CollisionPrefersLive(t *testing.T) {
 		t.Errorf("dedup picked archive (status=done); expected live (status=in-progress): %s", out.String())
 	}
 }
+
+// sessionDecisionTexts reads coord-state.json for project and returns the
+// session_decisions texts in order ("" slice when the file is absent).
+func sessionDecisionTexts(t *testing.T, home, project string) []string {
+	t.Helper()
+	path := filepath.Join(home, "projects", project, "coord-state.json")
+	if _, err := os.Stat(path); err != nil {
+		return nil
+	}
+	m := readCoordState(t, home, project)
+	raw, _ := m["session_decisions"].([]any)
+	out := make([]string, 0, len(raw))
+	for _, e := range raw {
+		if em, ok := e.(map[string]any); ok {
+			out = append(out, fmt.Sprint(em["text"]))
+		}
+	}
+	return out
+}
+
+// TestTasksSet_AutoRecordsDecision_CoordShellOnly — a coord agent's own
+// `fleet tasks set status=…` / `promote` lands in session_decisions without a
+// separate `fleet checkpoint decision`; bookkeeping fields, no-op sets, and
+// operator/worker/tick shells do not.
+func TestTasksSet_AutoRecordsDecision_CoordShellOnly(t *testing.T) {
+	home, project := setupTasksHome(t)
+	t.Setenv("FLEET_ROLE", "coord")
+	t.Setenv("FLEET_AGENT_ID", "cafe0123")
+	t.Setenv("FLEET_TICK", "")
+	addOut := &bytes.Buffer{}
+	if err := runTasksAdd(&tasksAddOpts{
+		project: project, slug: "auto-dec", priority: "P2",
+		spec: "p", spawnedBy: "user", status: "todo",
+	}, "", addOut); err != nil {
+		t.Fatalf("add: %v", err)
+	}
+	slug := strings.Fields(addOut.String())[1]
+	set := func(kv string) {
+		t.Helper()
+		if err := runTasksSet(&tasksSetOpts{project: project}, slug, kv, &bytes.Buffer{}); err != nil {
+			t.Fatalf("set %s: %v", kv, err)
+		}
+	}
+
+	if err := runTasksPromote(&tasksPromoteOpts{project: project}, slug, &bytes.Buffer{}); err != nil {
+		t.Fatalf("promote: %v", err)
+	}
+	set("priority=P1")
+	set("priority=P1")                          // no-op: value unchanged
+	set("pr_url=https://github.com/o/r/pull/7") // bookkeeping, not a decision
+	set("parked=operator")
+	set("status=in-progress")
+
+	want := []string{
+		"promoted " + slug + " todo → ready",
+		"set " + slug + " priority P2 → P1",
+		"set " + slug + " parked  → operator",
+		"set " + slug + " status ready → in-progress",
+	}
+	got := sessionDecisionTexts(t, home, project)
+	if strings.Join(got, "\n") != strings.Join(want, "\n") {
+		t.Fatalf("session_decisions:\n got %q\nwant %q", got, want)
+	}
+	m := readCoordState(t, home, project)
+	if first, _ := m["session_decisions"].([]any)[0].(map[string]any); first["coord_id"] != "cafe0123" {
+		t.Errorf("coord_id stamp missing: %#v", first)
+	}
+	if rolling := toStringSlice(m["recent_decisions"]); len(rolling) != len(want) {
+		t.Errorf("recent_decisions mirror: got %q", rolling)
+	}
+
+	// Tick-driven shell-outs and non-coord shells never self-record.
+	t.Setenv("FLEET_TICK", "1")
+	set("status=in-review")
+	t.Setenv("FLEET_TICK", "")
+	t.Setenv("FLEET_ROLE", "worker")
+	set("status=done")
+	t.Setenv("FLEET_ROLE", "")
+	set("status=ready")
+	if got := sessionDecisionTexts(t, home, project); len(got) != len(want) {
+		t.Fatalf("non-coord shells recorded decisions: %q", got)
+	}
+}

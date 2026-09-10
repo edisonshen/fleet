@@ -54,6 +54,8 @@ The skill emits at most two concatenated injections per fire, joined by a blank 
 1. Operator inbox message — `[OPERATOR] <body>` (if `~/.fleet/inbox/<id>.md` is present).
 2. `HANDOFF REQUESTED` — Yellow-threshold prompt directing the agent to wrap with `MILESTONE` on its own line so the next turn can write a clean handoff doc.
 
+On COORD sessions (`FLEET_ROLE=coord`) the Stop hook also captures the conversation into Key Decisions (`decisions.py`): it walks the transcript for the LAST operator turn (a human `user` entry or an `[OPERATOR]` inbox delivery — never tool results, `isMeta` entries, or the hook's own `HANDOFF REQUESTED` / `[FLEET]` injections) and pairs it with the coord's final assistant text after it, then shells `fleet checkpoint decision "operator: <prompt> → coord: <reply>"` (each half flattened and truncated to 240 chars). A cursor at `~/.fleet/coord-decisions/<id>.cursor` holds the recorded turn's uuid so a blocked-and-continued turn records once; a failed CLI write leaves the cursor alone and retries on the next Stop. This runs BEFORE the handoff trigger so a doc written on the same fire already carries the exchange.
+
 ### `PreCompact`
 
 Stdin is the same JSON shape minus token deltas. Stdout is ignored (the compaction is already in motion). The skill writes a handoff doc + queue file unconditionally — better an emergency handoff than a lossy compaction.
@@ -176,7 +178,8 @@ Both `new_agent_id` AND `new_session` MUST be pre-allocated by the skill before 
 
 - `~/.fleet/agents/<id>.json` — to preserve fields the skill doesn't own (e.g., spawn metadata).
 - `~/.fleet/inbox/<id>.md` — operator messages (one-shot; archived after delivery).
-- Transcript JSONL at `payload.transcript_path` — token usage source.
+- Transcript JSONL at `payload.transcript_path` — token usage source; on coord sessions also the operator↔coord exchange for Key Decisions.
+- `~/.fleet/coord-decisions/<id>.cursor` — last operator turn already recorded (written atomically).
 - Tmux pane via `tmux capture-pane -t <session> -p` — recent activity + MILESTONE detection.
 
 ## Failure mode

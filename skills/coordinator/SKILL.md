@@ -225,22 +225,28 @@ Rules:
 
 ### Decision log
 
-On every **material** call, log one rationale line — always with the *why*:
+Key Decisions in the handoff is fed **automatically** — you do not have to
+remember a logging step. Three producers write the durable per-coord
+`session_decisions` buffer in `coord-state.json` (cap 50, stamped with your
+agent id, deduped by text; tick noise never evicts it):
 
-```bash
-fleet checkpoint decision "<what> — <why>"
-# e.g. fleet checkpoint decision "Stopped rebase of PR #224 — superseded PR for an operator-paused task"
-```
+1. **Your own state changes.** `fleet tasks set <slug> status=… / priority=… /
+   parked=…` and `fleet tasks promote` from your shell self-record one line
+   (`set foo status ready → in-progress`, `promoted foo todo → ready`). No-op
+   sets and bookkeeping fields (`pr_url`, `worker_pid`, …) are skipped.
+2. **The tick's material transitions.** Reconciled → in-review, worker
+   finished, requeued worker-failed, parked blocked-question, raised hand.
+   Dispatches stay in the rolling `recent_decisions` only — Active Subagents /
+   Status already narrate them.
+3. **Operator conversation.** fleet-guard's Stop hook records the last
+   operator prompt and your final reply as one line
+   (`operator: defer cache, do auth first → coord: parked cache-1234, …`) —
+   once per operator turn. A decision that lives only in chat still reaches
+   the successor.
 
-Material = a fix/defer choice, a design fork resolved, a re-prioritisation, a
-PR-shepherding action. It appends to the same capped
-coord-state.json:recent_decisions buffer the tick auto-producer feeds, AND to
-the durable per-coord `session_decisions` buffer (cap 50, stamped with your
-agent id, deduped by text) that tick lines can never evict — so the handoff's
-"Key Decisions" carries every rationale you logged this generation alongside
-the mechanical events, even on a manual handoff before the next tick (the
-handoff reads both buffers live). Routine mechanical steps (a dispatch, a
-poll) are NOT material; the auto-producer already records those.
+`fleet checkpoint decision "<what> — <why>"` remains for a rationale none of
+the above can infer (e.g. `"Stopped rebase of PR #224 — superseded PR for an
+operator-paused task"`); it writes the same buffer plus the rolling one.
 
 The handoff doc's `## Status` block (task → status, PR state from
 `pr-watches.json`, next job; then one `Next job:` line) is derived from

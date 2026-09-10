@@ -24,6 +24,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -312,6 +313,41 @@ func runCheckpointDecision(project, text string) error {
 	if flat == "" {
 		return errors.New("decision text must be non-empty")
 	}
+	return recordDecision(project, flat)
+}
+
+// autoDecisionEnabled reports whether a task-mutating CLI call should
+// self-record into session_decisions. Only a coordinator's own shell
+// qualifies (FLEET_ROLE=coord, stamped by spawn): an operator shell has no
+// live coord whose heartbeat the coord-state.json write would spoof, a
+// worker's status flips are the coord's to record, and the coord TICK
+// (FLEET_TICK=1 on its `fleet` shell-outs) already records its own
+// transitions in-memory — a CLI write mid-tick would also be clobbered by
+// the tick's load-mutate-save.
+func autoDecisionEnabled() bool {
+	if os.Getenv("FLEET_TICK") != "" {
+		return false
+	}
+	return strings.EqualFold(strings.TrimSpace(os.Getenv("FLEET_ROLE")), "coord")
+}
+
+// recordAutoDecision is the best-effort seam for CLI-driven task mutations
+// (`fleet tasks set status=…`, `fleet tasks promote`): the coord agent's own
+// state changes ARE its decisions, so they land in Key Decisions without a
+// separate `fleet checkpoint decision` call. Never fails the caller.
+func recordAutoDecision(project, text string, stderr io.Writer) {
+	if !autoDecisionEnabled() {
+		return
+	}
+	if err := recordDecision(project, text); err != nil {
+		_, _ = fmt.Fprintf(stderr, "warning: decision not recorded: %v\n", err)
+	}
+}
+
+// recordDecision is the shared writer behind `fleet checkpoint decision` and
+// the auto-recording task mutations. flat must already be newline-free and
+// non-empty.
+func recordDecision(project, flat string) error {
 	capN := resolveCheckpointDecisions()
 	return withCoordState(project, func(cs map[string]any) {
 		// Durable copy FIRST: session_decisions is the agent's own buffer

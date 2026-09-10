@@ -1653,6 +1653,47 @@ def record_checkpoint_decision(state: dict, line: str) -> None:
     state["recent_decisions"] = raw
 
 
+# _SESSION_DECISIONS_MAX caps coord-state.json:session_decisions — the
+# durable per-coord Key Decisions buffer. Mirrors the Go writer's cap
+# (cmd/fleet/checkpoint.go checkpointSessionDecisionsMax); both sides
+# write the same {text, coord_id, ts} entry shape the Go READER
+# (internal/handoff collect.go sessionDecision) round-trips.
+_SESSION_DECISIONS_MAX = 50
+
+
+def record_session_decision(state: dict, line: str, coord_id: str) -> None:
+    """Append {text, coord_id, ts} to state["session_decisions"] — the
+    durable buffer the tick's mechanical recent_decisions churn never
+    evicts. Mutates `state` in place.
+
+    Dedupe by text: a re-recorded line moves to the tail with a fresh ts.
+    Capped to _SESSION_DECISIONS_MAX (newest kept). Blank lines are
+    dropped; embedded newlines flatten to spaces. coord_id is omitted when
+    empty so the entry stays unstamped (= visible to any successor),
+    matching the Go writer's empty-FLEET_AGENT_ID handling.
+    """
+    if line is None:
+        return
+    flat = str(line).replace("\r", "\n").replace("\n", " ").strip()
+    if not flat:
+        return
+    raw = state.get("session_decisions")
+    if not isinstance(raw, list):
+        raw = []
+    kept = [
+        e for e in raw
+        if not (isinstance(e, dict) and e.get("text") == flat)
+    ]
+    entry: dict = {"text": flat}
+    if coord_id:
+        entry["coord_id"] = coord_id
+    entry["ts"] = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    kept.append(entry)
+    if len(kept) > _SESSION_DECISIONS_MAX:
+        kept = kept[-_SESSION_DECISIONS_MAX:]
+    state["session_decisions"] = kept
+
+
 # _SESSION_TASKS_MAX caps coord-state.json:session_tasks — the auto Next
 # Steps buffer (promoted/dispatched slugs). The coord TICK is the SOLE
 # writer of session_tasks (codex iter-11 [P1]: a Go CLI write would spoof
