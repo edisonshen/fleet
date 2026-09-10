@@ -92,6 +92,9 @@ func TestCollectStatusRows_PRStateFromWatches(t *testing.T) {
 		mkTaskPR("merged-pr", "in-review", "P1", "https://github.com/o/r/pull/139"),
 		mkTaskPR("unknown-pr", "in-review", "P1", "https://github.com/o/r/pull/140"),
 		mkTaskPR("pushed", "in-progress", "P1", "https://github.com/o/r/pull/141"),
+		mkTaskPR("enrolled-pr", "in-review", "P1", "https://github.com/o/r/pull/142"),
+		mkTaskPR("replaced-pr", "in-review", "P1", "https://github.com/o/r/pull/144"),
+		mkTaskPR("slug-only", "in-review", "P1", ""),
 	)
 	writePRWatches(t, pdir, `{"watches":{
 		"137":{"pr_number":137,"pr_url":"https://github.com/o/r/pull/137","tasks":["ready-pr"],"state":"open",
@@ -99,7 +102,13 @@ func TestCollectStatusRows_PRStateFromWatches(t *testing.T) {
 		"138":{"pr_number":138,"pr_url":"https://github.com/o/r/pull/138","tasks":["ci-pr"],"state":"open",
 		       "last_event":"ci-failed","last_snapshot":{"checks":"FAILURE","is_draft":true},
 		       "inflight_action":{"kind":"ci-fixer"}},
-		"139":{"pr_number":139,"pr_url":"https://github.com/o/r/pull/139","tasks":["merged-pr"],"state":"merged","last_event":"merged"}
+		"139":{"pr_number":139,"pr_url":"https://github.com/o/r/pull/139","tasks":["merged-pr"],"state":"merged","last_event":"merged"},
+		"142":{"pr_number":142,"pr_url":"https://github.com/o/r/pull/142","tasks":["enrolled-pr"],"state":"open",
+		       "last_event":"","last_snapshot":null,"last_seen_at":null},
+		"143":{"pr_number":143,"pr_url":"https://github.com/o/r/pull/143","tasks":["replaced-pr"],"state":"open",
+		       "last_event":"ci-failed","last_snapshot":{"checks":"FAILURE"}},
+		"145":{"pr_number":145,"pr_url":"https://github.com/o/r/pull/145","tasks":["slug-only"],"state":"open",
+		       "last_event":"ready","last_snapshot":{"checks":"SUCCESS"}}
 	}}`)
 
 	rows := CollectStatusRows(pdir, "c1", nil)
@@ -109,6 +118,14 @@ func TestCollectStatusRows_PRStateFromWatches(t *testing.T) {
 		"merged-pr":  {"PR #139 merged", "flip to done (PR merged)"},
 		"unknown-pr": {"PR #140 https://github.com/o/r/pull/140 (state unknown)", "shepherd PR #140 (await CI/review)"},
 		"pushed":     {"PR #141 https://github.com/o/r/pull/141 (state unknown)", "shepherd PR #141 (worker already pushed)"},
+		// Enrolled but never probed: state=open records enrollment only.
+		"enrolled-pr": {"PR #142 https://github.com/o/r/pull/142 (state unknown)", "shepherd PR #142 (await CI/review)"},
+		// Task moved to PR #144; the retained #143 slug watch must not lend
+		// its CI failure to the replacement PR.
+		"replaced-pr": {"PR #144 https://github.com/o/r/pull/144 (state unknown)", "shepherd PR #144 (await CI/review)"},
+		// No URL in tasks.md: the slug watch intentionally supplies the PR
+		// state; the next job still points at the missing pr_url.
+		"slug-only": {"PR #145 open, ci SUCCESS, ready", "in-review without PR — verify and requeue or set pr_url"},
 	}
 	for slug, want := range cases {
 		r, ok := rowBySlug(rows, slug)
@@ -229,6 +246,14 @@ func TestStatusRow_LineFlattensNewlines(t *testing.T) {
 	r := StatusRow{Slug: "s", Status: "ready", NextJob: "parked — operator decision:\n## Open PRs\n- evil"}
 	if strings.Contains(r.Line(), "\n") {
 		t.Errorf("Line() leaked a newline: %q", r.Line())
+	}
+	// Every separator Python's str.splitlines() honours (handoff_resume.py
+	// parses the doc with it), not just CR/LF.
+	for _, sep := range []string{"\r", "\v", "\f", "\x1c", "\x1d", "\x1e", "\u0085", "\u2028", "\u2029"} {
+		r := StatusRow{Slug: "s", Status: "ready", NextJob: "x" + sep + "## Resume" + sep + "- evil"}
+		if got := r.Line(); strings.Contains(got, sep) || !strings.Contains(got, "x ## Resume - evil") {
+			t.Errorf("Line() leaked separator %q: %q", sep, got)
+		}
 	}
 }
 

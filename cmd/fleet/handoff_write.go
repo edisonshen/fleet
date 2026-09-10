@@ -58,10 +58,10 @@ var autoHandoffTypes = map[string]bool{
 // project-wide state. Enrichment is best-effort and never fails the
 // handoff — the worst case is a section left at its placeholder.
 func writeHandoffDoc(rec *agent.Record, typ string, contextPct *float64, recent, repoDir string,
-	now time.Time, stderr io.Writer) (string, error) {
+	now time.Time, stderr io.Writer) (string, *handoff.Doc, error) {
 	docPath, err := state.HandoffPath(rec.ID, now)
 	if err != nil {
-		return "", err
+		return "", nil, err
 	}
 	doc := handoff.NewStub(typ, rec.ID, rec.TaskID, rec.Project,
 		rec.HandoffNumber, rec.LastHandoffPath, contextPct, now)
@@ -72,19 +72,25 @@ func writeHandoffDoc(rec *agent.Record, typ string, contextPct *float64, recent,
 	}
 	handoff.AppendRecentActivity(doc, recent)
 	if err := handoff.Write(doc, docPath); err != nil {
-		return "", fmt.Errorf("write handoff doc: %w", err)
+		return "", nil, fmt.Errorf("write handoff doc: %w", err)
 	}
-	if isCoord {
-		recordHandoffTracking(doc, rec.Project, stderr)
+	if !isCoord {
+		doc = nil
 	}
-	return docPath, nil
+	return docPath, doc, nil
 }
 
 // recordHandoffTracking mirrors the doc's Status rows into tasks.md Notes
-// (handoff.RecordTaskTracking). Runs AFTER the doc is on disk and never
-// fails the handoff — a lock timeout or parse error is logged and the
-// successor still gets the doc.
+// (handoff.RecordTaskTracking). Each producer calls it at its PUBLISH
+// point — after the doc is on disk AND referenced (queue file written /
+// replacement journaled) — so a doc the producer fence or enqueue rejects
+// leaves no false "Handoff …" line in task history. Never fails the
+// handoff: a lock timeout or parse error is logged and the successor still
+// gets the doc. nil doc (worker handoff) is a no-op.
 func recordHandoffTracking(doc *handoff.Doc, project string, stderr io.Writer) {
+	if doc == nil {
+		return
+	}
 	n, err := handoff.RecordTaskTracking(project, doc.AgentID, doc.Number, doc.Timestamp, doc.StatusRows)
 	if err != nil {
 		_, _ = fmt.Fprintf(stderr, "handoff: task tracking not recorded in tasks.md: %v\n", err)
@@ -176,7 +182,7 @@ func runHandoffWrite(opts *handoffWriteOpts, stdin io.Reader, stdout, stderr io.
 	}
 
 	now := time.Now().UTC()
-	docPath, err := writeHandoffDoc(rec, opts.typ, contextPct, string(recentRaw), repoDir, now, stderr)
+	docPath, doc, err := writeHandoffDoc(rec, opts.typ, contextPct, string(recentRaw), repoDir, now, stderr)
 	if err != nil {
 		return fmt.Errorf("handoff-write: %w", err)
 	}
@@ -208,6 +214,7 @@ func runHandoffWrite(opts *handoffWriteOpts, stdin io.Reader, stdout, stderr io.
 		// fresh pair. Leave it for forensics rather than racing a delete.
 		return fmt.Errorf("handoff-write: enqueue spawn-fresh: %w", err)
 	}
+	recordHandoffTracking(doc, rec.Project, stderr)
 
 	out, err := json.Marshal(handoffWriteResult{DocPath: docPath, QueuePath: queuePath, NewAgentID: newID})
 	if err != nil {

@@ -381,11 +381,11 @@ func TestHandoffWrite_ManualAndAutoShareRenderer(t *testing.T) {
 
 	now := time.Date(2026, 9, 5, 1, 2, 3, 0, time.UTC)
 	stderr := &bytes.Buffer{}
-	manualPath, err := writeHandoffDoc(rec, handoff.TypeManual, nil, "", rec.Cwd, now, stderr)
+	manualPath, _, err := writeHandoffDoc(rec, handoff.TypeManual, nil, "", rec.Cwd, now, stderr)
 	if err != nil {
 		t.Fatalf("manual: %v", err)
 	}
-	autoPath, err := writeHandoffDoc(rec, handoff.TypeAutoYellow, nil, "", rec.Cwd, now, stderr)
+	autoPath, _, err := writeHandoffDoc(rec, handoff.TypeAutoYellow, nil, "", rec.Cwd, now, stderr)
 	if err != nil {
 		t.Fatalf("auto: %v", err)
 	}

@@ -767,10 +767,25 @@ def _record_decision(state: dict, action, coord_id: str = "") -> None:
     Best-effort — never raises."""
     try:
         line = _decision_line(action)
-        if line:
+        if not line:
+            return
+        if isinstance(action, _DispatchAction):
             dispatch_mod.record_checkpoint_decision(state, line, coord_id)
-            if not isinstance(action, _DispatchAction):
-                dispatch_mod.record_session_decision(state, line, coord_id)
+        else:
+            _record_material_decision(state, line, coord_id)
+    except Exception:  # noqa: BLE001 — a decision-log fault must not wedge a tick
+        pass
+
+
+def _record_material_decision(state: dict, line: str, coord_id: str = "") -> None:
+    """Record a free-text material decision into BOTH buffers: the rolling
+    recent_decisions (owner-claimed) and the durable, coord-stamped
+    session_decisions. The one seam for tick-side decisions that are not
+    dispatches (reconcile transitions, PR-merged flips, raised hands).
+    Best-effort — never raises."""
+    try:
+        dispatch_mod.record_checkpoint_decision(state, line, coord_id)
+        dispatch_mod.record_session_decision(state, line, coord_id)
     except Exception:  # noqa: BLE001 — a decision-log fault must not wedge a tick
         pass
 
@@ -1490,7 +1505,7 @@ def _tick_locked(
         _reconcile_pr_watches(
             watch_tasks, project=project, project_dir=project_dir,
             cwd=cwd, fleet_bin=fleet_bin, state=state, result=result,
-            home=home,
+            home=home, coord_id=coord_id,
             enroll_tasks=list(pre_reconcile_tasks_by_slug.values()),
         )
     except Exception as exc:  # noqa: BLE001 — watch reconcile must never wedge a tick
@@ -2013,7 +2028,7 @@ def _run_supervisor(
             _reconcile_pr_watches(
                 f_pw.tasks, project=project, project_dir=project_dir,
                 cwd=cwd, fleet_bin=fleet_bin,
-                state=cs_pw, result=result, home=home,
+                state=cs_pw, result=result, home=home, coord_id=coord_id,
                 enroll_tasks=enroll_tasks if enroll_tasks is not None else f_pw.tasks,
             )
             # Slice 2 fix: _reconcile_pr_watches mutates cs_pw["recent_completions"]
@@ -6275,6 +6290,7 @@ def _reconcile_pr_watches(
     result,
     home: Path | None = None,
     enroll_tasks: list[parse.Task] | None = None,
+    coord_id: str = "",
 ) -> None:
     """Drive one PR-watch reconcile pass (DESIGN-coord-pr-watch-durable,
     PR1 tracking + PR2 auto-fix). Hooks the pr_watch module into the tick:
@@ -6354,12 +6370,9 @@ def _reconcile_pr_watches(
             state, f"merged {slug} {pr_url}".rstrip(),
         )
         # Slice 3 (Key Decisions): the same PR-merged flip is also a
-        # decision (→ Key Decisions). Inline (not via _record_decision) —
-        # this closure has slug+pr_url, not an action object. Best-effort.
-        try:
-            dispatch_mod.record_checkpoint_decision(state, f"merged PR → task {slug} done")
-        except Exception:  # noqa: BLE001
-            pass
+        # material decision (→ Key Decisions, rolling + durable). Not via
+        # _record_decision — this closure has slug+pr_url, not an action.
+        _record_material_decision(state, f"merged PR → task {slug} done", coord_id)
 
     # --- PR2 auto-fix seam (DESIGN §5.1c / §6). Three injected callbacks
     # keep pr_watch shell-free: it decides WHAT to dispatch + owns the

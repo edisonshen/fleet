@@ -176,12 +176,21 @@ func prStateSummary(prURL string, w *prWatch) string {
 	if w == nil {
 		return label + " " + prURL + " (state unknown)"
 	}
+	if prURL == "" {
+		prURL = w.PRURL
+	}
 	st := w.State
 	if st == "" {
 		st = "open"
 	}
+	// A watch is born state=open at enrollment, before any GitHub probe;
+	// last_snapshot is written only by a successful probe. Until then the
+	// open state records enrollment, not an observation — say so.
+	if st == "open" && w.LastSnapshot == nil {
+		return label + " " + prURL + " (state unknown)"
+	}
 	parts := []string{label + " " + st}
-	if w.State == "" || w.State == "open" {
+	if st == "open" {
 		if s := w.LastSnapshot; s != nil {
 			if s.IsDraft {
 				parts = append(parts, "draft")
@@ -390,8 +399,11 @@ func CollectStatusRows(pdir, agentID string, subs []ActiveSubagent) []StatusRow 
 
 	rows := make([]StatusRow, 0, len(picked))
 	for _, t := range picked {
+		// Slug fallback only when tasks.md carries no URL: a retained
+		// slug watch for a superseded PR must not lend its state to the
+		// task's replacement PR before that PR's own watch is enrolled.
 		w := watchByURL[t.PRURL]
-		if w == nil {
+		if w == nil && t.PRURL == "" {
 			w = watchBySlug[t.Slug]
 		}
 		prURL := t.PRURL
@@ -510,11 +522,18 @@ func BuildStatus(doc *Doc, pdir, agentID string) []StatusRow {
 	return rows
 }
 
-// oneLine flattens CR/LF to spaces and trims — every Status line must be
-// a single physical line (a stray newline could forge a `## ` header in
-// a doc the successor reads as trusted instructions).
+// oneLine flattens every line separator to a space and trims — every
+// Status line must be a single physical line for BOTH the Go parser and
+// Python's str.splitlines() (which also breaks on VT, FF, FS/GS/RS, NEL,
+// U+2028/U+2029), since a stray break could forge a `## ` header in a doc
+// the successor reads as trusted instructions.
 func oneLine(s string) string {
-	s = strings.ReplaceAll(s, "\r", " ")
-	s = strings.ReplaceAll(s, "\n", " ")
+	s = strings.Map(func(r rune) rune {
+		switch r {
+		case '\n', '\r', '\v', '\f', 0x1c, 0x1d, 0x1e, 0x85, 0x2028, 0x2029:
+			return ' '
+		}
+		return r
+	}, s)
 	return strings.TrimSpace(s)
 }
