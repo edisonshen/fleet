@@ -61,6 +61,14 @@ const checkpointNextStepsMax = 10
 // producer cap the shared buffer identically.
 const checkpointDefaultDecisions = 10
 
+// checkpointSessionDecisionsMax caps coord-state.json:session_decisions —
+// the agent-authored rationale buffer `fleet checkpoint decision` owns.
+// Deliberately much deeper than the 10-deep shared recent_decisions: the
+// tick appends a line per dispatch/promote and would otherwise evict a
+// coord's real decisions within a few ticks, leaving Key Decisions on the
+// successor's handoff full of mechanical noise.
+const checkpointSessionDecisionsMax = 50
+
 // coordLockTimeout bounds the coordinator.lock acquire in `fleet checkpoint`.
 // A coord mid-tick holds the lock for its whole pass; failing fast (with a
 // short bounded retry) keeps the agent's turn responsive and lets it retry,
@@ -295,9 +303,10 @@ func runCheckpointDoc(project, role, path string) error {
 	})
 }
 
-// runCheckpointDecision appends one flattened line to recent_decisions,
-// capped to the FLEET_COORD_CHECKPOINT_DECISIONS limit (shared with the
-// Python tick producer).
+// runCheckpointDecision appends one flattened line to session_decisions
+// (durable, cap checkpointSessionDecisionsMax) AND to recent_decisions
+// (rolling, capped to the FLEET_COORD_CHECKPOINT_DECISIONS limit shared
+// with the Python tick producer).
 func runCheckpointDecision(project, text string) error {
 	flat := strings.TrimSpace(strings.ReplaceAll(strings.ReplaceAll(text, "\r", " "), "\n", " "))
 	if flat == "" {
@@ -305,6 +314,35 @@ func runCheckpointDecision(project, text string) error {
 	}
 	capN := resolveCheckpointDecisions()
 	return withCoordState(project, func(cs map[string]any) {
+		// Durable copy FIRST: session_decisions is the agent's own buffer
+		// (per-entry coord_id stamp, cap checkpointSessionDecisionsMax,
+		// never touched by the tick), so a rationale survives however many
+		// mechanical tick lines land in recent_decisions afterwards.
+		// Dedupe by text so a re-logged rationale refreshes to the tail.
+		decisions, _ := cs["session_decisions"].([]any)
+		kept := make([]any, 0, len(decisions)+1)
+		for _, e := range decisions {
+			if m, ok := e.(map[string]any); ok && m["text"] == flat {
+				continue
+			}
+			kept = append(kept, e)
+		}
+		entry := map[string]any{
+			"text": flat,
+			"ts":   time.Now().UTC().Format(time.RFC3339),
+		}
+		if id := os.Getenv("FLEET_AGENT_ID"); id != "" {
+			entry["coord_id"] = id
+		}
+		kept = append(kept, entry)
+		if len(kept) > checkpointSessionDecisionsMax {
+			kept = kept[len(kept)-checkpointSessionDecisionsMax:]
+		}
+		cs["session_decisions"] = kept
+
+		// Rolling copy too: recent_decisions is what the tick round-trips
+		// into coord-checkpoint.md, so the rationale also shows up in the
+		// operator-visible checkpoint until the cap evicts it.
 		raw := toStringSlice(cs["recent_decisions"])
 		raw = append(raw, flat)
 		if capN > 0 && len(raw) > capN {

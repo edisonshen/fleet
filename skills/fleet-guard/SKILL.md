@@ -121,6 +121,12 @@ timestamp: "<RFC3339 UTC>"
 handoff_type: "auto-yellow" | "auto-red" | "precompact"
 ---
 
+## First Action (auto)
+<body>
+
+## Status
+<body>
+
 ## Completed
 <body>
 
@@ -141,7 +147,9 @@ All string values are double-quoted (Go `%q` form) so YAML metacharacters in ope
 
 Body sections Go cannot populate use the canonical placeholder string from `internal/handoff.go:Placeholder`: `_(operator-triggered handoff — fill in before resuming)_`. Do NOT invent alternate sentinels — 4a's chain reader and any future loader recognize only this exact string. Per plan D3, the tmux-pane capture from `capture-pane -t <session>` is appended to "Completed" (below any checkpoint completions) rather than added as a new section or marked with a custom placeholder.
 
-For COORD handoffs (exact `task_id == "coord-" + project`) Active Subagents, Open PRs, Key Decisions, Docs (this session), Open Questions and Next Steps are filled from `coord-state.json` / `workers/*/state.json` / `tasks.md` / `coord-checkpoint.md` / `gh pr list` by `handoff.EnrichManualDoc` — the collectors `fleet handoff <id>` uses. Worker handoffs are never enriched: a worker must not resume against project-wide coord state. Enrichment is best-effort — missing or malformed state degrades a section to its placeholder, never fails the handoff.
+For COORD handoffs (exact `task_id == "coord-" + project`) Status, Active Subagents, Open PRs, Key Decisions, Docs (this session), Open Questions and Next Steps are filled from `coord-state.json` / `workers/*/state.json` / `tasks.md` / `pr-watches.json` / `coord-checkpoint.md` / `gh pr list` by `handoff.EnrichManualDoc` — the collectors `fleet handoff <id>` uses. Worker handoffs are never enriched: a worker must not resume against project-wide coord state. Enrichment is best-effort — missing or malformed state degrades a section to its placeholder, never fails the handoff.
+
+`## Status` is the compact "where things stand" block the successor reads first: one line per tracked task (every in-flight task plus this coord's session tasks) — `- <slug> — <status> P<n> [phase=<worker phase>] — <PR state> — next: <job>` — followed by a single `Next job:` line (the coord's top explicit `fleet checkpoint next-step`, else the most urgent derived job). PR state comes ONLY from the durable `pr-watches.json` observation (`state`, `last_event`, checks/review/merge snapshot); a task `pr_url` the watcher has not probed renders `(state unknown)` — the doc never guesses open/merged/closed. After the doc is written, the same per-task line is appended to each non-terminal task's `notes` in `tasks.md` (`Handoff <ts> coord <id> (#<n>): <status> — <PR state> — next: <job>`) so the record survives in the task registry even if the doc is lost. Best-effort: a `tasks.md` lock timeout is logged to stderr and never fails the handoff.
 
 ### `~/.fleet/queue/spawn-fresh-<old_id>.json` — drain trigger
 

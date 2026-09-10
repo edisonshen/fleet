@@ -65,7 +65,8 @@ func writeHandoffDoc(rec *agent.Record, typ string, contextPct *float64, recent,
 	}
 	doc := handoff.NewStub(typ, rec.ID, rec.TaskID, rec.Project,
 		rec.HandoffNumber, rec.LastHandoffPath, contextPct, now)
-	if spawn.IsCoordSpawn(rec.TaskID, rec.Project) {
+	isCoord := spawn.IsCoordSpawn(rec.TaskID, rec.Project)
+	if isCoord {
 		handoff.EnrichManualDoc(doc, rec.Project, rec.ID, repoDir, rec.LastHandoffPath,
 			func(msg string) { _, _ = fmt.Fprintln(stderr, msg) })
 	}
@@ -73,7 +74,25 @@ func writeHandoffDoc(rec *agent.Record, typ string, contextPct *float64, recent,
 	if err := handoff.Write(doc, docPath); err != nil {
 		return "", fmt.Errorf("write handoff doc: %w", err)
 	}
+	if isCoord {
+		recordHandoffTracking(doc, rec.Project, stderr)
+	}
 	return docPath, nil
+}
+
+// recordHandoffTracking mirrors the doc's Status rows into tasks.md Notes
+// (handoff.RecordTaskTracking). Runs AFTER the doc is on disk and never
+// fails the handoff — a lock timeout or parse error is logged and the
+// successor still gets the doc.
+func recordHandoffTracking(doc *handoff.Doc, project string, stderr io.Writer) {
+	n, err := handoff.RecordTaskTracking(project, doc.AgentID, doc.Number, doc.Timestamp, doc.StatusRows)
+	if err != nil {
+		_, _ = fmt.Fprintf(stderr, "handoff: task tracking not recorded in tasks.md: %v\n", err)
+		return
+	}
+	if n > 0 {
+		_, _ = fmt.Fprintf(stderr, "handoff: recorded handoff status on %d task(s) in tasks.md\n", n)
+	}
 }
 
 type handoffWriteOpts struct {

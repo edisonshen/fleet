@@ -8,6 +8,7 @@ import (
 )
 
 const (
+	resumeInlineStatusHeading       = "## Status"
 	resumeInlineKeyDecisionsHeading = "## Key Decisions"
 	resumeInlineNextStepsHeading    = "## Next Steps (prioritized)"
 	// ResumeInlineSectionMaxBytes bounds each inlined section defensively.
@@ -22,6 +23,7 @@ func resumePromptInlineSections(doc []byte, maxBytes int) string {
 	}
 	var sections []string
 	for _, heading := range []string{
+		resumeInlineStatusHeading,
 		resumeInlineKeyDecisionsHeading,
 		resumeInlineNextStepsHeading,
 	} {

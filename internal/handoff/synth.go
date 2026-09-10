@@ -173,6 +173,7 @@ func SynthesizeRecoveryWithLastHandoff(
 		if liveDecisions != "" {
 			doc.KeyDecisions = liveDecisions
 		}
+		BuildStatus(doc, pdir, agentID)
 		return doc, nil
 	}
 
@@ -182,7 +183,9 @@ func SynthesizeRecoveryWithLastHandoff(
 	}
 	if len(agentIDsBySlug) == 0 {
 		// Empty project — no in-flight work. Doc still renders cleanly
-		// via the _(none)_ placeholder for Active Subagents.
+		// via the _(none)_ placeholder for Active Subagents; Status still
+		// lists queued session tasks from tasks.md, if any.
+		BuildStatus(doc, pdir, agentID)
 		return doc, nil
 	}
 
@@ -230,6 +233,8 @@ func SynthesizeRecoveryWithLastHandoff(
 		doc.ActiveSubagents = append(doc.ActiveSubagents, sub)
 	}
 
+	// Status last — reads the Active Subagents rows built above.
+	BuildStatus(doc, pdir, agentID)
 	return doc, nil
 }
 

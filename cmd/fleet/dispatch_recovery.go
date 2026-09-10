@@ -681,6 +681,10 @@ func writeRecoveryHandoffDoc(deadRec *agent.Record, ts time.Time) (string, error
 	if err := handoff.Write(doc, docPath); err != nil {
 		return "", fmt.Errorf("write handoff doc: %w", err)
 	}
+	// Same tasks.md tracking mirror as the manual/auto producer
+	// (handoff_write.go): each in-flight task's Notes records the state
+	// the dead coord left it in. Best-effort, after the doc is on disk.
+	recordHandoffTracking(doc, deadRec.Project, os.Stderr)
 	// We deliberately DO NOT mutate deadRec.LastHandoffPath here
 	// (codex review iter-12 P1). When findRecoveryCandidate misclassifies
 	// a live coord on another tmux socket as dead, rewriting its

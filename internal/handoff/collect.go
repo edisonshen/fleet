@@ -8,7 +8,7 @@ package handoff
 //	section              source                              reader
 //	-------              ------                              ------
 //	Docs (this session)  coord-state.json:session_docs       CollectSessionDocs
-//	Key Decisions        coord-state.json:recent_decisions   CollectRecentDecisionsLive
+//	Key Decisions        coord-state.json:session_decisions + recent_decisions   CollectRecentDecisionsLive
 //	                     (live-preferred over the checkpoint)
 //
 // (Next Steps + Open Questions are session-scoped from coord-state.json
@@ -67,6 +67,7 @@ type coordStateForCollect struct {
 	SessionDocs          []sessionDoc      `json:"session_docs"`
 	RecentDecisions      []string          `json:"recent_decisions"`
 	RecentDecisionsOwner string            `json:"recent_decisions_owner"`
+	SessionDecisions     []sessionDecision `json:"session_decisions"`
 	SessionNextSteps     []sessionNextStep `json:"session_next_steps"`
 	SessionTasks         []sessionTask     `json:"session_tasks"`
 }
@@ -79,6 +80,14 @@ type coordStateForCollect struct {
 type sessionNextStep struct {
 	Text    string `json:"text"`
 	Slug    string `json:"slug,omitempty"`
+	CoordID string `json:"coord_id,omitempty"`
+	TS      string `json:"ts"`
+}
+
+// sessionDecision is one coord-state.json:session_decisions entry, written
+// by `fleet checkpoint decision` (cmd/fleet/checkpoint.go).
+type sessionDecision struct {
+	Text    string `json:"text"`
 	CoordID string `json:"coord_id,omitempty"`
 	TS      string `json:"ts"`
 }
@@ -210,16 +219,32 @@ func CollectSessionDocs(coordStatePath, agentID string) string {
 // caller keeps whatever the checkpoint lift already set.
 func CollectRecentDecisionsLive(coordStatePath, agentID string) []string {
 	cs := readCoordStateForCollect(coordStatePath)
-	if foreignGeneration(cs.RecentDecisionsOwner, agentID) {
-		return nil
-	}
-	raw := cs.RecentDecisions
-	out := make([]string, 0, len(raw))
-	for _, d := range raw {
-		if strings.TrimSpace(d) == "" {
+	var out []string
+	seen := map[string]bool{}
+	// Agent rationales first: coord-state.json:session_decisions is the
+	// durable per-entry-stamped buffer `fleet checkpoint decision` writes
+	// (cap 50, own key — so tick action lines can never evict a rationale
+	// out of the 10-deep rolling recent_decisions). Per-entry coord_id
+	// guard, same rule as session_docs.
+	for _, d := range cs.SessionDecisions {
+		text := strings.TrimSpace(d.Text)
+		if text == "" || seen[text] || foreignGeneration(d.CoordID, agentID) {
 			continue
 		}
-		out = append(out, d)
+		seen[text] = true
+		out = append(out, text)
+	}
+	// Then the rolling tick buffer (mechanical dispatch/promote lines plus
+	// any legacy CLI writes), owner-guarded as a whole.
+	if !foreignGeneration(cs.RecentDecisionsOwner, agentID) {
+		for _, d := range cs.RecentDecisions {
+			text := strings.TrimSpace(d)
+			if text == "" || seen[text] {
+				continue
+			}
+			seen[text] = true
+			out = append(out, text)
+		}
 	}
 	if len(out) == 0 {
 		return nil

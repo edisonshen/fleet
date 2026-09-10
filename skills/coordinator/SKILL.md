@@ -234,11 +234,20 @@ fleet checkpoint decision "<what> — <why>"
 
 Material = a fix/defer choice, a design fork resolved, a re-prioritisation, a
 PR-shepherding action. It appends to the same capped
-coord-state.json:recent_decisions buffer the tick auto-producer feeds, so the
-handoff's "Key Decisions" carries agent rationale alongside the mechanical
-events — even on a manual handoff before the next tick (the handoff reads the
-buffer live). Routine mechanical steps (a dispatch, a poll) are NOT material;
-the auto-producer already records those.
+coord-state.json:recent_decisions buffer the tick auto-producer feeds, AND to
+the durable per-coord `session_decisions` buffer (cap 50, stamped with your
+agent id, deduped by text) that tick lines can never evict — so the handoff's
+"Key Decisions" carries every rationale you logged this generation alongside
+the mechanical events, even on a manual handoff before the next tick (the
+handoff reads both buffers live). Routine mechanical steps (a dispatch, a
+poll) are NOT material; the auto-producer already records those.
+
+The handoff doc's `## Status` block (task → status, PR state from
+`pr-watches.json`, next job; then one `Next job:` line) is derived from
+`tasks.md` + `coord-state.json` — keep `fleet tasks set` / `fleet checkpoint
+next-step` current and the successor's first screen is accurate without any
+extra work at handoff time. The same per-task line lands in each in-flight
+task's `notes` in `tasks.md` at handoff.
 
 ### Step 7 — PR-TRACK
 

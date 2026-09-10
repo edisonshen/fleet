@@ -271,6 +271,57 @@ func TestCheckpointDecision_AppendsBuffer(t *testing.T) {
 	}
 }
 
+// `fleet checkpoint decision` ALSO writes the durable session_decisions
+// buffer: per-entry coord_id stamp, dedupe-by-text (re-log refreshes to the
+// tail), cap checkpointSessionDecisionsMax — independent of the 10-deep
+// recent_decisions cap so tick lines can never evict a rationale.
+func TestCheckpointDecision_SessionDecisionsDurable(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("FLEET_HOME", home)
+	if _, err := state.Bootstrap(); err != nil {
+		t.Fatalf("Bootstrap: %v", err)
+	}
+	t.Setenv("FLEET_AGENT_ID", "cafe0123")
+	const n = checkpointSessionDecisionsMax + 3
+	for i := 0; i < n; i++ {
+		if err := runCheckpoint(t, "decision", "--project", "myproj",
+			fmt.Sprintf("rationale-%02d", i)); err != nil {
+			t.Fatalf("decision %d: %v", i, err)
+		}
+	}
+	// Re-log an existing one → deduped, moved to tail.
+	if err := runCheckpoint(t, "decision", "--project", "myproj", "rationale-10"); err != nil {
+		t.Fatalf("relog: %v", err)
+	}
+	m := readCoordState(t, home, "myproj")
+	raw, ok := m["session_decisions"].([]any)
+	if !ok || len(raw) != checkpointSessionDecisionsMax {
+		t.Fatalf("session_decisions: want cap %d, got %#v", checkpointSessionDecisionsMax, m["session_decisions"])
+	}
+	last := raw[len(raw)-1].(map[string]any)
+	if last["text"] != "rationale-10" || last["coord_id"] != "cafe0123" {
+		t.Errorf("tail entry: %#v", last)
+	}
+	if _, ok := last["ts"].(string); !ok {
+		t.Errorf("entry missing ts: %#v", last)
+	}
+	texts := map[string]int{}
+	for _, e := range raw {
+		texts[e.(map[string]any)["text"].(string)]++
+	}
+	if texts["rationale-10"] != 1 {
+		t.Errorf("re-logged rationale must be deduped: %d copies", texts["rationale-10"])
+	}
+	if texts["rationale-00"] != 0 {
+		t.Errorf("oldest entry must be evicted past the cap")
+	}
+	// The rolling buffer is still capped at 10 — the durable one is why the
+	// rationale survives.
+	if rd, _ := m["recent_decisions"].([]any); len(rd) != checkpointDefaultDecisions {
+		t.Errorf("recent_decisions cap: got %d", len(rd))
+	}
+}
+
 // Blank / whitespace-only decision text is rejected (no empty bullet).
 func TestCheckpointDecision_RejectsBlank(t *testing.T) {
 	home := t.TempDir()

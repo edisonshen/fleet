@@ -117,8 +117,8 @@ func TestRender_StubBodyIsPlaceholder(t *testing.T) {
 	d := NewManualStub("a1b2c3d4", "auth-fix", "rainier", 1, nil, time.Now().UTC())
 	got := string(Render(d))
 	count := strings.Count(got, Placeholder)
-	if count != 5 {
-		t.Errorf("expected 5 placeholders (one per section), got %d in:\n%s", count, got)
+	if count != 6 {
+		t.Errorf("expected 6 placeholders (one per narrative section), got %d in:\n%s", count, got)
 	}
 }
 
@@ -227,11 +227,10 @@ func TestRender_DeterministicForSameInput(t *testing.T) {
 }
 
 // TestRender_SkillByteGolden pins the exact bytes Render produces for a
-// known input. The same byte-for-byte assertion lives in the Python skill at
-// skills/fleet-guard/tests/test_handoff.py:EXPECTED_GOLDEN — both sides MUST
-// produce the same bytes for the same input. If either drifts, both fail
-// and we re-converge intentionally rather than discovering at handoff time
-// that 4a's chain reader can't parse 4b's auto-handoff doc.
+// known input. Go is the single renderer for manual, auto and recovery
+// docs (#300), so this golden IS the doc contract: the section order and
+// headings are what skills/coordinator/handoff_resume.py and the
+// resume-prompt inliner (parse.go) slice on. Change deliberately.
 func TestRender_SkillByteGolden(t *testing.T) {
 	prev := "/home/op/.fleet/handoffs/prev.md"
 	pct := 50.0
@@ -244,6 +243,7 @@ func TestRender_SkillByteGolden(t *testing.T) {
 		PreviousPath:        &prev,
 		ContextPctAtHandoff: &pct,
 		Timestamp:           time.Date(2026, 4, 28, 12, 34, 56, 0, time.UTC),
+		Status:              "Handoff from coord abcd1234 at 50% context.\n" + StatusNonePlaceholder,
 		Completed:           "Wrote tests for foo",
 		KeyDecisions:        Placeholder,
 		SessionDocs:         Placeholder,
@@ -282,6 +282,7 @@ func TestRender_SkillByteGolden(t *testing.T) {
 		"Then run the slash command `/coordinator` (in the chat, not bash) to resume the per-project supervisor tick loop. The /coordinator skill is idempotent — running it on a coord session that already holds the NB-flock is a no-op (the flock skips when held), and on a non-coord lineage it exits cleanly with no project to supervise.\n" +
 		"\n" +
 		"Then continue with the sections below." + "\n\n" +
+		"## Status\nHandoff from coord abcd1234 at 50% context.\n" + StatusNonePlaceholder + "\n\n" +
 		"## Completed\nWrote tests for foo\n\n" +
 		"## Key Decisions\n" + Placeholder + "\n\n" +
 		"## Docs (this session)\n" + Placeholder + "\n\n" +
