@@ -14,10 +14,14 @@ package main
 //	1. findRecoveryCandidate(taskID, project, records, pidAlive, sessionAlive)
 //	   → dead coord record OR nil
 //	2. writeRecoveryHandoffDoc(deadRec, now)
-//	   → docPath, err
+//	   → docPath, doc, err
 //	3. spawn.Spawn(spawn.Options{OldRecord: deadRec, NewDocPath: docPath, ...})
-//	4. archiveDeadCoordPredecessors once the successor owns the lease
-//	   (pid+pid_start proof — see the helper; bare records stay)
+//	4. recordHandoffTracking(doc, ...) once a successor has ACCEPTED the doc
+//	   (spawned, or delivered to the live lease owner on stand-down) —
+//	   never from step 2, so a refused/failed recovery leaves no
+//	   "Handoff …" line in tasks.md; then archiveDeadCoordPredecessors
+//	   once the successor owns the lease (pid+pid_start proof — see the
+//	   helper; bare records stay)
 //
 // Step 3's OldRecord branch in spawn.Spawn already does the lineage
 // inheritance: handoff_number ++, last_handoff_path = NewDocPath, taskID
@@ -609,7 +613,9 @@ func pidAlive(pid int) bool {
 // for deadRec from on-disk state and writes it to
 // ~/.fleet/handoffs/<dead-id>-<UTC-stamp>.md (the same path layout
 // real handoffs use, via state.HandoffPath). Returns the doc path so
-// the caller can pass it as spawn.Options.NewDocPath.
+// the caller can pass it as spawn.Options.NewDocPath, and the doc so
+// the caller can mirror its Status rows into tasks.md at its commit
+// point. Writing the doc is the ONLY side effect here.
 //
 // Side effect: the dead agent's last_handoff_path is updated to point
 // at the synth doc. Why on the DEAD record (which will be archived
@@ -621,9 +627,9 @@ func pidAlive(pid int) bool {
 // The handoff doc itself does NOT carry the "previous_handoff: <synth>"
 // chain pointer — its previous_handoff IS the synth, so it inherits
 // the synth's chain (which may be nil for a never-handoff'd coord).
-func writeRecoveryHandoffDoc(deadRec *agent.Record, ts time.Time) (string, error) {
+func writeRecoveryHandoffDoc(deadRec *agent.Record, ts time.Time) (string, *handoff.Doc, error) {
 	if deadRec == nil {
-		return "", fmt.Errorf("writeRecoveryHandoffDoc: nil deadRec")
+		return "", nil, fmt.Errorf("writeRecoveryHandoffDoc: nil deadRec")
 	}
 	// Prefer the rolling coord-checkpoint.md (written every N ticks by
 	// the coord skill) over the last clean handoff doc when it's fresher
@@ -638,7 +644,7 @@ func writeRecoveryHandoffDoc(deadRec *agent.Record, ts time.Time) (string, error
 	doc, err := handoff.SynthesizeRecoveryWithLastHandoff(
 		deadRec.ID, deadRec.Project, lastHandoff, ts)
 	if err != nil {
-		return "", fmt.Errorf("synthesize recovery doc: %w", err)
+		return "", nil, fmt.Errorf("synthesize recovery doc: %w", err)
 	}
 	// Chain link: the synth doc's previous_handoff is whatever the dead
 	// coord itself last inherited from. nil for a never-handed-off
@@ -676,10 +682,10 @@ func writeRecoveryHandoffDoc(deadRec *agent.Record, ts time.Time) (string, error
 
 	docPath, err := state.HandoffPath(deadRec.ID, ts)
 	if err != nil {
-		return "", fmt.Errorf("resolve handoff doc path: %w", err)
+		return "", nil, fmt.Errorf("resolve handoff doc path: %w", err)
 	}
 	if err := handoff.Write(doc, docPath); err != nil {
-		return "", fmt.Errorf("write handoff doc: %w", err)
+		return "", nil, fmt.Errorf("write handoff doc: %w", err)
 	}
 	// We deliberately DO NOT mutate deadRec.LastHandoffPath here
 	// (codex review iter-12 P1). When findRecoveryCandidate misclassifies
@@ -693,7 +699,7 @@ func writeRecoveryHandoffDoc(deadRec *agent.Record, ts time.Time) (string, error
 	// coordinator.lock race, the successor exits cleanly and its
 	// (unused) record can be archived manually; the live coord's
 	// chain is untouched.
-	return docPath, nil
+	return docPath, doc, nil
 }
 
 // collectOpenPRs shells out to `gh pr list --state open --search

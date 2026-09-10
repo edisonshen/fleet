@@ -529,6 +529,14 @@ def test_tick_pr_watch_merged_completion_persisted_to_disk(
         f"PR-merged completion not persisted to disk: {completions!r} "
         "— the post-_reconcile_pr_watches flush is missing"
     )
+    # The merged flip is a material decision: rolling (owner-claimed) AND
+    # durable session_decisions, stamped with this coord's id.
+    cs = json.loads((project_dir / "coord-state.json").read_text())
+    assert "merged PR → task watch-aaaa done" in cs["recent_decisions"]
+    assert cs["recent_decisions_owner"] == "cccccc01"
+    durable = [d for d in cs["session_decisions"]
+               if d["text"] == "merged PR → task watch-aaaa done"]
+    assert durable and durable[0]["coord_id"] == "cccccc01" and durable[0]["ts"]
 
 
 class _FakePrWatchProber:

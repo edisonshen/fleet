@@ -87,6 +87,22 @@ def test_record_decision_writes_into_state():
     assert state["recent_decisions"] == ["dispatched worker s-1111 (gen 1)"]
 
 
+def test_record_decision_claims_rolling_buffer_on_succession():
+    state = {"recent_decisions": ["pred line"], "recent_decisions_owner": "aaaa1111"}
+    act = _dispatch(agent_id="a", dispatch_instruction="x", dispatch_generation=1)
+    # Same coord: append.
+    loop._record_decision(state, act, coord_id="aaaa1111")
+    assert state["recent_decisions"] == ["pred line", "dispatched worker s-1111 (gen 1)"]
+    # No coord_id (operator-shell shape): append, stamp untouched.
+    loop._record_decision(state, _sentinel("worker_failed"))
+    assert len(state["recent_decisions"]) == 3
+    assert state["recent_decisions_owner"] == "aaaa1111"
+    # Successor: predecessor's rolling lines are dropped, stamp flips.
+    loop._record_decision(state, act, coord_id="bbbb2222")
+    assert state["recent_decisions"] == ["dispatched worker s-1111 (gen 1)"]
+    assert state["recent_decisions_owner"] == "bbbb2222"
+
+
 def test_record_decision_noop_action_writes_nothing():
     state = {}
     loop._record_decision(state, _dispatch(error="boom"))
@@ -105,6 +121,59 @@ def test_dispatch_and_worker_failed_are_decisions_not_completions():
     ]
     # The completion buffer must stay empty — neither is a true completion.
     assert state.get("recent_completions", []) == []
+
+
+# ---------- session_decisions mirror (durable Key Decisions) ----------
+
+
+def test_material_tick_lines_mirror_into_session_decisions_not_dispatches():
+    state = {}
+    loop._record_decision(state, _dispatch(agent_id="a", dispatch_instruction="x", dispatch_generation=1), "c0ffee02")
+    loop._record_decision(state, _sentinel("worker_failed", slug="failed-2222"), "c0ffee02")
+    loop._record_decision(state, _reconcile(slug="ship-3333", new_status="in-review"), "c0ffee02")
+    loop._record_decision(state, _sentinel("blocked_question", slug="q-4444"), "c0ffee02")
+    assert len(state["recent_decisions"]) == 4
+    durable = state["session_decisions"]
+    assert [e["text"] for e in durable] == [
+        "requeued worker-failed task failed-2222",
+        "reconciled ship-3333 → in-review",
+        "parked task q-4444: blocked question",
+    ]
+    assert all(e["coord_id"] == "c0ffee02" and e["ts"].endswith("Z") for e in durable)
+
+
+def test_session_decisions_dedupe_cap_and_unstamped():
+    state = {}
+    for i in range(60):
+        loop.dispatch_mod.record_session_decision(state, f"line {i}", "c1")
+    loop.dispatch_mod.record_session_decision(state, "line 30", "c1")
+    kept = [e["text"] for e in state["session_decisions"]]
+    assert len(kept) == 50
+    assert kept[-1] == "line 30" and kept.count("line 30") == 1
+    assert kept[0] == "line 10"
+    loop.dispatch_mod.record_session_decision(state, "  \n ", "c1")
+    assert len(state["session_decisions"]) == 50
+    loop.dispatch_mod.record_session_decision(state, "no owner", "")
+    assert "coord_id" not in state["session_decisions"][-1]
+    # Corrupt buffer is replaced, never raises.
+    loop.dispatch_mod.record_session_decision({"session_decisions": "junk"}, "x", "c1")
+
+
+def test_run_fleet_marks_shell_outs_as_tick_driven(monkeypatch):
+    seen: dict[str, str | None] = {}
+
+    def fake_run(cmd, capture_output=True, text=True, timeout=None, check=False):
+        import os as _os
+        import subprocess as _sp
+        seen["FLEET_TICK"] = _os.environ.get("FLEET_TICK")
+        return _sp.CompletedProcess(args=cmd, returncode=0, stdout="", stderr="")
+
+    monkeypatch.delenv("FLEET_TICK", raising=False)
+    monkeypatch.setattr(loop.subprocess, "run", fake_run)
+    loop._run_fleet(["fleet", "tasks", "set", "s", "status=ready"])
+    assert seen["FLEET_TICK"] == "1"
+    import os as _os
+    assert "FLEET_TICK" not in _os.environ
 
 
 # ---------- _record_session_task seam (auto Next Steps buffer) ----------

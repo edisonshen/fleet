@@ -593,6 +593,9 @@ func EnrichManualDoc(doc *Doc, project, agentID, repoDir string, lastHandoffPath
 	if sd := CollectSessionDocs(filepath.Join(pdir, "coord-state.json"), agentID); sd != "" {
 		doc.SessionDocs = sd
 	}
+	// STATUS — last, because it reads the final Active Subagents (worker
+	// phase / liveness) and Next Steps (explicit next job) off the doc.
+	BuildStatus(doc, pdir, agentID)
 }
 
 // readTasksTolerant wraps the strict tasks.Read so a parse error or a

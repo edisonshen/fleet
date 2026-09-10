@@ -308,7 +308,7 @@ func TestWriteRecoveryHandoffDoc_PopulatesOpenPRsFromGH(t *testing.T) {
 		t.Fatalf("write coord-state: %v", err)
 	}
 
-	docPath, err := writeRecoveryHandoffDoc(deadRec, time.Now().UTC())
+	docPath, _, err := writeRecoveryHandoffDoc(deadRec, time.Now().UTC())
 	if err != nil {
 		t.Fatalf("writeRecoveryHandoffDoc: %v", err)
 	}
@@ -385,7 +385,7 @@ func TestWriteRecoveryHandoffDoc_WritesSynthDocToDisk(t *testing.T) {
 		t.Fatalf("write worker state: %v", err)
 	}
 
-	docPath, err := writeRecoveryHandoffDoc(deadRec, time.Now().UTC())
+	docPath, _, err := writeRecoveryHandoffDoc(deadRec, time.Now().UTC())
 	if err != nil {
 		t.Fatalf("writeRecoveryHandoffDoc: %v", err)
 	}
@@ -1066,6 +1066,15 @@ func TestRunDispatch_DeadCoord_CodexRecoveryRejected(t *testing.T) {
 	if err := os.Chtimes(csPath, stale, stale); err != nil {
 		t.Fatalf("chtimes coord-state: %v", err)
 	}
+	// An in-flight task: the synth doc's Status row for it must NOT be
+	// mirrored into tasks.md when no successor accepts the doc.
+	tasksPath := filepath.Join(pdir, "tasks.md")
+	inflight := &tasks.Task{Slug: "fix-foo-1234", Status: tasks.StatusInProgress, Priority: tasks.PriorityP1,
+		Created: time.Now(), Updated: time.Now(), SpawnedBy: "user", Spec: "fix foo"}
+	if err := tasks.Write(tasksPath, &tasks.File{Schema: tasks.SchemaVersion, Tasks: []*tasks.Task{inflight}}); err != nil {
+		t.Fatalf("write tasks.md: %v", err)
+	}
+	tasksBefore, _ := os.ReadFile(tasksPath)
 
 	opts := &dispatchOpts{
 		taskID:          "coord-myproj",
@@ -1083,6 +1092,9 @@ func TestRunDispatch_DeadCoord_CodexRecoveryRejected(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "coordinator skill only works under claude-code") {
 		t.Errorf("error must explain the codex-coord limitation; got: %v", err)
+	}
+	if tasksAfter, _ := os.ReadFile(tasksPath); !bytes.Equal(tasksBefore, tasksAfter) {
+		t.Errorf("refused recovery must not annotate tasks.md; diff:\n%s", string(tasksAfter))
 	}
 	// No successor should be on disk.
 	live, _ := agent.List()
@@ -1864,7 +1876,7 @@ func TestWriteRecoveryHandoffDoc_FallsBackToTasksMdWhenGHEmpty(t *testing.T) {
 		t.Fatalf("write tasks.md: %v", err)
 	}
 
-	docPath, err := writeRecoveryHandoffDoc(deadRec, time.Now().UTC())
+	docPath, _, err := writeRecoveryHandoffDoc(deadRec, time.Now().UTC())
 	if err != nil {
 		t.Fatalf("writeRecoveryHandoffDoc: %v", err)
 	}

@@ -24,6 +24,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -60,6 +61,14 @@ const checkpointNextStepsMax = 10
 // dispatch.resolve_checkpoint_decisions() so the Go CLI and the Python tick
 // producer cap the shared buffer identically.
 const checkpointDefaultDecisions = 10
+
+// checkpointSessionDecisionsMax caps coord-state.json:session_decisions —
+// the agent-authored rationale buffer `fleet checkpoint decision` owns.
+// Deliberately much deeper than the 10-deep shared recent_decisions: the
+// tick appends a line per dispatch/promote and would otherwise evict a
+// coord's real decisions within a few ticks, leaving Key Decisions on the
+// successor's handoff full of mechanical noise.
+const checkpointSessionDecisionsMax = 50
 
 // coordLockTimeout bounds the coordinator.lock acquire in `fleet checkpoint`.
 // A coord mid-tick holds the lock for its whole pass; failing fast (with a
@@ -295,16 +304,82 @@ func runCheckpointDoc(project, role, path string) error {
 	})
 }
 
-// runCheckpointDecision appends one flattened line to recent_decisions,
-// capped to the FLEET_COORD_CHECKPOINT_DECISIONS limit (shared with the
-// Python tick producer).
+// runCheckpointDecision appends one flattened line to session_decisions
+// (durable, cap checkpointSessionDecisionsMax) AND to recent_decisions
+// (rolling, capped to the FLEET_COORD_CHECKPOINT_DECISIONS limit shared
+// with the Python tick producer).
 func runCheckpointDecision(project, text string) error {
 	flat := strings.TrimSpace(strings.ReplaceAll(strings.ReplaceAll(text, "\r", " "), "\n", " "))
 	if flat == "" {
 		return errors.New("decision text must be non-empty")
 	}
+	return recordDecision(project, flat)
+}
+
+// autoDecisionEnabled reports whether a task-mutating CLI call should
+// self-record into session_decisions. Only a coordinator's own shell
+// qualifies (FLEET_ROLE=coord, stamped by spawn): an operator shell has no
+// live coord whose heartbeat the coord-state.json write would spoof, a
+// worker's status flips are the coord's to record, and the coord TICK
+// (FLEET_TICK=1 on its `fleet` shell-outs) already records its own
+// transitions in-memory — a CLI write mid-tick would also be clobbered by
+// the tick's load-mutate-save.
+func autoDecisionEnabled() bool {
+	if os.Getenv("FLEET_TICK") != "" {
+		return false
+	}
+	return strings.EqualFold(strings.TrimSpace(os.Getenv("FLEET_ROLE")), "coord")
+}
+
+// recordAutoDecision is the best-effort seam for CLI-driven task mutations
+// (`fleet tasks set status=…`, `fleet tasks promote`): the coord agent's own
+// state changes ARE its decisions, so they land in Key Decisions without a
+// separate `fleet checkpoint decision` call. Never fails the caller.
+func recordAutoDecision(project, text string, stderr io.Writer) {
+	if !autoDecisionEnabled() {
+		return
+	}
+	if err := recordDecision(project, text); err != nil {
+		_, _ = fmt.Fprintf(stderr, "warning: decision not recorded: %v\n", err)
+	}
+}
+
+// recordDecision is the shared writer behind `fleet checkpoint decision` and
+// the auto-recording task mutations. flat must already be newline-free and
+// non-empty.
+func recordDecision(project, flat string) error {
 	capN := resolveCheckpointDecisions()
 	return withCoordState(project, func(cs map[string]any) {
+		// Durable copy FIRST: session_decisions is the agent's own buffer
+		// (per-entry coord_id stamp, cap checkpointSessionDecisionsMax,
+		// never touched by the tick), so a rationale survives however many
+		// mechanical tick lines land in recent_decisions afterwards.
+		// Dedupe by text so a re-logged rationale refreshes to the tail.
+		decisions, _ := cs["session_decisions"].([]any)
+		kept := make([]any, 0, len(decisions)+1)
+		for _, e := range decisions {
+			if m, ok := e.(map[string]any); ok && m["text"] == flat {
+				continue
+			}
+			kept = append(kept, e)
+		}
+		entry := map[string]any{
+			"text": flat,
+			"ts":   time.Now().UTC().Format(time.RFC3339),
+		}
+		if id := os.Getenv("FLEET_AGENT_ID"); id != "" {
+			entry["coord_id"] = id
+		}
+		kept = append(kept, entry)
+		if len(kept) > checkpointSessionDecisionsMax {
+			kept = kept[len(kept)-checkpointSessionDecisionsMax:]
+		}
+		cs["session_decisions"] = kept
+
+		// Rolling copy too: recent_decisions is what the tick round-trips
+		// into coord-checkpoint.md, so the rationale also shows up in the
+		// operator-visible checkpoint until the cap evicts it.
+		claimRecentDecisions(cs, os.Getenv("FLEET_AGENT_ID"))
 		raw := toStringSlice(cs["recent_decisions"])
 		raw = append(raw, flat)
 		if capN > 0 && len(raw) > capN {
@@ -316,21 +391,29 @@ func runCheckpointDecision(project, text string) error {
 			out[i] = s
 		}
 		cs["recent_decisions"] = out
-		// Generation stamp for the LIVE read. recent_decisions is a plain-
-		// strings buffer shared with the Python tick producer (per-entry
-		// stamping would break the coord-checkpoint.md round-trip), so the
-		// stamp is a top-level sibling key: the last CLI writer's coord
-		// generation. CollectRecentDecisionsLive suppresses the live
-		// override when this stamp belongs to a different coord — the
-		// checkpoint fallback then applies its own coord_id guard. The tick
-		// preserves unknown keys through load-mutate-save, so the stamp
-		// rides through heartbeats untouched. Empty FLEET_AGENT_ID
-		// (operator shell) leaves any prior stamp in place rather than
-		// erasing attribution.
-		if id := os.Getenv("FLEET_AGENT_ID"); id != "" {
-			cs["recent_decisions_owner"] = id
-		}
 	})
+}
+
+// claimRecentDecisions stamps recent_decisions_owner with the writing coord.
+// recent_decisions is a plain-strings buffer shared with the Python tick
+// producer (per-entry stamping would break the coord-checkpoint.md
+// round-trip), so ownership is a top-level sibling key. A stamp from a
+// DIFFERENT coord means the buffer's lines are that generation's: they are
+// dropped before this coord's first write, so a successor's Key Decisions
+// never surfaces a predecessor's rolling tail once the successor starts
+// writing (CollectRecentDecisionsLive already hides the buffer while the
+// foreign stamp is still in place). The tick preserves unknown keys through
+// load-mutate-save and applies the same rule from its own seam
+// (dispatch.py claim_recent_decisions). Empty id (operator shell) leaves
+// buffer and stamp untouched rather than erasing attribution.
+func claimRecentDecisions(cs map[string]any, id string) {
+	if id == "" {
+		return
+	}
+	if prev, _ := cs["recent_decisions_owner"].(string); prev != "" && prev != id {
+		cs["recent_decisions"] = []any{}
+	}
+	cs["recent_decisions_owner"] = id
 }
 
 // withCoordState resolves the project, takes coordinator.lock (bounded by

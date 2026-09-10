@@ -745,7 +745,7 @@ func runHandoff(opts *handoffOpts, stdout, stderr io.Writer) error {
 	//    itself inherited from. The next handoff increments by 1
 	//    inside spawn.Spawn.
 	now := time.Now().UTC()
-	docPath, err := writeHandoffDoc(oldRec, handoff.TypeManual, nil, "", cwd, now, stderr)
+	docPath, doc, err := writeHandoffDoc(oldRec, handoff.TypeManual, nil, "", cwd, now, stderr)
 	if err != nil {
 		return err
 	}
@@ -808,6 +808,7 @@ func runHandoff(opts *handoffOpts, stdout, stderr io.Writer) error {
 	if err != nil {
 		return fmt.Errorf("enqueue spawn-fresh: %w", err)
 	}
+	recordHandoffTracking(doc, oldRec.Project, stderr)
 
 	// 8. Drain: spawn the replacement using the pre-allocated ID.
 	//    NewRec gets the resolved policy (override OR baseline) so

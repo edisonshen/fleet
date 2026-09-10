@@ -1629,7 +1629,21 @@ def should_checkpoint(tick_count: int, every: int) -> bool:
     return tick_count % every == 0
 
 
-def record_checkpoint_decision(state: dict, line: str) -> None:
+def claim_recent_decisions(state: dict, coord_id: str) -> None:
+    """Stamp state["recent_decisions_owner"] = coord_id. When the buffer was
+    last owned by a DIFFERENT coord, its lines are that generation's and are
+    dropped first, so a successor's handoff never surfaces a predecessor's
+    rolling tail. Same rule as the Go writer (cmd/fleet/checkpoint.go
+    claimRecentDecisions). No-op for an empty coord_id (operator shell)."""
+    if not coord_id:
+        return
+    prev = state.get("recent_decisions_owner")
+    if isinstance(prev, str) and prev and prev != coord_id:
+        state["recent_decisions"] = []
+    state["recent_decisions_owner"] = coord_id
+
+
+def record_checkpoint_decision(state: dict, line: str, coord_id: str = "") -> None:
     """Append `line` to state["recent_decisions"], capped to the
     FLEET_COORD_CHECKPOINT_DECISIONS limit. Mutates `state` in place.
 
@@ -1637,12 +1651,15 @@ def record_checkpoint_decision(state: dict, line: str) -> None:
     (fresh coord first tick) or one whose value is corrupt (non-list).
     Blank / whitespace-only entries are dropped; embedded newlines are
     flattened to spaces so the bullet-per-line markdown contract holds.
+    A non-empty coord_id claims the buffer (claim_recent_decisions) before
+    the append.
     """
     if line is None:
         return
     flat = str(line).replace("\r", "\n").replace("\n", " ").strip()
     if not flat:
         return
+    claim_recent_decisions(state, coord_id)
     cap = resolve_checkpoint_decisions()
     raw = state.get("recent_decisions")
     if not isinstance(raw, list):
@@ -1651,6 +1668,47 @@ def record_checkpoint_decision(state: dict, line: str) -> None:
     if cap > 0 and len(raw) > cap:
         raw = raw[-cap:]
     state["recent_decisions"] = raw
+
+
+# _SESSION_DECISIONS_MAX caps coord-state.json:session_decisions — the
+# durable per-coord Key Decisions buffer. Mirrors the Go writer's cap
+# (cmd/fleet/checkpoint.go checkpointSessionDecisionsMax); both sides
+# write the same {text, coord_id, ts} entry shape the Go READER
+# (internal/handoff collect.go sessionDecision) round-trips.
+_SESSION_DECISIONS_MAX = 50
+
+
+def record_session_decision(state: dict, line: str, coord_id: str) -> None:
+    """Append {text, coord_id, ts} to state["session_decisions"] — the
+    durable buffer the tick's mechanical recent_decisions churn never
+    evicts. Mutates `state` in place.
+
+    Dedupe by text: a re-recorded line moves to the tail with a fresh ts.
+    Capped to _SESSION_DECISIONS_MAX (newest kept). Blank lines are
+    dropped; embedded newlines flatten to spaces. coord_id is omitted when
+    empty so the entry stays unstamped (= visible to any successor),
+    matching the Go writer's empty-FLEET_AGENT_ID handling.
+    """
+    if line is None:
+        return
+    flat = str(line).replace("\r", "\n").replace("\n", " ").strip()
+    if not flat:
+        return
+    raw = state.get("session_decisions")
+    if not isinstance(raw, list):
+        raw = []
+    kept = [
+        e for e in raw
+        if not (isinstance(e, dict) and e.get("text") == flat)
+    ]
+    entry: dict = {"text": flat}
+    if coord_id:
+        entry["coord_id"] = coord_id
+    entry["ts"] = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    kept.append(entry)
+    if len(kept) > _SESSION_DECISIONS_MAX:
+        kept = kept[-_SESSION_DECISIONS_MAX:]
+    state["session_decisions"] = kept
 
 
 # _SESSION_TASKS_MAX caps coord-state.json:session_tasks — the auto Next

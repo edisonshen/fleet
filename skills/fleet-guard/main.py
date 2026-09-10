@@ -29,6 +29,7 @@ if _SKILL_DIR not in sys.path:
     sys.path.insert(0, _SKILL_DIR)
 
 import coordguard  # noqa: E402
+import decisions  # noqa: E402
 import handoff  # noqa: E402
 import health   # noqa: E402
 import inbox    # noqa: E402
@@ -164,6 +165,13 @@ def _on_stop(payload: dict, agent_id: str, session: str,
         nag = coordguard.stop_nag(agent_id)
         if nag is not None:
             injections.append(nag)
+
+    # Capture the operator↔coord exchange BEFORE the handoff trigger so a
+    # doc written this fire already carries it in Key Decisions.
+    try:
+        decisions.capture(payload, agent_id)
+    except Exception as exc:
+        print(f"fleet-guard: decision capture error: {exc}", file=sys.stderr)
 
     handoff_inject = handoff.maybe_trigger(
         payload, agent_id=agent_id, session=session,

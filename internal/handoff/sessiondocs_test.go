@@ -262,6 +262,41 @@ func TestCollectRecentDecisionsLive_ForeignOwnerSuppressed(t *testing.T) {
 	}
 }
 
+// Durable session_decisions come first (own / unstamped entries only,
+// per-entry guard), then the rolling recent_decisions tail; identical text
+// across the two buffers renders once. A rationale evicted from the 10-deep
+// rolling buffer by tick lines still reaches Key Decisions.
+func TestCollectRecentDecisionsLive_MergesDurableSessionDecisions(t *testing.T) {
+	dir := t.TempDir()
+	cs := writeCoordStateJSON(t, dir, `{
+		"session_decisions":[
+			{"text":"evicted rationale","coord_id":"aaaa1111","ts":"t"},
+			{"text":"unstamped rationale","ts":"t"},
+			{"text":"predecessor rationale","coord_id":"zzzz9999","ts":"t"},
+			{"text":"shared line","coord_id":"aaaa1111","ts":"t"},
+			{"text":"   ","coord_id":"aaaa1111","ts":"t"}],
+		"recent_decisions":["shared line","tick line"],
+		"recent_decisions_owner":"aaaa1111"}`)
+	got := CollectRecentDecisionsLive(cs, "aaaa1111")
+	want := []string{"evicted rationale", "unstamped rationale", "shared line", "tick line"}
+	if strings.Join(got, "|") != strings.Join(want, "|") {
+		t.Errorf("merged decisions:\n got %v\nwant %v", got, want)
+	}
+	// Foreign rolling owner + own durable entries → durable only.
+	cs = writeCoordStateJSON(t, dir, `{
+		"session_decisions":[{"text":"mine","coord_id":"bbbb2222","ts":"t"}],
+		"recent_decisions":["theirs"],"recent_decisions_owner":"aaaa1111"}`)
+	if got := CollectRecentDecisionsLive(cs, "bbbb2222"); strings.Join(got, "|") != "mine" {
+		t.Errorf("foreign rolling buffer must be dropped, durable kept: %v", got)
+	}
+	// Nothing valid at all → nil (caller falls back to checkpoint).
+	cs = writeCoordStateJSON(t, dir, `{
+		"session_decisions":[{"text":"theirs","coord_id":"zzzz9999","ts":"t"}]}`)
+	if got := CollectRecentDecisionsLive(cs, "bbbb2222"); got != nil {
+		t.Errorf("all-foreign must yield nil: %v", got)
+	}
+}
+
 // End-to-end: a successor coord's manual handoff must NOT lift a
 // predecessor-owned live decisions buffer into ITS Key Decisions.
 func TestEnrichManualDoc_ForeignOwnerDecisions_NotLifted(t *testing.T) {

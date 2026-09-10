@@ -4,8 +4,9 @@
 // The doc structure mirrors docs/DESIGN.md "Handoff Doc Structure":
 // frontmatter with chain fields (agent_id, task_id, project,
 // previous_handoff, handoff_number, timestamp, handoff_type,
-// context_pct_at_handoff) followed by five sections (Completed, Key
-// Decisions, Docs (this session), Open Questions, Next Steps).
+// context_pct_at_handoff) followed by the narrative sections (Status,
+// Completed, Key Decisions, Docs (this session), Open Questions, Next
+// Steps) and the machine sections (Active Subagents, Open PRs).
 //
 // NewManualStub writes operator-triggered stubs — the agent never got a
 // HANDOFF REQUESTED injection, so the body sections start as placeholders.
@@ -109,6 +110,16 @@ type Doc struct {
 	ContextPctAtHandoff *float64
 	Timestamp           time.Time
 
+	// Status is the compact "where things stand" block rendered first
+	// after First Action: one line per tracked task (status, PR state,
+	// next job) plus the single next job the successor should pick up.
+	// Built by BuildStatus (status.go) from tasks.md + coord-state.json +
+	// pr-watches.json. Placeholder for non-coord docs.
+	Status string
+	// StatusRows is the structured form of Status, kept so the producer
+	// can mirror the same facts into tasks.md (RecordTaskTracking) after
+	// the doc is written. Not rendered.
+	StatusRows      []StatusRow
 	Completed       string
 	KeyDecisions    string
 	SessionDocs     string
@@ -217,6 +228,7 @@ func NewStub(typ, agentID, taskID, project string, number int, prev *string, con
 		PreviousPath:        prev,
 		ContextPctAtHandoff: contextPct,
 		Timestamp:           ts.UTC(),
+		Status:              Placeholder,
 		Completed:           Placeholder,
 		KeyDecisions:        Placeholder,
 		SessionDocs:         Placeholder,
@@ -308,13 +320,15 @@ func FirstAction(project string) string {
 //
 // Body sections, in order:
 //  1. ## First Action (auto)        — fixed FirstAction string
-//  2. ## Completed                  — Doc.Completed
-//  3. ## Key Decisions              — Doc.KeyDecisions
-//  4. ## Docs (this session)        — Doc.SessionDocs
-//  5. ## Open Questions             — Doc.OpenQuestions
-//  6. ## Next Steps (prioritized)   — Doc.NextSteps
-//  7. ## Active Subagents           — Doc.ActiveSubagents (issue #93 Phase B2)
-//  8. ## Open PRs                   — Doc.OpenPRs (v0.8.3 — successor
+//  2. ## Status                     — Doc.Status (per-task status / PR
+//     state / next job; the successor's at-a-glance brief)
+//  3. ## Completed                  — Doc.Completed
+//  4. ## Key Decisions              — Doc.KeyDecisions
+//  5. ## Docs (this session)        — Doc.SessionDocs
+//  6. ## Open Questions             — Doc.OpenQuestions
+//  7. ## Next Steps (prioritized)   — Doc.NextSteps
+//  8. ## Active Subagents           — Doc.ActiveSubagents (issue #93 Phase B2)
+//  9. ## Open PRs                   — Doc.OpenPRs (v0.8.3 — successor
 //     re-spawns shepherd until-loops from this snapshot)
 //
 // Pure function — no I/O, no globals. Use Write to persist.
@@ -341,6 +355,7 @@ func Render(d *Doc) []byte {
 	b.WriteString("---\n\n")
 
 	fmt.Fprintf(&b, "## First Action (auto)\n%s\n\n", FirstAction(d.Project))
+	fmt.Fprintf(&b, "## Status\n%s\n\n", d.Status)
 	fmt.Fprintf(&b, "## Completed\n%s\n\n", d.Completed)
 	fmt.Fprintf(&b, "## Key Decisions\n%s\n\n", d.KeyDecisions)
 	fmt.Fprintf(&b, "## Docs (this session)\n%s\n\n", d.SessionDocs)

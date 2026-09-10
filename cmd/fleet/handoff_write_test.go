@@ -13,6 +13,7 @@ import (
 	"github.com/edisonshen/fleet/internal/agent"
 	"github.com/edisonshen/fleet/internal/handoff"
 	"github.com/edisonshen/fleet/internal/queue"
+	"github.com/edisonshen/fleet/internal/tasks"
 )
 
 // seedLiveRecord writes a live agent record without spawning tmux —
@@ -181,6 +182,88 @@ func TestHandoffWrite_CoordEnrichesFromDurableState(t *testing.T) {
 	}
 }
 
+// A coord handoff states where every in-flight task stands (## Status:
+// status, PR state, next job) AND mirrors that line into each task's Notes
+// in tasks.md, so the record survives even if the doc is lost. PR state
+// comes only from pr-watches.json — a PR the watcher never probed is
+// "state unknown", never guessed.
+func TestHandoffWrite_CoordStatusAndTasksTracking(t *testing.T) {
+	noGH(t)
+	home := setupFleetHome(t)
+	rec := seedLiveRecord(t, "c0ffee02", "coord-myproj", "myproj")
+	seedCoordProject(t, home, "myproj", rec.ID)
+	pdir := filepath.Join(home, "projects", "myproj")
+	inflight := &tasks.Task{Slug: "e2e-login-1234", Status: tasks.StatusInProgress, Priority: "P1",
+		Created: time.Now(), Updated: time.Now(), SpawnedBy: "user", Spec: "login e2e",
+		PRURL: "https://github.com/o/r/pull/42", Notes: "worker: pushed"}
+	review := &tasks.Task{Slug: "api-keys-5678", Status: tasks.StatusInReview, Priority: "P2",
+		Created: time.Now(), Updated: time.Now(), SpawnedBy: "user", Spec: "api keys",
+		PRURL: "https://github.com/o/r/pull/43"}
+	finished := &tasks.Task{Slug: "old-9999", Status: tasks.StatusDone, Priority: "P2",
+		Created: time.Now(), Updated: time.Now(), SpawnedBy: "user", Spec: "old"}
+	if err := tasks.Write(filepath.Join(pdir, "tasks.md"), &tasks.File{Schema: tasks.SchemaVersion,
+		Tasks: []*tasks.Task{inflight, review, finished}}); err != nil {
+		t.Fatalf("write tasks.md: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(pdir, "pr-watches.json"), []byte(`{"watches":{
+		"43":{"pr_number":43,"pr_url":"https://github.com/o/r/pull/43","tasks":["api-keys-5678"],
+		      "state":"open","last_event":"ci-failed","last_snapshot":{"checks":"FAILURE"}}}}`), 0o644); err != nil {
+		t.Fatalf("write pr-watches.json: %v", err)
+	}
+
+	res, stderr, err := runWrite(t, &handoffWriteOpts{agentID: rec.ID, typ: handoff.TypePreCompact}, "")
+	if err != nil {
+		t.Fatalf("handoff-write: %v\nstderr: %s", err, stderr)
+	}
+	raw, err := os.ReadFile(res.DocPath)
+	if err != nil {
+		t.Fatalf("read doc: %v", err)
+	}
+	doc := string(raw)
+	// Status renders right after First Action, before Completed.
+	if i, j, k := strings.Index(doc, "## First Action (auto)"), strings.Index(doc, "## Status"),
+		strings.Index(doc, "## Completed"); i >= j || j >= k {
+		t.Errorf("section order First Action < Status < Completed violated: %d %d %d", i, j, k)
+	}
+	status := section(t, doc, "Status")
+	for _, want := range []string{
+		"Handoff from coord " + rec.ID + ".",
+		"Tasks: 1 in-progress, 1 in-review",
+		"- e2e-login-1234 — in-progress P1 phase=e2e — PR #42 https://github.com/o/r/pull/42 (state unknown) — next: shepherd PR #42 (worker already pushed)",
+		"- api-keys-5678 — in-review P2 — PR #43 open, ci FAILURE, ci-failed — next: fix CI on PR #43",
+		"Next job: merge #42 once e2e-login-1234 reports green",
+	} {
+		if !strings.Contains(status, want) {
+			t.Errorf("Status missing %q:\n%s", want, status)
+		}
+	}
+	if strings.Contains(status, "old-9999") {
+		t.Errorf("finished non-session task leaked into Status:\n%s", status)
+	}
+
+	// tasks.md mirror: one handoff line per non-terminal task, prior Notes kept.
+	f, err := tasks.Read(filepath.Join(pdir, "tasks.md"))
+	if err != nil {
+		t.Fatalf("re-read tasks.md: %v", err)
+	}
+	got, _ := f.Get("e2e-login-1234")
+	if !strings.HasPrefix(got.Notes, "worker: pushed\n\nHandoff ") ||
+		!strings.Contains(got.Notes, "coord "+rec.ID+" (#1): in-progress — PR #42 https://github.com/o/r/pull/42 (state unknown) — next: shepherd PR #42 (worker already pushed)") {
+		t.Errorf("e2e-login-1234 Notes: %q", got.Notes)
+	}
+	got, _ = f.Get("api-keys-5678")
+	if !strings.Contains(got.Notes, "in-review — PR #43 open, ci FAILURE, ci-failed — next: fix CI on PR #43") {
+		t.Errorf("api-keys-5678 Notes: %q", got.Notes)
+	}
+	got, _ = f.Get("old-9999")
+	if got.Notes != "" {
+		t.Errorf("done task must not be annotated: %q", got.Notes)
+	}
+	if !strings.Contains(stderr, "recorded handoff status on 2 task(s)") {
+		t.Errorf("stderr lacks tracking summary: %q", stderr)
+	}
+}
+
 // A worker in the same project must NOT inherit the coord's project-wide
 // state — the successor worker would otherwise resume against a brief
 // about other agents' work.
@@ -298,11 +381,11 @@ func TestHandoffWrite_ManualAndAutoShareRenderer(t *testing.T) {
 
 	now := time.Date(2026, 9, 5, 1, 2, 3, 0, time.UTC)
 	stderr := &bytes.Buffer{}
-	manualPath, err := writeHandoffDoc(rec, handoff.TypeManual, nil, "", rec.Cwd, now, stderr)
+	manualPath, _, err := writeHandoffDoc(rec, handoff.TypeManual, nil, "", rec.Cwd, now, stderr)
 	if err != nil {
 		t.Fatalf("manual: %v", err)
 	}
-	autoPath, err := writeHandoffDoc(rec, handoff.TypeAutoYellow, nil, "", rec.Cwd, now, stderr)
+	autoPath, _, err := writeHandoffDoc(rec, handoff.TypeAutoYellow, nil, "", rec.Cwd, now, stderr)
 	if err != nil {
 		t.Fatalf("auto: %v", err)
 	}

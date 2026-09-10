@@ -245,6 +245,47 @@ func TestCheckpoint_StampsCoordGeneration(t *testing.T) {
 	}
 }
 
+// Succession: a different coord's first write claims recent_decisions —
+// the predecessor's rolling lines are dropped, the stamp flips. Same-coord
+// writes and operator-shell writes append without touching the buffer.
+func TestCheckpointDecision_SuccessorClaimsRollingBuffer(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("FLEET_HOME", home)
+	if _, err := state.Bootstrap(); err != nil {
+		t.Fatalf("Bootstrap: %v", err)
+	}
+	t.Setenv("FLEET_AGENT_ID", "aaaa1111")
+	for _, l := range []string{"pred one", "pred two"} {
+		if err := runCheckpoint(t, "decision", "--project", "myproj", l); err != nil {
+			t.Fatalf("pred decision: %v", err)
+		}
+	}
+	t.Setenv("FLEET_AGENT_ID", "")
+	if err := runCheckpoint(t, "decision", "--project", "myproj", "operator line"); err != nil {
+		t.Fatalf("operator decision: %v", err)
+	}
+	m := readCoordState(t, home, "myproj")
+	if got := toStringSlice(m["recent_decisions"]); len(got) != 3 {
+		t.Fatalf("operator-shell write must append, not reset: %#v", got)
+	}
+
+	t.Setenv("FLEET_AGENT_ID", "bbbb2222")
+	if err := runCheckpoint(t, "decision", "--project", "myproj", "succ one"); err != nil {
+		t.Fatalf("succ decision: %v", err)
+	}
+	m = readCoordState(t, home, "myproj")
+	if got := toStringSlice(m["recent_decisions"]); len(got) != 1 || got[0] != "succ one" {
+		t.Errorf("successor's first write must drop predecessor lines: %#v", got)
+	}
+	if m["recent_decisions_owner"] != "bbbb2222" {
+		t.Errorf("owner not flipped: %#v", m["recent_decisions_owner"])
+	}
+	// Durable buffer is per-entry stamped and untouched by the claim.
+	if got := sessionDecisionTexts(t, home, "myproj"); len(got) != 4 {
+		t.Errorf("session_decisions must be untouched by the claim: %#v", got)
+	}
+}
+
 // Test 7 — `fleet checkpoint decision` appends to recent_decisions.
 func TestCheckpointDecision_AppendsBuffer(t *testing.T) {
 	home := t.TempDir()
@@ -268,6 +309,57 @@ func TestCheckpointDecision_AppendsBuffer(t *testing.T) {
 	// Sibling preserved.
 	if tc, _ := m["tick_count"].(float64); tc != 3 {
 		t.Errorf("tick_count clobbered: %v", m["tick_count"])
+	}
+}
+
+// `fleet checkpoint decision` ALSO writes the durable session_decisions
+// buffer: per-entry coord_id stamp, dedupe-by-text (re-log refreshes to the
+// tail), cap checkpointSessionDecisionsMax — independent of the 10-deep
+// recent_decisions cap so tick lines can never evict a rationale.
+func TestCheckpointDecision_SessionDecisionsDurable(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("FLEET_HOME", home)
+	if _, err := state.Bootstrap(); err != nil {
+		t.Fatalf("Bootstrap: %v", err)
+	}
+	t.Setenv("FLEET_AGENT_ID", "cafe0123")
+	const n = checkpointSessionDecisionsMax + 3
+	for i := 0; i < n; i++ {
+		if err := runCheckpoint(t, "decision", "--project", "myproj",
+			fmt.Sprintf("rationale-%02d", i)); err != nil {
+			t.Fatalf("decision %d: %v", i, err)
+		}
+	}
+	// Re-log an existing one → deduped, moved to tail.
+	if err := runCheckpoint(t, "decision", "--project", "myproj", "rationale-10"); err != nil {
+		t.Fatalf("relog: %v", err)
+	}
+	m := readCoordState(t, home, "myproj")
+	raw, ok := m["session_decisions"].([]any)
+	if !ok || len(raw) != checkpointSessionDecisionsMax {
+		t.Fatalf("session_decisions: want cap %d, got %#v", checkpointSessionDecisionsMax, m["session_decisions"])
+	}
+	last := raw[len(raw)-1].(map[string]any)
+	if last["text"] != "rationale-10" || last["coord_id"] != "cafe0123" {
+		t.Errorf("tail entry: %#v", last)
+	}
+	if _, ok := last["ts"].(string); !ok {
+		t.Errorf("entry missing ts: %#v", last)
+	}
+	texts := map[string]int{}
+	for _, e := range raw {
+		texts[e.(map[string]any)["text"].(string)]++
+	}
+	if texts["rationale-10"] != 1 {
+		t.Errorf("re-logged rationale must be deduped: %d copies", texts["rationale-10"])
+	}
+	if texts["rationale-00"] != 0 {
+		t.Errorf("oldest entry must be evicted past the cap")
+	}
+	// The rolling buffer is still capped at 10 — the durable one is why the
+	// rationale survives.
+	if rd, _ := m["recent_decisions"].([]any); len(rd) != checkpointDefaultDecisions {
+		t.Errorf("recent_decisions cap: got %d", len(rd))
 	}
 }
 

@@ -755,14 +755,37 @@ def _decision_line(action) -> str:
     return ""
 
 
-def _record_decision(state: dict, action) -> None:
+def _record_decision(state: dict, action, coord_id: str = "") -> None:
     """Shared seam: record a decision line for `action` into the
     recent_decisions checkpoint buffer (in-memory; the enclosing loop
-    persists `state`). Best-effort — never raises."""
+    persists `state`). Non-dispatch lines (reconcile transitions, raised
+    hands, worker-finished / requeued / parked sentinels) ALSO mirror into
+    the durable session_decisions buffer: those are the tick's material
+    calls, and a 10-deep rolling buffer evicts them within a few busy
+    ticks. Dispatches stay rolling-only — Active Subagents / Status already
+    narrate them, and three lines per task would crowd the durable buffer.
+    Best-effort — never raises."""
     try:
         line = _decision_line(action)
-        if line:
-            dispatch_mod.record_checkpoint_decision(state, line)
+        if not line:
+            return
+        if isinstance(action, _DispatchAction):
+            dispatch_mod.record_checkpoint_decision(state, line, coord_id)
+        else:
+            _record_material_decision(state, line, coord_id)
+    except Exception:  # noqa: BLE001 — a decision-log fault must not wedge a tick
+        pass
+
+
+def _record_material_decision(state: dict, line: str, coord_id: str = "") -> None:
+    """Record a free-text material decision into BOTH buffers: the rolling
+    recent_decisions (owner-claimed) and the durable, coord-stamped
+    session_decisions. The one seam for tick-side decisions that are not
+    dispatches (reconcile transitions, PR-merged flips, raised hands).
+    Best-effort — never raises."""
+    try:
+        dispatch_mod.record_checkpoint_decision(state, line, coord_id)
+        dispatch_mod.record_session_decision(state, line, coord_id)
     except Exception:  # noqa: BLE001 — a decision-log fault must not wedge a tick
         pass
 
@@ -901,7 +924,7 @@ def _tick_locked(
             # Slice 3 (Key Decisions): record the decision for this applied
             # reconcile into recent_decisions (the "why"). `state` is the
             # primary tick dict, persisted at the heartbeat below.
-            _record_decision(state, action)
+            _record_decision(state, action, coord_id)
             if action.raised_to_user:
                 result.raised += 1
             # Drop slug → agent_id mapping when the worker is gone (any
@@ -1057,7 +1080,7 @@ def _tick_locked(
             # Checkpoint narrative (Slice 2/3): an APPLIED sentinel is a
             # decision (drain event). NOT a completion — task_done_pr →
             # in-review, worker_failed → requeue; neither is a true done.
-            _record_decision(state, action)
+            _record_decision(state, action, coord_id)
             if action.raised_to_user:
                 result.raised += 1
             # Worker is leaving the in-flight set on TASK_DONE_PR
@@ -1273,7 +1296,7 @@ def _tick_locked(
                 result.dispatched += 1
                 # Checkpoint narrative (Slice 3): reviewer/finisher
                 # dispatch is a decision.
-                _record_decision(state, action)
+                _record_decision(state, action, coord_id)
                 # Session-scoped Next Steps: record the slug this coord
                 # dispatched a reviewer/finisher for (auto buffer).
                 _record_session_task(state, action.slug, coord_id)
@@ -1346,7 +1369,7 @@ def _tick_locked(
                 result.dispatched += 1
                 # Checkpoint narrative (Slice 3): a genuine dispatch (a
                 # block was emitted) is a decision — never a completion.
-                _record_decision(state, action)
+                _record_decision(state, action, coord_id)
                 # Session-scoped Next Steps: record the dispatched slug into
                 # the auto buffer (rendered while still ready/todo).
                 _record_session_task(state, action.slug, coord_id)
@@ -1482,7 +1505,7 @@ def _tick_locked(
         _reconcile_pr_watches(
             watch_tasks, project=project, project_dir=project_dir,
             cwd=cwd, fleet_bin=fleet_bin, state=state, result=result,
-            home=home,
+            home=home, coord_id=coord_id,
             enroll_tasks=list(pre_reconcile_tasks_by_slug.values()),
         )
     except Exception as exc:  # noqa: BLE001 — watch reconcile must never wedge a tick
@@ -1740,7 +1763,7 @@ def _run_supervisor(
                 # Slice 3 (Key Decisions): record into `cs` —
                 # _save_coord_state(state_path, cs) at the end of this loop
                 # persists it for the post-supervisor checkpoint write.
-                _record_decision(cs, action)
+                _record_decision(cs, action, coord_id)
                 if action.clear_worker:
                     # PR1 dispatch-lifecycle: release coord_prompt_inbox
                     # BEFORE forget_agent_id (same ordering rule as the
@@ -1868,7 +1891,7 @@ def _run_supervisor(
                         emitted_this_tick.add(action.agent_id)
                 # Checkpoint narrative (Slice 3): record into `cs`
                 # (persisted by _save_coord_state at this loop's end).
-                _record_decision(cs, action)
+                _record_decision(cs, action, coord_id)
                 # Session-scoped Next Steps: supervisor review-handoff seam.
                 _record_session_task(cs, action.slug, coord_id)
             except Exception as exc:  # noqa: BLE001
@@ -1927,7 +1950,7 @@ def _run_supervisor(
                         emitted_this_tick.add(action.agent_id)
                 # Checkpoint narrative (Slice 3): supervisor-dispatched
                 # worker is a decision; record into `cs`.
-                _record_decision(cs, action)
+                _record_decision(cs, action, coord_id)
                 # Session-scoped Next Steps: supervisor dispatch seam.
                 _record_session_task(cs, action.slug, coord_id)
             except Exception as exc:  # noqa: BLE001
@@ -2005,7 +2028,7 @@ def _run_supervisor(
             _reconcile_pr_watches(
                 f_pw.tasks, project=project, project_dir=project_dir,
                 cwd=cwd, fleet_bin=fleet_bin,
-                state=cs_pw, result=result, home=home,
+                state=cs_pw, result=result, home=home, coord_id=coord_id,
                 enroll_tasks=enroll_tasks if enroll_tasks is not None else f_pw.tasks,
             )
             # Slice 2 fix: _reconcile_pr_watches mutates cs_pw["recent_completions"]
@@ -2245,7 +2268,7 @@ def _run_supervisor(
                 # Checkpoint narrative (Slice 2/3): an APPLIED deferred
                 # sentinel is a decision; record into `cs` (the caller
                 # persists it via _save_coord_state).
-                _record_decision(cs, action)
+                _record_decision(cs, action, coord_id)
                 # Codex iter-23 [P2]: same blocked_question carve-out
                 # as the non-replay drain — blocked workers stay alive,
                 # so we must preserve the agent_id mapping. Only the
@@ -2424,7 +2447,7 @@ def _run_supervisor(
                 # (the COMMON supervisor path — merge→done flip /
                 # worker-failed park) is a decision. Record into `cs`
                 # (persisted by _save_coord_state at this loop's end).
-                _record_decision(cs, action)
+                _record_decision(cs, action, coord_id)
                 # Codex iter-22 [P1]: blocked workers stay ALIVE so
                 # the operator can answer the BLOCKED_QUESTION. We
                 # must NOT forget the agent_id mapping in that case —
@@ -6267,6 +6290,7 @@ def _reconcile_pr_watches(
     result,
     home: Path | None = None,
     enroll_tasks: list[parse.Task] | None = None,
+    coord_id: str = "",
 ) -> None:
     """Drive one PR-watch reconcile pass (DESIGN-coord-pr-watch-durable,
     PR1 tracking + PR2 auto-fix). Hooks the pr_watch module into the tick:
@@ -6346,12 +6370,9 @@ def _reconcile_pr_watches(
             state, f"merged {slug} {pr_url}".rstrip(),
         )
         # Slice 3 (Key Decisions): the same PR-merged flip is also a
-        # decision (→ Key Decisions). Inline (not via _record_decision) —
-        # this closure has slug+pr_url, not an action object. Best-effort.
-        try:
-            dispatch_mod.record_checkpoint_decision(state, f"merged PR → task {slug} done")
-        except Exception:  # noqa: BLE001
-            pass
+        # material decision (→ Key Decisions, rolling + durable). Not via
+        # _record_decision — this closure has slug+pr_url, not an action.
+        _record_material_decision(state, f"merged PR → task {slug} done", coord_id)
 
     # --- PR2 auto-fix seam (DESIGN §5.1c / §6). Three injected callbacks
     # keep pr_watch shell-free: it decides WHAT to dispatch + owns the
@@ -8298,10 +8319,24 @@ def _run_fleet(cmd: list[str], timeout_s: float = 30.0) -> None:
     here is an operator-visible problem (the file's locked, the binary
     missing, etc.). Caller wraps in try/except and accumulates into
     TickResult.errors.
+
+    FLEET_TICK=1 marks the shell-out as tick-driven: `fleet tasks set` /
+    `promote` self-record a Key Decisions line only from the coord AGENT's
+    shell, never from inside a tick (the tick records its own transitions
+    in-memory, and a coord-state.json write mid-tick would be clobbered
+    by the tick's load-mutate-save).
     """
-    proc = subprocess.run(
-        cmd, capture_output=True, text=True, timeout=timeout_s, check=False,
-    )
+    prev = os.environ.get("FLEET_TICK")
+    os.environ["FLEET_TICK"] = "1"
+    try:
+        proc = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=timeout_s, check=False,
+        )
+    finally:
+        if prev is None:
+            os.environ.pop("FLEET_TICK", None)
+        else:
+            os.environ["FLEET_TICK"] = prev
     if proc.returncode != 0:
         msg = (proc.stderr or proc.stdout or "").strip()
         raise RuntimeError(f"{' '.join(cmd)}: {msg or f'exit {proc.returncode}'}")
