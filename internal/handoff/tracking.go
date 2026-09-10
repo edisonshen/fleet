@@ -14,6 +14,12 @@ package handoff
 // and the state at each, without opening the handoff chain. Terminal rows
 // (done/abandoned) are skipped — nothing left to track.
 //
+// Rows are a snapshot taken when the doc was built; the write happens
+// later (enrichment shells out, the auto path waits on the publish
+// fence). A task the tick moved meanwhile — status, parked, pr_url — is
+// SKIPPED rather than annotated with a stale line, and Updated is never
+// moved backwards.
+//
 // Best-effort like the rest of enrichment: a missing tasks.md, a lock
 // timeout, or a parse error returns an error the caller LOGS and ignores;
 // the handoff doc is already on disk and must not be failed by a tracking
@@ -53,7 +59,8 @@ func TrackingLine(r StatusRow, agentID string, number int, ts time.Time) string 
 
 // RecordTaskTracking appends a TrackingLine to the Notes of every
 // non-terminal row in tasks.md under project. Returns the number of tasks
-// updated. Rows whose slug is no longer in tasks.md are skipped.
+// updated. Rows whose slug is no longer in tasks.md, or whose task no
+// longer matches the row (see rowStale), are skipped.
 func RecordTaskTracking(project, agentID string, number int, ts time.Time, rows []StatusRow) (int, error) {
 	if len(rows) == 0 {
 		return 0, nil
@@ -79,7 +86,7 @@ func RecordTaskTracking(project, agentID string, number int, ts time.Time, rows 
 			continue
 		}
 		t, gerr := f.Get(r.Slug)
-		if gerr != nil {
+		if gerr != nil || rowStale(r, t) {
 			continue
 		}
 		line := TrackingLine(r, agentID, number, ts)
@@ -88,7 +95,9 @@ func RecordTaskTracking(project, agentID string, number int, ts time.Time, rows 
 		} else {
 			t.Notes = t.Notes + "\n\n" + line
 		}
-		t.Updated = ts.UTC()
+		if ts.After(t.Updated) {
+			t.Updated = ts.UTC()
+		}
 		n++
 	}
 	if n == 0 {
@@ -98,4 +107,19 @@ func RecordTaskTracking(project, agentID string, number int, ts time.Time, rows 
 		return 0, fmt.Errorf("write tasks.md: %w", err)
 	}
 	return n, nil
+}
+
+// rowStale reports whether the task on disk has moved since the row was
+// collected: a different status/parked label, a terminal status, or a
+// changed tasks.md pr_url. The row's PRURL may have come from a PR
+// watch when tasks.md had none, so an empty on-disk pr_url is not a
+// mismatch by itself.
+func rowStale(r StatusRow, t *tasks.Task) bool {
+	if t.Status == tasks.StatusDone || t.Status == tasks.StatusAbandoned {
+		return true
+	}
+	if statusLabel(t) != r.Status {
+		return true
+	}
+	return t.PRURL != "" && t.PRURL != r.PRURL
 }

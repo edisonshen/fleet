@@ -346,6 +346,46 @@ func TestRecordTaskTracking_AppendsNotes(t *testing.T) {
 		t.Errorf("terminal row must not be annotated: %q", done.Notes)
 	}
 
+	// Rows are a snapshot; a task the tick moved after collection must not
+	// get a stale line, and Updated never moves backwards.
+	later := ts.Add(90 * time.Second)
+	moved := mkTaskPR("moved-1", "in-review", "P1", "https://github.com/o/r/pull/9") // row said in-progress
+	parked := mkTaskPR("parked-1", "ready", "P2", "")                                // row said ready, now parked
+	parked.Parked = "operator: hold"
+	newPR := mkTaskPR("newpr-1", "in-review", "P1", "https://github.com/o/r/pull/11") // row saw PR #10
+	finished := mkTaskPR("fin-1", "done", "P1", "https://github.com/o/r/pull/12")     // row said in-review
+	fresh := mkTaskPR("fresh-1", "in-progress", "P1", "")
+	fresh.Updated = later
+	fromWatch := mkTaskPR("watch-1", "in-review", "P1", "") // tasks.md has no pr_url; row's came from a watch
+	writeTasksFile(t, filepath.Join(pdir, "tasks.md"), moved, parked, newPR, finished, fresh, fromWatch)
+	rows = []StatusRow{
+		{Slug: "moved-1", Status: "in-progress", PRURL: "https://github.com/o/r/pull/9"},
+		{Slug: "parked-1", Status: "ready"},
+		{Slug: "newpr-1", Status: "in-review", PRURL: "https://github.com/o/r/pull/10", PRState: "PR #10 open"},
+		{Slug: "fin-1", Status: "in-review", PRURL: "https://github.com/o/r/pull/12"},
+		{Slug: "fresh-1", Status: "in-progress"},
+		{Slug: "watch-1", Status: "in-review", PRURL: "https://github.com/o/r/pull/13", PRState: "PR #13 open"},
+	}
+	n, err = RecordTaskTracking("p", "c1", 5, ts, rows)
+	if err != nil {
+		t.Fatalf("RecordTaskTracking (stale): %v", err)
+	}
+	if n != 2 {
+		t.Errorf("stale pass updated %d tasks, want 2 (fresh-1, watch-1)", n)
+	}
+	f, _ = tasks.Read(filepath.Join(pdir, "tasks.md"))
+	for _, slug := range []string{"moved-1", "parked-1", "newpr-1", "fin-1"} {
+		if tk, _ := f.Get(slug); tk.Notes != "" {
+			t.Errorf("%s moved after collection; must not be annotated: %q", slug, tk.Notes)
+		}
+	}
+	if tk, _ := f.Get("fresh-1"); !strings.HasPrefix(tk.Notes, "Handoff ") || !tk.Updated.Equal(later) {
+		t.Errorf("fresh-1: notes=%q updated=%v (want annotated, Updated kept at %v)", tk.Notes, tk.Updated, later)
+	}
+	if tk, _ := f.Get("watch-1"); !strings.Contains(tk.Notes, "PR #13 open") {
+		t.Errorf("watch-1 (pr_url from watch) must be annotated: %q", tk.Notes)
+	}
+
 	// No rows → no-op, no error, no tasks.md required.
 	if n, err := RecordTaskTracking("nope", "c1", 1, ts, nil); err != nil || n != 0 {
 		t.Errorf("empty rows: n=%d err=%v", n, err)

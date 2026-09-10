@@ -766,9 +766,15 @@ func runDispatch(opts *dispatchOpts, stdout io.Writer) error {
 	// dir if they need to.
 	var oldRecord *agent.Record
 	var newDocPath string
+	// recoveryDoc is the synthesized doc; its Status rows are mirrored
+	// into tasks.md only at a commit point where a successor has taken
+	// the doc (spawned below, or delivered to the live leader on lease
+	// stand-down). Engine refusal, repo resolution failure, or a failed
+	// spawn must not leave a "Handoff …" line no coord inherited.
+	var recoveryDoc *handoff.Doc
 	if opts.coordSpawn {
 		if dead := findRecoveryCandidate(opts.taskID, opts.project, coordRecords, pidAlive, tmuxHasSession, coordStateFresh); dead != nil {
-			docPath, derr := writeRecoveryHandoffDoc(dead, time.Now().UTC())
+			docPath, doc, derr := writeRecoveryHandoffDoc(dead, time.Now().UTC())
 			if derr != nil {
 				_, _ = fmt.Fprintf(stdout,
 					"warning: synth handoff doc write failed (%v) — proceeding with fresh spawn (workers state preserved on disk)\n",
@@ -776,6 +782,7 @@ func runDispatch(opts *dispatchOpts, stdout io.Writer) error {
 			} else {
 				oldRecord = dead
 				newDocPath = docPath
+				recoveryDoc = doc
 				// Snapshot the dead record's original engine BEFORE
 				// the clamp mutates it (codex review iter-12 P2). The
 				// command-inheritance check below needs to know
@@ -1017,6 +1024,7 @@ func runDispatch(opts *dispatchOpts, stdout io.Writer) error {
 				_, _ = fmt.Fprintf(stdout,
 					"recovery doc delivered to live coord %s for project %s after lease stand-down\n",
 					ownerRec.ID, opts.project)
+				recordHandoffTracking(recoveryDoc, opts.project, os.Stderr)
 				archiveDeadCoordPredecessorsFn(opts.project, stdout, os.Stderr)
 			case errors.Is(derr, handoffdelivery.ErrNoOwnerObserved):
 				// No lease owner converged (legacy/bare leader). The durable
@@ -1087,6 +1095,11 @@ func runDispatch(opts *dispatchOpts, stdout io.Writer) error {
 	// findRecoveryCandidate's newest-wins tiebreaker (codex iter-7
 	// P2) picks the most-recent dead record if multiple recoveries
 	// accumulate, so successive recoveries don't fork lineages.
+
+	// Recovery commit point: the successor exists and inherited
+	// newDocPath (spawn.Spawn's OldRecord branch), so the doc's Status
+	// rows now belong in each task's history. nil doc → no-op.
+	recordHandoffTracking(recoveryDoc, opts.project, os.Stderr)
 
 	_, _ = fmt.Fprintf(stdout, "agent %s spawned\n", rec.ID)
 	_, _ = fmt.Fprintf(stdout, "  task:    %s\n", rec.TaskID)

@@ -410,13 +410,9 @@ func CollectStatusRows(pdir, agentID string, subs []ActiveSubagent) []StatusRow 
 		if prURL == "" && w != nil {
 			prURL = w.PRURL
 		}
-		status := string(t.Status)
-		if t.Parked != "" && t.Status != tasks.StatusBlocked {
-			status += " (parked)"
-		}
 		rows = append(rows, StatusRow{
 			Slug:     t.Slug,
-			Status:   status,
+			Status:   statusLabel(t),
 			Priority: string(t.Priority),
 			Phase:    phaseBySlug[t.Slug],
 			PRURL:    prURL,
@@ -426,6 +422,16 @@ func CollectStatusRows(pdir, agentID string, subs []ActiveSubagent) []StatusRow 
 		})
 	}
 	return rows
+}
+
+// statusLabel is the row's Status text: the tasks.md enum, with a
+// "(parked)" suffix for a non-blocked task the operator parked.
+func statusLabel(t *tasks.Task) string {
+	status := string(t.Status)
+	if t.Parked != "" && t.Status != tasks.StatusBlocked {
+		status += " (parked)"
+	}
+	return status
 }
 
 // RenderStatus renders the `## Status` body: a one-line header, a
