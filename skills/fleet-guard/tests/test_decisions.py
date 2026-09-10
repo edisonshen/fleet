@@ -167,6 +167,72 @@ def test_capture_keeps_cursor_when_record_fails(tmp_path, monkeypatch):
     assert not decisions.cursor_path(AGENT).exists()
 
 
+@pytest.mark.parametrize("text", [
+    "use ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789ab for the push",
+    "github_pat_11ABCDEFG0123456789_abcdefghijklmnopqrstuvwxyz",
+    "key is sk-ant-api03-abcdefghijklmnopqrstuvwxyz0123456789",
+    "AKIAIOSFODNN7EXAMPLE is the access key",
+    "xoxb-1234567890-abcdefghij",
+    "-----BEGIN RSA PRIVATE KEY-----\nMIIE...",
+    "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dozjgNryP4J3jVmNHl0w5N_XgL0n3I9PlFUP0THsR8U",
+    "Authorization: Bearer abcdefghijklmnopqrstuvwxyz",
+    "password=hunter2hunter2",
+    'DB_PASSWORD: "s3cr3t-value"',
+    "api_key = 0123456789abcdef",
+    "clone https://user:p4ssw0rd@github.com/o/r.git",
+])
+def test_looks_secret_matches_credential_shapes(text):
+    assert decisions.looks_secret(text)
+
+
+@pytest.mark.parametrize("text", [
+    "defer the cache refactor, do auth first",
+    "merged 41c0cb9afee3f295201aa6339fe40f1edd17a1c4 into main",
+    "the token budget is 200k; context at 41%",
+    "rotate the API key for the staging account tomorrow",
+    "password reset flow is out of scope",
+    "PR #301 https://github.com/edisonshen/fleet/pull/301 is green",
+    "",
+])
+def test_looks_secret_ignores_normal_coord_chat(text):
+    assert not decisions.looks_secret(text)
+
+
+def test_capture_skips_exchange_that_looks_like_a_secret(tmp_path, recorded, capsys):
+    # Token is in the operator turn, past the 240-char truncation point:
+    # the veto runs on the untruncated text.
+    op = "please use this " + ("x" * 250) + " ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789ab"
+    tp = write_transcript(
+        tmp_path,
+        _user(op, uuid="u1"),
+        _assistant({"type": "text", "text": "Set."}),
+    )
+    assert decisions.capture({"transcript_path": tp}, AGENT) is None
+    assert recorded == []
+    assert "looks like it contains a secret" in capsys.readouterr().err
+    # Cursor advances so the same turn is not re-examined every Stop ...
+    assert decisions.cursor_path(AGENT).read_text() == "u1"
+    assert decisions.capture({"transcript_path": tp}, AGENT) is None
+    # ... and the next clean turn records normally.
+    tp2 = write_transcript(
+        tmp_path,
+        _user(op, uuid="u1"),
+        _assistant({"type": "text", "text": "Set."}),
+        _user("park cache-1234", uuid="u2"),
+        _assistant({"type": "text", "text": "Parked."}),
+    )
+    assert decisions.capture({"transcript_path": tp2}, AGENT) == "operator: park cache-1234 → coord: Parked."
+
+    # Secret in the COORD's reply vetoes too.
+    tp3 = write_transcript(
+        tmp_path,
+        _user("what's in .env?", uuid="u3"),
+        _assistant({"type": "text", "text": "STRIPE_KEY=sk_live_abcdefghijklmnopqrstuv"}),
+    )
+    assert decisions.capture({"transcript_path": tp3}, AGENT) is None
+    assert recorded == ["operator: park cache-1234 → coord: Parked."]
+
+
 def test_record_shells_checkpoint_decision_with_project(monkeypatch, tmp_path):
     fake_bin = tmp_path / "bin" / "fleet"
     fake_bin.parent.mkdir()

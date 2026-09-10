@@ -24,6 +24,13 @@ own injections (HANDOFF REQUESTED, [FLEET] nags). Operator turns are rare
 and are exactly where conversation-only decisions live, so the buffer stays
 compact. Both halves are truncated so one exchange is one readable line.
 
+An exchange that looks like it carries a credential (a known token
+prefix, a private-key block, a `password=` assignment, a JWT, a URL with
+embedded userinfo, ...) is NOT recorded at all — coord-state.json outlives
+the transcript in handoff docs and tasks.md, so a pasted secret must never
+become durable state. The whole exchange is dropped (not redacted) and the
+cursor still advances, so the same turn is not re-examined on every Stop.
+
 The write goes through `fleet checkpoint decision` (coordinator.lock,
 load-mutate-save, coord_id stamp, dedupe) rather than touching
 coord-state.json from Python. A cursor file remembers the last captured
@@ -36,6 +43,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -60,6 +68,41 @@ _SKIP_PREFIXES = (
 MAX_OPERATOR_CHARS = 240
 MAX_COORD_CHARS = 240
 _CHECKPOINT_TIMEOUT_S = 10.0
+
+# Secret shapes that veto capture of the whole exchange. Deliberately
+# specific (vendor prefixes, key blocks, credential assignments) rather than
+# entropy-based: a 40-hex commit SHA or a long slug is normal coord chat.
+_SECRET_PATTERNS = tuple(re.compile(p) for p in (
+    r"-----BEGIN [A-Z ]*PRIVATE KEY-----",
+    r"\b(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{20,}",  # GitHub tokens
+    r"\bgithub_pat_[A-Za-z0-9_]{20,}",
+    r"\bglpat-[A-Za-z0-9_-]{20,}",  # GitLab
+    r"\bsk-(?:ant-)?[A-Za-z0-9_-]{20,}",  # OpenAI / Anthropic
+    r"\b(?:sk|rk|pk)_(?:live|test)_[A-Za-z0-9]{16,}",  # Stripe
+    r"\bxox[abprs]-[A-Za-z0-9-]{10,}",  # Slack
+    r"\bAKIA[0-9A-Z]{16}\b",  # AWS access key id
+    r"\bAIza[0-9A-Za-z_-]{35}\b",  # Google API key
+    r"\bnpm_[A-Za-z0-9]{36}\b",
+    r"\bhf_[A-Za-z0-9]{30,}\b",  # Hugging Face
+    r"\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}",  # JWT
+    r"(?i)\b(?:bearer|basic)\s+[A-Za-z0-9._~+/=-]{16,}",  # Authorization header
+    r"(?i)(?<![a-z])(?:passw(?:or)?d|passphrase|secret|api[_-]?key|access[_-]?key|"
+    r"auth[_-]?token|(?:private|secret|access|refresh|session)[_-]?token|"
+    r"client[_-]?secret)\b\s*[:=]\s*[\"']?[^\s\"']{6,}",  # key=value assignment
+    r"://[^/\s:@]+:[^/\s@]+@",  # URL with userinfo (user:pass@host)
+))
+
+
+def looks_secret(*texts: str) -> bool:
+    """True when any text matches a known credential shape. Run on the
+    UNTRUNCATED exchange so a token past the 240-char cut still vetoes."""
+    for text in texts:
+        if not text:
+            continue
+        for pat in _SECRET_PATTERNS:
+            if pat.search(text):
+                return True
+    return False
 
 
 def cursor_path(agent_id: str) -> Path:
@@ -230,11 +273,20 @@ def capture(payload: dict, agent_id: str) -> str | None:
     key, op, reply = found
     if key and key == _read_cursor(agent_id):
         return None
+    if looks_secret(op, reply):
+        print("fleet-guard: decisions: exchange looks like it contains a secret; not recorded",
+              file=sys.stderr)
+        _advance_cursor(agent_id, key)
+        return None
     line = decision_line(op, reply)
     if not record(line):
         return None
+    _advance_cursor(agent_id, key)
+    return line
+
+
+def _advance_cursor(agent_id: str, key: str) -> None:
     try:
         _write_cursor(agent_id, key)
     except Exception as exc:
         print(f"fleet-guard: decisions: cursor write failed: {exc}", file=sys.stderr)
-    return line
