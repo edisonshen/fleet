@@ -6,6 +6,41 @@ follows [SemVer](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.18.1] - 2026-09-11
+
+A coordinator no longer loses its subagents' work to a context-window handoff,
+and its successor gets a real brief instead of placeholders. At 40% the handoff
+is now soft: the coord stops opening new work, keeps ticking until every
+in-flight worker and PR-watch fixer has returned, and only then writes the doc
+and hands over; 50% remains the hard stop that writes immediately with whatever
+is still in flight listed for the successor. The handoff doc gains a `## Status`
+block and durably recorded Key Decisions, so the successor no longer depends on
+the outgoing coord having typed `fleet checkpoint decision`.
+
+### Added
+
+- `## Status` handoff section: per-task status / PR state / next job, the
+  successor's at-a-glance brief; the same rows are mirrored into each task's
+  `tasks.md` Notes once a successor holds the doc (#301).
+- Key Decisions are recorded automatically into durable `session_decisions`:
+  `fleet tasks set status|priority|parked` and `tasks promote` from a coord
+  shell, the tick's non-dispatch transitions (reconcile, requeue, park, raise
+  hand, worker finished), and each operator prompt + final coord reply via the
+  fleet-guard Stop hook (#301).
+
+### Changed
+
+- 40% (Yellow) is a soft coordinator handoff: fleet-guard injects the
+  coord-specific `HANDOFF REQUESTED` and holds the doc write until
+  `coord-state.json:worker_agent_ids` and running `pr-watches.json` leases are
+  empty; each hold logs the outstanding subagents. 50% (Red) is unchanged —
+  the doc is written immediately with in-flight workers under Active Subagents
+  (#302).
+- The coord tick emits no new worker or PR-watch fixer `DISPATCH` blocks while
+  its record carries a pending `handoff_type` (`result.errors` reports
+  `handoff pending`); reviewer/finisher handoffs, reconcile, and PR-watch
+  tracking keep running so the in-flight set only shrinks (#302).
+
 ## [0.18.0] - 2026-09-08
 
 Handoffs stop losing their payload. An auto-handoff (40/50% context) used to
