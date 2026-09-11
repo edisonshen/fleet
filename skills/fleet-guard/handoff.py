@@ -25,8 +25,20 @@ State machine on every Stop hook fire (delegated to maybe_trigger):
         handoff_type=    ^MILESTONE$ found?
         auto-yellow         │ no       │ yes
                             ▼          ▼
-                          noop     write doc + queue
-                                   (type from record)
+                          noop    coord with subagents
+                                  still in flight?
+                                    │ yes      │ no
+                                    ▼          ▼
+                                  hold     write doc + queue
+                                           (type from record)
+
+Yellow is the SOFT handoff. For a coordinator it additionally waits until
+every subagent it dispatched has returned — the durable ledgers are
+coord-state.json:worker_agent_ids and pr-watches.json running leases — so
+the doc carries their results rather than a list of things still running.
+The coord tick stops emitting new worker DISPATCH blocks while the record
+is marked (loop.py reads handoff_type), so the in-flight set only shrinks.
+Red is the HARD handoff: no MILESTONE, no subagent wait, write now.
 
 PreCompact hook fires emergency_trigger directly — same write path as Red,
 no threshold check.
@@ -121,13 +133,36 @@ _YELLOW_RESEND_THRESHOLD_SEC = 30 * 60
 _ANSI_SGR_RE = re.compile(r"\x1b\[[0-9;]*[mK]")
 
 
-def inject_handoff_requested() -> str:
+def inject_handoff_requested(*, coord: bool = False) -> str:
     """The exact text injected into the agent's next turn at Yellow.
 
     The agent is expected to wrap up, summarize via MILESTONE on its own
     line, and stop. The skill picks up the MILESTONE on the following fire
     and writes the handoff doc.
+
+    A coordinator gets the soft-handoff variant: no new work, let the
+    in-flight subagents return and land their results in coord state, then
+    MILESTONE. The skill holds the write until the subagent ledgers are
+    empty (see _coord_subagents_inflight).
     """
+    if coord:
+        return (
+            f"{HANDOFF_REQUESTED}: context window is over 40% — SOFT "
+            f"coordinator handoff. Start no new work: the tick emits no "
+            f"new worker DISPATCH blocks while this handoff is pending "
+            f"(reviewer/finisher handoffs and PR-watch keep running). Let "
+            f"every in-flight subagent return; after each return run the "
+            f"tick so its result lands in coord state, and record anything "
+            f"a successor needs (`fleet checkpoint next-step ...`, "
+            f"`fleet checkpoint decision ...`). Then on its own line write "
+            f"a single token:\n\n"
+            f"{MILESTONE}\n\n"
+            f"fleet-guard writes your handoff doc only once {MILESTONE} is "
+            f"present AND no subagent is still in flight, then spawns a "
+            f"fresh coord and retires this one. At 50% the handoff is "
+            f"forced regardless. Do not write MILESTONE mid-paragraph; it "
+            f"must be the only thing on its line."
+        )
     return (
         f"{HANDOFF_REQUESTED}: context window is over 40%. "
         f"Wrap up the current sub-task at the next safe boundary, "
@@ -354,6 +389,7 @@ def maybe_trigger(payload: dict[str, Any], *, agent_id: str,
         state = health.threshold(pct)
         committed = _is_handoff_committed(record)
         yellow_pending = record.get("handoff_type") == TYPE_AUTO_YELLOW
+        is_coord = _is_coord_record(record)
 
         if state == "red":
             # Bail only if the doc + queue already exist (drain owns it
@@ -380,6 +416,24 @@ def maybe_trigger(payload: dict[str, Any], *, agent_id: str,
                 return None
             if yellow_pending:
                 if find_milestone(session):
+                    # Soft handoff: a coord waits for every subagent it
+                    # dispatched to return so the doc carries their
+                    # results. The tick refuses new worker dispatches
+                    # while auto-yellow is set, so this converges; Red
+                    # at 50% is the hard ceiling.
+                    inflight = (
+                        _coord_subagents_inflight(record["project"])
+                        if is_coord else []
+                    )
+                    if inflight:
+                        print(
+                            f"fleet-guard: soft handoff for coord "
+                            f"{agent_id} holding — {len(inflight)} "
+                            f"subagent(s) still in flight: "
+                            f"{', '.join(inflight)}",
+                            file=sys.stderr,
+                        )
+                        return None
                     if not _do_handoff(record, session,
                                        TYPE_AUTO_YELLOW, pct):
                         _clear_pending(agent_id)
@@ -396,14 +450,14 @@ def maybe_trigger(payload: dict[str, Any], *, agent_id: str,
                         agent_id,
                         handoff_type_at=health.now_rfc3339(),
                     )
-                    return inject_handoff_requested()
+                    return inject_handoff_requested(coord=is_coord)
                 return None
             health.update_record(
                 agent_id,
                 handoff_type=TYPE_AUTO_YELLOW,
                 handoff_type_at=health.now_rfc3339(),
             )
-            return inject_handoff_requested()
+            return inject_handoff_requested(coord=is_coord)
 
         return None
     except Exception as exc:
@@ -457,7 +511,6 @@ def _do_handoff(record: dict[str, Any], session: str,
     wedged until manual repair).
     """
     agent_id = record["id"]
-    task_id = record.get("task_id", "")
     project = record.get("project", "")
 
     # (a) FENCE (correctness — DESIGN-handoff-drain-storm-leak PR4 item 10a).
@@ -478,7 +531,7 @@ def _do_handoff(record: dict[str, Any], session: str,
     # identity is the EXACT task_id "coord-<project>" (mirrors
     # internal/tui.coordTaskID); a prefix match would misclassify a worker
     # whose slug merely starts with "coord-" (codex PR4 [P2]).
-    is_coord = bool(project) and task_id == _COORD_TASK_ID_PREFIX + project
+    is_coord = _is_coord_record(record)
     if is_coord and _producer_fenced(project):
         print(
             f"fleet-guard: handoff producer for coord agent {agent_id} "
@@ -660,6 +713,51 @@ def _fleet_binary() -> str | None:
 # internal/spawn.IsCoordSpawn). A prefix match would misclassify a worker
 # whose slug merely starts with "coord-".
 _COORD_TASK_ID_PREFIX = "coord-"
+
+
+def _is_coord_record(record: dict[str, Any]) -> bool:
+    project = record.get("project", "")
+    return bool(project) and (
+        record.get("task_id", "") == _COORD_TASK_ID_PREFIX + project
+    )
+
+
+def _coord_subagents_inflight(project: str) -> list[str]:
+    """Labels of the subagents this coord still has out, from the two
+    durable ledgers the tick maintains: `coord-state.json:worker_agent_ids`
+    (slug -> fleet agent id; cleared when the worker's task reconciles to
+    a terminal status) and `pr-watches.json` watches whose
+    `inflight_action.outcome` is "running" (a PR-watch fixer/rebaser the
+    §6 lease has not yet resolved). Same sources `fleet handoff-write`
+    renders as Active Subagents / Open PRs.
+
+    Empty list when nothing is in flight. A missing or malformed ledger
+    contributes nothing — the soft handoff then degrades to the legacy
+    MILESTONE-only gate rather than wedging until Red."""
+    pdir = health.fleet_home() / "projects" / project
+    out: list[str] = []
+    try:
+        with open(pdir / "coord-state.json", encoding="utf-8") as fh:
+            cs = json.load(fh)
+        ids = cs.get("worker_agent_ids") if isinstance(cs, dict) else None
+        if isinstance(ids, dict):
+            out.extend(
+                f"{slug}={aid}" for slug, aid in sorted(ids.items()) if aid
+            )
+    except (OSError, ValueError):
+        pass
+    try:
+        with open(pdir / "pr-watches.json", encoding="utf-8") as fh:
+            pw = json.load(fh)
+        watches = pw.get("watches") if isinstance(pw, dict) else None
+        if isinstance(watches, dict):
+            for num, w in sorted(watches.items()):
+                act = w.get("inflight_action") if isinstance(w, dict) else None
+                if isinstance(act, dict) and act.get("outcome") == "running":
+                    out.append(f"pr#{num}:{act.get('kind', '')}")
+    except (OSError, ValueError):
+        pass
+    return out
 
 # `fleet handoff-write` reads coord-state.json / tasks.md / the checkpoint
 # and shells `gh pr list` (10s cap on the Go side); leave headroom so a

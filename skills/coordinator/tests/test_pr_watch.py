@@ -31,6 +31,7 @@ import pytest
 import loop
 import parse
 import pr_watch as pw
+from test_single_shot_tick import dispatch_subprocess  # noqa: F401 — fixture
 
 
 # ---------------------------------------------------------------------------
@@ -454,6 +455,66 @@ def test_merged_flip_records_completion(tmp_path: Path, monkeypatch) -> None:
     assert any("foo" in c and "merged" in c for c in completions), (
         f"expected a merged completion for foo, got {completions!r}"
     )
+
+
+def test_handoff_pending_launches_no_fixer_but_lease_retries(
+    tmp_path: Path, monkeypatch, dispatch_subprocess,
+) -> None:
+    """Coord soft handoff: while the coord's record carries a pending
+    handoff_type, a CI failure must NOT mint a new PR-watch fixer (it
+    would be an Agent-tool child of a coord about to be replaced). The
+    lease takes the failed_launch path so the SUCCESSOR coord's first
+    tick dispatches it; nothing is lost, and no `running` lease is left
+    behind to hold the soft handoff open."""
+    monkeypatch.setenv("FLEET_HOME", str(tmp_path))
+    project_dir = tmp_path / "projects" / "p"
+    project_dir.mkdir(parents=True)
+    tasks = [_task("a", pr_url=_pr_url(195), branch="worker/a")]
+    snaps = {195: pw.PRSnapshot(
+        number=195, pr_state="OPEN", merge_state_status="UNSTABLE",
+        review_decision="", checks="FAILURE", head_ref_oid="H1",
+        base_ref_name="main",
+    )}
+    monkeypatch.setattr(loop, "_pr_watch_prober",
+                        FakeProber(snaps=snaps, fresh_base="B", ancestors=set()))
+    monkeypatch.setattr(loop, "_run_fleet", lambda *a, **k: None)
+    monkeypatch.setattr(pw, "derive_owner_repo", lambda repo_path: OWNER_REPO)
+    minted: list[str] = []
+    monkeypatch.setattr(
+        loop.dispatch_mod, "mint_agent_id",
+        lambda: minted.append("x") or "aaaa0001",
+    )
+
+    class _Result:
+        def __init__(self) -> None:
+            self.dispatched = 0
+            self.raised = 0
+            self.errors: list[str] = []
+            self.dispatch_instructions: list[str] = []
+
+    res = _Result()
+    loop._reconcile_pr_watches(
+        tasks, project="p", project_dir=project_dir,
+        cwd="/repo", fleet_bin="fleet", state={}, result=res,
+        handoff_pending=True,
+    )
+    assert minted == []
+    assert res.dispatched == 0
+    assert res.dispatch_instructions == []
+    w = pw.load_watches(project_dir)["watches"]["195"]
+    act = w.get("inflight_action") or {}
+    assert act.get("outcome") != "running"
+
+    # Same tick shape without the pending handoff: the fixer IS launched.
+    res2 = _Result()
+    loop._reconcile_pr_watches(
+        tasks, project="p", project_dir=project_dir,
+        cwd="/repo", fleet_bin="fleet", state={}, result=res2,
+    )
+    assert minted == ["x"]
+    assert res2.dispatched == 1, res2.errors
+    assert pw.load_watches(project_dir)["watches"]["195"][
+        "inflight_action"]["outcome"] == "running"
 
 
 def test_merged_flip_failure_leaves_watch_unpruned(tmp_path: Path) -> None:
