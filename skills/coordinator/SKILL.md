@@ -255,6 +255,18 @@ next-step` current and the successor's first screen is accurate without any
 extra work at handoff time. The same per-task line lands in each in-flight
 task's `notes` in `tasks.md` at handoff.
 
+### Context-window handoff (fleet-guard)
+
+At 40% context fleet-guard injects `HANDOFF REQUESTED … SOFT coordinator
+handoff`. From that turn the tick emits **no new worker or PR-watch fixer
+DISPATCH blocks** (`result.errors` says `handoff pending`); reviewer/finisher
+handoffs, reconcile, and PR-watch tracking keep running so in-flight work
+lands. Do not start anything new — keep ticking as subagents return, record
+what a successor needs (`fleet checkpoint next-step` / `decision`), then emit
+`MILESTONE` on its own line. The doc is written and this coord retired only
+once `worker_agent_ids` and the PR-watch running leases are empty; at 50% the
+handoff is forced with whatever is still in flight listed for the successor.
+
 ### Step 7 — PR-TRACK
 
 Shepherd every PR you own. Watch for terminal close/merge, CI failure, BEHIND,

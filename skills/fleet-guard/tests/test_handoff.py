@@ -728,6 +728,205 @@ class TestMaybeTrigger:
         assert "merge #42" not in wbody
 
 
+# -- coord soft handoff (Yellow waits for subagents) -------------------------
+
+_COORD_PANE_WITH_MILESTONE = (
+    "> HANDOFF REQUESTED: context window is over 40% — SOFT ...token:\n"
+    "> MILESTONE\n"
+    "\n"
+    "⏺ Ticked; state recorded.\n"
+    "\n"
+    "⏺ MILESTONE\n"
+)
+
+
+def _seed_coord(home: Path, agent_id: str, *, worker_agent_ids: dict,
+                **overrides: Any) -> Path:
+    rec = _seed_record(home, agent_id, task_id="coord-myproj",
+                       project="myproj", **overrides)
+    pdir = home / "projects" / "myproj"
+    pdir.mkdir(parents=True, exist_ok=True)
+    (pdir / "coord-state.json").write_text(json.dumps({
+        "worker_agent_ids": worker_agent_ids,
+        "recent_completions": ["done e2e-login-1234 (PR #42 green)"],
+        "recent_decisions": ["merge #42 after e2e-login-1234 returned"],
+        "recent_decisions_owner": agent_id,
+    }), encoding="utf-8")
+    return rec
+
+
+def _no_files(d: Path) -> bool:
+    return not d.exists() or list(d.iterdir()) == []
+
+
+class TestCoordSoftHandoff:
+    def test_coord_yellow_first_fire_injects_soft_variant(
+        self, fleet_home_tmp: Path, fake_tmux: _FakeTmux, tmp_path: Path,
+    ) -> None:
+        record_path = _seed_coord(fleet_home_tmp, "c0ffee01",
+                                  worker_agent_ids={"t1": "aaaa0001"})
+        result = handoff.maybe_trigger(
+            {"transcript_path": str(_transcript(tmp_path, input_tokens=90_000))},
+            agent_id="c0ffee01", session="fleet-c0ffee01",
+        )
+        assert result is not None
+        assert result.startswith(handoff.HANDOFF_REQUESTED + ":")
+        assert "SOFT" in result and "subagent" in result
+        assert f"\n\n{handoff.MILESTONE}\n\n" in result
+        record = json.loads(record_path.read_text(encoding="utf-8"))
+        assert record["handoff_type"] == handoff.TYPE_AUTO_YELLOW
+        assert _no_files(fleet_home_tmp / "queue")
+        # Non-coord agents keep the original wording.
+        assert "SOFT" not in handoff.inject_handoff_requested()
+
+    def test_coord_yellow_milestone_holds_while_workers_in_flight(
+        self, fleet_home_tmp: Path, fake_tmux: _FakeTmux, tmp_path: Path,
+        capsys: pytest.CaptureFixture,
+    ) -> None:
+        """40% soft handoff: MILESTONE alone is not enough for a coord —
+        a worker still mapped in worker_agent_ids means its result has
+        not landed yet, so no doc, no queue, and the auto-yellow mark
+        stays armed for the next Stop."""
+        record_path = _seed_coord(
+            fleet_home_tmp, "c0ffee02",
+            worker_agent_ids={"e2e-login-1234": "beefcafe"},
+            handoff_type=handoff.TYPE_AUTO_YELLOW,
+            handoff_type_at=health.now_rfc3339(),
+        )
+        fake_tmux.output = _COORD_PANE_WITH_MILESTONE
+        result = handoff.maybe_trigger(
+            {"transcript_path": str(_transcript(tmp_path, input_tokens=90_000))},
+            agent_id="c0ffee02", session="fleet-c0ffee02",
+        )
+        assert result is None
+        assert _no_files(fleet_home_tmp / "handoffs")
+        assert _no_files(fleet_home_tmp / "queue")
+        record = json.loads(record_path.read_text(encoding="utf-8"))
+        assert record["handoff_type"] == handoff.TYPE_AUTO_YELLOW
+        err = capsys.readouterr().err
+        assert "holding" in err and "e2e-login-1234=beefcafe" in err
+
+    def test_coord_yellow_milestone_holds_on_running_pr_watch_lease(
+        self, fleet_home_tmp: Path, fake_tmux: _FakeTmux, tmp_path: Path,
+    ) -> None:
+        """PR-watch fixers are register:false subagents that never enter
+        worker_agent_ids; their `running` lease in pr-watches.json is the
+        ledger the soft handoff must respect."""
+        _seed_coord(fleet_home_tmp, "c0ffee03", worker_agent_ids={},
+                    handoff_type=handoff.TYPE_AUTO_YELLOW,
+                    handoff_type_at=health.now_rfc3339())
+        pdir = fleet_home_tmp / "projects" / "myproj"
+        (pdir / "pr-watches.json").write_text(json.dumps({
+            "watches": {
+                "42": {"inflight_action": {"kind": "fix",
+                                           "outcome": "running"}},
+                "43": {"inflight_action": {"kind": "rebase",
+                                           "outcome": "succeeded"}},
+            },
+        }), encoding="utf-8")
+        assert handoff._coord_subagents_inflight("myproj") == ["pr#42:fix"]
+        fake_tmux.output = _COORD_PANE_WITH_MILESTONE
+        assert handoff.maybe_trigger(
+            {"transcript_path": str(_transcript(tmp_path, input_tokens=90_000))},
+            agent_id="c0ffee03", session="fleet-c0ffee03",
+        ) is None
+        assert _no_files(fleet_home_tmp / "handoffs")
+        assert _no_files(fleet_home_tmp / "queue")
+
+    def test_coord_yellow_writes_once_all_subagents_returned(
+        self, fleet_home_tmp: Path, fake_tmux: _FakeTmux, tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Ledgers empty + MILESTONE → the soft handoff commits through
+        `fleet handoff-write`: the doc carries the returned results the
+        tick recorded, and the spawn-fresh queue is the durable signal
+        for `fleet drain` to spawn the successor and retire this coord."""
+        monkeypatch.setenv("PATH", str(tmp_path / "empty-path"))  # no `gh`
+        _seed_coord(fleet_home_tmp, "c0ffee04", worker_agent_ids={},
+                    handoff_type=handoff.TYPE_AUTO_YELLOW,
+                    handoff_type_at=health.now_rfc3339())
+        fake_tmux.output = _COORD_PANE_WITH_MILESTONE
+        result = handoff.maybe_trigger(
+            {"transcript_path": str(_transcript(tmp_path, input_tokens=90_000))},
+            agent_id="c0ffee04", session="fleet-c0ffee04",
+        )
+        assert result is None
+        docs = list((fleet_home_tmp / "handoffs").glob("c0ffee04-*.md"))
+        assert len(docs) == 1
+        body = docs[0].read_text(encoding="utf-8")
+        assert 'handoff_type: "auto-yellow"' in body
+        assert "merge #42 after e2e-login-1234 returned" in body
+        assert "Ticked; state recorded." in body
+        queue_files = list((fleet_home_tmp / "queue").glob("spawn-fresh-c0ffee04.json"))
+        assert len(queue_files) == 1
+        q = json.loads(queue_files[0].read_text(encoding="utf-8"))
+        assert q["task_id"] == "coord-myproj" and q["project"] == "myproj"
+
+    def test_coord_red_forces_write_despite_in_flight_subagents(
+        self, fleet_home_tmp: Path, fake_tmux: _FakeTmux, tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """50% hard handoff: the soft wait is abandoned — a coord armed
+        auto-yellow with workers still out gets its doc written NOW
+        (auto-red), the in-flight worker recorded for the successor."""
+        monkeypatch.setenv("PATH", str(tmp_path / "empty-path"))
+        record_path = _seed_coord(
+            fleet_home_tmp, "c0ffee05",
+            worker_agent_ids={"e2e-login-1234": "beefcafe"},
+            handoff_type=handoff.TYPE_AUTO_YELLOW,
+            handoff_type_at=health.now_rfc3339(),
+        )
+        fake_tmux.output = "⏺ still waiting on e2e-login-1234\n"
+        assert handoff.maybe_trigger(
+            {"transcript_path": str(_transcript(tmp_path, input_tokens=105_000))},
+            agent_id="c0ffee05", session="fleet-c0ffee05",
+        ) is None
+        docs = list((fleet_home_tmp / "handoffs").glob("c0ffee05-*.md"))
+        assert len(docs) == 1
+        body = docs[0].read_text(encoding="utf-8")
+        assert 'handoff_type: "auto-red"' in body
+        assert 'agent_id="beefcafe"' in body
+        assert len(list((fleet_home_tmp / "queue").glob("spawn-fresh-c0ffee05.json"))) == 1
+        record = json.loads(record_path.read_text(encoding="utf-8"))
+        assert record["handoff_type"] == handoff.TYPE_AUTO_RED
+
+    def test_worker_yellow_ignores_coord_ledgers(
+        self, fleet_home_tmp: Path, fake_tmux: _FakeTmux, tmp_path: Path,
+    ) -> None:
+        """The subagent gate is coord-only: a worker in the same project
+        commits on MILESTONE even while the coord has other workers out."""
+        _seed_coord(fleet_home_tmp, "c0ffee06",
+                    worker_agent_ids={"other-task": "aaaa0002"})
+        _seed_record(fleet_home_tmp, "0000beef", task_id="other-task",
+                     project="myproj", handoff_type=handoff.TYPE_AUTO_YELLOW,
+                     handoff_type_at=health.now_rfc3339())
+        fake_tmux.output = (
+            f"{handoff.HANDOFF_REQUESTED}: wrap up\n"
+            "⏺ MILESTONE\n"
+        )
+        assert handoff.maybe_trigger(
+            {"transcript_path": str(_transcript(tmp_path, input_tokens=90_000))},
+            agent_id="0000beef", session="fleet-0000beef",
+        ) is None
+        assert len(list((fleet_home_tmp / "handoffs").glob("0000beef-*.md"))) == 1
+
+    def test_inflight_ledger_missing_or_malformed_is_empty(
+        self, fleet_home_tmp: Path,
+    ) -> None:
+        assert handoff._coord_subagents_inflight("nope") == []
+        pdir = fleet_home_tmp / "projects" / "myproj"
+        pdir.mkdir(parents=True)
+        (pdir / "coord-state.json").write_text("{not json", encoding="utf-8")
+        (pdir / "pr-watches.json").write_text("[]", encoding="utf-8")
+        assert handoff._coord_subagents_inflight("myproj") == []
+        (pdir / "coord-state.json").write_text(json.dumps({
+            "worker_agent_ids": {"b": "bbbb0001", "a": "aaaa0001", "empty": ""},
+        }), encoding="utf-8")
+        assert handoff._coord_subagents_inflight("myproj") == [
+            "a=aaaa0001", "b=bbbb0001",
+        ]
+
+
 # -- _write_handoff: the subprocess boundary to `fleet handoff-write` -------
 
 class TestWriteHandoff:

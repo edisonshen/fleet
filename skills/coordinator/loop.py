@@ -859,6 +859,13 @@ def _tick_locked(
     state_path = project_dir / "coord-state.json"
     state = _load_coord_state(state_path)
 
+    handoff_pending = _coord_handoff_pending(coord_id, home=home)
+    if handoff_pending:
+        result.errors.append(
+            f"handoff pending ({handoff_pending}): no new worker / PR-watch "
+            f"dispatch this tick; letting in-flight subagents return"
+        )
+
     # 2.5. Reaper pass (DESIGN invariant 5). Runs BEFORE reconcile so a
     # worker whose state.json reports phase=done has its tmux session
     # killed + record archived BEFORE _apply_reconcile flips status to
@@ -1302,7 +1309,7 @@ def _tick_locked(
                 _record_session_task(state, action.slug, coord_id)
         except Exception as exc:
             result.errors.append(f"handoff apply {action.slug}: {exc}")
-    dispatched = _dispatch_ready(
+    dispatched = [] if handoff_pending else _dispatch_ready(
         tasks=f.tasks,
         project=project,
         cwd=cwd,
@@ -1507,6 +1514,7 @@ def _tick_locked(
             cwd=cwd, fleet_bin=fleet_bin, state=state, result=result,
             home=home, coord_id=coord_id,
             enroll_tasks=list(pre_reconcile_tasks_by_slug.values()),
+            handoff_pending=bool(handoff_pending),
         )
     except Exception as exc:  # noqa: BLE001 — watch reconcile must never wedge a tick
         result.errors.append(f"pr-watch reconcile: {exc}")
@@ -1898,7 +1906,9 @@ def _run_supervisor(
                 result.errors.append(
                     f"supervisor handoff apply {action.slug}: {exc}"
                 )
-        new_dispatched = _dispatch_ready(
+        new_dispatched = [] if _coord_handoff_pending(
+            coord_id, home=home,
+        ) else _dispatch_ready(
             tasks=f4.tasks,
             project=project,
             cwd=cwd,
@@ -2025,11 +2035,16 @@ def _run_supervisor(
             cs_pw = _load_coord_state(state_path)
             _bump_tick_counter(cs_pw)
             _save_coord_state(state_path, cs_pw)
+            # Re-read: the supervisor holds the lock for hours and a
+            # PreCompact handoff can mark the record mid-session.
             _reconcile_pr_watches(
                 f_pw.tasks, project=project, project_dir=project_dir,
                 cwd=cwd, fleet_bin=fleet_bin,
                 state=cs_pw, result=result, home=home, coord_id=coord_id,
                 enroll_tasks=enroll_tasks if enroll_tasks is not None else f_pw.tasks,
+                handoff_pending=bool(
+                    _coord_handoff_pending(coord_id, home=home)
+                ),
             )
             # Slice 2 fix: _reconcile_pr_watches mutates cs_pw["recent_completions"]
             # inside _flip_done. The _save_coord_state above ran BEFORE the
@@ -4916,6 +4931,29 @@ def _pid_alive(pid: int) -> bool:
     return True
 
 
+# fleet-guard marks the coord's own agent record with one of these when a
+# context-window handoff is pending (skills/fleet-guard/handoff.py). While
+# it is set the coord is about to be replaced, and workers are Agent-tool
+# subagents of the coord session — anything dispatched now dies with it.
+_HANDOFF_PENDING_TYPES = frozenset({"auto-yellow", "auto-red", "precompact"})
+
+
+def _coord_handoff_pending(coord_id: str, *, home: Path) -> str:
+    """The coord record's pending `handoff_type` (auto-yellow / auto-red /
+    precompact), or "" when none is pending, the record is missing, or
+    coord_id is empty (operator-shell tick). The soft handoff (auto-yellow)
+    only commits once every subagent has returned, so the tick must stop
+    opening NEW worker / PR-watch subagents — reviewer/finisher handoffs and
+    dispatch replay continue (they finish work already in flight)."""
+    if not coord_id:
+        return ""
+    rec = _read_agent_record(coord_id, home=home)
+    if rec is None:
+        return ""
+    ht = rec.get("handoff_type")
+    return ht if isinstance(ht, str) and ht in _HANDOFF_PENDING_TYPES else ""
+
+
 def _read_agent_record(agent_id: str, *, home: Path | None = None) -> dict | None:
     """Load ~/.fleet/agents/<id>.json (the fleet-guard-written agent
     record), or None on any read/parse failure. Used by the PR-watch
@@ -6291,6 +6329,7 @@ def _reconcile_pr_watches(
     home: Path | None = None,
     enroll_tasks: list[parse.Task] | None = None,
     coord_id: str = "",
+    handoff_pending: bool = False,
 ) -> None:
     """Drive one PR-watch reconcile pass (DESIGN-coord-pr-watch-durable,
     PR1 tracking + PR2 auto-fix). Hooks the pr_watch module into the tick:
@@ -6529,6 +6568,8 @@ def _reconcile_pr_watches(
         # skips it). The journal exists only to satisfy the launch gate.
         # Returns the agent_id on a successful acquire+emit, "" on failure
         # (-> the lease is marked failed_launch and retried next tick).
+        # A pending coord handoff takes the same "" exit before minting
+        # anything: the lease rolls back and the successor coord retries.
         #
         # The DISPATCH block is STAGED locally (not appended to
         # result.dispatch_instructions here) and only flushed AFTER
@@ -6537,6 +6578,8 @@ def _reconcile_pr_watches(
         # fails, reconcile_watches raises, the staged blocks are dropped,
         # and NO launchable block reaches the coord without a saved lease —
         # so a persist failure can't launch a second fixer next tick.
+        if handoff_pending:
+            return ""
         try:
             agent_id = dispatch_mod.mint_agent_id()
             label = f"pr-{action.kind}-{action.pr_number}"

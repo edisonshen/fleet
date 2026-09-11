@@ -52,7 +52,7 @@ Plain stdout from a Stop hook is NOT auto-injected into the conversation — ver
 The skill emits at most two concatenated injections per fire, joined by a blank line, in this order:
 
 1. Operator inbox message — `[OPERATOR] <body>` (if `~/.fleet/inbox/<id>.md` is present).
-2. `HANDOFF REQUESTED` — Yellow-threshold prompt directing the agent to wrap with `MILESTONE` on its own line so the next turn can write a clean handoff doc.
+2. `HANDOFF REQUESTED` — Yellow-threshold prompt directing the agent to wrap with `MILESTONE` on its own line so the next turn can write a clean handoff doc. Coordinators get the soft-handoff wording (stop dispatching, wait for every subagent to return, tick + checkpoint, then `MILESTONE`).
 
 On COORD sessions (explicit `FLEET_ROLE=coord`; the agent-record fallback is not honoured here) the Stop hook also captures the conversation into Key Decisions (`decisions.py`): it walks the transcript for the LAST operator turn (a human `user` entry or an `[OPERATOR]` inbox delivery — never tool results, `isMeta` entries, or the hook's own `HANDOFF REQUESTED` / `[FLEET]` injections) and pairs it with the coord's final assistant text after it, then shells `fleet checkpoint decision "operator: <prompt> → coord: <reply>"` (each half flattened and truncated to 240 chars). A cursor at `~/.fleet/coord-decisions/<id>.cursor` holds the recorded turn's uuid so a blocked-and-continued turn records once; a failed CLI write leaves the cursor alone and retries on the next Stop. This runs BEFORE the handoff trigger so a doc written on the same fire already carries the exchange.
 
@@ -73,8 +73,10 @@ Stdin contains the operator-submitted prompt and metadata. Stdout is ignored (th
 | context_pct | State | Action |
 |-------------|-------|--------|
 | < 40% | Green | Update health JSON only. |
-| ≥ 40% | Yellow | Inject `HANDOFF REQUESTED` once. Mark `handoff_type: "auto-yellow"` and `handoff_type_at: <RFC3339>` in agent record. On subsequent fires, grep tmux pane for `MILESTONE` on its own line; when found, write doc + queue with `handoff_type: "auto-yellow"`. If MILESTONE never lands and `handoff_type_at` is older than 30 min (or missing — legacy migration), re-inject `HANDOFF REQUESTED` and bump the timestamp. |
-| ≥ 50% | Red | Hard force: write doc + queue immediately with `handoff_type: "auto-red"`. No MILESTONE wait. |
+| ≥ 40% | Yellow (soft) | Inject `HANDOFF REQUESTED` once. Mark `handoff_type: "auto-yellow"` and `handoff_type_at: <RFC3339>` in agent record. On subsequent fires, grep tmux pane for `MILESTONE` on its own line; when found, write doc + queue with `handoff_type: "auto-yellow"`. If MILESTONE never lands and `handoff_type_at` is older than 30 min (or missing — legacy migration), re-inject `HANDOFF REQUESTED` and bump the timestamp. **Coordinator** (`task_id == "coord-<project>"`): the injection is the soft-handoff variant (no new work, let subagents return, tick, checkpoint, then MILESTONE), and the write is additionally HELD while any subagent is still in flight — `coord-state.json:worker_agent_ids` non-empty or a `pr-watches.json` watch with `inflight_action.outcome == "running"`. The coord tick refuses new worker `DISPATCH` blocks while its record carries an auto-* `handoff_type` (reviewer/finisher handoffs and PR-watch keep running), so the in-flight set only shrinks; each hold logs the outstanding subagents to stderr. A missing/malformed ledger contributes nothing (degrades to the MILESTONE-only gate). |
+| ≥ 50% | Red (hard) | Force: write doc + queue immediately with `handoff_type: "auto-red"`. No MILESTONE wait, no subagent wait — in-flight workers land in the doc's Active Subagents for the successor to pick up. |
+
+Both paths end the same way: the queue file is the commit point, `fleet drain` spawns the successor from it and retires (`/exit` + kill + archive) the old agent — the soft path only differs in *when* the doc is written.
 
 `PreCompact` writes its handoff doc with `handoff_type: "precompact"`.
 
