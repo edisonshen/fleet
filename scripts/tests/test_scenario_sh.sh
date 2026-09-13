@@ -133,6 +133,33 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+CASE="capture: a missing session is a failure (non-zero exit), fence still closed"
+rc=0; cap_out="$(scripts/scenario.sh capture fleet-nosuch 2>&1)" || rc=$?
+if assert "exit!=0" "$rc" -ne 0 \
+    && [[ "$(tail -n1 <<<"$cap_out")" == '```' ]]; then
+    ok
+else
+    fail "rc=$rc"; sed 's/^/    /' <<<"$cap_out" >&2
+fi
+
+# ---------------------------------------------------------------------------
+CASE="S4 down: refuses a FLEET_TMUX_SOCKET that is not this sandbox's"
+other="/tmp/fleet-test-$SLUG-other.sock"
+tmux -S "$other" new-session -d -s bystander sleep 60
+rc=0
+FLEET_TMUX_SOCKET="$other" scripts/scenario.sh down >/dev/null 2>"$WORK/down-sock.err" || rc=$?
+if assert "exit=2" "$rc" -eq 2 \
+    && assert "sandbox home kept" -d "$FLEET_HOME" \
+    && assert "bystander server untouched" "$(tmux -S "$other" ls 2>/dev/null | grep -c '^bystander:')" = 1 \
+    && grep -q 'does not belong to FLEET_HOME' "$WORK/down-sock.err"; then
+    ok
+else
+    fail "rc=$rc"; sed 's/^/    /' "$WORK/down-sock.err" >&2
+fi
+tmux -S "$other" kill-server 2>/dev/null || true
+rm -f "$other"
+
+# ---------------------------------------------------------------------------
 CASE="S4 down: removes home + socket, kills sandbox tmux, no debris"
 sock="$FLEET_TMUX_SOCKET"; home="$FLEET_HOME"
 tmux -S "$sock" has-session -t "fleet-$FLEET_AGENT_ID" 2>/dev/null || fail "precondition: coord session missing"
@@ -141,19 +168,31 @@ if assert "FLEET_HOME removed" ! -e "$home" \
     && assert "socket removed" ! -e "$sock" \
     && ! tmux -S "$sock" ls >/dev/null 2>&1 \
     && assert "no /tmp/fleet-test-$SLUG-* debris" -z "$(ls -d /tmp/fleet-test-"$SLUG"-* 2>/dev/null)" \
-    && grep -q '^unset FLEET_HOME' <<<"$down_out"; then
+    && grep -q '^unset FLEET_HOME FLEET_TMUX_SOCKET FLEET_DEV_BIN ' <<<"$down_out"; then
     ok
 else
-    fail "down left: $(ls -d /tmp/fleet-test-"$SLUG"-* 2>/dev/null)"
+    fail "down left: $(ls -d /tmp/fleet-test-"$SLUG"-* 2>/dev/null); down_out=$down_out"
 fi
 eval "$down_out"
+
+CASE="up: a stale FLEET_DEV_BIN inside a torn-down sandbox is ignored, not rebuilt there"
+export FLEET_DEV_BIN="$home/bin/fleet"   # what a shell that skipped `eval "$(down)"` still holds
+eval "$(scripts/scenario.sh up --slug "$SLUG" 2>"$WORK/up-stale.err")"
+if assert "old home not recreated" ! -e "$home" \
+    && [[ "$FLEET_DEV_BIN" == "$FLEET_HOME/bin/fleet" ]] \
+    && grep -q 'ignoring stale FLEET_DEV_BIN' "$WORK/up-stale.err"; then
+    ok
+else
+    fail "FLEET_DEV_BIN=$FLEET_DEV_BIN old=$home"; sed 's/^/    /' "$WORK/up-stale.err" >&2
+fi
+eval "$(scripts/scenario.sh down)"
 
 CASE="S4 down: refuses a FLEET_HOME that is not a sandbox"
 rc=0
 FLEET_HOME="$HOME/.fleet-real" FLEET_TMUX_SOCKET=/tmp/nope scripts/scenario.sh down >/dev/null 2>"$WORK/down.err" || rc=$?
 mkdir -p "$HOME/.fleet-real/.scenario"; : > "$HOME/.fleet-real/.scenario/marker"
 rc2=0
-FLEET_HOME="$HOME/.fleet-real" FLEET_TMUX_SOCKET=/tmp/nope scripts/scenario.sh down >/dev/null 2>>"$WORK/down.err" || rc2=$?
+FLEET_HOME="$HOME/.fleet-real" FLEET_TMUX_SOCKET="$HOME/.fleet-real.sock" scripts/scenario.sh down >/dev/null 2>>"$WORK/down.err" || rc2=$?
 if [[ "$rc" == 2 && "$rc2" == 2 ]] && [[ -d "$HOME/.fleet-real" ]] \
     && grep -q 'not a scenario sandbox' "$WORK/down.err" \
     && grep -q 'outside /tmp/fleet-test-' "$WORK/down.err"; then
@@ -193,6 +232,43 @@ else
 fi
 scripts/scenario.sh down >/dev/null
 unset FLEET_HOME FLEET_TMUX_SOCKET FLEET_AGENT_ID
+
+CASE="up: a relative FLEET_DEV_BIN is linked by absolute path"
+mkdir -p "$WORK/rel"; cp "$KEPT_BIN" "$WORK/rel/fleet"
+eval "$(cd "$WORK" && FLEET_DEV_BIN=./rel/fleet "$REPO_ROOT/scripts/scenario.sh" up --slug "$SLUG" 2>/dev/null)"
+if [[ "$FLEET_DEV_BIN" == "$WORK/rel/fleet" ]] \
+    && [[ "$(readlink "$FLEET_HOME/bin/fleet")" == "$WORK/rel/fleet" ]] \
+    && assert "fleet resolves through the sandbox PATH" -x "$FLEET_HOME/bin/fleet"; then
+    ok
+else
+    fail "FLEET_DEV_BIN=$FLEET_DEV_BIN link=$(readlink "$FLEET_HOME/bin/fleet" || true)"
+fi
+scripts/scenario.sh down >/dev/null
+unset FLEET_HOME FLEET_TMUX_SOCKET FLEET_AGENT_ID FLEET_DEV_BIN
+
+CASE="up: FLEET_SCENARIO_PROJECT with path characters is refused, no sandbox left"
+rc=0; out="$(FLEET_SCENARIO_PROJECT='../evil' scripts/scenario.sh up --slug "$SLUG" 2>"$WORK/up-proj.err")" || rc=$?
+if assert "exit=2" "$rc" -eq 2 \
+    && assert "no export lines" -z "$out" \
+    && grep -q 'FLEET_SCENARIO_PROJECT=../evil must match' "$WORK/up-proj.err" \
+    && assert "no /tmp/fleet-test-$SLUG-* left" -z "$(ls -d /tmp/fleet-test-"$SLUG"-* 2>/dev/null)"; then
+    ok
+else
+    fail "rc=$rc"; sed 's/^/    /' "$WORK/up-proj.err" >&2
+fi
+
+CASE="fake-claude crash-once: default marker dir is created under a clean HOME"
+mkdir -p "$WORK/cleanhome"
+rc1=0; out1="$(env -u FLEET_HOME HOME="$WORK/cleanhome" FLEET_FAKE_CLAUDE_MODE=crash-once scripts/fake-claude.sh </dev/null 2>&1)" || rc1=$?
+out2="$(env -u FLEET_HOME HOME="$WORK/cleanhome" FLEET_FAKE_CLAUDE_MODE=crash-once scripts/fake-claude.sh </dev/null 2>&1)" || true
+if assert "first start exits 1" "$rc1" -eq 1 \
+    && grep -q 'fake claude: crashing once' <<<"$out1" \
+    && assert "marker written" -e "$WORK/cleanhome/.fleet/fake-claude.crashed" \
+    && grep -q 'fake claude: ready' <<<"$out2"; then
+    ok
+else
+    fail "rc1=$rc1"; sed 's/^/    1: /' <<<"$out1" >&2; sed 's/^/    2: /' <<<"$out2" >&2
+fi
 
 CASE="up: a failing up (non-executable FLEET_DEV_BIN) exits 2 and leaves no sandbox"
 : > "$WORK/not-a-binary"

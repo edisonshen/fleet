@@ -784,6 +784,22 @@ run_case_shell "shell-exempt-comment" 0 "0 violations" \
 tmux ls || true
 '
 
+# --- Case SH6: order matters — a marker BELOW the tmux line does not excuse
+#     it (that first `tmux kill-server` already hit the default server).
+run_case_shell "shell-late-marker-flagged" 1 ":3: invokes tmux before" \
+'#!/usr/bin/env bash
+set -euo pipefail
+tmux kill-server
+export FLEET_TMUX_SOCKET=/tmp/fleet-test-lint-$$.sock
+tmux -S "$FLEET_TMUX_SOCKET" ls
+'
+run_case_shell "shell-late-scenario-up-flagged" 1 ":2: invokes tmux before" \
+'#!/usr/bin/env bash
+tmux ls
+eval "$(scripts/scenario.sh up --slug lint)"
+scripts/scenario.sh down
+'
+
 echo ""
 echo "test_lint_test_isolation: $passed passed, $failed failed"
 if [[ "$failed" -gt 0 ]]; then

@@ -42,6 +42,7 @@ case "$mode" in
     ;;
   crash-once)
     if [ ! -e "$state" ]; then
+      mkdir -p "$(dirname "$state")"
       : > "$state"
       echo "fake claude: crashing once pid $$"
       exit 1

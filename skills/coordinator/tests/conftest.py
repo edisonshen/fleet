@@ -16,6 +16,7 @@ locally before calling `loop.tick(...)` (or by exercising
 from __future__ import annotations
 
 import os
+import shlex
 import shutil
 import subprocess
 import sys
@@ -92,6 +93,8 @@ def fleet_sandbox():
         if not line.startswith("export "):
             continue
         key, _, value = line[len("export ") :].partition("=")
+        # `up` shell-quotes its values (printf %q); undo that like eval would.
+        value = shlex.split(value)[0]
         if key == "PATH":
             value = value.replace("$PATH", env.get("PATH", ""))
         env[key] = value

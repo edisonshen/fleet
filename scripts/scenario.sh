@@ -86,12 +86,18 @@ EOF
 
 die() { echo "$SELF: $*" >&2; exit 2; }
 
+# Slugs and project tags become path components and `export` values.
+name_ok() { [[ "$1" =~ ^[A-Za-z0-9_-]+$ ]]; }
+
 need_sandbox() {
     [[ -n "${FLEET_HOME:-}" ]] || die "FLEET_HOME is not set — run: eval \"\$($SELF up)\""
     [[ -f "$FLEET_HOME/.scenario/marker" ]] || die "FLEET_HOME=$FLEET_HOME is not a scenario sandbox (no .scenario/marker); refusing"
     [[ -n "${FLEET_TMUX_SOCKET:-}" ]] || die "FLEET_TMUX_SOCKET is not set"
+    [[ "$FLEET_TMUX_SOCKET" == "$FLEET_HOME.sock" ]] \
+        || die "FLEET_TMUX_SOCKET=$FLEET_TMUX_SOCKET does not belong to FLEET_HOME=$FLEET_HOME (expected $FLEET_HOME.sock); refusing"
     export PATH="$FLEET_HOME/bin:$PATH"
     FLEET_SCENARIO_PROJECT="${FLEET_SCENARIO_PROJECT:-demo}"
+    name_ok "$FLEET_SCENARIO_PROJECT" || die "FLEET_SCENARIO_PROJECT=$FLEET_SCENARIO_PROJECT must match [A-Za-z0-9_-]+"
 }
 
 project_dir() { echo "$FLEET_HOME/projects/$FLEET_SCENARIO_PROJECT"; }
@@ -112,8 +118,9 @@ cmd_up() {
             *) die "up: unknown argument $1" ;;
         esac
     done
-    [[ "$slug" =~ ^[A-Za-z0-9_-]+$ ]] || die "up: --slug must match [A-Za-z0-9_-]+"
+    name_ok "$slug" || die "up: --slug must match [A-Za-z0-9_-]+"
     local project="${FLEET_SCENARIO_PROJECT:-demo}"
+    name_ok "$project" || die "up: FLEET_SCENARIO_PROJECT=$project must match [A-Za-z0-9_-]+"
 
     local home
     home=$(mktemp -d "/tmp/fleet-test-${slug}-XXXXXX")
@@ -124,6 +131,12 @@ cmd_up() {
     : > "$home/.scenario/marker"
 
     local bin="${FLEET_DEV_BIN:-}"
+    # A FLEET_DEV_BIN that pointed into a sandbox `down` already removed is
+    # stale, not a build destination: rebuilding there would leave debris.
+    if [[ "$bin" == /tmp/fleet-test-*/bin/fleet && ! -e "$bin" ]]; then
+        echo "$SELF: up: ignoring stale FLEET_DEV_BIN=$bin (sandbox gone)" >&2
+        bin=""
+    fi
     if [[ -z "$bin" ]]; then
         bin="$home/bin/fleet"
     fi
@@ -132,6 +145,7 @@ cmd_up() {
         (cd "$REPO_ROOT" && go build -o "$bin" ./cmd/fleet) || die "up: go build ./cmd/fleet failed"
     fi
     [[ -x "$bin" ]] || die "up: FLEET_DEV_BIN=$bin is not executable"
+    bin="$(cd "$(dirname "$bin")" && pwd)/$(basename "$bin")"
     [[ "$bin" == "$home/bin/fleet" ]] || ln -s "$bin" "$home/bin/fleet"
     ln -s "$SCRIPT_DIR/fake-claude.sh" "$home/bin/claude"
 
@@ -139,11 +153,11 @@ cmd_up() {
         "$bin" project add --project "$project" "$home/repo" >/dev/null \
         || die "up: fleet project add failed"
 
-    echo "export FLEET_HOME=$home"
-    echo "export FLEET_TMUX_SOCKET=$sock"
-    echo "export FLEET_DEV_BIN=$bin"
-    echo "export FLEET_SCENARIO_PROJECT=$project"
-    echo "export PATH=$home/bin:\$PATH"
+    printf 'export FLEET_HOME=%q\n' "$home"
+    printf 'export FLEET_TMUX_SOCKET=%q\n' "$sock"
+    printf 'export FLEET_DEV_BIN=%q\n' "$bin"
+    printf 'export FLEET_SCENARIO_PROJECT=%q\n' "$project"
+    printf 'export PATH=%q:"$PATH"\n' "$home/bin"
 }
 
 # stop_payload <pct> — a Stop-hook payload whose transcript puts the agent at
@@ -300,10 +314,12 @@ cmd_capture() {
     if [[ -z "$session" ]]; then
         session="fleet-$(coord_id || die "capture: no session given and no coord seeded")"
     fi
+    local rc=0
     fence_open
     echo "\$ tmux -S \$FLEET_TMUX_SOCKET capture-pane -p -t $session"
-    tmux -S "$FLEET_TMUX_SOCKET" capture-pane -p -t "$session" || true
+    tmux -S "$FLEET_TMUX_SOCKET" capture-pane -p -t "$session" 2>&1 || rc=$?
     fence_close
+    return "$rc"
 }
 
 # Linux best-effort: pids of `fleet` processes whose environment carries this
@@ -357,7 +373,9 @@ cmd_down() {
         [[ $quiet -ge 5 ]] && break
     done
     [[ ! -e "$FLEET_HOME" ]] || die "down: $FLEET_HOME still present"
-    echo "unset FLEET_HOME FLEET_TMUX_SOCKET FLEET_SCENARIO_PROJECT FLEET_AGENT_ID"
+    local unset_bin=""
+    [[ "${FLEET_DEV_BIN:-}" == "$FLEET_HOME/"* ]] && unset_bin=" FLEET_DEV_BIN"
+    echo "unset FLEET_HOME FLEET_TMUX_SOCKET${unset_bin} FLEET_SCENARIO_PROJECT FLEET_AGENT_ID"
 }
 
 main() {
