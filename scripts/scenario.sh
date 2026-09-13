@@ -28,8 +28,10 @@ SUBCOMMANDS
                            registered on a non-git repo dir
                          - FLEET_TMUX_SOCKET=/tmp/fleet-test-<slug>-XXXXXX.sock
                            (same canonical path shape the Go tests use)
-                         - builds ./cmd/fleet into $FLEET_HOME/bin/fleet and
-                           exports FLEET_DEV_BIN unless it is already set
+                         - builds ./cmd/fleet into $FLEET_DEV_BIN when that
+                           is unset (-> $FLEET_HOME/bin/fleet) or names a
+                           path that does not exist yet; reuses it otherwise.
+                           Fails (and removes the sandbox) on a bad binary
                          - puts $FLEET_HOME/bin first on PATH: `fleet` is the
                            dev binary, `claude` is scripts/fake-claude.sh
   seed-coord [--pct N] [--dead]
@@ -63,7 +65,7 @@ SUBCOMMANDS
 ENVIRONMENT
   FLEET_HOME              sandbox state root (set by up; required after)
   FLEET_TMUX_SOCKET       sandbox tmux socket path (set by up)
-  FLEET_DEV_BIN           fleet binary to use; built by up when unset
+  FLEET_DEV_BIN           fleet binary to use; built by up when unset/missing
   FLEET_SCENARIO_PROJECT  project tag seeded by up (default: demo)
   FLEET_FAKE_CLAUDE_MODE  ok|exit|crash-once|hang — see scripts/fake-claude.sh
   FLEET_AGENT_ID          set by `run` from the seeded coord if unset
@@ -116,17 +118,21 @@ cmd_up() {
     local home
     home=$(mktemp -d "/tmp/fleet-test-${slug}-XXXXXX")
     local sock="$home.sock"
+    # A failed `up` must not leave a half-built sandbox behind.
+    trap '[[ $? -eq 0 ]] || rm -rf "$home" "$sock"' EXIT
     mkdir -p "$home/agents" "$home/projects" "$home/bin" "$home/repo" "$home/.scenario"
     : > "$home/.scenario/marker"
 
     local bin="${FLEET_DEV_BIN:-}"
     if [[ -z "$bin" ]]; then
         bin="$home/bin/fleet"
-        (cd "$REPO_ROOT" && go build -o "$bin" ./cmd/fleet) || die "up: go build ./cmd/fleet failed"
-    else
-        [[ -x "$bin" ]] || die "up: FLEET_DEV_BIN=$bin is not executable"
-        ln -s "$bin" "$home/bin/fleet"
     fi
+    if [[ ! -e "$bin" ]]; then
+        mkdir -p "$(dirname "$bin")"
+        (cd "$REPO_ROOT" && go build -o "$bin" ./cmd/fleet) || die "up: go build ./cmd/fleet failed"
+    fi
+    [[ -x "$bin" ]] || die "up: FLEET_DEV_BIN=$bin is not executable"
+    [[ "$bin" == "$home/bin/fleet" ]] || ln -s "$bin" "$home/bin/fleet"
     ln -s "$SCRIPT_DIR/fake-claude.sh" "$home/bin/claude"
 
     FLEET_HOME="$home" FLEET_TMUX_SOCKET="$sock" PATH="$home/bin:$PATH" \

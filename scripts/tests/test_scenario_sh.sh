@@ -181,6 +181,33 @@ fi
 scripts/scenario.sh down >/dev/null
 unset FLEET_HOME FLEET_TMUX_SOCKET FLEET_AGENT_ID
 
+# ---------------------------------------------------------------------------
+CASE="up: FLEET_DEV_BIN naming a missing path is built there (not an error)"
+export FLEET_DEV_BIN="$WORK/build-here/fleet"
+eval "$(scripts/scenario.sh up --slug "$SLUG" 2>"$WORK/up-missing.err")"
+if assert "binary built at the requested path" -x "$WORK/build-here/fleet" \
+    && [[ "$(readlink "$FLEET_HOME/bin/fleet")" == "$WORK/build-here/fleet" ]]; then
+    ok
+else
+    fail "FLEET_DEV_BIN=$FLEET_DEV_BIN"; sed 's/^/    /' "$WORK/up-missing.err" >&2
+fi
+scripts/scenario.sh down >/dev/null
+unset FLEET_HOME FLEET_TMUX_SOCKET FLEET_AGENT_ID
+
+CASE="up: a failing up (non-executable FLEET_DEV_BIN) exits 2 and leaves no sandbox"
+: > "$WORK/not-a-binary"
+export FLEET_DEV_BIN="$WORK/not-a-binary"
+rc=0; out="$(scripts/scenario.sh up --slug "$SLUG" 2>"$WORK/up-bad.err")" || rc=$?
+if assert "exit=2" "$rc" -eq 2 \
+    && assert "no export lines" -z "$out" \
+    && grep -q 'is not executable' "$WORK/up-bad.err" \
+    && assert "no /tmp/fleet-test-$SLUG-* left by the failed up" -z "$(ls -d /tmp/fleet-test-"$SLUG"-* 2>/dev/null)"; then
+    ok
+else
+    fail "rc=$rc"; sed 's/^/    /' "$WORK/up-bad.err" >&2; ls -d /tmp/fleet-test-"$SLUG"-* 2>/dev/null >&2 || true
+fi
+unset FLEET_DEV_BIN
+
 CASE="isolation: default tmux server and ~/.fleet never touched"
 sleep 1  # let any detached drain from the hook cases finish
 if assert "no default tmux socket dir" ! -e "$TMUX_TMPDIR/tmux-$(id -u)" \
