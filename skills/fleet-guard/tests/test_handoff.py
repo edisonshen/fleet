@@ -261,11 +261,26 @@ class TestFindMilestone:
         fake_tmux.returncode = 1  # tmux error
         assert handoff.find_milestone("fleet-abc") is False
 
-    def test_invokes_correct_session(self, fake_tmux: _FakeTmux) -> None:
+    def test_invokes_correct_session(self, fake_tmux: _FakeTmux,
+                                     monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delenv("FLEET_TMUX_SOCKET", raising=False)
         fake_tmux.output = "MILESTONE\n"
         handoff.find_milestone("fleet-deadbeef")
         assert fake_tmux.calls[0][:5] == [
             "tmux", "capture-pane", "-t", "fleet-deadbeef", "-p",
+        ]
+
+    def test_honours_fleet_tmux_socket(self, fake_tmux: _FakeTmux,
+                                       monkeypatch: pytest.MonkeyPatch) -> None:
+        """An isolated sandbox (scripts/scenario.sh, the Go e2e tests) puts
+        the coord on FLEET_TMUX_SOCKET; the capture must go to that server
+        or the MILESTONE gate silently never opens there."""
+        monkeypatch.setenv("FLEET_TMUX_SOCKET", "/tmp/fleet-test-x.sock")
+        fake_tmux.output = f"{handoff.HANDOFF_REQUESTED}: wrap\n⏺ MILESTONE\n"
+        assert handoff.find_milestone("fleet-deadbeef") is True
+        assert fake_tmux.calls[0][:7] == [
+            "tmux", "-S", "/tmp/fleet-test-x.sock",
+            "capture-pane", "-t", "fleet-deadbeef", "-p",
         ]
 
     # -- glyph-rendering regression (P0: auto-handoff was fully dead) --------

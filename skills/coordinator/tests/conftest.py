@@ -16,13 +16,130 @@ locally before calling `loop.tick(...)` (or by exercising
 from __future__ import annotations
 
 import os
+import shutil
+import subprocess
 import sys
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Callable
 
 import pytest
 
 _SKILL_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _SKILL_DIR not in sys.path:
     sys.path.insert(0, _SKILL_DIR)
+
+if TYPE_CHECKING:
+    from loop import TickResult
+
+_REPO_ROOT = os.path.dirname(os.path.dirname(_SKILL_DIR))
+_SCENARIO_SH = os.path.join(_REPO_ROOT, "scripts", "scenario.sh")
+
+
+@dataclass(frozen=True)
+class FleetSandbox:
+    """A `scripts/scenario.sh up` sandbox: the BUILT fleet binary, an isolated
+    FLEET_HOME + FLEET_TMUX_SOCKET, and the fake `claude` first on PATH.
+
+    bin      path of the fleet binary (FLEET_DEV_BIN)
+    home     the sandbox FLEET_HOME (/tmp/fleet-test-pytest-XXXXXX)
+    project  the project tag `up` registered (FLEET_SCENARIO_PROJECT)
+    env      the exports `up` printed, merged over os.environ
+    run(cmd) run <cmd> (argv list) inside the sandbox env, capture output
+    tick()   one REAL `loop.tick` against the sandbox (cap=1, cwd=<home>/repo)
+    """
+
+    bin: str
+    home: str
+    project: str
+    env: dict[str, str]
+    run: Callable[..., subprocess.CompletedProcess[str]]
+    tick: Callable[..., "TickResult"]
+
+
+def _scenario(args: list[str], env: dict[str, str]) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        ["bash", _SCENARIO_SH, *args],
+        cwd=_REPO_ROOT,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+
+@pytest.fixture(scope="session")
+def fleet_sandbox():
+    """Session-scoped `scripts/scenario.sh up` … `down`.
+
+    Builds ./cmd/fleet once per pytest session (or reuses $FLEET_DEV_BIN when
+    set), stands the sandbox up under /tmp/fleet-test-pytest-XXXXXX with its
+    own tmux socket, and tears it all down — sessions, socket, home — after
+    the last test that used it. Skips when tmux or go is unavailable, the
+    same way the Go e2e lanes do.
+    """
+    for tool in ("tmux", "go", "bash"):
+        if shutil.which(tool) is None:
+            pytest.skip(f"{tool} not installed")
+
+    up_env = dict(os.environ)
+    up_env.setdefault("FLEET_SCENARIO_PROJECT", "pytest")
+    up = _scenario(["up", "--slug", "pytest"], up_env)
+    if up.returncode != 0:
+        pytest.fail(f"scenario.sh up failed (exit {up.returncode}):\n{up.stderr}")
+
+    env = dict(up_env)
+    for line in up.stdout.splitlines():
+        if not line.startswith("export "):
+            continue
+        key, _, value = line[len("export ") :].partition("=")
+        if key == "PATH":
+            value = value.replace("$PATH", env.get("PATH", ""))
+        env[key] = value
+    home = env["FLEET_HOME"]
+    fleet_bin = env["FLEET_DEV_BIN"]
+    project = env["FLEET_SCENARIO_PROJECT"]
+
+    def run(cmd: list[str], **kw) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            cmd, cwd=home, env=env, capture_output=True, text=True, check=False, **kw
+        )
+
+    # The exports `up` printed, i.e. what a shell would have after eval.
+    exports = {k: v for k, v in env.items() if os.environ.get(k) != v}
+
+    def tick(**kw) -> "TickResult":
+        import loop
+
+        # loop.tick spawns `fleet dispatch` children which read FLEET_HOME /
+        # FLEET_TMUX_SOCKET / PATH from the process env — point them at the
+        # sandbox for the duration of the tick only.
+        saved = {k: os.environ.get(k) for k in exports}
+        os.environ.update(exports)
+        try:
+            return loop.tick(
+                project,
+                coord_id=kw.pop("coord_id", ""),
+                cwd=kw.pop("cwd", os.path.join(home, "repo")),
+                fleet_home=home,
+                fleet_bin=fleet_bin,
+                cap=kw.pop("cap", 1),
+                **kw,
+            )
+        finally:
+            for k, v in saved.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+
+    try:
+        yield FleetSandbox(
+            bin=fleet_bin, home=home, project=project, env=env, run=run, tick=tick
+        )
+    finally:
+        down = _scenario(["down"], env)
+        assert down.returncode == 0, f"scenario.sh down failed:\n{down.stderr}"
+        assert not os.path.exists(home), f"scenario.sh down left {home}"
 
 
 # rc-listener-bootstrap-sk-3e98: set FLEET_RC_BOOTSTRAP_DISABLED before

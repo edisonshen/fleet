@@ -1054,4 +1054,74 @@ if (( ${#scandir_violations[@]} > 0 )); then
   exit 1
 fi
 
-echo "test-isolation-lint: ${files_scanned} *_test.go files scanned, 0 violations"
+# ---------------------------------------------------------------------------
+# Rule #4: shell-driven tests. scripts/tests/*.sh run tmux directly (or via
+# the built fleet binary) from bash, where none of the Go markers exist. A
+# script that invokes `tmux <cmd>` / `tmux -S|-L ...` must first isolate the
+# socket by one of:
+#   - `scripts/scenario.sh up` (its exports set FLEET_TMUX_SOCKET to
+#     /tmp/fleet-test-<slug>-XXXXXX.sock — the canonical isolated path),
+#   - an explicit `FLEET_TMUX_SOCKET=...` assignment,
+#   - the `lint-test-isolation:exempt` comment.
+# Whole-file scope (shell has no test-function boundary to speak of); the
+# `#`-comment tail of each line is stripped before matching so a mention
+# in prose neither triggers nor attests.
+shell_file_lister() {
+  if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    git ls-files 'scripts/tests/*.sh'
+  else
+    find scripts/tests -name '*.sh' 2>/dev/null
+  fi
+}
+
+# scan_shell <file> → prints "<file>: <reason>" when the file invokes tmux
+# without an isolation marker; prints nothing otherwise.
+scan_shell() {
+  awk -v file="$1" '
+    {
+      if (index($0, "lint-test-isolation:exempt") > 0) iso = 1
+      line = $0
+      if (line ~ /^[ \t]*#/) next
+      sub(/[ \t]#.*$/, "", line)
+      if (line ~ /(^|[ \t;&|(`])tmux[ \t]+(-[SL][ \t]|[a-z][a-z-]*([ \t]|$))/) {
+        trig = 1
+        if (first == "") first = NR
+      }
+      if (line ~ /scenario\.sh"?[ \t]+up([ \t]|$)/) iso = 1
+      if (line ~ /(^|[ \t;])(export[ \t]+)?FLEET_TMUX_SOCKET=/) iso = 1
+    }
+    END {
+      if (trig && !iso) printf "%s:%d: invokes tmux without scenario.sh up / FLEET_TMUX_SOCKET=\n", file, first
+    }
+  ' "$1"
+}
+
+shell_violations=()
+shell_scanned=0
+while IFS= read -r f; do
+  [ -n "$f" ] || continue
+  shell_scanned=$((shell_scanned + 1))
+  while IFS= read -r v; do
+    [ -n "$v" ] || continue
+    shell_violations+=("$v")
+  done < <(scan_shell "$f")
+done < <(shell_file_lister)
+
+if (( ${#shell_violations[@]} > 0 )); then
+  echo "test-isolation-lint: FAIL (shell tmux isolation)" >&2
+  echo "" >&2
+  echo "The following scripts/tests/*.sh invoke tmux without isolating the" >&2
+  echo "socket first. Bash tests have no runtime sink guard: an unscoped" >&2
+  echo "\`tmux\` lands on the operator's default server." >&2
+  echo "" >&2
+  printf '  %s\n' "${shell_violations[@]}" >&2
+  echo "" >&2
+  echo "Fix (any one):" >&2
+  echo "  - eval \"\$(scripts/scenario.sh up)\"   # isolated FLEET_HOME + socket" >&2
+  echo "  - export FLEET_TMUX_SOCKET=/tmp/fleet-test-<slug>-\$\$.sock" >&2
+  echo "  - if the script must touch the default server, add the comment" >&2
+  echo "    # lint-test-isolation:exempt" >&2
+  exit 1
+fi
+
+echo "test-isolation-lint: ${files_scanned} *_test.go files scanned, ${shell_scanned} scripts/tests/*.sh scanned, 0 violations"

@@ -356,7 +356,13 @@ def _capture_pane(session: str, lines: int | None = None) -> str:
     the last N via `-S -<lines>`. Returns stdout on success, "" on any
     failure. The 5s timeout protects against a hung tmux server.
     """
-    cmd = ["tmux", "capture-pane", "-t", session, "-p"]
+    cmd = ["tmux"]
+    sock = os.environ.get("FLEET_TMUX_SOCKET", "")
+    if sock:
+        # Same server the Go side talks to (internal/tmux prepends -S too);
+        # without it an isolated sandbox's coord pane is invisible here.
+        cmd.extend(["-S", sock])
+    cmd.extend(["capture-pane", "-t", session, "-p"])
     if lines is not None:
         cmd.extend(["-S", f"-{lines}"])
     try:
