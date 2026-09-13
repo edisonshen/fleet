@@ -3969,7 +3969,8 @@ def _write_rolling_checkpoint_file(
 # best-effort register_subagent) apart from a true phantom that crashed
 # before the Agent invoke.
 _WORKER_AUTHORED_PHASES = frozenset({
-    "branch", "tdd-red", "tdd-green", "tdd-refactor", "review-pending",
+    "branch", "spec-repro", "spec-encode", "verify",
+    "tdd-red", "tdd-green", "tdd-refactor", "review-pending",
     "review-claude", "review-codex", "review-done", "push", "done",
 })
 

@@ -141,8 +141,10 @@ func ClassifyTask(t *tasks.Task) State {
 // Mapping (issue #101):
 //
 //	starting   → Prerun  (state.json bootstrap; worker hasn't begun)
-//	branch     → Prerun  (cutting the worker branch; pre-TDD)
-//	tdd-*      → Active
+//	branch     → Prerun  (cutting the worker branch; pre-work)
+//	spec-*     → Active  (scenario-first: spec-repro, spec-encode)
+//	verify     → Active
+//	tdd-*      → Active  (legacy ladder; still accepted)
 //	review-*   → Active
 //	push       → Active
 //	done       → TerminalSuccess
@@ -159,7 +161,8 @@ func ClassifyWorker(w *workers.State) State {
 	switch w.Phase {
 	case workers.PhaseStarting, workers.PhaseBranch:
 		return StatePrerun
-	case workers.PhaseTDDRed, workers.PhaseTDDGreen, workers.PhaseTDDRefactor,
+	case workers.PhaseSpecRepro, workers.PhaseSpecEncode, workers.PhaseVerify,
+		workers.PhaseTDDRed, workers.PhaseTDDGreen, workers.PhaseTDDRefactor,
 		workers.PhaseReviewClaude, workers.PhaseReviewCodex,
 		// PhaseReviewPending and PhaseReviewDone are three-stage flow
 		// handoff phases (reviewer-subagent-arch): the outgoing

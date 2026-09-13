@@ -2652,6 +2652,28 @@ def test_is_worker_alive_reads_state_json_freshness(
         assert loop._is_worker_alive(t, project) is True
 
 
+@pytest.mark.parametrize("phase", ["spec-repro", "spec-encode", "verify"])
+def test_worker_launch_looks_live_accepts_scenario_phases(
+    fleet_home: Path, phase: str,
+) -> None:
+    """Scenario-first phases (spec-repro / spec-encode / verify) are
+    worker-authored advances past the dispatch bootstrap's "starting",
+    exactly like the legacy tdd-* ladder — residual-crash repair must
+    not classify a worker sitting in one of them as a phantom."""
+    project = "fleet"
+    slug = f"scen-{phase}"
+    workers_dir = fleet_home / "projects" / project / "workers" / slug
+    workers_dir.mkdir(parents=True, exist_ok=True)
+    (workers_dir / "state.json").write_text(json.dumps({
+        "slug": slug, "project": project, "phase": phase,
+    }), encoding="utf-8")
+
+    assert phase in loop._WORKER_AUTHORED_PHASES
+    assert loop._worker_launch_looks_live(project, slug, home=fleet_home) is True
+    # Legacy ladder stays recognised alongside the new phases.
+    assert {"tdd-red", "tdd-green", "tdd-refactor"} <= loop._WORKER_AUTHORED_PHASES
+
+
 def test_is_worker_alive_treats_stale_state_json_as_dead(
     fleet_home: Path, project_dir: Path,
     monkeypatch,

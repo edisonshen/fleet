@@ -58,6 +58,11 @@ func TestClassifyWorker(t *testing.T) {
 	}{
 		{"starting", workers.PhaseStarting, lifecycle.StatePrerun},
 		{"branch", workers.PhaseBranch, lifecycle.StatePrerun},
+		// Scenario-first phases (DESIGN-scenario-first-testing) sit in
+		// the same Active bucket as the legacy tdd-* ladder.
+		{"spec-repro", workers.PhaseSpecRepro, lifecycle.StateActive},
+		{"spec-encode", workers.PhaseSpecEncode, lifecycle.StateActive},
+		{"verify", workers.PhaseVerify, lifecycle.StateActive},
 		{"tdd-red", workers.PhaseTDDRed, lifecycle.StateActive},
 		{"tdd-green", workers.PhaseTDDGreen, lifecycle.StateActive},
 		{"tdd-refactor", workers.PhaseTDDRefactor, lifecycle.StateActive},

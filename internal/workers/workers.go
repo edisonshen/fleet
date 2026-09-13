@@ -39,14 +39,24 @@ import (
 	"github.com/edisonshen/fleet/internal/state"
 )
 
-// Phase is the worker's current step in its TDD → review → push pipe.
-// Values are exact strings written into state.json; coord skill
-// matches on these.
+// Phase is the worker's current step in its reproduce → encode →
+// verify → review → push pipe. Values are exact strings written into
+// state.json; coord skill matches on these.
 type Phase string
 
 const (
-	PhaseStarting     Phase = "starting"
-	PhaseBranch       Phase = "branch"
+	PhaseStarting Phase = "starting"
+	PhaseBranch   Phase = "branch"
+	// PhaseSpecRepro / PhaseSpecEncode / PhaseVerify are the
+	// scenario-first worker steps (DESIGN-scenario-first-testing):
+	// reproduce the requirement's scenario on the built product,
+	// encode the observed outcome as a test, implement + run the full
+	// gates. The tdd-* phases below are the legacy ladder — retained
+	// and accepted (in-flight workers, lifecycle bucket, fixtures) but
+	// no longer emitted by the prompts.
+	PhaseSpecRepro    Phase = "spec-repro"
+	PhaseSpecEncode   Phase = "spec-encode"
+	PhaseVerify       Phase = "verify"
 	PhaseTDDRed       Phase = "tdd-red"
 	PhaseTDDGreen     Phase = "tdd-green"
 	PhaseTDDRefactor  Phase = "tdd-refactor"
@@ -71,8 +81,10 @@ const (
 
 func validPhase(p Phase) bool {
 	switch p {
-	case PhaseStarting, PhaseBranch, PhaseTDDRed, PhaseTDDGreen,
-		PhaseTDDRefactor, PhaseReviewClaude, PhaseReviewCodex,
+	case PhaseStarting, PhaseBranch,
+		PhaseSpecRepro, PhaseSpecEncode, PhaseVerify,
+		PhaseTDDRed, PhaseTDDGreen, PhaseTDDRefactor,
+		PhaseReviewClaude, PhaseReviewCodex,
 		PhaseReviewPending, PhaseReviewDone,
 		PhasePush, PhaseDone, PhaseBlocked, PhaseFailed:
 		return true
@@ -132,6 +144,18 @@ func validReviewStatus(s ReviewStatus) bool {
 	return ReviewStatusValidNonEmpty(s)
 }
 
+// GatesStatusPassed / GatesStatusFailed are the only non-empty values
+// of State.GatesStatus: the worker's claim about its full ci.yml gate
+// run (scenario-first testing, 2c VERIFY). Empty = not yet recorded.
+const (
+	GatesStatusPassed = "passed"
+	GatesStatusFailed = "failed"
+)
+
+func validGatesStatus(g string) bool {
+	return g == "" || g == GatesStatusPassed || g == GatesStatusFailed
+}
+
 // State is the on-disk shape of state.json.
 type State struct {
 	Slug            string    `json:"slug"`
@@ -161,6 +185,17 @@ type State struct {
 	ReviewBetaEngine      string       `json:"review_beta_engine,omitempty"`
 	ReviewBetaModel       string       `json:"review_beta_model,omitempty"`
 
+	// Scenario-first verification fields (DESIGN-scenario-first-testing).
+	// The worker records them at 2c VERIFY via `fleet workers update
+	// --scenarios-total M --scenarios-verified N --gates-status
+	// passed|failed`. Records pre-dating the fields load as zero and
+	// rewrite without them (omitempty). writeStateLocked enforces the
+	// shape only (enum, non-negative, verified ≤ total); no phase gates
+	// on them yet.
+	ScenariosTotal    int    `json:"scenarios_total,omitempty"`
+	ScenariosVerified int    `json:"scenarios_verified,omitempty"`
+	GatesStatus       string `json:"gates_status,omitempty"`
+
 	// DispatchGeneration is the coord-owned per-slug fence token
 	// (DESIGN-coord-worktree-lifecycle §1/§2.2) stamped at the dispatch
 	// that authored this state. The chokepoint reader
@@ -180,6 +215,8 @@ var (
 	ErrPhaseRequiresReview         = errors.New("terminal phase requires review slot gate: alpha passed or legal codex skip, and beta claude passed")
 	ErrInvalidPhase                = errors.New("invalid phase")
 	ErrInvalidReviewStat           = errors.New("invalid review status")
+	ErrInvalidGatesStatus          = errors.New("invalid gates_status: must be passed|failed")
+	ErrInvalidScenarioCounts       = errors.New("invalid scenario counts: scenarios_total and scenarios_verified must be >= 0 and scenarios_verified <= scenarios_total")
 	ErrCodexSkipNeedsReason        = errors.New("codex-engine review slot status=skipped requires skip_reason in {rate-limited, unavailable}")
 	ErrReviewSlotIdentity          = errors.New("review slot requires engine in {codex,claude} and non-empty model")
 	ErrReviewBetaAnchor            = errors.New("review beta slot must be engine=claude with status=passed (the Claude anchor)")
@@ -393,6 +430,12 @@ func writeStateLocked(project, slug string, s *State) error {
 	}
 	if !validReviewStatus(s.ReviewBetaStatus) {
 		return fmt.Errorf("%w: review_beta_status=%q", ErrInvalidReviewStat, s.ReviewBetaStatus)
+	}
+	if !validGatesStatus(s.GatesStatus) {
+		return fmt.Errorf("%w: gates_status=%q", ErrInvalidGatesStatus, s.GatesStatus)
+	}
+	if s.ScenariosTotal < 0 || s.ScenariosVerified < 0 || s.ScenariosVerified > s.ScenariosTotal {
+		return fmt.Errorf("%w: scenarios_total=%d scenarios_verified=%d", ErrInvalidScenarioCounts, s.ScenariosTotal, s.ScenariosVerified)
 	}
 	// Non-git projects skip the push step entirely. Reject phase=push
 	// upfront with a clear error so the dispatch code knows to write

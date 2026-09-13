@@ -377,6 +377,18 @@ type workersUpdateOpts struct {
 	reviewBetaEngineSet      bool
 	reviewBetaModelSet       bool
 
+	// Scenario-first verification fields (DESIGN-scenario-first-testing).
+	// Workers call `fleet workers update <slug> --phase verify
+	// --scenarios-total M --scenarios-verified N --gates-status
+	// passed|failed` at 2c VERIFY. Set-flag semantics like review-*:
+	// omitted flags preserve what is on disk.
+	scenariosTotal       int
+	scenariosVerified    int
+	gatesStatus          string
+	scenariosTotalSet    bool
+	scenariosVerifiedSet bool
+	gatesStatusSet       bool
+
 	// dispatchGeneration is the coord-owned per-slug fence token
 	// (DESIGN §1/§2.2) stamped into this dispatch's worker prompt. When
 	// set, the update routes through workers.UpdateStateGen, a CAS that
@@ -407,11 +419,17 @@ func newWorkersUpdateCmd() *cobra.Command {
 		Short: "Update one worker's state.json (called by the worker subprocess)",
 		Long: `update writes a phase boundary into the worker's state.json under
 ~/.fleet/projects/<project>/workers/<slug>/state.json. Workers run this
-on every phase change in their TDD → review → push pipeline so the
-coordinator can reconcile in-flight tasks correctly.
+on every phase change in their reproduce → encode → verify → review →
+push pipeline so the coordinator can reconcile in-flight tasks correctly.
 
-Phases: starting, branch, tdd-red, tdd-green, tdd-refactor,
+Phases: starting, branch, spec-repro, spec-encode, verify,
 review-claude, review-codex, push, done, blocked, failed.
+Legacy tdd-red, tdd-green, tdd-refactor remain accepted.
+
+--scenarios-total / --scenarios-verified / --gates-status record the
+worker's Scenario contract outcome at phase=verify (gates_status is
+passed|failed; counts are >= 0 with verified <= total). They are
+informational for now — no phase gates on them.
 
 Phase=done requires --pr-url. Phase=blocked requires --reason. The
 state file is created on first call (the coord pre-seeds it on
@@ -444,13 +462,16 @@ explicitly when the caller is a wrapper script.`,
 			opts.reviewBetaSkipReasonSet = cmd.Flags().Changed("review-beta-skip-reason")
 			opts.reviewBetaEngineSet = cmd.Flags().Changed("review-beta-engine")
 			opts.reviewBetaModelSet = cmd.Flags().Changed("review-beta-model")
+			opts.scenariosTotalSet = cmd.Flags().Changed("scenarios-total")
+			opts.scenariosVerifiedSet = cmd.Flags().Changed("scenarios-verified")
+			opts.gatesStatusSet = cmd.Flags().Changed("gates-status")
 			opts.dispatchGenerationSet = cmd.Flags().Changed("dispatch-generation")
 			return runWorkersUpdate(args[0], opts, cmd.OutOrStdout())
 		},
 	}
 	cmd.Flags().StringVar(&opts.project, "project", "", "project name (default: cwd basename)")
 	cmd.Flags().StringVar(&opts.phase, "phase", "",
-		"new worker phase (starting|branch|tdd-red|tdd-green|tdd-refactor|review-claude|review-codex|review-pending|review-done|push|done|blocked|failed)")
+		"new worker phase (starting|branch|spec-repro|spec-encode|verify|tdd-red|tdd-green|tdd-refactor|review-claude|review-codex|review-pending|review-done|push|done|blocked|failed)")
 	cmd.Flags().StringVar(&opts.prURL, "pr-url", "", "PR URL (required for phase=done)")
 	cmd.Flags().StringVar(&opts.reason, "reason", "", "blocked reason (required for phase=blocked)")
 	cmd.Flags().IntVar(&opts.pid, "pid", 0, "worker OS PID (default: os.Getpid())")
@@ -475,6 +496,12 @@ explicitly when the caller is a wrapper script.`,
 		"reviewer subagent: beta slot engine (codex|claude)")
 	cmd.Flags().StringVar(&opts.reviewBetaModel, "review-beta-model", "",
 		"reviewer subagent: beta slot model")
+	cmd.Flags().IntVar(&opts.scenariosTotal, "scenarios-total", 0,
+		"scenario-first: number of Scenario contract rows (>= 0)")
+	cmd.Flags().IntVar(&opts.scenariosVerified, "scenarios-verified", 0,
+		"scenario-first: Scenario contract rows verified on the built product (0..scenarios-total)")
+	cmd.Flags().StringVar(&opts.gatesStatus, "gates-status", "",
+		"scenario-first: outcome of the full ci.yml gate run (passed|failed)")
 	cmd.Flags().IntVar(&opts.dispatchGeneration, "dispatch-generation", 0,
 		"coord-owned per-slug fence token (DESIGN §2.2). When set, the update is a CAS against the task row's dispatch_generation: a stale generation is rejected. Omit on legacy/non-worker callers.")
 	_ = cmd.MarkFlagRequired("phase")
@@ -569,6 +596,25 @@ func runWorkersUpdate(slug string, opts *workersUpdateOpts, stdout io.Writer) er
 		}
 	}
 
+	// CLI-side verification field validation, naming the offending
+	// flag. workers.writeStateLocked is the hard guard (it also catches
+	// verified > total when only one count is passed and the other is
+	// on disk); this is the friendly one.
+	gatesStatus := strings.TrimSpace(opts.gatesStatus)
+	if opts.gatesStatusSet && gatesStatus != "" &&
+		gatesStatus != workers.GatesStatusPassed && gatesStatus != workers.GatesStatusFailed {
+		return fmt.Errorf("--gates-status %q: must be passed|failed", opts.gatesStatus)
+	}
+	if opts.scenariosTotalSet && opts.scenariosTotal < 0 {
+		return fmt.Errorf("--scenarios-total %d: must be >= 0", opts.scenariosTotal)
+	}
+	if opts.scenariosVerifiedSet && opts.scenariosVerified < 0 {
+		return fmt.Errorf("--scenarios-verified %d: must be >= 0", opts.scenariosVerified)
+	}
+	if opts.scenariosTotalSet && opts.scenariosVerifiedSet && opts.scenariosVerified > opts.scenariosTotal {
+		return fmt.Errorf("--scenarios-verified %d exceeds --scenarios-total %d", opts.scenariosVerified, opts.scenariosTotal)
+	}
+
 	mutate := func(s *workers.State) {
 		// Record phase transition: append the previous phase to the
 		// completed list so workers.list / peek can show "5/9 phases
@@ -602,6 +648,9 @@ func runWorkersUpdate(slug string, opts *workersUpdateOpts, stdout io.Writer) er
 			s.ReviewBetaSkipReason = ""
 			s.ReviewBetaEngine = ""
 			s.ReviewBetaModel = ""
+			s.ScenariosTotal = 0
+			s.ScenariosVerified = 0
+			s.GatesStatus = ""
 		}
 		// Apply review-* flag updates. Set-flag semantics: only
 		// overwrite when the operator (or reviewer subagent) passed
@@ -646,6 +695,15 @@ func runWorkersUpdate(slug string, opts *workersUpdateOpts, stdout io.Writer) er
 		if opts.reviewBetaModelSet {
 			s.ReviewBetaModel = strings.TrimSpace(opts.reviewBetaModel)
 		}
+		if opts.scenariosTotalSet {
+			s.ScenariosTotal = opts.scenariosTotal
+		}
+		if opts.scenariosVerifiedSet {
+			s.ScenariosVerified = opts.scenariosVerified
+		}
+		if opts.gatesStatusSet {
+			s.GatesStatus = gatesStatus
+		}
 		// Only set pid when the caller passed --pid explicitly.
 		// Defaulting to os.Getpid() captured the short-lived
 		// `fleet` helper PID and made workers look dead immediately
@@ -660,9 +718,9 @@ func runWorkersUpdate(slug string, opts *workersUpdateOpts, stdout io.Writer) er
 		// same slug after CI-red), --phase starting must not leave
 		// the previous attempt's pr_url / blocked_reason / exit
 		// hanging around. We clear them on every non-terminal
-		// transition (starting, branch, tdd-*, review-*, push) and
-		// only re-write them when the caller explicitly passes the
-		// matching flag.
+		// transition (starting, branch, spec-*, verify, tdd-*, review-*,
+		// push) and only re-write them when the caller explicitly
+		// passes the matching flag.
 		switch phase {
 		case workers.PhaseDone:
 			if strings.TrimSpace(opts.prURL) != "" {

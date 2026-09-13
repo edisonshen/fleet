@@ -2,7 +2,9 @@ package main
 
 import (
 	"bytes"
+	"encoding/json"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -731,5 +733,257 @@ func TestWorkersUpdate_UngatedAllowedWhenAuthorityZero(t *testing.T) {
 		project: project, phase: "tdd-red",
 	}, &bytes.Buffer{}); err != nil {
 		t.Fatalf("ungated update on a gen-0 slug should succeed: %v", err)
+	}
+}
+
+// runFleetBin runs the built `fleet` binary against a sandboxed
+// FLEET_HOME/HOME and returns combined stdout+stderr. Unlike the
+// in-process runWorkersUpdate tests above, this exercises the real
+// cobra flag surface (unknown-flag rejection, help text) that a worker
+// prompt shells out to — the scenario-first contract is stated at that
+// boundary.
+func runFleetBin(t *testing.T, bin, fleetHome, homeDir string, args ...string) (string, error) {
+	t.Helper()
+	cmd := exec.Command(bin, args...)
+	cmd.Dir = homeDir
+	cmd.Env = append(os.Environ(),
+		"FLEET_HOME="+fleetHome,
+		"HOME="+homeDir,
+	)
+	out, err := cmd.CombinedOutput()
+	return string(out), err
+}
+
+// TestWorkersUpdateCLI_ScenarioPhasesAndVerificationFields is the
+// Scenario contract S1–S4 for scenario-testing-pr1-phases, run against
+// the built binary in a sandbox FLEET_HOME:
+//
+//	S1 spec-repro / spec-encode / verify are accepted + persisted and
+//	   surface in `fleet peek` JSON.
+//	S2 legacy tdd-* stays accepted.
+//	S3 --scenarios-total / --scenarios-verified / --gates-status persist
+//	   and surface in `fleet peek` JSON.
+//	S4 malformed values are rejected naming the flag, exit non-zero,
+//	   and leave state.json byte-for-byte unchanged.
+func TestWorkersUpdateCLI_ScenarioPhasesAndVerificationFields(t *testing.T) {
+	bin := buildFleetBinary(t)
+	isolateTmuxSocket(t)
+	const project = "alpha"
+
+	type step struct {
+		args     []string
+		wantErr  bool
+		wantOut  []string // substrings of combined output
+		wantSame bool     // state.json unchanged after this step
+	}
+	cases := []struct {
+		name  string
+		steps []step
+		check func(t *testing.T, st *workers.State, peek string)
+	}{
+		{
+			name: "S1 new phases accepted and peek shows them",
+			steps: []step{
+				{args: []string{"workers", "update", "s1", "--project", project, "--phase", "spec-repro"}, wantOut: []string{"phase=spec-repro"}},
+				{args: []string{"workers", "update", "s1", "--project", project, "--phase", "spec-encode"}, wantOut: []string{"phase=spec-encode"}},
+				{args: []string{"workers", "update", "s1", "--project", project, "--phase", "verify"}, wantOut: []string{"phase=verify"}},
+			},
+			check: func(t *testing.T, st *workers.State, peek string) {
+				if st.Phase != workers.PhaseVerify {
+					t.Errorf("phase = %q, want verify", st.Phase)
+				}
+				// Bootstrap writes phase=starting on first touch; each
+				// accepted transition appends the prior phase.
+				want := []workers.Phase{workers.PhaseStarting, workers.PhaseSpecRepro, workers.PhaseSpecEncode}
+				if len(st.PhasesCompleted) != len(want) {
+					t.Fatalf("phases_completed = %v, want %v", st.PhasesCompleted, want)
+				}
+				for i := range want {
+					if st.PhasesCompleted[i] != want[i] {
+						t.Errorf("phases_completed = %v, want %v", st.PhasesCompleted, want)
+					}
+				}
+				if !strings.Contains(peek, `"phase": "verify"`) {
+					t.Errorf("peek missing phase: %s", peek)
+				}
+			},
+		},
+		{
+			name: "S2 legacy tdd phases still accepted",
+			steps: []step{
+				{args: []string{"workers", "update", "s2", "--project", project, "--phase", "tdd-red"}, wantOut: []string{"phase=tdd-red"}},
+				{args: []string{"workers", "update", "s2", "--project", project, "--phase", "tdd-green"}, wantOut: []string{"phase=tdd-green"}},
+				{args: []string{"workers", "update", "s2", "--project", project, "--phase", "tdd-refactor"}, wantOut: []string{"phase=tdd-refactor"}},
+			},
+			check: func(t *testing.T, st *workers.State, peek string) {
+				if st.Phase != workers.PhaseTDDRefactor {
+					t.Errorf("phase = %q, want tdd-refactor", st.Phase)
+				}
+				if !strings.Contains(peek, `"phase": "tdd-refactor"`) {
+					t.Errorf("peek missing phase: %s", peek)
+				}
+			},
+		},
+		{
+			name: "S3 verification fields persist and peek shows them",
+			steps: []step{
+				{args: []string{"workers", "update", "s3", "--project", project, "--phase", "verify",
+					"--scenarios-total", "3", "--scenarios-verified", "3", "--gates-status", "passed"}, wantOut: []string{"phase=verify"}},
+			},
+			check: func(t *testing.T, st *workers.State, peek string) {
+				if st.ScenariosTotal != 3 || st.ScenariosVerified != 3 || st.GatesStatus != "passed" {
+					t.Errorf("verification fields = total=%d verified=%d gates=%q, want 3/3/passed", st.ScenariosTotal, st.ScenariosVerified, st.GatesStatus)
+				}
+				for _, want := range []string{`"gates_status": "passed"`, `"scenarios_total": 3`, `"scenarios_verified": 3`} {
+					if !strings.Contains(peek, want) {
+						t.Errorf("peek missing %s:\n%s", want, peek)
+					}
+				}
+			},
+		},
+		{
+			name: "S4 malformed fields rejected and state untouched",
+			steps: []step{
+				{args: []string{"workers", "update", "s4", "--project", project, "--phase", "verify"}, wantOut: []string{"phase=verify"}},
+				{args: []string{"workers", "update", "s4", "--project", project, "--phase", "verify", "--gates-status", "maybe"},
+					wantErr: true, wantOut: []string{"--gates-status", "maybe"}, wantSame: true},
+				{args: []string{"workers", "update", "s4", "--project", project, "--phase", "verify", "--scenarios-verified", "4", "--scenarios-total", "3"},
+					wantErr: true, wantOut: []string{"--scenarios-verified", "--scenarios-total"}, wantSame: true},
+				{args: []string{"workers", "update", "s4", "--project", project, "--phase", "verify", "--scenarios-total", "-1"},
+					wantErr: true, wantOut: []string{"--scenarios-total"}, wantSame: true},
+			},
+			check: func(t *testing.T, st *workers.State, peek string) {
+				if st.ScenariosTotal != 0 || st.ScenariosVerified != 0 || st.GatesStatus != "" {
+					t.Errorf("rejected writes leaked into state: %#v", st)
+				}
+				for _, key := range []string{"gates_status", "scenarios_total", "scenarios_verified"} {
+					if strings.Contains(peek, key) {
+						t.Errorf("peek shows %s after rejected writes:\n%s", key, peek)
+					}
+				}
+			},
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			fleetHome := t.TempDir()
+			homeDir := t.TempDir()
+			slug := c.steps[0].args[2]
+			statePath := filepath.Join(fleetHome, "projects", project, "workers", slug, "state.json")
+			for _, s := range c.steps {
+				var before []byte
+				var beforeInfo os.FileInfo
+				if s.wantSame {
+					var err error
+					if before, err = os.ReadFile(statePath); err != nil {
+						t.Fatalf("read state before %v: %v", s.args, err)
+					}
+					if beforeInfo, err = os.Stat(statePath); err != nil {
+						t.Fatalf("stat state before %v: %v", s.args, err)
+					}
+				}
+				out, err := runFleetBin(t, bin, fleetHome, homeDir, s.args...)
+				if s.wantErr && err == nil {
+					t.Fatalf("fleet %v: want non-zero exit, got 0\n%s", s.args, out)
+				}
+				if !s.wantErr && err != nil {
+					t.Fatalf("fleet %v: %v\n%s", s.args, err, out)
+				}
+				for _, want := range s.wantOut {
+					if !strings.Contains(out, want) {
+						t.Errorf("fleet %v: output missing %q:\n%s", s.args, want, out)
+					}
+				}
+				if s.wantSame {
+					after, err := os.ReadFile(statePath)
+					if err != nil {
+						t.Fatalf("read state after %v: %v", s.args, err)
+					}
+					if !bytes.Equal(before, after) {
+						t.Errorf("fleet %v: state.json changed on rejected write:\n--- before\n%s\n--- after\n%s", s.args, before, after)
+					}
+					afterInfo, err := os.Stat(statePath)
+					if err != nil {
+						t.Fatalf("stat state after %v: %v", s.args, err)
+					}
+					if !afterInfo.ModTime().Equal(beforeInfo.ModTime()) {
+						t.Errorf("fleet %v: state.json mtime changed on rejected write", s.args)
+					}
+				}
+			}
+			raw, err := os.ReadFile(statePath)
+			if err != nil {
+				t.Fatalf("read state: %v", err)
+			}
+			var st workers.State
+			if err := json.Unmarshal(raw, &st); err != nil {
+				t.Fatalf("unmarshal state: %v\n%s", err, raw)
+			}
+			peek, err := runFleetBin(t, bin, fleetHome, homeDir, "peek", slug, "--project", project)
+			if err != nil {
+				t.Fatalf("fleet peek: %v\n%s", err, peek)
+			}
+			c.check(t, &st, peek)
+		})
+	}
+}
+
+// TestWorkersUpdateCLI_HelpListsScenarioPhasesAndFlags — acceptance 3:
+// `fleet workers update --help` (built binary) lists all six worker
+// phases (three new, three legacy) and the three verification flags.
+func TestWorkersUpdateCLI_HelpListsScenarioPhasesAndFlags(t *testing.T) {
+	bin := buildFleetBinary(t)
+	out, err := runFleetBin(t, bin, t.TempDir(), t.TempDir(), "workers", "update", "--help")
+	if err != nil {
+		t.Fatalf("--help: %v\n%s", err, out)
+	}
+	for _, want := range []string{
+		"spec-repro", "spec-encode", "verify",
+		"tdd-red", "tdd-green", "tdd-refactor",
+		"--scenarios-total", "--scenarios-verified", "--gates-status",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("--help missing %q:\n%s", want, out)
+		}
+	}
+}
+
+// TestWorkersUpdate_StartingResetClearsVerificationFields — S5: the
+// re-dispatch entry point (phase=starting) clears scenarios_total /
+// scenarios_verified / gates_status alongside the review_* fields, so
+// a retried worker can't inherit the previous attempt's gate claim.
+func TestWorkersUpdate_StartingResetClearsVerificationFields(t *testing.T) {
+	_, project := setupTasksHome(t)
+	slug := "verify-reset-aaaa"
+	if err := runWorkersUpdate(slug, &workersUpdateOpts{
+		project: project, phase: "verify",
+		scenariosTotal: 3, scenariosTotalSet: true,
+		scenariosVerified: 2, scenariosVerifiedSet: true,
+		gatesStatus: "failed", gatesStatusSet: true,
+		reviewAlphaStatus: "passed", reviewAlphaStatusSet: true,
+		reviewAlphaEngine: "claude", reviewAlphaEngineSet: true,
+		reviewAlphaModel: "opus-4.8", reviewAlphaModelSet: true,
+	}, &bytes.Buffer{}); err != nil {
+		t.Fatalf("seed verify: %v", err)
+	}
+	st, err := workers.ReadState(project, slug)
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if st.ScenariosTotal != 3 || st.ScenariosVerified != 2 || st.GatesStatus != "failed" {
+		t.Fatalf("seed not persisted: %#v", st)
+	}
+	if err := runWorkersUpdate(slug, &workersUpdateOpts{project: project, phase: "starting"}, &bytes.Buffer{}); err != nil {
+		t.Fatalf("reset: %v", err)
+	}
+	st, err = workers.ReadState(project, slug)
+	if err != nil {
+		t.Fatalf("read after reset: %v", err)
+	}
+	if st.ScenariosTotal != 0 || st.ScenariosVerified != 0 || st.GatesStatus != "" {
+		t.Errorf("verification fields not cleared: total=%d verified=%d gates=%q", st.ScenariosTotal, st.ScenariosVerified, st.GatesStatus)
+	}
+	if st.ReviewAlphaStatus != "" || st.ReviewAlphaEngine != "" || st.ReviewAlphaModel != "" {
+		t.Errorf("review fields not cleared: %#v", st)
 	}
 }

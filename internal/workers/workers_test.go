@@ -1525,3 +1525,144 @@ func TestUpdateStateNoPhaseChangeOmitsFleetlog(t *testing.T) {
 		t.Errorf("UpdateState no-phase-change: emitted %d bogus state.transition(s) with from==to", bogus)
 	}
 }
+
+// TestPhaseValidation_ScenarioPhasesAccepted: spec-repro / spec-encode /
+// verify (scenario-first testing) are valid Phase values alongside the
+// legacy tdd-* ladder, which stays accepted.
+func TestPhaseValidation_ScenarioPhasesAccepted(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("FLEET_HOME", tmp)
+	for _, p := range []Phase{
+		PhaseSpecRepro, PhaseSpecEncode, PhaseVerify,
+		PhaseTDDRed, PhaseTDDGreen, PhaseTDDRefactor,
+	} {
+		s := &State{
+			Slug:      "phase-" + sanitizeSlug(string(p)) + "-aaaa",
+			Project:   "fleet",
+			Phase:     p,
+			StartedAt: time.Now().UTC(),
+			PID:       1,
+		}
+		if err := WriteState("fleet", s.Slug, s); err != nil {
+			t.Errorf("WriteState phase=%s: %v; want nil", p, err)
+		}
+	}
+}
+
+// TestStateRoundTrip_VerificationFieldsOmittedWhenZero — S6: a
+// state.json written before the verification fields existed loads
+// with zero values and, when rewritten untouched, does not grow the
+// new keys (omitempty), so the on-disk shape of every existing worker
+// is unchanged until a worker actually passes the new flags.
+func TestStateRoundTrip_VerificationFieldsOmittedWhenZero(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("FLEET_HOME", tmp)
+	const slug = "legacy-shape-aaaa"
+	legacy := `{
+  "slug": "legacy-shape-aaaa",
+  "project": "fleet",
+  "phase": "tdd-green",
+  "phases_completed": ["starting", "branch", "tdd-red"],
+  "started_at": "2026-01-02T03:04:05Z",
+  "updated_at": "2026-01-02T03:05:05Z",
+  "pid": 4242
+}
+`
+	path, err := stateJSONPath("fleet", slug)
+	if err != nil {
+		t.Fatalf("stateJSONPath: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := os.WriteFile(path, []byte(legacy), 0o644); err != nil {
+		t.Fatalf("write legacy: %v", err)
+	}
+
+	got, err := ReadState("fleet", slug)
+	if err != nil {
+		t.Fatalf("ReadState: %v", err)
+	}
+	if got.ScenariosTotal != 0 || got.ScenariosVerified != 0 || got.GatesStatus != "" {
+		t.Fatalf("legacy record loaded with non-zero verification fields: %#v", got)
+	}
+
+	if err := UpdateState("fleet", slug, func(s *State) { s.Phase = PhaseTDDRefactor }); err != nil {
+		t.Fatalf("UpdateState: %v", err)
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read raw: %v", err)
+	}
+	for _, key := range []string{"scenarios_total", "scenarios_verified", "gates_status"} {
+		if containsSubstring(string(raw), key) {
+			t.Errorf("rewritten legacy state.json gained %q; want omitted (omitempty):\n%s", key, raw)
+		}
+	}
+
+	// Once set, the fields round-trip verbatim.
+	if err := UpdateState("fleet", slug, func(s *State) {
+		s.Phase = PhaseVerify
+		s.ScenariosTotal = 3
+		s.ScenariosVerified = 2
+		s.GatesStatus = GatesStatusFailed
+	}); err != nil {
+		t.Fatalf("UpdateState verify: %v", err)
+	}
+	got, err = ReadState("fleet", slug)
+	if err != nil {
+		t.Fatalf("ReadState after verify: %v", err)
+	}
+	if got.ScenariosTotal != 3 || got.ScenariosVerified != 2 || got.GatesStatus != GatesStatusFailed {
+		t.Errorf("verification fields did not round-trip: %#v", got)
+	}
+}
+
+// TestStateValidation_RejectsBogusVerificationFields: writeStateLocked
+// is the hard guard on the verification fields' shape — enum for
+// gates_status, non-negative counts, verified ≤ total. The rejected
+// write must not touch the on-disk record.
+func TestStateValidation_RejectsBogusVerificationFields(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("FLEET_HOME", tmp)
+	cases := []struct {
+		name    string
+		mut     func(*State)
+		wantErr error
+	}{
+		{"gates_status maybe", func(s *State) { s.GatesStatus = "maybe" }, ErrInvalidGatesStatus},
+		{"verified exceeds total", func(s *State) { s.ScenariosTotal = 3; s.ScenariosVerified = 4 }, ErrInvalidScenarioCounts},
+		{"negative total", func(s *State) { s.ScenariosTotal = -1 }, ErrInvalidScenarioCounts},
+		{"negative verified", func(s *State) { s.ScenariosTotal = 3; s.ScenariosVerified = -1 }, ErrInvalidScenarioCounts},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			slug := "bogus-" + sanitizeSlug(tc.name) + "-aaaa"
+			seed := &State{Slug: slug, Project: "fleet", Phase: PhaseVerify, StartedAt: time.Now().UTC(), PID: 1}
+			if err := WriteState("fleet", slug, seed); err != nil {
+				t.Fatalf("seed: %v", err)
+			}
+			path, _ := stateJSONPath("fleet", slug)
+			before, _ := os.ReadFile(path)
+			err := UpdateState("fleet", slug, tc.mut)
+			if !errors.Is(err, tc.wantErr) {
+				t.Fatalf("UpdateState err = %v; want %v", err, tc.wantErr)
+			}
+			after, _ := os.ReadFile(path)
+			if string(before) != string(after) {
+				t.Errorf("rejected write changed state.json:\n%s\n---\n%s", before, after)
+			}
+		})
+	}
+	// The boundary values are accepted.
+	slug := "bogus-ok-aaaa"
+	seed := &State{Slug: slug, Project: "fleet", Phase: PhaseVerify, StartedAt: time.Now().UTC(), PID: 1}
+	if err := WriteState("fleet", slug, seed); err != nil {
+		t.Fatalf("seed ok: %v", err)
+	}
+	for _, g := range []string{"", GatesStatusPassed, GatesStatusFailed} {
+		if err := UpdateState("fleet", slug, func(s *State) { s.GatesStatus = g; s.ScenariosTotal = 3; s.ScenariosVerified = 3 }); err != nil {
+			t.Errorf("gates_status=%q total=3 verified=3: %v; want nil", g, err)
+		}
+	}
+}
