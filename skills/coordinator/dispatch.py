@@ -289,16 +289,15 @@ def build_worker_prompt(
     # verification.md; the finisher copies its sections verbatim into
     # the PR body (or the non-git done note), so the wording of the
     # section headers here is load-bearing for build_finisher_prompt's
-    # gate. The prompt carries only what the worker must act on; the
-    # how-to (harness, baseline procedure) lives in docs/TESTING.md.
+    # gate. The text is project-agnostic: how to run, observe and gate
+    # the project comes only from the merged standards' `## Sandbox` /
+    # `## Gates` inlined above — Fleet dispatches into arbitrary
+    # projects, so nothing here may name Fleet's own build or harness.
+    # Git and non-git render the same arc; only the commit suffix
+    # differs.
     verification_md = f"{workers_dir}/verification.md"
     commit = " git commit." if is_git else ""
     if is_git:
-        repro_build = "build the product to $FLEET_DEV_BIN"
-        encode_ci = (
-            "\n    A new //go:build integration test must also be added to its package's -run\n"
-            "    list in .github/workflows/ci.yml or it never runs."
-        )
         step3_line = (
             "3. Commits are landed locally on the worker branch. Exit cleanly\n"
             "   (Ctrl-D / /exit). The coord polls state.json on the next tick,\n"
@@ -308,39 +307,38 @@ def build_worker_prompt(
         # Non-git: same phase machine, no commits. Workers leave a clean
         # local diff in the project directory and exit; the
         # phase=review-pending transition is the same handoff signal.
-        # e2e here means the project's own run command, named in the
-        # contract row.
-        repro_build = "run the project as the row's Stand-up / Trigger say"
-        encode_ci = ""
         step3_line = (
             "3. Files are landed in place. Exit cleanly (Ctrl-D / /exit). The\n"
             "   coord polls state.json on the next tick, sees phase=review-pending,\n"
             "   and dispatches the reviewer subagent."
         )
     spec_repro_line = (
-        "2a. REPRODUCE. Read docs/TESTING.md once. For every e2e/integ row of the task\n"
-        f"    plan's Scenario contract: {repro_build}, stand the row up in an\n"
-        f"    isolated sandbox (FLEET_HOME=$(mktemp -d) FLEET_TMUX_SOCKET=/tmp/fleet-test-{task.slug}-$$.sock),\n"
-        "    run the trigger, capture the wrong outcome VERBATIM under \"## Evidence — before\".\n"
-        f"    Cannot reproduce → `fleet workers update {task.slug} {proj_flag} --phase blocked\n"
-        f"    --reason \"spec mismatch: S<n> <what you saw instead>\"` and exit. Do not guess.{commit}"
+        "2a. REPRODUCE. Read `## Sandbox` and `## Gates` in the standards above. Export\n"
+        f"    FLEET_WORKER_SLUG={task.slug}. For every e2e row of the task plan's Scenario contract:\n"
+        "    `eval \"$(<up>)\"`, run the row's Trigger, capture with `<observe>`, then `<down>`.\n"
+        "    For every replay row: obtain the artifact the row names. Write what you saw\n"
+        f"    VERBATIM (commands + output) into {verification_md}\n"
+        "    under \"## Evidence — before\". A row above the tier (e2e with tier=none), a missing\n"
+        "    artifact, or an outcome that is not the wrong one → `fleet workers update\n"
+        f"    {task.slug} {proj_flag} --phase blocked --reason \"<S<n>>: <exactly what you saw / what is missing>\"`\n"
+        "    and exit. Do not guess. Do not stand in a mock for a boundary `## Sandbox` can run."
+        f"{commit}"
     )
     spec_encode_line = (
-        "2b. ENCODE. One test per row (grouped as the plan says) at the row's level,\n"
-        "    asserting the SAME observable you captured. Run it: it MUST fail for the\n"
-        f"    reason in \"Evidence — before\".{encode_ci}{commit}"
+        "2b. ENCODE. One test per row (grouped as the plan says) at the row's Level, in this\n"
+        "    project's own test framework, where `## Gates` will run it, asserting the SAME\n"
+        "    observable you captured (response/file/screen text, exit code, record — never an\n"
+        f"    internal call). Run it: it MUST fail for the reason in \"Evidence — before\".{commit}"
     )
     verify_line = (
-        "2c. IMPLEMENT + VERIFY. Fix. Re-run every scenario by hand AND via its test; record\n"
-        "    \"## Evidence — after\" (same commands, verbatim output). Then the FULL gates:\n"
-        "    go build ./... · gofmt -l . · golangci-lint run ./... ·\n"
-        "    go test -race -count=1 -timeout=5m ./... · FLEET_STANDBY_TIMEOUT=3s go test\n"
-        "    -tags=integration -count=1 -timeout=5m -run '^(<your e2e tests>)$' ./<pkg> ·\n"
-        "    python3 -m pytest skills/ scripts/ -q · bash scripts/lint-test-isolation.sh ·\n"
-        "    bash scripts/tests/test_lint_test_isolation.sh.\n"
-        "    Record each under \"## Gates\". Red you believe is pre-existing: prove it on\n"
-        "    untouched origin/main (docs/TESTING.md §6) under \"## Baseline\". Red that is\n"
-        f"    yours: fix it; do NOT flip review-pending.{commit} Then:\n"
+        "2c. IMPLEMENT + VERIFY. Fix. Re-run every row by hand (2a commands) AND via its test;\n"
+        "    record \"## Evidence — after\" (same commands, verbatim, PASS/FAIL per row). Run EVERY\n"
+        "    line of `## Gates`, in order; record command + result line under \"## Gates\". Red you\n"
+        "    believe is pre-existing: re-run it with the `baseline:` command on untouched main,\n"
+        "    record both under \"## Baseline\". Red that is yours: fix it; do NOT flip\n"
+        "    review-pending. `## Gates` empty in standards → run what the project's CI config\n"
+        "    runs, record the commands you used, and add \"standards: no ## Gates\" to \"## Baseline\".\n"
+        f"   {commit} Then:\n"
         f"      fleet workers update {task.slug} {proj_flag} --scenarios-total M --scenarios-verified N \\\n"
         "        --gates-status passed\n"
         "    (M = contract rows, N = rows PASS under \"Evidence — after\"; M=0 only for `none`.)"
@@ -360,16 +358,18 @@ def build_worker_prompt(
     )
     workflow_intro = (
         [
-            "You REPRODUCE each scenario on the built product, ENCODE it as a",
-            "test, IMPLEMENT + VERIFY, commit locally, and EXIT at",
+            "You REPRODUCE each scenario on the running product (per the",
+            "standards' `## Sandbox`), ENCODE it as a test, IMPLEMENT + VERIFY",
+            "(every `## Gates` line), commit locally, and EXIT at",
             "phase=review-pending. A separate reviewer subagent (dispatched",
             "by the coord on the next tick) runs /review + codex against your",
             "branch. A separate finisher subagent pushes + opens the PR.",
         ]
         if is_git
         else [
-            "You REPRODUCE each scenario on the running project, ENCODE it as",
-            "a test, IMPLEMENT + VERIFY directly in the project directory (no",
+            "You REPRODUCE each scenario on the running product (per the",
+            "standards' `## Sandbox`), ENCODE it as a test, IMPLEMENT + VERIFY",
+            "(every `## Gates` line) directly in the project directory (no",
             "branches, no commits — this is a non-git project) and EXIT at",
             "phase=review-pending. A reviewer subagent runs /review on your",
             "local diff. A finisher subagent marks the task done with a",
@@ -676,20 +676,25 @@ def build_reviewer_prompt(
     verification_md = f"{workers_dir}/verification.md"
     contract_lens_lines = [
         "   Scenario contract lens (read the task plan's `## Scenario contract`",
-        f"   table and {verification_md}):",
-        "   - every S<n> row has a test at its stated level (e2e/integ/unit);",
-        "   - each test asserts the row's observable outcome (file content, pane",
-        "     text, exit code, PR state) — not that an internal function was called;",
+        f"   table, the standards' `## Sandbox` / `## Gates`, and {verification_md}):",
+        "   - every S<n> row has a test at its stated level (e2e/integ/replay/unit);",
+        "   - each test asserts the row's observable outcome (response body, file",
+        "     content, screen text, exit code, record, PR state) — not that an",
+        "     internal function was called;",
         "   - `## Evidence — before` shows the test would have FAILED before the fix.",
-        "   A missing scenario, a level silently downgraded (e2e→unit) without the",
-        "   plan's reason, or an assertion on an internal call is a [P1] finding.",
+        "   A missing scenario, a row below the project's max level (`## Sandbox`",
+        "   tier: local/remote → e2e, none → replay) without the plan's one-word",
+        "   reason, a mock standing in for a boundary `## Sandbox` can run, or an",
+        "   assertion on an internal call is a [P1] finding.",
     ]
     contract_lens_context = (
         "Scenario contract lens: every S<n> row in the task plan's `## Scenario "
-        "contract` has a test at its stated level, asserting the row's observable "
-        "outcome (never that an internal function was called), and `## Evidence — "
-        f"before` in {verification_md} shows it would have failed before the fix. "
-        "Missing or downgraded scenario = [P1]."
+        "contract` has a test at its stated level (e2e/integ/replay/unit), asserting "
+        "the row's observable outcome (never that an internal function was called), "
+        f"and `## Evidence — before` in {verification_md} shows it would have failed "
+        "before the fix. Missing scenario, a row below the standards' `## Sandbox` "
+        "max level without the plan's reason, or a mock for a boundary `## Sandbox` "
+        "can run = [P1]."
     )
     task_context_arg = ""
     if not is_git:
@@ -787,11 +792,9 @@ def build_reviewer_prompt(
         loop_termination_line,
         terminal_invariant_line,
         "",
-        "   After ANY fix you land: re-run the scenario tests the fix touched AND",
-        "   the full gates (go build ./... · gofmt -l . · golangci-lint run ./... ·",
-        "   go test -race -count=1 -timeout=5m ./... · the -tags=integration lane for",
-        "   your e2e tests · python3 -m pytest skills/ scripts/ -q ·",
-        "   bash scripts/lint-test-isolation.sh), then append a",
+        "   After ANY fix you land: re-run the scenarios the fix touched (by hand",
+        "   per `## Sandbox` and via their tests) AND EVERY line of the standards'",
+        "   `## Gates`, in order, then append a",
         f"   `## Review re-verification` section to {verification_md}",
         "   (each re-run command + its result line) BEFORE the terminal write in",
         "   step 3. No fix landed → no section needed.",

@@ -286,8 +286,9 @@ def test_s2_tick_writes_scenario_first_worker_prompt(
     fleet_run_recorder, dispatch_subprocess,
 ) -> None:
     """S2: the prompt the real coord loop writes to the inbox on dispatch
-    is the S1 prompt — reproduce/encode/verify phases, verification.md,
-    the ci.yml gate list and the three flags; no TDD ladder."""
+    is the S1 prompt — reproduce/encode/verify phases driven by
+    `## Sandbox` / `## Gates`, verification.md and the three flags; no TDD
+    ladder, no Fleet noun outside the inlined standards."""
     _write_tasks(project_dir, [_make_task("ready-aaaa", status="ready")])
     dispatch_subprocess.append("abcdef01")
 

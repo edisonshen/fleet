@@ -144,7 +144,7 @@ Before any task is promoted to ready, save its worker-ready task plan doc.
 **Scenario contract (replaces the per-test "test plan" list):**
 
 Every TASK-PLAN doc carries a `## Scenario contract` table — one row per
-requirement the worker must prove on the built product, not one row per test
+requirement the worker must prove on the running product, not one row per test
 function:
 
 ```markdown
@@ -152,18 +152,31 @@ function:
 
 | S | Requirement | Stand-up | Trigger | Observable outcome | Level | Harness |
 |---|-------------|----------|---------|--------------------|-------|---------|
-| S1 | WHEN … THE … SHALL … | seeded state | the real command / key | pane text, file content, exit code | e2e | coorde2e |
+| S1 | WHEN … THE … SHALL … | seeded state | the real command / key / request | screen text, file content, response, exit code | e2e | `up` / `observe` from `## Sandbox` |
 ```
 
 Rules:
-- **Observable outcome** is what the operator would see — file content, pane
-  text, exit code, PR state, TUI flash. Never "function X is called".
-- **Level defaults to `e2e`**: built binary + real tmux (isolated
-  `FLEET_TMUX_SOCKET`) + real files under an isolated `FLEET_HOME`, driven via
-  `internal/testutil/coorde2e` (see `docs/TESTING.md`). `integ` = a package
-  test at a real boundary (real FS, real flock, `tmuxfake`). `unit` = pure
-  logic the scenario cannot reach; every `unit` row states the reason for the
-  downgrade in the Level cell (`unit — <reason>`), or a reviewer files it as P1.
+- **Observable outcome** is what the user/operator would see — response body,
+  file content, screen/pane text, exit code, DB row, PR state. Never "function X
+  is called".
+- **Level defaults to the project's max level**, read from the merged
+  standards' `## Sandbox` tier (`fleet standards show --merged --project <p>`):
+  `tier: local` or `tier: remote` → `e2e` (the running product via the
+  project's `up` / `observe` / `down`); `tier: none` → `replay` (the
+  highest-fidelity artifact — recorded request, log, fixture — driven through
+  the real boundary). `integ` = a package test at a real boundary that needs no
+  `up`. `unit` = pure logic the scenario cannot reach. A row below the max
+  level carries a one-word reason in the Level cell (`unit — pure`,
+  `integ — hermetic`, `replay — no-artifact`), or a reviewer files it as P1.
+- **Level never exceeds the tier**: plan review rejects a row whose Level the
+  project cannot run (`contract S<n> needs e2e but tier=none`).
+- **Harness** names how the row is driven: the `up` / `observe` commands for
+  `e2e`, the artifact for `replay`, the package harness for `integ`.
+- **Standards onboarding**: if the merged standards lack `## Sandbox` or
+  `## Gates`, the task plan carries a "standards onboarding" note and the coord
+  raises it to the operator at promote (`fleet standards edit --project <p>`);
+  workers cannot reproduce or gate against a project that has not declared how
+  it runs.
 - **Grouping is decided in the plan**: rows that share a stand-up become one
   table test, one row each; the plan says which rows group.
 - **Escape hatch:** a task with nothing observable (pure docs, rename) writes
@@ -209,7 +222,8 @@ dump of implementer notes. This standard gates the operator-approval step:
 4. **Short sentences, one idea per paragraph.** Halve length by removing
    redundancy, never by dropping a technical decision.
 5. **Scenario contract = one row per requirement** (stand-up / trigger /
-   observable outcome / level); rows sharing a stand-up group into one table
+   observable outcome / level / harness); Level defaults to the project's
+   `## Sandbox` max level and rows sharing a stand-up group into one table
    test. The contract names what the worker reproduces, not which functions
    it unit-tests.
 6. **Final version only:** no rev-by-rev review log, no "round 1/2/3" history,
@@ -235,24 +249,31 @@ phase=review-pending            phase=review-done           phase=done + pr_url
 
 Rules:
 - The worker runs the scenario-first arc (`spec-repro` -> `spec-encode` ->
-  `verify`): reproduce every contract row on the built product in a sandbox and
-  capture the wrong outcome verbatim; encode one test per row at the row's
-  level, failing for that reason; fix, re-run by hand and via the test, run the
-  full gates exactly as `ci.yml`. Evidence lives in
-  `~/.fleet/projects/<project>/workers/<slug>/verification.md` with sections
-  `## Scenario contract`, `## Evidence — before`, `## Evidence — after`,
+  `verify`) using only the merged standards' `## Sandbox` and `## Gates`:
+  export `FLEET_WORKER_SLUG=<slug>`, `eval "$(<up>)"`, run each e2e row's
+  trigger, capture with `<observe>`, `<down>` (replay rows: obtain the named
+  artifact) and record the wrong outcome verbatim; encode one test per row at
+  the row's level in the project's own framework, failing for that reason; fix,
+  re-run by hand and via the test, run every `## Gates` line in order. Evidence
+  lives in `~/.fleet/projects/<project>/workers/<slug>/verification.md` with
+  sections `## Scenario contract`, `## Evidence — before`, `## Evidence — after`,
   `## Gates`, `## Baseline`, `## Unit tests`. Before `review-pending` it records
   `--scenarios-total M --scenarios-verified N --gates-status passed`. A red gate
   of its own is fixed, never handed off; a red it believes pre-existing is
-  re-run on untouched `origin/main` and both results go under `## Baseline`.
+  re-run on untouched `origin/main` with the standards' `baseline:` command and
+  both results go under `## Baseline`. A row above the tier, a missing artifact,
+  or an outcome that is not the wrong one blocks with `<S<n>>: <what you saw>`;
+  the worker never mocks a boundary `## Sandbox` can run.
 - The worker exits at `review-pending`; it does not run `/review` and does not
   push.
 - The reviewer runs both resolved slots through `review_slot.py` with the
   Scenario-contract lens (every row has a test at its stated level asserting the
   observable outcome; `## Evidence — before` proves it would have failed;
-  missing or downgraded rows are P1), fixes P0/P1 findings, and after any fix
-  re-runs the touched scenario tests plus the full gates and appends
-  `## Review re-verification` to verification.md before the terminal write. It
+  a missing row, a row below the `## Sandbox` max level without the plan's
+  reason, or a mock for a boundary `## Sandbox` can run is P1), fixes P0/P1
+  findings, and after any fix re-runs the touched scenarios plus every
+  `## Gates` line and appends `## Review re-verification` to verification.md
+  before the terminal write. It
   records slot-named alpha/beta terminal fields. Beta is the Claude anchor and
   must pass; the beta review is never skippable.
 - On git projects, an alpha codex slot may be recorded as skipped only for
