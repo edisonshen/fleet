@@ -424,7 +424,6 @@ push pipeline so the coordinator can reconcile in-flight tasks correctly.
 
 Phases: starting, branch, spec-repro, spec-encode, verify,
 review-claude, review-codex, push, done, blocked, failed.
-Legacy tdd-red, tdd-green, tdd-refactor remain accepted.
 
 --scenarios-total / --scenarios-verified / --gates-status record the
 worker's Scenario contract outcome at phase=verify (gates_status is
@@ -471,7 +470,7 @@ explicitly when the caller is a wrapper script.`,
 	}
 	cmd.Flags().StringVar(&opts.project, "project", "", "project name (default: cwd basename)")
 	cmd.Flags().StringVar(&opts.phase, "phase", "",
-		"new worker phase (starting|branch|spec-repro|spec-encode|verify|tdd-red|tdd-green|tdd-refactor|review-claude|review-codex|review-pending|review-done|push|done|blocked|failed)")
+		"new worker phase (starting|branch|spec-repro|spec-encode|verify|review-claude|review-codex|review-pending|review-done|push|done|blocked|failed)")
 	cmd.Flags().StringVar(&opts.prURL, "pr-url", "", "PR URL (required for phase=done)")
 	cmd.Flags().StringVar(&opts.reason, "reason", "", "blocked reason (required for phase=blocked)")
 	cmd.Flags().IntVar(&opts.pid, "pid", 0, "worker OS PID (default: os.Getpid())")
@@ -718,9 +717,9 @@ func runWorkersUpdate(slug string, opts *workersUpdateOpts, stdout io.Writer) er
 		// same slug after CI-red), --phase starting must not leave
 		// the previous attempt's pr_url / blocked_reason / exit
 		// hanging around. We clear them on every non-terminal
-		// transition (starting, branch, spec-*, verify, tdd-*, review-*,
-		// push) and only re-write them when the caller explicitly
-		// passes the matching flag.
+		// transition (starting, branch, spec-*, verify, review-*, push)
+		// and only re-write them when the caller explicitly passes the
+		// matching flag.
 		switch phase {
 		case workers.PhaseDone:
 			if strings.TrimSpace(opts.prURL) != "" {

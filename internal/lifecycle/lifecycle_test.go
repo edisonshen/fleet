@@ -58,14 +58,12 @@ func TestClassifyWorker(t *testing.T) {
 	}{
 		{"starting", workers.PhaseStarting, lifecycle.StatePrerun},
 		{"branch", workers.PhaseBranch, lifecycle.StatePrerun},
-		// Scenario-first phases (DESIGN-scenario-first-testing) sit in
-		// the same Active bucket as the legacy tdd-* ladder.
+		// Scenario-first phases (DESIGN-scenario-first-testing).
 		{"spec-repro", workers.PhaseSpecRepro, lifecycle.StateActive},
 		{"spec-encode", workers.PhaseSpecEncode, lifecycle.StateActive},
 		{"verify", workers.PhaseVerify, lifecycle.StateActive},
-		{"tdd-red", workers.PhaseTDDRed, lifecycle.StateActive},
-		{"tdd-green", workers.PhaseTDDGreen, lifecycle.StateActive},
-		{"tdd-refactor", workers.PhaseTDDRefactor, lifecycle.StateActive},
+		// Removed tdd-* ladder is unknown to lifecycle.
+		{"tdd-red", workers.Phase("tdd-red"), lifecycle.StateUnknown},
 		{"review-claude", workers.PhaseReviewClaude, lifecycle.StateActive},
 		{"review-codex", workers.PhaseReviewCodex, lifecycle.StateActive},
 		// Three-stage flow handoff phases (reviewer-subagent-arch):
@@ -276,7 +274,7 @@ func TestOnTerminalWorkerActiveDoesNotDelete(t *testing.T) {
 		t.Fatalf("mkdir: %v", err)
 	}
 
-	w := &workers.State{Slug: slug, Project: project, Phase: workers.PhaseTDDRed}
+	w := &workers.State{Slug: slug, Project: project, Phase: workers.PhaseSpecRepro}
 	if err := lifecycle.OnTerminal(w, project); err != nil {
 		t.Fatalf("OnTerminal: %v", err)
 	}

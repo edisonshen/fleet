@@ -52,7 +52,7 @@ func TestWorkersList_EmptyAndPopulated(t *testing.T) {
 	}
 
 	// Seed an active starting worker (not done — done would need pr_url).
-	seedWorker(t, project, "alpha-1234", workers.PhaseTDDRed, os.Getpid())
+	seedWorker(t, project, "alpha-1234", workers.PhaseSpecRepro, os.Getpid())
 	out.Reset()
 	if err := runWorkersList(&workersListOpts{project: project}, out); err != nil {
 		t.Fatalf("list (populated): %v", err)
@@ -60,7 +60,7 @@ func TestWorkersList_EmptyAndPopulated(t *testing.T) {
 	if !strings.Contains(out.String(), "alpha-1234") {
 		t.Errorf("worker slug missing: %s", out.String())
 	}
-	if !strings.Contains(out.String(), "tdd-red") {
+	if !strings.Contains(out.String(), "spec-repro") {
 		t.Errorf("phase missing: %s", out.String())
 	}
 }
@@ -176,7 +176,7 @@ func TestWorkersUpdate_SetsPhase_NoExplicitPid(t *testing.T) {
 	out := &bytes.Buffer{}
 	opts := &workersUpdateOpts{
 		project: project,
-		phase:   "tdd-red",
+		phase:   "spec-repro",
 	}
 	if err := runWorkersUpdate("alpha-1234", opts, out); err != nil {
 		t.Fatalf("update: %v", err)
@@ -185,15 +185,15 @@ func TestWorkersUpdate_SetsPhase_NoExplicitPid(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read state: %v", err)
 	}
-	if st.Phase != workers.PhaseTDDRed {
-		t.Errorf("phase = %q, want tdd-red", st.Phase)
+	if st.Phase != workers.PhaseSpecRepro {
+		t.Errorf("phase = %q, want spec-repro", st.Phase)
 	}
 	// Without --pid, pid stays at the bootstrap default (0), NOT
 	// os.Getpid() of this test process.
 	if st.PID != 0 {
 		t.Errorf("pid = %d, want 0 (no --pid passed)", st.PID)
 	}
-	if !strings.Contains(out.String(), "tdd-red") {
+	if !strings.Contains(out.String(), "spec-repro") {
 		t.Errorf("stdout should report new phase: %s", out.String())
 	}
 }
@@ -206,7 +206,7 @@ func TestWorkersUpdate_ExplicitPidIsRecorded(t *testing.T) {
 	_, project := setupTasksHome(t)
 	opts := &workersUpdateOpts{
 		project: project,
-		phase:   "tdd-red",
+		phase:   "spec-repro",
 		pid:     42424,
 		pidSet:  true,
 	}
@@ -320,10 +320,10 @@ func TestWorkersUpdate_DoneWithPRURL(t *testing.T) {
 
 // TestWorkersUpdate_AppendsPhaseHistory — every phase change after
 // the initial bootstrap appends the previous phase to phases_completed,
-// so the coord/peek surfaces can show a worker's TDD pipeline progress.
+// so the coord/peek surfaces can show a worker's pipeline progress.
 func TestWorkersUpdate_AppendsPhaseHistory(t *testing.T) {
 	_, project := setupTasksHome(t)
-	steps := []string{"branch", "tdd-red", "tdd-green", "tdd-refactor"}
+	steps := []string{"branch", "spec-repro", "spec-encode", "verify"}
 	for _, p := range steps {
 		if err := runWorkersUpdate("alpha-5555", &workersUpdateOpts{
 			project: project, phase: p,
@@ -335,12 +335,12 @@ func TestWorkersUpdate_AppendsPhaseHistory(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read: %v", err)
 	}
-	if st.Phase != workers.PhaseTDDRefactor {
+	if st.Phase != workers.PhaseVerify {
 		t.Errorf("final phase = %q", st.Phase)
 	}
 	// Bootstrap is "starting"; first transition appends "starting",
 	// then each subsequent transition appends the previous phase.
-	// Expected history: starting, branch, tdd-red, tdd-green.
+	// Expected history: starting, branch, spec-repro, spec-encode.
 	wantLen := len(steps) // starting + (steps-1) prior phases = len(steps)
 	if len(st.PhasesCompleted) != wantLen {
 		t.Errorf("phases_completed = %v (len %d), want len %d",
@@ -672,7 +672,7 @@ func TestWorkersUpdate_DispatchGenerationCAS(t *testing.T) {
 	// A stale gen-1 worker self-report is CAS-rejected.
 	staleErr := runWorkersUpdate("gen-cas-aaaa", &workersUpdateOpts{
 		project:               project,
-		phase:                 "tdd-green",
+		phase:                 "spec-encode",
 		dispatchGeneration:    1,
 		dispatchGenerationSet: true,
 	}, &bytes.Buffer{})
@@ -687,7 +687,7 @@ func TestWorkersUpdate_DispatchGenerationCAS(t *testing.T) {
 	// A matching gen-2 write succeeds and stamps the gen.
 	if err := runWorkersUpdate("gen-cas-aaaa", &workersUpdateOpts{
 		project:               project,
-		phase:                 "tdd-green",
+		phase:                 "spec-encode",
 		dispatchGeneration:    2,
 		dispatchGenerationSet: true,
 	}, &bytes.Buffer{}); err != nil {
@@ -700,8 +700,8 @@ func TestWorkersUpdate_DispatchGenerationCAS(t *testing.T) {
 	if st.DispatchGeneration != 2 {
 		t.Errorf("stamped gen = %d, want 2", st.DispatchGeneration)
 	}
-	if st.Phase != workers.PhaseTDDGreen {
-		t.Errorf("phase = %q, want tdd-green", st.Phase)
+	if st.Phase != workers.PhaseSpecEncode {
+		t.Errorf("phase = %q, want spec-encode", st.Phase)
 	}
 
 	// Codex iter-3 [P1]: once a slug's task row has gen > 0, an UNGATED
@@ -709,7 +709,7 @@ func TestWorkersUpdate_DispatchGenerationCAS(t *testing.T) {
 	// worker must not bypass the fence by loading + rewriting the current
 	// state.json with the gen preserved.
 	ungatedErr := runWorkersUpdate("gen-cas-aaaa", &workersUpdateOpts{
-		project: project, phase: "tdd-refactor",
+		project: project, phase: "verify",
 	}, &bytes.Buffer{})
 	if ungatedErr == nil || !strings.Contains(ungatedErr.Error(), "must pass --dispatch-generation") {
 		t.Fatalf("ungated update on a gen>0 slug must be rejected, got %v", ungatedErr)
@@ -730,7 +730,7 @@ func TestWorkersUpdate_UngatedAllowedWhenAuthorityZero(t *testing.T) {
 	}
 	// Task row gen defaults to 0; an ungated update is allowed.
 	if err := runWorkersUpdate("legacy-zzzz", &workersUpdateOpts{
-		project: project, phase: "tdd-red",
+		project: project, phase: "spec-repro",
 	}, &bytes.Buffer{}); err != nil {
 		t.Fatalf("ungated update on a gen-0 slug should succeed: %v", err)
 	}
@@ -760,7 +760,7 @@ func runFleetBin(t *testing.T, bin, fleetHome, homeDir string, args ...string) (
 //
 //	S1 spec-repro / spec-encode / verify are accepted + persisted and
 //	   surface in `fleet peek` JSON.
-//	S2 legacy tdd-* stays accepted.
+//	S2 the removed tdd-* ladder is rejected as an invalid phase.
 //	S3 --scenarios-total / --scenarios-verified / --gates-status persist
 //	   and surface in `fleet peek` JSON.
 //	S4 malformed values are rejected naming the flag, exit non-zero,
@@ -809,17 +809,21 @@ func TestWorkersUpdateCLI_ScenarioPhasesAndVerificationFields(t *testing.T) {
 			},
 		},
 		{
-			name: "S2 legacy tdd phases still accepted",
+			name: "S2 removed tdd phases rejected",
 			steps: []step{
-				{args: []string{"workers", "update", "s2", "--project", project, "--phase", "tdd-red"}, wantOut: []string{"phase=tdd-red"}},
-				{args: []string{"workers", "update", "s2", "--project", project, "--phase", "tdd-green"}, wantOut: []string{"phase=tdd-green"}},
-				{args: []string{"workers", "update", "s2", "--project", project, "--phase", "tdd-refactor"}, wantOut: []string{"phase=tdd-refactor"}},
+				{args: []string{"workers", "update", "s2", "--project", project, "--phase", "spec-repro"}, wantOut: []string{"phase=spec-repro"}},
+				{args: []string{"workers", "update", "s2", "--project", project, "--phase", "tdd-red"},
+					wantErr: true, wantOut: []string{"invalid phase", "tdd-red"}, wantSame: true},
+				{args: []string{"workers", "update", "s2", "--project", project, "--phase", "tdd-green"},
+					wantErr: true, wantOut: []string{"invalid phase", "tdd-green"}, wantSame: true},
+				{args: []string{"workers", "update", "s2", "--project", project, "--phase", "tdd-refactor"},
+					wantErr: true, wantOut: []string{"invalid phase", "tdd-refactor"}, wantSame: true},
 			},
 			check: func(t *testing.T, st *workers.State, peek string) {
-				if st.Phase != workers.PhaseTDDRefactor {
-					t.Errorf("phase = %q, want tdd-refactor", st.Phase)
+				if st.Phase != workers.PhaseSpecRepro {
+					t.Errorf("phase = %q, want spec-repro", st.Phase)
 				}
-				if !strings.Contains(peek, `"phase": "tdd-refactor"`) {
+				if !strings.Contains(peek, `"phase": "spec-repro"`) {
 					t.Errorf("peek missing phase: %s", peek)
 				}
 			},
@@ -929,8 +933,8 @@ func TestWorkersUpdateCLI_ScenarioPhasesAndVerificationFields(t *testing.T) {
 }
 
 // TestWorkersUpdateCLI_HelpListsScenarioPhasesAndFlags — acceptance 3:
-// `fleet workers update --help` (built binary) lists all six worker
-// phases (three new, three legacy) and the three verification flags.
+// `fleet workers update --help` (built binary) lists the scenario-first
+// worker phases and the three verification flags, and no tdd-* phase.
 func TestWorkersUpdateCLI_HelpListsScenarioPhasesAndFlags(t *testing.T) {
 	bin := buildFleetBinary(t)
 	out, err := runFleetBin(t, bin, t.TempDir(), t.TempDir(), "workers", "update", "--help")
@@ -939,12 +943,14 @@ func TestWorkersUpdateCLI_HelpListsScenarioPhasesAndFlags(t *testing.T) {
 	}
 	for _, want := range []string{
 		"spec-repro", "spec-encode", "verify",
-		"tdd-red", "tdd-green", "tdd-refactor",
 		"--scenarios-total", "--scenarios-verified", "--gates-status",
 	} {
 		if !strings.Contains(out, want) {
 			t.Errorf("--help missing %q:\n%s", want, out)
 		}
+	}
+	if strings.Contains(out, "tdd-") {
+		t.Errorf("--help still mentions tdd-*:\n%s", out)
 	}
 }
 

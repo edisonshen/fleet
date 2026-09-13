@@ -377,7 +377,7 @@ func TestWriteRecoveryHandoffDoc_WritesSynthDocToDisk(t *testing.T) {
 	wState := map[string]any{
 		"slug":    "fix-foo-1234",
 		"project": "myproj",
-		"phase":   "tdd-green",
+		"phase":   "spec-encode",
 		"pid":     0,
 	}
 	wData, _ := json.Marshal(wState)
@@ -482,7 +482,7 @@ func TestRunDispatch_DeadCoord_Recovers(t *testing.T) {
 	wState := map[string]any{
 		"slug":    "fix-foo-1234",
 		"project": "myproj",
-		"phase":   "tdd-green",
+		"phase":   "spec-encode",
 		"pid":     0,
 	}
 	wData, _ := json.Marshal(wState)
@@ -772,7 +772,7 @@ func TestRunDispatch_DeadCoord_SendsResumePromptToSuccessor(t *testing.T) {
 	wState := map[string]any{
 		"slug":    "fix-foo-1234",
 		"project": "myproj",
-		"phase":   "tdd-green",
+		"phase":   "spec-encode",
 		"pid":     0,
 	}
 	wData, _ := json.Marshal(wState)

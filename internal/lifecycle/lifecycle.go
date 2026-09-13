@@ -2,7 +2,7 @@
 // orchestrator for Fleet (issue #101).
 //
 // Tasks, workers, and coord agent records each carry their own granular
-// status enums (tasks.StatusInProgress, workers.PhaseTDDRed, agent
+// status enums (tasks.StatusInProgress, workers.PhaseVerify, agent
 // records' alive/asking/blocked variants). The operator-visible
 // surfaces continue to use those granular values verbatim — nothing
 // here renames or collapses them. Lifecycle adds a small abstract layer
@@ -51,10 +51,10 @@ const (
 	StateUnknown State = iota
 	// StatePrerun: the entity exists but hasn't started running yet.
 	// Tasks in todo/ready, workers bootstrapped at phase=starting/branch
-	// before TDD begins. No cleanup applies.
+	// before spec-repro begins. No cleanup applies.
 	StatePrerun
 	// StateActive: the entity is doing work right now. Tasks
-	// in-progress / in-review, workers in the TDD/review/push pipe,
+	// in-progress / in-review, workers in the spec/verify/review/push pipe,
 	// fresh agents with no flags set.
 	StateActive
 	// StateWaiting: the entity is parked on input it can't proceed
@@ -144,7 +144,6 @@ func ClassifyTask(t *tasks.Task) State {
 //	branch     → Prerun  (cutting the worker branch; pre-work)
 //	spec-*     → Active  (scenario-first: spec-repro, spec-encode)
 //	verify     → Active
-//	tdd-*      → Active  (legacy ladder; still accepted)
 //	review-*   → Active
 //	push       → Active
 //	done       → TerminalSuccess
@@ -162,7 +161,6 @@ func ClassifyWorker(w *workers.State) State {
 	case workers.PhaseStarting, workers.PhaseBranch:
 		return StatePrerun
 	case workers.PhaseSpecRepro, workers.PhaseSpecEncode, workers.PhaseVerify,
-		workers.PhaseTDDRed, workers.PhaseTDDGreen, workers.PhaseTDDRefactor,
 		workers.PhaseReviewClaude, workers.PhaseReviewCodex,
 		// PhaseReviewPending and PhaseReviewDone are three-stage flow
 		// handoff phases (reviewer-subagent-arch): the outgoing

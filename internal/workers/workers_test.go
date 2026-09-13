@@ -24,8 +24,8 @@ func TestStateRoundTrip(t *testing.T) {
 	in := &State{
 		Slug:            "add-readme-7a3c",
 		Project:         "fleet",
-		Phase:           PhaseTDDRefactor,
-		PhasesCompleted: []Phase{PhaseBranch, PhaseTDDRed, PhaseTDDGreen},
+		Phase:           PhaseVerify,
+		PhasesCompleted: []Phase{PhaseBranch, PhaseSpecRepro, PhaseSpecEncode},
 		StartedAt:       time.Date(2026, 5, 6, 14, 0, 0, 0, time.UTC),
 		PID:             12345,
 	}
@@ -231,7 +231,7 @@ func TestArchive_RefusesLiveWorker(t *testing.T) {
 	tmp := t.TempDir()
 	t.Setenv("FLEET_HOME", tmp)
 	if err := WriteState("fleet", "live-aaaa", &State{
-		Slug: "live-aaaa", Project: "fleet", Phase: PhaseTDDGreen,
+		Slug: "live-aaaa", Project: "fleet", Phase: PhaseSpecEncode,
 		StartedAt: time.Now().UTC(), PID: 1,
 	}); err != nil {
 		t.Fatalf("seed: %v", err)
@@ -351,7 +351,7 @@ func TestArchive_SerializesWithUpdateState(t *testing.T) {
 			// Hold the lock briefly so Archive must wait.
 			time.Sleep(50 * time.Millisecond)
 			// Bump to non-terminal — Archive's re-check should reject.
-			s.Phase = PhaseTDDGreen
+			s.Phase = PhaseSpecEncode
 			s.PRURL = ""
 		})
 	}()
@@ -831,7 +831,7 @@ func TestStateRoundTrip_ReviewFieldsOmittedWhenEmpty(t *testing.T) {
 	in := &State{
 		Slug:      "no-review-aaaa",
 		Project:   "fleet",
-		Phase:     PhaseTDDGreen,
+		Phase:     PhaseSpecEncode,
 		StartedAt: time.Now().UTC(),
 		PID:       1,
 	}
@@ -1289,7 +1289,7 @@ func TestUpdateStateGen_CAS(t *testing.T) {
 		t.Setenv("FLEET_HOME", tmp)
 		// Live current attempt (gen 3) wrote in-progress + no PR.
 		if err := UpdateStateGen("p", "live-cccc", 3, 3, func(s *State) {
-			s.Phase = PhaseTDDGreen
+			s.Phase = PhaseSpecEncode
 		}); err != nil {
 			t.Fatalf("seed live state: %v", err)
 		}
@@ -1302,7 +1302,7 @@ func TestUpdateStateGen_CAS(t *testing.T) {
 			t.Fatalf("want ErrStaleGeneration, got %v", err)
 		}
 		got, _ := ReadState("p", "live-cccc")
-		if got.Phase != PhaseTDDGreen || got.PRURL != "" {
+		if got.Phase != PhaseSpecEncode || got.PRURL != "" {
 			t.Errorf("stale write clobbered live state: phase=%q pr=%q", got.Phase, got.PRURL)
 		}
 		if got.DispatchGeneration != 3 {
@@ -1320,7 +1320,7 @@ func TestUpdateStateGen_CAS(t *testing.T) {
 		t.Setenv("FLEET_HOME", tmp)
 		// Current attempt already wrote gen 5.
 		if err := UpdateStateGen("p", "newer-eeee", 5, 5, func(s *State) {
-			s.Phase = PhaseTDDGreen
+			s.Phase = PhaseSpecEncode
 		}); err != nil {
 			t.Fatalf("seed gen-5 state: %v", err)
 		}
@@ -1334,7 +1334,7 @@ func TestUpdateStateGen_CAS(t *testing.T) {
 			t.Fatalf("higher on-disk gen must reject, got %v", err)
 		}
 		got, _ := ReadState("p", "newer-eeee")
-		if got.Phase != PhaseTDDGreen || got.DispatchGeneration != 5 {
+		if got.Phase != PhaseSpecEncode || got.DispatchGeneration != 5 {
 			t.Errorf("live newer state was clobbered: phase=%q gen=%d",
 				got.Phase, got.DispatchGeneration)
 		}
@@ -1351,7 +1351,7 @@ func TestUpdateStateGen_CAS(t *testing.T) {
 		// status + completed phases on disk.
 		if err := UpdateStateGen("p", "repair-dddd", 1, 1, func(s *State) {
 			s.Phase = PhaseReviewDone
-			s.PhasesCompleted = []Phase{PhaseBranch, PhaseTDDGreen}
+			s.PhasesCompleted = []Phase{PhaseBranch, PhaseSpecEncode}
 			s.ReviewAlphaStatus = ReviewStatusPassed
 			s.ReviewBetaStatus = ReviewStatusPassed
 		}); err != nil {
@@ -1466,7 +1466,7 @@ func TestUpdateStateGenEmitsFleetlog(t *testing.T) {
 	logDir := fleetlog.Dir()
 
 	if err := UpdateStateGen("proj", "slug-fl2", 1, 1, func(s *State) {
-		s.Phase = PhaseTDDGreen
+		s.Phase = PhaseSpecEncode
 	}); err != nil {
 		t.Fatalf("UpdateStateGen: %v", err)
 	}
@@ -1476,8 +1476,8 @@ func TestUpdateStateGenEmitsFleetlog(t *testing.T) {
 		if m["type"] == "state.transition" && m["slug"] == "slug-fl2" {
 			found = true
 			data, _ := m["data"].(map[string]any)
-			if data["to"] != string(PhaseTDDGreen) {
-				t.Errorf("state.transition data.to want %q got %v", PhaseTDDGreen, data["to"])
+			if data["to"] != string(PhaseSpecEncode) {
+				t.Errorf("state.transition data.to want %q got %v", PhaseSpecEncode, data["to"])
 			}
 		}
 	}
@@ -1527,15 +1527,24 @@ func TestUpdateStateNoPhaseChangeOmitsFleetlog(t *testing.T) {
 }
 
 // TestPhaseValidation_ScenarioPhasesAccepted: spec-repro / spec-encode /
-// verify (scenario-first testing) are valid Phase values alongside the
-// legacy tdd-* ladder, which stays accepted.
+// verify (scenario-first testing) are valid Phase values; the removed
+// tdd-* ladder is not.
 func TestPhaseValidation_ScenarioPhasesAccepted(t *testing.T) {
 	tmp := t.TempDir()
 	t.Setenv("FLEET_HOME", tmp)
-	for _, p := range []Phase{
-		PhaseSpecRepro, PhaseSpecEncode, PhaseVerify,
-		PhaseTDDRed, PhaseTDDGreen, PhaseTDDRefactor,
-	} {
+	for _, p := range []Phase{"tdd-red", "tdd-green", "tdd-refactor"} {
+		s := &State{
+			Slug:      "phase-" + sanitizeSlug(string(p)) + "-aaaa",
+			Project:   "fleet",
+			Phase:     p,
+			StartedAt: time.Now().UTC(),
+			PID:       1,
+		}
+		if err := WriteState("fleet", s.Slug, s); !errors.Is(err, ErrInvalidPhase) {
+			t.Errorf("WriteState phase=%s: err=%v; want ErrInvalidPhase", p, err)
+		}
+	}
+	for _, p := range []Phase{PhaseSpecRepro, PhaseSpecEncode, PhaseVerify} {
 		s := &State{
 			Slug:      "phase-" + sanitizeSlug(string(p)) + "-aaaa",
 			Project:   "fleet",
@@ -1561,8 +1570,8 @@ func TestStateRoundTrip_VerificationFieldsOmittedWhenZero(t *testing.T) {
 	legacy := `{
   "slug": "legacy-shape-aaaa",
   "project": "fleet",
-  "phase": "tdd-green",
-  "phases_completed": ["starting", "branch", "tdd-red"],
+  "phase": "spec-encode",
+  "phases_completed": ["starting", "branch", "spec-repro"],
   "started_at": "2026-01-02T03:04:05Z",
   "updated_at": "2026-01-02T03:05:05Z",
   "pid": 4242
@@ -1587,7 +1596,7 @@ func TestStateRoundTrip_VerificationFieldsOmittedWhenZero(t *testing.T) {
 		t.Fatalf("legacy record loaded with non-zero verification fields: %#v", got)
 	}
 
-	if err := UpdateState("fleet", slug, func(s *State) { s.Phase = PhaseTDDRefactor }); err != nil {
+	if err := UpdateState("fleet", slug, func(s *State) { s.Phase = PhaseVerify }); err != nil {
 		t.Fatalf("UpdateState: %v", err)
 	}
 	raw, err := os.ReadFile(path)

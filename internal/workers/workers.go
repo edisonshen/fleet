@@ -51,15 +51,10 @@ const (
 	// scenario-first worker steps (DESIGN-scenario-first-testing):
 	// reproduce the requirement's scenario on the built product,
 	// encode the observed outcome as a test, implement + run the full
-	// gates. The tdd-* phases below are the legacy ladder — retained
-	// and accepted (in-flight workers, lifecycle bucket, fixtures) but
-	// no longer emitted by the prompts.
+	// gates.
 	PhaseSpecRepro    Phase = "spec-repro"
 	PhaseSpecEncode   Phase = "spec-encode"
 	PhaseVerify       Phase = "verify"
-	PhaseTDDRed       Phase = "tdd-red"
-	PhaseTDDGreen     Phase = "tdd-green"
-	PhaseTDDRefactor  Phase = "tdd-refactor"
 	PhaseReviewClaude Phase = "review-claude"
 	PhaseReviewCodex  Phase = "review-codex"
 	// PhaseReviewPending and PhaseReviewDone are the three-stage flow
@@ -83,7 +78,6 @@ func validPhase(p Phase) bool {
 	switch p {
 	case PhaseStarting, PhaseBranch,
 		PhaseSpecRepro, PhaseSpecEncode, PhaseVerify,
-		PhaseTDDRed, PhaseTDDGreen, PhaseTDDRefactor,
 		PhaseReviewClaude, PhaseReviewCodex,
 		PhaseReviewPending, PhaseReviewDone,
 		PhasePush, PhaseDone, PhaseBlocked, PhaseFailed:

@@ -146,7 +146,7 @@ def test_judge_phase_blocked_is_blocked_not_complete() -> None:
 def test_judge_non_terminal_phase_is_continue() -> None:
     j = reaper.judge_completion(
         task_status="in-progress",
-        worker_state={"phase": "tdd-red"},
+        worker_state={"phase": "spec-repro"},
         is_git=True,
     )
     assert j == reaper.JUDGE_CONTINUE
@@ -610,9 +610,9 @@ def test_error_abort_judgment_immediate_kill_when_session_dead() -> None:
 
 
 def test_reap_probes_pending_judgment_no_entry_kept() -> None:
-    """Worker still running (phase=tdd-red) → no entry opened."""
+    """Worker still running (phase=spec-repro) → no entry opened."""
     coord_state: dict = {}
-    inputs = [_inp(worker_state={"phase": "tdd-red"})]
+    inputs = [_inp(worker_state={"phase": "spec-repro"})]
     stubs = _stubs()
 
     decisions = reaper.reap_probes(

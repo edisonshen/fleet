@@ -11,7 +11,7 @@ schema: v1
 
 ## Testing
 
-- TDD required: a failing test on disk before the implementation.
+- Scenario-first: reproduce the scenario against the built product, encode the observed outcome as a test at the right boundary, then implement and verify.
 - Tests use stdlib `testing` only — no testify, no ginkgo.
 - All bug fixes carry a regression test that fails on the parent commit.
 - Integration tests preferred over heavy mocking when feasible.

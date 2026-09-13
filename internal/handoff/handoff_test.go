@@ -394,11 +394,11 @@ func TestRender_ActiveSubagents_SingleEntry(t *testing.T) {
 		time.Date(2026, 4, 27, 18, 48, 7, 0, time.UTC))
 	d.ActiveSubagents = []ActiveSubagent{
 		{TaskID: "fix-foo", Branch: "worker/fix-foo",
-			LastPhase: "tdd-green", Status: "in-progress", PRURL: "",
+			LastPhase: "spec-encode", Status: "in-progress", PRURL: "",
 			AgentID: "abcd1234", SubagentID: "claude-sub-1"},
 	}
 	got := string(Render(d))
-	want := `- task="fix-foo" branch="worker/fix-foo" phase="tdd-green" status="in-progress" pr_url="" agent_id="abcd1234" subagent_id="claude-sub-1"`
+	want := `- task="fix-foo" branch="worker/fix-foo" phase="spec-encode" status="in-progress" pr_url="" agent_id="abcd1234" subagent_id="claude-sub-1"`
 	if !strings.Contains(got, want) {
 		t.Errorf("expected entry line %q in:\n%s", want, got)
 	}
@@ -435,13 +435,13 @@ func TestRender_ActiveSubagents_MultipleEntries(t *testing.T) {
 	d := NewManualStub("a1b2c3d4", "t", "p", 1, nil, time.Now().UTC())
 	d.ActiveSubagents = []ActiveSubagent{
 		{TaskID: "a", Branch: "worker/a", LastPhase: "push", Status: "in-progress", PRURL: "", AgentID: "11111111", SubagentID: ""},
-		{TaskID: "b", Branch: "worker/b", LastPhase: "tdd-red", Status: "in-review", PRURL: "https://example/pr/1", AgentID: "22222222", SubagentID: "claude-sub-2"},
+		{TaskID: "b", Branch: "worker/b", LastPhase: "spec-repro", Status: "in-review", PRURL: "https://example/pr/1", AgentID: "22222222", SubagentID: "claude-sub-2"},
 	}
 	got := string(Render(d))
 	if !strings.Contains(got, `- task="a" branch="worker/a" phase="push" status="in-progress" pr_url="" agent_id="11111111" subagent_id=""`) {
 		t.Errorf("missing entry a in:\n%s", got)
 	}
-	if !strings.Contains(got, `- task="b" branch="worker/b" phase="tdd-red" status="in-review" pr_url="https://example/pr/1" agent_id="22222222" subagent_id="claude-sub-2"`) {
+	if !strings.Contains(got, `- task="b" branch="worker/b" phase="spec-repro" status="in-review" pr_url="https://example/pr/1" agent_id="22222222" subagent_id="claude-sub-2"`) {
 		t.Errorf("missing entry b in:\n%s", got)
 	}
 	idxA := strings.Index(got, `task="a"`)
@@ -475,7 +475,7 @@ func TestParseActiveSubagents_SingleWorker(t *testing.T) {
 	d := NewManualStub("a1b2c3d4", "t", "p", 1, nil, time.Now().UTC())
 	d.ActiveSubagents = []ActiveSubagent{
 		{TaskID: "fix-foo", Branch: "worker/fix-foo",
-			LastPhase: "tdd-green", Status: "in-progress", PRURL: "",
+			LastPhase: "spec-encode", Status: "in-progress", PRURL: "",
 			AgentID: "abcd1234", SubagentID: "claude-sub-1"},
 	}
 	doc := Render(d)
@@ -502,7 +502,7 @@ func TestParseActiveSubagents_MultipleWorkers(t *testing.T) {
 	d := NewManualStub("a1b2c3d4", "t", "p", 1, nil, time.Now().UTC())
 	d.ActiveSubagents = []ActiveSubagent{
 		{TaskID: "a", Branch: "worker/a", LastPhase: "push", Status: "in-progress", PRURL: "", AgentID: "11111111", SubagentID: ""},
-		{TaskID: "b", Branch: "worker/b", LastPhase: "tdd-red", Status: "in-progress", PRURL: "", AgentID: "22222222", SubagentID: "claude-sub-2"},
+		{TaskID: "b", Branch: "worker/b", LastPhase: "spec-repro", Status: "in-progress", PRURL: "", AgentID: "22222222", SubagentID: "claude-sub-2"},
 		{TaskID: "c", Branch: "worker/c", LastPhase: "review-codex", Status: "in-review", PRURL: "https://example/pr/3", AgentID: "33333333", SubagentID: "claude-sub-3"},
 	}
 	doc := Render(d)
@@ -533,7 +533,7 @@ func TestParseActiveSubagents_BackwardsCompat(t *testing.T) {
 	doc := []byte(
 		"---\nagent_id: \"x\"\n---\n\n" +
 			"## Active Subagents\n" +
-			`- task="legacy" branch="worker/legacy" phase="tdd-green" agent_id="abcd1234" subagent_id=""` + "\n",
+			`- task="legacy" branch="worker/legacy" phase="spec-encode" agent_id="abcd1234" subagent_id=""` + "\n",
 	)
 	subs, warnings, err := ParseActiveSubagents(doc)
 	if err != nil {
@@ -547,7 +547,7 @@ func TestParseActiveSubagents_BackwardsCompat(t *testing.T) {
 	}
 	got := subs[0]
 	want := ActiveSubagent{
-		TaskID: "legacy", Branch: "worker/legacy", LastPhase: "tdd-green",
+		TaskID: "legacy", Branch: "worker/legacy", LastPhase: "spec-encode",
 		Status: "", PRURL: "", AgentID: "abcd1234", SubagentID: "",
 	}
 	if got != want {
