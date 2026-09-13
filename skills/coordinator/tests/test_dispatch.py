@@ -762,6 +762,49 @@ def test_build_worker_prompt_non_git_project_skips_branch_push_pr() -> None:
     assert "reviewer" in out.lower()
 
 
+# ---------- verify gate (scenario-testing-pr3-gate) ----------
+
+
+VERIFY_GATE_LINE = (
+    "If the review-pending write is rejected by the verify gate, your gates "
+    "or counts are wrong; fix and re-record — never `--phase blocked` to bypass."
+)
+
+
+@pytest.mark.parametrize("is_git", [True, False])
+def test_build_worker_prompt_verify_gate_rejection_line_precedes_handoff(is_git: bool) -> None:
+    """D3: the worker prompt carries exactly one verify-gate rejection
+    line, placed after step 2c and before the review-pending handoff
+    command, in both git and non-git modes."""
+    t = _make_task()
+    out = dispatch.build_worker_prompt(
+        t, project="fleet", standards_md="", learnings_text="", is_git=is_git,
+    )
+    assert out.count(VERIFY_GATE_LINE) == 1
+    proj = "--project fleet"
+    assert out.index("--phase tdd-refactor") < out.index(VERIFY_GATE_LINE)
+    assert out.index(VERIFY_GATE_LINE) < out.index(
+        f"fleet workers update {t.slug} {proj} --phase review-pending"
+    )
+
+
+@pytest.mark.parametrize("is_git", [True, False])
+def test_build_finisher_prompt_unaffected_by_verify_gate(is_git: bool) -> None:
+    """S6: the verify gate is enforced by the Go validator at
+    phase=review-pending/push; the finisher prompt path is unchanged —
+    it never writes review-pending and does not carry the worker's
+    verify-gate rejection line."""
+    t = _make_task()
+    out = dispatch.build_finisher_prompt(t, project="fleet", is_git=is_git)
+    assert "--phase review-pending" not in out
+    assert VERIFY_GATE_LINE not in out
+    assert "verify gate" not in out.lower()
+    if is_git:
+        assert f"fleet workers update {t.slug} --project fleet --phase push" in out
+    else:
+        assert "--phase push" not in out
+
+
 def test_build_reviewer_prompt_non_git_uses_two_claude_slots_without_base() -> None:
     t = _make_task()
     t.spec = "Fix the quoted 'thing'.\nKeep context intact."

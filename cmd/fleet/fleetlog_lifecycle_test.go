@@ -89,9 +89,10 @@ func TestFleetlogLifecycle(t *testing.T) {
 
 	// --- Trigger 2: a real Go worker phase transition (state.transition)
 	if err := workers.WriteState(project, slug, &workers.State{
-		Slug:    slug,
-		Project: project,
-		Phase:   workers.PhaseReviewPending,
+		Slug:        slug,
+		Project:     project,
+		Phase:       workers.PhaseReviewPending,
+		GatesStatus: workers.GatesStatusPassed,
 	}); err != nil {
 		t.Fatalf("WriteState: %v", err)
 	}

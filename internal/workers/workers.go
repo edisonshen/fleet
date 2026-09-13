@@ -184,8 +184,9 @@ type State struct {
 	// --scenarios-total M --scenarios-verified N --gates-status
 	// passed|failed`. Records pre-dating the fields load as zero and
 	// rewrite without them (omitempty). writeStateLocked enforces the
-	// shape only (enum, non-negative, verified ≤ total); no phase gates
-	// on them yet.
+	// shape (enum, non-negative, verified ≤ total) on every write and
+	// validateVerifyGate requires passed + verified == total at
+	// phase=review-pending and phase=push.
 	ScenariosTotal    int    `json:"scenarios_total,omitempty"`
 	ScenariosVerified int    `json:"scenarios_verified,omitempty"`
 	GatesStatus       string `json:"gates_status,omitempty"`
@@ -202,15 +203,22 @@ type State struct {
 
 // Errors.
 var (
-	ErrNotFound                    = errors.New("worker state.json not found")
-	ErrInvalidState                = errors.New("invalid worker state")
-	ErrPhaseRequiresPR             = errors.New("phase=done requires pr_url")
-	ErrPhaseRequiresWhy            = errors.New("phase=blocked requires blocked_reason")
-	ErrPhaseRequiresReview         = errors.New("terminal phase requires review slot gate: alpha passed or legal codex skip, and beta claude passed")
-	ErrInvalidPhase                = errors.New("invalid phase")
-	ErrInvalidReviewStat           = errors.New("invalid review status")
-	ErrInvalidGatesStatus          = errors.New("invalid gates_status: must be passed|failed")
-	ErrInvalidScenarioCounts       = errors.New("invalid scenario counts: scenarios_total and scenarios_verified must be >= 0 and scenarios_verified <= scenarios_total")
+	ErrNotFound              = errors.New("worker state.json not found")
+	ErrInvalidState          = errors.New("invalid worker state")
+	ErrPhaseRequiresPR       = errors.New("phase=done requires pr_url")
+	ErrPhaseRequiresWhy      = errors.New("phase=blocked requires blocked_reason")
+	ErrPhaseRequiresReview   = errors.New("terminal phase requires review slot gate: alpha passed or legal codex skip, and beta claude passed")
+	ErrInvalidPhase          = errors.New("invalid phase")
+	ErrInvalidReviewStat     = errors.New("invalid review status")
+	ErrInvalidGatesStatus    = errors.New("invalid gates_status: must be passed|failed")
+	ErrInvalidScenarioCounts = errors.New("invalid scenario counts: scenarios_total and scenarios_verified must be >= 0 and scenarios_verified <= scenarios_total")
+	// ErrPhaseRequiresGates / ErrPhaseRequiresScenarios are the verify
+	// gate (validateVerifyGate): phase=review-pending and phase=push are
+	// rejected unless gates_status=passed and scenarios_verified ==
+	// scenarios_total. The wrapped message names the phase and the
+	// offending values so the worker prompt can show it verbatim.
+	ErrPhaseRequiresGates          = errors.New("phase requires gates_status=passed")
+	ErrPhaseRequiresScenarios      = errors.New("phase requires scenarios_verified == scenarios_total")
 	ErrCodexSkipNeedsReason        = errors.New("codex-engine review slot status=skipped requires skip_reason in {rate-limited, unavailable}")
 	ErrReviewSlotIdentity          = errors.New("review slot requires engine in {codex,claude} and non-empty model")
 	ErrReviewBetaAnchor            = errors.New("review beta slot must be engine=claude with status=passed (the Claude anchor)")
@@ -328,6 +336,35 @@ func validateReviewGate(s *State, gitMode bool) error {
 	return nil
 }
 
+// validateVerifyGate enforces the scenario-first verification
+// precondition (DESIGN-scenario-first-testing §Lever 4). The worker
+// records its claim at 2c VERIFY (`--gates-status passed
+// --scenarios-total M --scenarios-verified N`); the gate makes the
+// claim un-skippable at the two handoff writes:
+//
+//	worker   ── review-pending ──▶ reviewer ── review-done ──▶ finisher ── push ──▶ done
+//	          ▲ verify gate                                     ▲ review gate, then verify gate
+//
+// Fail-closed like validateReviewGate: an empty gates_status (worker
+// never recorded) is rejected the same as "failed". scenarios_total=0
+// is legal (docs-only task, contract `none`) but gates_status must
+// still be passed. Re-checked at push so a reviewer/finisher write
+// that downgraded the fields cannot ship. Runs AFTER validateReviewGate
+// in writeStateLocked so a missing review at push still surfaces
+// ErrPhaseRequiresReview (the verify gate must not mask it).
+func validateVerifyGate(s *State) error {
+	if s.Phase != PhaseReviewPending && s.Phase != PhasePush {
+		return nil
+	}
+	if s.GatesStatus != GatesStatusPassed {
+		return fmt.Errorf("%w: phase=%s (got gates_status=%q)", ErrPhaseRequiresGates, s.Phase, s.GatesStatus)
+	}
+	if s.ScenariosTotal < 0 || s.ScenariosVerified != s.ScenariosTotal {
+		return fmt.Errorf("%w: phase=%s scenarios_verified=%d != scenarios_total=%d", ErrPhaseRequiresScenarios, s.Phase, s.ScenariosVerified, s.ScenariosTotal)
+	}
+	return nil
+}
+
 // updateMu serializes UpdateState calls within one process per
 // (project, slug) pair. Cross-process serialization is provided by
 // the per-state-file flock acquired inside UpdateState.
@@ -441,6 +478,9 @@ func writeStateLocked(project, slug string, s *State) error {
 		return ErrPhasePushNonGit
 	}
 	if err := validateReviewGate(s, gitMode); err != nil {
+		return err
+	}
+	if err := validateVerifyGate(s); err != nil {
 		return err
 	}
 	// phase=done's pr_url precondition applies only to git projects.
