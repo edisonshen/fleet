@@ -782,7 +782,7 @@ def test_build_worker_prompt_verify_gate_rejection_line_precedes_handoff(is_git:
     )
     assert out.count(VERIFY_GATE_LINE) == 1
     proj = "--project fleet"
-    assert out.index("--phase tdd-refactor") < out.index(VERIFY_GATE_LINE)
+    assert out.index("--phase verify") < out.index(VERIFY_GATE_LINE)
     assert out.index(VERIFY_GATE_LINE) < out.index(
         f"fleet workers update {t.slug} {proj} --phase review-pending"
     )
