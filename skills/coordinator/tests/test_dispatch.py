@@ -6,6 +6,7 @@ to assert the exact argv we'd send and to drive return-code paths.
 from __future__ import annotations
 
 import os
+import re
 import shlex
 import subprocess
 from unittest.mock import patch
@@ -47,7 +48,7 @@ def test_build_worker_prompt_contains_required_sections() -> None:
     assert "use t.TempDir" in out
     # Three-stage flow: worker writes the code phases ONLY. Review +
     # push happen in separate subagents (reviewer-subagent-arch).
-    for phase in ("branch", "tdd-red", "tdd-green", "tdd-refactor",
+    for phase in ("branch", "spec-repro", "spec-encode", "verify",
                   "review-pending"):
         assert f"--phase {phase}" in out, f"worker prompt missing --phase {phase}"
     # The old inline phases are GONE from the worker prompt — only the
@@ -134,6 +135,33 @@ def test_build_worker_prompt_oversized_raises() -> None:
             standards_md=huge_standards,
             learnings_text="",
         )
+
+
+@pytest.mark.parametrize("is_git", [True, False], ids=["git", "non-git"])
+def test_build_worker_prompt_fits_cap_with_repo_standards(is_git: bool) -> None:
+    """The repo's own templates/standards.md + a realistic ~2KB spec must
+    render under _PROMPT_HARD_CAP_BYTES, or every real dispatch on this
+    project raises PromptTooLargeError (task marked blocked)."""
+    here = os.path.dirname(os.path.abspath(__file__))
+    repo = here
+    while repo != "/" and not os.path.exists(os.path.join(repo, "go.mod")):
+        repo = os.path.dirname(repo)
+    with open(os.path.join(repo, "templates", "standards.md"), encoding="utf-8") as f:
+        standards = f.read()
+    spec = ("WHEN the operator presses [a] on a project row THE TUI SHALL "
+            "dispatch a coord and flash `dispatched <id>` in the status bar. ") * 12
+    acceptance = ("- pane shows `fake claude: ready`\n"
+                  "- agents/<id>.json has project=demo\n") * 8
+    assert len((spec + acceptance).encode()) >= 2000
+    t = parse.Task(slug="fix-thing-aaaa", status="ready", priority="P1",
+                   spec=spec, acceptance=acceptance, notes="")
+    out = dispatch.build_worker_prompt(
+        t, project="fleet", standards_md=standards,
+        learnings_text="", branch="worker/fix-thing-aaaa",
+        workers_dir="~/.fleet/projects/fleet/workers/fix-thing-aaaa",
+        is_git=is_git,
+    )
+    assert len(out.encode()) <= dispatch._PROMPT_HARD_CAP_BYTES
 
 
 def test_build_worker_prompt_handles_empty_spec_and_acceptance() -> None:
@@ -769,12 +797,16 @@ def test_build_reviewer_prompt_non_git_uses_two_claude_slots_without_base() -> N
     out = dispatch.build_reviewer_prompt(
         t, project="scratch", is_git=False, has_codex=True,
     )
-    context = f"{t.spec}\n\nAcceptance:\n{t.acceptance}"
     assert "review_slot.py" in out
     assert "--engine codex" not in out
     assert out.count("--engine claude --model") == 2
     assert "--base" not in out
-    assert out.count(f"--task-context {shlex.quote(context)}") == 2
+    # Spec + acceptance ride along in --task-context on both slots (the
+    # contract lens is appended after them; S3 pins that part).
+    contexts = _task_contexts(out)
+    assert len(contexts) == 2
+    for ctx in contexts:
+        assert ctx.startswith(f"{t.spec}\n\nAcceptance:\n{t.acceptance}")
     assert "no-git" not in out
     assert "--review-alpha-status passed" in out
     assert "--review-beta-status passed" in out
@@ -1187,3 +1219,226 @@ def test_release_coord_prompt_inbox_e2e_via_real_fleet_bin(tmp_path) -> None:
         # cleaned up by the first release; either is valid idempotent.
         dispatch.RELEASE_OUTCOME_ABSENT,
     )
+
+
+# ---------- Scenario contract (scenario-first testing, PR-2) ----------
+#
+# S1/S3/S4 pin the prompt text each subagent sees — the prompt IS the
+# boundary between the coord and the worker. S5 executes the finisher's
+# embedded gate snippet with PATH shims. S6 runs the built binary.
+
+
+def _task_contexts(prompt: str) -> list[str]:
+    """The decoded `--task-context` argument of every review_slot line."""
+    out = []
+    marker = "--task-context "
+    pos = prompt.find(marker)
+    while pos != -1:
+        lexer = shlex.shlex(prompt[pos + len(marker):], posix=True)
+        lexer.whitespace_split = True
+        out.append(lexer.get_token())
+        pos = prompt.find(marker, pos + len(marker))
+    return out
+
+
+_S1_REQUIRED = (
+    "--phase spec-repro", "--phase spec-encode", "--phase verify",
+    "verification.md", "Evidence — before",
+    "go test -race -count=1 -timeout=5m ./...",
+    "--scenarios-total M --scenarios-verified N", "--gates-status passed",
+    "docs/TESTING.md", "FLEET_HOME=$(mktemp -d)", "FLEET_TMUX_SOCKET=/tmp/fleet-test-",
+    "## Baseline", "do NOT flip review-pending",
+    "bash scripts/lint-test-isolation.sh",
+    "bash scripts/tests/test_lint_test_isolation.sh",
+)
+_S1_FORBIDDEN = ("tdd-", "Write the failing test")
+
+
+def _assert_s1_prompt(out: str, *, is_git: bool) -> None:
+    for needle in _S1_REQUIRED:
+        assert needle in out, f"S1: worker prompt missing {needle!r}"
+    for needle in _S1_FORBIDDEN:
+        assert needle not in out, f"S1: worker prompt still carries {needle!r}"
+    # The scenario phases run in order, after branch and before the
+    # handoff, and the flags update lands before review-pending.
+    order = ["--phase branch", "--phase spec-repro", "--phase spec-encode",
+             "--phase verify", "--gates-status passed", "--phase review-pending"]
+    idx = [out.index(s) for s in order]
+    assert idx == sorted(idx), f"S1: phase order wrong: {order} at {idx}"
+    if is_git:
+        assert "git commit" in out
+        assert ".github/workflows/ci.yml" in out, (
+            "S1: until PR-3 the worker must add new //go:build integration "
+            "tests to the package's -run list in ci.yml"
+        )
+    else:
+        assert "git commit" not in out
+
+
+@pytest.mark.parametrize("is_git", [True, False], ids=["git", "non-git"])
+def test_s1_worker_prompt_is_scenario_first(is_git: bool) -> None:
+    """S1: the dispatched worker prompt carries 2a REPRODUCE / 2b ENCODE /
+    2c IMPLEMENT + VERIFY, the verification.md path + sections, the full
+    ci.yml gate list and the three flags — and no TDD ladder."""
+    t = _make_task()
+    out = dispatch.build_worker_prompt(
+        t, project="fleet", standards_md="# Standards\n", learnings_text="",
+        is_git=is_git,
+    )
+    _assert_s1_prompt(out, is_git=is_git)
+    for header in ("## Scenario contract", "## Evidence — before",
+                   "## Evidence — after", "## Gates", "## Baseline",
+                   "## Unit tests"):
+        assert header in out, f"S1: verification.md section {header!r} missing"
+    assert "~/.fleet/projects/fleet/workers/fix-thing-aaaa/verification.md" in out
+
+
+@pytest.mark.parametrize("is_git", [True, False], ids=["git", "non-git"])
+def test_s3_reviewer_prompt_carries_contract_lens(is_git: bool) -> None:
+    """S3: the reviewer prompt carries the Scenario-contract lens and the
+    re-verify-after-fix rule; non-git threads the lens via --task-context."""
+    t = _make_task()
+    out = dispatch.build_reviewer_prompt(t, project="fleet", is_git=is_git)
+    for needle in ("Scenario contract", "observable outcome", "re-run",
+                   "## Review re-verification", "Evidence — before", "[P1]",
+                   "verification.md"):
+        assert needle in out, f"S3: reviewer prompt missing {needle!r}"
+    # Re-verification is appended BEFORE the terminal review-done write.
+    assert out.index("## Review re-verification") < out.index("--phase review-done")
+    contexts = _task_contexts(out)
+    if is_git:
+        assert contexts == []
+    else:
+        assert len(contexts) == 2
+        for ctx in contexts:
+            assert ctx.startswith(f"{t.spec}\n\nAcceptance:\n{t.acceptance}")
+            assert "Scenario contract lens" in ctx
+            assert "observable outcome" in ctx
+
+
+@pytest.mark.parametrize("is_git", [True, False], ids=["git", "non-git"])
+def test_s4_finisher_prompt_ships_verification_not_placeholder(is_git: bool) -> None:
+    """S4: the finisher reads verification.md into `## Verification`
+    (PR body / done note) and never emits the old checklist placeholder."""
+    t = _make_task()
+    out = dispatch.build_finisher_prompt(t, project="fleet", is_git=is_git)
+    for needle in ("verification.md", "## Verification",
+                   "finisher: no verification evidence (~/.fleet/projects/fleet/"
+                   "workers/fix-thing-aaaa/verification.md)",
+                   "section_nonempty '## Gates'",
+                   "section_nonempty '## Evidence — after'"):
+        assert needle in out, f"S4: finisher prompt missing {needle!r}"
+    for needle in ("- [ ] CI green", "- [ ] verify locally", "## Test plan"):
+        assert needle not in out, f"S4: finisher prompt still carries {needle!r}"
+    if is_git:
+        assert '## Verification\n$(cat "$V")' in out
+    else:
+        assert "fleet tasks note" in out
+        assert "## Verification" in out.split("fleet tasks note", 1)[1]
+
+
+_S5_GATE_RE = re.compile(r"```sh\n(.*?)```", re.S)
+
+
+def _s5_run_finisher_gate(tmp_path, verification: str | None) -> tuple[int, list[str]]:
+    """Stand up a sandbox FLEET_HOME with a worker at review-done, drop
+    `verification` at its verification.md (None = no file), then run the
+    finisher prompt's step-3 gate snippet followed by the step-4 PR
+    command with `fleet`/`gh`/`git` shimmed onto PATH. Returns the
+    script's exit code and the shims' call log."""
+    fleet_home = tmp_path / "home"
+    workers_dir = fleet_home / "projects" / "fleet" / "workers" / "fix-thing-aaaa"
+    workers_dir.mkdir(parents=True)
+    (workers_dir / "state.json").write_text('{"phase":"review-done"}\n')
+    if verification is not None:
+        (workers_dir / "verification.md").write_text(verification)
+    shims = tmp_path / "bin"
+    shims.mkdir()
+    log = tmp_path / "calls.log"
+    for tool in ("fleet", "gh", "git"):
+        shim = shims / tool
+        shim.write_text(f'#!/bin/sh\necho "{tool} $*" >> "{log}"\n')
+        shim.chmod(0o755)
+    t = _make_task()
+    prompt = dispatch.build_finisher_prompt(
+        t, project="fleet", is_git=True, workers_dir=str(workers_dir),
+    )
+    m = _S5_GATE_RE.search(prompt)
+    assert m, "S5: finisher prompt embeds no ```sh gate snippet"
+    script = m.group(1) + "\ngh pr create --base main --head worker/fix-thing-aaaa\n"
+    env = dict(os.environ, PATH=f"{shims}:{os.environ['PATH']}", FLEET_HOME=str(fleet_home))
+    proc = subprocess.run(
+        ["bash", "-c", script], env=env, capture_output=True, text=True, check=False,
+    )
+    calls = log.read_text().splitlines() if log.exists() else []
+    return proc.returncode, calls
+
+
+_S5_VERIFICATION_EMPTY_GATES = (
+    "## Scenario contract\n| S1 | x |\n\n"
+    "## Evidence — before\nsaw the bug\n\n"
+    "## Evidence — after\nPASS\n\n"
+    "## Gates\n\n"
+    "## Baseline\n\n## Unit tests\ntest_x\n"
+)
+_S5_VERIFICATION_FULL = _S5_VERIFICATION_EMPTY_GATES.replace(
+    "## Gates\n\n", "## Gates\ngo build ./... ok\n\n",
+)
+
+
+@pytest.mark.parametrize(
+    "verification",
+    [_S5_VERIFICATION_EMPTY_GATES, None,
+     _S5_VERIFICATION_FULL.replace("## Evidence — after\nPASS\n", "## Evidence — after\n")],
+    ids=["empty-gates", "missing-file", "empty-evidence-after"],
+)
+def test_s5_finisher_gate_blocks_without_evidence(tmp_path, verification) -> None:
+    """S5: running the finisher's own gate against a worker whose
+    verification.md is missing or has an empty `## Gates` /
+    `## Evidence — after` writes phase=blocked with the canonical reason
+    and never reaches `gh pr create`."""
+    rc, calls = _s5_run_finisher_gate(tmp_path, verification)
+    assert rc == 0, f"S5: gate must exit 0 after blocking, got {rc}: {calls}"
+    path = tmp_path / "home/projects/fleet/workers/fix-thing-aaaa/verification.md"
+    assert calls == [
+        "fleet workers update fix-thing-aaaa --project fleet --phase blocked "
+        f"--reason finisher: no verification evidence ({path})",
+    ], f"S5: unexpected shim calls: {calls}"
+
+
+def test_s5_finisher_gate_passes_with_evidence(tmp_path) -> None:
+    """S5 (control): a filled `## Gates` + `## Evidence — after` lets the
+    same snippet fall through to the PR step."""
+    rc, calls = _s5_run_finisher_gate(tmp_path, _S5_VERIFICATION_FULL)
+    assert rc == 0
+    assert calls == ["gh pr create --base main --head worker/fix-thing-aaaa"], calls
+
+
+def test_s6_built_binary_merged_standards_are_scenario_first(tmp_path) -> None:
+    """S6: `fleet standards show --merged` from a freshly built binary in a
+    sandbox HOME prints the scenario-first `## Testing` section and no TDD
+    text. Built binary, not the template file: the embedded copy is what
+    every worker's prompt gets."""
+    fleet_bin = _build_fleet_bin(tmp_path)
+    if not fleet_bin:
+        pytest.skip("could not build fleet binary; skipping S6 e2e")
+    home = tmp_path / "home"
+    home.mkdir()
+    (home / ".fleet" / "projects" / "demo").mkdir(parents=True)
+    env = dict(os.environ, HOME=str(home))
+    env.pop("FLEET_HOME", None)
+    init = subprocess.run(
+        [fleet_bin, "init", "--parallelism", "2"],
+        env=env, capture_output=True, text=True, check=False,
+    )
+    assert init.returncode == 0, init.stderr
+    show = subprocess.run(
+        [fleet_bin, "standards", "show", "--project", "demo", "--merged"],
+        env=env, capture_output=True, text=True, check=False,
+    )
+    assert show.returncode == 0, show.stderr
+    assert "## Testing" in show.stdout
+    assert "Scenario-first, not test-first." in show.stdout
+    assert "Test at the boundary where the operator would see it" in show.stdout
+    assert "TDD required" not in show.stdout
+    assert "tdd" not in show.stdout.lower()

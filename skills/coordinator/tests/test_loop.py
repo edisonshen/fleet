@@ -30,6 +30,7 @@ import loop
 import parse
 import pr_watch as pw
 import supervisor
+from test_dispatch import _assert_s1_prompt
 
 
 # ---------- helpers ----------
@@ -278,6 +279,29 @@ def test_tick_dispatches_ready_task(
     assert all(
         cmd[1:2] != ["dispatch"] for cmd in seen_cmds
     ), f"unexpected `fleet dispatch` subprocess call: {seen_cmds!r}"
+
+
+def test_s2_tick_writes_scenario_first_worker_prompt(
+    fleet_home: Path, project_dir: Path,
+    fleet_run_recorder, dispatch_subprocess,
+) -> None:
+    """S2: the prompt the real coord loop writes to the inbox on dispatch
+    is the S1 prompt — reproduce/encode/verify phases, verification.md,
+    the ci.yml gate list and the three flags; no TDD ladder."""
+    _write_tasks(project_dir, [_make_task("ready-aaaa", status="ready")])
+    dispatch_subprocess.append("abcdef01")
+
+    result = loop.tick(
+        "fleet", coord_id="cccccc01", cwd="/repo",
+        fleet_home=str(fleet_home),
+        cap=1,
+    )
+
+    assert result.dispatched == 1
+    body = (fleet_home / "inbox" / "abcdef01.md").read_text()
+    assert "Fleet worker for task: ready-aaaa" in body
+    _assert_s1_prompt(body, is_git=True)
+    assert "~/.fleet/projects/fleet/workers/ready-aaaa/verification.md" in body
 
 
 def test_tick_dispatch_records_session_task(

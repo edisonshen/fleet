@@ -11,14 +11,24 @@ schema: v1
 
 ## Testing
 
-- TDD required: a failing test on disk before the implementation.
-- Tests use stdlib `testing` only — no testify, no ginkgo.
-- All bug fixes carry a regression test that fails on the parent commit.
-- Integration tests preferred over heavy mocking when feasible.
-- Test SHAPE matters as much as coverage: a matrix of near-identical single-scenario functions is a review liability. Consolidate scenarios that share a driver into ONE table test (Go table-driven / `pytest.mark.parametrize`), one row per case, and factor setup into a per-package builder/harness. New case = new row, not new function.
-- Test one CONTRACT, not the implementation: no assertion a legitimate refactor would break. One integration test at a real boundary beats N unit tests re-pinning the same behavior through mocks.
-- Budget: test LOC should stay within ~1.5x the production LOC it covers unless a specific case justifies more. If a PR's tests dwarf its logic, that's a signal to consolidate, not a badge.
-- Every test must name the bug it catches — in the function/row name or a one-line comment. A test whose failure wouldn't tell you what broke is noise; delete or rename it.
+- Scenario-first, not test-first. Reproduce the requirement's real scenario on the built
+  product before writing any test; the test encodes what you observed.
+- Test at the boundary where the operator would see it: built binary, real tmux, real
+  files, real tick — isolated as docs/TESTING.md says. Unit tests only for pure logic the
+  scenario cannot reach; never a mock of a boundary we can run for real.
+- Test one CONTRACT, not the implementation: assert the observable outcome (file
+  content, pane text, exit code, PR state, TUI flash) — never that an internal function
+  was called. One scenario test through the real arc beats N function tests re-pinning
+  it through mocks.
+- Test SHAPE matters as much as coverage: one table test per shared stand-up, one row
+  per scenario. New case = new row, not new function.
+- Budget: test LOC stays within ~1.5x the production LOC it covers unless a specific
+  case justifies more.
+- Every bug fix ships the scenario that reproduces it, failing before and passing after.
+  Pre-existing red is proven on main, not asserted.
+- Delete tests the new scenario subsumes; the task plan lists Tests removed / KEEP.
+- stdlib `testing` / pytest only. Every test must name the bug it catches or the
+  scenario it pins (S<n>).
 
 ## Code review
 

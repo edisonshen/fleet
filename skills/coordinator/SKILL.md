@@ -130,8 +130,8 @@ Before any task is promoted to ready, save its worker-ready task plan doc.
 - Open: after rendering, run `open docs/TASK-PLAN-<slug>.html` so the human
   reviewer sees it immediately.
 - Contents: parent design doc link, task goal, acceptance criteria,
-  expected files/surfaces, tests, non-goals, dependencies, and approval
-  timestamp.
+  expected files/surfaces, a `## Scenario contract` (below), tests removed /
+  KEEP, non-goals, dependencies, and approval timestamp.
 - Worker visibility: before promotion, either embed the task plan in Spec or
   append its path to Spec/Acceptance, for example:
   `fleet tasks note --project <project> <slug> --section spec "Task plan: docs/TASK-PLAN-<slug>.md"`.
@@ -140,6 +140,37 @@ Before any task is promoted to ready, save its worker-ready task plan doc.
   (this session)" in the handoff).
 - Promotion: run `fleet tasks promote <slug>` only after the doc exists and is
   linked or embedded in worker-visible task text.
+
+**Scenario contract (replaces the per-test "test plan" list):**
+
+Every TASK-PLAN doc carries a `## Scenario contract` table — one row per
+requirement the worker must prove on the built product, not one row per test
+function:
+
+```markdown
+## Scenario contract
+
+| S | Requirement | Stand-up | Trigger | Observable outcome | Level | Harness |
+|---|-------------|----------|---------|--------------------|-------|---------|
+| S1 | WHEN … THE … SHALL … | seeded state | the real command / key | pane text, file content, exit code | e2e | coorde2e |
+```
+
+Rules:
+- **Observable outcome** is what the operator would see — file content, pane
+  text, exit code, PR state, TUI flash. Never "function X is called".
+- **Level defaults to `e2e`**: built binary + real tmux (isolated
+  `FLEET_TMUX_SOCKET`) + real files under an isolated `FLEET_HOME`, driven via
+  `internal/testutil/coorde2e` (see `docs/TESTING.md`). `integ` = a package
+  test at a real boundary (real FS, real flock, `tmuxfake`). `unit` = pure
+  logic the scenario cannot reach; every `unit` row states the reason for the
+  downgrade in the Level cell (`unit — <reason>`), or a reviewer files it as P1.
+- **Grouping is decided in the plan**: rows that share a stand-up become one
+  table test, one row each; the plan says which rows group.
+- **Escape hatch:** a task with nothing observable (pure docs, rename) writes
+  `none — <reason>` instead of a table. The worker then records
+  `--scenarios-total 0`.
+- **Tests removed / KEEP** lists the existing tests the new scenarios subsume
+  (delete them) and the ones that stay.
 
 **Task-plan review SOP (operator-approved 2026-06-11, all projects):**
 
@@ -177,8 +208,10 @@ dump of implementer notes. This standard gates the operator-approval step:
    and the fix. Cut redundant ones.
 4. **Short sentences, one idea per paragraph.** Halve length by removing
    redundancy, never by dropping a technical decision.
-5. **Test plan = one line per test** (scenario / input / expected); group
-   near-identical cases.
+5. **Scenario contract = one row per requirement** (stand-up / trigger /
+   observable outcome / level); rows sharing a stand-up group into one table
+   test. The contract names what the worker reproduces, not which functions
+   it unit-tests.
 6. **Final version only:** no rev-by-rev review log, no "round 1/2/3" history,
    no "superseded" appendix inside the doc — that lives in the task/PR. Minimal
    header: status / scope / priority / depends-on / PR-base.
@@ -192,23 +225,43 @@ technical decision — preserve every invariant verbatim in meaning.
 Implementation is a three-stage flow across separate Agent subagents:
 
 ```text
-worker                reviewer                  finisher
-------                --------                  --------
-code + tests       -> alpha/beta slot loop   -> push + PR
-local commits         no push                    gated by review state
-phase=review-pending  phase=review-done          phase=done + pr_url
+worker                       reviewer                    finisher
+------                       --------                    --------
+reproduce -> encode -> verify  -> alpha/beta slot loop    -> push + PR
+verification.md (evidence)      contract lens; re-verify    ## Verification = the
+local commits                   after any fix; no push      evidence, verbatim
+phase=review-pending            phase=review-done           phase=done + pr_url
 ```
 
 Rules:
+- The worker runs the scenario-first arc (`spec-repro` -> `spec-encode` ->
+  `verify`): reproduce every contract row on the built product in a sandbox and
+  capture the wrong outcome verbatim; encode one test per row at the row's
+  level, failing for that reason; fix, re-run by hand and via the test, run the
+  full gates exactly as `ci.yml`. Evidence lives in
+  `~/.fleet/projects/<project>/workers/<slug>/verification.md` with sections
+  `## Scenario contract`, `## Evidence — before`, `## Evidence — after`,
+  `## Gates`, `## Baseline`, `## Unit tests`. Before `review-pending` it records
+  `--scenarios-total M --scenarios-verified N --gates-status passed`. A red gate
+  of its own is fixed, never handed off; a red it believes pre-existing is
+  re-run on untouched `origin/main` and both results go under `## Baseline`.
 - The worker exits at `review-pending`; it does not run `/review` and does not
   push.
-- The reviewer runs both resolved slots through `review_slot.py`, fixes P0/P1
-  findings, and records slot-named alpha/beta terminal fields. Beta is the
-  Claude anchor and must pass; the beta review is never skippable.
+- The reviewer runs both resolved slots through `review_slot.py` with the
+  Scenario-contract lens (every row has a test at its stated level asserting the
+  observable outcome; `## Evidence — before` proves it would have failed;
+  missing or downgraded rows are P1), fixes P0/P1 findings, and after any fix
+  re-runs the touched scenario tests plus the full gates and appends
+  `## Review re-verification` to verification.md before the terminal write. It
+  records slot-named alpha/beta terminal fields. Beta is the Claude anchor and
+  must pass; the beta review is never skippable.
 - On git projects, an alpha codex slot may be recorded as skipped only for
   `rate-limited` or `unavailable`; non-git projects resolve to Claude slots.
 - The finisher pushes and opens the PR only when review terminal fields satisfy
-  the worker state validator.
+  the worker state validator. Its PR body carries `## Verification` =
+  verification.md verbatim (the non-git finisher writes the same block into the
+  done note). A missing file or an empty `## Gates` / `## Evidence — after`
+  blocks with `finisher: no verification evidence (<path>)` — no PR, no done.
 - Default parallelism is 3. Resolution order: the project's
   `coord-config.json:parallelism`, then `~/.fleet/coord-config.json:parallelism`
   (what `fleet init` prompts for / `fleet init --parallelism N` writes), then 3.
