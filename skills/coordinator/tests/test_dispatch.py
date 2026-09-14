@@ -1275,7 +1275,7 @@ _S1_REQUIRED = (
     "project's own test framework", "it MUST fail for the reason",
     "Run EVERY\n    line of `## Gates`, in order", "`baseline:` command on untouched main",
     "## Baseline", "do NOT flip\n    review-pending", "standards: no ## Gates",
-    "--scenarios-total M --scenarios-verified N", "--gates-status passed",
+    "--phase verify \\\n        --scenarios-total M --scenarios-verified N --gates-status passed",
 )
 # Fleet-the-project nouns that must never reach a worker in another
 # project (acceptance 3 of the task plan + the rev 1 TDD ladder).
@@ -1372,7 +1372,7 @@ def test_s3_reviewer_prompt_carries_contract_lens(is_git: bool) -> None:
                    "verification.md", "e2e/integ/replay/unit", "max level",
                    "tier: local/remote → e2e, none → replay",
                    "mock standing in for a boundary `## Sandbox` can run",
-                   "EVERY line of the standards'\n   `## Gates`"):
+                   "EVERY line of `## Gates` from\n   `fleet standards show --merged --project shop`"):
         assert needle in out, f"S3: reviewer prompt missing {needle!r}"
     for needle in _FLEET_NOUNS:
         assert needle not in out, f"S3: reviewer prompt leaks Fleet noun {needle!r}"

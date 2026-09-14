@@ -322,7 +322,6 @@ def build_worker_prompt(
         "    artifact, or an outcome that is not the wrong one → `fleet workers update\n"
         f"    {task.slug} {proj_flag} --phase blocked --reason \"<S<n>>: <exactly what you saw / what is missing>\"`\n"
         "    and exit. Do not guess. Do not stand in a mock for a boundary `## Sandbox` can run."
-        f"{commit}"
     )
     spec_encode_line = (
         "2b. ENCODE. One test per row (grouped as the plan says) at the row's Level, in this\n"
@@ -339,8 +338,8 @@ def build_worker_prompt(
         "    review-pending. `## Gates` empty in standards → run what the project's CI config\n"
         "    runs, record the commands you used, and add \"standards: no ## Gates\" to \"## Baseline\".\n"
         f"   {commit} Then:\n"
-        f"      fleet workers update {task.slug} {proj_flag} --scenarios-total M --scenarios-verified N \\\n"
-        "        --gates-status passed\n"
+        f"      fleet workers update {task.slug} {proj_flag} --phase verify \\\n"
+        "        --scenarios-total M --scenarios-verified N --gates-status passed\n"
         "    (M = contract rows, N = rows PASS under \"Evidence — after\"; M=0 only for `none`.)"
     )
     verification_file_lines = [
@@ -676,7 +675,8 @@ def build_reviewer_prompt(
     verification_md = f"{workers_dir}/verification.md"
     contract_lens_lines = [
         "   Scenario contract lens (read the task plan's `## Scenario contract`",
-        f"   table, the standards' `## Sandbox` / `## Gates`, and {verification_md}):",
+        f"   table, `## Sandbox` / `## Gates` from `fleet standards show --merged --project {project}`,",
+        f"   and {verification_md}):",
         "   - every S<n> row has a test at its stated level (e2e/integ/replay/unit);",
         "   - each test asserts the row's observable outcome (response body, file",
         "     content, screen text, exit code, record, PR state) — not that an",
@@ -692,9 +692,9 @@ def build_reviewer_prompt(
         "contract` has a test at its stated level (e2e/integ/replay/unit), asserting "
         "the row's observable outcome (never that an internal function was called), "
         f"and `## Evidence — before` in {verification_md} shows it would have failed "
-        "before the fix. Missing scenario, a row below the standards' `## Sandbox` "
-        "max level without the plan's reason, or a mock for a boundary `## Sandbox` "
-        "can run = [P1]."
+        "before the fix. Missing scenario, a row below the `## Sandbox` max level "
+        f"(`fleet standards show --merged --project {project}`) without the plan's "
+        "reason, or a mock for a boundary `## Sandbox` can run = [P1]."
     )
     task_context_arg = ""
     if not is_git:
@@ -793,8 +793,8 @@ def build_reviewer_prompt(
         terminal_invariant_line,
         "",
         "   After ANY fix you land: re-run the scenarios the fix touched (by hand",
-        "   per `## Sandbox` and via their tests) AND EVERY line of the standards'",
-        "   `## Gates`, in order, then append a",
+        "   per `## Sandbox` and via their tests) AND EVERY line of `## Gates` from",
+        f"   `fleet standards show --merged --project {project}`, in order, then append a",
         f"   `## Review re-verification` section to {verification_md}",
         "   (each re-run command + its result line) BEFORE the terminal write in",
         "   step 3. No fix landed → no section needed.",
