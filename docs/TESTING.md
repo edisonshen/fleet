@@ -20,7 +20,7 @@ notes: fake claude modes ok|exit|crash-once|hang via scripts/fake-claude.sh; see
 - gofmt -l .
 - golangci-lint run ./...
 - go test -race -count=1 -timeout=5m ./...
-- FLEET_STANDBY_TIMEOUT=3s bash scripts/integration-lane.sh ./cmd/fleet    # (PR-3; until then the -run list)
+- FLEET_STANDBY_TIMEOUT=3s bash scripts/integration-lane.sh ./cmd/fleet
 - python3 -m pytest skills/ scripts/ -q
 - bash scripts/lint-test-isolation.sh
 baseline: git worktree add /tmp/fleet-base-$FLEET_WORKER_SLUG origin/main && cd there && <same gate>
@@ -69,9 +69,10 @@ tmux -S "$FLEET_TMUX_SOCKET" kill-server; rm -rf "$FLEET_HOME" "$REPO" "$FAKE"  
 ## 4. Where tests live, how the gates run them, baseline
 
 - **e2e** (`//go:build integration`, real binary + real tmux via `coorde2e`): `cmd/fleet/`, `internal/tui/`.
-  Isolate with `tmuxtest.RequireTmux(t)` + `t.Setenv("FLEET_HOME", …)`. Until PR-3's `integration-lane.sh`,
-  `.github/workflows/ci.yml` runs a hard-coded `-run` list per package — add your test's name or it never runs:
-  `FLEET_STANDBY_TIMEOUT=3s go test -tags=integration -count=1 -timeout=5m -run '^(TestCoordLeaderCheck)$' ./cmd/fleet`
+  Isolate with `tmuxtest.RequireTmux(t)` + `t.Setenv("FLEET_HOME", …)`. The CI lane discovers
+  `//go:build integration` tests automatically — `scripts/integration-lane.sh <pkg>` runs exactly the tests present
+  in the tagged build and absent from the default one, so there is no `-run` list to add your name to:
+  `FLEET_STANDBY_TIMEOUT=3s bash scripts/integration-lane.sh ./cmd/fleet`
 - **integ** (real FS / flock / in-process `tmuxfake`): the package's own `_test.go`, no build tag. **unit**:
   only pure logic a scenario cannot reach (`unit — pure`). `bash scripts/lint-test-isolation.sh` is the static
   tripwire for tests that reach tmux without isolation.

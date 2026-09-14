@@ -411,6 +411,7 @@ def build_worker_prompt(
         "",
         f"  fleet workers update {task.slug} {proj_flag} --phase verify",
         verify_line,
+        "   If the review-pending write is rejected by the verify gate, your gates or counts are wrong; fix and re-record — never `--phase blocked` to bypass.",
         "",
         f"  fleet workers update {task.slug} {proj_flag} --phase review-pending",
         step3_line,
