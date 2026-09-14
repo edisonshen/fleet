@@ -80,6 +80,64 @@ PR rule
 	}
 }
 
+// TestStandardsShow_MergedProjectSandboxWins — S10 (scenario-first
+// testing): the worker prompt reads how to run / gate a project only from
+// the merged `## Sandbox` / `## Gates`. The seeded global says
+// `tier: none` + no gates; a project that declares `tier: remote` and
+// `npm test` must be what `standards show --merged --project <p>` prints —
+// one `## Sandbox`, one `## Gates`, the project's values, none of the
+// global's.
+func TestStandardsShow_MergedProjectSandboxWins(t *testing.T) {
+	fleetHome, project := setupTasksHome(t)
+	if err := seedStandardsTemplate(&bytes.Buffer{}); err != nil {
+		t.Fatalf("seed global: %v", err)
+	}
+	projDir := filepath.Join(fleetHome, "projects", project)
+	if err := os.MkdirAll(projDir, 0o755); err != nil {
+		t.Fatalf("mkdir proj: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(projDir, "standards.md"), []byte(`---
+schema: v1
+---
+
+# Standards
+
+## Sandbox
+tier: remote
+up: bin/preview up
+down: bin/preview down
+isolation: namespace
+observe: bin/preview logs
+credentials: PREVIEW_TOKEN
+notes:
+
+## Gates
+- npm test
+baseline: git worktree add /tmp/base origin/main && cd /tmp/base && npm test
+`), 0o644); err != nil {
+		t.Fatalf("seed proj: %v", err)
+	}
+
+	out := &bytes.Buffer{}
+	if err := runStandardsShow(&standardsShowOpts{scope: scopeMerged, project: project}, out); err != nil {
+		t.Fatalf("show merged: %v", err)
+	}
+	got := out.String()
+	for _, want := range []string{"\ntier: remote\n", "\nup: bin/preview up\n", "\n- npm test\n"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("merged missing project value %q:\n%s", want, got)
+		}
+	}
+	if strings.Contains(got, "\ntier: none") {
+		t.Errorf("merged still shows the global `tier: none`:\n%s", got)
+	}
+	for _, h := range []string{"\n## Sandbox\n", "\n## Gates\n"} {
+		if n := strings.Count(got, h); n != 1 {
+			t.Errorf("merged has %d %q sections, want 1:\n%s", n, h, got)
+		}
+	}
+}
+
 // TestStandardsShow_MutuallyExclusiveFlags — passing two scope flags
 // fails fast (we surface this through cobra's PreRunE-equivalent path).
 func TestStandardsShow_MutuallyExclusiveFlags(t *testing.T) {

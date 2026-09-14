@@ -7,6 +7,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"sort"
 	"strings"
@@ -609,6 +610,55 @@ func TestRunInit_SeedsStandardsTemplate(t *testing.T) {
 	}
 	if !strings.Contains(body, "until") {
 		t.Errorf("Async waits section missing until-loop pattern:\n%s", body)
+	}
+}
+
+// TestRunInit_SeedsSandboxAndGates — S10 (scenario-first testing): the
+// worker prompt is project-agnostic and reads how to run / observe / gate
+// a project ONLY from the merged standards' `## Sandbox` and `## Gates`.
+// The global seed must therefore fail closed — `tier: none` (no runnable
+// instance) and an empty gate list — and point the operator at the
+// per-project override. A project that never edits its standards must
+// not inherit Fleet's own build or tmux nouns.
+func TestRunInit_SeedsSandboxAndGates(t *testing.T) {
+	tmp := t.TempDir()
+	claudeHome := filepath.Join(tmp, ".claude")
+	fleetHome := filepath.Join(tmp, ".fleet")
+	t.Setenv("FLEET_HOME", fleetHome)
+
+	if err := runInit(&bytes.Buffer{}, false, claudeHome); err != nil {
+		t.Fatalf("runInit: %v", err)
+	}
+	got, err := os.ReadFile(filepath.Join(fleetHome, "standards.md"))
+	if err != nil {
+		t.Fatalf("standards.md not seeded: %v", err)
+	}
+	body := string(got)
+	sandbox := section(t, body, "Sandbox")
+	gates := section(t, body, "Gates")
+	if !regexp.MustCompile(`(?m)^tier: none\b`).MatchString(sandbox) {
+		t.Errorf("seeded ## Sandbox must default to `tier: none`:\n%s", sandbox)
+	}
+	for _, key := range []string{"up:", "down:", "isolation: namespace", "observe:", "credentials:", "notes:"} {
+		if !regexp.MustCompile(`(?m)^` + regexp.QuoteMeta(key)).MatchString(sandbox) {
+			t.Errorf("seeded ## Sandbox missing key %q:\n%s", key, sandbox)
+		}
+	}
+	if !strings.Contains(sandbox, "fleet standards edit --project <p>") {
+		t.Errorf("seeded ## Sandbox must tell the operator to override per project:\n%s", sandbox)
+	}
+	if regexp.MustCompile(`(?m)^- `).MatchString(gates) {
+		t.Errorf("seeded ## Gates must be an empty list:\n%s", gates)
+	}
+	if !regexp.MustCompile(`(?m)^baseline:`).MatchString(gates) {
+		t.Errorf("seeded ## Gates missing `baseline:` key:\n%s", gates)
+	}
+	for _, noun := range []string{"FLEET_HOME", "FLEET_TMUX_SOCKET", "go build", "go test", "pytest", "docs/TESTING.md", "coorde2e", "tmux"} {
+		for name, sec := range map[string]string{"## Testing": section(t, body, "Testing"), "## Sandbox": sandbox, "## Gates": gates} {
+			if strings.Contains(sec, noun) {
+				t.Errorf("seeded %s carries Fleet-the-project noun %q:\n%s", name, noun, sec)
+			}
+		}
 	}
 }
 

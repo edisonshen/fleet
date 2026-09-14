@@ -11,14 +11,43 @@ schema: v1
 
 ## Testing
 
-- Scenario-first: reproduce the scenario against the built product, encode the observed outcome as a test at the right boundary, then implement and verify.
-- Tests use stdlib `testing` only — no testify, no ginkgo.
-- All bug fixes carry a regression test that fails on the parent commit.
-- Integration tests preferred over heavy mocking when feasible.
-- Test SHAPE matters as much as coverage: a matrix of near-identical single-scenario functions is a review liability. Consolidate scenarios that share a driver into ONE table test (Go table-driven / `pytest.mark.parametrize`), one row per case, and factor setup into a per-package builder/harness. New case = new row, not new function.
-- Test one CONTRACT, not the implementation: no assertion a legitimate refactor would break. One integration test at a real boundary beats N unit tests re-pinning the same behavior through mocks.
-- Budget: test LOC should stay within ~1.5x the production LOC it covers unless a specific case justifies more. If a PR's tests dwarf its logic, that's a signal to consolidate, not a badge.
-- Every test must name the bug it catches — in the function/row name or a one-line comment. A test whose failure wouldn't tell you what broke is noise; delete or rename it.
+- Scenario-first, not test-first. Reproduce the requirement's real scenario on the running
+  product (per `## Sandbox`) before writing any test; the test encodes what you observed.
+- Test at the boundary where the user/operator would see it, at the highest level
+  `## Sandbox` allows (e2e > integ > replay > unit). Unit tests only for pure logic the
+  scenario cannot reach; never a mock of a boundary we can run for real.
+- Test one CONTRACT, not the implementation: assert the observable outcome (response
+  body, file content, screen/pane text, exit code, DB row, PR state) — never that an
+  internal function was called.
+- Test SHAPE matters as much as coverage: one table test per shared stand-up; one row
+  per scenario. New case = new row.
+- Every bug fix ships the scenario that reproduces it; the PR shows it failing before
+  and passing after. Pre-existing red is proven on main, not asserted.
+- Delete tests the new scenario subsumes; the task plan lists Tests removed / KEEP.
+- Test shape over volume: one scenario test through the real arc beats N function tests
+  re-pinning it through mocks. Test LOC that dwarfs the arc it covers
+  (past ~1.5x the production LOC) is a signal to consolidate.
+- Every test must name the bug it catches or the scenario it pins (S<n>).
+
+## Sandbox
+
+Override per project with `fleet standards edit --project <p>` (see the project's own
+testing doc). The global default is fail-closed: no runnable instance, no gates.
+
+tier: none                # local | remote | none — highest fidelity a worker can run THIS project at
+up:                       # stands up ONE isolated instance; prints `export K=V` lines the worker evals
+down:                     # tears it down; must leave no debris
+isolation: namespace      # every resource `up` creates is keyed by $FLEET_WORKER_SLUG (per worker)
+observe:                  # how to capture evidence verbatim: logs / curl / capture-pane / SELECT …
+credentials:              # env var NAMES only, never values; the worker fails fast if one is unset
+notes:                    # e.g. "preview env takes ~4 min; poll /healthz"
+
+## Gates
+
+The project's CI, verbatim, in order — every line must pass before review-pending.
+Empty list = the worker runs what the project's CI config runs and records "standards: no ## Gates".
+
+baseline:                 # runs the same gate on untouched main, e.g. `git worktree add /tmp/base origin/main && cd /tmp/base && <gate>`
 
 ## Code review
 
