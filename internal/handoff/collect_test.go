@@ -192,7 +192,7 @@ func lifecycleState(t *testing.T, pdir string, now time.Time) {
 		[]string{"revive codex-engine-mvp"},
 		[]string{"have-state-1111", "ready-3333", "todo-4444", "blocked-5555", "parked-6666"})
 	// Only one worker has a state.json on disk; the other is emit-on-missing.
-	seedWorkerState(t, pdir, "myproj", "have-state-1111", "tdd-green", "")
+	seedWorkerState(t, pdir, "myproj", "have-state-1111", "spec-encode", "")
 	seedCheckpointFull(t, pdir, "myproj", now,
 		nil,
 		[]string{"- dispatched worker have-state-1111 (gen 1)"},

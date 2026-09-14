@@ -27,7 +27,7 @@ schema: v1
 # Standards
 
 ## Testing
-- TDD required.
+- Scenario-first required.
 
 ## Code review
 - Run /review.
@@ -40,7 +40,7 @@ schema: v1
 # Standards
 
 ## Testing
-- TDD required.
+- Scenario-first required.
 - This project also requires fuzz tests.
 
 ## Project-only

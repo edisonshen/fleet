@@ -387,7 +387,7 @@ func TestTA7b_TUIWaitLoopAsyncBounded(t *testing.T) {
 func TestTA10_TUIWorkerRowResolvesCoordHolder(t *testing.T) {
 	pdir := withFleetHome(t)
 	seedTasks(t, pdir, "fleet", TaskCounts{Todo: 1})
-	seedWorker(t, pdir, "fleet", "do-x-1a2b", workers.State{Phase: workers.PhaseTDDGreen})
+	seedWorker(t, pdir, "fleet", "do-x-1a2b", workers.State{Phase: workers.PhaseSpecEncode})
 	(&stubSessionProbe{}).install(t)
 	owner := tuiCoordRecord("holder10", "fleet")
 	st := reconciletest.State{LiveOwner: &coordlock.Owner{AgentID: owner.ID, PID: 1010}}

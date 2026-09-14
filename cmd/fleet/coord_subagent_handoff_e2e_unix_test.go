@@ -84,9 +84,9 @@ func TestE2E_CoordAutoHandoffWhileSubagentWorking(t *testing.T) {
 
 	// Step 3: the subagent works; the coord waits on it.
 	env.runFleet(t, "workers", "update", slug, "--project", project,
-		"--phase", "tdd-red", "--dispatch-generation", gen)
+		"--phase", "spec-repro", "--dispatch-generation", gen)
 	env.runFleet(t, "workers", "update", slug, "--project", project,
-		"--phase", "tdd-green", "--dispatch-generation", gen)
+		"--phase", "spec-encode", "--dispatch-generation", gen)
 	env.runFleetAs(t, coordID, "checkpoint", "next-step", "--project", project,
 		"--slug", slug, nextStep)
 
@@ -132,7 +132,7 @@ func TestE2E_CoordAutoHandoffWhileSubagentWorking(t *testing.T) {
 	want := handoff.ActiveSubagent{
 		TaskID:    slug,
 		Branch:    "worker/" + slug,
-		LastPhase: "tdd-green",
+		LastPhase: "spec-encode",
 		Status:    string(tasks.StatusInProgress),
 		AgentID:   workerID,
 	}

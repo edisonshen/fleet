@@ -165,7 +165,7 @@ func TestKeyEnter_OpensWorkerPeek(t *testing.T) {
 	pdir := withFleetHome(t)
 	seedTasks(t, pdir, "fleet", TaskCounts{Todo: 1})
 	seedWorker(t, pdir, "fleet", "do-x-1a2b", workers.State{
-		Phase: workers.PhaseTDDGreen,
+		Phase: workers.PhaseSpecEncode,
 		PID:   42,
 	})
 	// Seed a small output.log so the panel has something to tail.
@@ -199,7 +199,7 @@ func TestKeyEnter_OpensWorkerPeek(t *testing.T) {
 	}
 	out := got.View()
 	// state.json fields must appear (we render parsed JSON).
-	if !strings.Contains(out, "do-x-1a2b") || !strings.Contains(out, "tdd-green") {
+	if !strings.Contains(out, "do-x-1a2b") || !strings.Contains(out, "spec-encode") {
 		t.Errorf("detail panel should render state.json fields, got:\n%s", out)
 	}
 	// Log tail must show.
@@ -564,7 +564,7 @@ func TestKeyA_WorkerRow_RoutesToCoordTmux(t *testing.T) {
 	pdir := withFleetHome(t)
 	seedTasks(t, pdir, "fleet", TaskCounts{Todo: 1})
 	seedWorker(t, pdir, "fleet", "do-x-1a2b", workers.State{
-		Phase: workers.PhaseTDDGreen,
+		Phase: workers.PhaseSpecEncode,
 	})
 
 	// Seed an alive coord agent record for the project. Coord identity
@@ -628,7 +628,7 @@ func TestKeyA_WorkerRow_OrphanFlashesHint(t *testing.T) {
 	stub.install(t)
 	seedTasks(t, pdir, "fleet", TaskCounts{Todo: 1})
 	seedWorker(t, pdir, "fleet", "orphan-9999", workers.State{
-		Phase: workers.PhaseTDDGreen,
+		Phase: workers.PhaseSpecEncode,
 	})
 
 	m := New("test")
@@ -677,7 +677,7 @@ func TestKeyX_WorkerRow_FlashesNotImplemented(t *testing.T) {
 	pdir := withFleetHome(t)
 	seedTasks(t, pdir, "fleet", TaskCounts{Todo: 1})
 	seedWorker(t, pdir, "fleet", "x-1234", workers.State{
-		Phase: workers.PhaseTDDGreen,
+		Phase: workers.PhaseSpecEncode,
 		PID:   42,
 	})
 
@@ -937,7 +937,7 @@ func TestView_SearchHidesWorkersShowsMatchHint(t *testing.T) {
 	pdir := withFleetHome(t)
 	seedTasks(t, pdir, "demo", TaskCounts{Todo: 1})
 	seedWorker(t, pdir, "demo", "real-worker-aaaa", workers.State{
-		Phase: workers.PhaseTDDGreen,
+		Phase: workers.PhaseSpecEncode,
 		PID:   1,
 	})
 

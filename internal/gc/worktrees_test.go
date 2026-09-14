@@ -212,7 +212,7 @@ func TestResolver_CurrentGenNonTerminalState_Vetoes(t *testing.T) {
 		entries: []WorktreeEntry{wtEntry("feat-eeee")},
 		candidates: []TaskCandidate{{
 			Slug: "feat-eeee", Status: "done", Branch: "worker/feat-eeee",
-			HasWorkerState: true, WorkerPhase: "tdd-green", TaskGen: 3, WorkerStateGen: 3,
+			HasWorkerState: true, WorkerPhase: "spec-encode", TaskGen: 3, WorkerStateGen: 3,
 		}},
 		branchByPth: map[string]string{"/wt/feat-eeee": "worker/feat-eeee"},
 	}
@@ -233,7 +233,7 @@ func TestResolver_StaleGenNonTerminalState_DoesNotVeto(t *testing.T) {
 		entries: []WorktreeEntry{wtEntry("feat-ffff")},
 		candidates: []TaskCandidate{{
 			Slug: "feat-ffff", Status: "done", Branch: "worker/feat-ffff",
-			HasWorkerState: true, WorkerPhase: "tdd-green", TaskGen: 5, WorkerStateGen: 4,
+			HasWorkerState: true, WorkerPhase: "spec-encode", TaskGen: 5, WorkerStateGen: 4,
 		}},
 		branchByPth: map[string]string{"/wt/feat-ffff": "worker/feat-ffff"},
 	}

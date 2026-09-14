@@ -3969,7 +3969,7 @@ def _write_rolling_checkpoint_file(
 # best-effort register_subagent) apart from a true phantom that crashed
 # before the Agent invoke.
 _WORKER_AUTHORED_PHASES = frozenset({
-    "branch", "tdd-red", "tdd-green", "tdd-refactor", "review-pending",
+    "branch", "spec-repro", "spec-encode", "verify", "review-pending",
     "review-claude", "review-codex", "review-done", "push", "done",
 })
 
@@ -3986,7 +3986,7 @@ def _worker_launch_looks_live(
     Conservative on purpose:
       - Only a phase the bootstrap never writes counts (the dispatch
         bootstrap sets phase="starting"; a real worker advances to
-        branch/tdd-*/review-* etc.). A phantom that crashed right after
+        branch/spec-*/verify/review-* etc.). A phantom that crashed right after
         _apply_dispatch reads "starting" → not live.
       - Codex iter-3 [P1]: when `since_unix` is given (this journal's
         launch_attempted_at), the worker's state.json `updated_at` MUST
@@ -8055,7 +8055,7 @@ def _apply_dispatch(action: _DispatchAction, project: str, fleet_bin: str) -> No
     storing it on the task block requires a future schema bump (the
     in-flight `worker_pid` field on tasks.md still expects an OS PID
     per ENG §3.1). v0.2 dispatches workers via `fleet dispatch` (tmux
-    + interactive Claude session); the worker drives the TDD pipeline
+    + interactive Claude session); the worker drives the reproduce → encode → verify pipeline
     itself and publishes progress via `fleet workers update`, which
     writes workers/<slug>/state.json. For the skill side, we write
     the agent_id as a NOTE so the operator can correlate the agent

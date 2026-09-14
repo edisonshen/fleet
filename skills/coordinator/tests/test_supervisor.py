@@ -131,7 +131,7 @@ def _cfg(**overrides) -> supervisor.SupervisorConfig:
 def test_stuck_idle_detection_all_four_conditions() -> None:
     """All four conditions hold → is_stuck_idle returns True."""
     state = {
-        "phase": "tdd-red",
+        "phase": "spec-repro",
         "updated_at": "1970-01-01T00:00:00Z",  # very old
     }
     assert supervisor.is_stuck_idle(
@@ -154,7 +154,7 @@ def test_stuck_idle_skips_recently_progressing_workers() -> None:
     # heartbeat 60 s ago, threshold 180 → fresh
     from datetime import datetime, timezone
     fresh = datetime.fromtimestamp(_now() - 60, tz=timezone.utc).isoformat()
-    state = {"phase": "tdd-red", "updated_at": fresh}
+    state = {"phase": "spec-repro", "updated_at": fresh}
     assert supervisor.is_stuck_idle(
         state, _sup(consecutive=10),
         cfg=_cfg(), session_alive=True, now_unix=_now(),
@@ -163,7 +163,7 @@ def test_stuck_idle_skips_recently_progressing_workers() -> None:
 
 def test_stuck_idle_skips_dead_session_workers() -> None:
     """tmux session gone → don't escalate (no one to nudge)."""
-    state = {"phase": "tdd-red", "updated_at": "1970-01-01T00:00:00Z"}
+    state = {"phase": "spec-repro", "updated_at": "1970-01-01T00:00:00Z"}
     assert supervisor.is_stuck_idle(
         state, _sup(consecutive=10),
         cfg=_cfg(), session_alive=False, now_unix=_now(),
@@ -172,7 +172,7 @@ def test_stuck_idle_skips_dead_session_workers() -> None:
 
 def test_stuck_idle_requires_consecutive_polls() -> None:
     """Counter below threshold → not stuck (transient idle ignored)."""
-    state = {"phase": "tdd-red", "updated_at": "1970-01-01T00:00:00Z"}
+    state = {"phase": "spec-repro", "updated_at": "1970-01-01T00:00:00Z"}
     assert supervisor.is_stuck_idle(
         state, _sup(consecutive=2),  # below stuck_polls=3
         cfg=_cfg(), session_alive=True, now_unix=_now(),
@@ -198,7 +198,7 @@ def test_consecutive_stuck_polls_resets_on_phase_change(
     initial = {
         "supervisor": {
             "alpha-aaaa": {
-                "last_phase": "tdd-red",
+                "last_phase": "spec-repro",
                 "consecutive_stuck_polls": 2,
                 "nudged_at": 0.0,
                 "escalated_at": 0.0,
@@ -207,11 +207,11 @@ def test_consecutive_stuck_polls_resets_on_phase_change(
     }
     coord_state_path.write_text(json.dumps(initial), encoding="utf-8")
 
-    # Worker now in phase tdd-green — different from last_phase=tdd-red.
+    # Worker now in phase spec-encode — different from last_phase=spec-repro.
     state_path = (
         fleet_home / "projects" / "fleet" / "workers" / "alpha-aaaa" / "state.json"
     )
-    _write_state_json(state_path, phase="tdd-green", updated_at="1970-01-01T00:00:00Z")
+    _write_state_json(state_path, phase="spec-encode", updated_at="1970-01-01T00:00:00Z")
 
     probes = [supervisor.WorkerProbe(
         slug="alpha-aaaa",
@@ -236,7 +236,7 @@ def test_consecutive_stuck_polls_resets_on_phase_change(
     sup_after = after["supervisor"]["alpha-aaaa"]
     # Counter reset → 0 → +1 from this pass = 1.
     assert sup_after["consecutive_stuck_polls"] == 1
-    assert sup_after["last_phase"] == "tdd-green"
+    assert sup_after["last_phase"] == "spec-encode"
 
 
 # ---------- nudge_worker ----------
@@ -264,7 +264,7 @@ def test_nudge_respects_cooldown(fleet_home: Path, monkeypatch) -> None:
     initial = {
         "supervisor": {
             "alpha-aaaa": {
-                "last_phase": "tdd-red",
+                "last_phase": "spec-repro",
                 "consecutive_stuck_polls": 5,
                 # Nudged 30 s ago — under default cooldown.
                 "nudged_at": _now() - 30,
@@ -277,7 +277,7 @@ def test_nudge_respects_cooldown(fleet_home: Path, monkeypatch) -> None:
     state_path = (
         fleet_home / "projects" / "fleet" / "workers" / "alpha-aaaa" / "state.json"
     )
-    _write_state_json(state_path, phase="tdd-red", updated_at="1970-01-01T00:00:00Z")
+    _write_state_json(state_path, phase="spec-repro", updated_at="1970-01-01T00:00:00Z")
 
     probes = [supervisor.WorkerProbe(
         slug="alpha-aaaa", state_path=state_path,
@@ -318,7 +318,7 @@ def test_escalation_marks_task_blocked(
     initial = {
         "supervisor": {
             "alpha-aaaa": {
-                "last_phase": "tdd-red",
+                "last_phase": "spec-repro",
                 "consecutive_stuck_polls": 5,
                 # Nudged in the past, beyond cooldown.
                 "nudged_at": _now() - 1000,
@@ -331,7 +331,7 @@ def test_escalation_marks_task_blocked(
     state_path = (
         fleet_home / "projects" / "fleet" / "workers" / "alpha-aaaa" / "state.json"
     )
-    _write_state_json(state_path, phase="tdd-red", updated_at="1970-01-01T00:00:00Z")
+    _write_state_json(state_path, phase="spec-repro", updated_at="1970-01-01T00:00:00Z")
 
     probes = [supervisor.WorkerProbe(
         slug="alpha-aaaa", state_path=state_path,
@@ -375,7 +375,7 @@ def test_block_phase_after_persistent_stuck(
     initial = {
         "supervisor": {
             "alpha-aaaa": {
-                "last_phase": "tdd-red",
+                "last_phase": "spec-repro",
                 "consecutive_stuck_polls": 5,
                 "nudged_at": _now() - 1000,
                 "escalated_at": _now() - 200,  # past cooldown of 60
@@ -387,7 +387,7 @@ def test_block_phase_after_persistent_stuck(
     state_path = (
         fleet_home / "projects" / "fleet" / "workers" / "alpha-aaaa" / "state.json"
     )
-    _write_state_json(state_path, phase="tdd-red", updated_at="1970-01-01T00:00:00Z")
+    _write_state_json(state_path, phase="spec-repro", updated_at="1970-01-01T00:00:00Z")
 
     probes = [supervisor.WorkerProbe(
         slug="alpha-aaaa", state_path=state_path,
@@ -433,7 +433,7 @@ def test_recovery_state_persisted_in_coord_state_json(
         "worker_agent_ids": {"alpha-aaaa": "aaaaaaaa"},
         "supervisor": {
             "alpha-aaaa": {
-                "last_phase": "tdd-red",
+                "last_phase": "spec-repro",
                 "consecutive_stuck_polls": 5,  # already accumulated
                 "nudged_at": 0.0, "escalated_at": 0.0,
             },
@@ -442,7 +442,7 @@ def test_recovery_state_persisted_in_coord_state_json(
     state_path = (
         fleet_home / "projects" / "fleet" / "workers" / "alpha-aaaa" / "state.json"
     )
-    _write_state_json(state_path, phase="tdd-red", updated_at="1970-01-01T00:00:00Z")
+    _write_state_json(state_path, phase="spec-repro", updated_at="1970-01-01T00:00:00Z")
 
     probes = [supervisor.WorkerProbe(
         slug="alpha-aaaa", state_path=state_path,
@@ -528,7 +528,7 @@ def test_supervisor_loop_polls_until_all_workers_terminal(
     state_path = (
         fleet_home / "projects" / "fleet" / "workers" / "alpha-aaaa" / "state.json"
     )
-    _write_state_json(state_path, phase="tdd-red", updated_at="1970-01-01T00:00:00Z")
+    _write_state_json(state_path, phase="spec-repro", updated_at="1970-01-01T00:00:00Z")
     probe = supervisor.WorkerProbe(
         slug="alpha-aaaa", state_path=state_path,
         agent_id="aaaaaaaa", tmux_session="fleet-aaaaaaaa",
@@ -553,7 +553,7 @@ def test_supervisor_loop_respects_max_duration(fleet_home: Path) -> None:
     state_path = (
         fleet_home / "projects" / "fleet" / "workers" / "alpha-aaaa" / "state.json"
     )
-    _write_state_json(state_path, phase="tdd-red", updated_at="1970-01-01T00:00:00Z")
+    _write_state_json(state_path, phase="spec-repro", updated_at="1970-01-01T00:00:00Z")
     probe = supervisor.WorkerProbe(
         slug="alpha-aaaa", state_path=state_path,
         agent_id="aaaaaaaa", tmux_session="fleet-aaaaaaaa",
@@ -595,8 +595,8 @@ def test_mtime_change_triggers_reconcile_for_one_worker(
     b_path = (
         fleet_home / "projects" / "fleet" / "workers" / "beta-bbbb" / "state.json"
     )
-    _write_state_json(a_path, phase="tdd-red", updated_at="2026-01-01T00:00:00Z")
-    _write_state_json(b_path, phase="tdd-red", updated_at="2026-01-01T00:00:00Z")
+    _write_state_json(a_path, phase="spec-repro", updated_at="2026-01-01T00:00:00Z")
+    _write_state_json(b_path, phase="spec-repro", updated_at="2026-01-01T00:00:00Z")
     probes = [
         supervisor.WorkerProbe(
             slug="alpha-aaaa", state_path=a_path,
@@ -661,7 +661,7 @@ def test_mtime_unchanged_skips_reconcile(fleet_home: Path) -> None:
     a_path = (
         fleet_home / "projects" / "fleet" / "workers" / "alpha-aaaa" / "state.json"
     )
-    _write_state_json(a_path, phase="tdd-red", updated_at="2026-01-01T00:00:00Z")
+    _write_state_json(a_path, phase="spec-repro", updated_at="2026-01-01T00:00:00Z")
     probe = supervisor.WorkerProbe(
         slug="alpha-aaaa", state_path=a_path,
         agent_id="aaaaaaaa", tmux_session="fleet-aaaaaaaa",
@@ -684,7 +684,7 @@ def test_stuck_check_runs_only_every_n_polls(
     a_path = (
         fleet_home / "projects" / "fleet" / "workers" / "alpha-aaaa" / "state.json"
     )
-    _write_state_json(a_path, phase="tdd-red", updated_at="1970-01-01T00:00:00Z")
+    _write_state_json(a_path, phase="spec-repro", updated_at="1970-01-01T00:00:00Z")
     probe = supervisor.WorkerProbe(
         slug="alpha-aaaa", state_path=a_path,
         agent_id="aaaaaaaa", tmux_session="fleet-aaaaaaaa",
@@ -730,7 +730,7 @@ def test_supervisor_emits_summary_lines_to_stdout(fleet_home: Path) -> None:
     a_path = (
         fleet_home / "projects" / "fleet" / "workers" / "alpha-aaaa" / "state.json"
     )
-    _write_state_json(a_path, phase="tdd-red", updated_at="2026-01-01T00:00:00Z")
+    _write_state_json(a_path, phase="spec-repro", updated_at="2026-01-01T00:00:00Z")
     probe = supervisor.WorkerProbe(
         slug="alpha-aaaa", state_path=a_path,
         agent_id="aaaaaaaa", tmux_session="fleet-aaaaaaaa",
@@ -781,7 +781,7 @@ def test_supervisor_exits_when_stdout_broken(fleet_home: Path) -> None:
     a_path = (
         fleet_home / "projects" / "fleet" / "workers" / "alpha-aaaa" / "state.json"
     )
-    _write_state_json(a_path, phase="tdd-red", updated_at="2026-01-01T00:00:00Z")
+    _write_state_json(a_path, phase="spec-repro", updated_at="2026-01-01T00:00:00Z")
     probe = supervisor.WorkerProbe(
         slug="alpha-aaaa", state_path=a_path,
         agent_id="aaaaaaaa", tmux_session="fleet-aaaaaaaa",
@@ -857,7 +857,7 @@ def test_supervisor_inbox_emit_broken_pipe_propagates(fleet_home: Path) -> None:
     a_path = (
         fleet_home / "projects" / "fleet" / "workers" / "alpha-aaaa" / "state.json"
     )
-    _write_state_json(a_path, phase="tdd-red", updated_at="2026-01-01T00:00:00Z")
+    _write_state_json(a_path, phase="spec-repro", updated_at="2026-01-01T00:00:00Z")
     probe = supervisor.WorkerProbe(
         slug="alpha-aaaa", state_path=a_path,
         agent_id="aaaaaaaa", tmux_session="fleet-aaaaaaaa",
@@ -915,7 +915,7 @@ def test_supervisor_respects_supervisor_max_s_cap(fleet_home: Path) -> None:
     a_path = (
         fleet_home / "projects" / "fleet" / "workers" / "alpha-aaaa" / "state.json"
     )
-    _write_state_json(a_path, phase="tdd-red", updated_at="2026-01-01T00:00:00Z")
+    _write_state_json(a_path, phase="spec-repro", updated_at="2026-01-01T00:00:00Z")
     probe = supervisor.WorkerProbe(
         slug="alpha-aaaa", state_path=a_path,
         agent_id="aaaaaaaa", tmux_session="fleet-aaaaaaaa",
@@ -938,7 +938,7 @@ def test_supervisor_max_s_zero_disables_cap(fleet_home: Path) -> None:
     a_path = (
         fleet_home / "projects" / "fleet" / "workers" / "alpha-aaaa" / "state.json"
     )
-    _write_state_json(a_path, phase="tdd-red", updated_at="2026-01-01T00:00:00Z")
+    _write_state_json(a_path, phase="spec-repro", updated_at="2026-01-01T00:00:00Z")
     probe = supervisor.WorkerProbe(
         slug="alpha-aaaa", state_path=a_path,
         agent_id="aaaaaaaa", tmux_session="fleet-aaaaaaaa",
@@ -967,7 +967,7 @@ def test_supervisor_sleep_clamped_to_remaining_cap(fleet_home: Path) -> None:
     a_path = (
         fleet_home / "projects" / "fleet" / "workers" / "alpha-aaaa" / "state.json"
     )
-    _write_state_json(a_path, phase="tdd-red", updated_at="2026-01-01T00:00:00Z")
+    _write_state_json(a_path, phase="spec-repro", updated_at="2026-01-01T00:00:00Z")
     probe = supervisor.WorkerProbe(
         slug="alpha-aaaa", state_path=a_path,
         agent_id="aaaaaaaa", tmux_session="fleet-aaaaaaaa",
@@ -1011,7 +1011,7 @@ def test_supervisor_no_poll_body_after_cap_consuming_sleep(fleet_home: Path) -> 
     a_path = (
         fleet_home / "projects" / "fleet" / "workers" / "alpha-aaaa" / "state.json"
     )
-    _write_state_json(a_path, phase="tdd-red", updated_at="2026-01-01T00:00:00Z")
+    _write_state_json(a_path, phase="spec-repro", updated_at="2026-01-01T00:00:00Z")
     probe = supervisor.WorkerProbe(
         slug="alpha-aaaa", state_path=a_path,
         agent_id="aaaaaaaa", tmux_session="fleet-aaaaaaaa",
@@ -1230,7 +1230,7 @@ def test_phase_change_resets_recovery_ladder(
     coord_state_path.write_text(json.dumps({
         "supervisor": {
             "alpha-aaaa": {
-                "last_phase": "tdd-red",
+                "last_phase": "spec-repro",
                 "consecutive_stuck_polls": 3,
                 "nudged_at": _now() - 1000,         # already nudged
                 "escalated_at": _now() - 500,       # already escalated
@@ -1241,8 +1241,8 @@ def test_phase_change_resets_recovery_ladder(
     state_path = (
         fleet_home / "projects" / "fleet" / "workers" / "alpha-aaaa" / "state.json"
     )
-    # Worker advanced to phase tdd-green (different from last_phase).
-    _write_state_json(state_path, phase="tdd-green", updated_at="1970-01-01T00:00:00Z")
+    # Worker advanced to phase spec-encode (different from last_phase).
+    _write_state_json(state_path, phase="spec-encode", updated_at="1970-01-01T00:00:00Z")
 
     probes = [supervisor.WorkerProbe(
         slug="alpha-aaaa", state_path=state_path,
@@ -1268,7 +1268,7 @@ def test_phase_change_resets_recovery_ladder(
     assert sup["consecutive_stuck_polls"] in (0, 1)  # may have re-incremented
     assert sup["nudged_at"] == 0.0
     assert sup["escalated_at"] == 0.0
-    assert sup["last_phase"] == "tdd-green"
+    assert sup["last_phase"] == "spec-encode"
 
 
 def test_fresh_heartbeat_resets_recovery_ladder(
@@ -1281,7 +1281,7 @@ def test_fresh_heartbeat_resets_recovery_ladder(
     coord_state_path.write_text(json.dumps({
         "supervisor": {
             "alpha-aaaa": {
-                "last_phase": "tdd-red",
+                "last_phase": "spec-repro",
                 "consecutive_stuck_polls": 5,
                 "nudged_at": _now() - 1000,
                 "escalated_at": _now() - 500,
@@ -1297,7 +1297,7 @@ def test_fresh_heartbeat_resets_recovery_ladder(
     fresh = datetime.fromtimestamp(_now(), tz=timezone.utc).strftime(
         "%Y-%m-%dT%H:%M:%SZ"
     )
-    _write_state_json(state_path, phase="tdd-red", updated_at=fresh)
+    _write_state_json(state_path, phase="spec-repro", updated_at=fresh)
 
     probes = [supervisor.WorkerProbe(
         slug="alpha-aaaa", state_path=state_path,
@@ -1329,7 +1329,7 @@ def test_periodic_reconcile_fires_when_stuck_check_disabled(
     a_path = (
         fleet_home / "projects" / "fleet" / "workers" / "alpha-aaaa" / "state.json"
     )
-    _write_state_json(a_path, phase="tdd-red", updated_at="2026-01-01T00:00:00Z")
+    _write_state_json(a_path, phase="spec-repro", updated_at="2026-01-01T00:00:00Z")
     probe = supervisor.WorkerProbe(
         slug="alpha-aaaa", state_path=a_path,
         agent_id="aaaaaaaa", tmux_session="fleet-aaaaaaaa",
@@ -1385,7 +1385,7 @@ def test_in_review_probe_skips_stuck_detection(
     coord_state_path.write_text(json.dumps({
         "supervisor": {
             "alpha-aaaa": {
-                "last_phase": "tdd-red",
+                "last_phase": "spec-repro",
                 "consecutive_stuck_polls": 5,  # would trigger if live
                 "nudged_at": 0.0, "escalated_at": 0.0,
             }
@@ -1395,7 +1395,7 @@ def test_in_review_probe_skips_stuck_detection(
     state_path = (
         fleet_home / "projects" / "fleet" / "workers" / "alpha-aaaa" / "state.json"
     )
-    _write_state_json(state_path, phase="tdd-red", updated_at="1970-01-01T00:00:00Z")
+    _write_state_json(state_path, phase="spec-repro", updated_at="1970-01-01T00:00:00Z")
 
     # Note live_worker=False — this is the in-review probe shape.
     probes = [supervisor.WorkerProbe(
@@ -1458,7 +1458,7 @@ def test_periodic_full_reconcile_runs_on_stuck_check_pass(
     a_path = (
         fleet_home / "projects" / "fleet" / "workers" / "alpha-aaaa" / "state.json"
     )
-    _write_state_json(a_path, phase="tdd-red", updated_at="2026-01-01T00:00:00Z")
+    _write_state_json(a_path, phase="spec-repro", updated_at="2026-01-01T00:00:00Z")
     probe = supervisor.WorkerProbe(
         slug="alpha-aaaa", state_path=a_path,
         agent_id="aaaaaaaa", tmux_session="fleet-aaaaaaaa",
@@ -2346,7 +2346,7 @@ def test_legacy_mode_stuck_check_cadence_uses_wall_clock(fleet_home: Path) -> No
     a_path = (
         fleet_home / "projects" / "fleet" / "workers" / "alpha-aaaa" / "state.json"
     )
-    _write_state_json(a_path, phase="tdd-red", updated_at="1970-01-01T00:00:00Z")
+    _write_state_json(a_path, phase="spec-repro", updated_at="1970-01-01T00:00:00Z")
     probe = supervisor.WorkerProbe(
         slug="alpha-aaaa", state_path=a_path,
         agent_id="aaaaaaaa", tmux_session="fleet-aaaaaaaa",
@@ -2496,7 +2496,7 @@ def test_poll_cadence_force_tick_on_inbox_event(fleet_home: Path) -> None:
     a_path = (
         fleet_home / "projects" / "fleet" / "workers" / "alpha-aaaa" / "state.json"
     )
-    _write_state_json(a_path, phase="tdd-red", updated_at="2026-01-01T00:00:00Z")
+    _write_state_json(a_path, phase="spec-repro", updated_at="2026-01-01T00:00:00Z")
     probe = supervisor.WorkerProbe(
         slug="alpha-aaaa", state_path=a_path,
         agent_id="aaaaaaaa", tmux_session="fleet-aaaaaaaa",
@@ -2554,7 +2554,7 @@ def test_poll_detects_stuck_via_last_activity_ts_plus_session_alive(
     alive AND status=running → mark stuck. Verify is_stuck_idle
     captures all four conditions."""
     state = {
-        "phase": "tdd-red",
+        "phase": "spec-repro",
         "updated_at": "1970-01-01T00:00:00Z",  # very stale
     }
     sup = supervisor.WorkerSupervisorState(
@@ -2580,13 +2580,13 @@ def test_stuck_alert_drops_inbox_line(fleet_home: Path) -> None:
     The TUI/operator surface is this file."""
     target = supervisor.emit_stuck_alert(
         "c00bf001", "alpha-aaaa", fleet_home=fleet_home,
-        detail="phase=tdd-red idle since X",
+        detail="phase=spec-repro idle since X",
     )
     assert target
     body = (fleet_home / "inbox" / "c00bf001.md").read_text()
     assert "[STUCK]" in body
     assert "alpha-aaaa" in body
-    assert "phase=tdd-red" in body
+    assert "phase=spec-repro" in body
 
 
 def test_stuck_alert_appends_does_not_clobber(fleet_home: Path) -> None:
@@ -2711,7 +2711,7 @@ def test_supervisor_force_tick_skips_sleep_when_inbox_event_pending(
     a_path = (
         fleet_home / "projects" / "fleet" / "workers" / "alpha-aaaa" / "state.json"
     )
-    _write_state_json(a_path, phase="tdd-red", updated_at="2026-01-01T00:00:00Z")
+    _write_state_json(a_path, phase="spec-repro", updated_at="2026-01-01T00:00:00Z")
     probe = supervisor.WorkerProbe(
         slug="alpha-aaaa", state_path=a_path,
         agent_id="aaaaaaaa", tmux_session="fleet-aaaaaaaa",
@@ -2821,7 +2821,7 @@ def test_supervisor_exits_when_operator_writes_direct_inbox(
     a_path = (
         fleet_home / "projects" / "fleet" / "workers" / "alpha-aaaa" / "state.json"
     )
-    _write_state_json(a_path, phase="tdd-red", updated_at="2026-01-01T00:00:00Z")
+    _write_state_json(a_path, phase="spec-repro", updated_at="2026-01-01T00:00:00Z")
     probe = supervisor.WorkerProbe(
         slug="alpha-aaaa", state_path=a_path,
         agent_id="aaaaaaaa", tmux_session="fleet-aaaaaaaa",
@@ -2831,7 +2831,7 @@ def test_supervisor_exits_when_operator_writes_direct_inbox(
     # cause a premature exit. Set mtime to a known-old value so the
     # supervisor records that as the baseline.
     inbox = fleet_home / "inbox" / "c00bf001.md"
-    inbox.write_text("[STUCK] stale alpha-aaaa phase=tdd-red\n", encoding="utf-8")
+    inbox.write_text("[STUCK] stale alpha-aaaa phase=spec-repro\n", encoding="utf-8")
     import os as _os
     pre_mtime = 1000.0
     _os.utime(inbox, (pre_mtime, pre_mtime))
@@ -2893,7 +2893,7 @@ def test_supervisor_own_stuck_alert_does_not_trigger_inbox_exit(
     a_path = (
         fleet_home / "projects" / "fleet" / "workers" / "alpha-aaaa" / "state.json"
     )
-    _write_state_json(a_path, phase="tdd-red", updated_at="2026-01-01T00:00:00Z")
+    _write_state_json(a_path, phase="spec-repro", updated_at="2026-01-01T00:00:00Z")
     probe = supervisor.WorkerProbe(
         slug="alpha-aaaa", state_path=a_path,
         agent_id="aaaaaaaa", tmux_session="fleet-aaaaaaaa",
@@ -2957,7 +2957,7 @@ def test_supervisor_does_not_exit_on_stale_inbox_file(fleet_home: Path) -> None:
     a_path = (
         fleet_home / "projects" / "fleet" / "workers" / "alpha-aaaa" / "state.json"
     )
-    _write_state_json(a_path, phase="tdd-red", updated_at="2026-01-01T00:00:00Z")
+    _write_state_json(a_path, phase="spec-repro", updated_at="2026-01-01T00:00:00Z")
     probe = supervisor.WorkerProbe(
         slug="alpha-aaaa", state_path=a_path,
         agent_id="aaaaaaaa", tmux_session="fleet-aaaaaaaa",
@@ -3010,7 +3010,7 @@ def test_reaper_hook_runs_before_reconcile_on_mtime_change(
     a_path = (
         fleet_home / "projects" / "fleet" / "workers" / "alpha-aaaa" / "state.json"
     )
-    _write_state_json(a_path, phase="tdd-red", updated_at="2026-01-01T00:00:00Z")
+    _write_state_json(a_path, phase="spec-repro", updated_at="2026-01-01T00:00:00Z")
     probe = supervisor.WorkerProbe(
         slug="alpha-aaaa", state_path=a_path,
         agent_id="aaaaaaaa", tmux_session="fleet-aaaaaaaa",
@@ -3070,7 +3070,7 @@ def test_reaper_hook_called_each_iteration(fleet_home: Path) -> None:
     a_path = (
         fleet_home / "projects" / "fleet" / "workers" / "alpha-aaaa" / "state.json"
     )
-    _write_state_json(a_path, phase="tdd-red", updated_at="2026-01-01T00:00:00Z")
+    _write_state_json(a_path, phase="spec-repro", updated_at="2026-01-01T00:00:00Z")
     probe = supervisor.WorkerProbe(
         slug="alpha-aaaa", state_path=a_path,
         agent_id="aaaaaaaa", tmux_session="fleet-aaaaaaaa",
@@ -3127,7 +3127,7 @@ def _floor_harness(fleet_home: Path, *, floor_s, floor_due, n_iters=40,
     a_path = (
         fleet_home / "projects" / "fleet" / "workers" / "alpha-aaaa" / "state.json"
     )
-    _write_state_json(a_path, phase="tdd-red", updated_at="2026-01-01T00:00:00Z")
+    _write_state_json(a_path, phase="spec-repro", updated_at="2026-01-01T00:00:00Z")
     probe = supervisor.WorkerProbe(
         slug="alpha-aaaa", state_path=a_path, agent_id="aaaaaaaa",
         tmux_session="fleet-aaaaaaaa", live_worker=True,
@@ -3235,7 +3235,7 @@ def test_floor_uses_pr_watch_only_pass_not_full_reconcile(fleet_home: Path) -> N
     a_path = (
         fleet_home / "projects" / "fleet" / "workers" / "alpha-aaaa" / "state.json"
     )
-    _write_state_json(a_path, phase="tdd-red", updated_at="2026-01-01T00:00:00Z")
+    _write_state_json(a_path, phase="spec-repro", updated_at="2026-01-01T00:00:00Z")
     probe = supervisor.WorkerProbe(
         slug="alpha-aaaa", state_path=a_path, agent_id="aaaaaaaa",
         tmux_session="fleet-aaaaaaaa", live_worker=True,

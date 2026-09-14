@@ -2642,7 +2642,7 @@ def test_is_worker_alive_reads_state_json_freshness(
     )
     (workers_dir / "state.json").write_text(json.dumps({
         "slug": "alpha-1234", "project": project,
-        "phase": "tdd-red", "updated_at": fresh,
+        "phase": "spec-repro", "updated_at": fresh,
     }), encoding="utf-8")
 
     t = _make_task("alpha-1234", status="in-progress", worker_pid=99999)
@@ -2650,6 +2650,28 @@ def test_is_worker_alive_reads_state_json_freshness(
     # _is_worker_alive returns True via the state.json fallback.
     with patch.object(loop, "_pid_alive", return_value=False):
         assert loop._is_worker_alive(t, project) is True
+
+
+@pytest.mark.parametrize("phase", ["spec-repro", "spec-encode", "verify"])
+def test_worker_launch_looks_live_accepts_scenario_phases(
+    fleet_home: Path, phase: str,
+) -> None:
+    """Scenario-first phases (spec-repro / spec-encode / verify) are
+    worker-authored advances past the dispatch bootstrap's "starting" —
+    residual-crash repair must not classify a worker sitting in one of
+    them as a phantom."""
+    project = "fleet"
+    slug = f"scen-{phase}"
+    workers_dir = fleet_home / "projects" / project / "workers" / slug
+    workers_dir.mkdir(parents=True, exist_ok=True)
+    (workers_dir / "state.json").write_text(json.dumps({
+        "slug": slug, "project": project, "phase": phase,
+    }), encoding="utf-8")
+
+    assert phase in loop._WORKER_AUTHORED_PHASES
+    assert loop._worker_launch_looks_live(project, slug, home=fleet_home) is True
+    # The removed tdd-* ladder is no longer a recognised worker phase.
+    assert not {"tdd-red", "tdd-green", "tdd-refactor"} & loop._WORKER_AUTHORED_PHASES
 
 
 def test_is_worker_alive_treats_stale_state_json_as_dead(
@@ -2668,7 +2690,7 @@ def test_is_worker_alive_treats_stale_state_json_as_dead(
     )
     (workers_dir / "state.json").write_text(json.dumps({
         "slug": "alpha-9999", "project": project,
-        "phase": "tdd-red", "updated_at": stale,
+        "phase": "spec-repro", "updated_at": stale,
     }), encoding="utf-8")
 
     t = _make_task("alpha-9999", status="in-progress", worker_pid=99999)
@@ -3468,7 +3490,7 @@ def test_sweep_done_worker_dirs_deletes_orphan_with_status_done(
     workers_dir.mkdir(parents=True, exist_ok=True)
     (workers_dir / "state.json").write_text(json.dumps({
         "slug": "orphan-aaaa", "project": project,
-        "phase": "tdd-green", "pid": 0,
+        "phase": "spec-encode", "pid": 0,
     }), encoding="utf-8")
 
     _write_tasks(project_dir, [
@@ -3586,7 +3608,7 @@ def test_sweep_failure_does_not_abort_tick(
     workers_dir.mkdir(parents=True, exist_ok=True)
     (workers_dir / "state.json").write_text(json.dumps({
         "slug": "fragile-dddd", "project": project,
-        "phase": "tdd-green",
+        "phase": "spec-encode",
     }), encoding="utf-8")
 
     _write_tasks(project_dir, [

@@ -130,7 +130,7 @@ class TestR1toR4ReconcileStale:
 
     def test_stale_fresh_nonterminal_state_does_not_mask_as_alive(self, tmp_path: Path) -> None:
         # codex iter-2 [P1]: a re-dispatched slug whose PRIOR attempt left
-        # a FRESH non-terminal state.json (phase=tdd-green, recent
+        # a FRESH non-terminal state.json (phase=spec-encode, recent
         # updated_at) would make _is_worker_alive return True off the
         # stale file. The generation gate must run BEFORE liveness so the
         # stale file does not suppress reconcile forever. Expected: ZERO
@@ -141,7 +141,7 @@ class TestR1toR4ReconcileStale:
         fresh = dt2.datetime.now(dt2.timezone.utc).isoformat()
         _write_worker_state(
             tmp_path, "p", "mask-eeee",
-            {"slug": "mask-eeee", "phase": "tdd-green",
+            {"slug": "mask-eeee", "phase": "spec-encode",
              "dispatch_generation": 1, "updated_at": fresh},
         )
         # worker_pid 0 → liveness relies on state freshness; the stale
@@ -216,7 +216,7 @@ class TestR6SupervisorStuckStale:
 
         _write_worker_state(
             tmp_path, "p", "stuck-aaaa",
-            {"slug": "stuck-aaaa", "phase": "tdd-green",
+            {"slug": "stuck-aaaa", "phase": "spec-encode",
              "dispatch_generation": 1,
              "updated_at": "2000-01-01T00:00:00Z"},  # ancient → would-be stuck
         )

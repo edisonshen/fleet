@@ -31,7 +31,7 @@ def test_build_worker_prompt_contains_required_sections() -> None:
     t = _make_task()
     out = dispatch.build_worker_prompt(
         t, project="fleet",
-        standards_md="# Standards\n\n## Testing\n- TDD only.\n",
+        standards_md="# Standards\n\n## Testing\n- Scenario-first only.\n",
         learnings_text="WHEN  AUTHOR  TAG  TASK  BODY\n2026-05-06T10:00:00Z  agent:abcdef01  testing  -  use t.TempDir\n",
     )
     # Required structural sections.
@@ -42,12 +42,12 @@ def test_build_worker_prompt_contains_required_sections() -> None:
     assert "## Acceptance" in out
     assert "Thing is fixed." in out
     assert "## Standards (the bar — non-negotiable)" in out
-    assert "TDD only." in out
+    assert "Scenario-first only." in out
     assert "## Relevant prior learnings" in out
     assert "use t.TempDir" in out
     # Three-stage flow: worker writes the code phases ONLY. Review +
     # push happen in separate subagents (reviewer-subagent-arch).
-    for phase in ("branch", "tdd-red", "tdd-green", "tdd-refactor",
+    for phase in ("branch", "spec-repro", "spec-encode", "verify",
                   "review-pending"):
         assert f"--phase {phase}" in out, f"worker prompt missing --phase {phase}"
     # The old inline phases are GONE from the worker prompt — only the
@@ -744,7 +744,7 @@ def test_build_worker_prompt_git_project_uses_three_stage_flow() -> None:
 
 def test_build_worker_prompt_non_git_project_skips_branch_push_pr() -> None:
     """is_git=False emits the non-git worker contract: no branch
-    creation, no commits, but the same TDD/phase progression and
+    creation, no commits, but the same spec-repro → encode → verify phase progression and
     exit-at-review-pending handoff.
     """
     t = _make_task()

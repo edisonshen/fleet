@@ -284,9 +284,9 @@ def build_worker_prompt(
     else:
         step1 = f"1. git checkout -b {branch}"
     if is_git:
-        tdd_red_line = "2a. Write the failing test. git commit."
-        tdd_green_line = "2b. Write the minimal impl. Test passes. git commit."
-        tdd_refactor_line = "2c. Refactor without changing test behavior. git commit."
+        spec_repro_line = "2a. Reproduce the scenario against the built product; capture the current outcome."
+        spec_encode_line = "2b. Encode that outcome as a test at the right boundary. git commit."
+        verify_line = "2c. Implement, re-run the scenario and the test, run the gates. git commit."
         step3_line = (
             "3. Commits are landed locally on the worker branch. Exit cleanly\n"
             "   (Ctrl-D / /exit). The coord polls state.json on the next tick,\n"
@@ -298,9 +298,9 @@ def build_worker_prompt(
         # the diff from `git status`-equivalent (or just file mtime if
         # truly non-git). The phase=review-pending transition is the
         # same handoff signal.
-        tdd_red_line = "2a. Write the failing test (file in place, no commit)."
-        tdd_green_line = "2b. Write the minimal impl. Test passes (file in place, no commit)."
-        tdd_refactor_line = "2c. Refactor without changing test behavior (file in place, no commit)."
+        spec_repro_line = "2a. Reproduce the scenario against the built product; capture the current outcome."
+        spec_encode_line = "2b. Encode that outcome as a test at the right boundary (file in place, no commit)."
+        verify_line = "2c. Implement, re-run the scenario and the test, run the gates (file in place, no commit)."
         step3_line = (
             "3. Files are landed in place. Exit cleanly (Ctrl-D / /exit). The\n"
             "   coord polls state.json on the next tick, sees phase=review-pending,\n"
@@ -354,14 +354,14 @@ def build_worker_prompt(
         f"  fleet workers update {task.slug} {proj_flag} --phase branch",
         step1,
         "",
-        f"  fleet workers update {task.slug} {proj_flag} --phase tdd-red",
-        tdd_red_line,
+        f"  fleet workers update {task.slug} {proj_flag} --phase spec-repro",
+        spec_repro_line,
         "",
-        f"  fleet workers update {task.slug} {proj_flag} --phase tdd-green",
-        tdd_green_line,
+        f"  fleet workers update {task.slug} {proj_flag} --phase spec-encode",
+        spec_encode_line,
         "",
-        f"  fleet workers update {task.slug} {proj_flag} --phase tdd-refactor",
-        tdd_refactor_line,
+        f"  fleet workers update {task.slug} {proj_flag} --phase verify",
+        verify_line,
         "",
         f"  fleet workers update {task.slug} {proj_flag} --phase review-pending",
         step3_line,
