@@ -212,11 +212,7 @@ var (
 	ErrInvalidReviewStat     = errors.New("invalid review status")
 	ErrInvalidGatesStatus    = errors.New("invalid gates_status: must be passed|failed")
 	ErrInvalidScenarioCounts = errors.New("invalid scenario counts: scenarios_total and scenarios_verified must be >= 0 and scenarios_verified <= scenarios_total")
-	// ErrPhaseRequiresGates / ErrPhaseRequiresScenarios are the verify
-	// gate (validateVerifyGate): phase=review-pending and phase=push are
-	// rejected unless gates_status=passed and scenarios_verified ==
-	// scenarios_total. The wrapped message names the phase and the
-	// offending values so the worker prompt can show it verbatim.
+	// Returned by validateVerifyGate; wrapped with the phase and offending values.
 	ErrPhaseRequiresGates          = errors.New("phase requires gates_status=passed")
 	ErrPhaseRequiresScenarios      = errors.New("phase requires scenarios_verified == scenarios_total")
 	ErrCodexSkipNeedsReason        = errors.New("codex-engine review slot status=skipped requires skip_reason in {rate-limited, unavailable}")
@@ -336,22 +332,11 @@ func validateReviewGate(s *State, gitMode bool) error {
 	return nil
 }
 
-// validateVerifyGate enforces the scenario-first verification
-// precondition (DESIGN-scenario-first-testing §Lever 4). The worker
-// records its claim at 2c VERIFY (`--gates-status passed
-// --scenarios-total M --scenarios-verified N`); the gate makes the
-// claim un-skippable at the two handoff writes:
-//
-//	worker   ── review-pending ──▶ reviewer ── review-done ──▶ finisher ── push ──▶ done
-//	          ▲ verify gate                                     ▲ review gate, then verify gate
-//
-// Fail-closed like validateReviewGate: an empty gates_status (worker
-// never recorded) is rejected the same as "failed". scenarios_total=0
-// is legal (docs-only task, contract `none`) but gates_status must
-// still be passed. Re-checked at push so a reviewer/finisher write
-// that downgraded the fields cannot ship. Runs AFTER validateReviewGate
-// in writeStateLocked so a missing review at push still surfaces
-// ErrPhaseRequiresReview (the verify gate must not mask it).
+// validateVerifyGate rejects phase=review-pending and phase=push unless
+// gates_status=passed and scenarios_verified == scenarios_total. An empty
+// gates_status is rejected like "failed"; scenarios_total=0 is legal.
+// Runs after validateReviewGate so a missing review at push still returns
+// ErrPhaseRequiresReview.
 func validateVerifyGate(s *State) error {
 	if s.Phase != PhaseReviewPending && s.Phase != PhasePush {
 		return nil

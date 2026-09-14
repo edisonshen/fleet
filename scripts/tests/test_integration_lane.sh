@@ -1,20 +1,14 @@
 #!/usr/bin/env bash
-# test_integration_lane.sh — fixture-driven test for scripts/integration-lane.sh.
+# Tests scripts/integration-lane.sh against the fixture module
+# scripts/tests/fixtures/lane (own go.mod, invisible to the root `go test ./...`):
+#   a_test.go              TestDefault_X    default build only
+#   b_integration_test.go  TestOnlyTagged_Y //go:build integration; fails when
+#                                           LANE_FIXTURE_FAIL=1
+#   none/c_test.go         TestDefault_Z    package with no tagged tests
 #
-# Fixture module: scripts/tests/fixtures/lane (its own go.mod, so the root
-# `go test ./...` never sees it):
-#   a_test.go              TestDefault_X   (default build)
-#   b_integration_test.go  TestOnlyTagged_Y (//go:build integration; fails when
-#                                            LANE_FIXTURE_FAIL=1)
-#   none/c_test.go         TestDefault_Z   (package with no tagged tests)
-#
-# Contracts (scenario-testing PR-3 S7–S9):
-#   S7  the lane runs the tagged test and NOT the default one
-#   S8  a package with no integration-only tests exits 0 with a message and
-#       runs nothing
-#   S9  a failing tagged test propagates a non-zero exit and its FAIL line
-#
-# Bash 3.2 portable. Runs via `bash scripts/tests/test_integration_lane.sh`.
+# Checks: tagged test runs and default does not; empty set exits 0 with a
+# message and runs nothing; a failing tagged test exits non-zero with its FAIL
+# line. Bash 3.2 portable.
 
 set -euo pipefail
 
@@ -63,28 +57,26 @@ expect() {
 contains() { [[ "$1" == *"$2"* ]]; }
 not_contains() { [[ "$1" != *"$2"* ]]; }
 
-# S7: tagged runs, default does not. -v so per-test RUN lines are visible.
+# -v so per-test RUN lines are visible.
 run_lane . -v
-expect S7 "exit 0" test "$rc" -eq 0
-expect S7 "tagged test ran" contains "$out" "=== RUN   TestOnlyTagged_Y"
-expect S7 "tagged test passed" contains "$out" "--- PASS: TestOnlyTagged_Y"
-expect S7 "default test did NOT run" not_contains "$out" "TestDefault_X"
+expect tagged-only "exit 0" test "$rc" -eq 0
+expect tagged-only "tagged test ran" contains "$out" "=== RUN   TestOnlyTagged_Y"
+expect tagged-only "tagged test passed" contains "$out" "--- PASS: TestOnlyTagged_Y"
+expect tagged-only "default test did NOT run" not_contains "$out" "TestDefault_X"
 
-# S8: no integration-only tests -> exit 0, message, nothing run.
 run_lane ./none -v
-expect S8 "exit 0" test "$rc" -eq 0
-expect S8 "explains the empty set" contains "$out" "no integration-only tests in ./none"
-expect S8 "no test ran" not_contains "$out" "=== RUN"
-expect S8 "no go test summary" not_contains "$out" "ok "
+expect empty-set "exit 0" test "$rc" -eq 0
+expect empty-set "explains the empty set" contains "$out" "no integration-only tests in ./none"
+expect empty-set "no test ran" not_contains "$out" "=== RUN"
+expect empty-set "no go test summary" not_contains "$out" "ok "
 
-# S9: failing tagged test -> non-zero exit, FAIL line surfaces.
 set +e
 out="$(cd "$FIXTURE" && LANE_FIXTURE_FAIL=1 bash "$LANE" . -v 2>&1)"
 rc=$?
 set -e
-expect S9 "non-zero exit" test "$rc" -ne 0
-expect S9 "names the failing tagged test" contains "$out" "--- FAIL: TestOnlyTagged_Y"
-expect S9 "default test still did NOT run" not_contains "$out" "TestDefault_X"
+expect tagged-fail "non-zero exit" test "$rc" -ne 0
+expect tagged-fail "names the failing tagged test" contains "$out" "--- FAIL: TestOnlyTagged_Y"
+expect tagged-fail "default test still did NOT run" not_contains "$out" "TestDefault_X"
 
 echo
 echo "passed=$passed failed=$failed"

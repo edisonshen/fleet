@@ -427,12 +427,11 @@ review-claude, review-codex, push, done, blocked, failed.
 
 --scenarios-total / --scenarios-verified / --gates-status record the
 worker's Scenario contract outcome at phase=verify (gates_status is
-passed|failed; counts are >= 0 with verified <= total). The verify
-gate then makes the claim load-bearing: --phase review-pending and
---phase push are rejected unless gates_status=passed and
-scenarios_verified == scenarios_total (state.json is left unchanged).
-A rejected write means your gates or counts are wrong — fix and
-re-record; never --phase blocked to bypass.
+passed|failed; counts are >= 0 with verified <= total). --phase
+review-pending and --phase push are rejected unless gates_status=passed
+and scenarios_verified == scenarios_total; state.json is left unchanged.
+Fix the gates or counts and re-record; do not use --phase blocked to
+bypass.
 
 Phase=done requires --pr-url. Phase=blocked requires --reason. The
 state file is created on first call (the coord pre-seeds it on

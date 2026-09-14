@@ -2,6 +2,5 @@ package none
 
 import "testing"
 
-// TestDefault_Z: this package has no //go:build integration tests, so the
-// lane must exit 0 without running anything.
+// TestDefault_Z: default build only; this package has no integration tests.
 func TestDefault_Z(t *testing.T) {}

@@ -52,5 +52,6 @@ Policy: **symlink for repo developers (the maintainer default), copy for brew/bi
 ## House style
 
 - Terse commits. `fix(handoff): clear assigned field on archive`.
+- Comments say only what the code, script, or command does, concisely. No task-plan, PR, design-doc, scenario-row, or history references — that context belongs in the PR body or `docs/`.
 - ASCII diagrams in code comments for non-obvious flows (handoff sequence, reconciliation, fsnotify fan-out).
 - No premature abstractions. Three similar lines is better than a generic helper that takes nine arguments.

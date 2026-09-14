@@ -7,8 +7,8 @@ import (
 	"testing"
 )
 
-// TestOnlyTagged_Y exists only in the integration build. LANE_FIXTURE_FAIL=1
-// makes it fail so the lane's non-zero exit path can be asserted.
+// TestOnlyTagged_Y exists only in the integration build; fails when
+// LANE_FIXTURE_FAIL=1.
 func TestOnlyTagged_Y(t *testing.T) {
 	if os.Getenv("LANE_FIXTURE_FAIL") == "1" {
 		t.Fatal("LANE_FIXTURE_FAIL=1")

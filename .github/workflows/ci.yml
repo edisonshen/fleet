@@ -100,13 +100,9 @@ jobs:
         run: bash scripts/tests/test_lint_test_isolation.sh
 
       - name: Integration lane script — regression fixtures
-        # scenario-testing PR-3: scripts/integration-lane.sh is what the three
-        # integration lane steps below execute. This fixture suite
-        # (scripts/tests/fixtures/lane, its own go.mod) pins its contract:
-        # runs ONLY the //go:build integration tests of a package, exits 0
-        # with a message when there are none, and propagates a tagged
-        # test's failure. Python pytest skips *.sh, so without this step the
-        # discovery could silently regress to running nothing.
+        # Exercises scripts/integration-lane.sh (used by the lane steps below)
+        # against scripts/tests/fixtures/lane: runs only //go:build integration
+        # tests, exits 0 on an empty set, propagates a tagged failure.
         run: bash scripts/tests/test_integration_lane.sh
 
       - name: Pre-test leak sentinel
@@ -149,15 +145,10 @@ jobs:
       # cases are stubbed and stay default-lane), so it needs no integration
       # step at all.
       #
-      # DISCOVERY, NOT HAND-MAINTAINED LISTS (scenario-testing PR-3): each lane
-      # calls scripts/integration-lane.sh <pkg>, which derives the -run set at
-      # run time via `comm -13 <(go test -list) <(go test -tags=integration
-      # -list)` and exits 0 with a message when the set is empty. A new
-      # `//go:build integration` test in one of these packages is picked up
-      # automatically — there is no list here to keep in sync. Adding a NEW
-      # package with integration-only tests still needs a new lane step.
-      # scripts/tests/test_integration_lane.sh (run above) pins the script's
-      # contract.
+      # Each lane calls scripts/integration-lane.sh <pkg>, which derives the
+      # -run set at run time (`comm -13 <(go test -list) <(go test
+      # -tags=integration -list)`) and exits 0 when it is empty. A new package
+      # with integration-only tests still needs its own lane step.
       #
       # FLEET_STANDBY_TIMEOUT=3s caps each standby at 3s (vs the 10m production
       # default), so even an aborted run self-reaps in seconds. No -race here:

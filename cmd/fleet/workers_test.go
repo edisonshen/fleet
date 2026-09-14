@@ -578,8 +578,8 @@ func TestWorkersUpdateCLI_ReviewFieldsPersist(t *testing.T) {
 	_, project := setupTasksHome(t)
 	slug := "rev-cli-persist-aaaa"
 
-	// Step 1: worker writes review-pending (no review fields yet; the
-	// verify gate needs the 2c VERIFY claim recorded).
+	// Step 1: worker writes review-pending (no review fields yet;
+	// gates_status=passed satisfies the verify gate).
 	if err := runWorkersUpdate(slug, &workersUpdateOpts{
 		project: project, phase: "review-pending",
 		gatesStatus: "passed", gatesStatusSet: true,
@@ -786,7 +786,7 @@ func TestWorkersUpdateCLI_ScenarioPhasesAndVerificationFields(t *testing.T) {
 		check func(t *testing.T, st *workers.State, peek string)
 	}{
 		{
-			name: "S1 new phases accepted and peek shows them",
+			name: "new phases accepted and peek shows them",
 			steps: []step{
 				{args: []string{"workers", "update", "s1", "--project", project, "--phase", "spec-repro"}, wantOut: []string{"phase=spec-repro"}},
 				{args: []string{"workers", "update", "s1", "--project", project, "--phase", "spec-encode"}, wantOut: []string{"phase=spec-encode"}},
@@ -813,7 +813,7 @@ func TestWorkersUpdateCLI_ScenarioPhasesAndVerificationFields(t *testing.T) {
 			},
 		},
 		{
-			name: "S2 removed tdd phases rejected",
+			name: "removed tdd phases rejected",
 			steps: []step{
 				{args: []string{"workers", "update", "s2", "--project", project, "--phase", "spec-repro"}, wantOut: []string{"phase=spec-repro"}},
 				{args: []string{"workers", "update", "s2", "--project", project, "--phase", "tdd-red"},
@@ -833,7 +833,7 @@ func TestWorkersUpdateCLI_ScenarioPhasesAndVerificationFields(t *testing.T) {
 			},
 		},
 		{
-			name: "S3 verification fields persist and peek shows them",
+			name: "verification fields persist and peek shows them",
 			steps: []step{
 				{args: []string{"workers", "update", "s3", "--project", project, "--phase", "verify",
 					"--scenarios-total", "3", "--scenarios-verified", "3", "--gates-status", "passed"}, wantOut: []string{"phase=verify"}},
@@ -850,7 +850,7 @@ func TestWorkersUpdateCLI_ScenarioPhasesAndVerificationFields(t *testing.T) {
 			},
 		},
 		{
-			name: "S4 malformed fields rejected and state untouched",
+			name: "malformed fields rejected and state untouched",
 			steps: []step{
 				{args: []string{"workers", "update", "s4", "--project", project, "--phase", "verify"}, wantOut: []string{"phase=verify"}},
 				{args: []string{"workers", "update", "s4", "--project", project, "--phase", "verify", "--gates-status", "maybe"},
@@ -936,13 +936,10 @@ func TestWorkersUpdateCLI_ScenarioPhasesAndVerificationFields(t *testing.T) {
 	}
 }
 
-// TestWorkersUpdateCLI_VerifyGate is the Scenario contract S1–S4 for
-// scenario-testing-pr3-gate, run against the built binary in a sandbox
-// FLEET_HOME: the worker's `--phase review-pending` (and the finisher's
-// `--phase push`) is rejected unless gates_status=passed and
-// scenarios_verified == scenarios_total. A rejected write exits
-// non-zero, prints the gate error verbatim, and leaves state.json
-// byte-for-byte unchanged (`fleet peek` still shows the prior phase).
+// TestWorkersUpdateCLI_VerifyGate: `--phase review-pending` / `--phase push`
+// through the built binary exit non-zero, print the gate error, and leave
+// state.json unchanged unless gates_status=passed and
+// scenarios_verified == scenarios_total.
 func TestWorkersUpdateCLI_VerifyGate(t *testing.T) {
 	bin := buildFleetBinary(t)
 	isolateTmuxSocket(t)
@@ -965,7 +962,7 @@ func TestWorkersUpdateCLI_VerifyGate(t *testing.T) {
 		wantPhase workers.Phase
 	}{
 		{
-			name: "S1 review-pending without gates rejected",
+			name: "review-pending without gates rejected",
 			steps: []step{
 				{args: upd("s1", "--phase", "verify")},
 				{args: upd("s1", "--phase", "review-pending"), wantErr: true,
@@ -974,7 +971,7 @@ func TestWorkersUpdateCLI_VerifyGate(t *testing.T) {
 			wantPhase: workers.PhaseVerify,
 		},
 		{
-			name: "S2 counts disagree rejected naming both",
+			name: "counts disagree rejected naming both",
 			steps: []step{
 				{args: upd("s2", "--phase", "verify", "--gates-status", "passed", "--scenarios-total", "3", "--scenarios-verified", "2")},
 				{args: upd("s2", "--phase", "review-pending"), wantErr: true,
@@ -983,7 +980,7 @@ func TestWorkersUpdateCLI_VerifyGate(t *testing.T) {
 			wantPhase: workers.PhaseVerify,
 		},
 		{
-			name: "S3 passed 3/3 accepted",
+			name: "passed 3/3 accepted",
 			steps: []step{
 				{args: upd("s3a", "--phase", "verify", "--gates-status", "passed", "--scenarios-total", "3", "--scenarios-verified", "3")},
 				{args: upd("s3a", "--phase", "review-pending"), wantOut: []string{"phase=review-pending"}},
@@ -991,7 +988,7 @@ func TestWorkersUpdateCLI_VerifyGate(t *testing.T) {
 			wantPhase: workers.PhaseReviewPending,
 		},
 		{
-			name: "S3 passed 0/0 accepted",
+			name: "passed 0/0 accepted",
 			steps: []step{
 				{args: upd("s3b", "--phase", "verify", "--gates-status", "passed")},
 				{args: upd("s3b", "--phase", "review-pending"), wantOut: []string{"phase=review-pending"}},
@@ -999,7 +996,7 @@ func TestWorkersUpdateCLI_VerifyGate(t *testing.T) {
 			wantPhase: workers.PhaseReviewPending,
 		},
 		{
-			name: "S4 gates failed rejected at review-pending",
+			name: "gates failed rejected at review-pending",
 			steps: []step{
 				{args: upd("s4a", "--phase", "verify", "--gates-status", "failed", "--scenarios-total", "3", "--scenarios-verified", "3")},
 				{args: upd("s4a", "--phase", "review-pending"), wantErr: true,
@@ -1008,7 +1005,7 @@ func TestWorkersUpdateCLI_VerifyGate(t *testing.T) {
 			wantPhase: workers.PhaseVerify,
 		},
 		{
-			name: "S4 gates failed rejected at push",
+			name: "gates failed rejected at push",
 			steps: []step{
 				{args: upd("s4b", "--phase", "verify", "--gates-status", "passed", "--scenarios-total", "3", "--scenarios-verified", "3")},
 				{args: upd("s4b", "--phase", "review-pending")},

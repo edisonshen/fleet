@@ -1099,9 +1099,8 @@ func TestValidateReviewGate(t *testing.T) {
 			},
 			wantErr: ErrPhasePushNonGit,
 		},
-		// S5: at push the review gate runs before the verify gate, so a
-		// missing review is reported as such even when the verify
-		// fields are also wrong.
+		// At push the review gate runs before the verify gate, so a missing
+		// review is reported even when the verify fields are also wrong.
 		{
 			name:    "push empty review and empty gates reports review gate",
 			gitMode: true,
@@ -1195,12 +1194,9 @@ func TestPhaseValidation_NewReviewPhasesAccepted(t *testing.T) {
 	}
 }
 
-// TestValidateVerifyGate: the scenario-first verify gate
-// (DESIGN-scenario-first-testing §Lever 4) fires on phase=review-pending
-// and phase=push only, requires gates_status=passed, and requires
-// scenarios_verified == scenarios_total (0/0 is legal). Scenario
-// contract S1–S4 at the package level; the CLI-level rows live in
-// cmd/fleet/workers_test.go.
+// TestValidateVerifyGate: fires on phase=review-pending and phase=push only,
+// requires gates_status=passed and scenarios_verified == scenarios_total
+// (0/0 is legal).
 func TestValidateVerifyGate(t *testing.T) {
 	verified := func(phase Phase, gates string, total, done int) *State {
 		return &State{
@@ -1220,14 +1216,10 @@ func TestValidateVerifyGate(t *testing.T) {
 		wantErr error
 		wantMsg string
 	}{
-		// S1
 		{"review-pending no gates recorded", verified(PhaseReviewPending, "", 0, 0), ErrPhaseRequiresGates, `phase=review-pending (got gates_status="")`},
-		// S2
 		{"review-pending counts disagree", verified(PhaseReviewPending, GatesStatusPassed, 3, 2), ErrPhaseRequiresScenarios, "phase=review-pending scenarios_verified=2 != scenarios_total=3"},
-		// S3
 		{"review-pending passed 3/3", verified(PhaseReviewPending, GatesStatusPassed, 3, 3), nil, ""},
 		{"review-pending passed 0/0", verified(PhaseReviewPending, GatesStatusPassed, 0, 0), nil, ""},
-		// S4
 		{"review-pending gates failed", verified(PhaseReviewPending, GatesStatusFailed, 3, 3), ErrPhaseRequiresGates, `phase=review-pending (got gates_status="failed")`},
 		{"push gates failed", func() *State {
 			s := stateWithReview("fleet", "vg-aaaa", PhasePush, ReviewStatusPassed, ReviewEngineClaude, "sonnet-5", "", ReviewStatusPassed, ReviewEngineClaude, "opus-4.8", "")
