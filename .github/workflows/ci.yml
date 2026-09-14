@@ -115,6 +115,14 @@ jobs:
         # exercised by act / local-runner emulators).
         run: touch /tmp/fleet-test-ci-sentinel
 
+      - name: Scenario harness — scripts/scenario.sh contract
+        # Drives scripts/scenario.sh (up / seed-coord / seed-worker / run /
+        # capture / down) against the built binary, real tmux on an isolated
+        # socket and the real fleet-guard Stop hook. Sits AFTER the leak
+        # sentinel on purpose: a `down` that leaves /tmp/fleet-test-* debris
+        # must fail the post-test leak assertion, not slip in before it.
+        run: bash scripts/tests/test_scenario_sh.sh
+
       - name: Test
         # -timeout=5m (ci-perf-pr1, P0): a single wedged test (e.g. the /tmp
         # socket-scan grinding N tmux subprocesses) aborts at 5m at the process

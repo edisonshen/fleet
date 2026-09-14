@@ -319,16 +319,7 @@ func TestE2E_DeadCoordRecovery_BareLegacyRecordIsKept(t *testing.T) {
 	requireTmux(t)
 	h := newDeadCoordE2E(t, "e2e-legacy")
 
-	legacy := agent.New("1e9acy01")
-	legacy.TaskID = CoordTaskIDPrefix + h.project
-	legacy.Project = h.project
-	legacy.IsCoord = true
-	legacy.Engine = "claude-code"
-	legacy.TmuxSession = tmux.SessionName(legacy.ID)
-	legacy.SpawnedAt = time.Now().Add(-72 * time.Hour).UTC()
-	if err := legacy.Write(); err != nil {
-		t.Fatalf("write legacy record: %v", err)
-	}
+	legacy := coorde2e.SeedCoord(t, h.project, coorde2e.SeedCoordOpts{ID: "1e9acy01", Dead: true})
 	coorde2e.SeedInFlightWorker(t, h.project, "fix-login", "wkr00001", "implementing")
 	coorde2e.AgeDeadCoord(t, h.project, legacy.ID)
 

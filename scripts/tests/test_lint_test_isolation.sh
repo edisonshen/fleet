@@ -695,6 +695,142 @@ more${bb_bt}
 }
 "
 
+# ===================================================================
+# Shell rule (#4, scenario-testing PR-4): scripts/tests/*.sh that invoke
+# tmux must isolate the socket via `scripts/scenario.sh up`, an explicit
+# FLEET_TMUX_SOCKET= assignment, or the exempt comment. The Go fixture in
+# the sandbox stays clean so only the shell rule can fail these cases.
+#
+# lint-test-isolation:exempt — the `tmux ...` lines below are fixture
+# BODIES written into a throwaway sandbox for the lint to read; this
+# file never executes them.
+# ===================================================================
+
+# run_case_shell <name> <expected-exit> <expected-stderr-substring> <script-body>
+run_case_shell() {
+    local name="$1" want_exit="$2" want_stderr="$3" body="$4"
+    local tmp; tmp="$(mktemp -d -t fleet-lint-test-XXXXXX)"
+    (
+        cd "$tmp"
+        git init -q 2>/dev/null || true
+        git config user.email t@example.com 2>/dev/null || true
+        git config user.name t 2>/dev/null || true
+        mkdir -p scripts/tests
+        printf '%s\n' "$body" > scripts/tests/test_example.sh
+        git add -A 2>/dev/null || true
+    ) >/dev/null 2>&1
+    cp "$LINT" "$tmp/scripts/lint-test-isolation.sh"
+    local out_file; out_file="$(mktemp -t fleet-lint-test-out-XXXXXX)"
+    local got_exit=0
+    bash "$tmp/scripts/lint-test-isolation.sh" >"$out_file" 2>&1 || got_exit=$?
+    local ok=1
+    if [[ "$got_exit" != "$want_exit" ]]; then
+        ok=0; echo "FAIL [$name]: exit = $got_exit, want $want_exit" >&2
+        echo "$body" | sed 's/^/    /' >&2
+        sed 's/^/    /' "$out_file" >&2
+    fi
+    if [[ -n "$want_stderr" ]] && ! grep -q -F -- "$want_stderr" "$out_file"; then
+        ok=0; echo "FAIL [$name]: missing stderr '$want_stderr'" >&2
+        sed 's/^/    /' "$out_file" >&2
+    fi
+    if [[ "$ok" == "1" ]]; then echo "PASS [$name]"; passed=$((passed + 1));
+    else failed=$((failed + 1)); fi
+    rm -rf "$tmp" "$out_file"
+}
+
+# --- Case SH1: bare `tmux ls` with no isolation → flagged by the shell rule.
+run_case_shell "shell-tmux-without-isolation-flagged" 1 "shell tmux isolation" \
+'#!/usr/bin/env bash
+set -euo pipefail
+tmux ls
+tmux -S /tmp/whatever.sock kill-server
+'
+
+# --- Case SH2: `scenario.sh up` attests isolation (the D7 contract).
+run_case_shell "shell-scenario-up-isolates" 0 "1 scripts/tests/*.sh scanned, 0 violations" \
+'#!/usr/bin/env bash
+set -euo pipefail
+eval "$(scripts/scenario.sh up --slug lint)"
+tmux -S "$FLEET_TMUX_SOCKET" ls
+scripts/scenario.sh down
+'
+
+# --- Case SH3: an explicit FLEET_TMUX_SOCKET= assignment also attests.
+run_case_shell "shell-explicit-socket-isolates" 0 "0 violations" \
+'#!/usr/bin/env bash
+export FLEET_TMUX_SOCKET=/tmp/fleet-test-lint-$$.sock
+tmux -S "$FLEET_TMUX_SOCKET" new-session -d -s x sleep 1
+'
+
+# --- Case SH4: a marker that only appears in a comment does NOT attest,
+#     and a tmux mention that only appears in a comment does NOT trigger.
+run_case_shell "shell-commented-marker-not-isolation" 1 "shell tmux isolation" \
+'#!/usr/bin/env bash
+# eval "$(scripts/scenario.sh up)"   # TODO: isolate
+tmux kill-server
+'
+run_case_shell "shell-commented-tmux-not-trigger" 0 "0 violations" \
+'#!/usr/bin/env bash
+# this script talks about tmux ls in prose only
+echo "nothing spawned here"   # tmux ls
+command -v tmux >/dev/null
+'
+
+# --- Case SH5: the exempt comment still works for scripts that must
+#     touch the default server.
+run_case_shell "shell-exempt-comment" 0 "0 violations" \
+'#!/usr/bin/env bash
+# lint-test-isolation:exempt — asserts the default server is untouched
+tmux ls || true
+'
+
+# --- Case SH6: order matters — a marker BELOW a `tmux -S` line does not
+#     excuse it (the socket variable it names was still empty).
+run_case_shell "shell-late-marker-flagged" 1 ":3: tmux -S/-L before" \
+'#!/usr/bin/env bash
+set -euo pipefail
+tmux -S "$FLEET_TMUX_SOCKET" kill-server
+export FLEET_TMUX_SOCKET=/tmp/fleet-test-lint-$$.sock
+tmux -S "$FLEET_TMUX_SOCKET" ls
+'
+run_case_shell "shell-late-scenario-up-flagged" 1 ":2: tmux -S/-L before" \
+'#!/usr/bin/env bash
+tmux -S "$FLEET_TMUX_SOCKET" ls
+eval "$(scripts/scenario.sh up --slug lint)"
+scripts/scenario.sh down
+'
+
+# --- Case SH7: tmux itself does not read FLEET_TMUX_SOCKET — a bare `tmux`
+#     AFTER a marker still hits the default server and is flagged.
+run_case_shell "shell-bare-tmux-after-export-flagged" 1 ":3: bare tmux (no -S/-L)" \
+'#!/usr/bin/env bash
+export FLEET_TMUX_SOCKET=/tmp/fleet-test-lint-$$.sock
+tmux kill-server
+'
+run_case_shell "shell-bare-tmux-after-scenario-up-flagged" 1 ":3: bare tmux (no -S/-L)" \
+'#!/usr/bin/env bash
+eval "$(scripts/scenario.sh up --slug lint)"
+tmux ls
+scripts/scenario.sh down
+'
+run_case_shell "shell-tmux-L-after-export-isolates" 0 "0 violations" \
+'#!/usr/bin/env bash
+export FLEET_TMUX_SOCKET=/tmp/fleet-test-lint-$$.sock
+tmux -L "fleet-test-lint-$$" ls
+'
+
+# --- Case SH8: `tmux` inside a pure string literal is prose, not a call;
+#     inside "$(...)" it still executes and is still flagged.
+run_case_shell "shell-tmux-in-string-literal-not-trigger" 0 "0 violations" \
+'#!/usr/bin/env bash
+CASE="isolation: default tmux server never touched"
+echo '"'"'tmux ls would be wrong here'"'"'
+'
+run_case_shell "shell-tmux-in-command-substitution-flagged" 1 ":2: bare tmux (no -S/-L)" \
+'#!/usr/bin/env bash
+out="$(tmux ls 2>&1)"
+'
+
 echo ""
 echo "test_lint_test_isolation: $passed passed, $failed failed"
 if [[ "$failed" -gt 0 ]]; then

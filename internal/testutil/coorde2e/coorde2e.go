@@ -26,6 +26,7 @@ import (
 
 	"github.com/edisonshen/fleet/internal/agent"
 	"github.com/edisonshen/fleet/internal/coordlock"
+	"github.com/edisonshen/fleet/internal/handoff"
 	"github.com/edisonshen/fleet/internal/projects"
 	"github.com/edisonshen/fleet/internal/state"
 	"github.com/edisonshen/fleet/internal/tmux"
@@ -44,10 +45,60 @@ const (
 	// dispatch wrapper's non-zero-exit branch ends the pane, so the tmux
 	// session and its coord-run supervisor go away with it.
 	ModeExit = "exit"
+	// ModeCrashOnce: the FIRST start after SetMode behaves like ModeExit
+	// (printing `fake claude: crashing once pid <pid>`) and leaves a crash
+	// marker beside the mode file; every later start behaves like ModeOK.
+	// A transient launch failure the next dispatch attempt recovers from.
+	ModeCrashOnce = "crash-once"
+	// ModeHang: print `fake claude: hanging pid <pid>` and block forever —
+	// never the `> ` prompt, never a stdin read. "claude launched but never
+	// became ready", so readiness polls time out while the pane stays up.
+	ModeHang = "hang"
 )
 
 // PromptAck is the line the ModeOK shim prints after consuming a prompt.
 const PromptAck = "fake claude: got prompt"
+
+// FakeClaudeScript is the shim body FakeClaude writes, parameterised on
+// the mode-file path. It is the Go twin of scripts/fake-claude.sh: same
+// four modes, same stdout lines, same exit codes — the parity test in
+// this package runs both and diffs the observable result, so a change
+// here must land in the shell script too (and vice versa).
+func FakeClaudeScript(modeFile string) string {
+	return `#!/bin/sh
+mode=$(cat "` + modeFile + `" 2>/dev/null || echo ok)
+state="` + modeFile + `.crashed"
+case "$mode" in
+  ok) ;;
+  exit)
+    echo "fake claude: startup failure pid $$"
+    exit 1
+    ;;
+  crash-once)
+    if [ ! -e "$state" ]; then
+      : > "$state"
+      echo "fake claude: crashing once pid $$"
+      exit 1
+    fi
+    ;;
+  hang)
+    echo "fake claude: hanging pid $$"
+    exec tail -f /dev/null
+    ;;
+  *)
+    echo "fake claude: unknown mode $mode" >&2
+    exit 2
+    ;;
+esac
+echo "fake claude: ready pid $$"
+echo "> "
+stty -echo 2>/dev/null
+while IFS= read -r line; do
+  echo "` + PromptAck + ` (${#line} chars)"
+done
+exit 1
+`
+}
 
 // FakeClaude writes an executable `claude` shim into dir and returns the
 // path of the mode file that controls it (initially ModeOK). Callers put
@@ -57,32 +108,22 @@ const PromptAck = "fake claude: got prompt"
 func FakeClaude(t *testing.T, dir string) string {
 	t.Helper()
 	modeFile := filepath.Join(dir, "claude.mode")
-	script := `#!/bin/sh
-mode=$(cat "` + modeFile + `" 2>/dev/null || echo ok)
-if [ "$mode" = "exit" ]; then
-  echo "fake claude: startup failure pid $$"
-  exit 1
-fi
-echo "fake claude: ready pid $$"
-echo "> "
-stty -echo 2>/dev/null
-while IFS= read -r line; do
-  echo "` + PromptAck + ` (${#line} chars)"
-done
-exit 1
-`
-	if err := os.WriteFile(filepath.Join(dir, "claude"), []byte(script), 0o755); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, "claude"), []byte(FakeClaudeScript(modeFile)), 0o755); err != nil {
 		t.Fatalf("coorde2e: write fake claude: %v", err)
 	}
 	SetMode(t, modeFile, ModeOK)
 	return modeFile
 }
 
-// SetMode switches the fake claude shim's behaviour for its NEXT start.
+// SetMode switches the fake claude shim's behaviour for its NEXT start
+// and re-arms ModeCrashOnce by dropping its crash marker.
 func SetMode(t *testing.T, modeFile, mode string) {
 	t.Helper()
 	if err := os.WriteFile(modeFile, []byte(mode+"\n"), 0o644); err != nil {
 		t.Fatalf("coorde2e: write claude mode: %v", err)
+	}
+	if err := os.Remove(modeFile + ".crashed"); err != nil && !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("coorde2e: clear crash marker: %v", err)
 	}
 }
 
@@ -132,6 +173,158 @@ func SeedInFlightWorker(t *testing.T, project, slug, workerID, phase string) {
 	if err := os.WriteFile(filepath.Join(wdir, "state.json"), []byte(ws), 0o644); err != nil {
 		t.Fatalf("coorde2e: write worker state.json: %v", err)
 	}
+}
+
+// CapturePane returns the visible text of a tmux session's pane on the
+// isolated socket — what an operator attached to it would see. Fails the
+// test when the session is gone, so a pane assertion never silently
+// passes against an empty capture.
+func CapturePane(t *testing.T, session string) string {
+	t.Helper()
+	pane, err := tmux.CapturePane(session)
+	if err != nil {
+		t.Fatalf("coorde2e: capture pane %s: %v", session, err)
+	}
+	return string(pane)
+}
+
+// yellowPct mirrors skills/fleet-guard/health.py YELLOW_THRESHOLD: the
+// context_pct at which the Stop hook requests a soft handoff.
+const yellowPct = 40.0
+
+// YellowPaneBanner is the shell command that prints what a coord's pane
+// shows once the 40% soft handoff has been requested and the coord
+// answered with its MILESTONE turn (fleet-guard's find_milestone looks
+// for exactly this HANDOFF REQUESTED → ⏺ MILESTONE sequence).
+const YellowPaneBanner = `printf '> HANDOFF REQUESTED: context window is over 40%% — SOFT\n\n⏺ MILESTONE\n\n'`
+
+// SeedCoordOpts shapes the coordinator record SeedCoord writes.
+type SeedCoordOpts struct {
+	// ID is the 8-hex agent id; empty picks a fresh one.
+	ID string
+	// Dead leaves the coord with no tmux session and a spawned_at 72h in
+	// the past: the record an operator finds after a coord died and nothing
+	// archived it. Live (the default) also spawns the coord's fleet-<id>
+	// session on the isolated socket, running Command.
+	Dead bool
+	// Pct stamps context_pct (source "hook") as the Stop hook would after
+	// the coord's last turn; 0 leaves it unset. At or above the 40% yellow
+	// threshold the record also carries handoff_type=auto-yellow (the
+	// pending soft handoff) and a live coord's pane already shows the
+	// `HANDOFF REQUESTED:` line followed by a `⏺ MILESTONE` turn — the
+	// exact state fleet-guard evaluates the in-flight hold in.
+	Pct int
+	// Command runs inside a live coord's pane; default `claude` (the fake
+	// shim callers put first on PATH).
+	Command []string
+}
+
+// SeedCoord writes a coordinator record for project (and, unless Dead,
+// its tmux session) without going through `fleet dispatch`: the state a
+// coord leaves behind, planted directly so a scenario can start from
+// "coord at 41% with a worker in flight" or "coord dead for days" in one
+// call. Returns the record as written.
+func SeedCoord(t *testing.T, project string, opts SeedCoordOpts) *agent.Record {
+	t.Helper()
+	id := opts.ID
+	if id == "" {
+		id = agent.NewID()
+	}
+	now := time.Now().UTC()
+	rec := agent.New(id)
+	rec.TaskID = "coord-" + project
+	rec.Project = project
+	rec.IsCoord = true
+	rec.Engine = "claude-code"
+	rec.TmuxSession = tmux.SessionName(id)
+	rec.SpawnedAt = now
+	rec.LastActivityTS = now
+	if opts.Dead {
+		rec.SpawnedAt = now.Add(-72 * time.Hour)
+	}
+	yellow := false
+	if opts.Pct > 0 {
+		pct := float64(opts.Pct)
+		rec.ContextPct = &pct
+		rec.ContextSource = "hook"
+		if pct >= yellowPct {
+			yellow = true
+			ht := handoff.TypeAutoYellow
+			at := now.Format(time.RFC3339)
+			rec.HandoffType = &ht
+			rec.HandoffTypeAt = &at
+		}
+	}
+	if !opts.Dead {
+		cmd := opts.Command
+		if len(cmd) == 0 {
+			cmd = []string{"claude"}
+		}
+		if yellow {
+			// Same pane text the 40% soft handoff leaves on screen: the
+			// hook's request line, then the coord's MILESTONE turn.
+			cmd = append([]string{"sh", "-c", YellowPaneBanner + `; exec "$@"`, "coord-pane"}, cmd...)
+		}
+		rec.Cwd = t.TempDir()
+		rec.Command = cmd
+		if err := tmux.Spawn(rec.TmuxSession, rec.Cwd, cmd, []string{"FLEET_AGENT_ID=" + id}); err != nil {
+			t.Fatalf("coorde2e: spawn coord %s: %v", id, err)
+		}
+		t.Cleanup(func() { _ = tmux.Kill(rec.TmuxSession) })
+	}
+	if err := rec.Write(); err != nil {
+		t.Fatalf("coorde2e: write coord record %s: %v", id, err)
+	}
+	return rec
+}
+
+// WriteHookEvent applies what fleet-guard's Stop / UserPromptSubmit hook
+// writes to project's coordinator record after a turn at pct% context:
+// context_pct (source "hook"), last_activity_ts, and the idle flag — a
+// Stop with nothing injected marks the coord needs_input, a
+// UserPromptSubmit clears it. Any other event name fails the test.
+func WriteHookEvent(t *testing.T, project string, pct int, event string) {
+	t.Helper()
+	rec := coordRecord(t, project)
+	p := float64(pct)
+	rec.ContextPct = &p
+	rec.ContextSource = "hook"
+	rec.LastActivityTS = time.Now().UTC()
+	switch event {
+	case "Stop":
+		rec.NeedsInput = true
+	case "UserPromptSubmit":
+		rec.NeedsInput = false
+		rec.HasPendingQuestion = false
+	default:
+		t.Fatalf("coorde2e: WriteHookEvent: unknown hook event %q (want Stop or UserPromptSubmit)", event)
+	}
+	if err := rec.Write(); err != nil {
+		t.Fatalf("coorde2e: write hook event for %s: %v", rec.ID, err)
+	}
+}
+
+// coordRecord returns project's single unarchived coordinator record.
+func coordRecord(t *testing.T, project string) *agent.Record {
+	t.Helper()
+	recs, err := agent.List()
+	if err != nil {
+		t.Fatalf("coorde2e: list agents: %v", err)
+	}
+	var found *agent.Record
+	for _, r := range recs {
+		if r.Project != project || !r.IsCoord {
+			continue
+		}
+		if found != nil {
+			t.Fatalf("coorde2e: project %s has more than one coord record (%s, %s)", project, found.ID, r.ID)
+		}
+		found = r
+	}
+	if found == nil {
+		t.Fatalf("coorde2e: project %s has no coord record", project)
+	}
+	return found
 }
 
 // DispatchResult is one real `fleet dispatch --coord-spawn` run.
