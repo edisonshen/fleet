@@ -119,7 +119,7 @@ func TestEnrichManualDoc_LiveStateWinsOverCheckpoint(t *testing.T) {
 
 	// LIVE state: the current truth — fix-live-9999 is in flight now.
 	seedCoordState(t, pdir, "myproj", map[string]string{"fix-live-9999": "livebeef"})
-	seedWorkerState(t, pdir, "myproj", "fix-live-9999", "tdd-green", "")
+	seedWorkerState(t, pdir, "myproj", "fix-live-9999", "spec-encode", "")
 
 	// Checkpoint is fresher than the last handoff but STALE vs live —
 	// it references work that has since moved on.
@@ -530,7 +530,7 @@ func TestEnrichManualDoc_NoCheckpointLiveWalk(t *testing.T) {
 		"fix-foo-1234": "deadbeef",
 		"fix-bar-5678": "cafef00d",
 	})
-	seedWorkerState(t, pdir, "myproj", "fix-foo-1234", "tdd-green", "")
+	seedWorkerState(t, pdir, "myproj", "fix-foo-1234", "spec-encode", "")
 	seedWorkerState(t, pdir, "myproj", "fix-bar-5678", "push", "https://github.com/o/r/pull/9")
 
 	fakeGH(t, ghJSON(t, []ghOpenPR{
@@ -548,8 +548,8 @@ func TestEnrichManualDoc_NoCheckpointLiveWalk(t *testing.T) {
 		t.Errorf("order: got %q,%q want fix-bar-5678,fix-foo-1234",
 			doc.ActiveSubagents[0].TaskID, doc.ActiveSubagents[1].TaskID)
 	}
-	if doc.ActiveSubagents[1].LastPhase != "tdd-green" {
-		t.Errorf("foo phase: got %q want tdd-green", doc.ActiveSubagents[1].LastPhase)
+	if doc.ActiveSubagents[1].LastPhase != "spec-encode" {
+		t.Errorf("foo phase: got %q want spec-encode", doc.ActiveSubagents[1].LastPhase)
 	}
 	if len(doc.OpenPRs) != 1 || doc.OpenPRs[0].Number != 9 {
 		t.Fatalf("OpenPRs: got %#v want one #9", doc.OpenPRs)
@@ -562,7 +562,7 @@ func TestEnrichManualDoc_GhFailsFallsBackToPlaceholder(t *testing.T) {
 	pdir := withFleetHomeSynth(t)
 	now := time.Now().UTC()
 	seedCoordState(t, pdir, "myproj", map[string]string{"fix-foo-1234": "deadbeef"})
-	seedWorkerState(t, pdir, "myproj", "fix-foo-1234", "tdd-green", "")
+	seedWorkerState(t, pdir, "myproj", "fix-foo-1234", "spec-encode", "")
 
 	fakeGH(t, nil, errors.New("not a git repository")) // gh exits non-zero
 
@@ -703,7 +703,7 @@ func TestCollectActiveSubagentsLive_PromotesPROpenToInReview(t *testing.T) {
 	// pr-open: PR opened in state.json, tasks.md still in-progress.
 	seedWorkerState(t, pdir, "myproj", "pr-open-1111", "push", "https://github.com/o/r/pull/7")
 	// writing: no PR yet, in-progress.
-	seedWorkerState(t, pdir, "myproj", "writing-2222", "tdd-green", "")
+	seedWorkerState(t, pdir, "myproj", "writing-2222", "spec-encode", "")
 	// no-status: PR in state.json but NO tasks.md row at all (empty status).
 	seedWorkerState(t, pdir, "myproj", "no-status-3333", "push", "https://github.com/o/r/pull/8")
 	seedTasksMD(t, pdir, "myproj", map[string]tasks.Status{
@@ -735,7 +735,7 @@ func TestCollectActiveSubagentsLive_PromotesFromTasksMDPRURL(t *testing.T) {
 	pdir := withFleetHomeSynth(t)
 	seedCoordState(t, pdir, "myproj", map[string]string{"tonly-1111": "idA"})
 	// state.json: in-flight, NO pr_url.
-	seedWorkerState(t, pdir, "myproj", "tonly-1111", "tdd-green", "")
+	seedWorkerState(t, pdir, "myproj", "tonly-1111", "spec-encode", "")
 	// tasks.md: in-progress but carries a pr_url (coord stamped tasks.md
 	// before state.json caught up).
 	seedTasksMDWithPRAndStatus(t, pdir, "myproj", map[string][2]string{
@@ -907,7 +907,7 @@ func TestEnrichManualDoc_RejectsForeignGenerationCheckpoint(t *testing.T) {
 
 	// Live state belongs to the current (different) coord generation.
 	seedCoordState(t, pdir, "myproj", map[string]string{"live-9999": "newcoord1"})
-	seedWorkerState(t, pdir, "myproj", "live-9999", "tdd-green", "")
+	seedWorkerState(t, pdir, "myproj", "live-9999", "spec-encode", "")
 
 	fakeGH(t, []byte("[]"), nil)
 

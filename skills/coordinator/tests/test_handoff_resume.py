@@ -90,7 +90,7 @@ def test_resume_absent_journal_acquires_gen0_passes_gate(
 
     entries = [
         handoff_resume.ResumeEntry(
-            task_id="fix-foo", branch="worker/fix-foo", phase="tdd-green",
+            task_id="fix-foo", branch="worker/fix-foo", phase="spec-encode",
             agent_id="abcd1234", subagent_id="",
         )
     ]
@@ -160,7 +160,7 @@ def test_parse_handoff_doc_single_entry(tmp_path: Path) -> None:
     _seed_handoff(
         p,
         body_subagents=(
-            '- task="fix-foo" branch="worker/fix-foo" phase="tdd-green" '
+            '- task="fix-foo" branch="worker/fix-foo" phase="spec-encode" '
             'agent_id="abcd1234" subagent_id="claude-sub-1"'
         ),
     )
@@ -169,7 +169,7 @@ def test_parse_handoff_doc_single_entry(tmp_path: Path) -> None:
     e = got[0]
     assert e.task_id == "fix-foo"
     assert e.branch == "worker/fix-foo"
-    assert e.phase == "tdd-green"
+    assert e.phase == "spec-encode"
     assert e.agent_id == "abcd1234"
     assert e.subagent_id == "claude-sub-1"
 
@@ -178,7 +178,7 @@ def test_parse_handoff_doc_multi_entry(tmp_path: Path) -> None:
     p = tmp_path / "handoff.md"
     body = (
         '- task="a" branch="worker/a" phase="push" agent_id="11111111" subagent_id=""\n'
-        '- task="b" branch="worker/b" phase="tdd-red" agent_id="22222222" subagent_id="claude-sub-2"'
+        '- task="b" branch="worker/b" phase="spec-repro" agent_id="22222222" subagent_id="claude-sub-2"'
     )
     _seed_handoff(p, body_subagents=body)
     got = handoff_resume.parse_handoff_doc(p)
@@ -236,7 +236,7 @@ def test_build_resume_dispatches_skips_when_wip_missing(tmp_path: Path) -> None:
     inbox.write_text("original prompt body", encoding="utf-8")
     entries = [
         handoff_resume.ResumeEntry(
-            task_id="fix-foo", branch="worker/fix-foo", phase="tdd-green",
+            task_id="fix-foo", branch="worker/fix-foo", phase="spec-encode",
             agent_id="abcd1234", subagent_id="",
         )
     ]
@@ -256,7 +256,7 @@ def test_build_resume_dispatches_skips_when_inbox_missing(tmp_path: Path) -> Non
     (wip_dir / "fix-foo.md").write_text("phases_completed: [...]\n", encoding="utf-8")
     entries = [
         handoff_resume.ResumeEntry(
-            task_id="fix-foo", branch="worker/fix-foo", phase="tdd-green",
+            task_id="fix-foo", branch="worker/fix-foo", phase="spec-encode",
             agent_id="abcd1234", subagent_id="",
         )
     ]
@@ -285,7 +285,7 @@ def test_build_resume_dispatches_emits_block_when_wip_and_inbox_present(
     )
     entries = [
         handoff_resume.ResumeEntry(
-            task_id="fix-foo", branch="worker/fix-foo", phase="tdd-green",
+            task_id="fix-foo", branch="worker/fix-foo", phase="spec-encode",
             agent_id="abcd1234", subagent_id="",
         )
     ]
@@ -344,7 +344,7 @@ def test_build_resume_dispatches_handles_multiple_entries(
             agent_id="11111111", subagent_id="",
         ),
         handoff_resume.ResumeEntry(
-            task_id="task-b", branch="worker/task-b", phase="tdd-red",
+            task_id="task-b", branch="worker/task-b", phase="spec-repro",
             agent_id="22222222", subagent_id="",
         ),
     ]
@@ -387,7 +387,7 @@ def test_main_emits_dispatch_blocks_on_stdout(
     _seed_handoff(
         doc,
         body_subagents=(
-            '- task="fix-foo" branch="worker/fix-foo" phase="tdd-green" '
+            '- task="fix-foo" branch="worker/fix-foo" phase="spec-encode" '
             'agent_id="abcd1234" subagent_id=""'
         ),
     )
@@ -422,7 +422,7 @@ def test_main_records_resumed_task_into_session_tasks(
     _seed_handoff(
         doc,
         body_subagents=(
-            '- task="fix-foo" branch="worker/fix-foo" phase="tdd-green" '
+            '- task="fix-foo" branch="worker/fix-foo" phase="spec-encode" '
             'agent_id="abcd1234" subagent_id=""'
         ),
     )
@@ -485,7 +485,7 @@ def test_main_stdout_failure_does_not_ack_resume(
     _seed_handoff(
         doc,
         body_subagents=(
-            '- task="fix-foo" branch="worker/fix-foo" phase="tdd-green" '
+            '- task="fix-foo" branch="worker/fix-foo" phase="spec-encode" '
             'agent_id="abcd1234" subagent_id=""'
         ),
     )
@@ -521,7 +521,7 @@ def test_main_stdout_flush_failure_does_not_ack_resume(
     _seed_handoff(
         doc,
         body_subagents=(
-            '- task="fix-foo" branch="worker/fix-foo" phase="tdd-green" '
+            '- task="fix-foo" branch="worker/fix-foo" phase="spec-encode" '
             'agent_id="abcd1234" subagent_id=""'
         ),
     )
@@ -552,7 +552,7 @@ def test_main_busy_coordinator_lock_does_not_emit_dispatch_or_ack(
     _seed_handoff(
         doc,
         body_subagents=(
-            '- task="fix-foo" branch="worker/fix-foo" phase="tdd-green" '
+            '- task="fix-foo" branch="worker/fix-foo" phase="spec-encode" '
             'agent_id="abcd1234" subagent_id=""'
         ),
     )
@@ -620,7 +620,7 @@ def test_main_transient_resume_skip_does_not_ack(
     _seed_handoff(
         doc,
         body_subagents=(
-            '- task="fix-foo" branch="worker/fix-foo" phase="tdd-green" '
+            '- task="fix-foo" branch="worker/fix-foo" phase="spec-encode" '
             'agent_id="abcd1234" subagent_id=""'
         ),
     )
@@ -653,9 +653,9 @@ def test_main_transient_skip_suppresses_prepared_blocks(
     (wip_dir / "task-b.md").write_text("phase B", encoding="utf-8")
     doc = tmp_path / "handoff.md"
     body = (
-        '- task="task-a" branch="worker/task-a" phase="tdd-green" '
+        '- task="task-a" branch="worker/task-a" phase="spec-encode" '
         'agent_id="11111111" subagent_id=""\n'
-        '- task="task-b" branch="worker/task-b" phase="tdd-green" '
+        '- task="task-b" branch="worker/task-b" phase="spec-encode" '
         'agent_id="22222222" subagent_id=""'
     )
     _seed_handoff(doc, body_subagents=body)
@@ -696,7 +696,7 @@ def test_main_reset_error_does_not_emit_or_ack_fallback_block(
     _seed_handoff(
         doc,
         body_subagents=(
-            '- task="fix-foo" branch="worker/fix-foo" phase="tdd-green" '
+            '- task="fix-foo" branch="worker/fix-foo" phase="spec-encode" '
             'agent_id="abcd1234" subagent_id=""'
         ),
     )
@@ -771,7 +771,7 @@ def test_main_rejects_traversal_project_before_resume_side_effects(
     _seed_handoff(
         doc,
         body_subagents=(
-            '- task="fix-foo" branch="worker/fix-foo" phase="tdd-green" '
+            '- task="fix-foo" branch="worker/fix-foo" phase="spec-encode" '
             'agent_id="abcd1234" subagent_id=""'
         ),
         project="../../outside",
@@ -803,7 +803,7 @@ def test_main_rejects_absolute_project_before_resume_side_effects(
     _seed_handoff(
         doc,
         body_subagents=(
-            '- task="fix-foo" branch="worker/fix-foo" phase="tdd-green" '
+            '- task="fix-foo" branch="worker/fix-foo" phase="spec-encode" '
             'agent_id="abcd1234" subagent_id=""'
         ),
         project=str(outside),
@@ -986,7 +986,7 @@ def test_parse_handoff_doc_legacy_5field_row_status_empty(tmp_path: Path) -> Non
     _seed_handoff(
         p,
         body_subagents=(
-            '- task="legacy" branch="worker/legacy" phase="tdd-green" '
+            '- task="legacy" branch="worker/legacy" phase="spec-encode" '
             'agent_id="abcd1234" subagent_id=""'
         ),
     )
@@ -1038,7 +1038,7 @@ def test_handoff_resume_redispatches_when_in_progress_no_pr(
     (wip_dir / "fix-foo.md").write_text("phase 1", encoding="utf-8")
     entries = [
         handoff_resume.ResumeEntry(
-            task_id="fix-foo", branch="worker/fix-foo", phase="tdd-green",
+            task_id="fix-foo", branch="worker/fix-foo", phase="spec-encode",
             status="in-progress", pr_url="",
             agent_id="abcd1234", subagent_id="",
         )
@@ -1093,7 +1093,7 @@ def test_handoff_resume_legacy_empty_status_falls_back_to_redispatch(
     (wip_dir / "legacy.md").write_text("phase 1", encoding="utf-8")
     entries = [
         handoff_resume.ResumeEntry(
-            task_id="legacy", branch="worker/legacy", phase="tdd-green",
+            task_id="legacy", branch="worker/legacy", phase="spec-encode",
             status="", pr_url="",
             agent_id="abcd1234", subagent_id="",
         )

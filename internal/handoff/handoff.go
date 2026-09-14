@@ -195,7 +195,7 @@ type OpenPR struct {
 type ActiveSubagent struct {
 	TaskID     string // task slug (the worker's task)
 	Branch     string // worker/<slug>
-	LastPhase  string // tdd-green / push / blocked / etc.
+	LastPhase  string // verify / push / blocked / etc.
 	Status     string // tasks.md status enum; "" when not captured (legacy doc).
 	PRURL      string // open PR URL from tasks.md; "" when no PR yet.
 	AgentID    string // 8-hex Fleet agent ID (inbox file key)

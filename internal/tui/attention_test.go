@@ -620,12 +620,12 @@ func TestKeyA_TaskRow_LiveStatusOverridesSnapshot(t *testing.T) {
 	seedBlockedTask(t, pdir, "fleet", "race-task-aaaa", tasks.StatusInProgress, "")
 	stubReadTaskWorker(t, func(project, slug string) (*workers.State, error) {
 		return &workers.State{
-			Slug: slug, Project: project, Phase: workers.PhaseTDDGreen, PID: 9999,
+			Slug: slug, Project: project, Phase: workers.PhaseSpecEncode, PID: 9999,
 		}, nil
 	})
 	seedWorker(t, pdir, "fleet", "race-task-aaaa", workers.State{
 		Slug: "race-task-aaaa", Project: "fleet",
-		Phase: workers.PhaseTDDGreen, PID: 9999,
+		Phase: workers.PhaseSpecEncode, PID: 9999,
 	})
 
 	m := New("test")
@@ -793,12 +793,12 @@ func TestKeyA_DetailPanel_LiveStatusOverridesCachedStatus(t *testing.T) {
 	seedBlockedTask(t, pdir, "fleet", "race-task-aaaa", tasks.StatusInProgress, "")
 	stubReadTaskWorker(t, func(project, slug string) (*workers.State, error) {
 		return &workers.State{
-			Slug: slug, Project: project, Phase: workers.PhaseTDDGreen, PID: 9999,
+			Slug: slug, Project: project, Phase: workers.PhaseSpecEncode, PID: 9999,
 		}, nil
 	})
 	// Seed a worker dir so readWorkerDetail succeeds.
 	seedWorker(t, pdir, "fleet", "race-task-aaaa", workers.State{
-		Slug: "race-task-aaaa", Project: "fleet", Phase: workers.PhaseTDDGreen, PID: 9999,
+		Slug: "race-task-aaaa", Project: "fleet", Phase: workers.PhaseSpecEncode, PID: 9999,
 	})
 
 	m := New("test")

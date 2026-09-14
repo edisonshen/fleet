@@ -82,8 +82,8 @@ func TestLogWritesEnvelopeToOwnFile(t *testing.T) {
 	dir := setupLogHome(t)
 	id := Log(CompWorker, "state.transition", "info", Fields{
 		Proj: "projects-fleet", Slug: "slug-1",
-		Msg:  "worker slug-1 phase tdd-green -> review-pending",
-		Data: map[string]any{"from": "tdd-green", "to": "review-pending"},
+		Msg:  "worker slug-1 phase spec-encode -> review-pending",
+		Data: map[string]any{"from": "spec-encode", "to": "review-pending"},
 	})
 	if id == "" {
 		t.Fatal("Log returned empty id")
@@ -109,7 +109,7 @@ func TestLogWritesEnvelopeToOwnFile(t *testing.T) {
 		t.Errorf("envelope fields wrong: %v", m)
 	}
 	data, _ := m["data"].(map[string]any)
-	if data["from"] != "tdd-green" || data["to"] != "review-pending" {
+	if data["from"] != "spec-encode" || data["to"] != "review-pending" {
 		t.Errorf("data wrong: %v", data)
 	}
 }

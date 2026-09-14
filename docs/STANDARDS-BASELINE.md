@@ -14,7 +14,7 @@ does not already exist — operator hand-edits are preserved across
 The baseline has three sections, each scoped to a recurring failure
 mode the coordinator's worker prompts kept stepping on:
 
-- **Testing** — TDD ratchet, stdlib `testing` only, regression test
+- **Testing** — scenario-first (reproduce → encode → verify), stdlib `testing` only, regression test
   for every bug fix.
 - **Code review** — ruthless reviewers, P0/P1 fixes before merge,
   documented "wontfix" rationale for anything left open.

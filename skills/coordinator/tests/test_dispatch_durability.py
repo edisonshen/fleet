@@ -251,7 +251,7 @@ def test_case_g_live_worker_not_repaired(fleet_bin: str, home: Path) -> None:
     wdir = home / "projects" / "myproj" / "workers" / "fix-foo"
     wdir.mkdir(parents=True)
     (wdir / "state.json").write_text(
-        json.dumps({"phase": "tdd-green", "updated_at": "2099-01-01T00:00:00Z"}),
+        json.dumps({"phase": "spec-encode", "updated_at": "2099-01-01T00:00:00Z"}),
         encoding="utf-8")
     actions = _replay(
         home, fleet_bin,
@@ -355,7 +355,7 @@ def test_residual_crash_repair_left_alone_for_live_worker(
     wdir = home / "projects" / "myproj" / "workers" / "fix-foo"
     wdir.mkdir(parents=True)
     (wdir / "state.json").write_text(
-        json.dumps({"phase": "tdd-green", "updated_at": "2099-01-01T00:00:00Z"}),
+        json.dumps({"phase": "spec-encode", "updated_at": "2099-01-01T00:00:00Z"}),
         encoding="utf-8")
 
     actions = _replay(

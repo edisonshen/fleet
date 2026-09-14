@@ -459,7 +459,7 @@ coord skill                    fleet binary             filesystem
                                                              │ reads inbox, injects body
                                                              │ archives to inbox/archive/
                                                              │
-                            worker begins TDD → review → push
+                            worker begins repro → encode → verify → review → push
 ```
 
 If the worker's first SessionStart races the inbox write and arrives
@@ -610,7 +610,7 @@ Each worker owns one directory: `~/.fleet/projects/<name>/workers/<slug>/`. The 
   "slug": "add-readme-7a3c",
   "project": "fleet",
   "phase": "review-codex",
-  "phases_completed": ["branch", "tdd-red", "tdd-green", "tdd-refactor", "review-claude"],
+  "phases_completed": ["branch", "spec-repro", "spec-encode", "verify", "review-claude"],
   "started_at": "2026-05-06T14:00:00Z",
   "updated_at": "2026-05-06T14:08:23Z",
   "pid": 12345,
@@ -620,7 +620,7 @@ Each worker owns one directory: `~/.fleet/projects/<name>/workers/<slug>/`. The 
 }
 ```
 
-Allowed `phase` values: `starting`, `branch`, `tdd-red`, `tdd-green`, `tdd-refactor`, `review-claude`, `review-codex`, `push`, `done`, `blocked`, `failed`. Phase `done` requires non-empty `pr_url`. Phase `blocked` requires non-empty `blocked_reason`.
+Allowed `phase` values: `starting`, `branch`, `spec-repro`, `spec-encode`, `verify`, `review-claude`, `review-codex`, `push`, `done`, `blocked`, `failed`. Phase `done` requires non-empty `pr_url`. Phase `blocked` requires non-empty `blocked_reason`.
 
 ### 6.3 Per-worker isolation discipline
 
@@ -666,14 +666,14 @@ Output log:  ~/.fleet/projects/fleet/workers/add-readme-7a3c/output.log
   fleet workers update add-readme-7a3c --phase branch
 1. git checkout -b worker/add-readme-7a3c
 
-  fleet workers update add-readme-7a3c --phase tdd-red
-2a. Write the failing test. git commit.
+  fleet workers update add-readme-7a3c --phase spec-repro
+2a. Reproduce the scenario against the built product; capture the current outcome.
 
-  fleet workers update add-readme-7a3c --phase tdd-green
-2b. Write the minimal impl. Test passes. git commit.
+  fleet workers update add-readme-7a3c --phase spec-encode
+2b. Encode that outcome as a test at the right boundary. git commit.
 
-  fleet workers update add-readme-7a3c --phase tdd-refactor
-2c. Refactor without changing test. git commit.
+  fleet workers update add-readme-7a3c --phase verify
+2c. Implement, re-run the scenario and the test, run the gates. git commit.
 
   fleet workers update add-readme-7a3c --phase review-claude
 3a. /review on your diff. Fix every P0/P1.
