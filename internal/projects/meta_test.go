@@ -165,6 +165,59 @@ func TestSanitizeTag_ProducerValidatorContract(t *testing.T) {
 	}
 }
 
+// TestTagForPath_LinkedWorktreeTagsAsMainCheckout: a linked git worktree
+// (Claude Code's <repo>/.claude/worktrees/agent-<hex>, or any `git
+// worktree add`) must tag as the main checkout's project, not as a
+// phantom "worktrees-agent-<hex>" project.
+func TestTagForPath_LinkedWorktreeTagsAsMainCheckout(t *testing.T) {
+	root := t.TempDir()
+	repo := filepath.Join(root, "projects", "graph-runner")
+	wtName := "agent-a4ed2a772bd52d96b"
+	wtGitDir := filepath.Join(repo, ".git", "worktrees", wtName)
+	if err := os.MkdirAll(wtGitDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	wt := filepath.Join(repo, ".claude", "worktrees", wtName)
+	if err := os.MkdirAll(wt, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(wt, ".git"), []byte("gitdir: "+wtGitDir+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	want := TagForPath(repo)
+	if want != "projects-graph-runner" {
+		t.Fatalf("main checkout tag = %q, want projects-graph-runner", want)
+	}
+	if got := TagForPath(wt); got != want {
+		t.Errorf("TagForPath(worktree)=%q, want main checkout tag %q", got, want)
+	}
+
+	// Relative gitdir pointers resolve against the worktree dir.
+	rel, err := filepath.Rel(wt, wtGitDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(wt, ".git"), []byte("gitdir: "+rel+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if got := TagForPath(wt); got != want {
+		t.Errorf("TagForPath(worktree, relative gitdir)=%q, want %q", got, want)
+	}
+
+	// A regular clone (.git directory) and a non-repo dir are unchanged.
+	plain := filepath.Join(root, "work", "fleet")
+	if err := os.MkdirAll(filepath.Join(plain, ".git"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if got := TagForPath(plain); got != "work-fleet" {
+		t.Errorf("TagForPath(clone)=%q, want work-fleet", got)
+	}
+	if got := TagForPath(filepath.Join(root, "worktrees", "agent-ffff")); got != "worktrees-agent-ffff" {
+		t.Errorf("TagForPath(non-repo)=%q, want worktrees-agent-ffff", got)
+	}
+}
+
 // TestMeta_LegacyFileWithoutIsGit_ParsesAsTrue: a meta.json written by
 // v0.8.x and earlier (no is_git field) must continue to behave as a
 // git-backed project. GitMode() returns true; the on-disk file is

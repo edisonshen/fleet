@@ -683,17 +683,19 @@ func (m Model) actionArchive() (Model, tea.Cmd, bool) {
 			return m, nil, true
 		}
 		cur := row.agent
-		// Coord rows: [x] (archive → `fleet rm`, which kills the session with
-		// no handoff and no replacement) would orphan the coord lock and wedge
-		// the project. Refuse + redirect to [h]/[r] on the project row.
-		if recordIsCoord(cur) {
+		status := deriveStatus(cur, m.aliveByID)
+		// Live coord rows: [x] (archive → `fleet rm`, which kills the session
+		// with no handoff and no replacement) would orphan the coord lock and
+		// wedge the project. Refuse + redirect to [h]/[r] on the project row.
+		// A dead coord has no session to kill and no lock to orphan — its
+		// record is just a stale entry, so archive proceeds like any agent.
+		if recordIsCoord(cur) && status != "dead" {
 			m.flash = &flashMsg{
-				text:  "[x] can't archive a coord — use [h] handoff or [r] reset on its project row (left panel)",
+				text:  "[x] can't archive a live coord — use [h] handoff or [r] reset on its project row (left panel)",
 				isErr: true,
 			}
 			return m, nil, true
 		}
-		status := deriveStatus(cur, m.aliveByID)
 		if status == "auto-red" || status == "precompact" {
 			m.flash = &flashMsg{
 				text:  fmt.Sprintf("agent %s has a pending handoff journal — `fleet drain` first", cur.ID),
@@ -1630,19 +1632,22 @@ var resetReapFn = func(project string, frozenIDs []string) tea.Msg {
 	}
 }
 
-// coordLockStillPresent is the codex iter-3 [P2] post-gc backstop: after
-// the reset reap archived every coord record for the project and gc ran
-// (without an explicit refusal), the project's coordinator.lock MUST be
-// gone for the "clear the stale lock" guarantee to hold. A surviving
-// file means gc couldn't classify it (unreadable holder record, torn
-// body, ambiguous probe → no action line) — the reset did NOT clear it,
-// so we fail closed (no respawn). Respawn hasn't run yet, so nothing
-// should be legitimately recreating the lock between reap and this stat.
+// coordLockStillPresent is the post-gc backstop: after the reset reap
+// archived every coord record for the project and gc ran (without an
+// explicit refusal), the project's coordinator.lock MUST be gone for the
+// "clear the stale lock" guarantee to hold. A surviving file means gc
+// couldn't classify it (empty/torn body, unreadable holder record,
+// ambiguous probe → no action line). The flock is the load-bearing
+// liveness signal, so the backstop tries a flock-guarded unlink: a lock
+// nobody holds is stale and gets removed; a held lock (live coord) or an
+// inode swap refuses and the reset fails closed (no respawn). Respawn
+// hasn't run yet, so nothing should be legitimately recreating the lock
+// between reap and this check.
 //
-// Returns nil when the lock is absent (success) or the path can't be
-// resolved (can't make a claim → don't block recovery on a path error,
-// the line-parse refusal already covered the classifiable cases). A stat
-// error other than not-exist is itself ambiguous → fail closed.
+// Returns nil when the lock is absent or was unlinked (success), or the
+// path can't be resolved (can't make a claim → don't block recovery on a
+// path error). A stat error other than not-exist is ambiguous → fail
+// closed.
 func coordLockStillPresent(project string) error {
 	lp, perr := state.CoordinatorLockPath(project)
 	if perr != nil {
@@ -1650,9 +1655,12 @@ func coordLockStillPresent(project string) error {
 	}
 	_, serr := os.Stat(lp)
 	if serr == nil {
-		return fmt.Errorf(
-			"coordinator.lock still present at %s after gc (gc could not classify it — likely an unreadable holder record or torn lock body); reset did not clear it",
-			lp)
+		if rerr := gc.RemoveCoordLockIfUnheld(lp); rerr != nil {
+			return fmt.Errorf(
+				"coordinator.lock still present at %s after gc and could not be unlinked: %w; reset did not clear it",
+				lp, rerr)
+		}
+		return nil
 	}
 	if !os.IsNotExist(serr) {
 		return fmt.Errorf("stat coordinator.lock for %s after gc: %w", project, serr)
