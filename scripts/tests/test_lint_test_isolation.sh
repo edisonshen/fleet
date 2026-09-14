@@ -784,20 +784,51 @@ run_case_shell "shell-exempt-comment" 0 "0 violations" \
 tmux ls || true
 '
 
-# --- Case SH6: order matters — a marker BELOW the tmux line does not excuse
-#     it (that first `tmux kill-server` already hit the default server).
-run_case_shell "shell-late-marker-flagged" 1 ":3: invokes tmux before" \
+# --- Case SH6: order matters — a marker BELOW a `tmux -S` line does not
+#     excuse it (the socket variable it names was still empty).
+run_case_shell "shell-late-marker-flagged" 1 ":3: tmux -S/-L before" \
 '#!/usr/bin/env bash
 set -euo pipefail
-tmux kill-server
+tmux -S "$FLEET_TMUX_SOCKET" kill-server
 export FLEET_TMUX_SOCKET=/tmp/fleet-test-lint-$$.sock
 tmux -S "$FLEET_TMUX_SOCKET" ls
 '
-run_case_shell "shell-late-scenario-up-flagged" 1 ":2: invokes tmux before" \
+run_case_shell "shell-late-scenario-up-flagged" 1 ":2: tmux -S/-L before" \
 '#!/usr/bin/env bash
-tmux ls
+tmux -S "$FLEET_TMUX_SOCKET" ls
 eval "$(scripts/scenario.sh up --slug lint)"
 scripts/scenario.sh down
+'
+
+# --- Case SH7: tmux itself does not read FLEET_TMUX_SOCKET — a bare `tmux`
+#     AFTER a marker still hits the default server and is flagged.
+run_case_shell "shell-bare-tmux-after-export-flagged" 1 ":3: bare tmux (no -S/-L)" \
+'#!/usr/bin/env bash
+export FLEET_TMUX_SOCKET=/tmp/fleet-test-lint-$$.sock
+tmux kill-server
+'
+run_case_shell "shell-bare-tmux-after-scenario-up-flagged" 1 ":3: bare tmux (no -S/-L)" \
+'#!/usr/bin/env bash
+eval "$(scripts/scenario.sh up --slug lint)"
+tmux ls
+scripts/scenario.sh down
+'
+run_case_shell "shell-tmux-L-after-export-isolates" 0 "0 violations" \
+'#!/usr/bin/env bash
+export FLEET_TMUX_SOCKET=/tmp/fleet-test-lint-$$.sock
+tmux -L "fleet-test-lint-$$" ls
+'
+
+# --- Case SH8: `tmux` inside a pure string literal is prose, not a call;
+#     inside "$(...)" it still executes and is still flagged.
+run_case_shell "shell-tmux-in-string-literal-not-trigger" 0 "0 violations" \
+'#!/usr/bin/env bash
+CASE="isolation: default tmux server never touched"
+echo '"'"'tmux ls would be wrong here'"'"'
+'
+run_case_shell "shell-tmux-in-command-substitution-flagged" 1 ":2: bare tmux (no -S/-L)" \
+'#!/usr/bin/env bash
+out="$(tmux ls 2>&1)"
 '
 
 echo ""

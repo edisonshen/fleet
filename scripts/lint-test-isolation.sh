@@ -1056,19 +1056,21 @@ fi
 
 # ---------------------------------------------------------------------------
 # Rule #4: shell-driven tests. scripts/tests/*.sh run tmux directly (or via
-# the built fleet binary) from bash, where none of the Go markers exist. A
-# script that invokes `tmux <cmd>` / `tmux -S|-L ...` must first isolate the
-# socket by one of:
-#   - `scripts/scenario.sh up` (its exports set FLEET_TMUX_SOCKET to
-#     /tmp/fleet-test-<slug>-XXXXXX.sock — the canonical isolated path),
-#   - an explicit `FLEET_TMUX_SOCKET=...` assignment,
-#   - the `lint-test-isolation:exempt` comment.
+# the built fleet binary) from bash, where none of the Go markers exist.
+# The fleet binary honours FLEET_TMUX_SOCKET; the tmux executable does NOT,
+# so every direct `tmux` invocation must name its server itself:
+#   - `tmux -S <path>` / `tmux -L <name>` — a bare `tmux <cmd>` is always a
+#     violation (it lands on the operator's default server),
+#   - and the socket it names must have been isolated ABOVE it by either
+#     `scripts/scenario.sh up` (exports FLEET_TMUX_SOCKET=/tmp/fleet-test-
+#     <slug>-XXXXXX.sock) or an explicit `FLEET_TMUX_SOCKET=...` assignment,
+#   - or the file carries the `lint-test-isolation:exempt` comment.
 # Whole-file scope (shell has no test-function boundary to speak of), but
 # ORDER matters: FLEET_TMUX_SOCKET only governs the commands after it, so a
-# `tmux` line is a violation unless an isolation marker appears textually
-# above it (the exempt comment attests anywhere). The `#`-comment tail of
-# each line is stripped before matching so a mention in prose neither
-# triggers nor attests.
+# later marker does not excuse an earlier `tmux -S`. The `#`-comment tail
+# and pure string literals (no `$`/backtick, so nothing executes inside)
+# are stripped from each line before matching so a mention in prose
+# neither triggers nor attests; `"$(tmux ...)"` is kept and still counts.
 shell_file_lister() {
   if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
     git ls-files 'scripts/tests/*.sh'
@@ -1077,8 +1079,9 @@ shell_file_lister() {
   fi
 }
 
-# scan_shell <file> → prints "<file>: <reason>" when the file invokes tmux
-# before (or without) an isolation marker; prints nothing otherwise.
+# scan_shell <file> → prints "<file>:<line>: <reason>" for the first bare
+# tmux and the first `tmux -S|-L` that precedes any isolation marker;
+# prints nothing otherwise.
 scan_shell() {
   awk -v file="$1" '
     {
@@ -1088,10 +1091,16 @@ scan_shell() {
       sub(/[ \t]#.*$/, "", line)
       if (line ~ /scenario\.sh"?[ \t]+up([ \t]|$)/) iso = 1
       if (line ~ /(^|[ \t;])(export[ \t]+)?FLEET_TMUX_SOCKET=/) iso = 1
-      if (!iso && first == "" && line ~ /(^|[ \t;&|(`])tmux[ \t]+(-[SL][ \t]|[a-z][a-z-]*([ \t]|$))/) first = NR
+      code = line
+      gsub(/"[^"$`]*"/, "\"\"", code)
+      gsub(/\047[^\047]*\047/, "\047\047", code)
+      if (bare == "" && code ~ /(^|[ \t;&|(`])tmux[ \t]+[a-z][a-z-]*([ \t]|$)/) bare = NR
+      if (!iso && early == "" && code ~ /(^|[ \t;&|(`])tmux[ \t]+-[SL][ \t]/) early = NR
     }
     END {
-      if (first != "" && !exempt) printf "%s:%d: invokes tmux before scenario.sh up / FLEET_TMUX_SOCKET=\n", file, first
+      if (exempt) exit
+      if (bare != "") printf "%s:%d: bare tmux (no -S/-L): tmux itself ignores FLEET_TMUX_SOCKET\n", file, bare
+      if (early != "") printf "%s:%d: tmux -S/-L before scenario.sh up / FLEET_TMUX_SOCKET=\n", file, early
     }
   ' "$1"
 }
@@ -1110,15 +1119,17 @@ done < <(shell_file_lister)
 if (( ${#shell_violations[@]} > 0 )); then
   echo "test-isolation-lint: FAIL (shell tmux isolation)" >&2
   echo "" >&2
-  echo "The following scripts/tests/*.sh invoke tmux before isolating the" >&2
-  echo "socket. Bash tests have no runtime sink guard: an unscoped \`tmux\`" >&2
-  echo "lands on the operator's default server." >&2
+  echo "The following scripts/tests/*.sh invoke tmux without an isolated" >&2
+  echo "server. Bash tests have no runtime sink guard, and tmux itself does" >&2
+  echo "not read FLEET_TMUX_SOCKET: a bare \`tmux\` lands on the operator's" >&2
+  echo "default server." >&2
   echo "" >&2
   printf '  %s\n' "${shell_violations[@]}" >&2
   echo "" >&2
-  echo "Fix (any one, placed ABOVE the first tmux line):" >&2
+  echo "Fix: pass the socket on every tmux call, and isolate it ABOVE the first one:" >&2
   echo "  - eval \"\$(scripts/scenario.sh up)\"   # isolated FLEET_HOME + socket" >&2
-  echo "  - export FLEET_TMUX_SOCKET=/tmp/fleet-test-<slug>-\$\$.sock" >&2
+  echo "    or: export FLEET_TMUX_SOCKET=/tmp/fleet-test-<slug>-\$\$.sock" >&2
+  echo "  - tmux -S \"\$FLEET_TMUX_SOCKET\" <cmd>" >&2
   echo "  - if the script must touch the default server, add the comment" >&2
   echo "    # lint-test-isolation:exempt" >&2
   exit 1
