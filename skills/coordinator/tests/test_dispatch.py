@@ -6,6 +6,7 @@ to assert the exact argv we'd send and to drive return-code paths.
 from __future__ import annotations
 
 import os
+import re
 import shlex
 import subprocess
 from unittest.mock import patch
@@ -134,6 +135,42 @@ def test_build_worker_prompt_oversized_raises() -> None:
             standards_md=huge_standards,
             learnings_text="",
         )
+
+
+@pytest.mark.parametrize("is_git", [True, False], ids=["git", "non-git"])
+def test_build_worker_prompt_fits_cap_with_repo_standards(is_git: bool) -> None:
+    """S11: the repo's own templates/standards.md + Fleet's project
+    standards block (the ```markdown block in docs/TESTING.md, as a
+    project override merges it) + a realistic ~2KB spec must render under
+    _PROMPT_HARD_CAP_BYTES, or every real dispatch on this project raises
+    PromptTooLargeError (task marked blocked)."""
+    here = os.path.dirname(os.path.abspath(__file__))
+    repo = here
+    while repo != "/" and not os.path.exists(os.path.join(repo, "go.mod")):
+        repo = os.path.dirname(repo)
+    with open(os.path.join(repo, "templates", "standards.md"), encoding="utf-8") as f:
+        standards = f.read()
+    with open(os.path.join(repo, "docs", "TESTING.md"), encoding="utf-8") as f:
+        testing_md = f.read()
+    m = re.search(r"```markdown\n(## Sandbox\n.*?)```", testing_md, re.S)
+    assert m, "docs/TESTING.md must open with Fleet's ```markdown ## Sandbox block"
+    fleet_block = m.group(1)
+    assert len(fleet_block.encode()) >= 800
+    standards = standards + "\n" + fleet_block
+    spec = ("WHEN the operator presses [a] on a project row THE TUI SHALL "
+            "dispatch a coord and flash `dispatched <id>` in the status bar. ") * 12
+    acceptance = ("- pane shows `fake claude: ready`\n"
+                  "- agents/<id>.json has project=demo\n") * 8
+    assert len((spec + acceptance).encode()) >= 2000
+    t = parse.Task(slug="fix-thing-aaaa", status="ready", priority="P1",
+                   spec=spec, acceptance=acceptance, notes="")
+    out = dispatch.build_worker_prompt(
+        t, project="fleet", standards_md=standards,
+        learnings_text="", branch="worker/fix-thing-aaaa",
+        workers_dir="~/.fleet/projects/fleet/workers/fix-thing-aaaa",
+        is_git=is_git,
+    )
+    assert len(out.encode()) <= dispatch._PROMPT_HARD_CAP_BYTES
 
 
 def test_build_worker_prompt_handles_empty_spec_and_acceptance() -> None:
@@ -769,12 +806,16 @@ def test_build_reviewer_prompt_non_git_uses_two_claude_slots_without_base() -> N
     out = dispatch.build_reviewer_prompt(
         t, project="scratch", is_git=False, has_codex=True,
     )
-    context = f"{t.spec}\n\nAcceptance:\n{t.acceptance}"
     assert "review_slot.py" in out
     assert "--engine codex" not in out
     assert out.count("--engine claude --model") == 2
     assert "--base" not in out
-    assert out.count(f"--task-context {shlex.quote(context)}") == 2
+    # Spec + acceptance ride along in --task-context on both slots (the
+    # contract lens is appended after them; S3 pins that part).
+    contexts = _task_contexts(out)
+    assert len(contexts) == 2
+    for ctx in contexts:
+        assert ctx.startswith(f"{t.spec}\n\nAcceptance:\n{t.acceptance}")
     assert "no-git" not in out
     assert "--review-alpha-status passed" in out
     assert "--review-beta-status passed" in out
@@ -1187,3 +1228,336 @@ def test_release_coord_prompt_inbox_e2e_via_real_fleet_bin(tmp_path) -> None:
         # cleaned up by the first release; either is valid idempotent.
         dispatch.RELEASE_OUTCOME_ABSENT,
     )
+
+
+# ---------- Scenario contract (scenario-first testing, PR-2) ----------
+#
+# S1/S3/S4 pin the prompt text each subagent sees — the prompt IS the
+# boundary between the coord and the worker. S5 executes the finisher's
+# embedded gate snippet with PATH shims. S6 runs the built binary.
+
+
+def _task_contexts(prompt: str) -> list[str]:
+    """The decoded `--task-context` argument of every review_slot line."""
+    out = []
+    marker = "--task-context "
+    pos = prompt.find(marker)
+    while pos != -1:
+        lexer = shlex.shlex(prompt[pos + len(marker):], posix=True)
+        lexer.whitespace_split = True
+        out.append(lexer.get_token())
+        pos = prompt.find(marker, pos + len(marker))
+    return out
+
+
+# Non-Fleet project standards. Fleet dispatches workers into arbitrary
+# projects, so the prompt text is pinned against a project that is NOT
+# Fleet: a remote preview sandbox gated by `npm test` (S1/S3) and a
+# project with no runnable instance at all (S9). Anything Fleet-specific
+# that shows up in the rendered prompt is a leak from dispatch.py.
+_STANDARDS_REMOTE = (
+    "# Standards\n\n## Sandbox\ntier: remote\nup: bin/preview up\n"
+    "down: bin/preview down\nisolation: namespace\nobserve: bin/preview logs\n"
+    "credentials: PREVIEW_TOKEN\nnotes:\n\n## Gates\n- npm test\n"
+    "baseline: git worktree add /tmp/base origin/main && cd /tmp/base && npm test\n"
+)
+_STANDARDS_NONE = (
+    "# Standards\n\n## Sandbox\ntier: none\nup:\ndown:\nisolation: namespace\n"
+    "observe:\ncredentials:\nnotes:\n\n## Gates\n\nbaseline:\n"
+)
+_S1_REQUIRED = (
+    "--phase spec-repro", "--phase spec-encode", "--phase verify",
+    "Read `## Sandbox` and `## Gates` in the standards above",
+    "Export\n    FLEET_WORKER_SLUG=", 'eval "$(<up>)"', "<observe>", "<down>",
+    "obtain the artifact the row names",
+    "verification.md", "Evidence — before", "A row above the tier (e2e with tier=none)",
+    "Do not stand in a mock for a boundary `## Sandbox` can run",
+    "project's own test framework", "it MUST fail for the reason",
+    "Run EVERY\n    line of `## Gates`, in order", "`baseline:` command on untouched main",
+    "## Baseline", "do NOT flip\n    review-pending", "standards: no ## Gates",
+    "--phase verify \\\n        --scenarios-total M --scenarios-verified N --gates-status passed",
+)
+# Fleet-the-project nouns that must never reach a worker in another
+# project (acceptance 3 of the task plan + the rev 1 TDD ladder).
+_FLEET_NOUNS = (
+    "go build", "$FLEET_DEV_BIN", "FLEET_HOME", "FLEET_TMUX_SOCKET", "go test",
+    "pytest", "docs/TESTING.md", "coorde2e", ".github/workflows/ci.yml",
+    "lint-test-isolation", "-tags=integration", "tdd-", "Write the failing test",
+    "verify locally",
+)
+
+
+def _outside_standards(out: str) -> str:
+    """The worker prompt minus the inlined standards block — the standards
+    are the project's own words and may say anything."""
+    head, _, rest = out.partition("## Standards (the bar — non-negotiable)")
+    _, _, tail = rest.partition("\n## Required workflow")
+    return head + "\n## Required workflow" + tail
+
+
+def _assert_s1_prompt(out: str, *, is_git: bool) -> None:
+    for needle in _S1_REQUIRED:
+        assert needle in out, f"S1: worker prompt missing {needle!r}"
+    generic = _outside_standards(out)
+    for needle in _FLEET_NOUNS:
+        assert needle not in generic, f"S1: worker prompt leaks Fleet noun {needle!r}"
+    # The scenario phases run in order, after branch and before the
+    # handoff, and the flags update lands before review-pending.
+    order = ["--phase branch", "--phase spec-repro", "--phase spec-encode",
+             "--phase verify", "--gates-status passed", "--phase review-pending"]
+    idx = [out.index(s) for s in order]
+    assert idx == sorted(idx), f"S1: phase order wrong: {order} at {idx}"
+    if is_git:
+        assert "git commit" in out
+    else:
+        assert "git commit" not in out
+
+
+@pytest.mark.parametrize("is_git", [True, False], ids=["git", "non-git"])
+def test_s1_worker_prompt_is_scenario_first_and_project_agnostic(is_git: bool) -> None:
+    """S1: rendered for a NON-Fleet project (tier remote, `npm test`), the
+    worker prompt carries 2a REPRODUCE / 2b ENCODE / 2c IMPLEMENT + VERIFY
+    driven only by `## Sandbox` / `## Gates`, the verification.md path +
+    sections and the three flags — and no Fleet noun, no TDD ladder."""
+    t = _make_task()
+    out = dispatch.build_worker_prompt(
+        t, project="shop", standards_md=_STANDARDS_REMOTE, learnings_text="",
+        is_git=is_git,
+    )
+    _assert_s1_prompt(out, is_git=is_git)
+    for header in ("## Scenario contract", "## Evidence — before",
+                   "## Evidence — after", "## Gates", "## Baseline",
+                   "## Unit tests"):
+        assert header in out, f"S1: verification.md section {header!r} missing"
+    assert "~/.fleet/projects/shop/workers/fix-thing-aaaa/verification.md" in out
+    assert "FLEET_WORKER_SLUG=fix-thing-aaaa" in out
+    # The project's own sandbox/gates reach the worker through the
+    # standards block, not through dispatch.py.
+    assert "up: bin/preview up" in out and "- npm test" in out
+    assert "npm test" not in _outside_standards(out)
+
+
+@pytest.mark.parametrize("is_git", [True, False], ids=["git", "non-git"])
+def test_s9_tier_none_renders_same_prompt_text(is_git: bool) -> None:
+    """S9: a project with no runnable instance (tier none, empty gates)
+    gets byte-for-byte the same instructions as the remote project — the
+    only difference is the inlined standards. Nothing in dispatch.py
+    branches on the tier."""
+    t = _make_task()
+    remote = dispatch.build_worker_prompt(
+        t, project="shop", standards_md=_STANDARDS_REMOTE, learnings_text="",
+        is_git=is_git,
+    )
+    none = dispatch.build_worker_prompt(
+        t, project="shop", standards_md=_STANDARDS_NONE, learnings_text="",
+        is_git=is_git,
+    )
+    assert remote != none
+    assert _outside_standards(remote) == _outside_standards(none)
+    _assert_s1_prompt(none, is_git=is_git)
+    assert "tier: none" in none
+
+
+@pytest.mark.parametrize("is_git", [True, False], ids=["git", "non-git"])
+def test_s3_reviewer_prompt_carries_contract_lens(is_git: bool) -> None:
+    """S3: the reviewer prompt carries the Scenario-contract lens (row at
+    its level, observable outcome, evidence-before, tier/max-level and
+    mock-for-a-runnable-boundary are P1) and the re-verify-after-fix rule
+    over EVERY `## Gates` line — no Fleet gate list; non-git threads the
+    lens via --task-context."""
+    t = _make_task()
+    out = dispatch.build_reviewer_prompt(t, project="shop", is_git=is_git)
+    for needle in ("Scenario contract", "observable outcome", "re-run",
+                   "## Review re-verification", "Evidence — before", "[P1]",
+                   "verification.md", "e2e/integ/replay/unit", "max level",
+                   "tier: local/remote → e2e, none → replay",
+                   "mock standing in for a boundary `## Sandbox` can run",
+                   "EVERY line of `## Gates` from\n   `fleet standards show --merged --project shop`"):
+        assert needle in out, f"S3: reviewer prompt missing {needle!r}"
+    for needle in _FLEET_NOUNS:
+        assert needle not in out, f"S3: reviewer prompt leaks Fleet noun {needle!r}"
+    # Re-verification is appended BEFORE the terminal review-done write.
+    assert out.index("## Review re-verification") < out.index("--phase review-done")
+    contexts = _task_contexts(out)
+    if is_git:
+        assert contexts == []
+    else:
+        assert len(contexts) == 2
+        for ctx in contexts:
+            assert ctx.startswith(f"{t.spec}\n\nAcceptance:\n{t.acceptance}")
+            assert "Scenario contract lens" in ctx
+            assert "observable outcome" in ctx
+            assert "`## Sandbox` max level" in ctx
+            assert "mock for a boundary `## Sandbox` can run" in ctx
+
+
+@pytest.mark.parametrize("is_git", [True, False], ids=["git", "non-git"])
+def test_s4_finisher_prompt_ships_verification_not_placeholder(is_git: bool) -> None:
+    """S4: the finisher reads verification.md into `## Verification`
+    (PR body / done note) and never emits the old checklist placeholder."""
+    t = _make_task()
+    out = dispatch.build_finisher_prompt(t, project="fleet", is_git=is_git)
+    for needle in ("verification.md", "## Verification",
+                   "finisher: no verification evidence (~/.fleet/projects/fleet/"
+                   "workers/fix-thing-aaaa/verification.md)",
+                   "section_nonempty '## Gates'",
+                   "section_nonempty '## Evidence — after'"):
+        assert needle in out, f"S4: finisher prompt missing {needle!r}"
+    for needle in ("- [ ] CI green", "- [ ] verify locally", "## Test plan"):
+        assert needle not in out, f"S4: finisher prompt still carries {needle!r}"
+    if is_git:
+        assert '## Verification\n$(cat "$V")' in out
+    else:
+        assert "fleet tasks note" in out
+        assert "## Verification" in out.split("fleet tasks note", 1)[1]
+
+
+_S5_GATE_RE = re.compile(r"```sh\n(.*?)```", re.S)
+
+
+def _s5_run_finisher_gate(tmp_path, verification: str | None) -> tuple[int, list[str]]:
+    """Stand up a sandbox FLEET_HOME with a worker at review-done, drop
+    `verification` at its verification.md (None = no file), then run the
+    finisher prompt's step-3 gate snippet followed by the step-4 PR
+    command with `fleet`/`gh`/`git` shimmed onto PATH. Returns the
+    script's exit code and the shims' call log."""
+    fleet_home = tmp_path / "home"
+    workers_dir = fleet_home / "projects" / "fleet" / "workers" / "fix-thing-aaaa"
+    workers_dir.mkdir(parents=True)
+    (workers_dir / "state.json").write_text('{"phase":"review-done"}\n')
+    if verification is not None:
+        (workers_dir / "verification.md").write_text(verification)
+    shims = tmp_path / "bin"
+    shims.mkdir()
+    log = tmp_path / "calls.log"
+    for tool in ("fleet", "gh", "git"):
+        shim = shims / tool
+        shim.write_text(f'#!/bin/sh\necho "{tool} $*" >> "{log}"\n')
+        shim.chmod(0o755)
+    t = _make_task()
+    prompt = dispatch.build_finisher_prompt(
+        t, project="fleet", is_git=True, workers_dir=str(workers_dir),
+    )
+    m = _S5_GATE_RE.search(prompt)
+    assert m, "S5: finisher prompt embeds no ```sh gate snippet"
+    script = m.group(1) + "\ngh pr create --base main --head worker/fix-thing-aaaa\n"
+    env = dict(os.environ, PATH=f"{shims}:{os.environ['PATH']}", FLEET_HOME=str(fleet_home))
+    proc = subprocess.run(
+        ["bash", "-c", script], env=env, capture_output=True, text=True, check=False,
+    )
+    calls = log.read_text().splitlines() if log.exists() else []
+    return proc.returncode, calls
+
+
+_S5_VERIFICATION_EMPTY_GATES = (
+    "## Scenario contract\n| S1 | x |\n\n"
+    "## Evidence — before\nsaw the bug\n\n"
+    "## Evidence — after\nPASS\n\n"
+    "## Gates\n\n"
+    "## Baseline\n\n## Unit tests\ntest_x\n"
+)
+_S5_VERIFICATION_FULL = _S5_VERIFICATION_EMPTY_GATES.replace(
+    "## Gates\n\n", "## Gates\ngo build ./... ok\n\n",
+)
+
+
+@pytest.mark.parametrize(
+    "verification",
+    [_S5_VERIFICATION_EMPTY_GATES, None,
+     _S5_VERIFICATION_FULL.replace("## Evidence — after\nPASS\n", "## Evidence — after\n")],
+    ids=["empty-gates", "missing-file", "empty-evidence-after"],
+)
+def test_s5_finisher_gate_blocks_without_evidence(tmp_path, verification) -> None:
+    """S5: running the finisher's own gate against a worker whose
+    verification.md is missing or has an empty `## Gates` /
+    `## Evidence — after` writes phase=blocked with the canonical reason
+    and never reaches `gh pr create`."""
+    rc, calls = _s5_run_finisher_gate(tmp_path, verification)
+    assert rc == 0, f"S5: gate must exit 0 after blocking, got {rc}: {calls}"
+    path = tmp_path / "home/projects/fleet/workers/fix-thing-aaaa/verification.md"
+    assert calls == [
+        "fleet workers update fix-thing-aaaa --project fleet --phase blocked "
+        f"--reason finisher: no verification evidence ({path})",
+    ], f"S5: unexpected shim calls: {calls}"
+
+
+def test_s5_finisher_gate_passes_with_evidence(tmp_path) -> None:
+    """S5 (control): a filled `## Gates` + `## Evidence — after` lets the
+    same snippet fall through to the PR step."""
+    rc, calls = _s5_run_finisher_gate(tmp_path, _S5_VERIFICATION_FULL)
+    assert rc == 0
+    assert calls == ["gh pr create --base main --head worker/fix-thing-aaaa"], calls
+
+
+def test_s6_built_binary_merged_standards_are_scenario_first(tmp_path) -> None:
+    """S6: `fleet standards show --merged` from a freshly built binary in a
+    sandbox HOME prints the scenario-first `## Testing` section and no TDD
+    text. Built binary, not the template file: the embedded copy is what
+    every worker's prompt gets."""
+    fleet_bin = _build_fleet_bin(tmp_path)
+    if not fleet_bin:
+        pytest.skip("could not build fleet binary; skipping S6 e2e")
+    home = tmp_path / "home"
+    home.mkdir()
+    (home / ".fleet" / "projects" / "demo").mkdir(parents=True)
+    env = dict(os.environ, HOME=str(home))
+    env.pop("FLEET_HOME", None)
+    init = subprocess.run(
+        [fleet_bin, "init", "--parallelism", "2"],
+        env=env, capture_output=True, text=True, check=False,
+    )
+    assert init.returncode == 0, init.stderr
+    show = subprocess.run(
+        [fleet_bin, "standards", "show", "--project", "demo", "--merged"],
+        env=env, capture_output=True, text=True, check=False,
+    )
+    assert show.returncode == 0, show.stderr
+    assert "## Testing" in show.stdout
+    assert "Scenario-first, not test-first." in show.stdout
+    assert "Test at the boundary where the user/operator would see it" in show.stdout
+    assert "TDD required" not in show.stdout
+    assert "tdd" not in show.stdout.lower()
+    for noun in _FLEET_NOUNS:
+        assert noun not in show.stdout, f"S6: global standards carry Fleet noun {noun!r}"
+
+
+def test_s10_built_binary_project_sandbox_wins_over_global(tmp_path) -> None:
+    """S10 (pytest half; the Go half is cmd/fleet/init_test.go +
+    standards_test.go): `fleet init` seeds a global `## Sandbox` with
+    `tier: none` and an empty `## Gates`; a project override with
+    `tier: remote` + `npm test` wins in `standards show --merged`."""
+    fleet_bin = _build_fleet_bin(tmp_path)
+    if not fleet_bin:
+        pytest.skip("could not build fleet binary; skipping S10 e2e")
+    home = tmp_path / "home"
+    home.mkdir()
+    (home / ".fleet" / "projects" / "shop").mkdir(parents=True)
+    env = dict(os.environ, HOME=str(home))
+    env.pop("FLEET_HOME", None)
+    init = subprocess.run(
+        [fleet_bin, "init", "--parallelism", "2"],
+        env=env, capture_output=True, text=True, check=False,
+    )
+    assert init.returncode == 0, init.stderr
+    glob = subprocess.run(
+        [fleet_bin, "standards", "show", "--global"],
+        env=env, capture_output=True, text=True, check=False,
+    )
+    assert glob.returncode == 0, glob.stderr
+    assert "## Sandbox" in glob.stdout and "## Gates" in glob.stdout
+    assert re.search(r"^tier: none", glob.stdout, re.M), glob.stdout
+    gates = glob.stdout.split("## Gates", 1)[1].split("\n## ", 1)[0]
+    assert not re.search(r"^- ", gates, re.M), f"S10: seeded ## Gates not empty: {gates}"
+    assert "fleet standards edit --project <p>" in glob.stdout
+
+    (home / ".fleet" / "projects" / "shop" / "standards.md").write_text(_STANDARDS_REMOTE)
+    merged = subprocess.run(
+        [fleet_bin, "standards", "show", "--project", "shop", "--merged"],
+        env=env, capture_output=True, text=True, check=False,
+    )
+    assert merged.returncode == 0, merged.stderr
+    assert re.search(r"^tier: remote", merged.stdout, re.M), merged.stdout
+    assert not re.search(r"^tier: none", merged.stdout, re.M), merged.stdout
+    assert "- npm test" in merged.stdout
+    assert merged.stdout.count("\n## Sandbox\n") == 1
+    assert merged.stdout.count("\n## Gates\n") == 1

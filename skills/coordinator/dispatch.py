@@ -44,11 +44,12 @@ import parse
 import reviewcfg
 
 
-# Hard cap on rendered prompt size (ENG §6.5: ≤4KB rendered). Soft cap
-# at 8KB so we have headroom for unusually long Spec bodies — exceeding
-# this is a sign the operator over-specified the task and the loop will
-# refuse to dispatch.
-_PROMPT_HARD_CAP_BYTES = 16 * 1024
+# Hard cap on rendered prompt size. The worker prompt is ~6KB of
+# workflow text + the merged standards (~10KB for this repo) + the
+# task's spec/acceptance; exceeding the cap is a sign the operator
+# over-specified the task and the loop will refuse to dispatch.
+# test_dispatch pins the repo's own standards.md + a 2KB spec under it.
+_PROMPT_HARD_CAP_BYTES = 24 * 1024
 # Per-learning truncation cap (ENG §6.5: 500 chars × 5).
 _LEARNING_BODY_CAP = 500
 _MAX_LEARNINGS_INLINED = 5
@@ -283,10 +284,20 @@ def build_worker_prompt(
         )
     else:
         step1 = f"1. git checkout -b {branch}"
+    # Steps 2a-2c are the scenario-first arc (reproduce -> encode ->
+    # verify). Every observation lands in the worker-owned
+    # verification.md; the finisher copies its sections verbatim into
+    # the PR body (or the non-git done note), so the wording of the
+    # section headers here is load-bearing for build_finisher_prompt's
+    # gate. The text is project-agnostic: how to run, observe and gate
+    # the project comes only from the merged standards' `## Sandbox` /
+    # `## Gates` inlined above — Fleet dispatches into arbitrary
+    # projects, so nothing here may name Fleet's own build or harness.
+    # Git and non-git render the same arc; only the commit suffix
+    # differs.
+    verification_md = f"{workers_dir}/verification.md"
+    commit = " git commit." if is_git else ""
     if is_git:
-        spec_repro_line = "2a. Reproduce the scenario against the built product; capture the current outcome."
-        spec_encode_line = "2b. Encode that outcome as a test at the right boundary. git commit."
-        verify_line = "2c. Implement, re-run the scenario and the test, run the gates. git commit."
         step3_line = (
             "3. Commits are landed locally on the worker branch. Exit cleanly\n"
             "   (Ctrl-D / /exit). The coord polls state.json on the next tick,\n"
@@ -294,18 +305,51 @@ def build_worker_prompt(
         )
     else:
         # Non-git: same phase machine, no commits. Workers leave a clean
-        # local diff in the project directory and exit; reviewer reads
-        # the diff from `git status`-equivalent (or just file mtime if
-        # truly non-git). The phase=review-pending transition is the
-        # same handoff signal.
-        spec_repro_line = "2a. Reproduce the scenario against the built product; capture the current outcome."
-        spec_encode_line = "2b. Encode that outcome as a test at the right boundary (file in place, no commit)."
-        verify_line = "2c. Implement, re-run the scenario and the test, run the gates (file in place, no commit)."
+        # local diff in the project directory and exit; the
+        # phase=review-pending transition is the same handoff signal.
         step3_line = (
             "3. Files are landed in place. Exit cleanly (Ctrl-D / /exit). The\n"
             "   coord polls state.json on the next tick, sees phase=review-pending,\n"
             "   and dispatches the reviewer subagent."
         )
+    spec_repro_line = (
+        "2a. REPRODUCE. Read `## Sandbox` and `## Gates` in the standards above. Export\n"
+        f"    FLEET_WORKER_SLUG={task.slug}. For every e2e row of the task plan's Scenario contract:\n"
+        "    `eval \"$(<up>)\"`, run the row's Trigger, capture with `<observe>`, then `<down>`.\n"
+        "    For every replay row: obtain the artifact the row names. Write what you saw\n"
+        f"    VERBATIM (commands + output) into {verification_md}\n"
+        "    under \"## Evidence — before\". A row above the tier (e2e with tier=none), a missing\n"
+        "    artifact, or an outcome that is not the wrong one → `fleet workers update\n"
+        f"    {task.slug} {proj_flag} --phase blocked --reason \"<S<n>>: <exactly what you saw / what is missing>\"`\n"
+        "    and exit. Do not guess. Do not stand in a mock for a boundary `## Sandbox` can run."
+    )
+    spec_encode_line = (
+        "2b. ENCODE. One test per row (grouped as the plan says) at the row's Level, in this\n"
+        "    project's own test framework, where `## Gates` will run it, asserting the SAME\n"
+        "    observable you captured (response/file/screen text, exit code, record — never an\n"
+        f"    internal call). Run it: it MUST fail for the reason in \"Evidence — before\".{commit}"
+    )
+    verify_line = (
+        "2c. IMPLEMENT + VERIFY. Fix. Re-run every row by hand (2a commands) AND via its test;\n"
+        "    record \"## Evidence — after\" (same commands, verbatim, PASS/FAIL per row). Run EVERY\n"
+        "    line of `## Gates`, in order; record command + result line under \"## Gates\". Red you\n"
+        "    believe is pre-existing: re-run it with the `baseline:` command on untouched main,\n"
+        "    record both under \"## Baseline\". Red that is yours: fix it; do NOT flip\n"
+        "    review-pending. `## Gates` empty in standards → run what the project's CI config\n"
+        "    runs, record the commands you used, and add \"standards: no ## Gates\" to \"## Baseline\".\n"
+        f"   {commit} Then:\n"
+        f"      fleet workers update {task.slug} {proj_flag} --phase verify \\\n"
+        "        --scenarios-total M --scenarios-verified N --gates-status passed\n"
+        "    (M = contract rows, N = rows PASS under \"Evidence — after\"; M=0 only for `none`.)"
+    )
+    verification_file_lines = [
+        f"Verification file: {verification_md}",
+        "  Sections, in this order (the finisher copies them verbatim into the PR body /",
+        "  done note and BLOCKS if \"## Gates\" or \"## Evidence — after\" is empty):",
+        "  ## Scenario contract · ## Evidence — before · ## Evidence — after · ## Gates ·",
+        "  ## Baseline · ## Unit tests",
+        "",
+    ]
     workflow_header = (
         "## Required workflow (three-stage flow — reviewer-subagent-arch)"
         if is_git
@@ -313,14 +357,18 @@ def build_worker_prompt(
     )
     workflow_intro = (
         [
-            "You write CODE + TESTS, commit them locally, and EXIT at",
+            "You REPRODUCE each scenario on the running product (per the",
+            "standards' `## Sandbox`), ENCODE it as a test, IMPLEMENT + VERIFY",
+            "(every `## Gates` line), commit locally, and EXIT at",
             "phase=review-pending. A separate reviewer subagent (dispatched",
             "by the coord on the next tick) runs /review + codex against your",
             "branch. A separate finisher subagent pushes + opens the PR.",
         ]
         if is_git
         else [
-            "You write CODE + TESTS directly in the project directory (no",
+            "You REPRODUCE each scenario on the running product (per the",
+            "standards' `## Sandbox`), ENCODE it as a test, IMPLEMENT + VERIFY",
+            "(every `## Gates` line) directly in the project directory (no",
             "branches, no commits — this is a non-git project) and EXIT at",
             "phase=review-pending. A reviewer subagent runs /review on your",
             "local diff. A finisher subagent marks the task done with a",
@@ -350,6 +398,7 @@ def build_worker_prompt(
     lines.append("")
     lines.extend(workflow_prohibit)
     lines.append("")
+    lines.extend(verification_file_lines)
     lines.extend([
         f"  fleet workers update {task.slug} {proj_flag} --phase branch",
         step1,
@@ -617,9 +666,41 @@ def build_reviewer_prompt(
             "   top.",
         ]
     base_arg = f" --base origin/{base_branch}" if is_git else ""
+    # Scenario-contract lens (templates/standards.md ## Testing). The
+    # worker's task plan carries a `## Scenario contract` table; the
+    # review checks the diff against it, not against a generic "has
+    # tests" bar. Git mode: the lens is step 2 of the loop. Non-git: the
+    # review slots only see the working tree, so the lens rides along in
+    # --task-context next to the spec.
+    verification_md = f"{workers_dir}/verification.md"
+    contract_lens_lines = [
+        "   Scenario contract lens (read the task plan's `## Scenario contract`",
+        f"   table, `## Sandbox` / `## Gates` from `fleet standards show --merged --project {project}`,",
+        f"   and {verification_md}):",
+        "   - every S<n> row has a test at its stated level (e2e/integ/replay/unit);",
+        "   - each test asserts the row's observable outcome (response body, file",
+        "     content, screen text, exit code, record, PR state) — not that an",
+        "     internal function was called;",
+        "   - `## Evidence — before` shows the test would have FAILED before the fix.",
+        "   A missing scenario, a row below the project's max level (`## Sandbox`",
+        "   tier: local/remote → e2e, none → replay) without the plan's one-word",
+        "   reason, a mock standing in for a boundary `## Sandbox` can run, or an",
+        "   assertion on an internal call is a [P1] finding.",
+    ]
+    contract_lens_context = (
+        "Scenario contract lens: every S<n> row in the task plan's `## Scenario "
+        "contract` has a test at its stated level (e2e/integ/replay/unit), asserting "
+        "the row's observable outcome (never that an internal function was called), "
+        f"and `## Evidence — before` in {verification_md} shows it would have failed "
+        "before the fix. Missing scenario, a row below the `## Sandbox` max level "
+        f"(`fleet standards show --merged --project {project}`) without the plan's "
+        "reason, or a mock for a boundary `## Sandbox` can run = [P1]."
+    )
     task_context_arg = ""
     if not is_git:
-        task_context = f"{task.spec}\n\nAcceptance:\n{task.acceptance}"
+        task_context = (
+            f"{task.spec}\n\nAcceptance:\n{task.acceptance}\n\n{contract_lens_context}"
+        )
         task_context_arg = f" --task-context {shlex.quote(task_context)}"
     alpha_cmd = (
         f"python3 ~/.claude/skills/coordinator/review_slot.py "
@@ -671,10 +752,10 @@ def build_reviewer_prompt(
     )
     if is_git:
         fix_instruction = (
-            "fix all [P0]/[P1] findings, add regression tests, "
-            "`git commit -m \"fix: review iter-N — <one line>\"`, then RE-RUN BOTH "
-            "SLOTS from scratch — a fix changes the reviewed code, so any earlier "
-            "slot pass is stale and must be re-obtained on the new code"
+            "fix all [P0]/[P1] findings, add the scenario test the finding "
+            "implies, `git commit -m \"fix: review iter-N — <one line>\"`, then "
+            "RE-RUN BOTH SLOTS from scratch — a fix changes the reviewed code, so "
+            "any earlier slot pass is stale and must be re-obtained on the new code"
         )
         initial_step = step1_lines
         review_target = "the worker's diff against origin/main"
@@ -696,6 +777,7 @@ def build_reviewer_prompt(
         "   Run BOTH slots each round through review_slot.py. Do not invoke",
         "   `/review` as a bare Skill call and do not run engine-specific",
         "   review commands directly; the helper owns engine details.",
+        *contract_lens_lines,
         f"   - alpha ({alpha.engine}/{alpha.model}): `{alpha_cmd}`",
         f"   - beta ({beta.engine}/{beta.model}): `{beta_cmd}`",
         "   - exit 0 => record that slot passed.",
@@ -709,6 +791,13 @@ def build_reviewer_prompt(
         "       --phase review-claude --review-alpha-status iterating`",
         loop_termination_line,
         terminal_invariant_line,
+        "",
+        "   After ANY fix you land: re-run the scenarios the fix touched (by hand",
+        "   per `## Sandbox` and via their tests) AND EVERY line of `## Gates` from",
+        f"   `fleet standards show --merged --project {project}`, in order, then append a",
+        f"   `## Review re-verification` section to {verification_md}",
+        "   (each re-run command + its result line) BEFORE the terminal write in",
+        "   step 3. No fix landed → no section needed.",
         "",
         "3. Final terminal write (the load-bearing call):",
         "",
@@ -769,11 +858,15 @@ def build_finisher_prompt(
       1. `fleet workers update <slug> --phase push` (review gate).
       2. `git push origin <branch>` (or --force-with-lease if a fix
          landed on a remote-existing branch from a prior attempt).
-      3. `gh pr create --base main --head <branch> --title ... --body
+      3. Read state.json (reviewer counts) + verification.md; an
+         absent file or empty `## Gates` / `## Evidence — after` flips
+         phase=blocked ("finisher: no verification evidence (<path>)").
+      4. `gh pr create --base main --head <branch> --title ... --body
          ...` with the standard PR body shape (scope summary +
-         reviewer iteration counts + test plan).
-      4. `fleet workers update <slug> --phase done --pr-url <url>`.
-      5. Exit.
+         reviewer iteration counts + `## Verification` = verification.md
+         verbatim).
+      5. `fleet workers update <slug> --phase done --pr-url <url>`.
+      6. Exit.
 
     The finisher does NOT run /review or codex (the reviewer already
     did). The finisher does NOT amend commits or rebase. Any failure
@@ -800,6 +893,31 @@ def build_finisher_prompt(
     # CAS'd under the same generation as the worker + reviewer.
     if int(dispatch_generation) > 0:
         proj_flag = f"{proj_flag} --dispatch-generation {int(dispatch_generation)}"
+
+    # Verification evidence gate. The worker wrote verification.md
+    # (## Scenario contract / ## Evidence — before / ## Evidence — after /
+    # ## Gates / ## Baseline / ## Unit tests); the finisher copies it
+    # verbatim into the PR body (git) or the done note (non-git). A
+    # missing file, or an empty `## Gates` / `## Evidence — after`
+    # section, means the arc was not verified — block instead of
+    # shipping. The check is a deterministic shell snippet (not prose)
+    # so it runs the same way every time and can be exercised directly.
+    verification_md = f"{workers_dir}/verification.md"
+    blocked_reason = f"finisher: no verification evidence ({verification_md})"
+    verification_gate = [
+        "   ```sh",
+        f"   V={verification_md}",
+        "   section_nonempty() {  # $1 = header; true iff body has a non-blank line",
+        "     awk -v h=\"$1\" '$0==h{f=1;next} /^## /{f=0} f&&NF{n++} END{exit n?0:1}' \"$V\"",
+        "   }",
+        "   if ! [ -f \"$V\" ] || ! section_nonempty '## Gates' \\",
+        "      || ! section_nonempty '## Evidence — after'; then",
+        f"     fleet workers update {task.slug} {proj_flag} --phase blocked \\",
+        f"       --reason \"{blocked_reason}\"",
+        "     exit 0",
+        "   fi",
+        "   ```",
+    ]
 
     # Push step. When the worker ran in a pre-created worktree, the cd is
     # folded into step 2 (push + PR must run from the worktree, which
@@ -859,9 +977,14 @@ def build_finisher_prompt(
             *push_step,
             "3. Read state.json to extract reviewer counts for the PR body:",
             f"   - `cat {workers_dir}/state.json | jq -r '.review_alpha_status, .review_alpha_engine, .review_alpha_model, .review_alpha_rounds, .review_alpha_skip_reason, .review_beta_status, .review_beta_engine, .review_beta_model, .review_beta_rounds'`",
+            f"   Then read the worker's verification evidence at {verification_md}",
+            "   and run this gate EXACTLY as written — no PR without evidence:",
+            *verification_gate,
+            "   (A missing file or an empty `## Gates` / `## Evidence — after` means the",
+            "   scenario arc was never verified. Block; do NOT `gh pr create`.)",
             "",
             f"4. `gh pr create --base main --head {branch} --title '<commit-1 message>' \\",
-            "     --body \"$(cat <<'EOF'",
+            "     --body \"$(cat <<EOF",
             "## Summary",
             "<1-3 bullets from the worker's commits>",
             "",
@@ -869,11 +992,14 @@ def build_finisher_prompt(
             "- alpha (<engine>/<model>): passed|skipped:<reason>|single-claude-degraded (rounds: <N>)",
             "- beta (claude/<model>): passed (rounds: <M>)",
             "",
-            "## Test plan",
-            "- [ ] CI green",
-            "- [ ] verify locally",
+            "## Verification",
+            "$(cat \"$V\")",
             "EOF",
             "     )\"`",
+            "   `## Verification` is the verification.md sections VERBATIM (Scenario",
+            "   contract, Evidence — before/after, Gates, Baseline, Unit tests, plus the",
+            "   reviewer's `## Review re-verification` if present). Do not summarize,",
+            "   do not add checklists.",
             "",
             f"5. Capture the PR URL. Then:",
             f"   `fleet workers update {task.slug} {proj_flag} --phase done --pr-url <url> --exit 0`",
@@ -883,7 +1009,7 @@ def build_finisher_prompt(
             "## On failure",
             "",
             "If `git push` or `gh pr create` errors, do NOT retry blindly. Flip",
-            f"to blocked with the error inlined:",
+            "to blocked with the error inlined:",
             f"   `fleet workers update {task.slug} {proj_flag} --phase blocked \\",
             "     --reason \"finisher: <one-line error>\"`",
             "Then exit. The coord raises BLOCKED to the operator.",
@@ -935,6 +1061,11 @@ def build_finisher_prompt(
             "2. Read state.json to confirm the reviewer's terminal status:",
             f"   - `cat {workers_dir}/state.json | jq -r '.review_alpha_status, .review_alpha_engine, .review_alpha_model, .review_alpha_rounds, .review_beta_status, .review_beta_engine, .review_beta_model, .review_beta_rounds'`",
             "   - Expected: review_alpha_status=passed and review_beta_status=passed.",
+            f"   Then read the worker's verification evidence at {verification_md}",
+            "   and run this gate EXACTLY as written — no done without evidence:",
+            *verification_gate,
+            "   (A missing file or an empty `## Gates` / `## Evidence — after` means the",
+            "   scenario arc was never verified. Block; do NOT write phase=done.)",
             "",
             "3. Write the terminal phase update (no --pr-url; non-git workers ship",
             "   without a PR URL):",
@@ -951,9 +1082,13 @@ def build_finisher_prompt(
             "   update with ErrPhaseRequiresPR, the meta.json is mis-declared as",
             "   git — flip to blocked with that error inlined and exit.",
             "",
-            f"4. Append a one-line note to tasks.md so the operator sees the diff",
-            "   summary in `fleet tasks show`:",
-            f"   `fleet tasks note {task.slug} --project {project} \"finisher: <diff summary>\"`",
+            "4. Append the done note to tasks.md so the operator sees the diff",
+            "   summary AND the verification evidence in `fleet tasks show`:",
+            f"   `fleet tasks note {task.slug} --project {project} \"$(printf '%s\\n\\n## Verification\\n' 'finisher: <diff summary>'; cat \"$V\")\"`",
+            "   The `## Verification` block is verification.md VERBATIM (Scenario",
+            "   contract, Evidence — before/after, Gates, Baseline, Unit tests, plus the",
+            "   reviewer's `## Review re-verification` if present) — the non-git",
+            "   equivalent of the PR body. Do not summarize it.",
             "",
             "5. Exit cleanly.",
             "",
