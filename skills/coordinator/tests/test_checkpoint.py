@@ -100,7 +100,7 @@ def test_write_emits_sections_in_order(project_dir: Path):
     active = [
         {
             "task": "fix-foo", "branch": "worker/fix-foo",
-            "phase": "tdd-green", "status": "in-progress",
+            "phase": "spec-encode", "status": "in-progress",
             "pr_url": "", "agent_id": "deadbeef", "subagent_id": "",
         },
     ]
@@ -137,7 +137,7 @@ def test_write_active_subagents_uses_handoff_row_format(project_dir: Path):
     active = [
         {
             "task": "fix-foo", "branch": "worker/fix-foo",
-            "phase": "tdd-green", "status": "in-progress",
+            "phase": "spec-encode", "status": "in-progress",
             "pr_url": "https://github.com/owner/repo/pull/1",
             "agent_id": "deadbeef", "subagent_id": "sub-id",
         },
@@ -153,7 +153,7 @@ def test_write_active_subagents_uses_handoff_row_format(project_dir: Path):
     body = Path(path).read_text(encoding="utf-8")
 
     expected_line = (
-        '- task="fix-foo" branch="worker/fix-foo" phase="tdd-green" '
+        '- task="fix-foo" branch="worker/fix-foo" phase="spec-encode" '
         'status="in-progress" pr_url="https://github.com/owner/repo/pull/1" '
         'agent_id="deadbeef" subagent_id="sub-id"'
     )

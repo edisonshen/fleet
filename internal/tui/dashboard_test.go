@@ -329,7 +329,7 @@ func TestView_HeaderShowsTotals(t *testing.T) {
 			project = "gstack"
 		}
 		seedWorker(t, pdir, project, slug, workers.State{
-			Phase: workers.PhaseTDDGreen,
+			Phase: workers.PhaseSpecEncode,
 			PID:   1000 + i,
 		})
 	}
@@ -356,8 +356,8 @@ func TestView_HeaderShowsTotals(t *testing.T) {
 func TestView_HeaderShowsAgentsChipWhenSubagentsRegistered(t *testing.T) {
 	pdir := withFleetHome(t)
 	// Seed two workers with state.json, register subagents for both.
-	seedWorker(t, pdir, "fleet", "alpha-aaaa", workers.State{Phase: workers.PhaseTDDRed})
-	seedWorker(t, pdir, "fleet", "beta-bbbb", workers.State{Phase: workers.PhaseTDDGreen})
+	seedWorker(t, pdir, "fleet", "alpha-aaaa", workers.State{Phase: workers.PhaseSpecRepro})
+	seedWorker(t, pdir, "fleet", "beta-bbbb", workers.State{Phase: workers.PhaseSpecEncode})
 	writeCoordStateWithSubagentMap(t, pdir, "fleet", map[string]string{
 		"alpha-aaaa": "claude-sub-1",
 		"beta-bbbb":  "claude-sub-2",
@@ -375,7 +375,7 @@ func TestView_HeaderShowsAgentsChipWhenSubagentsRegistered(t *testing.T) {
 func TestView_HeaderHidesAgentsChipWhenNoneRegistered(t *testing.T) {
 	pdir := withFleetHome(t)
 	// Worker exists but no subagent_ids registered. Chip must NOT render.
-	seedWorker(t, pdir, "fleet", "alpha-aaaa", workers.State{Phase: workers.PhaseTDDRed})
+	seedWorker(t, pdir, "fleet", "alpha-aaaa", workers.State{Phase: workers.PhaseSpecRepro})
 	m := New("test")
 	m.width = 140
 	m.height = 30
@@ -393,7 +393,7 @@ func TestView_HeaderHidesAgentsChipWhenNoneRegistered(t *testing.T) {
 
 func TestView_HeaderShowsSingularAgentChip(t *testing.T) {
 	pdir := withFleetHome(t)
-	seedWorker(t, pdir, "fleet", "alpha-aaaa", workers.State{Phase: workers.PhaseTDDRed})
+	seedWorker(t, pdir, "fleet", "alpha-aaaa", workers.State{Phase: workers.PhaseSpecRepro})
 	writeCoordStateWithSubagentMap(t, pdir, "fleet", map[string]string{
 		"alpha-aaaa": "claude-sub-1",
 	}, false, "")
@@ -420,7 +420,7 @@ func TestWorkerBlockLines_RendersSubagentChip(t *testing.T) {
 		ID:         "1a2b",
 		Project:    "fleet",
 		Slug:       "alpha-1a2b",
-		Phase:      workers.PhaseTDDRed,
+		Phase:      workers.PhaseSpecRepro,
 		Color:      "green",
 		Age:        "2m",
 		State:      "ok",
@@ -446,7 +446,7 @@ func TestWorkerBlockLines_OmitsChipWhenSubagentEmpty(t *testing.T) {
 		ID:      "1a2b",
 		Project: "fleet",
 		Slug:    "alpha-1a2b",
-		Phase:   workers.PhaseTDDRed,
+		Phase:   workers.PhaseSpecRepro,
 		Color:   "green",
 		Age:     "2m",
 		State:   "ok",
@@ -473,7 +473,7 @@ func TestWorkerBlockLines_TruncatesLongSubagentID(t *testing.T) {
 		ID:         "1a2b",
 		Project:    "fleet",
 		Slug:       "alpha-1a2b",
-		Phase:      workers.PhaseTDDRed,
+		Phase:      workers.PhaseSpecRepro,
 		Color:      "green",
 		Age:        "2m",
 		State:      "ok",
@@ -654,7 +654,7 @@ func TestWorkerRow_ColorByPhase(t *testing.T) {
 		{workers.PhaseReviewClaude, "blue", "rv"},
 		{workers.PhaseReviewCodex, "blue", "rv"},
 		{workers.PhaseDone, "green", "ok"},
-		{workers.PhaseTDDGreen, "green", "ok"},
+		{workers.PhaseSpecEncode, "green", "ok"},
 		{workers.PhasePush, "amber", "rn"},
 	}
 	for _, c := range cases {
@@ -683,7 +683,7 @@ func TestWorkerRow_ZeroUpdatedAtRendersDash(t *testing.T) {
 	now := time.Date(2025, 1, 1, 12, 0, 0, 0, time.UTC)
 	s := &workers.State{
 		Slug:  "x-1234",
-		Phase: workers.PhaseTDDGreen,
+		Phase: workers.PhaseSpecEncode,
 		// UpdatedAt left as zero on purpose.
 	}
 	row := workerRowFor(s, "p", now)
@@ -696,7 +696,7 @@ func TestWorkerRow_StaleHeartbeatGoesAmber(t *testing.T) {
 	now := time.Date(2025, 1, 1, 12, 0, 0, 0, time.UTC)
 	s := &workers.State{
 		Slug:      "x-1234",
-		Phase:     workers.PhaseTDDGreen,
+		Phase:     workers.PhaseSpecEncode,
 		UpdatedAt: now.Add(-15 * time.Minute), // > workerStaleWindow
 	}
 	row := workerRowFor(s, "p", now)
@@ -712,7 +712,7 @@ func TestSnapshot_CIRunningCountsReviewPhases(t *testing.T) {
 			{Phase: workers.PhaseReviewClaude},
 			{Phase: workers.PhaseReviewCodex},
 			{Phase: workers.PhasePush},
-			{Phase: workers.PhaseTDDGreen},
+			{Phase: workers.PhaseSpecEncode},
 			{Phase: workers.PhaseBlocked},
 		},
 		LoadedAt: now,
@@ -1947,7 +1947,7 @@ func TestScanWorkers_KeepsBlockedWorkerDir(t *testing.T) {
 func TestScanWorkers_KeepsActiveWorkerDir(t *testing.T) {
 	pdir := withFleetHome(t)
 	seedWorker(t, pdir, "fleet", "active-1a2b", workers.State{
-		Phase: workers.PhaseTDDRed,
+		Phase: workers.PhaseSpecRepro,
 	})
 	rows := scanWorkers(filepath.Join(pdir, "fleet"), "fleet", time.Now(), nil)
 	found := false
@@ -2027,7 +2027,7 @@ func TestScanWorkers_DoesNotMisclassifyLegitimateSlug(t *testing.T) {
 	// `phase.deleting-stage-1a2b` is a legitimate slug per
 	// state.ValidateSlug (lowercase + digits + . / - / _ allowed).
 	seedWorker(t, pdir, "fleet", "phase.deleting-stage-1a2b", workers.State{
-		Phase: workers.PhaseTDDRed,
+		Phase: workers.PhaseSpecRepro,
 	})
 	rows := scanWorkers(filepath.Join(pdir, "fleet"), "fleet", time.Now(), nil)
 	found := false
@@ -2130,7 +2130,7 @@ func TestReadWorkerSubagentMap_FiltersWhitespaceValues(t *testing.T) {
 func TestScanWorkers_AttachesSubagentID(t *testing.T) {
 	pdir := withFleetHome(t)
 	seedWorker(t, pdir, "fleet", "alpha-aaaa", workers.State{
-		Phase: workers.PhaseTDDRed,
+		Phase: workers.PhaseSpecRepro,
 	})
 	subMap := map[string]string{"alpha-aaaa": "claude-sub-1"}
 	rows := scanWorkers(filepath.Join(pdir, "fleet"), "fleet", time.Now(), subMap)
@@ -2145,7 +2145,7 @@ func TestScanWorkers_AttachesSubagentID(t *testing.T) {
 func TestScanWorkers_NoSubagentMapYieldsEmptyID(t *testing.T) {
 	pdir := withFleetHome(t)
 	seedWorker(t, pdir, "fleet", "alpha-aaaa", workers.State{
-		Phase: workers.PhaseTDDRed,
+		Phase: workers.PhaseSpecRepro,
 	})
 	rows := scanWorkers(filepath.Join(pdir, "fleet"), "fleet", time.Now(), nil)
 	if len(rows) != 1 {
@@ -2161,7 +2161,7 @@ func TestScanProject_PlumbsSubagentMap(t *testing.T) {
 	// gets the map, the resulting WorkerRow carries the SubagentID.
 	pdir := withFleetHome(t)
 	seedWorker(t, pdir, "fleet", "alpha-aaaa", workers.State{
-		Phase: workers.PhaseTDDRed,
+		Phase: workers.PhaseSpecRepro,
 	})
 	writeCoordStateWithSubagentMap(t, pdir, "fleet", map[string]string{
 		"alpha-aaaa": "claude-sub-1",

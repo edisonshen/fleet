@@ -104,7 +104,7 @@ func TestSynthesizeRecovery_PopulatesActiveSubagents(t *testing.T) {
 		"fix-foo-1234": "deadbeef",
 		"fix-bar-5678": "cafef00d",
 	})
-	seedWorkerState(t, pdir, "myproj", "fix-foo-1234", "tdd-green", "")
+	seedWorkerState(t, pdir, "myproj", "fix-foo-1234", "spec-encode", "")
 	seedWorkerState(t, pdir, "myproj", "fix-bar-5678", "push", "https://github.com/owner/repo/pull/42")
 
 	doc, err := SynthesizeRecovery("a1b2c3d4", "myproj", time.Now().UTC())
@@ -123,8 +123,8 @@ func TestSynthesizeRecovery_PopulatesActiveSubagents(t *testing.T) {
 	if !ok {
 		t.Fatalf("fix-foo-1234 missing from ActiveSubagents")
 	}
-	if foo.LastPhase != "tdd-green" {
-		t.Errorf("fix-foo phase: got %q want tdd-green", foo.LastPhase)
+	if foo.LastPhase != "spec-encode" {
+		t.Errorf("fix-foo phase: got %q want spec-encode", foo.LastPhase)
 	}
 	if foo.AgentID != "deadbeef" {
 		t.Errorf("fix-foo agent_id: got %q want deadbeef", foo.AgentID)
@@ -150,7 +150,7 @@ func TestSynthesizeRecovery_RoundTripViaRender(t *testing.T) {
 	seedCoordState(t, pdir, "myproj", map[string]string{
 		"fix-foo-1234": "deadbeef",
 	})
-	seedWorkerState(t, pdir, "myproj", "fix-foo-1234", "tdd-green", "")
+	seedWorkerState(t, pdir, "myproj", "fix-foo-1234", "spec-encode", "")
 
 	doc, err := SynthesizeRecovery("a1b2c3d4", "myproj", time.Now().UTC())
 	if err != nil {
@@ -170,8 +170,8 @@ func TestSynthesizeRecovery_RoundTripViaRender(t *testing.T) {
 	if parsed[0].TaskID != "fix-foo-1234" {
 		t.Errorf("task: got %q want fix-foo-1234", parsed[0].TaskID)
 	}
-	if parsed[0].LastPhase != "tdd-green" {
-		t.Errorf("phase: got %q want tdd-green", parsed[0].LastPhase)
+	if parsed[0].LastPhase != "spec-encode" {
+		t.Errorf("phase: got %q want spec-encode", parsed[0].LastPhase)
 	}
 }
 
@@ -207,7 +207,7 @@ func TestSynthesizeRecovery_SkipsMissingWorkerState(t *testing.T) {
 		"fix-bar-5678": "cafef00d",
 	})
 	// Only seed one worker dir; fix-bar's state.json is missing.
-	seedWorkerState(t, pdir, "myproj", "fix-foo-1234", "tdd-green", "")
+	seedWorkerState(t, pdir, "myproj", "fix-foo-1234", "spec-encode", "")
 
 	doc, err := SynthesizeRecovery("a1b2c3d4", "myproj", time.Now().UTC())
 	if err != nil {
@@ -273,7 +273,7 @@ func TestSynthesizeRecovery_OverlaysStatusFromTasksMD(t *testing.T) {
 		"fix-bar-5678": "cafef00d",
 		"fix-baz-9abc": "feedface",
 	})
-	seedWorkerState(t, pdir, "myproj", "fix-foo-1234", "tdd-green", "")
+	seedWorkerState(t, pdir, "myproj", "fix-foo-1234", "spec-encode", "")
 	seedWorkerState(t, pdir, "myproj", "fix-bar-5678", "push", "https://github.com/owner/repo/pull/42")
 	seedWorkerState(t, pdir, "myproj", "fix-baz-9abc", "done", "https://github.com/owner/repo/pull/43")
 	// tasks.md says: foo is in-progress (re-dispatch), bar is in-review
@@ -314,7 +314,7 @@ func TestSynthesizeRecovery_MissingTasksMDLeavesStatusEmpty(t *testing.T) {
 	seedCoordState(t, pdir, "myproj", map[string]string{
 		"fix-foo-1234": "deadbeef",
 	})
-	seedWorkerState(t, pdir, "myproj", "fix-foo-1234", "tdd-green", "")
+	seedWorkerState(t, pdir, "myproj", "fix-foo-1234", "spec-encode", "")
 	// No tasks.md.
 
 	doc, err := SynthesizeRecovery("a1b2c3d4", "myproj", time.Now().UTC())
@@ -339,8 +339,8 @@ func TestSynthesizeRecovery_SlugMissingFromTasksMDStaysEmpty(t *testing.T) {
 		"fix-foo-1234": "deadbeef",
 		"fix-bar-5678": "cafef00d", // in coord-state but NOT tasks.md
 	})
-	seedWorkerState(t, pdir, "myproj", "fix-foo-1234", "tdd-green", "")
-	seedWorkerState(t, pdir, "myproj", "fix-bar-5678", "tdd-green", "")
+	seedWorkerState(t, pdir, "myproj", "fix-foo-1234", "spec-encode", "")
+	seedWorkerState(t, pdir, "myproj", "fix-bar-5678", "spec-encode", "")
 	seedTasksMD(t, pdir, "myproj", map[string]tasks.Status{
 		"fix-foo-1234": tasks.Status("in-progress"),
 		// fix-bar-5678 absent.
@@ -461,7 +461,7 @@ func TestSynthesizeRecovery_PrefersCheckpointWhenNewer(t *testing.T) {
 	seedCoordState(t, pdir, "myproj", map[string]string{
 		"fix-old-0000": "obsolete",
 	})
-	seedWorkerState(t, pdir, "myproj", "fix-old-0000", "tdd-green", "")
+	seedWorkerState(t, pdir, "myproj", "fix-old-0000", "spec-encode", "")
 
 	// Checkpoint is newer + says the lane carries different work.
 	activeRow := `- task="fix-new-1234" branch="worker/fix-new-1234" phase="push" status="in-review" pr_url="https://github.com/owner/repo/pull/77" agent_id="cafef00d" subagent_id=""`
@@ -507,7 +507,7 @@ func TestSynthesizeRecovery_FallsThroughWhenNoCheckpoint(t *testing.T) {
 	seedCoordState(t, pdir, "myproj", map[string]string{
 		"fix-foo-1234": "deadbeef",
 	})
-	seedWorkerState(t, pdir, "myproj", "fix-foo-1234", "tdd-green", "")
+	seedWorkerState(t, pdir, "myproj", "fix-foo-1234", "spec-encode", "")
 	// No coord-checkpoint.md.
 
 	doc, err := SynthesizeRecoveryWithLastHandoff("a1b2c3d4", "myproj", "", time.Now().UTC())
@@ -533,7 +533,7 @@ func TestSynthesizeRecovery_PrefersHandoffWhenCheckpointStale(t *testing.T) {
 	seedCoordState(t, pdir, "myproj", map[string]string{
 		"fix-fresh-9999": "deadbeef",
 	})
-	seedWorkerState(t, pdir, "myproj", "fix-fresh-9999", "tdd-green", "")
+	seedWorkerState(t, pdir, "myproj", "fix-fresh-9999", "spec-encode", "")
 
 	// Checkpoint is OLDER than the last handoff doc.
 	staleRow := `- task="fix-stale-0000" branch="worker/fix-stale-0000" phase="push" status="in-progress" pr_url="" agent_id="abc123ab" subagent_id=""`
@@ -565,9 +565,9 @@ func TestSynthesizeRecovery_NoHandoffPathButCheckpointWins(t *testing.T) {
 	seedCoordState(t, pdir, "myproj", map[string]string{
 		"fix-old-0000": "obsolete",
 	})
-	seedWorkerState(t, pdir, "myproj", "fix-old-0000", "tdd-green", "")
+	seedWorkerState(t, pdir, "myproj", "fix-old-0000", "spec-encode", "")
 
-	activeRow := `- task="fix-new-1234" branch="worker/fix-new-1234" phase="tdd-green" status="in-progress" pr_url="" agent_id="cafef00d" subagent_id=""`
+	activeRow := `- task="fix-new-1234" branch="worker/fix-new-1234" phase="spec-encode" status="in-progress" pr_url="" agent_id="cafef00d" subagent_id=""`
 	seedCheckpoint(t, pdir, "myproj", now, []string{activeRow}, nil, nil)
 
 	doc, err := SynthesizeRecoveryWithLastHandoff("deadbeef", "myproj", "", now)
@@ -591,7 +591,7 @@ func TestSynthesizeRecovery_MalformedCheckpointFallsThrough(t *testing.T) {
 	seedCoordState(t, pdir, "myproj", map[string]string{
 		"fix-foo-1234": "deadbeef",
 	})
-	seedWorkerState(t, pdir, "myproj", "fix-foo-1234", "tdd-green", "")
+	seedWorkerState(t, pdir, "myproj", "fix-foo-1234", "spec-encode", "")
 
 	// Write a checkpoint with no closing frontmatter delimiter.
 	dir := filepath.Join(pdir, "myproj")
@@ -627,7 +627,7 @@ func TestSynthesizeRecovery_RejectsForeignCoordCheckpoint(t *testing.T) {
 	seedCoordState(t, pdir, "myproj", map[string]string{
 		"fix-current-9999": "b0b0b0b0",
 	})
-	seedWorkerState(t, pdir, "myproj", "fix-current-9999", "tdd-green", "")
+	seedWorkerState(t, pdir, "myproj", "fix-current-9999", "spec-encode", "")
 
 	// Checkpoint on disk was written by coord A (coord_id "deadbeef"),
 	// fresh timestamp, carrying A's now-stale lane.

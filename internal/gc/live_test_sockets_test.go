@@ -12,7 +12,7 @@ import (
 	"time"
 )
 
-// TDD suite for leak-gc-live-testsock (PR-D, DESIGN-lifecycle-leak-recurrence.md).
+// Test suite for leak-gc-live-testsock (PR-D, DESIGN-lifecycle-leak-recurrence.md).
 //
 // A LIVE `fleet-<id>` tmux server bound to /tmp/fleet-test-*.sock whose
 // owning `go test` process is gone is the resource the operator had to

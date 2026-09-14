@@ -57,11 +57,11 @@ class TestReadCurrentWorkerState:
     def test_current_when_generation_matches(self, tmp_path: Path) -> None:
         _write_worker_state(
             tmp_path, "p", "cur-aaaa",
-            {"slug": "cur-aaaa", "phase": "tdd-green", "dispatch_generation": 3},
+            {"slug": "cur-aaaa", "phase": "spec-encode", "dispatch_generation": 3},
         )
         cls, st = loop.read_current_worker_state("p", "cur-aaaa", 3, home=tmp_path)
         assert cls == loop.WORKER_STATE_CURRENT
-        assert st is not None and st["phase"] == "tdd-green"
+        assert st is not None and st["phase"] == "spec-encode"
 
     def test_stale_when_prior_generation(self, tmp_path: Path) -> None:
         # A prior attempt left a TERMINAL phase=done at gen 1; the slug's
@@ -91,7 +91,7 @@ class TestReadCurrentWorkerState:
         # fenced stale.
         _write_worker_state(
             tmp_path, "p", "legacy-cccc",
-            {"slug": "legacy-cccc", "phase": "tdd-red"},  # no gen key
+            {"slug": "legacy-cccc", "phase": "spec-repro"},  # no gen key
         )
         cls0, _ = loop.read_current_worker_state("p", "legacy-cccc", 0, home=tmp_path)
         assert cls0 == loop.WORKER_STATE_CURRENT
