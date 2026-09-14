@@ -6,6 +6,80 @@ follows [SemVer](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.19.0] - 2026-09-14
+
+Workers test the way a careful human does: reproduce the scenario, encode what
+was seen, then verify — instead of a unit-test TDD ladder. The coordinator's
+task plan carries a **Scenario contract** (requirement → stand-up → trigger →
+observable outcome → level), the worker reproduces every row against a real
+instance where one exists, and the PR body ships the recorded evidence instead
+of `- [ ] CI green / - [ ] verify locally`. How a project is stood up, observed
+and gated comes from its own standards `## Sandbox` / `## Gates` sections, so
+the same prompts drive a project with a local sandbox, a remote-only one, or
+none at all (reproduce from the highest-fidelity artifact, encode as `replay`).
+A worker cannot reach `review-pending` without recorded passing gates and a
+fully verified contract.
+
+### Added
+
+- Worker phases `spec-repro` / `spec-encode` / `verify` and state fields
+  `scenarios_total` / `scenarios_verified` / `gates_status`, set via
+  `fleet workers update --scenarios-total M --scenarios-verified N
+  --gates-status passed|failed`; visible in `fleet peek` JSON (#305).
+- Fail-closed verify gate: `phase=review-pending|push` (and non-git `done`)
+  requires `gates_status=passed` and `scenarios_verified == scenarios_total`
+  (`ErrPhaseRequiresGates` / `ErrPhaseRequiresScenarios`; `state.json` is left
+  untouched on reject) (#306).
+- Standards `## Sandbox` (`tier: local|remote|none`, `up`, `down`,
+  `isolation`, `observe`, `credentials`) and `## Gates` (exact commands +
+  `baseline:`) sections. The global template seeds `tier: none` and an empty
+  gate list; projects override with `fleet standards edit --project <p>`.
+  A project `## Testing` section shadows the global one, so extend it under a
+  distinct heading such as `## Testing (Fleet addendum)` (#307).
+- `docs/TESTING.md`: Fleet-the-project's own `## Sandbox` / `## Gates` block
+  and the local scenario walkthrough (#307).
+- `scripts/scenario.sh up|seed-coord|seed-worker|run|capture|down` stands up
+  an isolated Fleet sandbox (`FLEET_HOME`, `FLEET_TMUX_SOCKET`, built
+  `FLEET_DEV_BIN`, fake `claude` on PATH) keyed by slug; `scripts/fake-claude.sh`
+  with `ok|exit|crash-once|hang` modes; `coorde2e` helpers and a session-scoped
+  pytest `fleet_sandbox` fixture. `scripts/lint-test-isolation.sh` now also
+  covers shell scripts and flags any bare `tmux` call without `-S`/`-L` (#308).
+- CI integration lanes discover `//go:build integration` tests per package via
+  `scripts/integration-lane.sh <pkg>` instead of hand-maintained `-run` lists,
+  so a new e2e test can no longer silently never run (#306).
+- `testing-fleet-tui` agent skill: exercise worker CLI state and the dashboard
+  in an isolated terminal (#309).
+
+### Changed
+
+- Worker prompt: 2a REPRODUCE (eval `up`, run the row's trigger, capture with
+  `observe`, `down`; `replay` rows obtain the named artifact) → 2b ENCODE (one
+  test per contract row at its level, in the project's own framework) → 2c
+  IMPLEMENT + VERIFY (re-run every row by hand and via its test, run every
+  `## Gates` line, baseline suspected pre-existing failures on untouched
+  `main`). Evidence is written verbatim to `verification.md` (#307).
+- Reviewer lens checks contract coverage; an unjustified lower test level or a
+  mocked boundary the sandbox could have run is a P1; after fixes it re-runs
+  touched scenarios and every gate and appends `## Review re-verification`
+  (#307).
+- Finisher copies `verification.md` into the PR body's `## Verification` and
+  blocks when `## Gates` or `## Evidence — after` is empty; the unchecked
+  `- [ ] CI green / - [ ] verify locally` placeholders are gone (#307).
+- `_PROMPT_HARD_CAP_BYTES` 16 → 24 KiB; a test pins the real standards + a 2 KB
+  spec under the cap (#307).
+
+### Removed
+
+- Legacy `tdd-red` / `tdd-green` / `tdd-refactor` worker phases: `fleet workers
+  update --phase tdd-*` is rejected. Drain workers spawned from the old prompt
+  before upgrading (#305).
+
+### Fixed
+
+- fleet-guard `_capture_pane` honours `FLEET_TMUX_SOCKET`; in an isolated
+  sandbox the soft-handoff hold previously never fired because the coord pane
+  was captured from the wrong tmux server (#308).
+
 ## [0.18.1] - 2026-09-11
 
 A coordinator no longer loses its subagents' work to a context-window handoff,
@@ -1425,7 +1499,9 @@ Initial public release.
 - Filesystem packages: `internal/state`, `internal/handoff`,
   `internal/queue`, `internal/spawn`, `internal/tmux`.
 
-[Unreleased]: https://github.com/edisonshen/fleet/compare/v0.18.0...HEAD
+[Unreleased]: https://github.com/edisonshen/fleet/compare/v0.19.0...HEAD
+[0.19.0]: https://github.com/edisonshen/fleet/compare/v0.18.1...v0.19.0
+[0.18.1]: https://github.com/edisonshen/fleet/compare/v0.18.0...v0.18.1
 [0.18.0]: https://github.com/edisonshen/fleet/compare/v0.17.0...v0.18.0
 [0.17.0]: https://github.com/edisonshen/fleet/compare/v0.16.2...v0.17.0
 [0.16.2]: https://github.com/edisonshen/fleet/compare/v0.16.1...v0.16.2
