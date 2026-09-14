@@ -15,7 +15,7 @@ import (
 	"github.com/edisonshen/fleet/internal/tmux"
 )
 
-// TDD-red suite for fleet#165 PR-A. Each test stubs the Reconcile Deps
+// Test suite for fleet#165 PR-A. Each test stubs the Reconcile Deps
 // struct so the unit under test never touches the operator's real
 // ~/.fleet/ or /tmp/ state. Production wiring (DefaultDeps) is covered
 // indirectly by the CLI smoke tests in cmd/fleet/gc_test.go.

@@ -26,7 +26,7 @@ func TestPeek_OnceMissingSlug(t *testing.T) {
 // prints the JSON state block.
 func TestPeek_OncePrintsState(t *testing.T) {
 	_, project := setupTasksHome(t)
-	seedWorker(t, project, "alpha-1234", workers.PhaseTDDRed, os.Getpid())
+	seedWorker(t, project, "alpha-1234", workers.PhaseSpecRepro, os.Getpid())
 
 	out := &bytes.Buffer{}
 	if err := runPeek(&peekOpts{project: project}, "alpha-1234", out, &bytes.Buffer{}); err != nil {
@@ -36,7 +36,7 @@ func TestPeek_OncePrintsState(t *testing.T) {
 	if !strings.Contains(got, `"slug": "alpha-1234"`) {
 		t.Errorf("output missing slug: %s", got)
 	}
-	if !strings.Contains(got, `"phase": "tdd-red"`) {
+	if !strings.Contains(got, `"phase": "spec-repro"`) {
 		t.Errorf("output missing phase: %s", got)
 	}
 }
@@ -44,7 +44,7 @@ func TestPeek_OncePrintsState(t *testing.T) {
 // TestPeek_OnceWithLogs — --logs dumps output.log when present.
 func TestPeek_OnceWithLogs(t *testing.T) {
 	fleetHome, project := setupTasksHome(t)
-	seedWorker(t, project, "logs-test-7a3c", workers.PhaseTDDGreen, os.Getpid())
+	seedWorker(t, project, "logs-test-7a3c", workers.PhaseSpecEncode, os.Getpid())
 	logPath := filepath.Join(fleetHome, "projects", project, "workers", "logs-test-7a3c", "output.log")
 	if err := os.WriteFile(logPath, []byte("hello from worker\nstep 2\n"), 0o644); err != nil {
 		t.Fatalf("write log: %v", err)
@@ -190,7 +190,7 @@ func TestPeek_OnceFallsBackToArchive(t *testing.T) {
 // cleanly, not time out at 30s.
 func TestPeek_FollowExitsCleanlyOnArchive(t *testing.T) {
 	fleetHome, project := setupTasksHome(t)
-	seedWorker(t, project, "fast-4444", workers.PhaseTDDRed, os.Getpid())
+	seedWorker(t, project, "fast-4444", workers.PhaseSpecRepro, os.Getpid())
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -247,7 +247,7 @@ func TestPeek_FollowExitsCleanlyOnArchive(t *testing.T) {
 // states in the output.
 func TestPeek_FollowReactsToPhaseChange(t *testing.T) {
 	_, project := setupTasksHome(t)
-	seedWorker(t, project, "evolve-2222", workers.PhaseTDDRed, os.Getpid())
+	seedWorker(t, project, "evolve-2222", workers.PhaseSpecRepro, os.Getpid())
 
 	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
 	defer cancel()
@@ -282,7 +282,7 @@ func TestPeek_FollowReactsToPhaseChange(t *testing.T) {
 		t.Fatal("peekFollow did not exit after terminal phase")
 	}
 	got := out.String()
-	if !strings.Contains(got, `"phase": "tdd-red"`) {
+	if !strings.Contains(got, `"phase": "spec-repro"`) {
 		t.Errorf("initial phase missing: %s", got)
 	}
 	if !strings.Contains(got, `"phase": "done"`) {

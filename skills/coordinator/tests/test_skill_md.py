@@ -318,3 +318,91 @@ def test_skill_md_step5_documents_task_plan_review_sop():
             f"SKILL.md task-plan review SOP missing clause {clause!r} — "
             f"SOP wording drifted from the operator-approved text."
         )
+
+
+# ---------- Scenario contract (scenario-first testing, PR-2) ----------
+
+
+def _section(body: str, heading: str) -> str:
+    assert heading in body, f"SKILL.md missing {heading!r}"
+    return body.split(heading, 1)[1].split("\n### ", 1)[0]
+
+
+def test_s7_skill_md_step5_carries_scenario_contract():
+    """S7: Step 5 defines the Scenario contract — header row, observable
+    outcome, Level defaulting to the project's max level from the merged
+    `## Sandbox` tier (local/remote → e2e, none → replay), one-word
+    downgrade reasons, Harness naming up/observe / artifact / package
+    harness, tier rejection, standards onboarding, plan-decided grouping,
+    `none — <reason>` escape hatch — with no Fleet noun, and the writing
+    standard no longer asks for one line per test."""
+    body = _read_skill_md()
+    step5 = _section(body, "### Step 5 — TASK-PLAN-DOC")
+    flat = " ".join(step5.split())
+    assert "## Scenario contract" in step5
+    assert ("| S | Requirement | Stand-up | Trigger | Observable outcome "
+            "| Level | Harness |") in step5
+    for clause in (
+        "Level defaults to the project's max level",
+        "merged standards' `## Sandbox` tier",
+        "`tier: local` or `tier: remote` → `e2e`",
+        "`tier: none` → `replay`",
+        "`integ` = a package test at a real boundary",
+        "`unit` = pure logic the scenario cannot reach",
+        "one-word reason in the Level cell (`unit — pure`, `integ — hermetic`, "
+        "`replay — no-artifact`)",
+        "Level never exceeds the tier",
+        "`contract S<n> needs e2e but tier=none`",
+        "Harness** names how the row is driven: the `up` / `observe` commands for "
+        "`e2e`, the artifact for `replay`, the package harness for `integ`",
+        "Standards onboarding",
+        "lack `## Sandbox` or `## Gates`",
+        "raises it to the operator at promote",
+        "Grouping is decided in the plan",
+        "`none — <reason>`",
+        "Never \"function X is called\"",
+        "Tests removed / KEEP",
+    ):
+        assert clause in flat, f"S7: Step 5 Scenario contract missing {clause!r}"
+    for noun in ("FLEET_HOME", "FLEET_TMUX_SOCKET", "coorde2e", "docs/TESTING.md",
+                 "built binary", "tmux", "go test", "pytest"):
+        assert noun not in step5, f"S7: Step 5 carries Fleet noun {noun!r}"
+    standard = _section(body, "### Plan & design-doc writing standard")
+    item5 = standard.split("\n5. ", 1)[1].split("\n6. ", 1)[0]
+    assert "one line per test" not in item5
+    assert "Scenario contract" in item5
+    assert "one line per test" not in body
+
+
+def test_s7_skill_md_step6_names_evidence_duties():
+    """S7: Step 6 assigns the evidence duties — worker writes
+    verification.md and the three flags, reviewer applies the contract
+    lens and re-verifies after fixes, finisher ships the block verbatim
+    or blocks."""
+    body = _read_skill_md()
+    step6 = _section(body, "### Step 6 — IMPLEMENT")
+    flat = " ".join(step6.split())
+    for clause in (
+        "`spec-repro` -> `spec-encode` -> `verify`",
+        "using only the merged standards' `## Sandbox` and `## Gates`",
+        "export `FLEET_WORKER_SLUG=<slug>`",
+        "`eval \"$(<up>)\"`",
+        "capture with `<observe>`",
+        "run every `## Gates` line in order",
+        "workers/<slug>/verification.md",
+        "`## Scenario contract`, `## Evidence — before`, `## Evidence — after`, "
+        "`## Gates`, `## Baseline`, `## Unit tests`",
+        "--scenarios-total M --scenarios-verified N --gates-status passed",
+        "re-run on untouched `origin/main` with the standards' `baseline:` command",
+        "never mocks a boundary `## Sandbox` can run",
+        "Scenario-contract lens",
+        "a row below the `## Sandbox` max level without the plan's reason",
+        "re-runs the touched scenarios plus every `## Gates` line",
+        "`## Review re-verification`",
+        "`## Verification` = verification.md verbatim",
+        "finisher: no verification evidence (<path>)",
+    ):
+        assert clause in flat, f"S7: Step 6 evidence duties missing {clause!r}"
+    for legacy in ("tdd-red", "tdd-green", "tdd-refactor", "TDD ladder",
+                   "ci.yml", "built product", "go test", "pytest"):
+        assert legacy not in step6, f"S7: Step 6 still carries {legacy!r}"

@@ -1,4 +1,4 @@
-// Package projectlookup tests — TDD red for attach-failover-59db.
+// Package projectlookup tests — attach-failover-59db.
 //
 // Covers the helpers Tier 3 PROJECT RECOVERY depends on:
 //

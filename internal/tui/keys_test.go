@@ -581,7 +581,7 @@ func TestActionHandoff_OnSeparator_FlashUnchanged(t *testing.T) {
 	// "active" project with a recent worker so it classifies active.
 	seedTasks(t, pdir, "active", TaskCounts{InProgress: 1})
 	seedWorker(t, pdir, "active", "wip-task", workers.State{
-		Phase:     workers.PhaseTDDGreen,
+		Phase:     workers.PhaseSpecEncode,
 		UpdatedAt: time.Now().UTC(),
 	})
 	// "stale" project with no fresh signals.

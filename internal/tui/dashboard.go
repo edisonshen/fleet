@@ -586,7 +586,7 @@ func workerRowFor(s *workers.State, project string, now time.Time) *WorkerRow {
 		if !s.UpdatedAt.IsZero() && now.Sub(s.UpdatedAt) > workerStaleWindow {
 			row.Color = "amber"
 			row.State = "!!"
-		} else if s.Phase == workers.PhaseTDDRefactor || s.Phase == workers.PhasePush {
+		} else if s.Phase == workers.PhaseVerify || s.Phase == workers.PhasePush {
 			row.Color = "amber"
 			row.State = "rn"
 		} else {

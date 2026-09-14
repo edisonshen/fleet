@@ -27,12 +27,12 @@ jobs:
     #
     # Process-level timeouts now in play (each step gets its OWN budget; the
     # PR-A integration lane is `-run`-scoped per-package to the integration-only
-    # standby tests — see the steps below — so it no longer re-runs each
-    # package's full default suite):
+    # tests, discovered by scripts/integration-lane.sh — see the steps below —
+    # so it no longer re-runs each package's full default suite):
     #   - default `go test -race ./...`     : 5m
-    #   - integration internal/spawn        : 5m  (2 scoped tests)
-    #   - integration cmd/fleet             : 5m  (17 scoped tests)
-    #   - integration internal/tui          : 5m  (3 scoped tests)
+    #   - integration internal/spawn        : 5m  (2 discovered tests at time of writing)
+    #   - integration cmd/fleet             : 5m  (17 discovered tests at time of writing)
+    #   - integration internal/tui          : 5m  (3 discovered tests at time of writing)
     #   (internal/handoffop has no integration-only tests → no step)
     # Worst-case sum if every step burns its full timeout = 20m, plus the
     # UNBUDGETED steps that sit between/after the timed lanes and the always()
@@ -99,6 +99,12 @@ jobs:
         # dispatchOpts guard against future awk/regex drift.
         run: bash scripts/tests/test_lint_test_isolation.sh
 
+      - name: Integration lane script — regression fixtures
+        # Exercises scripts/integration-lane.sh (used by the lane steps below)
+        # against scripts/tests/fixtures/lane: runs only //go:build integration
+        # tests, exits 0 on an empty set, propagates a tagged failure.
+        run: bash scripts/tests/test_integration_lane.sh
+
       - name: Pre-test leak sentinel
         # fleet#165 PR-B (per feedback_fleet_owns_its_resources.md): a
         # green CI run with /tmp/fleet-test-* debris left over is NOT a
@@ -141,40 +147,33 @@ jobs:
       # what blew the 5m/7m budgets (panics in runs 27597394005, 27601497061):
       # the package is just slow on a 2-core runner. Scoping each step to `-run`
       # the integration-ONLY test functions (those present in the integration
-      # build but absent from the default build — derived via
-      # `comm -13 <(go test -list) <(go test -tags=integration -list)`) runs each
-      # standby test exactly ONCE, in the lane that needs it, and skips the
-      # already-covered default suite. internal/handoffop has ZERO
-      # integration-only tests (its standby cases are stubbed and stay
-      # default-lane), so it needs no integration step at all.
+      # build but absent from the default build) runs each standby test exactly
+      # ONCE, in the lane that needs it, and skips the already-covered default
+      # suite. internal/handoffop has ZERO integration-only tests (its standby
+      # cases are stubbed and stay default-lane), so it needs no integration
+      # step at all.
+      #
+      # Each lane calls scripts/integration-lane.sh <pkg>, which derives the
+      # -run set at run time (`comm -13 <(go test -list) <(go test
+      # -tags=integration -list)`) and exits 0 when it is empty. A new package
+      # with integration-only tests still needs its own lane step.
       #
       # FLEET_STANDBY_TIMEOUT=3s caps each standby at 3s (vs the 10m production
       # default), so even an aborted run self-reaps in seconds. No -race here:
       # these tests exec real tmux-pane subprocesses (the race detector
       # instruments only in-process goroutines, and -race would roughly double
       # each lane's wall time for no added coverage of the subprocess paths this
-      # lane exists to exercise). Keep these `-run` lists in sync with the
-      # `//go:build integration` test functions in each package; a new
-      # integration test that isn't listed here will silently NOT run in CI.
+      # lane exists to exercise).
       - name: Integration lane — internal/spawn
-        run: >-
-          FLEET_STANDBY_TIMEOUT=3s go test -tags=integration -count=1 -timeout=5m
-          -run '^(TestSpawn_PersistsLeaseWrappedState|TestSpawn_StandbyFinalMergePreservesStampedEnginePID)$'
-          ./internal/spawn
+        run: FLEET_STANDBY_TIMEOUT=3s bash scripts/integration-lane.sh ./internal/spawn
 
       - name: Integration lane — cmd/fleet
-        run: >-
-          FLEET_STANDBY_TIMEOUT=3s go test -tags=integration -count=1 -timeout=5m
-          -run '^(TestCoordLeaderCheck|TestCoordRun_Lease_Integration_RealFlockHeldThenReleased|TestCoordRun_Lease_Integration_StandDownArchivesRecord|TestDeliverHandoffResumePrompt_NoLeaseOwner_FallsBackToDirectSend|TestHandoff_GracefulRoute_SwapsViaBarrier|TestHandoff_GracefulRouteError_PreservesQueueAndOld|TestHandoff_LeaseFailoverCoordHandoffFinalizesDeliveredLockOwner|TestHandoff_LeaseFailoverCoordHandoffRefusesBeforeRetiringOld|TestHandoffResumeNudger_Integration_EnterSwallowed_TypesPromptOnce|TestHandoffResumeNudger_Integration_BusyPane_TypesNothingUntilSettled|TestHandoffDelivery_Integration_EnterSwallowed_RetriesThenSubmits|TestHandoffDelivery_Integration_EnterNeverAccepted_FailsWithoutRetyping|TestRunDispatch_DeadCoordRecovery_AdvertisesLockWinner|TestE2E_DeadCoordRecovery_ReplacementInheritsAndReapsPredecessor|TestE2E_DeadCoordRecovery_ReplacementDiesAtStartup_NextAttemptRecovers|TestE2E_DeadCoordRecovery_LiveCoordIsNeverDuplicated|TestE2E_DeadCoordRecovery_BareLegacyRecordIsKept)$'
-          ./cmd/fleet
+        run: FLEET_STANDBY_TIMEOUT=3s bash scripts/integration-lane.sh ./cmd/fleet
 
       - name: Integration lane — internal/tui
         # [a] dead-coord recovery driven through the real Bubble Tea model
         # against the built fleet binary + real coord-run/tmux subprocesses.
-        run: >-
-          FLEET_STANDBY_TIMEOUT=3s go test -tags=integration -count=1 -timeout=5m
-          -run '^(TestE2E_KeyA_DaysDeadCoord_RecoversAndAttachesReplacement|TestE2E_KeyA_ReplacementDiesAfterDispatch_AutoRespawnsOnce|TestE2E_KeyA_ReplacementDiesTwice_BoundedThenFreshPressRecovers)$'
-          ./internal/tui
+        run: FLEET_STANDBY_TIMEOUT=3s bash scripts/integration-lane.sh ./internal/tui
 
       - name: Python tests
         run: python3 -m pytest skills/ scripts/ -q

@@ -24,8 +24,8 @@ func TestStateRoundTrip(t *testing.T) {
 	in := &State{
 		Slug:            "add-readme-7a3c",
 		Project:         "fleet",
-		Phase:           PhaseTDDRefactor,
-		PhasesCompleted: []Phase{PhaseBranch, PhaseTDDRed, PhaseTDDGreen},
+		Phase:           PhaseVerify,
+		PhasesCompleted: []Phase{PhaseBranch, PhaseSpecRepro, PhaseSpecEncode},
 		StartedAt:       time.Date(2026, 5, 6, 14, 0, 0, 0, time.UTC),
 		PID:             12345,
 	}
@@ -231,7 +231,7 @@ func TestArchive_RefusesLiveWorker(t *testing.T) {
 	tmp := t.TempDir()
 	t.Setenv("FLEET_HOME", tmp)
 	if err := WriteState("fleet", "live-aaaa", &State{
-		Slug: "live-aaaa", Project: "fleet", Phase: PhaseTDDGreen,
+		Slug: "live-aaaa", Project: "fleet", Phase: PhaseSpecEncode,
 		StartedAt: time.Now().UTC(), PID: 1,
 	}); err != nil {
 		t.Fatalf("seed: %v", err)
@@ -351,7 +351,7 @@ func TestArchive_SerializesWithUpdateState(t *testing.T) {
 			// Hold the lock briefly so Archive must wait.
 			time.Sleep(50 * time.Millisecond)
 			// Bump to non-terminal — Archive's re-check should reject.
-			s.Phase = PhaseTDDGreen
+			s.Phase = PhaseSpecEncode
 			s.PRURL = ""
 		})
 	}()
@@ -831,7 +831,7 @@ func TestStateRoundTrip_ReviewFieldsOmittedWhenEmpty(t *testing.T) {
 	in := &State{
 		Slug:      "no-review-aaaa",
 		Project:   "fleet",
-		Phase:     PhaseTDDGreen,
+		Phase:     PhaseSpecEncode,
 		StartedAt: time.Now().UTC(),
 		PID:       1,
 	}
@@ -897,6 +897,9 @@ func TestStateRoundTrip_RejectsBogusReviewStatus(t *testing.T) {
 	}
 }
 
+// stateWithReview builds a push/done-phase fixture with the review
+// slots set as given and the verify gate satisfied (gates_status=passed,
+// 0/0 scenarios) so the table below exercises the review gate alone.
 func stateWithReview(project, slug string, phase Phase, alphaStatus ReviewStatus, alphaEngine, alphaModel, alphaReason string, betaStatus ReviewStatus, betaEngine, betaModel, betaReason string) *State {
 	return &State{
 		Slug:                  slug,
@@ -904,6 +907,7 @@ func stateWithReview(project, slug string, phase Phase, alphaStatus ReviewStatus
 		Phase:                 phase,
 		StartedAt:             time.Now().UTC(),
 		PID:                   1,
+		GatesStatus:           GatesStatusPassed,
 		ReviewAlphaStatus:     alphaStatus,
 		ReviewAlphaEngine:     alphaEngine,
 		ReviewAlphaModel:      alphaModel,
@@ -1095,6 +1099,38 @@ func TestValidateReviewGate(t *testing.T) {
 			},
 			wantErr: ErrPhasePushNonGit,
 		},
+		// At push the review gate runs before the verify gate, so a missing
+		// review is reported even when the verify fields are also wrong.
+		{
+			name:    "push empty review and empty gates reports review gate",
+			gitMode: true,
+			state: func(project, slug string) *State {
+				s := stateWithReview(project, slug, PhasePush, "", "", "", "", "", "", "", "")
+				s.GatesStatus = ""
+				return s
+			},
+			wantErr: ErrPhaseRequiresReview,
+		},
+		{
+			name:    "push pending review and failed gates reports review gate",
+			gitMode: true,
+			state: func(project, slug string) *State {
+				s := stateWithReview(project, slug, PhasePush, ReviewStatusPending, ReviewEngineClaude, "sonnet-5", "", ReviewStatusPassed, ReviewEngineClaude, "opus-4.8", "")
+				s.GatesStatus = GatesStatusFailed
+				return s
+			},
+			wantErr: ErrPhaseRequiresReview,
+		},
+		{
+			name:    "push valid review and failed gates reports verify gate",
+			gitMode: true,
+			state: func(project, slug string) *State {
+				s := stateWithReview(project, slug, PhasePush, ReviewStatusPassed, ReviewEngineClaude, "sonnet-5", "", ReviewStatusPassed, ReviewEngineClaude, "opus-4.8", "")
+				s.GatesStatus = GatesStatusFailed
+				return s
+			},
+			wantErr: ErrPhaseRequiresGates,
+		},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -1145,15 +1181,175 @@ func TestPhaseValidation_NewReviewPhasesAccepted(t *testing.T) {
 	t.Setenv("FLEET_HOME", tmp)
 	for _, p := range []Phase{PhaseReviewPending, PhaseReviewDone} {
 		s := &State{
-			Slug:      "phase-" + sanitizeSlug(string(p)) + "-aaaa",
-			Project:   "fleet",
-			Phase:     p,
-			StartedAt: time.Now().UTC(),
-			PID:       1,
+			Slug:        "phase-" + sanitizeSlug(string(p)) + "-aaaa",
+			Project:     "fleet",
+			Phase:       p,
+			StartedAt:   time.Now().UTC(),
+			PID:         1,
+			GatesStatus: GatesStatusPassed,
 		}
 		if err := WriteState("fleet", s.Slug, s); err != nil {
 			t.Errorf("WriteState phase=%s: %v; want nil", p, err)
 		}
+	}
+}
+
+// TestValidateVerifyGate: fires on phase=review-pending and the git-mode
+// terminal write (push), requires gates_status=passed and
+// scenarios_verified == scenarios_total (0/0 is legal).
+func TestValidateVerifyGate(t *testing.T) {
+	verified := func(phase Phase, gates string, total, done int) *State {
+		return &State{
+			Slug:              "vg-aaaa",
+			Project:           "fleet",
+			Phase:             phase,
+			StartedAt:         time.Now().UTC(),
+			PID:               1,
+			GatesStatus:       gates,
+			ScenariosTotal:    total,
+			ScenariosVerified: done,
+		}
+	}
+	cases := []struct {
+		name    string
+		state   *State
+		wantErr error
+		wantMsg string
+	}{
+		{"review-pending no gates recorded", verified(PhaseReviewPending, "", 0, 0), ErrPhaseRequiresGates, `phase=review-pending (got gates_status="")`},
+		{"review-pending counts disagree", verified(PhaseReviewPending, GatesStatusPassed, 3, 2), ErrPhaseRequiresScenarios, "phase=review-pending scenarios_verified=2 != scenarios_total=3"},
+		{"review-pending passed 3/3", verified(PhaseReviewPending, GatesStatusPassed, 3, 3), nil, ""},
+		{"review-pending passed 0/0", verified(PhaseReviewPending, GatesStatusPassed, 0, 0), nil, ""},
+		{"review-pending gates failed", verified(PhaseReviewPending, GatesStatusFailed, 3, 3), ErrPhaseRequiresGates, `phase=review-pending (got gates_status="failed")`},
+		{"push gates failed", func() *State {
+			s := stateWithReview("fleet", "vg-aaaa", PhasePush, ReviewStatusPassed, ReviewEngineClaude, "sonnet-5", "", ReviewStatusPassed, ReviewEngineClaude, "opus-4.8", "")
+			s.GatesStatus = GatesStatusFailed
+			s.ScenariosTotal, s.ScenariosVerified = 3, 3
+			return s
+		}(), ErrPhaseRequiresGates, `phase=push (got gates_status="failed")`},
+		{"push counts disagree", func() *State {
+			s := stateWithReview("fleet", "vg-aaaa", PhasePush, ReviewStatusPassed, ReviewEngineClaude, "sonnet-5", "", ReviewStatusPassed, ReviewEngineClaude, "opus-4.8", "")
+			s.ScenariosTotal, s.ScenariosVerified = 3, 1
+			return s
+		}(), ErrPhaseRequiresScenarios, "phase=push scenarios_verified=1 != scenarios_total=3"},
+		// Gate is scoped to the two handoff writes.
+		{"verify without gates accepted", verified(PhaseVerify, "", 0, 0), nil, ""},
+		{"verify with failed gates accepted", verified(PhaseVerify, GatesStatusFailed, 3, 1), nil, ""},
+		{"review-done without gates accepted", verified(PhaseReviewDone, "", 0, 0), nil, ""},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			t.Setenv("FLEET_HOME", t.TempDir())
+			err := WriteState("fleet", c.state.Slug, c.state)
+			if c.wantErr == nil {
+				if err != nil {
+					t.Fatalf("WriteState: %v; want nil", err)
+				}
+				got, rerr := ReadState("fleet", c.state.Slug)
+				if rerr != nil || got.Phase != c.state.Phase {
+					t.Fatalf("ReadState: %+v, %v; want phase=%s", got, rerr, c.state.Phase)
+				}
+				return
+			}
+			if !errors.Is(err, c.wantErr) {
+				t.Fatalf("WriteState: got %v; want %v", err, c.wantErr)
+			}
+			if !containsSubstring(err.Error(), c.wantMsg) {
+				t.Fatalf("error %q lacks %q", err.Error(), c.wantMsg)
+			}
+			if _, rerr := ReadState("fleet", c.state.Slug); !errors.Is(rerr, ErrNotFound) {
+				t.Fatalf("rejected write must not create state.json; ReadState err=%v", rerr)
+			}
+		})
+	}
+}
+
+// TestValidateVerifyGate_NonGitDone: non-git projects have no push, so the
+// gate fires on phase=done instead; the review gate still runs first.
+func TestValidateVerifyGate_NonGitDone(t *testing.T) {
+	const project = "ng-proj"
+	done := func(slug string) *State {
+		return stateWithReview(project, slug, PhaseDone, ReviewStatusPassed, ReviewEngineClaude, "sonnet-5", "", ReviewStatusPassed, ReviewEngineClaude, "opus-4.8", "")
+	}
+	cases := []struct {
+		name    string
+		state   *State
+		wantErr error
+		wantMsg string
+	}{
+		{"done no gates recorded", func() *State {
+			s := done("ng-aaaa")
+			s.GatesStatus = ""
+			return s
+		}(), ErrPhaseRequiresGates, `phase=done (got gates_status="")`},
+		{"done gates failed", func() *State {
+			s := done("ng-aaaa")
+			s.GatesStatus = GatesStatusFailed
+			s.ScenariosTotal, s.ScenariosVerified = 3, 3
+			return s
+		}(), ErrPhaseRequiresGates, `phase=done (got gates_status="failed")`},
+		{"done counts disagree", func() *State {
+			s := done("ng-aaaa")
+			s.ScenariosTotal, s.ScenariosVerified = 3, 1
+			return s
+		}(), ErrPhaseRequiresScenarios, "phase=done scenarios_verified=1 != scenarios_total=3"},
+		{"done passed 3/3", func() *State {
+			s := done("ng-aaaa")
+			s.ScenariosTotal, s.ScenariosVerified = 3, 3
+			return s
+		}(), nil, ""},
+		{"done passed 0/0", done("ng-aaaa"), nil, ""},
+		{"done missing review wins over failed gates", func() *State {
+			s := done("ng-aaaa")
+			s.ReviewAlphaStatus, s.ReviewBetaStatus = "", ""
+			s.GatesStatus = GatesStatusFailed
+			return s
+		}(), ErrPhaseRequiresReview, ""},
+		{"review-done with failed gates accepted", func() *State {
+			s := done("ng-aaaa")
+			s.Phase = PhaseReviewDone
+			s.GatesStatus = GatesStatusFailed
+			return s
+		}(), nil, ""},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			t.Setenv("FLEET_HOME", t.TempDir())
+			writeNonGitProject(t, project)
+			err := WriteState(project, c.state.Slug, c.state)
+			if c.wantErr == nil {
+				if err != nil {
+					t.Fatalf("WriteState: %v; want nil", err)
+				}
+				return
+			}
+			if !errors.Is(err, c.wantErr) {
+				t.Fatalf("WriteState: got %v; want %v", err, c.wantErr)
+			}
+			if !containsSubstring(err.Error(), c.wantMsg) {
+				t.Fatalf("error %q lacks %q", err.Error(), c.wantMsg)
+			}
+			if _, rerr := ReadState(project, c.state.Slug); !errors.Is(rerr, ErrNotFound) {
+				t.Fatalf("rejected write must not create state.json; ReadState err=%v", rerr)
+			}
+		})
+	}
+}
+
+// Git-mode phase=done is not verify-gated; push already was.
+func TestValidateVerifyGate_GitDoneNotGated(t *testing.T) {
+	t.Setenv("FLEET_HOME", t.TempDir())
+	s := &State{
+		Slug:        "vg-git-done-aaaa",
+		Project:     "fleet",
+		Phase:       PhaseDone,
+		StartedAt:   time.Now().UTC(),
+		PID:         1,
+		PRURL:       "https://github.com/acme/repo/pull/1",
+		GatesStatus: GatesStatusFailed,
+	}
+	if err := WriteState("fleet", s.Slug, s); err != nil {
+		t.Fatalf("WriteState: %v; want nil", err)
 	}
 }
 
@@ -1289,7 +1485,7 @@ func TestUpdateStateGen_CAS(t *testing.T) {
 		t.Setenv("FLEET_HOME", tmp)
 		// Live current attempt (gen 3) wrote in-progress + no PR.
 		if err := UpdateStateGen("p", "live-cccc", 3, 3, func(s *State) {
-			s.Phase = PhaseTDDGreen
+			s.Phase = PhaseSpecEncode
 		}); err != nil {
 			t.Fatalf("seed live state: %v", err)
 		}
@@ -1302,7 +1498,7 @@ func TestUpdateStateGen_CAS(t *testing.T) {
 			t.Fatalf("want ErrStaleGeneration, got %v", err)
 		}
 		got, _ := ReadState("p", "live-cccc")
-		if got.Phase != PhaseTDDGreen || got.PRURL != "" {
+		if got.Phase != PhaseSpecEncode || got.PRURL != "" {
 			t.Errorf("stale write clobbered live state: phase=%q pr=%q", got.Phase, got.PRURL)
 		}
 		if got.DispatchGeneration != 3 {
@@ -1320,7 +1516,7 @@ func TestUpdateStateGen_CAS(t *testing.T) {
 		t.Setenv("FLEET_HOME", tmp)
 		// Current attempt already wrote gen 5.
 		if err := UpdateStateGen("p", "newer-eeee", 5, 5, func(s *State) {
-			s.Phase = PhaseTDDGreen
+			s.Phase = PhaseSpecEncode
 		}); err != nil {
 			t.Fatalf("seed gen-5 state: %v", err)
 		}
@@ -1334,7 +1530,7 @@ func TestUpdateStateGen_CAS(t *testing.T) {
 			t.Fatalf("higher on-disk gen must reject, got %v", err)
 		}
 		got, _ := ReadState("p", "newer-eeee")
-		if got.Phase != PhaseTDDGreen || got.DispatchGeneration != 5 {
+		if got.Phase != PhaseSpecEncode || got.DispatchGeneration != 5 {
 			t.Errorf("live newer state was clobbered: phase=%q gen=%d",
 				got.Phase, got.DispatchGeneration)
 		}
@@ -1351,7 +1547,7 @@ func TestUpdateStateGen_CAS(t *testing.T) {
 		// status + completed phases on disk.
 		if err := UpdateStateGen("p", "repair-dddd", 1, 1, func(s *State) {
 			s.Phase = PhaseReviewDone
-			s.PhasesCompleted = []Phase{PhaseBranch, PhaseTDDGreen}
+			s.PhasesCompleted = []Phase{PhaseBranch, PhaseSpecEncode}
 			s.ReviewAlphaStatus = ReviewStatusPassed
 			s.ReviewBetaStatus = ReviewStatusPassed
 		}); err != nil {
@@ -1466,7 +1662,7 @@ func TestUpdateStateGenEmitsFleetlog(t *testing.T) {
 	logDir := fleetlog.Dir()
 
 	if err := UpdateStateGen("proj", "slug-fl2", 1, 1, func(s *State) {
-		s.Phase = PhaseTDDGreen
+		s.Phase = PhaseSpecEncode
 	}); err != nil {
 		t.Fatalf("UpdateStateGen: %v", err)
 	}
@@ -1476,8 +1672,8 @@ func TestUpdateStateGenEmitsFleetlog(t *testing.T) {
 		if m["type"] == "state.transition" && m["slug"] == "slug-fl2" {
 			found = true
 			data, _ := m["data"].(map[string]any)
-			if data["to"] != string(PhaseTDDGreen) {
-				t.Errorf("state.transition data.to want %q got %v", PhaseTDDGreen, data["to"])
+			if data["to"] != string(PhaseSpecEncode) {
+				t.Errorf("state.transition data.to want %q got %v", PhaseSpecEncode, data["to"])
 			}
 		}
 	}
@@ -1523,5 +1719,155 @@ func TestUpdateStateNoPhaseChangeOmitsFleetlog(t *testing.T) {
 	}
 	if bogus > 0 {
 		t.Errorf("UpdateState no-phase-change: emitted %d bogus state.transition(s) with from==to", bogus)
+	}
+}
+
+// TestPhaseValidation_ScenarioPhasesAccepted: spec-repro / spec-encode /
+// verify (scenario-first testing) are valid Phase values; the removed
+// tdd-* ladder is not.
+func TestPhaseValidation_ScenarioPhasesAccepted(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("FLEET_HOME", tmp)
+	for _, p := range []Phase{"tdd-red", "tdd-green", "tdd-refactor"} {
+		s := &State{
+			Slug:      "phase-" + sanitizeSlug(string(p)) + "-aaaa",
+			Project:   "fleet",
+			Phase:     p,
+			StartedAt: time.Now().UTC(),
+			PID:       1,
+		}
+		if err := WriteState("fleet", s.Slug, s); !errors.Is(err, ErrInvalidPhase) {
+			t.Errorf("WriteState phase=%s: err=%v; want ErrInvalidPhase", p, err)
+		}
+	}
+	for _, p := range []Phase{PhaseSpecRepro, PhaseSpecEncode, PhaseVerify} {
+		s := &State{
+			Slug:      "phase-" + sanitizeSlug(string(p)) + "-aaaa",
+			Project:   "fleet",
+			Phase:     p,
+			StartedAt: time.Now().UTC(),
+			PID:       1,
+		}
+		if err := WriteState("fleet", s.Slug, s); err != nil {
+			t.Errorf("WriteState phase=%s: %v; want nil", p, err)
+		}
+	}
+}
+
+// TestStateRoundTrip_VerificationFieldsOmittedWhenZero — S6: a
+// state.json written before the verification fields existed loads
+// with zero values and, when rewritten untouched, does not grow the
+// new keys (omitempty), so the on-disk shape of every existing worker
+// is unchanged until a worker actually passes the new flags.
+func TestStateRoundTrip_VerificationFieldsOmittedWhenZero(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("FLEET_HOME", tmp)
+	const slug = "legacy-shape-aaaa"
+	legacy := `{
+  "slug": "legacy-shape-aaaa",
+  "project": "fleet",
+  "phase": "spec-encode",
+  "phases_completed": ["starting", "branch", "spec-repro"],
+  "started_at": "2026-01-02T03:04:05Z",
+  "updated_at": "2026-01-02T03:05:05Z",
+  "pid": 4242
+}
+`
+	path, err := stateJSONPath("fleet", slug)
+	if err != nil {
+		t.Fatalf("stateJSONPath: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := os.WriteFile(path, []byte(legacy), 0o644); err != nil {
+		t.Fatalf("write legacy: %v", err)
+	}
+
+	got, err := ReadState("fleet", slug)
+	if err != nil {
+		t.Fatalf("ReadState: %v", err)
+	}
+	if got.ScenariosTotal != 0 || got.ScenariosVerified != 0 || got.GatesStatus != "" {
+		t.Fatalf("legacy record loaded with non-zero verification fields: %#v", got)
+	}
+
+	if err := UpdateState("fleet", slug, func(s *State) { s.Phase = PhaseVerify }); err != nil {
+		t.Fatalf("UpdateState: %v", err)
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read raw: %v", err)
+	}
+	for _, key := range []string{"scenarios_total", "scenarios_verified", "gates_status"} {
+		if containsSubstring(string(raw), key) {
+			t.Errorf("rewritten legacy state.json gained %q; want omitted (omitempty):\n%s", key, raw)
+		}
+	}
+
+	// Once set, the fields round-trip verbatim.
+	if err := UpdateState("fleet", slug, func(s *State) {
+		s.Phase = PhaseVerify
+		s.ScenariosTotal = 3
+		s.ScenariosVerified = 2
+		s.GatesStatus = GatesStatusFailed
+	}); err != nil {
+		t.Fatalf("UpdateState verify: %v", err)
+	}
+	got, err = ReadState("fleet", slug)
+	if err != nil {
+		t.Fatalf("ReadState after verify: %v", err)
+	}
+	if got.ScenariosTotal != 3 || got.ScenariosVerified != 2 || got.GatesStatus != GatesStatusFailed {
+		t.Errorf("verification fields did not round-trip: %#v", got)
+	}
+}
+
+// TestStateValidation_RejectsBogusVerificationFields: writeStateLocked
+// is the hard guard on the verification fields' shape — enum for
+// gates_status, non-negative counts, verified ≤ total. The rejected
+// write must not touch the on-disk record.
+func TestStateValidation_RejectsBogusVerificationFields(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("FLEET_HOME", tmp)
+	cases := []struct {
+		name    string
+		mut     func(*State)
+		wantErr error
+	}{
+		{"gates_status maybe", func(s *State) { s.GatesStatus = "maybe" }, ErrInvalidGatesStatus},
+		{"verified exceeds total", func(s *State) { s.ScenariosTotal = 3; s.ScenariosVerified = 4 }, ErrInvalidScenarioCounts},
+		{"negative total", func(s *State) { s.ScenariosTotal = -1 }, ErrInvalidScenarioCounts},
+		{"negative verified", func(s *State) { s.ScenariosTotal = 3; s.ScenariosVerified = -1 }, ErrInvalidScenarioCounts},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			slug := "bogus-" + sanitizeSlug(tc.name) + "-aaaa"
+			seed := &State{Slug: slug, Project: "fleet", Phase: PhaseVerify, StartedAt: time.Now().UTC(), PID: 1}
+			if err := WriteState("fleet", slug, seed); err != nil {
+				t.Fatalf("seed: %v", err)
+			}
+			path, _ := stateJSONPath("fleet", slug)
+			before, _ := os.ReadFile(path)
+			err := UpdateState("fleet", slug, tc.mut)
+			if !errors.Is(err, tc.wantErr) {
+				t.Fatalf("UpdateState err = %v; want %v", err, tc.wantErr)
+			}
+			after, _ := os.ReadFile(path)
+			if string(before) != string(after) {
+				t.Errorf("rejected write changed state.json:\n%s\n---\n%s", before, after)
+			}
+		})
+	}
+	// The boundary values are accepted.
+	slug := "bogus-ok-aaaa"
+	seed := &State{Slug: slug, Project: "fleet", Phase: PhaseVerify, StartedAt: time.Now().UTC(), PID: 1}
+	if err := WriteState("fleet", slug, seed); err != nil {
+		t.Fatalf("seed ok: %v", err)
+	}
+	for _, g := range []string{"", GatesStatusPassed, GatesStatusFailed} {
+		if err := UpdateState("fleet", slug, func(s *State) { s.GatesStatus = g; s.ScenariosTotal = 3; s.ScenariosVerified = 3 }); err != nil {
+			t.Errorf("gates_status=%q total=3 verified=3: %v; want nil", g, err)
+		}
 	}
 }

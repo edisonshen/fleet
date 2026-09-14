@@ -134,7 +134,7 @@ func runProjectAdd(rawPath, projectOverride string, stdout, stderr io.Writer) er
 	// without .git is accepted with a stderr warning. The project is
 	// registered with IsGit=false; downstream dispatch swaps the
 	// finisher (push + PR) for a "mark done with local-diff summary"
-	// path. Worker still runs TDD + /review + (where possible) codex
+	// path. Worker still runs spec-repro → encode → verify + /review + (where possible) codex
 	// review.
 	isGit := true
 	if _, gerr := os.Stat(filepath.Join(abs, ".git")); gerr != nil {
