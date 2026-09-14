@@ -1194,9 +1194,9 @@ func TestPhaseValidation_NewReviewPhasesAccepted(t *testing.T) {
 	}
 }
 
-// TestValidateVerifyGate: fires on phase=review-pending and phase=push only,
-// requires gates_status=passed and scenarios_verified == scenarios_total
-// (0/0 is legal).
+// TestValidateVerifyGate: fires on phase=review-pending and the git-mode
+// terminal write (push), requires gates_status=passed and
+// scenarios_verified == scenarios_total (0/0 is legal).
 func TestValidateVerifyGate(t *testing.T) {
 	verified := func(phase Phase, gates string, total, done int) *State {
 		return &State{
@@ -1261,6 +1261,95 @@ func TestValidateVerifyGate(t *testing.T) {
 				t.Fatalf("rejected write must not create state.json; ReadState err=%v", rerr)
 			}
 		})
+	}
+}
+
+// TestValidateVerifyGate_NonGitDone: non-git projects have no push, so the
+// gate fires on phase=done instead; the review gate still runs first.
+func TestValidateVerifyGate_NonGitDone(t *testing.T) {
+	const project = "ng-proj"
+	done := func(slug string) *State {
+		return stateWithReview(project, slug, PhaseDone, ReviewStatusPassed, ReviewEngineClaude, "sonnet-5", "", ReviewStatusPassed, ReviewEngineClaude, "opus-4.8", "")
+	}
+	cases := []struct {
+		name    string
+		state   *State
+		wantErr error
+		wantMsg string
+	}{
+		{"done no gates recorded", func() *State {
+			s := done("ng-aaaa")
+			s.GatesStatus = ""
+			return s
+		}(), ErrPhaseRequiresGates, `phase=done (got gates_status="")`},
+		{"done gates failed", func() *State {
+			s := done("ng-aaaa")
+			s.GatesStatus = GatesStatusFailed
+			s.ScenariosTotal, s.ScenariosVerified = 3, 3
+			return s
+		}(), ErrPhaseRequiresGates, `phase=done (got gates_status="failed")`},
+		{"done counts disagree", func() *State {
+			s := done("ng-aaaa")
+			s.ScenariosTotal, s.ScenariosVerified = 3, 1
+			return s
+		}(), ErrPhaseRequiresScenarios, "phase=done scenarios_verified=1 != scenarios_total=3"},
+		{"done passed 3/3", func() *State {
+			s := done("ng-aaaa")
+			s.ScenariosTotal, s.ScenariosVerified = 3, 3
+			return s
+		}(), nil, ""},
+		{"done passed 0/0", done("ng-aaaa"), nil, ""},
+		{"done missing review wins over failed gates", func() *State {
+			s := done("ng-aaaa")
+			s.ReviewAlphaStatus, s.ReviewBetaStatus = "", ""
+			s.GatesStatus = GatesStatusFailed
+			return s
+		}(), ErrPhaseRequiresReview, ""},
+		{"review-done with failed gates accepted", func() *State {
+			s := done("ng-aaaa")
+			s.Phase = PhaseReviewDone
+			s.GatesStatus = GatesStatusFailed
+			return s
+		}(), nil, ""},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			t.Setenv("FLEET_HOME", t.TempDir())
+			writeNonGitProject(t, project)
+			err := WriteState(project, c.state.Slug, c.state)
+			if c.wantErr == nil {
+				if err != nil {
+					t.Fatalf("WriteState: %v; want nil", err)
+				}
+				return
+			}
+			if !errors.Is(err, c.wantErr) {
+				t.Fatalf("WriteState: got %v; want %v", err, c.wantErr)
+			}
+			if !containsSubstring(err.Error(), c.wantMsg) {
+				t.Fatalf("error %q lacks %q", err.Error(), c.wantMsg)
+			}
+			if _, rerr := ReadState(project, c.state.Slug); !errors.Is(rerr, ErrNotFound) {
+				t.Fatalf("rejected write must not create state.json; ReadState err=%v", rerr)
+			}
+		})
+	}
+}
+
+// Git-mode phase=done is not verify-gated; push already was.
+func TestValidateVerifyGate_GitDoneNotGated(t *testing.T) {
+	t.Setenv("FLEET_HOME", t.TempDir())
+	s := &State{
+		Slug:        "vg-git-done-aaaa",
+		Project:     "fleet",
+		Phase:       PhaseDone,
+		StartedAt:   time.Now().UTC(),
+		PID:         1,
+		PRURL:       "https://github.com/acme/repo/pull/1",
+		GatesStatus: GatesStatusFailed,
+	}
+	if err := WriteState("fleet", s.Slug, s); err != nil {
+		t.Fatalf("WriteState: %v; want nil", err)
 	}
 }
 

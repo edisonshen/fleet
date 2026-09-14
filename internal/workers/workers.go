@@ -186,7 +186,8 @@ type State struct {
 	// rewrite without them (omitempty). writeStateLocked enforces the
 	// shape (enum, non-negative, verified ≤ total) on every write and
 	// validateVerifyGate requires passed + verified == total at
-	// phase=review-pending and phase=push.
+	// phase=review-pending and the terminal write (push, or done for
+	// non-git projects).
 	ScenariosTotal    int    `json:"scenarios_total,omitempty"`
 	ScenariosVerified int    `json:"scenarios_verified,omitempty"`
 	GatesStatus       string `json:"gates_status,omitempty"`
@@ -332,13 +333,18 @@ func validateReviewGate(s *State, gitMode bool) error {
 	return nil
 }
 
-// validateVerifyGate rejects phase=review-pending and phase=push unless
+// validateVerifyGate rejects phase=review-pending and the finisher's
+// terminal write (push for git projects, done for non-git) unless
 // gates_status=passed and scenarios_verified == scenarios_total. An empty
 // gates_status is rejected like "failed"; scenarios_total=0 is legal.
-// Runs after validateReviewGate so a missing review at push still returns
+// Runs after validateReviewGate so a missing review still returns
 // ErrPhaseRequiresReview.
-func validateVerifyGate(s *State) error {
-	if s.Phase != PhaseReviewPending && s.Phase != PhasePush {
+func validateVerifyGate(s *State, gitMode bool) error {
+	terminal := PhasePush
+	if !gitMode {
+		terminal = PhaseDone
+	}
+	if s.Phase != PhaseReviewPending && s.Phase != terminal {
 		return nil
 	}
 	if s.GatesStatus != GatesStatusPassed {
@@ -465,7 +471,7 @@ func writeStateLocked(project, slug string, s *State) error {
 	if err := validateReviewGate(s, gitMode); err != nil {
 		return err
 	}
-	if err := validateVerifyGate(s); err != nil {
+	if err := validateVerifyGate(s, gitMode); err != nil {
 		return err
 	}
 	// phase=done's pr_url precondition applies only to git projects.
