@@ -266,7 +266,8 @@ Rules:
   the worker never mocks a boundary `## Sandbox` can run.
 - The worker exits at `review-pending`; it does not run `/review` and does not
   push.
-- The reviewer runs both resolved slots through `review_slot.py` with the
+- The reviewer runs both resolved slots concurrently with one
+  `review_slot.py --both` call (per-slot `exit` in the JSON report) with the
   Scenario-contract lens (every row has a test at its stated level asserting the
   observable outcome; `## Evidence — before` proves it would have failed;
   a missing row, a row below the `## Sandbox` max level without the plan's
@@ -288,6 +289,10 @@ Rules:
   (what `fleet init` prompts for / `fleet init --parallelism N` writes), then 3.
   Parallelism above 1 uses worktrees and conflict checks; set `parallelism: 1`
   for serialized in-place dispatch.
+- `coord-config.json:review_effort` (`low|medium|high`, default `high`;
+  project file, then `~/.fleet/coord-config.json`) sets the reasoning effort
+  passed to both review slots. Lower it on projects with small diffs where
+  review wall-time matters more than depth.
 - `coord-config.json:worktree_timeout_s` bounds `git worktree add` (default
   300s, clamped to 5..3600). Raise it on repos whose full checkout takes longer
   than that — a timeout kills the add mid-checkout.
