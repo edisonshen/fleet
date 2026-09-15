@@ -6,6 +6,26 @@ follows [SemVer](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.19.1] - 2026-09-15
+
+Patch release: two dashboard fixes. Agents running inside a linked git
+worktree (e.g. `<repo>/.claude/worktrees/agent-<hex>`) now belong to the
+repo's project instead of a phantom `worktrees-agent-<hex>` project, and a
+coordinator that has died can be archived with `[x]` instead of wedging the
+project behind a lock nobody holds.
+
+### Fixed
+
+- `projects.TagForPath` resolves a linked worktree (`p/.git` is a `gitdir:`
+  pointer into `<main>/.git/worktrees/<name>`) to its main checkout, so the
+  Ops Console and `fleet` commands tag such agents with the repo's project
+  (#311).
+- `[x]` on a **dead** coordinator row archives it like any other agent; the
+  refusal (`use [h] handoff or [r] reset`) now applies only to a live coord.
+  `[r]` reset's post-gc backstop attempts a flock-guarded unlink of a leftover
+  `coordinator.lock` (`gc.RemoveCoordLockIfUnheld`): an unheld lock is stale
+  and removed, a held lock still fails closed with no respawn (#312).
+
 ## [0.19.0] - 2026-09-14
 
 Workers test the way a careful human does: reproduce the scenario, encode what
