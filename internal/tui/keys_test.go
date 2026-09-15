@@ -1843,14 +1843,60 @@ func TestKeyX_ArchiveCoord_RefusedAndRedirected(t *testing.T) {
 	}
 }
 
+// A coord whose tmux probe says dead but whom the lease still names as
+// the project's live owner must be refused: the lease is authoritative.
+func TestKeyX_ArchiveDeadProbeCoord_LeaseHeld_Refused(t *testing.T) {
+	stub := &stubFleetCmd{}
+	stub.install(t)
+	(&stubSessionAlive{dead: map[string]bool{"fleet-c00bf003": true}}).install(t)
+	prev := coordSpawnIdentityFn
+	coordSpawnIdentityFn = func(projectName string) string {
+		if projectName == "demo" {
+			return "c00bf003"
+		}
+		return ""
+	}
+	t.Cleanup(func() { coordSpawnIdentityFn = prev })
+
+	coord := agent.New("c00bf003")
+	coord.IsCoord = true
+	coord.Project = ""
+	coord.TaskID = "coord-demo"
+	coord.TmuxSession = "fleet-c00bf003"
+
+	m := makeModelWithAgents(coord)
+	m.aliveByID = map[string]bool{"c00bf003": false}
+	row := m.selectedRow()
+	if row == nil || row.kind != rowAgent || row.agent == nil || row.agent.ID != "c00bf003" {
+		t.Fatalf("cursor not on coord's agent row; got %+v", row)
+	}
+	mm, cmd, handled := m.actionArchive()
+	if !handled || cmd != nil {
+		t.Fatalf("handled=%v cmd=%v; want handled, no cmd", handled, cmd)
+	}
+	if mm.mode != modeNav {
+		t.Fatalf("mode = %v, want modeNav (refused)", mm.mode)
+	}
+	if mm.flash == nil || !mm.flash.isErr || !strings.Contains(mm.flash.text, "can't archive a live coord") {
+		t.Fatalf("flash = %+v, want live-coord refusal", mm.flash)
+	}
+	if len(stub.calls) != 0 {
+		t.Fatalf("expected no fleet calls; got %v", stub.calls)
+	}
+}
+
 // TestKeyX_ArchiveDeadCoord_EntersConfirm: a coord whose tmux session
-// is gone has no session to kill and no lock to orphan — [x] must stage
-// it for archive like any other dead agent instead of redirecting to
-// [h]/[r], so long-dead coord entries can be cleared from the panel.
+// is gone and whom the lease no longer names has no session to kill and
+// no lock to orphan — [x] must stage it for archive like any other dead
+// agent instead of redirecting to [h]/[r], so long-dead coord entries can
+// be cleared from the panel.
 func TestKeyX_ArchiveDeadCoord_EntersConfirm(t *testing.T) {
 	stub := &stubFleetCmd{}
 	stub.install(t)
 	(&stubSessionAlive{dead: map[string]bool{"fleet-c00bf002": true}}).install(t)
+	prev := coordSpawnIdentityFn
+	coordSpawnIdentityFn = func(string) string { return "" }
+	t.Cleanup(func() { coordSpawnIdentityFn = prev })
 
 	coord := agent.New("c00bf002")
 	coord.IsCoord = true

@@ -689,7 +689,10 @@ func (m Model) actionArchive() (Model, tea.Cmd, bool) {
 		// wedge the project. Refuse + redirect to [h]/[r] on the project row.
 		// A dead coord has no session to kill and no lock to orphan — its
 		// record is just a stale entry, so archive proceeds like any agent.
-		if recordIsCoord(cur) && status != "dead" {
+		// "Dead" is the tmux probe; the coordinator lease is the authority
+		// on who is coordinating, so a coord the lease still names as the
+		// live owner is refused even if the probe says its session is gone.
+		if recordIsCoord(cur) && (status != "dead" || coordHoldsLease(cur)) {
 			m.flash = &flashMsg{
 				text:  "[x] can't archive a live coord — use [h] handoff or [r] reset on its project row (left panel)",
 				isErr: true,
@@ -1807,6 +1810,21 @@ func coordTaskID(projectName string) string {
 // coordTaskID(Project)-equality form would miss.
 func recordIsCoord(r *agent.Record) bool {
 	return r != nil && (r.IsCoord || strings.HasPrefix(r.TaskID, "coord-"))
+}
+
+// coordHoldsLease reports whether the coordinator lease for r's project
+// currently names r as the live coord (flock owner or in-flight handoff
+// successor). The project comes from r.Project, falling back to the
+// "coord-<project>" task_id form.
+func coordHoldsLease(r *agent.Record) bool {
+	project := r.Project
+	if project == "" {
+		project = strings.TrimPrefix(r.TaskID, "coord-")
+	}
+	if project == "" {
+		return false
+	}
+	return coordSpawnIdentityFn(project) == r.ID
 }
 
 // findCoordByLockBody returns the alive agent whose ID is written
