@@ -179,11 +179,19 @@ func Write(project string, m Meta) error {
 // for in-flight agents, which is a worse practical regression for a
 // pre-1.0 project. Revisit at v1.0 with a documented migration path.
 //
+// A linked git worktree (p/.git is a `gitdir:` pointer file into
+// <main>/.git/worktrees/<name>) tags as its MAIN checkout: agents run
+// inside such worktrees (e.g. <repo>/.claude/worktrees/agent-<hex>)
+// belong to the repo's project, not to a phantom "worktrees-agent-<hex>".
+//
 // Lives here (not in internal/tui) so callers that only care about
 // the path → tag mapping don't drag the bubbletea dep tree. The TUI
 // re-exports this via internal/tui.ProjectTag.
 func TagForPath(p string) string {
 	p = filepath.Clean(p)
+	if main := linkedWorktreeMain(p); main != "" {
+		p = main
+	}
 	base := filepath.Base(p)
 	parent := filepath.Base(filepath.Dir(p))
 	var raw string
@@ -193,6 +201,42 @@ func TagForPath(p string) string {
 		raw = parent + "-" + base
 	}
 	return sanitizeTag(raw)
+}
+
+// linkedWorktreeMain returns the main checkout root when p is a linked
+// git worktree, i.e. p/.git is a regular file whose `gitdir:` pointer
+// resolves to <main>/.git/worktrees/<name>. Returns "" for a regular
+// clone (.git is a directory), a non-repo, or any other pointer shape.
+func linkedWorktreeMain(p string) string {
+	gitPath := filepath.Join(p, ".git")
+	st, err := os.Stat(gitPath)
+	if err != nil || st.IsDir() {
+		return ""
+	}
+	data, err := os.ReadFile(gitPath)
+	if err != nil {
+		return ""
+	}
+	line, _, _ := strings.Cut(string(data), "\n")
+	gitdir, ok := strings.CutPrefix(strings.TrimSpace(line), "gitdir:")
+	if !ok {
+		return ""
+	}
+	gitdir = strings.TrimSpace(gitdir)
+	if gitdir == "" {
+		return ""
+	}
+	if !filepath.IsAbs(gitdir) {
+		gitdir = filepath.Join(p, gitdir)
+	}
+	gitdir = filepath.Clean(gitdir)
+	// <main>/.git/worktrees/<name>
+	wtDir := filepath.Dir(gitdir)
+	dotGit := filepath.Dir(wtDir)
+	if filepath.Base(wtDir) != "worktrees" || filepath.Base(dotGit) != ".git" {
+		return ""
+	}
+	return filepath.Dir(dotGit)
 }
 
 // sanitizeTag forces s into the state.ValidateProjectName allowlist

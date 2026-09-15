@@ -409,6 +409,13 @@ func isCoordHolderShape(s string) bool {
 //	os.Remove(path)                           -> dirent gone; we own the inode
 //	Flock(LOCK_UN); Close                     -> inode reaped (no other openers)
 func removeCoordLockFile(path string) error {
+	return RemoveCoordLockIfUnheld(path)
+}
+
+// RemoveCoordLockIfUnheld unlinks a coordinator.lock only when no live
+// process holds its flock. Returns an error (and leaves the file) when
+// the lock is held or the inode was swapped between open and lock.
+func RemoveCoordLockIfUnheld(path string) error {
 	f, err := os.OpenFile(path, os.O_RDWR, 0o644)
 	if err != nil {
 		if os.IsNotExist(err) {

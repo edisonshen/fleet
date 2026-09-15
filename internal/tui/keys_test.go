@@ -1843,6 +1843,102 @@ func TestKeyX_ArchiveCoord_RefusedAndRedirected(t *testing.T) {
 	}
 }
 
+// A coord whose tmux probe says dead but whom the lease still names as
+// the project's live owner must be refused: the lease is authoritative.
+func TestKeyX_ArchiveDeadProbeCoord_LeaseHeld_Refused(t *testing.T) {
+	stub := &stubFleetCmd{}
+	stub.install(t)
+	(&stubSessionAlive{dead: map[string]bool{"fleet-c00bf003": true}}).install(t)
+	prev := coordSpawnIdentityFn
+	coordSpawnIdentityFn = func(projectName string) string {
+		if projectName == "demo" {
+			return "c00bf003"
+		}
+		return ""
+	}
+	t.Cleanup(func() { coordSpawnIdentityFn = prev })
+
+	coord := agent.New("c00bf003")
+	coord.IsCoord = true
+	coord.Project = ""
+	coord.TaskID = "coord-demo"
+	coord.TmuxSession = "fleet-c00bf003"
+
+	m := makeModelWithAgents(coord)
+	m.aliveByID = map[string]bool{"c00bf003": false}
+	row := m.selectedRow()
+	if row == nil || row.kind != rowAgent || row.agent == nil || row.agent.ID != "c00bf003" {
+		t.Fatalf("cursor not on coord's agent row; got %+v", row)
+	}
+	mm, cmd, handled := m.actionArchive()
+	if !handled || cmd != nil {
+		t.Fatalf("handled=%v cmd=%v; want handled, no cmd", handled, cmd)
+	}
+	if mm.mode != modeNav {
+		t.Fatalf("mode = %v, want modeNav (refused)", mm.mode)
+	}
+	if mm.flash == nil || !mm.flash.isErr || !strings.Contains(mm.flash.text, "can't archive a live coord") {
+		t.Fatalf("flash = %+v, want live-coord refusal", mm.flash)
+	}
+	if len(stub.calls) != 0 {
+		t.Fatalf("expected no fleet calls; got %v", stub.calls)
+	}
+}
+
+// TestKeyX_ArchiveDeadCoord_EntersConfirm: a coord whose tmux session
+// is gone and whom the lease no longer names has no session to kill and
+// no lock to orphan — [x] must stage it for archive like any other dead
+// agent instead of redirecting to [h]/[r], so long-dead coord entries can
+// be cleared from the panel.
+func TestKeyX_ArchiveDeadCoord_EntersConfirm(t *testing.T) {
+	stub := &stubFleetCmd{}
+	stub.install(t)
+	(&stubSessionAlive{dead: map[string]bool{"fleet-c00bf002": true}}).install(t)
+	prev := coordSpawnIdentityFn
+	coordSpawnIdentityFn = func(string) string { return "" }
+	t.Cleanup(func() { coordSpawnIdentityFn = prev })
+
+	coord := agent.New("c00bf002")
+	coord.IsCoord = true
+	coord.Project = ""
+	coord.TaskID = "coord-demo"
+	coord.TmuxSession = "fleet-c00bf002"
+
+	m := makeModelWithAgents(coord)
+	m.aliveByID = map[string]bool{"c00bf002": false}
+	if deriveStatus(coord, m.aliveByID) != "dead" {
+		t.Fatal("fixture coord must derive as dead")
+	}
+	row := m.selectedRow()
+	if row == nil || row.kind != rowAgent || row.agent == nil || row.agent.ID != "c00bf002" {
+		t.Fatalf("cursor not on coord's agent row; got %+v", row)
+	}
+	mm, cmd, handled := m.actionArchive()
+	if !handled {
+		t.Fatal("[x] not handled by actionArchive on dead coord row")
+	}
+	if cmd != nil {
+		t.Fatal("[x] must not shell out before confirm")
+	}
+	if mm.mode != modeConfirmArchive {
+		t.Fatalf("mode = %v, want modeConfirmArchive", mm.mode)
+	}
+	if mm.archiveCandidate != "c00bf002" {
+		t.Errorf("archiveCandidate = %q, want c00bf002", mm.archiveCandidate)
+	}
+	mm2, cmd2, _ := mm.handleConfirmArchiveKey("y")
+	if cmd2 == nil {
+		t.Fatal("confirm y must return the rm command")
+	}
+	_ = cmd2()
+	if mm2.mode != modeNav {
+		t.Errorf("mode after confirm = %v, want modeNav", mm2.mode)
+	}
+	if len(stub.calls) != 1 || len(stub.calls[0]) < 2 || stub.calls[0][0] != "rm" || stub.calls[0][1] != "c00bf002" {
+		t.Fatalf("expected `fleet rm c00bf002`; got calls %v", stub.calls)
+	}
+}
+
 // TestRecordIsCoord_PrefixForm (A8) pins the exact discriminator the [x]
 // guard, the coord tag, and the GC skip all share. The prefix form
 // classifies a legacy coord (Project="", TaskID="coord-demo") as a coord

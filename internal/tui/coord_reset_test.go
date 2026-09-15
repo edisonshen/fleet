@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -905,9 +906,10 @@ func TestKeyR_InFlightSpawn_RefusesArm(t *testing.T) {
 	}
 }
 
-// TestCoordLockStillPresent is the codex iter-3 [P2] backstop regression:
-// after the reap+gc, a surviving coordinator.lock (gc couldn't classify
-// it → no action line, exit 0) must fail the reset, NOT respawn over it.
+// TestCoordLockStillPresent covers the post-gc backstop: a surviving
+// coordinator.lock that gc couldn't classify (garbled body → no action
+// line, exit 0) is unlinked when nobody holds its flock, and fails the
+// reset (no respawn) when a live holder still has it flocked.
 func TestCoordLockStillPresent(t *testing.T) {
 	pdir := withFleetHome(t)
 	const project = "demo"
@@ -917,7 +919,7 @@ func TestCoordLockStillPresent(t *testing.T) {
 		t.Errorf("absent lock should be success; got %v", err)
 	}
 
-	// Seed a coordinator.lock that survived the sweep.
+	// Seed a garbled, unheld coordinator.lock that survived the sweep.
 	lockDir := filepath.Join(pdir, project, ".locks")
 	if err := os.MkdirAll(lockDir, 0o755); err != nil {
 		t.Fatalf("mkdir locks: %v", err)
@@ -927,20 +929,35 @@ func TestCoordLockStillPresent(t *testing.T) {
 		t.Fatalf("seed lock: %v", err)
 	}
 
-	err := coordLockStillPresent(project)
+	if err := coordLockStillPresent(project); err != nil {
+		t.Fatalf("unheld stale lock should be unlinked; got %v", err)
+	}
+	if _, serr := os.Stat(lockPath); !os.IsNotExist(serr) {
+		t.Fatalf("stale lock should be gone after backstop; stat err=%v", serr)
+	}
+
+	// Seed again and hold the flock like a live coord would.
+	if err := os.WriteFile(lockPath, []byte("garbledbody\n"), 0o644); err != nil {
+		t.Fatalf("seed lock: %v", err)
+	}
+	f, err := os.OpenFile(lockPath, os.O_RDWR, 0o644)
+	if err != nil {
+		t.Fatalf("open lock: %v", err)
+	}
+	defer func() { _ = f.Close() }()
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		t.Fatalf("flock: %v", err)
+	}
+
+	err = coordLockStillPresent(project)
 	if err == nil {
-		t.Fatal("surviving coordinator.lock after gc must fail the reset; got nil")
+		t.Fatal("held coordinator.lock after gc must fail the reset; got nil")
 	}
 	if !strings.Contains(err.Error(), "still present") {
 		t.Errorf("error should explain the surviving lock; got %v", err)
 	}
-
-	// Remove it → success again.
-	if rmErr := os.Remove(lockPath); rmErr != nil {
-		t.Fatalf("rm lock: %v", rmErr)
-	}
-	if err := coordLockStillPresent(project); err != nil {
-		t.Errorf("removed lock should be success; got %v", err)
+	if _, serr := os.Stat(lockPath); serr != nil {
+		t.Errorf("held lock must not be unlinked; stat err=%v", serr)
 	}
 }
 
