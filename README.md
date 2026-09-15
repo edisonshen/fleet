@@ -217,8 +217,9 @@ TASK-PLAN-DOC → IMPLEMENT → PR-TRACK → DONE).
   `drain`, `status`, `tasks`, `workers`, `learnings`, `standards`,
   `peek`, `project`, `rc`, `skills`, `gc`, `maintenance`).
 - `~/.fleet/coord-config.json` / `<project>/coord-config.json` —
-  `parallelism` and `worktree_timeout_s` (default 300s, for monorepos
-  where `git worktree add` is slow).
+  `parallelism`, `worktree_timeout_s` (default 300s, for monorepos
+  where `git worktree add` is slow), and `review_effort`
+  (`low|medium|high`, default `high`, for the reviewer slots).
 - [CHANGELOG.md](CHANGELOG.md) — release history.
 - [skills/fleet-guard/SKILL.md](skills/fleet-guard/SKILL.md) — agent-side
   context watcher and handoff trigger.

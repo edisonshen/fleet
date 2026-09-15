@@ -1,11 +1,17 @@
 #!/usr/bin/env python3
-"""Run one reviewer slot and normalize its gate result.
+"""Run one reviewer slot (or both concurrently) and normalize the gate result.
 
-Exit codes:
+Single slot (`--engine --model`), exit codes:
   0 = no P0/P1 findings
   1 = P0/P1 findings (JSON stdout)
   2 = codex slot skipped (reason on stdout)
   3 = blocked
+
+Both slots (`--both --alpha-engine/--alpha-model --beta-engine/--beta-model`)
+run in parallel; stdout is one JSON object
+  {"alpha": {"exit": n, "findings": [...], "skip_reason": ...}, "beta": {...}}
+and the exit code is 3 if either slot blocked, else 1 if either slot has
+P0/P1 findings, else 0 (a skipped codex alpha shows exit 2 in the JSON only).
 """
 from __future__ import annotations
 
@@ -15,10 +21,13 @@ import re
 import shutil
 import subprocess
 import sys
+import time
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
 from typing import Any
 
 
-MAX_ATTEMPTS = 3
+MAX_ATTEMPTS = 2
 BLOCKING_SEVERITIES = {"P0", "P1"}
 FINDING_RE = re.compile(r"\[(P[0-3])\]", re.IGNORECASE)
 RATE_LIMIT_RE = re.compile(
@@ -53,17 +62,57 @@ def build_inner_schema() -> dict[str, Any]:
     }
 
 
+@dataclass(frozen=True)
+class SlotSpec:
+    engine: str
+    model: str
+    effort: str
+    base: str | None
+    task_context: str | None
+    name: str = "slot"
+
+
+@dataclass
+class SlotOutcome:
+    exit_code: int
+    findings: list[dict[str, Any]]
+    skip_reason: str | None
+    stderr: str
+    error: str | None = None
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--engine", choices=("codex", "claude"), required=True)
-    parser.add_argument("--model", required=True)
+    parser.add_argument("--engine", choices=("codex", "claude"))
+    parser.add_argument("--model")
+    parser.add_argument("--both", action="store_true")
+    parser.add_argument("--alpha-engine", choices=("codex", "claude"))
+    parser.add_argument("--alpha-model")
+    parser.add_argument("--beta-engine", choices=("codex", "claude"))
+    parser.add_argument("--beta-model")
     parser.add_argument("--effort", default="high")
     parser.add_argument("--base")
     parser.add_argument("--task-context")
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.both:
+        missing = [
+            flag
+            for flag, value in (
+                ("--alpha-engine", args.alpha_engine),
+                ("--alpha-model", args.alpha_model),
+                ("--beta-engine", args.beta_engine),
+                ("--beta-model", args.beta_model),
+            )
+            if not value
+        ]
+        if missing:
+            parser.error(f"--both requires {', '.join(missing)}")
+    elif not args.engine or not args.model:
+        parser.error("--engine and --model are required (or use --both)")
+    return args
 
 
-def run_claude(args: argparse.Namespace) -> subprocess.CompletedProcess[str]:
+def run_claude(args: SlotSpec) -> subprocess.CompletedProcess[str]:
     if args.base:
         prompt = f"/review the diff against {args.base}"
     elif args.task_context:
@@ -148,13 +197,13 @@ def parse_claude(stdout: str, returncode: int) -> tuple[list[dict[str, Any]], st
         return [], str(exc)
 
 
-def run_codex(args: argparse.Namespace) -> subprocess.CompletedProcess[str]:
+def run_codex(args: SlotSpec) -> subprocess.CompletedProcess[str]:
     if shutil.which("codex") is None:
         raise FileNotFoundError("codex binary not found")
     command = ["codex", "review"]
     if args.base:
         command.extend(["--base", args.base])
-    command.extend(["--config", 'model_reasoning_effort="high"'])
+    command.extend(["--config", f'model_reasoning_effort="{args.effort}"'])
     return subprocess.run(command, capture_output=True, stdin=subprocess.DEVNULL, text=True)
 
 
@@ -181,7 +230,7 @@ def codex_skip_reason(stdout: str, stderr: str, error: str | None = None) -> str
     return None
 
 
-def run_once(args: argparse.Namespace) -> tuple[list[dict[str, Any]], str | None, str, str | None]:
+def run_once(args: SlotSpec) -> tuple[list[dict[str, Any]], str | None, str, str | None]:
     try:
         if args.engine == "claude":
             completed = run_claude(args)
@@ -202,37 +251,95 @@ def run_once(args: argparse.Namespace) -> tuple[list[dict[str, Any]], str | None
     return findings, error, completed.stderr, None
 
 
-def finish(findings: list[dict[str, Any]]) -> int:
-    blocking = [
-        finding
+def has_blocking(findings: list[dict[str, Any]]) -> bool:
+    return any(
+        finding.get("severity", "").upper() in BLOCKING_SEVERITIES
         for finding in findings
-        if finding.get("severity", "").upper() in BLOCKING_SEVERITIES
-    ]
-    if blocking:
-        print(json.dumps(findings))
+    )
+
+
+def log(spec: SlotSpec, message: str) -> None:
+    print(f"[review_slot {spec.name} {spec.engine}/{spec.model}] {message}", file=sys.stderr)
+
+
+def run_slot(spec: SlotSpec) -> SlotOutcome:
+    last_error = "unknown parse failure"
+    for attempt in range(1, MAX_ATTEMPTS + 1):
+        started = time.monotonic()
+        findings, error, stderr, skip_reason = run_once(spec)
+        elapsed = time.monotonic() - started
+        if skip_reason is not None:
+            log(spec, f"attempt {attempt}/{MAX_ATTEMPTS} skipped ({skip_reason}) in {elapsed:.0f}s")
+            return SlotOutcome(2, [], skip_reason, "")
+        if error is None:
+            code = 1 if has_blocking(findings) else 0
+            log(spec, f"attempt {attempt}/{MAX_ATTEMPTS} exit {code}, {len(findings)} finding(s) in {elapsed:.0f}s")
+            return SlotOutcome(code, findings, None, stderr)
+        last_error = error
+        log(spec, f"attempt {attempt}/{MAX_ATTEMPTS} unparseable in {elapsed:.0f}s: {error}")
+
+    return SlotOutcome(
+        3, [], None, "",
+        error=f"review slot blocked after {MAX_ATTEMPTS} attempts: {last_error}",
+    )
+
+
+def finish_single(outcome: SlotOutcome) -> int:
+    if outcome.exit_code == 2:
+        print(outcome.skip_reason)
+        return 2
+    if outcome.exit_code == 3:
+        print(outcome.error, file=sys.stderr)
+        return 3
+    if outcome.stderr:
+        print(outcome.stderr, end="", file=sys.stderr)
+    if outcome.exit_code == 1:
+        print(json.dumps(outcome.findings))
         return 1
-    if findings:
-        print(json.dumps(findings), file=sys.stderr)
+    if outcome.findings:
+        print(json.dumps(outcome.findings), file=sys.stderr)
+    return 0
+
+
+def finish_both(alpha: SlotOutcome, beta: SlotOutcome) -> int:
+    for outcome in (alpha, beta):
+        if outcome.stderr:
+            print(outcome.stderr, end="", file=sys.stderr)
+        if outcome.error:
+            print(outcome.error, file=sys.stderr)
+    report = {
+        name: {
+            "exit": outcome.exit_code,
+            "findings": outcome.findings,
+            "skip_reason": outcome.skip_reason,
+        }
+        for name, outcome in (("alpha", alpha), ("beta", beta))
+    }
+    print(json.dumps(report))
+    codes = {alpha.exit_code, beta.exit_code}
+    if 3 in codes:
+        return 3
+    if 1 in codes:
+        return 1
     return 0
 
 
 def main() -> int:
     args = parse_args()
-    last_error = "unknown parse failure"
+    if not args.both:
+        spec = SlotSpec(args.engine, args.model, args.effort, args.base, args.task_context)
+        return finish_single(run_slot(spec))
 
-    for _ in range(MAX_ATTEMPTS):
-        findings, error, stderr, skip_reason = run_once(args)
-        if skip_reason is not None:
-            print(skip_reason)
-            return 2
-        if error is None:
-            if stderr:
-                print(stderr, end="", file=sys.stderr)
-            return finish(findings)
-        last_error = error
-
-    print(f"review slot blocked after {MAX_ATTEMPTS} attempts: {last_error}", file=sys.stderr)
-    return 3
+    alpha_spec = SlotSpec(
+        args.alpha_engine, args.alpha_model, args.effort, args.base, args.task_context, "alpha"
+    )
+    beta_spec = SlotSpec(
+        args.beta_engine, args.beta_model, args.effort, args.base, args.task_context, "beta"
+    )
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        alpha_future = pool.submit(run_slot, alpha_spec)
+        beta_future = pool.submit(run_slot, beta_spec)
+        return finish_both(alpha_future.result(), beta_future.result())
 
 
 if __name__ == "__main__":
