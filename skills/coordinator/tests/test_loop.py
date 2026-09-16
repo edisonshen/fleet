@@ -1187,12 +1187,42 @@ def test_dispatch_review_handoffs_wires_resolved_review_slots(
     )
 
     body = (fleet_home / "inbox" / "abcddcba.md").read_text(encoding="utf-8")
+    assert "review_slot.py --both" in body
     if expect_codex:
-        assert "--engine codex" in body
-        assert "--engine claude" in body
+        assert "--alpha-engine codex" in body
+        assert "--beta-engine claude" in body
     else:
-        assert "--engine codex" not in body
-        assert body.count("--engine claude --model") == 2
+        assert "--alpha-engine codex" not in body
+        assert "--alpha-engine claude" in body
+        assert "--beta-engine claude" in body
+
+
+def test_dispatch_review_handoffs_threads_review_effort(
+    fleet_home: Path, project_dir: Path,
+    fleet_run_recorder, dispatch_subprocess, monkeypatch,
+) -> None:
+    monkeypatch.setattr(loop.shutil, "which", lambda name: "/usr/local/bin/codex")
+    (project_dir / loop.COORD_CONFIG_FILE).write_text(
+        json.dumps({"review_effort": "medium"}), encoding="utf-8",
+    )
+    _write_tasks(project_dir, [
+        _make_task("effort-aaaa", status="in-progress", worker_pid=0),
+    ])
+    workers_dir = project_dir / "workers" / "effort-aaaa"
+    workers_dir.mkdir(parents=True, exist_ok=True)
+    (workers_dir / "state.json").write_text(
+        json.dumps({"phase": "review-pending"}), encoding="utf-8",
+    )
+    dispatch_subprocess.append("abcddcba")
+
+    loop.tick(
+        "fleet", coord_id="cccccc01", cwd="/repo",
+        fleet_home=str(fleet_home),
+    )
+
+    body = (fleet_home / "inbox" / "abcddcba.md").read_text(encoding="utf-8")
+    assert "--effort medium" in body
+    assert "--effort high" not in body
 
 
 # ---------- acquire-prompt failure handling (codex iter-4 [P1]) ----------
@@ -5122,3 +5152,32 @@ def test_tick_keeps_claim_when_parse_error_save_fails(
         "pending claim must survive a failed parse-error-path save — "
         "clearing it removes the sole cold-start double-spawn veto"
     )
+
+
+# ---------- review_effort resolution ----------
+
+
+@pytest.mark.parametrize(
+    ("project_cfg", "home_cfg", "want"),
+    [
+        (None, None, "high"),
+        ({"review_effort": "medium"}, None, "medium"),
+        (None, {"review_effort": "LOW"}, "low"),
+        ({"review_effort": "medium"}, {"review_effort": "low"}, "medium"),
+        ({"review_effort": "turbo"}, None, "high"),
+        ({"review_effort": 3}, None, "high"),
+        ({"parallelism": 2}, {"review_effort": "medium"}, "medium"),
+    ],
+)
+def test_load_review_effort_resolution(
+    tmp_path: Path, project_cfg, home_cfg, want: str
+) -> None:
+    home = tmp_path / ".fleet"
+    project_dir = home / "projects" / "proj"
+    project_dir.mkdir(parents=True)
+    if project_cfg is not None:
+        (project_dir / loop.COORD_CONFIG_FILE).write_text(json.dumps(project_cfg))
+    if home_cfg is not None:
+        (home / loop.COORD_CONFIG_FILE).write_text(json.dumps(home_cfg))
+    assert loop._load_review_effort(project_dir, home) == want
+

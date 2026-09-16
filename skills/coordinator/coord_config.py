@@ -5,6 +5,7 @@ Schema (additive — new fields land alongside without breaking the loader):
     {
         "parallelism":        <int>,    # _load_parallelism (loop.py)
         "worktree_timeout_s": <number>, # _load_worktree_timeout (loop.py)
+        "review_effort":      <str>,    # _load_review_effort (loop.py): low|medium|high
         "repo":               <str>     # absolute path to project's git checkout
     }
 

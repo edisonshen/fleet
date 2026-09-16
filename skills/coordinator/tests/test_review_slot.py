@@ -8,6 +8,8 @@ from pathlib import Path
 
 import pytest
 
+import review_slot
+
 
 SCRIPT = Path(__file__).resolve().parents[1] / "review_slot.py"
 
@@ -38,7 +40,14 @@ if counter:
     count = int(path.read_text() or "0") if path.exists() else 0
     path.write_text(str(count + 1))
 
-stdout_file = os.environ.get("REVIEW_SLOT_STDOUT_FILE")
+me = Path(sys.argv[0]).name.upper()
+
+sleep_s = os.environ.get("REVIEW_SLOT_SLEEP_S")
+if sleep_s:
+    import time
+    time.sleep(float(sleep_s))
+
+stdout_file = os.environ.get(f"REVIEW_SLOT_STDOUT_FILE_{me}") or os.environ.get("REVIEW_SLOT_STDOUT_FILE")
 if stdout_file:
     sys.stdout.write(Path(stdout_file).read_text())
 
@@ -46,13 +55,29 @@ stderr_file = os.environ.get("REVIEW_SLOT_STDERR_FILE")
 if stderr_file:
     sys.stderr.write(Path(stderr_file).read_text())
 
-sys.exit(int(os.environ.get("REVIEW_SLOT_EXIT_CODE", "0")))
+sys.exit(int(os.environ.get(f"REVIEW_SLOT_EXIT_CODE_{me}") or os.environ.get("REVIEW_SLOT_EXIT_CODE", "0")))
 """,
             encoding="utf-8",
         )
         script.chmod(0o755)
     monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ['PATH']}")
     return bin_dir
+
+
+ATTEMPT_LOG_PREFIX = "[review_slot "
+
+
+def strip_attempt_log(stderr: str) -> str:
+    return "".join(
+        line for line in stderr.splitlines(keepends=True)
+        if not line.startswith(ATTEMPT_LOG_PREFIX)
+    )
+
+
+def assert_only_attempt_log(stderr: str) -> None:
+    lines = stderr.splitlines()
+    assert lines, "expected an attempt log line on stderr"
+    assert all(line.startswith(ATTEMPT_LOG_PREFIX) for line in lines), stderr
 
 
 def write_output(tmp_path: Path, text: str, name: str) -> Path:
@@ -148,7 +173,7 @@ def test_review_slot_table(
         assert result.stdout == ""
 
 
-def test_claude_parse_failure_retries_twice_then_blocks(
+def test_claude_parse_failure_retries_once_then_blocks(
     shim_bin: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     counter = tmp_path / "counter.txt"
@@ -162,7 +187,7 @@ def test_claude_parse_failure_retries_twice_then_blocks(
     )
 
     assert result.returncode == 3
-    assert counter.read_text() == "3"
+    assert counter.read_text() == "2"
     assert result.stdout == ""
     assert result.stderr.strip()
 
@@ -189,7 +214,7 @@ def test_claude_clean_false_without_findings_retries_then_blocks(
 
     assert result.returncode == 3
     assert result.stdout == ""
-    assert counter.read_text() == "3"
+    assert counter.read_text() == "2"
     assert "clean=false with no findings" in result.stderr
 
 
@@ -214,7 +239,7 @@ def test_claude_clean_false_with_nonblocking_finding_exits_clean(
 
     assert result.returncode == 0
     assert result.stdout == ""
-    assert json.loads(result.stderr) == [{"severity": "P2"}]
+    assert json.loads(strip_attempt_log(result.stderr)) == [{"severity": "P2"}]
 
 
 def test_claude_clean_false_with_blocking_finding_exits_blocking(
@@ -319,7 +344,7 @@ def test_codex_rate_limited_exits_skip_without_retry(
 
     assert result.returncode == 2
     assert result.stdout == "rate-limited\n"
-    assert result.stderr == ""
+    assert_only_attempt_log(result.stderr)
     assert counter.read_text() == "1"
 
 
@@ -339,7 +364,7 @@ def test_codex_rate_limited_on_stdout_exits_skip_without_retry(
 
     assert result.returncode == 2
     assert result.stdout == "rate-limited\n"
-    assert result.stderr == ""
+    assert_only_attempt_log(result.stderr)
     assert counter.read_text() == "1"
 
 
@@ -360,7 +385,7 @@ def test_codex_unavailable_exits_skip_without_retry(
 
     assert result.returncode == 2
     assert result.stdout == "unavailable\n"
-    assert result.stderr == ""
+    assert_only_attempt_log(result.stderr)
     assert counter.read_text() == "1"
 
 
@@ -381,7 +406,7 @@ def test_codex_parse_failure_without_skip_signal_retries_then_blocks(
 
     assert result.returncode == 3
     assert result.stdout == ""
-    assert counter.read_text() == "3"
+    assert counter.read_text() == "2"
     assert "review slot blocked" in result.stderr
 
 
@@ -400,7 +425,7 @@ def test_codex_findings_win_over_rate_limit_skip_signal(
     assert result.returncode == 1
     findings = json.loads(result.stdout)
     assert [item["severity"] for item in findings] == ["P0"]
-    assert result.stderr == "usage limit reached\n"
+    assert strip_attempt_log(result.stderr) == "usage limit reached\n"
 
 
 def test_codex_nonzero_stdout_without_findings_retries_then_blocks(
@@ -420,7 +445,7 @@ def test_codex_nonzero_stdout_without_findings_retries_then_blocks(
 
     assert result.returncode == 3
     assert result.stdout == ""
-    assert counter.read_text() == "3"
+    assert counter.read_text() == "2"
     assert "codex exited nonzero with no findings" in result.stderr
 
 
@@ -441,7 +466,7 @@ def test_codex_missing_ref_error_retries_then_blocks(
 
     assert result.returncode == 3
     assert result.stdout == ""
-    assert counter.read_text() == "3"
+    assert counter.read_text() == "2"
     assert "review slot blocked" in result.stderr
 
 
@@ -559,6 +584,146 @@ def test_claude_prompt_matches_git_or_non_git_mode(
     assert "structured review" in without_base_argv[-1]
     assert "JSON schema" in without_base_argv[-1]
     assert '{"clean": bool, "findings":' in without_base_argv[-1]
+
+
+CLEAN_ENVELOPE = json.dumps(
+    {
+        "type": "result",
+        "subtype": "success",
+        "session_id": "sess",
+        "result": json.dumps({"clean": True, "findings": []}),
+    }
+)
+
+BOTH_ARGS = [
+    "--both",
+    "--alpha-engine", "codex", "--alpha-model", "gpt-5.5-codex",
+    "--beta-engine", "claude", "--beta-model", "claude-opus-4-8",
+    "--base", "origin/main",
+]
+
+
+def test_both_runs_slots_concurrently_and_reports_clean(
+    shim_bin: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    argv_log = tmp_path / "argv.jsonl"
+    monkeypatch.setenv("REVIEW_SLOT_SLEEP_S", "1.5")
+    monkeypatch.setenv(
+        "REVIEW_SLOT_STDOUT_FILE_CODEX", str(write_output(tmp_path, "", "codex.txt"))
+    )
+
+    import time
+    started = time.monotonic()
+    result = run_slot(tmp_path, monkeypatch, BOTH_ARGS, CLEAN_ENVELOPE, argv_log=argv_log)
+    elapsed = time.monotonic() - started
+
+    assert result.returncode == 0, result.stderr
+    assert elapsed < 2.8, f"slots did not overlap: {elapsed:.1f}s"
+    report = json.loads(result.stdout)
+    assert report == {
+        "alpha": {"exit": 0, "findings": [], "skip_reason": None},
+        "beta": {"exit": 0, "findings": [], "skip_reason": None},
+    }
+    argvs = [json.loads(line) for line in argv_log.read_text().splitlines()]
+    names = sorted(Path(a[0]).name for a in argvs)
+    assert names == ["claude", "codex"]
+    assert "[review_slot alpha codex/gpt-5.5-codex]" in result.stderr
+    assert "[review_slot beta claude/claude-opus-4-8]" in result.stderr
+
+
+def test_both_alpha_blocking_beta_clean_exits_one(
+    shim_bin: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv(
+        "REVIEW_SLOT_STDOUT_FILE_CODEX",
+        str(write_output(tmp_path, "[P1] missing guard\n", "codex.txt")),
+    )
+
+    result = run_slot(tmp_path, monkeypatch, BOTH_ARGS, CLEAN_ENVELOPE)
+
+    assert result.returncode == 1
+    report = json.loads(result.stdout)
+    assert report["alpha"]["exit"] == 1
+    assert [f["severity"] for f in report["alpha"]["findings"]] == ["P1"]
+    assert report["beta"]["exit"] == 0
+
+
+def test_both_alpha_skipped_beta_clean_exits_zero(
+    shim_bin: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv(
+        "REVIEW_SLOT_STDOUT_FILE_CODEX",
+        str(write_output(tmp_path, "usage limit reached\n", "codex.txt")),
+    )
+
+    result = run_slot(tmp_path, monkeypatch, BOTH_ARGS, CLEAN_ENVELOPE)
+
+    assert result.returncode == 0
+    report = json.loads(result.stdout)
+    assert report["alpha"] == {"exit": 2, "findings": [], "skip_reason": "rate-limited"}
+    assert report["beta"]["exit"] == 0
+
+
+def test_both_beta_blocked_wins_over_alpha_findings(
+    shim_bin: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv(
+        "REVIEW_SLOT_STDOUT_FILE_CODEX",
+        str(write_output(tmp_path, "[P0] data loss\n", "codex.txt")),
+    )
+
+    result = run_slot(tmp_path, monkeypatch, BOTH_ARGS, "not json")
+
+    assert result.returncode == 3
+    report = json.loads(result.stdout)
+    assert report["alpha"]["exit"] == 1
+    assert report["beta"]["exit"] == 3
+    assert "review slot blocked after 2 attempts" in result.stderr
+
+
+def test_effort_is_threaded_to_both_engines(
+    shim_bin: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    argv_log = tmp_path / "argv.jsonl"
+    monkeypatch.setenv(
+        "REVIEW_SLOT_STDOUT_FILE_CODEX", str(write_output(tmp_path, "", "codex.txt"))
+    )
+
+    result = run_slot(
+        tmp_path, monkeypatch, [*BOTH_ARGS, "--effort", "medium"], CLEAN_ENVELOPE, argv_log=argv_log
+    )
+
+    assert result.returncode == 0
+    argvs = {Path(a[0]).name: a for a in map(json.loads, argv_log.read_text().splitlines())}
+    assert argvs["claude"][argvs["claude"].index("--effort") + 1] == "medium"
+    assert 'model_reasoning_effort="medium"' in argvs["codex"]
+
+
+def test_both_requires_all_slot_flags(
+    shim_bin: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    result = run_slot(tmp_path, monkeypatch, ["--both", "--alpha-engine", "codex"], "")
+    assert result.returncode == 2
+    assert "--both requires" in result.stderr
+
+
+def test_both_rejects_non_claude_beta_engine(
+    shim_bin: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    args = [
+        "--both", "--alpha-engine", "codex", "--alpha-model", "gpt-5.5-codex",
+        "--beta-engine", "codex", "--beta-model", "gpt-5.5-codex",
+    ]
+    result = run_slot(tmp_path, monkeypatch, args, "")
+    assert result.returncode == 2
+    assert "--beta-engine" in result.stderr
+
+
+def test_finish_both_beta_skip_is_blocked() -> None:
+    clean = review_slot.SlotOutcome(0, [], None, "")
+    skipped = review_slot.SlotOutcome(2, [], "rate-limited", "")
+    assert review_slot.finish_both(skipped, clean) == 0
+    assert review_slot.finish_both(clean, skipped) == 3
 
 
 def test_codex_base_flag_is_threaded_only_when_set(

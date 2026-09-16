@@ -3442,6 +3442,33 @@ def _parallelism_from_file(cfg_path: Path) -> int:
     return raw
 
 
+_REVIEW_EFFORTS = ("low", "medium", "high")
+
+
+def _load_review_effort(project_dir: Path, home: Path | None = None) -> str:
+    """Resolve `review_effort` (low|medium|high) for the reviewer slots:
+    the project's coord-config.json wins, then ~/.fleet/coord-config.json,
+    else "high". Unknown values are ignored."""
+    configured = _review_effort_from_file(project_dir / COORD_CONFIG_FILE)
+    if configured or home is None:
+        return configured or "high"
+    return _review_effort_from_file(home / COORD_CONFIG_FILE) or "high"
+
+
+def _review_effort_from_file(cfg_path: Path) -> str:
+    try:
+        with open(cfg_path, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return ""
+    if not isinstance(data, dict):
+        return ""
+    raw = data.get("review_effort")
+    if not isinstance(raw, str) or raw.lower() not in _REVIEW_EFFORTS:
+        return ""
+    return raw.lower()
+
+
 def _load_worktree_timeout(project_dir: Path) -> float:
     """Read coord-config.json's `worktree_timeout_s` field. Defaults to
     0.0 (caller falls through to worktree.CREATE_TIMEOUT_S).
@@ -7689,6 +7716,7 @@ def _dispatch_review_handoffs(
         is_git=is_git,
         unavailable=set(),
     )
+    review_effort = _load_review_effort(home / "projects" / project, home)
     for t in tasks:
         if t.status != "in-progress":
             continue
@@ -7774,6 +7802,7 @@ def _dispatch_review_handoffs(
                 dispatch_generation=handoff_generation,
                 has_codex=has_codex,
                 resolution=resolution,
+                review_effort=review_effort,
             )
             description = f"fleet reviewer {t.slug}"
         except dispatch_mod.PromptTooLargeError as exc:

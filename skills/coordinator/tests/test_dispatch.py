@@ -490,9 +490,9 @@ def test_build_reviewer_prompt_contains_review_iter_loop() -> None:
 def test_build_reviewer_prompt_git_with_codex_threads_slots() -> None:
     t = _make_task()
     out = dispatch.build_reviewer_prompt(t, project="fleet", has_codex=True)
-    assert "review_slot.py" in out
-    assert "--engine codex" in out
-    assert "--engine claude" in out
+    assert "review_slot.py --both" in out
+    assert "--alpha-engine codex" in out
+    assert "--beta-engine claude" in out
     assert "--effort high" in out
     assert "--base origin/main" in out
     assert "--task-context" not in out
@@ -503,6 +503,7 @@ def test_build_reviewer_prompt_git_with_codex_threads_slots() -> None:
     assert "exit 0 => record that slot passed" in out
     assert "exit 1 => the slot found [P0]/[P1]" in out
     assert "exit 2 => codex slot skipped" in out
+    assert '"alpha": {"exit": N' in out
     assert "--review-alpha-status skipped --review-alpha-engine codex" in out
     assert "--review-alpha-skip-reason <reason>" in out
     assert "continue (beta still must pass)" in out
@@ -520,13 +521,23 @@ def test_build_reviewer_prompt_git_with_codex_threads_slots() -> None:
 def test_build_reviewer_prompt_git_without_codex_uses_two_claude_slots() -> None:
     t = _make_task()
     out = dispatch.build_reviewer_prompt(t, project="fleet", has_codex=False)
-    assert "--engine codex" not in out
-    assert out.count("--engine claude --model") == 2
+    assert "--alpha-engine codex" not in out
+    assert "--alpha-engine claude" in out
+    assert "--beta-engine claude" in out
     assert dispatch.reviewcfg.SONNET_FALLBACK[0] in out
     assert dispatch.reviewcfg.OPUS_FALLBACK[0] in out
     assert "Loop until BOTH slots exit 0." in out
     assert "Loop until BOTH slots are RESOLVED" not in out
     assert "OR the codex alpha exits 2 (skipped)" not in out
+
+
+def test_build_reviewer_prompt_threads_review_effort() -> None:
+    t = _make_task()
+    out = dispatch.build_reviewer_prompt(
+        t, project="fleet", has_codex=True, review_effort="medium",
+    )
+    assert "--effort medium" in out
+    assert "--effort high" not in out
 
 
 def test_build_reviewer_prompt_git_reruns_both_slots_after_fix() -> None:
@@ -747,14 +758,15 @@ def test_build_reviewer_prompt_non_git_uses_two_claude_slots_without_base() -> N
     out = dispatch.build_reviewer_prompt(
         t, project="scratch", is_git=False, has_codex=True,
     )
-    assert "review_slot.py" in out
-    assert "--engine codex" not in out
-    assert out.count("--engine claude --model") == 2
+    assert "review_slot.py --both" in out
+    assert "--alpha-engine codex" not in out
+    assert "--alpha-engine claude" in out
+    assert "--beta-engine claude" in out
     assert "--base" not in out
-    # Spec + acceptance ride along in --task-context on both slots (the
+    # Spec + acceptance ride along in --task-context on the --both call (the
     # contract lens is appended after them; S3 pins that part).
     contexts = _task_contexts(out)
-    assert len(contexts) == 2
+    assert len(contexts) == 1
     for ctx in contexts:
         assert ctx.startswith(f"{t.spec}\n\nAcceptance:\n{t.acceptance}")
     assert "no-git" not in out
@@ -1279,7 +1291,7 @@ def test_s3_reviewer_prompt_carries_contract_lens(is_git: bool) -> None:
     if is_git:
         assert contexts == []
     else:
-        assert len(contexts) == 2
+        assert len(contexts) == 1
         for ctx in contexts:
             assert ctx.startswith(f"{t.spec}\n\nAcceptance:\n{t.acceptance}")
             assert "Scenario contract lens" in ctx
