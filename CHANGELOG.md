@@ -6,6 +6,45 @@ follows [SemVer](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.20.0] - 2026-09-16
+
+Faster review and finish stages without loosening the gates. The reviewer runs
+the alpha and beta slots **concurrently** in one `review_slot.py --both` call
+(wall-time per round ≈ max(alpha, beta) instead of the sum), and the finisher
+is no longer a subagent: the coordinator tick itself pushes the branch and
+opens the PR, so a task reaches `done` one cold-start Claude session and one
+tick wait sooner.
+
+### Added
+
+- `review_slot.py --both`: alpha and beta review slots run in parallel and
+  report per-slot exit codes. Beta must be Claude; a skipped beta aggregates
+  to blocked, never success. Each attempt logs slot / engine / model /
+  attempt / result / finding count / elapsed to stderr; malformed-output
+  retries drop from 3 to 2 (#315).
+- `coord-config.json:review_effort` (`low|medium|high`, default `high`)
+  controls reviewer effort; resolution is project → `~/.fleet` → default,
+  threaded into the reviewer prompt (#315).
+- `skills/coordinator/finisher.py`: deterministic in-tick finisher. On
+  `phase=review-done` (or a `phase=push` left by a tick that died mid-finish)
+  it validates `verification.md` (`## Gates` and `## Evidence — after`
+  non-empty), writes `phase=push` (review gate), pushes from the worker's
+  worktree (`--force-with-lease` only on a rejected push), creates the PR —
+  or `gh pr edit`s an already-open one — with the `## Summary` / `## Review`
+  / `## Verification` body, and writes `phase=done --pr-url`. Non-git
+  projects write the verification task note once (marker-guarded) before
+  `phase=done`. Timeouts, missing binaries and push/gh failures block with
+  the reason inlined; the outcome lands as a task note (#317).
+
+### Changed
+
+- Three-stage flow is now worker → reviewer → tick finisher; the finisher
+  subagent, its `DISPATCH` block and `build_finisher_prompt` are removed.
+  Reconcile treats `push` as a handoff phase so a mid-finish crash resumes
+  instead of requeueing (#317).
+- `testing-fleet-tui` skill documents fake-engine `review_slot` smoke testing
+  (#316).
+
 ## [0.19.1] - 2026-09-15
 
 Patch release: two dashboard fixes. Agents running inside a linked git
@@ -1519,7 +1558,9 @@ Initial public release.
 - Filesystem packages: `internal/state`, `internal/handoff`,
   `internal/queue`, `internal/spawn`, `internal/tmux`.
 
-[Unreleased]: https://github.com/edisonshen/fleet/compare/v0.19.0...HEAD
+[Unreleased]: https://github.com/edisonshen/fleet/compare/v0.20.0...HEAD
+[0.20.0]: https://github.com/edisonshen/fleet/compare/v0.19.1...v0.20.0
+[0.19.1]: https://github.com/edisonshen/fleet/compare/v0.19.0...v0.19.1
 [0.19.0]: https://github.com/edisonshen/fleet/compare/v0.18.1...v0.19.0
 [0.18.1]: https://github.com/edisonshen/fleet/compare/v0.18.0...v0.18.1
 [0.18.0]: https://github.com/edisonshen/fleet/compare/v0.17.0...v0.18.0
