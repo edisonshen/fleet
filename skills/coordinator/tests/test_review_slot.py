@@ -8,6 +8,8 @@ from pathlib import Path
 
 import pytest
 
+import review_slot
+
 
 SCRIPT = Path(__file__).resolve().parents[1] / "review_slot.py"
 
@@ -703,6 +705,25 @@ def test_both_requires_all_slot_flags(
     result = run_slot(tmp_path, monkeypatch, ["--both", "--alpha-engine", "codex"], "")
     assert result.returncode == 2
     assert "--both requires" in result.stderr
+
+
+def test_both_rejects_non_claude_beta_engine(
+    shim_bin: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    args = [
+        "--both", "--alpha-engine", "codex", "--alpha-model", "gpt-5.5-codex",
+        "--beta-engine", "codex", "--beta-model", "gpt-5.5-codex",
+    ]
+    result = run_slot(tmp_path, monkeypatch, args, "")
+    assert result.returncode == 2
+    assert "--beta-engine" in result.stderr
+
+
+def test_finish_both_beta_skip_is_blocked() -> None:
+    clean = review_slot.SlotOutcome(0, [], None, "")
+    skipped = review_slot.SlotOutcome(2, [], "rate-limited", "")
+    assert review_slot.finish_both(skipped, clean) == 0
+    assert review_slot.finish_both(clean, skipped) == 3
 
 
 def test_codex_base_flag_is_threaded_only_when_set(
