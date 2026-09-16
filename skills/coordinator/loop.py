@@ -43,6 +43,7 @@ from typing import Iterable
 import conflict
 import coord_config
 import dispatch as dispatch_mod
+import finisher as finisher_mod
 try:
     import fleetlog as fleetlog_mod
 except Exception:  # pragma: no cover - logging is best-effort; never block import
@@ -718,8 +719,8 @@ def _decision_line(action) -> str:
             phase = getattr(action, "handoff_phase", "") or ""
             if phase == "review-pending":
                 return f"dispatched reviewer for {slug}"
-            if phase == "review-done":
-                return f"dispatched finisher for {slug}"
+            if phase in ("review-done", "push"):
+                return f"finished {slug}"
             if getattr(action, "dispatch_instruction", "") or getattr(action, "agent_id", ""):
                 gen = getattr(action, "dispatch_generation", 0) or 0
                 return f"dispatched worker {slug} (gen {gen})"
@@ -1259,6 +1260,7 @@ def _tick_locked(
         fleet_home=str(home),
         home=home,
         coord_state=state,
+        cwd=cwd,
     )
     for action in handoffs:
         if action.error:
@@ -1871,6 +1873,7 @@ def _run_supervisor(
             fleet_home=str(home),
             home=home,
             coord_state=cs,
+            cwd=cwd,
         )
         for action in handoffs:
             if action.error:
@@ -4710,16 +4713,17 @@ def _reconcile_inflight(
         # that finish the merge → done lifecycle).
         if t.status == "in-progress":
             # Three-stage flow handoff phases: phase=review-pending
-            # (worker → reviewer) and phase=review-done (reviewer →
-            # finisher). The previous subagent exited cleanly to make
-            # way for the next; this is NOT a "worker died" failure.
-            # The handoff dispatch path (_dispatch_review_handoffs)
-            # spawns the next subagent. Skip the reconcile decision
-            # tree entirely so we don't transcribe the worker's
-            # mid-pipeline exit as a requeue-to-todo.
+            # (worker → reviewer), phase=review-done (reviewer →
+            # in-tick finisher) and phase=push (finisher mid-flight or
+            # died before phase=done). The previous stage exited
+            # cleanly to make way for the next; this is NOT a "worker
+            # died" failure. The handoff dispatch path
+            # (_dispatch_review_handoffs) drives the next stage. Skip
+            # the reconcile decision tree entirely so we don't
+            # transcribe the mid-pipeline exit as a requeue-to-todo.
             mid_phase = _read_worker_state(project, t.slug, home=home)
             if mid_phase is not None and mid_phase.get("phase", "") in (
-                "review-pending", "review-done",
+                "review-pending", "review-done", "push",
             ):
                 # Stuck-handoff recovery: state.json frozen at review-
                 # pending/review-done (handoff chain went off-rails)
@@ -6921,6 +6925,8 @@ class _DispatchAction:
                                   # a handoff inherits the slug's current
                                   # gen (no increment).
     error: str = ""
+    finish: finisher_mod.FinishResult | None = None  # review-done ran the
+                                                     # in-tick finisher.
 
 
 @dataclass
@@ -7622,6 +7628,7 @@ def _dispatch_review_handoffs(
     fleet_home: str,
     home: Path,
     coord_state: dict | None = None,
+    cwd: str | None = None,
 ) -> list[_DispatchAction]:
     """Detect in-flight tasks whose worker dir signals a stage handoff
     and emit DISPATCH blocks for the next stage's subagent.
@@ -7629,7 +7636,9 @@ def _dispatch_review_handoffs(
     Three-stage flow (reviewer-subagent-arch):
 
         worker (phase=review-pending) → reviewer subagent
-        reviewer (phase=review-done)  → finisher subagent
+        reviewer (phase=review-done)  → in-tick finisher (finisher.py):
+        or a finisher that died at      push + PR, no subagent
+        phase=push (git only)
 
     Trigger condition is per-task:
       1. task.status == "in-progress" (the slot is owned).
@@ -7710,16 +7719,20 @@ def _dispatch_review_handoffs(
         if cls != WORKER_STATE_CURRENT or st is None:
             continue
         phase = st.get("phase", "")
-        if phase not in ("review-pending", "review-done"):
+        if phase not in ("review-pending", "review-done", "push"):
+            continue
+        if phase == "push" and not is_git:
             continue
 
-        # De-dup: don't re-spawn a reviewer/finisher while it's still
-        # working. We key on (slug, phase) — once the next subagent
-        # writes phase=review-claude (reviewer iterating) or
-        # phase=push/done (finisher executing), the key changes and
-        # the dispatch is naturally not retriggered.
+        # De-dup: don't re-spawn a reviewer while it's still working.
+        # We key on (slug, phase) — once the reviewer writes
+        # phase=review-claude the key changes and the dispatch is
+        # naturally not retriggered. review-done / push are exempt: the
+        # in-tick finisher is idempotent and moves the phase itself
+        # (push/done/blocked), so a tick that died mid-finish (leaving
+        # phase=push) simply reruns it.
         key = f"{t.slug}:{phase}"
-        if key in seen_handoffs:
+        if phase == "review-pending" and key in seen_handoffs:
             continue
 
         branch = t.branch or f"worker/{t.slug}"
@@ -7738,23 +7751,31 @@ def _dispatch_review_handoffs(
         # `fleet workers update` lands against the unchanged task-row
         # authority.
         handoff_generation = int(t.dispatch_generation)
+        if phase in ("review-done", "push"):
+            _release_prior_stage_inbox(
+                coord_state, slug=t.slug, phase=phase,
+                fleet_bin=fleet_bin, home=home,
+            )
+            fin = finisher_mod.run_finisher(
+                slug=t.slug, project=project, fleet_bin=fleet_bin,
+                fleet_home=home, repo_dir=worktree or cwd or os.getcwd(),
+                branch=branch, is_git=is_git,
+                dispatch_generation=handoff_generation,
+            )
+            actions.append(_DispatchAction(
+                slug=t.slug, branch=branch, handoff_phase=phase,
+                finish=fin, error=fin.error,
+            ))
+            continue
         try:
-            if phase == "review-pending":
-                prompt = dispatch_mod.build_reviewer_prompt(
-                    t, project=project, branch=branch,
-                    worktree=worktree or None, is_git=is_git,
-                    dispatch_generation=handoff_generation,
-                    has_codex=has_codex,
-                    resolution=resolution,
-                )
-                description = f"fleet reviewer {t.slug}"
-            else:
-                prompt = dispatch_mod.build_finisher_prompt(
-                    t, project=project, branch=branch,
-                    worktree=worktree or None, is_git=is_git,
-                    dispatch_generation=handoff_generation,
-                )
-                description = f"fleet finisher {t.slug}"
+            prompt = dispatch_mod.build_reviewer_prompt(
+                t, project=project, branch=branch,
+                worktree=worktree or None, is_git=is_git,
+                dispatch_generation=handoff_generation,
+                has_codex=has_codex,
+                resolution=resolution,
+            )
+            description = f"fleet reviewer {t.slug}"
         except dispatch_mod.PromptTooLargeError as exc:
             actions.append(_DispatchAction(slug=t.slug, error=str(exc)))
             continue
@@ -7779,7 +7800,7 @@ def _dispatch_review_handoffs(
         # via already_acquired — that would hand the reviewer/finisher
         # the worker's prompt. Kind mismatch → forget the stale entry +
         # mint fresh (a fresh acquire writes the correct prompt).
-        this_kind = "reviewer" if phase == "review-pending" else "finisher"
+        this_kind = "reviewer"
         pending_handoff_rec = None
         if coord_state is not None:
             pending_handoff_rec = supervisor_mod.load_pending_acquire_record_map(
@@ -7836,33 +7857,11 @@ def _dispatch_review_handoffs(
         # Skip the release when we're reusing a pending agent_id —
         # the prior worker's agent_id is the one we're recovering, so
         # releasing it would conflict with the acquire that follows.
-        if coord_state is not None and not reusing_pending:
-            prior_agent_id = supervisor_mod.load_agent_id_map(
-                coord_state,
-            ).get(t.slug, "")
-            release_outcome = _release_coord_prompt_inbox(
-                slug=t.slug,
-                agent_id=prior_agent_id,
-                fleet_bin=fleet_bin,
-                fleet_home=home,
-                site=f"handoff phase={phase}",
+        if not reusing_pending:
+            _release_prior_stage_inbox(
+                coord_state, slug=t.slug, phase=phase,
+                fleet_bin=fleet_bin, home=home,
             )
-            # Codex iter-9 [P1]: if the handoff release failed
-            # transiently, the new subagent dispatch is about to
-            # overwrite worker_agent_ids with its own id — that would
-            # permanently lose the only handle on the prior subagent's
-            # claim. Stash the prior_agent_id in pending_release_
-            # agent_ids so a later sweep / reconcile can retry. Only
-            # do this when the outcome is non-terminal AND we have a
-            # real agent_id (skip when prior_agent_id was empty —
-            # e.g., legacy pre-PR1 worker).
-            if (
-                prior_agent_id
-                and not _release_outcome_is_terminal(release_outcome)
-            ):
-                supervisor_mod.remember_pending_release_agent_id(
-                    coord_state, t.slug, prior_agent_id,
-                )
         # PR1 dispatch-lifecycle migration: same as _dispatch_ready,
         # but dispatch_kind reflects review-pending → "reviewer" and
         # review-done → "finisher" so the journal owner string + dispatch
@@ -7872,7 +7871,7 @@ def _dispatch_review_handoffs(
             inbox_path = dispatch_mod.acquire_coord_prompt_inbox(
                 agent_id, prompt,
                 owner=f"project/{project}/slug/{t.slug}",
-                dispatch_kind=("reviewer" if phase == "review-pending" else "finisher"),
+                dispatch_kind="reviewer",
                 fleet_bin=fleet_bin,
                 fleet_home=fleet_home,
             )
@@ -8180,6 +8179,28 @@ def _apply_dispatch(action: _DispatchAction, project: str, fleet_bin: str) -> No
           data={"branch": action.branch, "worktree": action.worktree})
 
 
+def _release_prior_stage_inbox(
+    coord_state: dict | None, *, slug: str, phase: str, fleet_bin: str, home: Path,
+) -> None:
+    """Release the outgoing stage's coord_prompt_inbox claim before the
+    next stage runs. Best-effort; a non-terminal outcome stashes the
+    agent_id in pending_release_agent_ids so a later sweep retries."""
+    if coord_state is None:
+        return
+    prior_agent_id = supervisor_mod.load_agent_id_map(coord_state).get(slug, "")
+    release_outcome = _release_coord_prompt_inbox(
+        slug=slug,
+        agent_id=prior_agent_id,
+        fleet_bin=fleet_bin,
+        fleet_home=home,
+        site=f"handoff phase={phase}",
+    )
+    if prior_agent_id and not _release_outcome_is_terminal(release_outcome):
+        supervisor_mod.remember_pending_release_agent_id(
+            coord_state, slug, prior_agent_id,
+        )
+
+
 def _apply_dispatch_handoff(
     action: _DispatchAction, project: str, fleet_bin: str,
 ) -> None:
@@ -8205,6 +8226,18 @@ def _apply_dispatch_handoff(
     # breadcrumb the operator sees in `fleet tasks show` for the
     # reviewer/finisher slot.
     label = action.handoff_phase or "handoff"
+    if action.finish is not None:
+        fin = action.finish
+        if fin.blocked_reason:
+            msg = f"{label}: finisher blocked — {fin.blocked_reason}"
+        else:
+            msg = f"{label}: finisher done ({', '.join(fin.steps)})"
+            if fin.pr_url:
+                msg += f" → {fin.pr_url}"
+        _run_fleet([
+            fleet_bin, "tasks", "note", "--project", project, action.slug, msg,
+        ])
+        return
     if action.agent_id:
         _run_fleet([
             fleet_bin, "tasks", "note", "--project", project, action.slug,

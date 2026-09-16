@@ -41,7 +41,7 @@ def test_decision_line_dispatch_reviewer_finisher():
     rev = loop._decision_line(_dispatch(agent_id="a", handoff_phase="review-pending"))
     fin = loop._decision_line(_dispatch(agent_id="a", handoff_phase="review-done"))
     assert rev == "dispatched reviewer for s-1111"
-    assert fin == "dispatched finisher for s-1111"
+    assert fin == "finished s-1111"
 
 
 def test_decision_line_dispatch_error_is_empty():

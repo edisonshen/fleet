@@ -1,6 +1,6 @@
 ---
 name: coordinator
-description: Per-project coordinator that owns tasks.md, saves approved plan docs, dispatches worker/reviewer/finisher Agent subagents, monitors PR/CI, and raises hand only when human input is needed. Mutates task state only through fleet CLI. One coordinator per project is enforced by coordinator.lock.
+description: Per-project coordinator that owns tasks.md, saves approved plan docs, dispatches worker/reviewer Agent subagents, pushes + opens PRs from the tick, monitors PR/CI, and raises hand only when human input is needed. Mutates task state only through fleet CLI. One coordinator per project is enforced by coordinator.lock.
 ---
 
 # coordinator
@@ -72,7 +72,7 @@ Every engagement follows this eight-step order:
 3. SPLIT          approved plan -> tasks.md, inline <=10 or planner >10
 4. TASK LIST      one-line goal per task; structured state remains in fields
 5. TASK-PLAN-DOC  save docs/TASK-PLAN-<slug>.md (+ render & open .html), link, promote
-6. IMPLEMENT      worker -> reviewer -> finisher; cap=1 by default
+6. IMPLEMENT      worker -> reviewer -> tick finisher; cap=1 by default
 7. PR-TRACK       async PR/CI shepherding; fix/rebase subagents when needed
 8. DONE           set pr_url + status=done; advance or raise hand when empty
 ```
@@ -236,11 +236,13 @@ technical decision — preserve every invariant verbatim in meaning.
 
 ### Step 6 — IMPLEMENT
 
-Implementation is a three-stage flow across separate Agent subagents:
+Implementation is a three-stage flow: two Agent subagents, then a
+deterministic finisher that runs inside the coord tick (`finisher.py`, no
+subagent, no coordinator context):
 
 ```text
-worker                       reviewer                    finisher
-------                       --------                    --------
+worker                       reviewer                    finisher (tick)
+------                       --------                    ---------------
 reproduce -> encode -> verify  -> alpha/beta slot loop    -> push + PR
 verification.md (evidence)      contract lens; re-verify    ## Verification = the
 local commits                   after any fix; no push      evidence, verbatim
@@ -278,11 +280,19 @@ Rules:
   must pass; the beta review is never skippable.
 - On git projects, an alpha codex slot may be recorded as skipped only for
   `rate-limited` or `unavailable`; non-git projects resolve to Claude slots.
-- The finisher pushes and opens the PR only when review terminal fields satisfy
-  the worker state validator. Its PR body carries `## Verification` =
-  verification.md verbatim (the non-git finisher writes the same block into the
-  done note). A missing file or an empty `## Gates` / `## Evidence — after`
-  blocks with `finisher: no verification evidence (<path>)` — no PR, no done.
+- The finisher runs in the tick on `phase=review-done` (and again on
+  `phase=push` if an earlier tick died mid-finish): `--phase push` (the
+  worker state validator gates on review terminal fields), `git push -u` from
+  the worker's worktree (`--force-with-lease` only on a rejected push), then
+  `gh pr create` — or `gh pr edit` on an already-open PR for the branch — with
+  `## Summary` / `## Review` / `## Verification` = verification.md verbatim,
+  then `--phase done --pr-url`. Non-git projects skip push/PR: the same
+  `## Verification` block is written as a task note (once, marker-guarded)
+  before `--phase done`. A missing file or an empty `## Gates` /
+  `## Evidence — after` blocks with `finisher: no verification evidence
+  (<path>)` — no push, no PR, no done. Any push / gh failure (including a
+  timeout or missing binary) blocks with the error inlined; the outcome lands
+  as a task note.
 - Default parallelism is 3. Resolution order: the project's
   `coord-config.json:parallelism`, then `~/.fleet/coord-config.json:parallelism`
   (what `fleet init` prompts for / `fleet init --parallelism N` writes), then 3.
@@ -594,7 +604,8 @@ Same phases, no branch/commit/push/PR. Reviewer runs two Claude slots through
 
 - `loop.py` — tick driver and dispatch block emission.
 - `parse.py` — read-only Python task parser mirror.
-- `dispatch.py` — worker/reviewer/finisher prompt builders and inbox writes.
+- `dispatch.py` — worker/reviewer prompt builders and inbox writes.
+- `finisher.py` — in-tick push + PR (or non-git done note) on `review-done`.
 - `workflow_state.py` — atomic `workflow.md` writer.
 - `handoff_resume.py` — successor coord resume helper.
 - `register_subagent.py` — records host Agent `subagent_id`.
