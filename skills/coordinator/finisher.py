@@ -1,14 +1,16 @@
 """Deterministic finisher: run inside the coordinator tick once the
-reviewer has written phase=review-done.
+reviewer has written phase=review-done (or a prior tick died at phase=push).
 
-    git:      phase=push (review gate) -> git push -> verification gate
-              -> gh pr create (reuse an open PR on the branch) -> phase=done
-    non-git:  verification gate -> phase=done -> tasks note (## Verification)
+    git:      verification gate -> phase=push (review gate) -> git push
+              -> gh pr create | gh pr edit (open PR on the branch) -> phase=done
+    non-git:  verification gate -> tasks note (## Verification, once)
+              -> phase=done
 
 Every step is idempotent so a tick that dies mid-run can redo the whole
-sequence on the next tick. Any push / gh failure flips the worker to
-phase=blocked with the error inlined; only a failure to write state at all
-is returned as `error` (the tick logs it and retries).
+sequence on the next tick. Any push / gh failure (including a timeout or a
+missing binary) flips the worker to phase=blocked with the error inlined;
+only a failure to write state at all is returned as `error` (the tick logs
+it and retries).
 """
 from __future__ import annotations
 
@@ -25,12 +27,11 @@ FLEET_TIMEOUT_S = 30.0
 GIT_PUSH_TIMEOUT_S = 180.0
 GH_TIMEOUT_S = 90.0
 
-_REVIEW_FIELDS = (
-    "review_alpha_status", "review_alpha_engine", "review_alpha_model",
-    "review_alpha_rounds", "review_alpha_skip_reason",
-    "review_beta_status", "review_beta_engine", "review_beta_model",
-    "review_beta_rounds",
-)
+NOTE_MARKER = "finisher-note.done"
+
+
+class CommandError(Exception):
+    """An external command could not run (timeout, missing binary, OS error)."""
 
 
 @dataclass
@@ -139,10 +140,15 @@ class Finisher:
 
     def _exec(self, cmd: list[str], *, timeout: float, cwd: str | None = None,
               stdin: str | None = None) -> subprocess.CompletedProcess:
-        return self._run(
-            cmd, capture_output=True, text=True, timeout=timeout,
-            check=False, cwd=cwd, input=stdin,
-        )
+        try:
+            return self._run(
+                cmd, capture_output=True, text=True, timeout=timeout,
+                check=False, cwd=cwd, input=stdin,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise CommandError(f"{' '.join(cmd[:3])} timed out after {timeout:.0f}s") from exc
+        except OSError as exc:
+            raise CommandError(f"{' '.join(cmd[:3])} could not run: {exc}") from exc
 
     def _fleet(self, args: list[str]) -> subprocess.CompletedProcess:
         prev = os.environ.get("FLEET_TICK")
@@ -163,8 +169,11 @@ class Finisher:
 
     def _block(self, reason: str) -> FinishResult:
         reason = _one_line(reason)
-        proc = self._workers_update("--phase", "blocked", "--reason", reason)
         self.result.blocked_reason = reason
+        try:
+            proc = self._workers_update("--phase", "blocked", "--reason", reason)
+        except CommandError as exc:
+            return self._fail(f"finisher: phase=blocked write failed after {reason!r}: {exc}")
         if proc.returncode != 0:
             self.result.error = (
                 f"finisher: phase=blocked write failed after {reason!r}: "
@@ -219,10 +228,23 @@ class Finisher:
             return []
         return [ln for ln in proc.stdout.splitlines() if ln.strip()]
 
-    def _create_pr(self, verification_text: str) -> tuple[str, str]:
+    def _title_body(self, verification_text: str) -> tuple[str, str]:
         subjects = self._commit_subjects()
-        title = subjects[0] if subjects else f"{self.slug}"
-        body = pr_body(self._read_state(), subjects, verification_text)
+        title = subjects[0] if subjects else self.slug
+        return title, pr_body(self._read_state(), subjects, verification_text)
+
+    def _edit_pr(self, url: str, verification_text: str) -> str:
+        title, body = self._title_body(verification_text)
+        proc = self._exec(
+            ["gh", "pr", "edit", url, "--title", title, "--body-file", "-"],
+            timeout=GH_TIMEOUT_S, cwd=self.repo_dir, stdin=body,
+        )
+        if proc.returncode != 0:
+            return f"finisher: gh pr edit failed — {_one_line(proc.stderr or proc.stdout)}"
+        return ""
+
+    def _create_pr(self, verification_text: str) -> tuple[str, str]:
+        title, body = self._title_body(verification_text)
         proc = self._exec(
             ["gh", "pr", "create", "--base", self.base, "--head", self.branch,
              "--title", title, "--body-file", "-"],
@@ -242,7 +264,10 @@ class Finisher:
     # ---- entry points ----
 
     def run(self) -> FinishResult:
-        return self._run_git() if self.is_git else self._run_non_git()
+        try:
+            return self._run_git() if self.is_git else self._run_non_git()
+        except CommandError as exc:
+            return self._block(f"finisher: {exc}")
 
     def _run_git(self) -> FinishResult:
         verification_md = self.workers_dir / "verification.md"
@@ -257,11 +282,14 @@ class Finisher:
         self.result.steps.append("phase=push")
         if err := self._push():
             return self._block(err)
+        verification_text = verification_md.read_text(encoding="utf-8")
         url = self._existing_pr()
         if url:
-            self.result.steps.append("pr reused")
+            if err := self._edit_pr(url, verification_text):
+                return self._block(err)
+            self.result.steps.append("pr updated")
         else:
-            url, err = self._create_pr(verification_md.read_text(encoding="utf-8"))
+            url, err = self._create_pr(verification_text)
             if err:
                 return self._block(err)
             self.result.steps.append("pr created")
@@ -279,23 +307,27 @@ class Finisher:
         verification_md = self.workers_dir / "verification.md"
         if reason := verification_gate(verification_md):
             return self._block(reason)
+        marker = self.workers_dir / NOTE_MARKER
+        if not marker.exists():
+            note = (
+                "finisher: local diff shipped in place (non-git)\n\n## Verification\n"
+                + verification_md.read_text(encoding="utf-8")
+            )
+            proc = self._fleet(["tasks", "note", self.slug, "--project", self.project, note])
+            if proc.returncode != 0:
+                return self._fail(
+                    "finisher: tasks note failed: " + _one_line(proc.stderr or proc.stdout)
+                )
+            tmp = marker.with_suffix(".tmp")
+            tmp.write_text("", encoding="utf-8")
+            os.replace(tmp, marker)
+            self.result.steps.append("note")
         proc = self._workers_update("--phase", "done", "--exit", "0")
         if proc.returncode != 0:
             return self._block(
                 "finisher: review gate rejected — " + _one_line(proc.stderr or proc.stdout)
             )
         self.result.steps.append("phase=done")
-        note = (
-            "finisher: local diff shipped in place (non-git)\n\n## Verification\n"
-            + verification_md.read_text(encoding="utf-8")
-        )
-        proc = self._fleet(["tasks", "note", self.slug, "--project", self.project, note])
-        if proc.returncode != 0:
-            return self._fail(
-                "finisher: tasks note failed after phase=done: "
-                + _one_line(proc.stderr or proc.stdout)
-            )
-        self.result.steps.append("note")
         return self.result
 
 

@@ -280,17 +280,19 @@ Rules:
   must pass; the beta review is never skippable.
 - On git projects, an alpha codex slot may be recorded as skipped only for
   `rate-limited` or `unavailable`; non-git projects resolve to Claude slots.
-- The finisher runs in the tick on `phase=review-done`: `--phase push` (the
+- The finisher runs in the tick on `phase=review-done` (and again on
+  `phase=push` if an earlier tick died mid-finish): `--phase push` (the
   worker state validator gates on review terminal fields), `git push -u` from
-  the worker's worktree (`--force-with-lease` only on a rejected push), reuse
-  of an already-open PR on the branch, else `gh pr create` with `## Summary` /
-  `## Review` / `## Verification` = verification.md verbatim, then
-  `--phase done --pr-url`. Non-git projects skip push/PR and write the same
-  `## Verification` block into the done note. A missing file or an empty
-  `## Gates` / `## Evidence — after` blocks with
-  `finisher: no verification evidence (<path>)` — no push, no PR, no done. Any
-  push / gh failure blocks with the error inlined; the outcome lands as a task
-  note.
+  the worker's worktree (`--force-with-lease` only on a rejected push), then
+  `gh pr create` — or `gh pr edit` on an already-open PR for the branch — with
+  `## Summary` / `## Review` / `## Verification` = verification.md verbatim,
+  then `--phase done --pr-url`. Non-git projects skip push/PR: the same
+  `## Verification` block is written as a task note (once, marker-guarded)
+  before `--phase done`. A missing file or an empty `## Gates` /
+  `## Evidence — after` blocks with `finisher: no verification evidence
+  (<path>)` — no push, no PR, no done. Any push / gh failure (including a
+  timeout or missing binary) blocks with the error inlined; the outcome lands
+  as a task note.
 - Default parallelism is 3. Resolution order: the project's
   `coord-config.json:parallelism`, then `~/.fleet/coord-config.json:parallelism`
   (what `fleet init` prompts for / `fleet init --parallelism N` writes), then 3.

@@ -4040,6 +4040,60 @@ def test_loop_finishes_in_tick_on_phase_review_done(
     assert "https://x/pr/7" in finisher_notes[0][-1]
 
 
+def test_loop_resumes_finisher_from_phase_push(
+    fleet_home: Path, project_dir: Path,
+    fleet_run_recorder, dispatch_subprocess,
+) -> None:
+    """A tick that died after writing phase=push leaves the task there;
+    the next tick reruns the finisher instead of stranding the task."""
+    _write_tasks(project_dir, [
+        _make_task("fin-resume-eeee", status="in-progress", worker_pid=0),
+    ])
+    _write_worker_state(fleet_home, "fleet", "fin-resume-eeee", "push")
+    calls: list[dict] = []
+
+    def fake_finish(**kw):
+        calls.append(kw)
+        return finisher.FinishResult(slug=kw["slug"], pr_url="https://x/pr/3")
+
+    with patch.object(loop, "_gh_pr_checks", return_value=loop._CIResult(pending=True)), \
+         patch.object(loop.finisher_mod, "run_finisher", side_effect=fake_finish):
+        loop.tick("fleet", coord_id="cccccc01", cwd="/repo", fleet_home=str(fleet_home))
+    assert [c["slug"] for c in calls] == ["fin-resume-eeee"]
+
+
+def test_loop_phase_push_is_not_requeued_by_reconcile(
+    fleet_home: Path, project_dir: Path,
+    fleet_run_recorder, dispatch_subprocess,
+) -> None:
+    _write_tasks(project_dir, [
+        _make_task("fin-push-dddd", status="in-progress", worker_pid=999999),
+    ])
+    _write_worker_state(fleet_home, "fleet", "fin-push-dddd", "push")
+    with patch.object(loop, "_gh_pr_checks", return_value=loop._CIResult(pending=True)), \
+         patch.object(loop.finisher_mod, "run_finisher",
+                      return_value=finisher.FinishResult(slug="fin-push-dddd", error="transient")):
+        loop.tick("fleet", coord_id="cccccc01", cwd="/repo", fleet_home=str(fleet_home))
+    assert not any(
+        "status=todo" in cmd for cmd in fleet_run_recorder if "fin-push-dddd" in cmd
+    )
+
+
+def test_loop_non_git_phase_push_is_ignored(
+    fleet_home: Path, project_dir: Path,
+    fleet_run_recorder, dispatch_subprocess,
+) -> None:
+    _write_non_git_meta(fleet_home, "fleet")
+    _write_tasks(project_dir, [
+        _make_task("ng-push-ffff", status="in-progress", worker_pid=0),
+    ])
+    _write_worker_state(fleet_home, "fleet", "ng-push-ffff", "push")
+    with patch.object(loop, "_gh_pr_checks", return_value=loop._CIResult(pending=True)), \
+         patch.object(loop.finisher_mod, "run_finisher") as rf:
+        loop.tick("fleet", coord_id="cccccc01", cwd="/repo", fleet_home=str(fleet_home))
+    rf.assert_not_called()
+
+
 def test_loop_records_blocked_finisher_outcome(
     fleet_home: Path, project_dir: Path,
     fleet_run_recorder, dispatch_subprocess,

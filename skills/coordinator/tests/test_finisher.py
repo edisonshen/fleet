@@ -122,13 +122,44 @@ def test_alpha_skipped_reason_in_pr_body(tmp_path: Path) -> None:
     assert "- alpha (codex/gpt-5.5-codex): skipped:rate-limited" in body
 
 
-def test_existing_open_pr_is_reused_not_recreated(tmp_path: Path) -> None:
+def test_existing_open_pr_is_edited_not_recreated(tmp_path: Path) -> None:
     _seed(tmp_path, "t-1")
-    run = FakeRun([(["gh", "pr", "list"], 0, "https://x/pr/42\n", "")])
+    run = FakeRun([
+        (["gh", "pr", "list"], 0, "https://x/pr/42\n", ""),
+        (["git", "log"], 0, "fix: second attempt\n", ""),
+    ])
     res = _finisher(tmp_path, run).run()
     assert res.ok and res.pr_url == "https://x/pr/42"
     assert not run.has("gh", "pr", "create")
-    assert "pr reused" in res.steps
+    edit = next(c for c in run.calls if c["cmd"][:3] == ["gh", "pr", "edit"])
+    assert edit["cmd"][3] == "https://x/pr/42"
+    assert edit["cmd"][edit["cmd"].index("--title") + 1] == "fix: second attempt"
+    assert "## Verification\n" + VERIFICATION.rstrip() in edit["input"]
+    assert "pr updated" in res.steps
+
+
+def test_existing_pr_edit_failure_blocks(tmp_path: Path) -> None:
+    _seed(tmp_path, "t-1")
+    run = FakeRun([
+        (["gh", "pr", "list"], 0, "https://x/pr/42\n", ""),
+        (["gh", "pr", "edit"], 1, "", "gh: HTTP 403"),
+    ])
+    res = _finisher(tmp_path, run).run()
+    assert res.blocked_reason.startswith("finisher: gh pr edit failed — gh: HTTP 403")
+    assert not any("done" in c for c in _update_cmds(run))
+
+
+def test_resume_from_phase_push_reruns_whole_sequence(tmp_path: Path) -> None:
+    wd = _seed(tmp_path, "t-1")
+    st = json.loads((wd / "state.json").read_text())
+    st["phase"] = "push"
+    (wd / "state.json").write_text(json.dumps(st))
+    run = FakeRun([(["gh", "pr", "list"], 0, "https://x/pr/42\n", "")])
+    res = _finisher(tmp_path, run).run()
+    assert res.ok and res.pr_url == "https://x/pr/42"
+    assert run.has("git", "push", "-u")
+    assert _update_cmds(run)[0][-2:] == ["--phase", "push"]
+    assert _update_cmds(run)[-1][-6:-2] == ["--phase", "done", "--pr-url", "https://x/pr/42"]
 
 
 def test_rejected_push_retries_with_force_with_lease_only(tmp_path: Path) -> None:
@@ -223,6 +254,47 @@ def test_blocked_write_failure_surfaces_error(tmp_path: Path) -> None:
     assert "phase=blocked write failed" in res.error
 
 
+def test_command_timeout_blocks_instead_of_raising(tmp_path: Path) -> None:
+    _seed(tmp_path, "t-1")
+    run = FakeRun()
+    inner = run.__call__
+
+    def raising(cmd, **kw):
+        if cmd[:2] == ["gh", "pr"]:
+            raise subprocess.TimeoutExpired(cmd, kw["timeout"])
+        return inner(cmd, **kw)
+
+    res = _finisher(tmp_path, raising).run()
+    assert res.blocked_reason == "finisher: gh pr list timed out after 90s"
+    assert res.error == ""
+    assert any("blocked" in c for c in _update_cmds(run))
+
+
+def test_missing_binary_blocks(tmp_path: Path) -> None:
+    _seed(tmp_path, "t-1")
+    run = FakeRun()
+    inner = run.__call__
+
+    def raising(cmd, **kw):
+        if cmd[0] == "git":
+            raise FileNotFoundError("git")
+        return inner(cmd, **kw)
+
+    res = _finisher(tmp_path, raising).run()
+    assert res.blocked_reason.startswith("finisher: git push -u could not run:")
+
+
+def test_fleet_binary_failure_is_error(tmp_path: Path) -> None:
+    _seed(tmp_path, "t-1")
+
+    def raising(cmd, **kw):
+        raise FileNotFoundError("fleet")
+
+    res = _finisher(tmp_path, raising).run()
+    assert not res.ok
+    assert "phase=blocked write failed" in res.error
+
+
 # ---- non-git ----
 
 def test_non_git_marks_done_without_push_or_pr_and_notes_verification(tmp_path: Path) -> None:
@@ -236,8 +308,28 @@ def test_non_git_marks_done_without_push_or_pr_and_notes_verification(tmp_path: 
     assert len(updates) == 1
     assert updates[0][-4:] == ["--phase", "done", "--exit", "0"]
     assert "--pr-url" not in updates[0]
+    kinds = [tuple(c[:3]) for c in run.cmds()]
+    assert kinds.index(("fleet", "tasks", "note")) < kinds.index(("fleet", "workers", "update"))
     note = next(c for c in run.cmds() if c[:3] == ["fleet", "tasks", "note"])
     assert "## Verification" in note[-1] and "passes" in note[-1]
+    assert (tmp_path / "projects" / "proj" / "workers" / "t-1" / finisher.NOTE_MARKER).exists()
+
+
+def test_non_git_note_failure_keeps_phase_and_retries_once(tmp_path: Path) -> None:
+    _seed(tmp_path, "t-1")
+    run = FakeRun([(["fleet", "tasks", "note"], 1, "", "disk full")])
+    res = _finisher(tmp_path, run, is_git=False).run()
+    assert not res.ok and "tasks note failed" in res.error
+    assert _update_cmds(run) == []
+    # retry after the note lands: note is written once, then phase=done
+    run2 = FakeRun()
+    res2 = _finisher(tmp_path, run2, is_git=False).run()
+    assert res2.ok
+    assert sum(1 for c in run2.cmds() if c[:3] == ["fleet", "tasks", "note"]) == 1
+    run3 = FakeRun()
+    _finisher(tmp_path, run3, is_git=False).run()
+    assert not run3.has("fleet", "tasks", "note")
+    assert _update_cmds(run3)[0][-4:] == ["--phase", "done", "--exit", "0"]
 
 
 def test_non_git_missing_verification_blocks(tmp_path: Path) -> None:

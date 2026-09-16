@@ -719,8 +719,8 @@ def _decision_line(action) -> str:
             phase = getattr(action, "handoff_phase", "") or ""
             if phase == "review-pending":
                 return f"dispatched reviewer for {slug}"
-            if phase == "review-done":
-                return f"dispatched finisher for {slug}"
+            if phase in ("review-done", "push"):
+                return f"finished {slug}"
             if getattr(action, "dispatch_instruction", "") or getattr(action, "agent_id", ""):
                 gen = getattr(action, "dispatch_generation", 0) or 0
                 return f"dispatched worker {slug} (gen {gen})"
@@ -4713,16 +4713,17 @@ def _reconcile_inflight(
         # that finish the merge → done lifecycle).
         if t.status == "in-progress":
             # Three-stage flow handoff phases: phase=review-pending
-            # (worker → reviewer) and phase=review-done (reviewer →
-            # finisher). The previous subagent exited cleanly to make
-            # way for the next; this is NOT a "worker died" failure.
-            # The handoff dispatch path (_dispatch_review_handoffs)
-            # spawns the next subagent. Skip the reconcile decision
-            # tree entirely so we don't transcribe the worker's
-            # mid-pipeline exit as a requeue-to-todo.
+            # (worker → reviewer), phase=review-done (reviewer →
+            # in-tick finisher) and phase=push (finisher mid-flight or
+            # died before phase=done). The previous stage exited
+            # cleanly to make way for the next; this is NOT a "worker
+            # died" failure. The handoff dispatch path
+            # (_dispatch_review_handoffs) drives the next stage. Skip
+            # the reconcile decision tree entirely so we don't
+            # transcribe the mid-pipeline exit as a requeue-to-todo.
             mid_phase = _read_worker_state(project, t.slug, home=home)
             if mid_phase is not None and mid_phase.get("phase", "") in (
-                "review-pending", "review-done",
+                "review-pending", "review-done", "push",
             ):
                 # Stuck-handoff recovery: state.json frozen at review-
                 # pending/review-done (handoff chain went off-rails)
@@ -7636,7 +7637,8 @@ def _dispatch_review_handoffs(
 
         worker (phase=review-pending) → reviewer subagent
         reviewer (phase=review-done)  → in-tick finisher (finisher.py):
-                                        push + PR, no subagent
+        or a finisher that died at      push + PR, no subagent
+        phase=push (git only)
 
     Trigger condition is per-task:
       1. task.status == "in-progress" (the slot is owned).
@@ -7717,16 +7719,18 @@ def _dispatch_review_handoffs(
         if cls != WORKER_STATE_CURRENT or st is None:
             continue
         phase = st.get("phase", "")
-        if phase not in ("review-pending", "review-done"):
+        if phase not in ("review-pending", "review-done", "push"):
+            continue
+        if phase == "push" and not is_git:
             continue
 
         # De-dup: don't re-spawn a reviewer while it's still working.
         # We key on (slug, phase) — once the reviewer writes
         # phase=review-claude the key changes and the dispatch is
-        # naturally not retriggered. review-done is exempt: the in-tick
-        # finisher is idempotent and moves the phase itself
-        # (push/done/blocked), so a tick that died mid-finish simply
-        # reruns it.
+        # naturally not retriggered. review-done / push are exempt: the
+        # in-tick finisher is idempotent and moves the phase itself
+        # (push/done/blocked), so a tick that died mid-finish (leaving
+        # phase=push) simply reruns it.
         key = f"{t.slug}:{phase}"
         if phase == "review-pending" and key in seen_handoffs:
             continue
@@ -7747,7 +7751,7 @@ def _dispatch_review_handoffs(
         # `fleet workers update` lands against the unchanged task-row
         # authority.
         handoff_generation = int(t.dispatch_generation)
-        if phase == "review-done":
+        if phase in ("review-done", "push"):
             _release_prior_stage_inbox(
                 coord_state, slug=t.slug, phase=phase,
                 fleet_bin=fleet_bin, home=home,
