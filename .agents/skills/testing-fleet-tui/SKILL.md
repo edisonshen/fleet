@@ -41,3 +41,22 @@ real agents or access remote projects unless separately authorized.
   atomic rejection, not merely an error message.
 - Keep all state/sockets/test artifacts under temporary paths. Avoid running
   skill linking/sync or project registration against the operator's home.
+
+## Coordinator reviewer CLI smoke tests
+- When fake engines are explicitly authorized, prepend a temporary shim bin
+  directory to PATH. Name executable shims `codex` and `claude`; record argv
+  and per-process monotonic start/end timestamps to verify overlap, not just
+  wall time. Label recordings as fake-engine tests.
+- Claude review replies use an outer JSON object whose `result` is a JSON
+  string containing `clean` and `findings`. Codex review replies use text
+  severity markers such as `[P1]`. See coordinator/tests/test_review_slot.py
+  for current response contracts.
+- To run generated reviewer commands against current source, use
+  `fleet skills link --from <checkout>` only with the isolated HOME and
+  FLEET_HOME exports active. This replaces init's frozen embedded copies.
+- A full coordinator tick may require a registered checkout and an ancestor
+  coordinator lease. Do not assume the mocked test_loop.py fixture alone
+  satisfies those runtime guards. If a prompt-builder fallback is authorized,
+  call the config loader and build_reviewer_prompt in a Python REPL, execute
+  the emitted command, and explicitly leave tick/inbox publication untested.
+- In Konsole, Ctrl+= increases the terminal font size for readable recordings.
