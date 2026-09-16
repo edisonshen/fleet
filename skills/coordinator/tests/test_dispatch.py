@@ -629,91 +629,6 @@ def test_build_reviewer_prompt_no_worktree_keeps_checkout() -> None:
     assert "cd /" not in out
 
 
-def test_build_finisher_prompt_worktree_cds_before_push() -> None:
-    """Regression for dispatch-reviewer-finish-9316: the finisher must
-    `cd` into the worker's worktree before `git push` / `gh pr create`,
-    otherwise it operates on the main repo's checkout (wrong branch /
-    no worker commits visible to gh from the wrong cwd)."""
-    t = _make_task()
-    wt = "/Users/x/.fleet/projects/fleet/worktrees/fix-thing-aaaa"
-    out = dispatch.build_finisher_prompt(
-        t, project="fleet", branch="worker/fix-thing-aaaa", worktree=wt,
-    )
-    assert f"cd {wt}" in out
-    # The cd step must come before the push instruction.
-    assert out.index(f"cd {wt}") < out.index("git push")
-
-
-def test_build_finisher_prompt_no_worktree_omits_cd() -> None:
-    """In-place finisher dispatch must NOT emit a `cd` into a worktree —
-    it runs in the main repo's checkout as before."""
-    t = _make_task()
-    out = dispatch.build_finisher_prompt(
-        t, project="fleet", branch="worker/fix-thing-aaaa",
-    )
-    assert "cd /" not in out
-    assert "git push" in out
-
-
-# ---------- build_finisher_prompt (reviewer-subagent-arch) ----------
-
-
-def test_build_finisher_prompt_documents_push_and_pr() -> None:
-    """The finisher's job is mechanical: push, open PR, mark done.
-    The prompt must instruct exactly those steps with no review loop."""
-    t = _make_task()
-    out = dispatch.build_finisher_prompt(t, project="fleet")
-    assert "FINISHER" in out.upper()
-    assert "git push" in out
-    assert "gh pr create" in out
-    assert "--phase done --pr-url" in out
-    # Hard prohibition: finisher does NOT run /review or codex.
-    assert "Do NOT run /review" in out or "do NOT run /review" in out.lower()
-
-
-def test_build_finisher_prompt_git_writes_push_phase_before_done() -> None:
-    """Git finisher must trigger the review gate at phase=push before
-    pushing remote code, then write phase=done only after the PR exists."""
-    t = _make_task()
-    out = dispatch.build_finisher_prompt(t, project="fleet", is_git=True)
-    push_update = f"fleet workers update {t.slug} --project fleet --phase push"
-    done_update = f"fleet workers update {t.slug} --project fleet --phase done --pr-url"
-
-    assert push_update in out
-    assert done_update in out
-    assert out.index(push_update) < out.index("git push -u")
-    assert out.index(push_update) < out.index(done_update)
-
-
-def test_build_finisher_prompt_git_blocks_on_push_gate_rejection() -> None:
-    """A phase=push review-gate rejection must block before push/PR."""
-    t = _make_task()
-    out = dispatch.build_finisher_prompt(t, project="fleet", is_git=True)
-    assert "If this phase=push write is REJECTED by the review gate" in out
-    assert "do NOT" in out and "push or open the PR" in out
-    assert "finisher: review gate rejected at phase=push" in out
-
-
-def test_build_finisher_prompt_force_with_lease_only() -> None:
-    """A finisher that --force-pushes can blow away co-located changes.
-    The prompt must pin --force-with-lease as the only force variant
-    allowed, and document plain --force as prohibited."""
-    t = _make_task()
-    out = dispatch.build_finisher_prompt(t, project="fleet")
-    assert "--force-with-lease" in out
-    # Explicitly prohibits plain force.
-    assert "plain --force" in out.lower() or "NOT plain --force" in out
-
-
-def test_build_finisher_prompt_blocks_on_push_failure() -> None:
-    """The finisher cannot retry blindly on a push/PR creation
-    failure. It must flip to phase=blocked + raise to operator."""
-    t = _make_task()
-    out = dispatch.build_finisher_prompt(t, project="fleet")
-    assert "--phase blocked" in out
-    assert "--reason" in out
-
-
 # ---------- non-git project support (operator clarification 2026-05-12) ----------
 
 
@@ -825,21 +740,6 @@ def test_build_worker_prompt_verify_gate_rejection_line_precedes_handoff(is_git:
     )
 
 
-@pytest.mark.parametrize("is_git", [True, False])
-def test_build_finisher_prompt_unaffected_by_verify_gate(is_git: bool) -> None:
-    """The finisher prompt never writes review-pending and does not carry
-    the worker's verify-gate rejection line."""
-    t = _make_task()
-    out = dispatch.build_finisher_prompt(t, project="fleet", is_git=is_git)
-    assert "--phase review-pending" not in out
-    assert VERIFY_GATE_LINE not in out
-    assert "verify gate" not in out.lower()
-    if is_git:
-        assert f"fleet workers update {t.slug} --project fleet --phase push" in out
-    else:
-        assert "--phase push" not in out
-
-
 def test_build_reviewer_prompt_non_git_uses_two_claude_slots_without_base() -> None:
     t = _make_task()
     t.spec = "Fix the quoted 'thing'.\nKeep context intact."
@@ -872,50 +772,6 @@ def test_build_reviewer_prompt_non_git_reruns_both_slots_after_fix() -> None:
     assert "re-run that slot" not in lower
     assert "same final code" in lower
     assert "if any fix lands after a slot passed" in lower
-
-
-def test_build_finisher_prompt_non_git_skips_push_and_pr() -> None:
-    """Non-git finisher: no git push, no gh pr create. Writes
-    phase=done WITHOUT a pr_url (workers CLI relaxes the pr_url gate
-    for non-git projects).
-    """
-    t = _make_task()
-    out = dispatch.build_finisher_prompt(t, project="scratch", is_git=False)
-    # Hard prohibitions. We assert the imperative-command form is
-    # absent ("git push -u" / "gh pr create" the verb) rather than
-    # the literal substring — the body explains that there is no PR
-    # and no push, which incidentally contains the substring "PR" in
-    # informational prose.
-    assert "git push -u" not in out
-    assert "gh pr create" not in out
-    # Phase done is the terminal write — the command line itself must
-    # NOT carry --pr-url.
-    assert "--phase done --exit 0" in out
-    assert "--phase done --pr-url" not in out
-    assert "--phase push" not in out
-    assert "review_alpha_status=passed" in out
-    assert "review_beta_status=passed" in out
-    assert "no-git" not in out
-    # Diff summary is the operator-visible deliverable.
-    assert "diff" in out.lower()
-
-
-def test_build_finisher_prompt_git_keeps_push_and_pr() -> None:
-    """Regression: is_git=True (default) keeps the existing finisher
-    push + PR workflow.
-    """
-    t = _make_task()
-    out = dispatch.build_finisher_prompt(t, project="fleet", is_git=True)
-    assert "git push" in out
-    assert "gh pr create" in out
-    assert "--phase done --pr-url" in out
-    assert ".review_alpha_" in out
-    assert ".review_beta_" in out
-    assert "- alpha (<engine>/<model>):" in out
-    assert "- beta (claude/<model>):" in out
-    assert "--phase blocked" in out
-    assert "review gate rejected" in out
-    assert ".review_codex_" not in out
 
 
 # ---------- acquire_coord_prompt_inbox (PR1 dispatch-lifecycle) ----------
@@ -1430,104 +1286,6 @@ def test_s3_reviewer_prompt_carries_contract_lens(is_git: bool) -> None:
             assert "observable outcome" in ctx
             assert "`## Sandbox` max level" in ctx
             assert "mock for a boundary `## Sandbox` can run" in ctx
-
-
-@pytest.mark.parametrize("is_git", [True, False], ids=["git", "non-git"])
-def test_s4_finisher_prompt_ships_verification_not_placeholder(is_git: bool) -> None:
-    """S4: the finisher reads verification.md into `## Verification`
-    (PR body / done note) and never emits the old checklist placeholder."""
-    t = _make_task()
-    out = dispatch.build_finisher_prompt(t, project="fleet", is_git=is_git)
-    for needle in ("verification.md", "## Verification",
-                   "finisher: no verification evidence (~/.fleet/projects/fleet/"
-                   "workers/fix-thing-aaaa/verification.md)",
-                   "section_nonempty '## Gates'",
-                   "section_nonempty '## Evidence — after'"):
-        assert needle in out, f"S4: finisher prompt missing {needle!r}"
-    for needle in ("- [ ] CI green", "- [ ] verify locally", "## Test plan"):
-        assert needle not in out, f"S4: finisher prompt still carries {needle!r}"
-    if is_git:
-        assert '## Verification\n$(cat "$V")' in out
-    else:
-        assert "fleet tasks note" in out
-        assert "## Verification" in out.split("fleet tasks note", 1)[1]
-
-
-_S5_GATE_RE = re.compile(r"```sh\n(.*?)```", re.S)
-
-
-def _s5_run_finisher_gate(tmp_path, verification: str | None) -> tuple[int, list[str]]:
-    """Stand up a sandbox FLEET_HOME with a worker at review-done, drop
-    `verification` at its verification.md (None = no file), then run the
-    finisher prompt's step-3 gate snippet followed by the step-4 PR
-    command with `fleet`/`gh`/`git` shimmed onto PATH. Returns the
-    script's exit code and the shims' call log."""
-    fleet_home = tmp_path / "home"
-    workers_dir = fleet_home / "projects" / "fleet" / "workers" / "fix-thing-aaaa"
-    workers_dir.mkdir(parents=True)
-    (workers_dir / "state.json").write_text('{"phase":"review-done"}\n')
-    if verification is not None:
-        (workers_dir / "verification.md").write_text(verification)
-    shims = tmp_path / "bin"
-    shims.mkdir()
-    log = tmp_path / "calls.log"
-    for tool in ("fleet", "gh", "git"):
-        shim = shims / tool
-        shim.write_text(f'#!/bin/sh\necho "{tool} $*" >> "{log}"\n')
-        shim.chmod(0o755)
-    t = _make_task()
-    prompt = dispatch.build_finisher_prompt(
-        t, project="fleet", is_git=True, workers_dir=str(workers_dir),
-    )
-    m = _S5_GATE_RE.search(prompt)
-    assert m, "S5: finisher prompt embeds no ```sh gate snippet"
-    script = m.group(1) + "\ngh pr create --base main --head worker/fix-thing-aaaa\n"
-    env = dict(os.environ, PATH=f"{shims}:{os.environ['PATH']}", FLEET_HOME=str(fleet_home))
-    proc = subprocess.run(
-        ["bash", "-c", script], env=env, capture_output=True, text=True, check=False,
-    )
-    calls = log.read_text().splitlines() if log.exists() else []
-    return proc.returncode, calls
-
-
-_S5_VERIFICATION_EMPTY_GATES = (
-    "## Scenario contract\n| S1 | x |\n\n"
-    "## Evidence — before\nsaw the bug\n\n"
-    "## Evidence — after\nPASS\n\n"
-    "## Gates\n\n"
-    "## Baseline\n\n## Unit tests\ntest_x\n"
-)
-_S5_VERIFICATION_FULL = _S5_VERIFICATION_EMPTY_GATES.replace(
-    "## Gates\n\n", "## Gates\ngo build ./... ok\n\n",
-)
-
-
-@pytest.mark.parametrize(
-    "verification",
-    [_S5_VERIFICATION_EMPTY_GATES, None,
-     _S5_VERIFICATION_FULL.replace("## Evidence — after\nPASS\n", "## Evidence — after\n")],
-    ids=["empty-gates", "missing-file", "empty-evidence-after"],
-)
-def test_s5_finisher_gate_blocks_without_evidence(tmp_path, verification) -> None:
-    """S5: running the finisher's own gate against a worker whose
-    verification.md is missing or has an empty `## Gates` /
-    `## Evidence — after` writes phase=blocked with the canonical reason
-    and never reaches `gh pr create`."""
-    rc, calls = _s5_run_finisher_gate(tmp_path, verification)
-    assert rc == 0, f"S5: gate must exit 0 after blocking, got {rc}: {calls}"
-    path = tmp_path / "home/projects/fleet/workers/fix-thing-aaaa/verification.md"
-    assert calls == [
-        "fleet workers update fix-thing-aaaa --project fleet --phase blocked "
-        f"--reason finisher: no verification evidence ({path})",
-    ], f"S5: unexpected shim calls: {calls}"
-
-
-def test_s5_finisher_gate_passes_with_evidence(tmp_path) -> None:
-    """S5 (control): a filled `## Gates` + `## Evidence — after` lets the
-    same snippet fall through to the PR step."""
-    rc, calls = _s5_run_finisher_gate(tmp_path, _S5_VERIFICATION_FULL)
-    assert rc == 0
-    assert calls == ["gh pr create --base main --head worker/fix-thing-aaaa"], calls
 
 
 def test_s6_built_binary_merged_standards_are_scenario_first(tmp_path) -> None:

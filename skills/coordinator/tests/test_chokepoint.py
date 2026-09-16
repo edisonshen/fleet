@@ -303,7 +303,7 @@ def test_handoff_reader_short_circuits_on_stale(fleet_home: Path) -> None:
     )
     with patch.object(dispatch, "project_is_git", return_value=True), \
          patch.object(dispatch, "build_reviewer_prompt") as rb, \
-         patch.object(dispatch, "build_finisher_prompt") as fb:
+         patch.object(loop.finisher_mod, "run_finisher") as fb:
         actions = loop._dispatch_review_handoffs(
             tasks=[task], project="fleet", fleet_bin="fleet",
             fleet_home=str(fleet_home), home=fleet_home, coord_state={},

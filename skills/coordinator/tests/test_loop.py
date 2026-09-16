@@ -26,6 +26,7 @@ from unittest.mock import patch
 import pytest
 
 import dispatch
+import finisher
 import loop
 import parse
 import pr_watch as pw
@@ -1088,13 +1089,12 @@ def test_handoff_reviewer_prompt_cds_into_worktree(
     )
 
 
-def test_handoff_finisher_prompt_cds_into_worktree(
+def test_handoff_finisher_runs_from_worktree(
     fleet_home: Path, project_dir: Path,
     fleet_run_recorder, dispatch_subprocess,
 ) -> None:
-    """Regression for dispatch-reviewer-finish-9316: the finisher dispatch
-    for a worktree-created task must cd into the worktree before push/PR.
-    FAILS on the parent commit (no worktree passed → no cd step)."""
+    """A worktree task's branch is checked out THERE; the in-tick finisher
+    must push from the worktree, never the main checkout."""
     wt = _seed_worktree(fleet_home, "fleet", "wtfin-aaaa")
     _write_tasks(project_dir, [
         _make_task("wtfin-aaaa", status="in-progress", worker_pid=0),
@@ -1104,22 +1104,22 @@ def test_handoff_finisher_prompt_cds_into_worktree(
     (workers_dir / "state.json").write_text(
         json.dumps({"phase": "review-done"}), encoding="utf-8",
     )
-    dispatch_subprocess.append("ffff0001")
+    calls: list[dict] = []
 
-    loop.tick(
-        "fleet", coord_id="cccccc01", cwd="/repo",
-        fleet_home=str(fleet_home),
-    )
+    def fake_finish(**kw):
+        calls.append(kw)
+        return finisher.FinishResult(slug=kw["slug"], pr_url="https://x/pr/1")
 
-    inbox = fleet_home / "inbox" / "ffff0001.md"
-    assert inbox.exists(), "finisher prompt was not written to inbox"
-    body = inbox.read_text()
-    assert f"cd {wt}" in body, (
-        f"finisher prompt must cd into the worktree; body=\n{body}"
-    )
-    assert body.index(f"cd {wt}") < body.index("git push"), (
-        "cd into worktree must precede git push"
-    )
+    with patch.object(loop.finisher_mod, "run_finisher", side_effect=fake_finish):
+        loop.tick(
+            "fleet", coord_id="cccccc01", cwd="/repo",
+            fleet_home=str(fleet_home),
+        )
+
+    assert len(calls) == 1
+    assert calls[0]["repo_dir"] == str(wt)
+    assert calls[0]["branch"] == "worker/wtfin-aaaa"
+    assert calls[0]["is_git"] is True
 
 
 def test_handoff_reviewer_prompt_no_worktree_keeps_checkout(
@@ -3993,13 +3993,13 @@ def test_loop_dispatches_reviewer_on_phase_review_pending(
     assert review_notes, f"expected review-pending note: {note_calls!r}"
 
 
-def test_loop_dispatches_finisher_on_phase_review_done(
+def test_loop_finishes_in_tick_on_phase_review_done(
     fleet_home: Path, project_dir: Path,
     fleet_run_recorder, dispatch_subprocess,
 ) -> None:
-    """Three-stage flow: reviewer writes phase=review-done → coord
-    dispatches the finisher on the next tick. Counterpart to the
-    review-pending dispatch test."""
+    """Three-stage flow: reviewer writes phase=review-done → the tick runs
+    the deterministic finisher itself. No DISPATCH block, no inbox
+    prompt; the outcome is recorded as a task note."""
     _write_tasks(project_dir, [
         _make_task(
             "review-done-bbbb", status="in-progress", worker_pid=99998,
@@ -4008,65 +4008,132 @@ def test_loop_dispatches_finisher_on_phase_review_done(
     _write_worker_state(
         fleet_home, "fleet", "review-done-bbbb", "review-done",
     )
-    dispatch_subprocess.append("ffffbbbb")
+    calls: list[dict] = []
+
+    def fake_finish(**kw):
+        calls.append(kw)
+        return finisher.FinishResult(
+            slug=kw["slug"], pr_url="https://x/pr/7", steps=["phase=push", "push"],
+        )
+
     with patch.object(loop, "_pid_alive", return_value=False), \
-         patch.object(loop, "_gh_pr_checks", return_value=loop._CIResult(pending=True)):
+         patch.object(loop, "_gh_pr_checks", return_value=loop._CIResult(pending=True)), \
+         patch.object(loop.finisher_mod, "run_finisher", side_effect=fake_finish):
         result = loop.tick(
             "fleet", coord_id="cccccc01", cwd="/repo",
             fleet_home=str(fleet_home),
         )
 
-    assert any(
+    assert calls and calls[0]["slug"] == "review-done-bbbb"
+    assert calls[0]["repo_dir"] == "/repo"
+    assert not any(
         block.startswith("DISPATCH: review-done-bbbb")
-        and "agent_id: ffffbbbb" in block
         for block in result.dispatch_instructions
-    ), f"finisher DISPATCH not emitted: {result.dispatch_instructions!r}"
-    inbox = fleet_home / "inbox" / "ffffbbbb.md"
-    assert inbox.exists()
-    body = inbox.read_text()
-    assert "FINISHER" in body.upper()
-    # The note recorded for this handoff phase is "review-done:".
+    ), result.dispatch_instructions
+    assert not list((fleet_home / "inbox").glob("*.md")) or not any(
+        "FINISHER" in p.read_text().upper()
+        for p in (fleet_home / "inbox").glob("*.md")
+    )
     note_calls = [c for c in fleet_run_recorder if c[1:3] == ["tasks", "note"]]
-    finisher_notes = [c for c in note_calls if "review-done" in (c[-1] if c else "")]
-    assert finisher_notes, f"expected review-done note: {note_calls!r}"
+    finisher_notes = [c for c in note_calls if "finisher done" in (c[-1] if c else "")]
+    assert finisher_notes, f"expected finisher note: {note_calls!r}"
+    assert "https://x/pr/7" in finisher_notes[0][-1]
 
 
-def test_loop_does_not_redispatch_finisher_on_consecutive_ticks(
+def test_loop_resumes_finisher_from_phase_push(
     fleet_home: Path, project_dir: Path,
     fleet_run_recorder, dispatch_subprocess,
 ) -> None:
-    """Finisher dedup: same invariant as the reviewer dedup test, but
-    for phase=review-done. Once a finisher is dispatched, a second
-    tick at the same phase MUST NOT spawn a second finisher."""
+    """A tick that died after writing phase=push leaves the task there;
+    the next tick reruns the finisher instead of stranding the task."""
     _write_tasks(project_dir, [
-        _make_task(
-            "no-double-finisher-dddd", status="in-progress", worker_pid=99996,
-        ),
+        _make_task("fin-resume-eeee", status="in-progress", worker_pid=0),
     ])
-    _write_worker_state(
-        fleet_home, "fleet", "no-double-finisher-dddd", "review-done",
-    )
-    dispatch_subprocess.append("ffffeeee")
-    with patch.object(loop, "_pid_alive", return_value=False), \
-         patch.object(loop, "_gh_pr_checks", return_value=loop._CIResult(pending=True)):
-        first = loop.tick(
-            "fleet", coord_id="cccccc01", cwd="/repo",
-            fleet_home=str(fleet_home),
-        )
-    assert any(
-        b.startswith("DISPATCH: no-double-finisher-dddd")
-        for b in first.dispatch_instructions
-    )
-    with patch.object(loop, "_pid_alive", return_value=False), \
-         patch.object(loop, "_gh_pr_checks", return_value=loop._CIResult(pending=True)):
-        second = loop.tick(
-            "fleet", coord_id="cccccc01", cwd="/repo",
-            fleet_home=str(fleet_home),
-        )
+    _write_worker_state(fleet_home, "fleet", "fin-resume-eeee", "push")
+    calls: list[dict] = []
+
+    def fake_finish(**kw):
+        calls.append(kw)
+        return finisher.FinishResult(slug=kw["slug"], pr_url="https://x/pr/3")
+
+    with patch.object(loop, "_gh_pr_checks", return_value=loop._CIResult(pending=True)), \
+         patch.object(loop.finisher_mod, "run_finisher", side_effect=fake_finish):
+        loop.tick("fleet", coord_id="cccccc01", cwd="/repo", fleet_home=str(fleet_home))
+    assert [c["slug"] for c in calls] == ["fin-resume-eeee"]
+
+
+def test_loop_phase_push_is_not_requeued_by_reconcile(
+    fleet_home: Path, project_dir: Path,
+    fleet_run_recorder, dispatch_subprocess,
+) -> None:
+    _write_tasks(project_dir, [
+        _make_task("fin-push-dddd", status="in-progress", worker_pid=999999),
+    ])
+    _write_worker_state(fleet_home, "fleet", "fin-push-dddd", "push")
+    with patch.object(loop, "_gh_pr_checks", return_value=loop._CIResult(pending=True)), \
+         patch.object(loop.finisher_mod, "run_finisher",
+                      return_value=finisher.FinishResult(slug="fin-push-dddd", error="transient")):
+        loop.tick("fleet", coord_id="cccccc01", cwd="/repo", fleet_home=str(fleet_home))
     assert not any(
-        b.startswith("DISPATCH: no-double-finisher-dddd")
-        for b in second.dispatch_instructions
-    ), f"finisher redispatched on second tick: {second.dispatch_instructions!r}"
+        "status=todo" in cmd for cmd in fleet_run_recorder if "fin-push-dddd" in cmd
+    )
+
+
+def test_loop_non_git_phase_push_is_ignored(
+    fleet_home: Path, project_dir: Path,
+    fleet_run_recorder, dispatch_subprocess,
+) -> None:
+    _write_non_git_meta(fleet_home, "fleet")
+    _write_tasks(project_dir, [
+        _make_task("ng-push-ffff", status="in-progress", worker_pid=0),
+    ])
+    _write_worker_state(fleet_home, "fleet", "ng-push-ffff", "push")
+    with patch.object(loop, "_gh_pr_checks", return_value=loop._CIResult(pending=True)), \
+         patch.object(loop.finisher_mod, "run_finisher") as rf:
+        loop.tick("fleet", coord_id="cccccc01", cwd="/repo", fleet_home=str(fleet_home))
+    rf.assert_not_called()
+
+
+def test_loop_records_blocked_finisher_outcome(
+    fleet_home: Path, project_dir: Path,
+    fleet_run_recorder, dispatch_subprocess,
+) -> None:
+    _write_tasks(project_dir, [
+        _make_task("fin-blocked-cccc", status="in-progress", worker_pid=0),
+    ])
+    _write_worker_state(fleet_home, "fleet", "fin-blocked-cccc", "review-done")
+    blocked = finisher.FinishResult(
+        slug="fin-blocked-cccc", blocked_reason="finisher: git push failed — boom",
+    )
+    with patch.object(loop, "_gh_pr_checks", return_value=loop._CIResult(pending=True)), \
+         patch.object(loop.finisher_mod, "run_finisher", return_value=blocked):
+        result = loop.tick(
+            "fleet", coord_id="cccccc01", cwd="/repo",
+            fleet_home=str(fleet_home),
+        )
+    assert result.errors == []
+    notes = [c[-1] for c in fleet_run_recorder if c[1:3] == ["tasks", "note"]]
+    assert any("finisher blocked" in n and "git push failed" in n for n in notes), notes
+
+
+def test_loop_surfaces_finisher_error_and_retries_next_tick(
+    fleet_home: Path, project_dir: Path,
+    fleet_run_recorder, dispatch_subprocess,
+) -> None:
+    """A state-write failure is an infrastructure error: surfaced in
+    result.errors, no note, and the next tick tries again."""
+    _write_tasks(project_dir, [
+        _make_task("fin-err-dddd", status="in-progress", worker_pid=0),
+    ])
+    _write_worker_state(fleet_home, "fleet", "fin-err-dddd", "review-done")
+    failed = finisher.FinishResult(slug="fin-err-dddd", error="finisher: phase=done write failed")
+    with patch.object(loop, "_gh_pr_checks", return_value=loop._CIResult(pending=True)), \
+         patch.object(loop.finisher_mod, "run_finisher", return_value=failed) as rf:
+        first = loop.tick("fleet", coord_id="cccccc01", cwd="/repo", fleet_home=str(fleet_home))
+        second = loop.tick("fleet", coord_id="cccccc01", cwd="/repo", fleet_home=str(fleet_home))
+    assert any("phase=done write failed" in e for e in first.errors), first.errors
+    assert any("phase=done write failed" in e for e in second.errors), second.errors
+    assert rf.call_count == 2
 
 
 def test_loop_does_not_redispatch_reviewer_on_consecutive_ticks(
@@ -4192,15 +4259,12 @@ def test_loop_dispatches_non_git_worker_with_no_branch_or_commit(
     assert "--phase review-pending" in body
 
 
-def test_loop_dispatches_non_git_finisher_without_push_or_pr(
+def test_loop_non_git_review_done_runs_finisher_without_git(
     fleet_home: Path, project_dir: Path,
     fleet_run_recorder, dispatch_subprocess,
 ) -> None:
-    """Reviewer wrote phase=review-done on a non-git project → coord
-    dispatches the non-git finisher. The finisher prompt MUST NOT
-    contain 'git push' or 'gh pr create' command lines, and the
-    final terminal write does NOT carry --pr-url.
-    """
+    """Non-git project at phase=review-done: the in-tick finisher is
+    invoked with is_git=False (no push / PR path)."""
     _write_non_git_meta(fleet_home, "fleet")
     _write_tasks(project_dir, [
         _make_task(
@@ -4210,29 +4274,24 @@ def test_loop_dispatches_non_git_finisher_without_push_or_pr(
     _write_worker_state(
         fleet_home, "fleet", "ng-finish-bbbb", "review-done",
     )
-    dispatch_subprocess.append("bbbbbb01")
+    calls: list[dict] = []
+
+    def fake_finish(**kw):
+        calls.append(kw)
+        return finisher.FinishResult(slug=kw["slug"], steps=["phase=done", "note"])
+
     with patch.object(loop, "_pid_alive", return_value=False), \
-         patch.object(loop, "_gh_pr_checks", return_value=loop._CIResult(pending=True)):
+         patch.object(loop, "_gh_pr_checks", return_value=loop._CIResult(pending=True)), \
+         patch.object(loop.finisher_mod, "run_finisher", side_effect=fake_finish):
         result = loop.tick(
             "fleet", coord_id="cccccc01", cwd="/repo",
             fleet_home=str(fleet_home),
         )
 
-    blocks = [
-        b for b in result.dispatch_instructions
-        if b.startswith("DISPATCH: ng-finish-bbbb") and "agent_id: bbbbbb01" in b
-    ]
-    assert blocks, f"non-git finisher not dispatched: {result.dispatch_instructions!r}"
-    inbox = fleet_home / "inbox" / "bbbbbb01.md"
-    assert inbox.exists()
-    body = inbox.read_text()
-    assert "FLEET FINISHER" in body.upper()
-    # No push, no PR command lines.
-    assert "git push -u" not in body
-    assert "gh pr create" not in body
-    # phase=done is written without --pr-url.
-    assert "--phase done --exit 0" in body
-    assert "--phase done --pr-url" not in body
+    assert calls and calls[0]["is_git"] is False
+    assert not any(
+        b.startswith("DISPATCH: ng-finish-bbbb") for b in result.dispatch_instructions
+    )
 
 
 def test_loop_non_git_cap_above_one_skips_worktree_create(
