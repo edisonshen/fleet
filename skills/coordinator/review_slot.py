@@ -88,7 +88,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--both", action="store_true")
     parser.add_argument("--alpha-engine", choices=("codex", "claude"))
     parser.add_argument("--alpha-model")
-    parser.add_argument("--beta-engine", choices=("codex", "claude"))
+    parser.add_argument("--beta-engine", choices=("claude",))
     parser.add_argument("--beta-model")
     parser.add_argument("--effort", default="high")
     parser.add_argument("--base")
@@ -317,7 +317,7 @@ def finish_both(alpha: SlotOutcome, beta: SlotOutcome) -> int:
     }
     print(json.dumps(report))
     codes = {alpha.exit_code, beta.exit_code}
-    if 3 in codes:
+    if 3 in codes or beta.exit_code == 2:
         return 3
     if 1 in codes:
         return 1
