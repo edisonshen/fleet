@@ -514,6 +514,7 @@ def build_reviewer_prompt(
     dispatch_generation: int = 0,
     has_codex: bool = False,
     resolution: reviewcfg.Resolution | None = None,
+    review_effort: str = "high",
 ) -> str:
     """Assemble the reviewer subagent's first-turn prompt.
 
@@ -525,12 +526,13 @@ def build_reviewer_prompt(
     finisher subagent picks up from there.
 
     Contract this prompt enforces (matches CLAUDE.md §4):
-      - Each round runs BOTH slots through review_slot.py.
-      - exit 0 records that slot passed; exit 1 means P0/P1 findings,
-        so the reviewer fixes and reruns both slots from scratch; exit 2 means a git
-        codex alpha slot was skipped because review_slot.py printed
-        rate-limited|unavailable on stdout; exit 3 blocks the worker and
-        does not flip review-done.
+      - Each round runs BOTH slots concurrently via `review_slot.py
+        --both`, which prints one JSON report with a per-slot `exit`.
+      - per-slot exit 0 records that slot passed; exit 1 means P0/P1
+        findings, so the reviewer fixes and reruns both slots from
+        scratch; exit 2 means a git codex alpha slot was skipped
+        (`skip_reason` = rate-limited|unavailable); exit 3 blocks the
+        worker and does not flip review-done.
       - Per-iteration fixes are committed (`fix: review iter-N — <line>`)
         on the worker's branch. No squashing.
       - Final action: `fleet workers update <slug> --phase review-done`
@@ -703,15 +705,11 @@ def build_reviewer_prompt(
             f"{task.spec}\n\nAcceptance:\n{task.acceptance}\n\n{contract_lens_context}"
         )
         task_context_arg = f" --task-context {shlex.quote(task_context)}"
-    alpha_cmd = (
-        f"python3 ~/.claude/skills/coordinator/review_slot.py "
-        f"--engine {alpha.engine} --model {alpha.model} --effort high"
-        f"{base_arg}{task_context_arg}"
-    )
-    beta_cmd = (
-        f"python3 ~/.claude/skills/coordinator/review_slot.py "
-        f"--engine {beta.engine} --model {beta.model} --effort high"
-        f"{base_arg}{task_context_arg}"
+    both_cmd = (
+        f"python3 ~/.claude/skills/coordinator/review_slot.py --both "
+        f"--alpha-engine {alpha.engine} --alpha-model {alpha.model} "
+        f"--beta-engine {beta.engine} --beta-model {beta.model} "
+        f"--effort {review_effort}{base_arg}{task_context_arg}"
     )
     if is_git and alpha.engine == "codex":
         alpha_status_arg = "--review-alpha-status {passed|skipped}"
@@ -720,7 +718,7 @@ def build_reviewer_prompt(
             "add `--review-alpha-skip-reason rate-limited|unavailable`."
         )
         alpha_exit2_note = (
-            "   - exit 2 => codex slot skipped (helper prints reason on stdout: "
+            "   - exit 2 => codex slot skipped (`skip_reason` in the report: "
             "rate-limited|unavailable); record that slot as "
             "`--review-alpha-status skipped --review-alpha-engine codex "
             "--review-alpha-skip-reason <reason>` and continue (beta still must pass)."
@@ -775,12 +773,17 @@ def build_reviewer_prompt(
         *initial_step,
         "",
         f"2. Two-slot review loop for {review_target}:",
-        "   Run BOTH slots each round through review_slot.py. Do not invoke",
-        "   `/review` as a bare Skill call and do not run engine-specific",
-        "   review commands directly; the helper owns engine details.",
+        "   Run BOTH slots each round with ONE review_slot.py --both call (the",
+        "   helper runs them concurrently). Do not invoke `/review` as a bare",
+        "   Skill call and do not run engine-specific review commands directly;",
+        "   the helper owns engine details.",
         *contract_lens_lines,
-        f"   - alpha ({alpha.engine}/{alpha.model}): `{alpha_cmd}`",
-        f"   - beta ({beta.engine}/{beta.model}): `{beta_cmd}`",
+        f"   - alpha ({alpha.engine}/{alpha.model}) + beta ({beta.engine}/{beta.model}):",
+        f"     `{both_cmd}`",
+        "   The call prints one JSON object on stdout:",
+        '   `{"alpha": {"exit": N, "findings": [...], "skip_reason": ...}, "beta": {...}}`.',
+        "   Read each slot's `exit` from that report (the process exit code is",
+        "   3 if either slot blocked, else 1 if either has [P0]/[P1], else 0):",
         "   - exit 0 => record that slot passed.",
         f"   - exit 1 => the slot found [P0]/[P1]; {fix_instruction}.",
         *([alpha_exit2_note] if alpha_exit2_note else []),
@@ -818,7 +821,7 @@ def build_reviewer_prompt(
         "",
         "- Do NOT push the branch. Do NOT `gh pr create`. Do NOT amend.",
         "- Do NOT invoke `/review` as a bare Skill call for the loop.",
-        "- Do NOT run engine-specific review commands directly; use review_slot.py.",
+        "- Do NOT run engine-specific review commands directly; use review_slot.py --both.",
         "- Do NOT alter the worker's commits except via review-iter fix commits",
         "  on top in git mode.",
         "",
