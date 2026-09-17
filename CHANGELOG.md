@@ -6,6 +6,60 @@ follows [SemVer](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.21.0] - 2026-09-17
+
+Fleet is no longer Claude-only. The operator picks a **dominant engine** —
+`fleet -codex` or `fleet -claude` — and the coordinator, workers, finisher
+and the beta review anchor all run on it; the other provider is an optional
+second-opinion reviewer. A Codex-only or Claude-only subscription runs Fleet
+end-to-end. The choice is remembered and applied at the *next* coordinator
+start, recovery or handoff — a running coordinator is never replaced (#296).
+
+### Added
+
+- `fleet -codex` / `fleet -claude` / `fleet --engine <claude-code|codex>`
+  select the dominant engine. An explicit flag is persisted to
+  `~/.fleet/coord-config.json:engine` (atomic, sibling keys preserved); a
+  flag-less `fleet` reads it back. Resolution for a new coord spawn,
+  dead-coord recovery and coord handoff is explicit flag → global choice →
+  project stamp → predecessor engine → `claude-code`. Worker handoffs keep
+  their coordinator's engine.
+- Codex coordinator: stock wrapper `codex --dangerously-bypass-approvals-and-sandbox
+  --dangerously-bypass-hook-trust`; the project dir is pre-trusted in
+  `$CODEX_HOME/config.toml` (`trust_level = "trusted"` inserted or upgraded in
+  place, one atomic write) so an unattended coord does not die at the trust
+  prompt. `CODEX_HOME` is propagated into the tmux pane.
+- Provider-aware install: `fleet init`, autoinit and `fleet skills
+  {link,status,sync}` place Codex skills under `~/.agents/skills/<name>` and
+  hooks in `$CODEX_HOME/hooks.json` (default `~/.codex/hooks.json`); Claude
+  keeps `~/.claude/skills` and `~/.claude/settings.json`.
+- Coordinator skill: `DISPATCH` blocks carry `engine:`; Claude fans out via
+  the Agent tool, Codex via `spawn_agent(task_name=<slug>)`.
+  `register_subagent` accepts Codex task slugs; the supervisor trusts
+  heartbeats from either engine.
+- fleet-guard: `read_context_pct` parses Codex rollouts
+  (`token_count.last_token_usage.input_tokens / model_context_window`);
+  coordguard denies Codex `apply_patch` outside the approved docs /
+  `FLEET_HOME` locations, mirroring the Claude edit-tool rule;
+  SessionStart emits `hookSpecificOutput.additionalContext` JSON, accepted by
+  both CLIs.
+
+### Changed
+
+- Review slots are mirrored on the dominant engine: **beta = dominant
+  anchor, never skippable**; alpha = the other provider iff its binary is
+  installed (skippable for `unavailable|rate-limited`), else a second
+  dominant-engine model, else `single-engine-degraded` (legacy
+  `single-claude-degraded` still accepted). The Go gate reads the anchor from
+  the project's live coordinator record, then its `coord-config.json` stamp,
+  then Claude. Both slots share `review_effort` (`claude --effort` /
+  `codex --config model_reasoning_effort`). Codex non-git review uses
+  `codex exec --output-schema` with a closed schema.
+- TUI / attach / handoff respawns pass `--engine` only when the operator was
+  explicit; a custom `--command` coord keeps its engine across a handoff with
+  a stderr warning instead of being rewritten.
+- Remote control (`fleet rc`) remains Claude-only in this release.
+
 ## [0.20.0] - 2026-09-16
 
 Faster review and finish stages without loosening the gates. The reviewer runs
@@ -1558,7 +1612,8 @@ Initial public release.
 - Filesystem packages: `internal/state`, `internal/handoff`,
   `internal/queue`, `internal/spawn`, `internal/tmux`.
 
-[Unreleased]: https://github.com/edisonshen/fleet/compare/v0.20.0...HEAD
+[Unreleased]: https://github.com/edisonshen/fleet/compare/v0.21.0...HEAD
+[0.21.0]: https://github.com/edisonshen/fleet/compare/v0.20.0...v0.21.0
 [0.20.0]: https://github.com/edisonshen/fleet/compare/v0.19.1...v0.20.0
 [0.19.1]: https://github.com/edisonshen/fleet/compare/v0.19.0...v0.19.1
 [0.19.0]: https://github.com/edisonshen/fleet/compare/v0.18.1...v0.19.0
