@@ -25,6 +25,7 @@ import (
 	"unicode"
 
 	"github.com/edisonshen/fleet/internal/agent"
+	"github.com/edisonshen/fleet/internal/enginecfg"
 	"github.com/edisonshen/fleet/internal/fleetlog"
 	"github.com/edisonshen/fleet/internal/handoff"
 	"github.com/edisonshen/fleet/internal/state"
@@ -1033,6 +1034,41 @@ func Spawn(opts Options) (*agent.Record, error) {
 		}
 	}
 	spawnIsCoord := isCoordSpawn(spawnTaskID, spawnProject)
+	// Handoff engine: a coord successor runs the engine the operator
+	// currently wants (explicit flag this invocation → persisted
+	// `fleet -codex` / `-claude` choice → the outgoing coord's engine),
+	// not blindly the predecessor's. The running coord is never touched
+	// by a choice change; it takes effect on exactly this next handoff /
+	// recovery. When the engine flips and the caller handed us a stock
+	// engine wrapper we swap in the new engine's wrapper; a custom
+	// command can't be re-targeted, so the successor keeps its
+	// predecessor's engine and we say so on stderr.
+	handoffEngine := ""
+	if opts.OldRecord != nil {
+		handoffEngine = opts.OldRecord.Engine
+		if handoffEngine == "" {
+			handoffEngine = agent.DefaultEngine
+		}
+		if spawnIsCoord {
+			want := resolveCoordHandoffEngine(spawnProject, handoffEngine)
+			if want != handoffEngine {
+				switch _, stock := enginecfg.EngineForWrapperCommand(opts.Command); {
+				case stock && len(opts.ExecCommand) == 0:
+					argv, err := enginecfg.BuildWrapperCommand(want)
+					if err != nil {
+						return nil, fmt.Errorf("handoff engine %q: %w", want, err)
+					}
+					opts.Command = argv
+					rec.Command = append([]string(nil), argv...)
+					handoffEngine = want
+				default:
+					_, _ = fmt.Fprintf(os.Stderr,
+						"warning: coord %s handoff: engine choice is %s but the coord runs a custom command; successor keeps engine %s (re-dispatch with --command to switch)\n",
+						opts.OldRecord.ID, want, handoffEngine)
+				}
+			}
+		}
+	}
 	coordLeaseSupported := leaseSupportedProbe()
 	if spawnIsCoord && !coordLeaseSupported {
 		return nil, fmt.Errorf(
@@ -1095,32 +1131,25 @@ func Spawn(opts Options) (*agent.Record, error) {
 	// agent_id to exempt them.
 	extraEnv = append(extraEnv, "FLEET_ROLE="+roleEnvValue(spawnIsCoord))
 	// Propagate operator-set FLEET_* knobs. FLEET_ENGINE is a special
-	// case on the handoff branch: the replacement agent inherits
-	// OldRecord.Engine (set below), so its env must match the record
-	// rather than the caller's session env. Without this guard a
-	// caller running `fleet --engine codex handoff <claude-agent>`
-	// would propagate FLEET_ENGINE=codex into a replacement that's
-	// actually running claude-code (codex review iter-2 P1), and
-	// any code inside that replacement keying off FLEET_ENGINE — the
-	// reviewer-prompt builder, `fleet dispatch` subprocesses — would
-	// pick the wrong engine.
+	// case on the handoff branch: the replacement agent runs
+	// handoffEngine (resolved above, stamped on the record below), so
+	// its env must match the record rather than the caller's session
+	// env. Without this guard a worker handoff under `fleet --engine
+	// codex handoff <claude-agent>` would propagate FLEET_ENGINE=codex
+	// into a replacement that's actually running claude-code (codex
+	// review iter-2 P1), and any code inside that replacement keying
+	// off FLEET_ENGINE — the reviewer-prompt builder, `fleet dispatch`
+	// subprocesses — would pick the wrong engine.
 	//
 	// Legacy records (codex review iter-3 P2): pre-v0.9 agent records
 	// predate the engine field, so opts.OldRecord.Engine is "" even
-	// though agent.New defaults the new record to claude-code. Without
-	// normalization the handoff env would inherit the caller's
-	// FLEET_ENGINE while the new record silently sat at claude-code,
-	// re-introducing the env/record mismatch on the upgrade path.
-	// agent.DefaultEngine = "claude-code" matches what agent.New
-	// stamps onto a fresh record, so we substitute it here.
+	// though agent.New defaults the new record to claude-code;
+	// handoffEngine normalizes that to agent.DefaultEngine so env and
+	// record agree on the upgrade path.
 	for _, key := range propagatedRuntimeEnv {
 		v := os.Getenv(key)
 		if key == "FLEET_ENGINE" && opts.OldRecord != nil {
-			eng := opts.OldRecord.Engine
-			if eng == "" {
-				eng = agent.DefaultEngine
-			}
-			v = eng
+			v = handoffEngine
 		}
 		if v != "" {
 			extraEnv = append(extraEnv, key+"="+v)
@@ -1131,12 +1160,11 @@ func Spawn(opts Options) (*agent.Record, error) {
 		// Inherit task identity from outgoing agent.
 		rec.TaskID = opts.OldRecord.TaskID
 		rec.Project = opts.OldRecord.Project
-		// Inherit engine + role + mode so the replacement runs in the
-		// same configuration. v1.1 engine adapter relies on this for
-		// per-agent engine continuity.
-		if opts.OldRecord.Engine != "" {
-			rec.Engine = opts.OldRecord.Engine
-		}
+		// Engine is handoffEngine (the predecessor's unless the
+		// operator's persisted choice re-targeted a coord successor
+		// above); role + mode are inherited so the replacement runs in
+		// the same configuration.
+		rec.Engine = handoffEngine
 		if opts.OldRecord.Role != "" {
 			rec.Role = opts.OldRecord.Role
 		}

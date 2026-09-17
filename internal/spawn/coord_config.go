@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 
+	"github.com/edisonshen/fleet/internal/enginecfg"
 	"github.com/edisonshen/fleet/internal/projects"
 )
 
@@ -55,6 +56,36 @@ func CoordConfigPath(fleetHome, project string) string {
 // ReadCoordConfigEngine is projects.ReadCoordConfigEngine.
 func ReadCoordConfigEngine(fleetHome, project string) string {
 	return projects.ReadCoordConfigEngine(fleetHome, project)
+}
+
+// ResolveEngineChoice is projects.ResolveEngineChoice.
+func ResolveEngineChoice(fleetHome, project string) string {
+	return projects.ResolveEngineChoice(fleetHome, project)
+}
+
+// resolveCoordHandoffEngine picks the engine a coord successor runs:
+//
+//  1. FLEET_ENGINE when FLEET_ENGINE_EXPLICIT=1 — the operator passed
+//     -codex / -claude / --engine on THIS invocation.
+//  2. The persisted operator choice (global coord-config.json::engine,
+//     then the project's stamp) — see projects.ResolveEngineChoice.
+//  3. fallback — the outgoing coord's engine.
+//
+// An unknown persisted/explicit name is ignored (falls through) rather
+// than propagated onto a record the dashboard can't render; dispatch
+// validates names at the CLI boundary already.
+func resolveCoordHandoffEngine(project, fallback string) string {
+	if os.Getenv("FLEET_ENGINE_EXPLICIT") == "1" {
+		if eng := os.Getenv("FLEET_ENGINE"); enginecfg.Known(eng) {
+			return eng
+		}
+	}
+	if fhome := fleetHomeForSpawn(); fhome != "" {
+		if eng := ResolveEngineChoice(fhome, project); enginecfg.Known(eng) {
+			return eng
+		}
+	}
+	return fallback
 }
 
 // writeCoordConfigStamp stamps the resolved repo path and the coord's

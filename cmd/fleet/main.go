@@ -5,11 +5,14 @@ package main
 import (
 	"errors"
 	"fmt"
+	"io"
 	"os"
 
 	"github.com/spf13/cobra"
 
 	"github.com/edisonshen/fleet/internal/enginecfg"
+	"github.com/edisonshen/fleet/internal/projects"
+	"github.com/edisonshen/fleet/internal/state"
 	"github.com/edisonshen/fleet/internal/tui"
 )
 
@@ -52,6 +55,20 @@ func engineFlagChanged(root *cobra.Command) bool {
 	return pf.Changed("engine") || pf.Changed("codex") || pf.Changed("claude")
 }
 
+// persistEngineChoice remembers an explicit -codex / -claude / --engine
+// in ~/.fleet/coord-config.json::engine. Best-effort: a write failure is
+// a stderr warning, never a fatal — this invocation still runs on the
+// resolved engine, it just won't be remembered.
+func persistEngineChoice(stderr io.Writer, engine string) {
+	root, err := state.Root()
+	if err == nil {
+		err = projects.WriteGlobalCoordConfigEngine(root, engine)
+	}
+	if err != nil {
+		_, _ = fmt.Fprintf(stderr, "warning: could not persist engine choice %s: %v\n", engine, err)
+	}
+}
+
 func newRootCmd() *cobra.Command {
 	// rootEngine captures the persistent --engine value plus the
 	// -codex / -claude shorthand flags. cobra exposes the shorthand as
@@ -87,10 +104,20 @@ Engine selection (dominant engine; the other one is an optional review helper):
 		// root and stamps FLEET_ENGINE so every subcommand (dispatch,
 		// handoff, the TUI's startCoordSpawn) reads a single source of
 		// truth. Precedence: -codex > -claude > --engine > existing env.
+		//
+		// The persisted choice: an explicit flag is remembered in
+		// ~/.fleet/coord-config.json::engine so a later flag-less
+		// `fleet` (and every coord start / recovery / handoff it
+		// triggers) keeps using it. Running coords are never touched.
 		PersistentPreRunE: func(cmd *cobra.Command, _ []string) error {
+			envEngine := os.Getenv(FleetEngineEnv)
+			if envEngine == "" {
+				if root, rerr := state.Root(); rerr == nil {
+					envEngine = projects.ReadGlobalCoordConfigEngine(root)
+				}
+			}
 			resolved, err := resolveEngineFlags(
-				rootEngine, flagCodex, flagClaude,
-				os.Getenv(FleetEngineEnv),
+				rootEngine, flagCodex, flagClaude, envEngine,
 			)
 			if err != nil {
 				return err
@@ -99,6 +126,7 @@ Engine selection (dominant engine; the other one is an optional review helper):
 				if err := os.Setenv(FleetEngineExplicitEnv, "1"); err != nil {
 					return err
 				}
+				persistEngineChoice(cmd.ErrOrStderr(), resolved)
 			} else if err := os.Unsetenv(FleetEngineExplicitEnv); err != nil {
 				return err
 			}

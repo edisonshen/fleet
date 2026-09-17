@@ -203,6 +203,22 @@ func BuildWrapperCommand(name string) ([]string, error) {
 	return []string{"sh", "-c", WrapperScript(inv)}, nil
 }
 
+// EngineForWrapperCommand reports which registered engine's default
+// wrapper (BuildWrapperCommand) argv is, byte-for-byte. ok=false means
+// argv is a custom/operator-supplied command whose engine cannot be
+// inferred — callers must not rewrite it.
+func EngineForWrapperCommand(argv []string) (name string, ok bool) {
+	if len(argv) != 3 || argv[0] != "sh" || argv[1] != "-c" {
+		return "", false
+	}
+	for n, inv := range engineDefaults {
+		if argv[2] == WrapperScript(inv) {
+			return n, true
+		}
+	}
+	return "", false
+}
+
 // Known returns true iff name is a registered engine.
 func Known(name string) bool {
 	_, ok := engineDefaults[name]

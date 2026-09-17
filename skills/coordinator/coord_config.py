@@ -6,6 +6,10 @@ Schema (additive — new fields land alongside without breaking the loader):
         "parallelism":        <int>,    # _load_parallelism (loop.py)
         "worktree_timeout_s": <number>, # _load_worktree_timeout (loop.py)
         "review_effort":      <str>,    # _load_review_effort (loop.py): low|medium|high
+        "engine":             <str>,    # claude-code|codex — Go-owned (internal/spawn,
+                                        # internal/projects); project file = last coord's
+                                        # engine, ~/.fleet/coord-config.json = operator's
+                                        # explicit `fleet -codex` / `-claude` choice
         "repo":               <str>     # absolute path to project's git checkout
     }
 

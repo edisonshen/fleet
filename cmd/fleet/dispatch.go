@@ -354,11 +354,13 @@ func runDispatch(opts *dispatchOpts, stdout io.Writer) error {
 	//      NOT a CLI flag, see newDispatchCmd for why)
 	//   2. FLEET_ENGINE env when the operator chose it on THIS
 	//      invocation (root --engine / -codex / -claude; engineExplicit)
-	//   3. coord-spawn only: the engine stamped into the project's
-	//      coord-config.json by the previous coord spawn. This is the
-	//      per-project memory of `fleet -codex` — a flag-less TUI [a] /
-	//      `fleet attach` respawn keeps the operator's original choice
-	//      instead of falling back to the claude-code default.
+	//   3. coord-spawn only: the persisted operator choice — global
+	//      ~/.fleet/coord-config.json::engine written by the last
+	//      explicit `fleet -codex` / `fleet -claude`, else the engine
+	//      stamped into the project's coord-config.json by its previous
+	//      coord spawn. A flag-less TUI [a] / `fleet attach` respawn
+	//      keeps the operator's choice instead of falling back to the
+	//      claude-code default.
 	//   4. FLEET_ENGINE env (root's PersistentPreRunE always sets this,
 	//      to the default when no flag was passed)
 	//   5. enginecfg.DefaultEngine
@@ -380,9 +382,11 @@ func runDispatch(opts *dispatchOpts, stdout io.Writer) error {
 	if engineName == "" && opts.engineExplicit {
 		engineName = os.Getenv(FleetEngineEnv)
 	}
+	enginePersisted := false
 	if engineName == "" && opts.coordSpawn {
 		if fhome, ferr := state.Root(); ferr == nil {
-			engineName = spawn.ReadCoordConfigEngine(fhome, opts.project)
+			engineName = spawn.ResolveEngineChoice(fhome, opts.project)
+			enginePersisted = engineName != ""
 		}
 	}
 	if engineName == "" {
@@ -809,19 +813,26 @@ func runDispatch(opts *dispatchOpts, stdout io.Writer) error {
 				// shell-outs pass --engine only when the operator chose
 				// one on their `fleet` invocation, so the clamp fires
 				// exactly when the operator meant to switch engines.
-				if opts.engineExplicit && oldRecord.Engine != engineName {
+				//
+				// A persisted choice (`fleet -codex` on an earlier
+				// invocation, enginePersisted) clamps the same way:
+				// the operator's standing choice applies to the next
+				// coord start — this recovery — not to the dead
+				// lineage's engine.
+				engineChosen := opts.engineExplicit || enginePersisted
+				if engineChosen && oldRecord.Engine != engineName {
 					oldRecord.Engine = engineName
 				}
-				// Engine inheritance: with no explicit flag the
-				// successor keeps the dead coord's engine (spawn copies
-				// OldRecord.Engine onto the new record). engineName and
-				// the default wrapper were resolved before we knew
-				// which record we were recovering, so re-align them
-				// here — otherwise a codex lineage recovered from a
-				// project whose coord-config.json predates the engine
-				// stamp would get a record saying codex on top of the
-				// claude wrapper.
-				if !opts.engineExplicit && oldRecord.Engine != "" && oldRecord.Engine != engineName {
+				// Engine inheritance: with no explicit or persisted
+				// choice the successor keeps the dead coord's engine
+				// (spawn copies OldRecord.Engine onto the new record).
+				// engineName and the default wrapper were resolved
+				// before we knew which record we were recovering, so
+				// re-align them here — otherwise a codex lineage
+				// recovered from a project whose coord-config.json
+				// predates the engine stamp would get a record saying
+				// codex on top of the claude wrapper.
+				if !engineChosen && oldRecord.Engine != "" && oldRecord.Engine != engineName {
 					if !enginecfg.Known(oldRecord.Engine) {
 						return fmt.Errorf(
 							"--coord-spawn recovery refused: dead coord %s ran unknown engine %q; pass --engine to force-migrate the recovery, or archive the dead record (`fleet rm %s`) and start fresh",
