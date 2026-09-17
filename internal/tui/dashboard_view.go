@@ -948,8 +948,8 @@ func separatorBlockLine(sep *separatorRow, w int, selected bool) string {
 		} else {
 			label = fmt.Sprintf("%d hidden — [enter] to expand, [c] to view-toggle", sep.count)
 		}
-	case separatorHiddenMore:
-		label = fmt.Sprintf("%d more hidden · unhide with [c] on a row", sep.count)
+	case separatorMore:
+		label = fmt.Sprintf("%d more · [/] search to find", sep.count)
 	case separatorHistory:
 		// Issue #101: collapsible "─── N done ───" group inside an
 		// expanded project. Operator [enter]s the row to toggle.

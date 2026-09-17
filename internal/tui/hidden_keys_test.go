@@ -259,13 +259,13 @@ func TestKeyEnter_OnHiddenMoreSeparatorIsNoop(t *testing.T) {
 	moreIdx := -1
 	for i, row := range rows {
 		if row.kind == rowSeparator && row.separator != nil &&
-			row.separator.kind == separatorHiddenMore {
+			row.separator.kind == separatorMore {
 			moreIdx = i
 			break
 		}
 	}
 	if moreIdx < 0 {
-		t.Fatalf("hidden-more separator missing: %+v", rows)
+		t.Fatalf("more separator missing: %+v", rows)
 	}
 	m.dashCursor = moreIdx
 	mm, _ := m.Update(tea.KeyMsg{Type: tea.KeyEnter})

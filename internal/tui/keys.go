@@ -491,7 +491,7 @@ func (m Model) actionToggleHide() (Model, tea.Cmd, bool) {
 	case rowSeparator:
 		// Off-row toggle of show-hidden mode. Cursor stays on the
 		// separator (or wherever it ends up after the row list shifts).
-		if row.separator != nil && row.separator.kind == separatorHiddenMore {
+		if row.separator != nil && row.separator.kind == separatorMore {
 			return m, nil, true
 		}
 		m.showHidden = !m.showHidden
@@ -2203,7 +2203,7 @@ func (m Model) openDetail() (Model, tea.Cmd, bool) {
 			m.idleCollapseExplicit = true
 		case separatorHidden:
 			m.hiddenExpanded = !m.hiddenExpanded
-		case separatorHiddenMore:
+		case separatorMore:
 			// The cap notice is informational; [enter] does nothing.
 		case separatorHistory:
 			// Issue #101: [enter] on the `─── N done ───` separator
