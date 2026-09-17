@@ -6,6 +6,12 @@ follows [SemVer](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed
+
+- fleet-guard: context_pct treats every `gpt-*`/Codex id and Claude
+  Opus/Sonnet as a 1,000,000-token window; the Codex rollout's in-band
+  `model_context_window` is no longer used as the denominator.
+
 ## [0.21.0] - 2026-09-17
 
 Fleet is no longer Claude-only. The operator picks a **dominant engine** —
