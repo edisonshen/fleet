@@ -1,6 +1,7 @@
 package tui
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -30,6 +31,84 @@ func TestSeparatorBlockLine_HiddenRendersHiddenLabel(t *testing.T) {
 	line := separatorBlockLine(sep, 80, false)
 	if !strings.Contains(line, "1 hidden") {
 		t.Errorf("hidden separator should mention count: got %q", line)
+	}
+}
+
+func TestSeparatorBlockLine_HiddenMoreRendersUnhideHint(t *testing.T) {
+	sep := &separatorRow{kind: separatorHiddenMore, count: 2}
+	line := separatorBlockLine(sep, 80, false)
+	if !strings.Contains(line, "2 more hidden") {
+		t.Errorf("hidden-more separator should mention count: got %q", line)
+	}
+	if strings.Contains(line, "[enter]") {
+		t.Errorf("hidden-more separator should not hint [enter]: got %q", line)
+	}
+}
+
+func TestDashboardRows_CapsExpandedHiddenProjects(t *testing.T) {
+	defer resetHiddenStubs()()
+	names := make([]string, 12)
+	projects := make([]*ProjectRow, len(names))
+	for i := range names {
+		names[i] = fmt.Sprintf("hidden-%02d", i)
+		projects[i] = &ProjectRow{Name: names[i], RepoSlug: names[i]}
+	}
+	stubHidden(names...)
+	m := New("test")
+	m.showHidden = true
+	m.hiddenExpanded = true
+	m.dashboard = &Snapshot{Projects: projects}
+
+	rows := m.dashboardRows()
+	hiddenIdx := -1
+	for i, row := range rows {
+		if row.kind == rowSeparator && row.separator != nil && row.separator.kind == separatorHidden {
+			hiddenIdx = i
+			break
+		}
+	}
+	if hiddenIdx < 0 {
+		t.Fatalf("hidden separator missing: %+v", rows)
+	}
+	projectCount := 0
+	for _, row := range rows[hiddenIdx+1:] {
+		if row.kind == rowProject {
+			projectCount++
+		}
+	}
+	if projectCount != hiddenRenderCap {
+		t.Fatalf("hidden project rows = %d, want %d", projectCount, hiddenRenderCap)
+	}
+	moreIdx := hiddenIdx + 1 + projectCount
+	if moreIdx >= len(rows) || rows[moreIdx].kind != rowSeparator ||
+		rows[moreIdx].separator.kind != separatorHiddenMore {
+		t.Fatalf("hidden-more separator missing after capped projects: %+v", rows)
+	}
+	if rows[hiddenIdx].separator.count != 12 || rows[moreIdx].separator.count != 2 {
+		t.Errorf("separator counts = %d and %d, want 12 and 2",
+			rows[hiddenIdx].separator.count, rows[moreIdx].separator.count)
+	}
+}
+
+func TestDashboardRows_NoHiddenMoreSeparatorAtCap(t *testing.T) {
+	defer resetHiddenStubs()()
+	names := make([]string, hiddenRenderCap)
+	projects := make([]*ProjectRow, len(names))
+	for i := range names {
+		names[i] = fmt.Sprintf("hidden-%02d", i)
+		projects[i] = &ProjectRow{Name: names[i], RepoSlug: names[i]}
+	}
+	stubHidden(names...)
+	m := New("test")
+	m.showHidden = true
+	m.hiddenExpanded = true
+	m.dashboard = &Snapshot{Projects: projects}
+
+	for _, row := range m.dashboardRows() {
+		if row.kind == rowSeparator && row.separator != nil &&
+			row.separator.kind == separatorHiddenMore {
+			t.Fatal("hidden-more separator should not render at the cap")
+		}
 	}
 }
 

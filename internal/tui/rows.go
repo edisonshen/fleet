@@ -42,10 +42,11 @@ const (
 type separatorKind int
 
 const (
-	separatorIdle      separatorKind = iota // "─── N idle ───"
-	separatorHidden                         // "─── N hidden ───" (only when show-hidden mode is on)
-	separatorHistory                        // "─── N done ───" inside an expanded project block (issue #101)
-	separatorAgentIdle                      // "─── N idle ───" inside the RIGHT-column v0.1 agent list (dashboard-accumulation-f-4421)
+	separatorIdle       separatorKind = iota // "─── N idle ───"
+	separatorHidden                          // "─── N hidden ───" (only when show-hidden mode is on)
+	separatorHiddenMore                      // "─── N more hidden ───"
+	separatorHistory                         // "─── N done ───" inside an expanded project block (issue #101)
+	separatorAgentIdle                       // "─── N idle ───" inside the RIGHT-column v0.1 agent list (dashboard-accumulation-f-4421)
 )
 
 // separatorRow carries the per-group state for rowSeparator.
@@ -565,7 +566,20 @@ func (m Model) dashboardRows() []dashRow {
 				},
 			})
 			if m.hiddenExpanded {
-				rows = m.appendProjectRows(rows, hidden)
+				hiddenRenderCount := len(hidden)
+				if hiddenRenderCount > hiddenRenderCap {
+					hiddenRenderCount = hiddenRenderCap
+				}
+				rows = m.appendProjectRows(rows, hidden[:hiddenRenderCount])
+				if len(hidden) > hiddenRenderCap {
+					rows = append(rows, dashRow{
+						kind: rowSeparator,
+						separator: &separatorRow{
+							kind:  separatorHiddenMore,
+							count: len(hidden) - hiddenRenderCap,
+						},
+					})
+				}
 			}
 		}
 	}
@@ -672,6 +686,8 @@ func classifyAgentActivity(
 	}
 	return projectIdle
 }
+
+const hiddenRenderCap = 10
 
 // appendProjectRows adds project + (optionally expanded) task rows for
 // each entry in projects. Encapsulates the per-project filter +
@@ -908,6 +924,8 @@ func rowIdentity(r dashRow) string {
 				return "S:idle"
 			case separatorHidden:
 				return "S:hidden"
+			case separatorHiddenMore:
+				return "S:hidden-more"
 			case separatorHistory:
 				return "S:history:" + r.separator.project
 			case separatorAgentIdle:
