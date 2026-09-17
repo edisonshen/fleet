@@ -5,6 +5,32 @@ description: Safely exercise Fleet worker CLI state and dashboard in an isolated
 
 # Isolated Fleet CLI/TUI testing
 
+## Custom Codex home runtime checks
+- Real Codex turns require existing authenticated `~/.codex/auth.json` (or the
+  organization's Codex auth provision). Never print it; copy privately into an
+  isolated CODEX_HOME and remove that copy during cleanup. No additional named
+  Devin secret is required when device authentication is already provisioned.
+- Set CODEX_HOME to a non-default directory, e.g. isolated HOME/cx-home. Start
+  the isolated tmux server **without CODEX_HOME before Fleet**, so process env
+  assertions distinguish propagation from accidental server inheritance.
+- Run the checkout-built `fleet -codex init` rather than manually copying hooks:
+  verify custom CODEX_HOME/hooks.json and absence of HOME/.codex/hooks.json.
+  A fresh interactive init may ask for coordinator parallelism; choose 1 for
+  token-limited tests.
+- Seed supported TOML keys and an untrusted table for a new committed checkout.
+  Verify one trusted table, unchanged unrelated project and top-level values.
+  Codex itself may rewrite NUX counters/file formatting/mode on startup; isolate
+  Fleet-only byte/mode preservation using `--command sleep,600` if needed.
+- After one READY-only/no-tools turn, inspect the actual custom CODEX_HOME
+  rollout for the coordinator reminder tagged `hooks.additional_context`;
+  agent health alone does not prove SessionStart context delivery.
+- Live review-anchor resolution is observable without a real review: omit the
+  isolated project stamp while its coordinator runs, then use `workers update`
+  with dominant-engine status skipped and reason unavailable. Expect rejection
+  naming the anchor; the opposite helper engine must be allowed to skip.
+- Check child exit after killing the isolated tmux server (asynchronous cleanup
+  may require a second process check), then remove copied authentication.
+
 ## Devin Secrets Needed
 None for local worker updates, peek, and dashboard rendering. Do not dispatch
 real agents or access remote projects unless separately authorized.
