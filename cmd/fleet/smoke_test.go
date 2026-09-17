@@ -89,8 +89,8 @@ func TestSmoke_AutoHandoffEndToEnd(t *testing.T) {
 	}
 
 	// Step 3: synthetic Stop payload with a transcript that puts
-	// context_pct at 75% on claude-sonnet-4-6 (200k limit) → Red (≥50%).
-	transcript := writeFakeTranscript(t, "claude-sonnet-4-6", 150_000)
+	// context_pct at 75% on claude-haiku-4-5 (200k limit) → Red (≥50%).
+	transcript := writeFakeTranscript(t, "claude-haiku-4-5", 150_000)
 	payload := map[string]any{
 		"hook_event_name": "Stop",
 		"transcript_path": transcript,

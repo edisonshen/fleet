@@ -237,7 +237,7 @@ func readWorkerAgentID(t *testing.T, fleetHome, project, slug string) string {
 // Returns the handoff doc path fleet-guard wrote.
 func fireStopHookRed(t *testing.T, env *integrationEnv, coordID string) string {
 	t.Helper()
-	transcript := writeFakeTranscript(t, "claude-sonnet-4-6", 150_000)
+	transcript := writeFakeTranscript(t, "claude-haiku-4-5", 150_000)
 	payload, _ := json.Marshal(map[string]any{
 		"hook_event_name": "Stop",
 		"transcript_path": transcript,
