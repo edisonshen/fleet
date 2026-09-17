@@ -6,11 +6,25 @@ follows [SemVer](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.22.0] - 2026-09-17
+
+Codex coordinators now handoff on the same 1M-window schedule as Claude
+(soft at 40%, hard at 50%), and the dashboard stays responsive with
+dozens of hidden projects.
+
 ### Changed
 
 - fleet-guard: context_pct treats every `gpt-*`/Codex id and Claude
   Opus/Sonnet as a 1,000,000-token window; the Codex rollout's in-band
-  `model_context_window` is no longer used as the denominator.
+  `model_context_window` (observed 258k) is no longer used as the
+  denominator — it fired the 40/50% handoff at ~13% of real context and
+  made the soft handoff look like an immediate hard one (#322).
+- tui: hidden projects get a stat-only light scan (coord freshness +
+  workers; no tasks.md, coord-state, subagents or incidents), and the
+  incidents dir is indexed once per dashboard tick instead of once per
+  project. The expanded `─── N hidden ───` group renders at most 10
+  projects followed by a `N more hidden` notice; search bypasses the cap
+  (#323).
 
 ## [0.21.0] - 2026-09-17
 
@@ -1618,7 +1632,8 @@ Initial public release.
 - Filesystem packages: `internal/state`, `internal/handoff`,
   `internal/queue`, `internal/spawn`, `internal/tmux`.
 
-[Unreleased]: https://github.com/edisonshen/fleet/compare/v0.21.0...HEAD
+[Unreleased]: https://github.com/edisonshen/fleet/compare/v0.22.0...HEAD
+[0.22.0]: https://github.com/edisonshen/fleet/compare/v0.21.0...v0.22.0
 [0.21.0]: https://github.com/edisonshen/fleet/compare/v0.20.0...v0.21.0
 [0.20.0]: https://github.com/edisonshen/fleet/compare/v0.19.1...v0.20.0
 [0.19.1]: https://github.com/edisonshen/fleet/compare/v0.19.0...v0.19.1
