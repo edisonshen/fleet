@@ -53,9 +53,8 @@ func wrapper(t *testing.T, engine string) []string {
 	return argv
 }
 
-func handoffCoord(t *testing.T, old *agent.Record, command []string) (*agent.Record, *tmuxfake.Fake) {
+func handoffCoord(t *testing.T, old *agent.Record, command []string) *agent.Record {
 	t.Helper()
-	f := tmuxfake.InstallFake(t)
 	rec, err := spawn.Spawn(spawn.Options{
 		OldRecord:  old,
 		NewDocPath: "/some/handoffs/aaaa7777-20260917-180000.md",
@@ -65,7 +64,7 @@ func handoffCoord(t *testing.T, old *agent.Record, command []string) (*agent.Rec
 	if err != nil {
 		t.Fatalf("Spawn: %v", err)
 	}
-	return rec, f
+	return rec
 }
 
 func TestSpawn_CoordHandoffPersistedChoiceSwitchesEngine(t *testing.T) {
@@ -78,8 +77,9 @@ func TestSpawn_CoordHandoffPersistedChoiceSwitchesEngine(t *testing.T) {
 			if err := projects.WriteGlobalCoordConfigEngine(home, tc.to); err != nil {
 				t.Fatal(err)
 			}
+			f := tmuxfake.InstallFake(t)
 			old := oldCoord(t, tc.from)
-			rec, f := handoffCoord(t, old, wrapper(t, tc.from))
+			rec := handoffCoord(t, old, wrapper(t, tc.from))
 
 			if rec.Engine != tc.to {
 				t.Errorf("successor rec.Engine = %q want %q", rec.Engine, tc.to)
@@ -107,8 +107,9 @@ func TestSpawn_CoordHandoffPersistedChoiceSwitchesEngine(t *testing.T) {
 
 func TestSpawn_CoordHandoffNoPersistedChoiceInheritsEngine(t *testing.T) {
 	setupHandoffHome(t)
+	f := tmuxfake.InstallFake(t)
 	old := oldCoord(t, enginecfg.EngineCodex)
-	rec, f := handoffCoord(t, old, wrapper(t, enginecfg.EngineCodex))
+	rec := handoffCoord(t, old, wrapper(t, enginecfg.EngineCodex))
 
 	if rec.Engine != enginecfg.EngineCodex {
 		t.Errorf("rec.Engine = %q want codex (inherited)", rec.Engine)
@@ -129,8 +130,9 @@ func TestSpawn_CoordHandoffProjectStampUsedWhenNoGlobalChoice(t *testing.T) {
 		t.Fatal(err)
 	}
 	// Legacy predecessor (no engine field) under a project stamped codex.
+	tmuxfake.InstallFake(t)
 	old := oldCoord(t, "")
-	rec, _ := handoffCoord(t, old, wrapper(t, enginecfg.EngineClaudeCode))
+	rec := handoffCoord(t, old, wrapper(t, enginecfg.EngineClaudeCode))
 	if rec.Engine != enginecfg.EngineCodex {
 		t.Errorf("rec.Engine = %q want codex (project stamp)", rec.Engine)
 	}
@@ -145,8 +147,9 @@ func TestSpawn_CoordHandoffCustomCommandKeepsPredecessorEngine(t *testing.T) {
 		t.Fatal(err)
 	}
 	custom := []string{"sh", "-c", "my-claude-wrapper --flag"}
+	f := tmuxfake.InstallFake(t)
 	old := oldCoord(t, enginecfg.EngineClaudeCode)
-	rec, f := handoffCoord(t, old, custom)
+	rec := handoffCoord(t, old, custom)
 
 	if rec.Engine != enginecfg.EngineClaudeCode {
 		t.Errorf("rec.Engine = %q want claude-code (custom command can't be re-targeted)", rec.Engine)
@@ -169,8 +172,9 @@ func TestSpawn_CoordHandoffExplicitFlagBeatsPersistedChoice(t *testing.T) {
 	}
 	t.Setenv("FLEET_ENGINE", enginecfg.EngineClaudeCode)
 	t.Setenv("FLEET_ENGINE_EXPLICIT", "1")
+	tmuxfake.InstallFake(t)
 	old := oldCoord(t, enginecfg.EngineCodex)
-	rec, _ := handoffCoord(t, old, wrapper(t, enginecfg.EngineCodex))
+	rec := handoffCoord(t, old, wrapper(t, enginecfg.EngineCodex))
 	if rec.Engine != enginecfg.EngineClaudeCode {
 		t.Errorf("rec.Engine = %q want claude-code (explicit flag this invocation)", rec.Engine)
 	}
