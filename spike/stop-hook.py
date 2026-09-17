@@ -35,10 +35,10 @@ CONTEXT_LIMITS = {
     "claude-fable-5":    1_000_000,
     "claude-opus-4-8":   1_000_000,
     "claude-opus-4-7":   1_000_000,
-    "claude-opus-4-6":     200_000,
-    "claude-opus-4-5":     200_000,
-    "claude-sonnet-4-6":   200_000,
-    "claude-sonnet-4-5":   200_000,
+    "claude-opus-4-6":   1_000_000,
+    "claude-opus-4-5":   1_000_000,
+    "claude-sonnet-4-6": 1_000_000,
+    "claude-sonnet-4-5": 1_000_000,
     "claude-haiku-4-5":    200_000,
 }
 
@@ -51,6 +51,8 @@ ONE_M_BRACKET_TOKENS = 1_000_000
 # Fallback window for an unresolvable model id. Mirrors
 # skills/fleet-guard/health.py:DEFAULT_CONTEXT_LIMIT (bug D policy).
 DEFAULT_CONTEXT_LIMIT = 1_000_000
+
+ONE_M_FAMILIES = ("gpt-", "claude-opus-", "claude-sonnet-")
 
 
 def _normalize_model(raw):
@@ -74,7 +76,7 @@ def _normalize_model(raw):
 
 def _lookup_limit(raw):
     """Table/bracket resolution: exact hit -> "[1m]" variant means 1M ->
-    stripped base lookup -> None. Mirrors
+    1M families/Codex policy -> stripped base lookup -> None. Mirrors
     skills/fleet-guard/health.py:_lookup_limit.
     """
     if not raw:
@@ -87,7 +89,10 @@ def _lookup_limit(raw):
         close_b = raw.find("]", open_b)
         if close_b > open_b and raw[open_b + 1:close_b].strip().lower() == "1m":
             return ONE_M_BRACKET_TOKENS
-    return CONTEXT_LIMITS.get(_normalize_model(raw))
+    normalized = _normalize_model(raw)
+    if normalized.startswith(ONE_M_FAMILIES) or "codex" in normalized:
+        return DEFAULT_CONTEXT_LIMIT
+    return CONTEXT_LIMITS.get(normalized)
 
 
 def _resolve_limit(raw):
