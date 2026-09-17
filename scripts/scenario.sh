@@ -58,9 +58,11 @@ SUBCOMMANDS
                          run itself exits with <code>.
   capture [<session>]    fenced `tmux capture-pane -p` of a session on the
                          sandbox socket (default: the seeded coord's).
-  down                   kill every session on the sandbox socket, remove
-                         the socket and FLEET_HOME, print matching `unset`
-                         lines. Leaves no /tmp/fleet-test-* debris.
+  down                   terminate this sandbox's fleet processes (a
+                         detached drain, a coord-run supervisor), kill every
+                         session on the sandbox socket, remove the socket and
+                         FLEET_HOME, print matching `unset` lines. Leaves no
+                         /tmp/fleet-test-* debris.
 
 ENVIRONMENT
   FLEET_HOME              sandbox state root (set by up; required after)
@@ -338,17 +340,32 @@ sandbox_fleet_pids() {
     done
 }
 
-wait_sandbox_fleet_procs() {
+# TERM this sandbox's fleet processes and wait (bounded) for them to exit;
+# KILL whatever is left. Runs before the tmux server is killed: a live drain
+# would otherwise re-create the server (and its socket) while spawning the
+# successor coord.
+kill_sandbox_fleet_procs() {
     local i pids
-    for i in $(seq 1 50); do
+    pids=$(sandbox_fleet_pids)
+    [[ -n "$pids" ]] || return 0
+    echo "$SELF: down: terminating sandbox fleet process(es): ${pids//$'\n'/ }" >&2
+    # shellcheck disable=SC2086
+    kill -TERM $pids 2>/dev/null || true
+    for i in $(seq 1 30); do
         pids=$(sandbox_fleet_pids)
         [[ -n "$pids" ]] || return 0
         sleep 0.1
     done
-    echo "$SELF: down: terminating lingering fleet process(es): ${pids//$'\n'/ }" >&2
     # shellcheck disable=SC2086
-    kill -TERM $pids 2>/dev/null || true
-    sleep 0.5
+    kill -KILL $pids 2>/dev/null || true
+    sleep 0.2
+}
+
+kill_sandbox_tmux() {
+    if [[ -S "$FLEET_TMUX_SOCKET" ]]; then
+        tmux -S "$FLEET_TMUX_SOCKET" kill-server 2>/dev/null || true
+    fi
+    rm -f "$FLEET_TMUX_SOCKET" "$FLEET_TMUX_SOCKET.lock"
 }
 
 cmd_down() {
@@ -357,11 +374,12 @@ cmd_down() {
         /tmp/fleet-test-*) ;;
         *) die "down: FLEET_HOME=$FLEET_HOME is outside /tmp/fleet-test-*; refusing to remove" ;;
     esac
-    if [[ -S "$FLEET_TMUX_SOCKET" ]]; then
-        tmux -S "$FLEET_TMUX_SOCKET" kill-server 2>/dev/null || true
-    fi
-    rm -f "$FLEET_TMUX_SOCKET" "$FLEET_TMUX_SOCKET.lock"
-    wait_sandbox_fleet_procs
+    # Two passes: a drain caught between LoadAgent and its `tmux new-session`
+    # can still bring the server back after the first kill-server.
+    kill_sandbox_fleet_procs
+    kill_sandbox_tmux
+    kill_sandbox_fleet_procs
+    kill_sandbox_tmux
     # A detached `fleet drain` kicked by the hook can still be writing
     # logs/ and .locks/ for a moment: keep removing until the tree stays
     # gone for half a second.
