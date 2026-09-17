@@ -86,6 +86,55 @@ func TestEnsureCodexProjectTrust_AppendsAndPreserves(t *testing.T) {
 	}
 }
 
+func TestEnsureCodexProjectTrust_UpgradesUntrustedInPlace(t *testing.T) {
+	cfgDir := t.TempDir()
+	cfgPath := enginecfg.CodexConfigPath(cfgDir)
+	existing := "model = \"gpt-5\"\n\n[projects.\"/work/app\"]\n  trust_level = 'untrusted'  # said no once\n\n[projects.\"/other\"]\ntrust_level = \"trusted\"\n"
+	if err := os.WriteFile(cfgPath, []byte(existing), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if enginecfg.CodexProjectTrusted(cfgDir, "/work/app") {
+		t.Fatal("untrusted entry reported trusted")
+	}
+	added, err := enginecfg.EnsureCodexProjectTrust(cfgDir, "/work/app")
+	if err != nil || !added {
+		t.Fatalf("added=%v err=%v", added, err)
+	}
+	raw, _ := os.ReadFile(cfgPath)
+	want := "model = \"gpt-5\"\n\n[projects.\"/work/app\"]\ntrust_level = \"trusted\"\n\n[projects.\"/other\"]\ntrust_level = \"trusted\"\n"
+	if string(raw) != want {
+		t.Fatalf("config body:\n%s\nwant:\n%s", raw, want)
+	}
+	if !enginecfg.CodexProjectTrusted(cfgDir, "/work/app") {
+		t.Fatal("CodexProjectTrusted false after upgrade")
+	}
+	if strings.Count(string(raw), "[projects.\"/work/app\"]") != 1 {
+		t.Fatalf("table duplicated:\n%s", raw)
+	}
+}
+
+func TestEnsureCodexProjectTrust_InsertsMissingTrustLevel(t *testing.T) {
+	cfgDir := t.TempDir()
+	cfgPath := enginecfg.CodexConfigPath(cfgDir)
+	existing := "[projects.\"/work/app\"]\nsome_other_key = 1\n\n[projects.\"/other\"]\ntrust_level = \"untrusted\"\n"
+	if err := os.WriteFile(cfgPath, []byte(existing), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	added, err := enginecfg.EnsureCodexProjectTrust(cfgDir, "/work/app")
+	if err != nil || !added {
+		t.Fatalf("added=%v err=%v", added, err)
+	}
+	raw, _ := os.ReadFile(cfgPath)
+	want := "[projects.\"/work/app\"]\ntrust_level = \"trusted\"\nsome_other_key = 1\n\n[projects.\"/other\"]\ntrust_level = \"untrusted\"\n"
+	if string(raw) != want {
+		t.Fatalf("config body:\n%s\nwant:\n%s", raw, want)
+	}
+	// The neighbouring table's own trust_level must not be mistaken for ours.
+	if enginecfg.CodexProjectTrusted(cfgDir, "/other") {
+		t.Fatal("/other reported trusted")
+	}
+}
+
 func TestEnsureCodexProjectTrust_EscapesQuotesAndBackslashes(t *testing.T) {
 	cfgDir := t.TempDir()
 	dir := `/work/we"ird\path`

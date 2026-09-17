@@ -136,12 +136,18 @@ func SkillHome(home, name string) string {
 // HooksFile returns the JSON file whose top-level "hooks" object holds the
 // engine's hook registrations. Both CLIs read the same nested shape
 // (hooks.<Event>: [{hooks: [{type, command}]}]) but from different files:
-// Claude Code from ~/.claude/settings.json, Codex from ~/.codex/hooks.json.
+// Claude Code from ~/.claude/settings.json, Codex from
+// $CODEX_HOME/hooks.json (default ~/.codex/hooks.json — see CodexConfigDir).
 func HooksFile(home, name string) string {
+	if name == EngineCodex {
+		return filepath.Join(CodexConfigDir(home), "hooks.json")
+	}
 	return filepath.Join(home, HooksFileRel(name))
 }
 
-// HooksFileRel is HooksFile relative to the user home.
+// HooksFileRel is HooksFile relative to the user home, ignoring any
+// CODEX_HOME relocation. Callers that only need the file's basename (test
+// overrides) use this.
 func HooksFileRel(name string) string {
 	if name == EngineCodex {
 		return filepath.Join(".codex", "hooks.json")

@@ -19,6 +19,7 @@ import (
 func TestResolveInstallPaths_PerEngine(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
+	t.Setenv("CODEX_HOME", "")
 
 	cases := []struct {
 		engine        string
@@ -41,6 +42,34 @@ func TestResolveInstallPaths_PerEngine(t *testing.T) {
 			t.Errorf("engine %q: got (%s, %s) want (%s, %s)",
 				tc.engine, got.skillHome, got.hooksFile, tc.wantSkillHome, tc.wantHooks)
 		}
+	}
+}
+
+// A relocated CODEX_HOME moves the hooks file (codex reads hooks.json from
+// there) but not the ~/.agents skill home.
+func TestResolveInstallPaths_CodexHome(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	cx := filepath.Join(home, "srv", "cx")
+	t.Setenv("CODEX_HOME", cx)
+	t.Setenv(FleetEngineEnv, "codex")
+	got, err := resolveInstallPaths("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.hooksFile != filepath.Join(cx, "hooks.json") {
+		t.Errorf("hooksFile = %s, want under CODEX_HOME", got.hooksFile)
+	}
+	if got.skillHome != filepath.Join(home, ".agents") {
+		t.Errorf("skillHome = %s, want ~/.agents", got.skillHome)
+	}
+	t.Setenv(FleetEngineEnv, "claude-code")
+	got, err = resolveInstallPaths("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.hooksFile != filepath.Join(home, ".claude", "settings.json") {
+		t.Errorf("claude hooksFile = %s must ignore CODEX_HOME", got.hooksFile)
 	}
 }
 
@@ -155,6 +184,7 @@ func TestMaybeAutoInit_EnginesInstallSideBySide(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
 	t.Setenv("FLEET_HOME", filepath.Join(home, ".fleet"))
+	t.Setenv("CODEX_HOME", "")
 
 	t.Setenv(FleetEngineEnv, "claude-code")
 	maybeAutoInit(&bytes.Buffer{}, "")

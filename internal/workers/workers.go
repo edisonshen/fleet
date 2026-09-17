@@ -34,6 +34,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/edisonshen/fleet/internal/agent"
 	"github.com/edisonshen/fleet/internal/fleetlog"
 	"github.com/edisonshen/fleet/internal/projects"
 	"github.com/edisonshen/fleet/internal/state"
@@ -136,15 +137,50 @@ func ReviewEngineForDominant(engine string) string {
 }
 
 // ProjectReviewAnchor returns the review engine the project's beta slot
-// must be: the review engine of the dominant engine stamped into
-// coord-config.json by the last coord spawn, or claude when no coord
-// has stamped one (legacy / never-coordinated projects).
+// must be: the review engine of the project's dominant engine. Sources,
+// in order:
+//
+//  1. the project's newest live coord agent record (agents/<id>.json
+//     ::engine) — the running coord IS the dominant engine;
+//  2. the `engine` stamped into coord-config.json by the last coord
+//     spawn — a best-effort breadcrumb (its write may have failed)
+//     that outlives the coord record;
+//  3. claude when neither exists (legacy / never-coordinated projects).
 func ProjectReviewAnchor(project string) string {
+	if eng := liveCoordEngine(project); eng != "" {
+		return ReviewEngineForDominant(eng)
+	}
 	root, err := state.Root()
 	if err != nil {
 		return ReviewEngineClaude
 	}
 	return ReviewEngineForDominant(projects.ReadCoordConfigEngine(root, project))
+}
+
+// liveCoordEngine returns the engine of project's newest (by spawned_at)
+// live coord record, or "" when none is on disk. A coord record is one
+// flagged is_coord or carrying the coord-<project> task id.
+func liveCoordEngine(project string) string {
+	if project == "" {
+		return ""
+	}
+	recs, err := agent.List()
+	if err != nil {
+		return ""
+	}
+	var newest *agent.Record
+	for _, r := range recs {
+		if r.Project != project || (!r.IsCoord && r.TaskID != "coord-"+project) {
+			continue
+		}
+		if newest == nil || r.SpawnedAt.After(newest.SpawnedAt) {
+			newest = r
+		}
+	}
+	if newest == nil {
+		return ""
+	}
+	return newest.Engine
 }
 
 func isDegradedStatus(s ReviewStatus) bool {

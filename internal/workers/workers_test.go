@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/edisonshen/fleet/internal/agent"
 	"github.com/edisonshen/fleet/internal/fleetlog"
 	"github.com/edisonshen/fleet/internal/projects"
 	"github.com/edisonshen/fleet/internal/state"
@@ -1261,6 +1262,75 @@ func TestWorkers_ReviewGate_CodexAnchor(t *testing.T) {
 				t.Fatalf("WriteState: got %v; want %v", err, c.wantErr)
 			}
 		})
+	}
+}
+
+// writeCoordRecord drops a live coord agent record for project under
+// FLEET_HOME with the given engine and spawn time.
+func writeCoordRecord(t *testing.T, id, project, engine string, spawned time.Time) {
+	t.Helper()
+	r := agent.New(id)
+	r.Engine = engine
+	r.Project = project
+	r.TaskID = "coord-" + project
+	r.IsCoord = true
+	r.SpawnedAt = spawned
+	dir, err := state.AgentDir()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Write(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestProjectReviewAnchor_Sources: the live coord record is the
+// authoritative anchor source; the coord-config.json stamp is the
+// fallback when no coord record is on disk; claude when neither exists.
+func TestProjectReviewAnchor_Sources(t *testing.T) {
+	t.Setenv("FLEET_HOME", t.TempDir())
+	now := time.Now().UTC()
+
+	if got := ProjectReviewAnchor("p"); got != ReviewEngineClaude {
+		t.Fatalf("no stamp, no coord: anchor = %q", got)
+	}
+
+	// A codex coord whose coord-config.json stamp write failed must still
+	// anchor on codex, or its own beta results would never pass the gate.
+	writeCoordRecord(t, "c1", "p", "codex", now)
+	if got := ProjectReviewAnchor("p"); got != ReviewEngineCodex {
+		t.Fatalf("live codex coord, no stamp: anchor = %q", got)
+	}
+
+	// A stale stamp from a previous claude coord loses to the live record.
+	writeCoordEngine(t, "p", "claude-code")
+	if got := ProjectReviewAnchor("p"); got != ReviewEngineCodex {
+		t.Fatalf("live codex coord beats stale claude stamp: anchor = %q", got)
+	}
+
+	// Several coord records (dead predecessor not yet archived): newest wins.
+	writeCoordRecord(t, "c2", "p", "claude-code", now.Add(time.Minute))
+	if got := ProjectReviewAnchor("p"); got != ReviewEngineClaude {
+		t.Fatalf("newest coord record wins: anchor = %q", got)
+	}
+
+	// Another project's coord record never leaks across.
+	writeCoordRecord(t, "c3", "q", "codex", now.Add(time.Hour))
+	if got := ProjectReviewAnchor("p"); got != ReviewEngineClaude {
+		t.Fatalf("other project's coord leaked: anchor = %q", got)
+	}
+	if got := ProjectReviewAnchor("q"); got != ReviewEngineCodex {
+		t.Fatalf("project q anchor = %q", got)
+	}
+
+	// Stamp-only (coord archived): stamp is the fallback.
+	t.Setenv("FLEET_HOME", t.TempDir())
+	writeCoordEngine(t, "p", "codex")
+	if got := ProjectReviewAnchor("p"); got != ReviewEngineCodex {
+		t.Fatalf("stamp only: anchor = %q", got)
 	}
 }
 

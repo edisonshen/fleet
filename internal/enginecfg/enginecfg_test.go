@@ -144,7 +144,18 @@ func TestInstalled(t *testing.T) {
 	}
 }
 
+func TestHooksFile_CodexHonoursCodexHome(t *testing.T) {
+	t.Setenv("CODEX_HOME", "/srv/cx")
+	if got := enginecfg.HooksFile("/h", enginecfg.EngineCodex); got != filepath.FromSlash("/srv/cx/hooks.json") {
+		t.Errorf("HooksFile(codex) with CODEX_HOME = %q", got)
+	}
+	if got := enginecfg.HooksFile("/h", enginecfg.EngineClaudeCode); got != filepath.FromSlash("/h/.claude/settings.json") {
+		t.Errorf("HooksFile(claude-code) must ignore CODEX_HOME, got %q", got)
+	}
+}
+
 func TestSkillHomeAndHooksFile(t *testing.T) {
+	t.Setenv("CODEX_HOME", "")
 	home := "/h"
 	cases := []struct {
 		engine, wantSkill, wantHooks string

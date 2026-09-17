@@ -220,6 +220,11 @@ var propagatedRuntimeEnv = []string{
 	// server would strip it and the documented off switch would silently
 	// stay enforced.
 	"FLEET_COORD_GUARD",
+	// CODEX_HOME relocates Codex's config dir (hooks.json, config.toml with
+	// the project-trust table Fleet writes before a codex spawn). The pane
+	// must read the same dir Fleet wrote to, or an existing tmux server
+	// would strip it and codex would fall back to ~/.codex.
+	"CODEX_HOME",
 }
 
 // leaseSupervisorAvailable gates whether Spawn can wrap a coord in the
