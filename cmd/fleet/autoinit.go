@@ -14,7 +14,8 @@ import (
 )
 
 // maybeAutoInit installs the bundled skills silently if any embedded
-// file is missing from ~/.claude/skills/<skill>/. First-run UX: an
+// file is missing from the selected engine's <skillHome>/skills/<skill>/
+// (see installPaths). First-run UX: an
 // operator who runs `fleet dispatch X` or `fleet` (TUI) without first
 // running `fleet init` still gets auto-handoff (fleet-guard) and the
 // coordinator skill on disk, without an explicit setup step.
@@ -34,26 +35,21 @@ import (
 //     auto-handoff and coord-skill are disabled. The operator can
 //     rerun `fleet init` manually to retry.
 //
-// claudeHomeOverride is for tests; production passes "".
-func maybeAutoInit(stdout io.Writer, claudeHomeOverride string) {
-	claudeHome := claudeHomeOverride
-	if claudeHome == "" {
-		home, err := os.UserHomeDir()
-		if err != nil {
-			// No home dir means runInit would fail too. Skip silently;
-			// downstream code will surface the real error if it
-			// matters.
-			return
-		}
-		claudeHome = filepath.Join(home, ".claude")
-	}
-
-	if allSkillsFullyInstalled(claudeHome) {
+// skillHomeOverride is for tests; production passes "".
+func maybeAutoInit(stdout io.Writer, skillHomeOverride string) {
+	paths, err := resolveInstallPaths(skillHomeOverride)
+	if err != nil {
+		// No home dir means runInit would fail too. Skip silently;
+		// downstream code will surface the real error if it matters.
 		return
 	}
 
-	_, _ = fmt.Fprintln(stdout, "fleet: first run — installing bundled skills...")
-	if err := runInit(stdout, false, claudeHomeOverride); err != nil {
+	if allSkillsFullyInstalled(paths) {
+		return
+	}
+
+	_, _ = fmt.Fprintf(stdout, "fleet: first run — installing bundled skills for %s...\n", paths.engine)
+	if err := runInit(stdout, false, skillHomeOverride); err != nil {
 		_, _ = fmt.Fprintf(stdout,
 			"fleet: skill install warning: %v\n", err)
 		_, _ = fmt.Fprintln(stdout,
@@ -63,10 +59,11 @@ func maybeAutoInit(stdout io.Writer, claudeHomeOverride string) {
 
 // allSkillsFullyInstalled returns true iff every fleet.SkillFS() entry
 // is on disk byte-equal to the embedded source AND fleet-guard's hooks
-// are wired in settings.json. This is the v0.2 generalization of the
-// v0.1 fleet-guard-only check: a v0.1 install with fleet-guard but no
-// coordinator must trigger autoinit so the new skill lands.
-func allSkillsFullyInstalled(claudeHome string) bool {
+// are wired in the engine's hooks file. This is the v0.2 generalization
+// of the v0.1 fleet-guard-only check: a v0.1 install with fleet-guard but
+// no coordinator must trigger autoinit so the new skill lands.
+func allSkillsFullyInstalled(paths installPaths) bool {
+	skillHome := paths.skillHome
 	for name, fsys := range fleet.SkillFS() {
 		// A symlinked skill dir is an explicit operator choice to run the
 		// repo checkout live (`fleet skills link`). Its files legitimately
@@ -74,16 +71,15 @@ func allSkillsFullyInstalled(claudeHome string) bool {
 		// ahead of the last build — treating that as "not installed" would
 		// make autoinit clobber the live link with a stale copy and silently
 		// undo the operator's link. Symlink present → considered installed.
-		if install.IsSymlink(claudeHome, name) {
+		if install.IsSymlink(skillHome, name) {
 			continue
 		}
-		skillRoot := filepath.Join(claudeHome, "skills", name)
-		if !skillFilesPresentFS(fsys, skillRoot) {
+		if !skillFilesPresentFS(fsys, paths.skillDir(name)) {
 			return false
 		}
 	}
-	mainPath := filepath.Join(claudeHome, "skills", "fleet-guard", "main.py")
-	return hooksRegistered(claudeHome, mainPath)
+	mainPath := filepath.Join(paths.skillDir("fleet-guard"), "main.py")
+	return hooksRegistered(paths.hooksFile, mainPath)
 }
 
 // skillFilesPresentFS returns true iff every file in fsys exists
@@ -131,15 +127,14 @@ func skillFilesPresentFS(fsys fs.FS, skillRoot string) bool {
 	return complete
 }
 
-// hooksRegistered returns true iff settings.json contains a hook
-// command pointing at mainPath under every event in hookEvents
-// (Stop / PreCompact / SessionStart). Missing file, unparseable JSON,
-// missing hooks key, or a missing event entry all return false so
-// auto-init re-runs and mergeHookRegistrations can re-apply the
-// (idempotent) merge. Mirrors the same matching the merge does, so
-// re-running adds nothing on a healthy install.
-func hooksRegistered(claudeHome, mainPath string) bool {
-	settingsPath := filepath.Join(claudeHome, "settings.json")
+// hooksRegistered returns true iff the hooks file at settingsPath
+// contains a hook command pointing at mainPath under every event in
+// hookEvents. Missing file, unparseable JSON, missing hooks key, or a
+// missing event entry all return false so auto-init re-runs and
+// mergeHookRegistrations can re-apply the (idempotent) merge. Mirrors
+// the same matching the merge does, so re-running adds nothing on a
+// healthy install.
+func hooksRegistered(settingsPath, mainPath string) bool {
 	data, err := os.ReadFile(settingsPath)
 	if err != nil {
 		return false

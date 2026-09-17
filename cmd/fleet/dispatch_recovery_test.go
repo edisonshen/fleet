@@ -20,6 +20,7 @@ import (
 	"github.com/edisonshen/fleet/internal/agent"
 	"github.com/edisonshen/fleet/internal/handoff"
 	"github.com/edisonshen/fleet/internal/handoffdelivery"
+	"github.com/edisonshen/fleet/internal/projects"
 	"github.com/edisonshen/fleet/internal/spawn"
 	"github.com/edisonshen/fleet/internal/state"
 	"github.com/edisonshen/fleet/internal/tasks"
@@ -1023,23 +1024,18 @@ func TestRunDispatch_DeadCoord_EngineClampOverridesInheritedCodex(t *testing.T) 
 	}
 }
 
-// TestRunDispatch_DeadCoord_CodexRecoveryRejected pins codex review
-// iter-9 P2 back-door: recovery of a dead codex coord without
-// engine-clamp would inherit engine=codex into the successor, but the
-// Python /coordinator skill needs Claude's Agent tool — a codex
-// successor is non-functional. The dispatch path must reject this
-// instead of silently spawning a broken coord.
-//
-// Operator escape: pass --engine claude-code to force-migrate the
-// recovery (engineExplicit=true → clamp fires → successor is
-// claude-code, command is reset to claude wrapper).
-func TestRunDispatch_DeadCoord_CodexRecoveryRejected(t *testing.T) {
+// TestRunDispatch_DeadCoord_CodexRecoveryInheritsEngine pins the
+// dominant-engine contract: a dead codex coord recovered by a flag-less
+// `fleet dispatch --coord-spawn` (TUI [a] / attach Tier 3 under a plain
+// `fleet`) comes back as codex — record AND wrapper — even though
+// FLEET_ENGINE holds the claude-code default and the project's
+// coord-config.json predates the engine stamp. Codex is a first-class
+// coordinator engine, so recovery must not rewrite the lineage to the
+// default nor refuse it.
+func TestRunDispatch_DeadCoord_CodexRecoveryInheritsEngine(t *testing.T) {
+	requireFakeTmux(t)
 	setupFleetHome(t)
-	// Defensive isolation (postmortem 2026-05-14 follow-up): the codex
-	// rejection fires before any tmux.Spawn, but the runtime sink guard
-	// would block a regression instead of letting it leak. Isolate up
-	// front so the lint passes without relying on the gate's correctness.
-	isolateTmuxSocket(t)
+	t.Setenv(FleetEngineEnv, "claude-code")
 
 	deadRec := agent.New("c0dexc0de")
 	deadRec.TaskID = "coord-myproj"
@@ -1066,43 +1062,144 @@ func TestRunDispatch_DeadCoord_CodexRecoveryRejected(t *testing.T) {
 	if err := os.Chtimes(csPath, stale, stale); err != nil {
 		t.Fatalf("chtimes coord-state: %v", err)
 	}
-	// An in-flight task: the synth doc's Status row for it must NOT be
-	// mirrored into tasks.md when no successor accepts the doc.
+	// An in-flight task so the synth handoff doc has a Status row to carry.
 	tasksPath := filepath.Join(pdir, "tasks.md")
 	inflight := &tasks.Task{Slug: "fix-foo-1234", Status: tasks.StatusInProgress, Priority: tasks.PriorityP1,
 		Created: time.Now(), Updated: time.Now(), SpawnedBy: "user", Spec: "fix foo"}
 	if err := tasks.Write(tasksPath, &tasks.File{Schema: tasks.SchemaVersion, Tasks: []*tasks.Task{inflight}}); err != nil {
 		t.Fatalf("write tasks.md: %v", err)
 	}
-	tasksBefore, _ := os.ReadFile(tasksPath)
 
+	// lint-test-isolation:command-exempt — this test asserts the
+	// engine-wrapper swap itself (claude default → inherited codex), which
+	// fires only on the CLI default-command path. requireFakeTmux above
+	// guarantees the swapped argv never reaches a real tmux/codex.
 	opts := &dispatchOpts{
 		taskID:          "coord-myproj",
 		project:         "myproj",
 		projectExplicit: true,
 		coordSpawn:      true,
-		command:         []string{"sleep", "60"},
-		commandExplicit: true,
-		// No engine flag — would inherit codex without the guard.
+		// No engine flag and no --command: the default (claude) wrapper
+		// is what a flag-less CLI dispatch would carry.
+		command: append([]string(nil), defaultClaudeCommand...),
 	}
 	var out bytes.Buffer
-	err := runDispatch(opts, &out)
-	if err == nil {
-		t.Fatalf("expected codex recovery to be rejected; got nil error\n%s", out.String())
+	if err := runDispatch(opts, &out); err != nil {
+		t.Fatalf("runDispatch: %v\n%s", err, out.String())
 	}
-	if !strings.Contains(err.Error(), "coordinator skill only works under claude-code") {
-		t.Errorf("error must explain the codex-coord limitation; got: %v", err)
-	}
-	if tasksAfter, _ := os.ReadFile(tasksPath); !bytes.Equal(tasksBefore, tasksAfter) {
-		t.Errorf("refused recovery must not annotate tasks.md; diff:\n%s", string(tasksAfter))
-	}
-	// No successor should be on disk.
 	live, _ := agent.List()
+	var successor *agent.Record
 	for _, r := range live {
 		if r.TaskID == "coord-myproj" && r.Project == "myproj" && r.ID != "c0dexc0de" {
+			successor = r
 			t.Cleanup(func() { _ = tmux.Kill(r.TmuxSession) })
-			t.Errorf("no successor must be spawned when codex recovery is rejected; got %s", r.ID)
+			break
 		}
+	}
+	if successor == nil {
+		t.Fatal("expected a codex successor record; got none")
+	}
+	if successor.Engine != "codex" {
+		t.Errorf("successor.Engine = %q; want codex (flag-less recovery inherits the dead coord's engine)", successor.Engine)
+	}
+	if joined := strings.Join(successor.Command, " "); !strings.Contains(joined, "codex ") || strings.Contains(joined, "claude ") {
+		t.Errorf("successor wrapper must launch codex, not the claude default: %q", joined)
+	}
+	if got := os.Getenv(FleetEngineEnv); got != "codex" {
+		t.Errorf("FLEET_ENGINE after recovery = %q; want codex (must match the record)", got)
+	}
+	if got := spawn.ReadCoordConfigEngine(root, "myproj"); got != "codex" {
+		t.Errorf("coord-config.json engine stamp = %q; want codex", got)
+	}
+}
+
+// TestRunDispatch_DeadCoord_RecoveryUsesPersistedChoice pins the
+// operator-wide engine switch: after `fleet -claude` persisted
+// claude-code in ~/.fleet/coord-config.json, a flag-less recovery of a
+// dead codex coord comes back as claude-code — record, wrapper, env and
+// project stamp — instead of inheriting the dead lineage's codex. The
+// dead record itself is left alone.
+func TestRunDispatch_DeadCoord_RecoveryUsesPersistedChoice(t *testing.T) {
+	requireFakeTmux(t)
+	setupFleetHome(t)
+	t.Setenv(FleetEngineEnv, "claude-code")
+	root := os.Getenv("FLEET_HOME")
+	if err := projects.WriteGlobalCoordConfigEngine(root, "claude-code"); err != nil {
+		t.Fatalf("persist engine choice: %v", err)
+	}
+
+	deadRec := agent.New("c0dexdead")
+	deadRec.TaskID = "coord-myproj"
+	deadRec.Project = "myproj"
+	deadRec.PID = 99999
+	deadRec.TmuxSession = "fleet-c0dexdead"
+	deadRec.Engine = "codex"
+	if err := deadRec.Write(); err != nil {
+		t.Fatalf("seed dead record: %v", err)
+	}
+	seedRecoveryRepo(t, root, "myproj")
+	pdir := filepath.Join(root, "projects", "myproj")
+	if err := os.MkdirAll(pdir, 0o755); err != nil {
+		t.Fatalf("mkdir project dir: %v", err)
+	}
+	// The project stamp says codex (its last coord); the global choice wins.
+	if err := os.WriteFile(filepath.Join(pdir, "coord-config.json"), []byte(`{"engine": "codex"}`+"\n"), 0o644); err != nil {
+		t.Fatalf("seed coord-config: %v", err)
+	}
+	csPath := filepath.Join(pdir, "coord-state.json")
+	if err := os.WriteFile(csPath, []byte(`{"worker_agent_ids": {}}`), 0o644); err != nil {
+		t.Fatalf("write coord-state: %v", err)
+	}
+	stale := time.Now().Add(-2 * coordFreshnessWindow)
+	if err := os.Chtimes(csPath, stale, stale); err != nil {
+		t.Fatalf("chtimes coord-state: %v", err)
+	}
+	inflight := &tasks.Task{Slug: "fix-foo-1234", Status: tasks.StatusInProgress, Priority: tasks.PriorityP1,
+		Created: time.Now(), Updated: time.Now(), SpawnedBy: "user", Spec: "fix foo"}
+	if err := tasks.Write(filepath.Join(pdir, "tasks.md"), &tasks.File{Schema: tasks.SchemaVersion, Tasks: []*tasks.Task{inflight}}); err != nil {
+		t.Fatalf("write tasks.md: %v", err)
+	}
+
+	// lint-test-isolation:command-exempt — asserts the engine-wrapper
+	// selection on the CLI default-command path; requireFakeTmux above
+	// guarantees the argv never reaches a real tmux/claude.
+	opts := &dispatchOpts{
+		taskID:          "coord-myproj",
+		project:         "myproj",
+		projectExplicit: true,
+		coordSpawn:      true,
+		command:         append([]string(nil), defaultClaudeCommand...),
+	}
+	var out bytes.Buffer
+	if err := runDispatch(opts, &out); err != nil {
+		t.Fatalf("runDispatch: %v\n%s", err, out.String())
+	}
+	live, _ := agent.List()
+	var successor *agent.Record
+	for _, r := range live {
+		if r.TaskID == "coord-myproj" && r.Project == "myproj" && r.ID != "c0dexdead" {
+			successor = r
+			t.Cleanup(func() { _ = tmux.Kill(r.TmuxSession) })
+			break
+		}
+	}
+	if successor == nil {
+		t.Fatal("expected a successor record; got none")
+	}
+	if successor.Engine != "claude-code" {
+		t.Errorf("successor.Engine = %q; want claude-code (persisted `fleet -claude` beats the dead coord's codex)", successor.Engine)
+	}
+	if joined := strings.Join(successor.Command, " "); !strings.Contains(joined, "claude ") || strings.Contains(joined, "codex ") {
+		t.Errorf("successor wrapper must launch claude, not inherit codex: %q", joined)
+	}
+	if got := os.Getenv(FleetEngineEnv); got != "claude-code" {
+		t.Errorf("FLEET_ENGINE after recovery = %q; want claude-code", got)
+	}
+	if got := spawn.ReadCoordConfigEngine(root, "myproj"); got != "claude-code" {
+		t.Errorf("coord-config.json engine stamp = %q; want claude-code", got)
+	}
+	if dead, err := agent.Load("c0dexdead"); err == nil && dead.Engine != "codex" {
+		t.Errorf("dead record engine rewritten to %q; the choice must only shape successors", dead.Engine)
 	}
 }
 
@@ -1499,34 +1596,86 @@ func TestCollectOpenPRs_EmptyCwdReturnsNil(t *testing.T) {
 	}
 }
 
-// TestRunDispatch_CoordSpawnRejectsCodexEngine pins codex review
-// iter-9 P2 front-door: the CLI must reject
-// `fleet --engine codex dispatch coord-X --coord-spawn` outright
-// (not just for recovery). The Python /coordinator skill emits
-// Claude-Agent-tool DISPATCH blocks that only claude-code can run.
-func TestRunDispatch_CoordSpawnRejectsCodexEngine(t *testing.T) {
+// TestRunDispatch_CoordSpawnCodexEngine pins the front door of the
+// dominant-engine contract: `fleet -codex dispatch coord-X --coord-spawn`
+// spawns a codex coordinator (record engine=codex, codex wrapper) and
+// stamps the choice into the project's coord-config.json so flag-less
+// respawns keep it. A second, flag-less coord-spawn for the same project
+// must then resolve codex from that stamp rather than the FLEET_ENGINE
+// default.
+func TestRunDispatch_CoordSpawnCodexEngine(t *testing.T) {
+	requireFakeTmux(t)
 	setupFleetHome(t)
-	// Defensive isolation (postmortem 2026-05-14 follow-up): the
-	// engine-rejection gate fires before tmux.Spawn, but isolating
-	// matches the "rather block CI than re-leak production" rule.
-	isolateTmuxSocket(t)
+	t.Setenv(FleetEngineEnv, "claude-code")
+	root := os.Getenv("FLEET_HOME")
+	seedRecoveryRepo(t, root, "myproj")
 
+	// lint-test-isolation:command-exempt — this test asserts the engine
+	// wrapper selection (codex argv) and the coord-config.json stamp that a
+	// flag-less respawn resolves, both of which live on the CLI default-
+	// command path. requireFakeTmux above keeps the spawn fake.
 	opts := &dispatchOpts{
 		taskID:          "coord-myproj",
 		project:         "myproj",
 		projectExplicit: true,
 		coordSpawn:      true,
-		command:         []string{"sleep", "60"},
-		commandExplicit: true,
-		engine:          "codex", // explicit codex on coord-spawn — must fail
+		engine:          "codex",
 	}
 	var out bytes.Buffer
-	err := runDispatch(opts, &out)
-	if err == nil {
-		t.Fatalf("expected --coord-spawn + --engine codex to be rejected; got nil\n%s", out.String())
+	if err := runDispatch(opts, &out); err != nil {
+		t.Fatalf("runDispatch(--engine codex --coord-spawn): %v\n%s", err, out.String())
 	}
-	if !strings.Contains(err.Error(), "--coord-spawn requires --engine claude-code") {
-		t.Errorf("error must mention coord-spawn engine constraint; got: %v", err)
+	live, _ := agent.List()
+	if len(live) != 1 {
+		t.Fatalf("expected exactly one coord record, got %d", len(live))
+	}
+	first := live[0]
+	t.Cleanup(func() { _ = tmux.Kill(first.TmuxSession) })
+	if first.Engine != "codex" {
+		t.Errorf("coord.Engine = %q; want codex", first.Engine)
+	}
+	if joined := strings.Join(first.Command, " "); !strings.Contains(joined, "codex ") {
+		t.Errorf("coord wrapper must launch codex: %q", joined)
+	}
+	if got := spawn.ReadCoordConfigEngine(root, "myproj"); got != "codex" {
+		t.Fatalf("coord-config.json engine stamp = %q; want codex", got)
+	}
+
+	// Retire the first coord (archive its record) so a flag-less
+	// coord-spawn takes the fresh-project path and must consult the
+	// stamp, not recovery inheritance.
+	if err := first.Archive(); err != nil {
+		t.Fatalf("archive first coord: %v", err)
+	}
+	// The coord's first tick (loop.py) clears the cold-start claim in
+	// production; the fake coord never ticks, so clear it here.
+	if err := clearCoordPendingClaim("myproj"); err != nil {
+		t.Fatalf("clear pending claim: %v", err)
+	}
+	t.Setenv(FleetEngineEnv, "claude-code")
+	opts2 := &dispatchOpts{
+		taskID:          "coord-myproj",
+		project:         "myproj",
+		projectExplicit: true,
+		coordSpawn:      true,
+	}
+	out.Reset()
+	if err := runDispatch(opts2, &out); err != nil {
+		t.Fatalf("runDispatch(flag-less respawn): %v\n%s", err, out.String())
+	}
+	live, _ = agent.List()
+	var second *agent.Record
+	for _, r := range live {
+		if r.ID != first.ID {
+			second = r
+			t.Cleanup(func() { _ = tmux.Kill(r.TmuxSession) })
+		}
+	}
+	if second == nil {
+		t.Fatal("expected a respawned coord record; got none")
+	}
+	if second.Engine != "codex" {
+		t.Errorf("flag-less respawn Engine = %q; want codex from coord-config.json stamp", second.Engine)
 	}
 }
 

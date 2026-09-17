@@ -14,13 +14,24 @@
 // Default invocations:
 //   - claude-code: `claude --dangerously-skip-permissions` (matches
 //     spawn.DefaultClaudeInvocation; v0 default).
-//   - codex:       `codex` (no flag — codex has no equivalent of
-//     --dangerously-skip-permissions and the operator picks engine at
-//     coord-session start, not per-task).
+//   - codex:       `codex --dangerously-bypass-approvals-and-sandbox
+//     --dangerously-bypass-hook-trust` — the unattended shape. Fleet
+//     agents run detached in tmux with nobody to answer an approval
+//     prompt, and fleet-guard's hooks are non-managed hooks that codex
+//     would otherwise hold for interactive trust review on every spawn.
+//
+// Dominant engine / helper engine: the operator picks ONE engine per
+// session (`fleet -codex` / `fleet -claude`). That engine runs the coord,
+// every worker, reviewer and finisher it spawns. The OTHER engine is the
+// helper: it is only ever used as the optional second code-review slot,
+// and only when its binary is installed. Fleet must run end-to-end on a
+// machine that has exactly one of the two installed.
 package enginecfg
 
 import (
 	"fmt"
+	"os/exec"
+	"path/filepath"
 )
 
 // EngineClaudeCode is the canonical engine name for Claude Code. v0
@@ -83,9 +94,65 @@ var engineDefaults = map[string]Invocation{
 	},
 	EngineCodex: {
 		Name:   EngineCodex,
-		Cmd:    "codex",
+		Cmd:    "codex --dangerously-bypass-approvals-and-sandbox --dangerously-bypass-hook-trust",
 		Binary: "codex",
 	},
+}
+
+// Helper returns the engine that acts as the optional second reviewer
+// when name is the dominant engine. Empty for unknown names.
+func Helper(name string) string {
+	switch name {
+	case "", EngineClaudeCode:
+		return EngineCodex
+	case EngineCodex:
+		return EngineClaudeCode
+	}
+	return ""
+}
+
+// Installed reports whether the engine's binary is on PATH. Used to
+// decide whether the helper engine can be offered a review slot — never
+// to gate the dominant engine, which the operator asked for explicitly.
+func Installed(name string) bool {
+	inv, err := Resolve(name)
+	if err != nil {
+		return false
+	}
+	_, err = exec.LookPath(inv.Binary)
+	return err == nil
+}
+
+// SkillHome returns the directory under home whose skills/<name>/ subtree
+// the engine's CLI discovers skills from: ~/.claude for Claude Code,
+// ~/.agents for Codex. Unknown/empty names resolve as the default engine.
+func SkillHome(home, name string) string {
+	if name == EngineCodex {
+		return filepath.Join(home, ".agents")
+	}
+	return filepath.Join(home, ".claude")
+}
+
+// HooksFile returns the JSON file whose top-level "hooks" object holds the
+// engine's hook registrations. Both CLIs read the same nested shape
+// (hooks.<Event>: [{hooks: [{type, command}]}]) but from different files:
+// Claude Code from ~/.claude/settings.json, Codex from
+// $CODEX_HOME/hooks.json (default ~/.codex/hooks.json — see CodexConfigDir).
+func HooksFile(home, name string) string {
+	if name == EngineCodex {
+		return filepath.Join(CodexConfigDir(home), "hooks.json")
+	}
+	return filepath.Join(home, HooksFileRel(name))
+}
+
+// HooksFileRel is HooksFile relative to the user home, ignoring any
+// CODEX_HOME relocation. Callers that only need the file's basename (test
+// overrides) use this.
+func HooksFileRel(name string) string {
+	if name == EngineCodex {
+		return filepath.Join(".codex", "hooks.json")
+	}
+	return filepath.Join(".claude", "settings.json")
 }
 
 // Resolve returns the Invocation registered for name. Unknown names
@@ -140,6 +207,22 @@ func BuildWrapperCommand(name string) ([]string, error) {
 		return nil, err
 	}
 	return []string{"sh", "-c", WrapperScript(inv)}, nil
+}
+
+// EngineForWrapperCommand reports which registered engine's default
+// wrapper (BuildWrapperCommand) argv is, byte-for-byte. ok=false means
+// argv is a custom/operator-supplied command whose engine cannot be
+// inferred — callers must not rewrite it.
+func EngineForWrapperCommand(argv []string) (name string, ok bool) {
+	if len(argv) != 3 || argv[0] != "sh" || argv[1] != "-c" {
+		return "", false
+	}
+	for n, inv := range engineDefaults {
+		if argv[2] == WrapperScript(inv) {
+			return n, true
+		}
+	}
+	return "", false
 }
 
 // Known returns true iff name is a registered engine.

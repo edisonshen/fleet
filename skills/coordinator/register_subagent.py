@@ -1,15 +1,17 @@
-"""Register a Claude Agent-tool subagent_id for a worker slug (issue #94).
+"""Register the host engine's subagent handle for a worker slug (issue #94).
 
-Phase A (#84) made workers Agent-tool subagents of the coord agent.
+Phase A (#84) made workers in-session subagents of the coord agent.
 Phase B (#93) plumbed the Fleet 8-hex agent_id through coord-state.json
 and the handoff doc. Phase C (this module) captures the orthogonal
-**Claude Agent-tool subagent_id** — the opaque token the host Claude
-session generates per Agent call — so the fleet TUI can cross-reference
-its worker rows with Claude's chat-side "N local agents" indicator.
+**engine subagent handle** — the opaque token the host session
+generates per spawn (Claude Code: the Agent tool's `subagent_id`;
+Codex: the `spawn_agent` task slug, e.g. `/root/<name>`) — so the fleet
+TUI can cross-reference its worker rows with the engine's chat-side
+"N local agents" indicator.
 
-The Python skill cannot read the Agent tool's return value (it's a
-Claude tool, not a Python API). The coord agent (Claude session) sees
-the subagent_id in the Agent call's response, then runs:
+The Python skill cannot read the spawn tool's return value (it's an
+engine tool, not a Python API). The coord agent sees the handle in the
+spawn call's response, then runs:
 
     python3 -m coordinator.register_subagent \\
         --project <p> <slug> <subagent_id>

@@ -2,8 +2,10 @@ package main
 
 import (
 	"bytes"
+	"encoding/json"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -11,6 +13,7 @@ import (
 
 	"github.com/edisonshen/fleet/internal/agent"
 	"github.com/edisonshen/fleet/internal/enginecfg"
+	"github.com/edisonshen/fleet/internal/projects"
 	"github.com/edisonshen/fleet/internal/state"
 	"github.com/edisonshen/fleet/internal/testutil/tmuxtest"
 	"github.com/edisonshen/fleet/internal/tmux"
@@ -199,6 +202,112 @@ func TestRootEngineConflict_PassesThroughDispatch(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "conflicting flags") {
 		t.Errorf("err = %v, want 'conflicting flags' phrase", err)
+	}
+}
+
+// TestRootEngineExplicitMarker pins FLEET_ENGINE_EXPLICIT: set to "1"
+// only when an engine flag was passed on this invocation, cleared
+// otherwise (so a stale value from the parent shell can't make a plain
+// `fleet` behave like `fleet -codex`). The TUI's [a] and attach's Tier 3
+// read it to decide whether to pin --engine on their dispatch shell-out.
+func TestRootEngineExplicitMarker(t *testing.T) {
+	cases := []struct {
+		name     string
+		args     []string
+		preset   string
+		wantMark string
+		wantEng  string
+	}{
+		{name: "-codex sets mark", args: []string{"--codex", "noop"}, preset: "", wantMark: "1", wantEng: "codex"},
+		{name: "--engine sets mark", args: []string{"--engine", "claude-code", "noop"}, preset: "", wantMark: "1", wantEng: "claude-code"},
+		{name: "no flag clears stale mark", args: []string{"noop"}, preset: "1", wantMark: "", wantEng: "claude-code"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("FLEET_HOME", t.TempDir())
+			t.Setenv(FleetEngineEnv, "")
+			t.Setenv(FleetEngineExplicitEnv, tc.preset)
+			root := newRootCmd()
+			// A side-effect-free child so PersistentPreRunE runs without
+			// launching the TUI.
+			root.AddCommand(&cobra.Command{Use: "noop", RunE: func(*cobra.Command, []string) error { return nil }})
+			root.SetArgs(tc.args)
+			var buf bytes.Buffer
+			root.SetOut(&buf)
+			root.SetErr(&buf)
+			if err := root.Execute(); err != nil {
+				t.Fatalf("root.Execute(%v): %v", tc.args, err)
+			}
+			if got := os.Getenv(FleetEngineExplicitEnv); got != tc.wantMark {
+				t.Errorf("%s = %q; want %q", FleetEngineExplicitEnv, got, tc.wantMark)
+			}
+			if got := os.Getenv(FleetEngineEnv); got != tc.wantEng {
+				t.Errorf("%s = %q; want %q", FleetEngineEnv, got, tc.wantEng)
+			}
+		})
+	}
+}
+
+// TestRootEngineChoicePersists pins the operator-wide memory of
+// `fleet -codex` / `fleet -claude`: an explicit flag is written to
+// <FLEET_HOME>/coord-config.json::engine (sibling keys preserved), and a
+// later flag-less `fleet` resolves FLEET_ENGINE from it — without setting
+// the explicit marker, so running coords are never force-migrated.
+func TestRootEngineChoicePersists(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("FLEET_HOME", home)
+	cfgPath := filepath.Join(home, "coord-config.json")
+	if err := os.WriteFile(cfgPath, []byte(`{"review_effort": "medium"}`+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	run := func(args ...string) {
+		t.Helper()
+		t.Setenv(FleetEngineEnv, "")
+		t.Setenv(FleetEngineExplicitEnv, "")
+		root := newRootCmd()
+		root.AddCommand(&cobra.Command{Use: "noop", RunE: func(*cobra.Command, []string) error { return nil }})
+		root.SetArgs(args)
+		var buf bytes.Buffer
+		root.SetOut(&buf)
+		root.SetErr(&buf)
+		if err := root.Execute(); err != nil {
+			t.Fatalf("root.Execute(%v): %v\n%s", args, err, buf.String())
+		}
+		if buf.Len() != 0 {
+			t.Fatalf("root.Execute(%v) output: %s", args, buf.String())
+		}
+	}
+
+	run("--codex", "noop")
+	if got := projects.ReadGlobalCoordConfigEngine(home); got != "codex" {
+		t.Fatalf("after -codex: persisted engine = %q want codex", got)
+	}
+	raw, err := os.ReadFile(cfgPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var cfg map[string]any
+	if err := json.Unmarshal(raw, &cfg); err != nil {
+		t.Fatalf("coord-config.json not JSON: %v\n%s", err, raw)
+	}
+	if cfg["review_effort"] != "medium" {
+		t.Errorf("persisting engine clobbered review_effort: %v", cfg)
+	}
+
+	run("noop")
+	if got := os.Getenv(FleetEngineEnv); got != "codex" {
+		t.Errorf("flag-less fleet: %s = %q want codex (persisted choice)", FleetEngineEnv, got)
+	}
+	if got := os.Getenv(FleetEngineExplicitEnv); got != "" {
+		t.Errorf("flag-less fleet set %s=%q; persisted choice must not read as explicit", FleetEngineExplicitEnv, got)
+	}
+
+	run("--claude", "noop")
+	if got := projects.ReadGlobalCoordConfigEngine(home); got != "claude-code" {
+		t.Errorf("after -claude: persisted engine = %q want claude-code", got)
+	}
+	if got := os.Getenv(FleetEngineEnv); got != "claude-code" {
+		t.Errorf("-claude: %s = %q want claude-code", FleetEngineEnv, got)
 	}
 }
 

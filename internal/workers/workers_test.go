@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/edisonshen/fleet/internal/agent"
 	"github.com/edisonshen/fleet/internal/fleetlog"
 	"github.com/edisonshen/fleet/internal/projects"
 	"github.com/edisonshen/fleet/internal/state"
@@ -1150,6 +1151,199 @@ func TestValidateReviewGate(t *testing.T) {
 				t.Fatalf("WriteState: got %v; want %v", err, c.wantErr)
 			}
 		})
+	}
+}
+
+// writeCoordEngine stamps coord-config.json::engine for project under
+// FLEET_HOME, the way a `fleet -codex` coord spawn does.
+func writeCoordEngine(t *testing.T, project, engine string) {
+	t.Helper()
+	root, err := state.Root()
+	if err != nil {
+		t.Fatalf("state.Root: %v", err)
+	}
+	p := projects.CoordConfigPath(root, project)
+	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(p, []byte(`{"engine":"`+engine+`","repo":"/tmp/x"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestWorkers_ReviewGate_CodexAnchor mirrors TestWorkers_ReviewGate for a
+// project whose coord runs `fleet -codex`: beta must be codex+passed,
+// claude is the optional helper that may skip, and a claude-only state
+// (the pre-mirroring shape) is REJECTED because the anchor moved.
+func TestWorkers_ReviewGate_CodexAnchor(t *testing.T) {
+	cases := []struct {
+		name    string
+		gitMode bool
+		state   func(project, slug string) *State
+		wantErr error
+	}{
+		{
+			name:    "codex beta + claude alpha both passed",
+			gitMode: true,
+			state: func(project, slug string) *State {
+				return stateWithReview(project, slug, PhasePush, ReviewStatusPassed, ReviewEngineClaude, "opus-4.8", "", ReviewStatusPassed, ReviewEngineCodex, "gpt-5.5-codex", "")
+			},
+		},
+		{
+			name:    "claude helper skipped unavailable (codex-only host)",
+			gitMode: true,
+			state: func(project, slug string) *State {
+				return stateWithReview(project, slug, PhasePush, ReviewStatusSkipped, ReviewEngineClaude, "opus-4.8", "unavailable", ReviewStatusPassed, ReviewEngineCodex, "gpt-5.5-codex", "")
+			},
+		},
+		{
+			name:    "claude helper skipped on non-git project accepted",
+			gitMode: false,
+			state: func(project, slug string) *State {
+				return stateWithReview(project, slug, PhaseDone, ReviewStatusSkipped, ReviewEngineClaude, "opus-4.8", "rate-limited", ReviewStatusPassed, ReviewEngineCodex, "gpt-5.5-codex", "")
+			},
+		},
+		{
+			name:    "claude helper skipped without reason rejected",
+			gitMode: true,
+			state: func(project, slug string) *State {
+				return stateWithReview(project, slug, PhasePush, ReviewStatusSkipped, ReviewEngineClaude, "opus-4.8", "", ReviewStatusPassed, ReviewEngineCodex, "gpt-5.5-codex", "")
+			},
+			wantErr: ErrCodexSkipNeedsReason,
+		},
+		{
+			name:    "codex alpha skipped rejected (anchor engine never skips)",
+			gitMode: true,
+			state: func(project, slug string) *State {
+				return stateWithReview(project, slug, PhasePush, ReviewStatusSkipped, ReviewEngineCodex, "gpt-5.5-codex", "rate-limited", ReviewStatusPassed, ReviewEngineCodex, "gpt-5.5-codex", "")
+			},
+			wantErr: ErrPhaseRequiresReview,
+		},
+		{
+			name:    "single-engine-degraded codex accepted",
+			gitMode: true,
+			state: func(project, slug string) *State {
+				return stateWithReview(project, slug, PhasePush, ReviewStatusSingleEngineDegraded, ReviewEngineCodex, "gpt-5.5-codex", "", ReviewStatusPassed, ReviewEngineCodex, "gpt-5.5-codex", "")
+			},
+		},
+		{
+			name:    "single-engine-degraded on helper engine rejected",
+			gitMode: true,
+			state: func(project, slug string) *State {
+				return stateWithReview(project, slug, PhasePush, ReviewStatusSingleEngineDegraded, ReviewEngineClaude, "opus-4.8", "", ReviewStatusPassed, ReviewEngineCodex, "gpt-5.5-codex", "")
+			},
+			wantErr: ErrPhaseRequiresReview,
+		},
+		{
+			name:    "claude beta rejected under codex anchor",
+			gitMode: true,
+			state: func(project, slug string) *State {
+				return stateWithReview(project, slug, PhasePush, ReviewStatusPassed, ReviewEngineCodex, "gpt-5.5-codex", "", ReviewStatusPassed, ReviewEngineClaude, "opus-4.8", "")
+			},
+			wantErr: ErrReviewBetaAnchor,
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			tmp := t.TempDir()
+			t.Setenv("FLEET_HOME", tmp)
+			project := "git-proj"
+			if !c.gitMode {
+				project = "ng-proj"
+				writeNonGitProject(t, project)
+			}
+			writeCoordEngine(t, project, "codex")
+			slug := "cgate-" + sanitizeSlug(c.name) + "-aaaa"
+			err := WriteState(project, slug, c.state(project, slug))
+			if c.wantErr == nil && err != nil {
+				t.Fatalf("WriteState: %v; want nil", err)
+			}
+			if c.wantErr != nil && !errors.Is(err, c.wantErr) {
+				t.Fatalf("WriteState: got %v; want %v", err, c.wantErr)
+			}
+		})
+	}
+}
+
+// writeCoordRecord drops a live coord agent record for project under
+// FLEET_HOME with the given engine and spawn time.
+func writeCoordRecord(t *testing.T, id, project, engine string, spawned time.Time) {
+	t.Helper()
+	r := agent.New(id)
+	r.Engine = engine
+	r.Project = project
+	r.TaskID = "coord-" + project
+	r.IsCoord = true
+	r.SpawnedAt = spawned
+	dir, err := state.AgentDir()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Write(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestProjectReviewAnchor_Sources: the live coord record is the
+// authoritative anchor source; the coord-config.json stamp is the
+// fallback when no coord record is on disk; claude when neither exists.
+func TestProjectReviewAnchor_Sources(t *testing.T) {
+	t.Setenv("FLEET_HOME", t.TempDir())
+	now := time.Now().UTC()
+
+	if got := ProjectReviewAnchor("p"); got != ReviewEngineClaude {
+		t.Fatalf("no stamp, no coord: anchor = %q", got)
+	}
+
+	// A codex coord whose coord-config.json stamp write failed must still
+	// anchor on codex, or its own beta results would never pass the gate.
+	writeCoordRecord(t, "c1", "p", "codex", now)
+	if got := ProjectReviewAnchor("p"); got != ReviewEngineCodex {
+		t.Fatalf("live codex coord, no stamp: anchor = %q", got)
+	}
+
+	// A stale stamp from a previous claude coord loses to the live record.
+	writeCoordEngine(t, "p", "claude-code")
+	if got := ProjectReviewAnchor("p"); got != ReviewEngineCodex {
+		t.Fatalf("live codex coord beats stale claude stamp: anchor = %q", got)
+	}
+
+	// Several coord records (dead predecessor not yet archived): newest wins.
+	writeCoordRecord(t, "c2", "p", "claude-code", now.Add(time.Minute))
+	if got := ProjectReviewAnchor("p"); got != ReviewEngineClaude {
+		t.Fatalf("newest coord record wins: anchor = %q", got)
+	}
+
+	// Another project's coord record never leaks across.
+	writeCoordRecord(t, "c3", "q", "codex", now.Add(time.Hour))
+	if got := ProjectReviewAnchor("p"); got != ReviewEngineClaude {
+		t.Fatalf("other project's coord leaked: anchor = %q", got)
+	}
+	if got := ProjectReviewAnchor("q"); got != ReviewEngineCodex {
+		t.Fatalf("project q anchor = %q", got)
+	}
+
+	// Stamp-only (coord archived): stamp is the fallback.
+	t.Setenv("FLEET_HOME", t.TempDir())
+	writeCoordEngine(t, "p", "codex")
+	if got := ProjectReviewAnchor("p"); got != ReviewEngineCodex {
+		t.Fatalf("stamp only: anchor = %q", got)
+	}
+}
+
+func TestReviewEngineForDominant(t *testing.T) {
+	for in, want := range map[string]string{
+		"":            ReviewEngineClaude,
+		"claude-code": ReviewEngineClaude,
+		"codex":       ReviewEngineCodex,
+		"bogus":       ReviewEngineClaude,
+	} {
+		if got := ReviewEngineForDominant(in); got != want {
+			t.Errorf("ReviewEngineForDominant(%q) = %q; want %q", in, got, want)
+		}
 	}
 }
 

@@ -7,6 +7,9 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+
+	"github.com/edisonshen/fleet/internal/enginecfg"
+	"github.com/edisonshen/fleet/internal/projects"
 )
 
 // coordTaskIDPrefix matches cmd/fleet/dispatch.go's CoordTaskIDPrefix.
@@ -44,22 +47,64 @@ func IsCoordSpawn(taskID, project string) bool {
 	return isCoordSpawn(taskID, project)
 }
 
-// writeCoordConfigRepoIdempotent stamps the resolved repo path into
-// ~/.fleet/projects/<project>/coord-config.json under the `repo` key.
+// CoordConfigPath is projects.CoordConfigPath; kept here so spawn-side
+// callers and tests keep one import.
+func CoordConfigPath(fleetHome, project string) string {
+	return projects.CoordConfigPath(fleetHome, project)
+}
+
+// ReadCoordConfigEngine is projects.ReadCoordConfigEngine.
+func ReadCoordConfigEngine(fleetHome, project string) string {
+	return projects.ReadCoordConfigEngine(fleetHome, project)
+}
+
+// ResolveEngineChoice is projects.ResolveEngineChoice.
+func ResolveEngineChoice(fleetHome, project string) string {
+	return projects.ResolveEngineChoice(fleetHome, project)
+}
+
+// resolveCoordHandoffEngine picks the engine a coord successor runs:
+//
+//  1. FLEET_ENGINE when FLEET_ENGINE_EXPLICIT=1 — the operator passed
+//     -codex / -claude / --engine on THIS invocation.
+//  2. The persisted operator choice (global coord-config.json::engine,
+//     then the project's stamp) — see projects.ResolveEngineChoice.
+//  3. fallback — the outgoing coord's engine.
+//
+// An unknown persisted/explicit name is ignored (falls through) rather
+// than propagated onto a record the dashboard can't render; dispatch
+// validates names at the CLI boundary already.
+func resolveCoordHandoffEngine(project, fallback string) string {
+	if os.Getenv("FLEET_ENGINE_EXPLICIT") == "1" {
+		if eng := os.Getenv("FLEET_ENGINE"); enginecfg.Known(eng) {
+			return eng
+		}
+	}
+	if fhome := fleetHomeForSpawn(); fhome != "" {
+		if eng := ResolveEngineChoice(fhome, project); enginecfg.Known(eng) {
+			return eng
+		}
+	}
+	return fallback
+}
+
+// writeCoordConfigStamp stamps the resolved repo path and the coord's
+// engine into ~/.fleet/projects/<project>/coord-config.json.
 //
 // Schema (additive — never break existing readers):
 //
 //	{
 //	    "parallelism": <int>,   // loop.py _load_parallelism
-//	    "repo":        <str>    // fleet#175 — coord's project checkout
+//	    "repo":        <str>,   // fleet#175 — coord's project checkout
+//	    "engine":      <str>    // dominant engine of the last coord spawn
 //	}
 //
-// Idempotency:
-//   - file missing → create with {"repo": repo}
-//   - file present, `repo` missing or whitespace-only → merge (preserve
-//     parallelism + every other field)
-//   - file present, `repo` non-empty → leave untouched (operator may
-//     have set this to a fork/out-of-tree checkout)
+// Both keys are overwritten unconditionally; every other field is
+// preserved. `engine` is what lets a later `fleet` (TUI [a], `fleet
+// attach` Tier 3) with no engine flag respawn the project's coord under
+// the engine the operator originally chose — the per-project memory of
+// `fleet -codex` / `fleet -claude`. An explicit flag on the respawn
+// always wins over it (cmd/fleet/dispatch.go).
 //
 // Atomic: write to a tempfile in the same directory, fsync, rename.
 // On any non-recoverable error returns it for the caller to log; we
@@ -67,15 +112,15 @@ func IsCoordSpawn(taskID, project string) bool {
 // coord skill falls through to its legacy cwd-derived behavior + emits
 // a warning into TickResult.errors. A failed write here is a
 // breadcrumb, not a blocker.
-func writeCoordConfigRepoIdempotent(fleetHome, project, repo string) error {
+func writeCoordConfigStamp(fleetHome, project, repo, engine string) error {
 	if fleetHome == "" || project == "" || repo == "" {
-		return errors.New("writeCoordConfigRepoIdempotent: empty input")
+		return errors.New("writeCoordConfigStamp: empty input")
 	}
 	projDir := filepath.Join(fleetHome, "projects", project)
 	if err := os.MkdirAll(projDir, 0o755); err != nil {
 		return fmt.Errorf("mkdir project dir: %w", err)
 	}
-	cfgPath := filepath.Join(projDir, "coord-config.json")
+	cfgPath := CoordConfigPath(fleetHome, project)
 
 	// Read existing config (if any). Treat unreadable/malformed as
 	// empty — we'll write a clean one. Matches the Python helper's
@@ -105,6 +150,9 @@ func writeCoordConfigRepoIdempotent(fleetHome, project, repo string) error {
 	// lives in meta.json::repo_path (set via `fleet project add`), which
 	// the resolver reads first (tier 1) on every bind.
 	data["repo"] = repo
+	if engine != "" {
+		data["engine"] = engine
+	}
 
 	// Atomic write: tmp + fsync + rename in the same directory.
 	tmp, err := os.CreateTemp(projDir, "coord-config.json.tmp.*")
@@ -148,4 +196,24 @@ func fleetHomeForSpawn() string {
 		return filepath.Join(home, ".fleet")
 	}
 	return ""
+}
+
+// ensureEngineProjectTrust pre-trusts cwd in the engine's user config so
+// the unattended CLI does not stop at a first-run "trust this directory?"
+// prompt inside the tmux pane. Only Codex has such a prompt today; the
+// entry lands in $CODEX_HOME/config.toml (default ~/.codex/config.toml),
+// mirroring where Codex itself records the answer. Best-effort: a failed
+// write warns and the spawn proceeds.
+func ensureEngineProjectTrust(engine, cwd string) {
+	if engine != enginecfg.EngineCodex || cwd == "" {
+		return
+	}
+	home, err := os.UserHomeDir()
+	if err != nil || home == "" {
+		return
+	}
+	cfgDir := enginecfg.CodexConfigDir(home)
+	if _, err := enginecfg.EnsureCodexProjectTrust(cfgDir, cwd); err != nil {
+		_, _ = fmt.Fprintf(os.Stderr, "warning: could not pre-trust %s for codex: %v\n", cwd, err)
+	}
 }

@@ -1008,17 +1008,17 @@ const dispatchVetoExitCode = 75
 // in the wrong checkout. Codex review iter-2 P1 + iter-4 P1 + iter-6 P1.
 //
 // Shape: `dispatch coord-<project> --coord-spawn --project <project>
-// --prompt <coord-bootstrap-prompt> --engine claude-code
+// --prompt <coord-bootstrap-prompt> [--engine <engine>]
 // [--cwd <repo_path>]`.
 //
 //   - --prompt forces /coordinator into the fresh agent's first paint;
 //     without it the operator lands in a bare Claude that never claims
 //     the project (codex iter-6 P1).
-//   - --engine claude-code matches the TUI [a] auto-spawn discipline:
-//     the coordinator skill's DISPATCH blocks only a claude-code session
-//     can consume. Without the explicit stamp, an operator in
-//     `fleet -codex attach ...` would propagate FLEET_ENGINE=codex into
-//     dispatch, which today rejects coord-spawn with a different engine.
+//   - --engine is passed only when the operator chose one on this
+//     `fleet` invocation (FleetEngineExplicitEnv). Flag-less, dispatch
+//     resolves the project's stamped coord-config.json::engine so the
+//     coord comes back under the engine it was first spawned with;
+//     same discipline as the TUI [a] auto-spawn.
 //   - --cwd carries the resolver-validated repo (NOT the raw
 //     meta.json::repo_path). DESIGN-coord-repo-binding-from-project.md
 //     PR3: this path resolves through coordrepo.ResolveProjectRepo, so a
@@ -1032,7 +1032,11 @@ func buildCoordSpawnArgs(project string) ([]string, error) {
 		"--coord-spawn",
 		"--project", project,
 		"--prompt", projectlookup.CoordSpawnPrompt(project),
-		"--engine", "claude-code",
+	}
+	if os.Getenv(FleetEngineExplicitEnv) == "1" {
+		if eng := os.Getenv(FleetEngineEnv); eng != "" {
+			args = append(args, "--engine", eng)
+		}
 	}
 	// Resolve the repo binding through the shared resolver (codex PR3
 	// review [P1]): reading meta.RepoPath raw would bypass fingerprint

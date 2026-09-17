@@ -1,6 +1,6 @@
 ---
 name: fleet-guard
-description: Watches the host Claude Code agent's context window. Writes health JSON to ~/.fleet/agents/<id>.json on every turn, triggers structured handoffs at 40% (Yellow) and 50% (Red) thresholds, delivers operator messages from ~/.fleet/inbox/<id>.md, and enqueues handoff requests at ~/.fleet/queue/ for the fleet binary to drain. Agent-side half of Fleet (producer); the fleet TUI / `fleet drain` is the consumer.
+description: Watches the host agent's (Claude Code or Codex) context window. Writes health JSON to ~/.fleet/agents/<id>.json on every turn, triggers structured handoffs at 40% (Yellow) and 50% (Red) thresholds, delivers operator messages from ~/.fleet/inbox/<id>.md, and enqueues handoff requests at ~/.fleet/queue/ for the fleet binary to drain. Agent-side half of Fleet (producer); the fleet TUI / `fleet drain` is the consumer.
 ---
 
 # fleet-guard
@@ -11,7 +11,7 @@ Spike `docs/SPIKE-context-pct.md` closed PASS on 2026-04-28 (full spec). This sk
 
 ## Hook bindings
 
-Registration lives in `~/.claude/settings.json` and is written by `fleet init`. The skill is a passive consumer of three Claude Code hooks:
+Registration is written by `fleet init` for the dominant engine: `~/.claude/settings.json` (claude-code) or `~/.codex/hooks.json` (codex). Both engines fire the same hook names with the same JSON payload shape (`session_id`, `transcript_path`, `cwd`, `hook_event_name`, `tool_name`, `tool_input`, `agent_id` in subagents), so one skill serves both. The skill is a passive consumer of these hooks:
 
 | Hook | When | Skill action |
 |------|------|--------------|
@@ -19,7 +19,7 @@ Registration lives in `~/.claude/settings.json` and is written by `fleet init`. 
 | `PreCompact` | Just before context compaction | Emergency handoff: write doc + queue immediately, no MILESTONE wait |
 | `SessionStart` | Session begins (resume or fresh) | Deliver any pending operator inbox message |
 | `UserPromptSubmit` | Operator submits a prompt to the agent | Clear `needs_input` (agent transitions waiting → working) |
-| `PreToolUse` | Before every tool call | Coordinator delegation guard (`coordguard.py`): in a `FLEET_ROLE=coord` session, deny `Edit`/`Write`/`MultiEdit`/`NotebookEdit` outside `docs/`, and `Bash` that runs test suites, mutates git, or writes files. Agent-tool subagents (payload carries `agent_id`) are exempt. No-op for workers. |
+| `PreToolUse` | Before every tool call | Coordinator delegation guard (`coordguard.py`): in a `FLEET_ROLE=coord` session, deny `Edit`/`Write`/`MultiEdit`/`NotebookEdit` (claude-code) or `apply_patch` (codex) outside `docs/`, and `Bash` that runs test suites, mutates git, or writes files. Subagents (payload carries `agent_id`) are exempt. No-op for workers. |
 
 The original DESIGN.md referenced a `PostResponse` hook; that hook does not exist in Claude Code. `Stop` is the real binding and is what the spike validated (67 fires, 100% transcript availability, p95 18ms).
 
@@ -45,6 +45,8 @@ Stdin is a JSON payload containing at least `transcript_path`, `session_id`, and
 
 The `payload.model` field is unreliable on `Stop` (often empty). Authoritative model name comes from the transcript walk (`message.model` on the most-recent `assistant` line), matching `spike/stop-hook.py:118-141`.
 
+**Codex transcripts.** A codex agent's `transcript_path` is its rollout (`~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl`). The skill recognises `event_msg` records with `payload.type == "token_count"` and computes `context_pct = info.last_token_usage.input_tokens / info.model_context_window * 100` (cached input tokens are a subset of `input_tokens` in this shape; output tokens excluded as above). The window is in-band, so no per-model table is needed; a rollout that omits it falls back to the 1M default with the same loud flag. The model name is taken from `payload.model` (codex populates it). Coord-guard likewise recognises codex's `apply_patch` tool (patch headers name the target paths) alongside Claude's `Edit`/`Write`; `Bash` is shared.
+
 When the Stop hook needs to inject text into the agent's next turn (operator inbox or `HANDOFF REQUESTED`), the skill emits a JSON response: `{"decision": "block", "reason": <concatenated injections>}`. Claude Code refuses to stop and treats `reason` as the next assistant-side input.
 
 Plain stdout from a Stop hook is NOT auto-injected into the conversation — verified empirically across all transcripts on disk. The original v0.1 contract assumed otherwise and shipped broken: auto-yellow agents stayed stuck because the agent never saw the injection. The JSON form is the documented mechanism.
@@ -62,7 +64,7 @@ Stdin is the same JSON shape minus token deltas. Stdout is ignored (the compacti
 
 ### `SessionStart`
 
-Stdin contains `session_id` and resumption metadata. The skill checks for a pending inbox message and emits it via stdout (same `[OPERATOR] <body>` shape). No threshold evaluation on this hook — context is fresh.
+Stdin contains `session_id` and resumption metadata. The skill checks for a pending inbox message and emits it as `{"hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext": "[OPERATOR] <body>"}}` — the JSON shape both Claude Code and Codex inject as context (Codex rejects plain stdout here). No threshold evaluation on this hook — context is fresh.
 
 ### `UserPromptSubmit`
 
@@ -190,11 +192,11 @@ The skill MUST NEVER block the agent's turn. All exceptions are logged to stderr
 
 ## Install
 
-`fleet init` (added in Week 4b+4c) writes the skill files to `~/.claude/skills/fleet-guard/` and merges hook registrations (`Stop`, `PreCompact`, `SessionStart`) into `~/.claude/settings.json`.
+`fleet init` (added in Week 4b+4c) writes the skill files to the dominant engine's skill home (`~/.claude/skills/fleet-guard/` for claude-code, `~/.agents/skills/fleet-guard/` for codex) and merges hook registrations (`Stop`, `PreCompact`, `SessionStart`, `UserPromptSubmit`, `PreToolUse`) into that engine's hooks file (`~/.claude/settings.json` / `~/.codex/hooks.json`). `fleet -codex init` installs for codex.
 
 For development:
 
 ```sh
-ln -s "$(pwd)/skills/fleet-guard" ~/.claude/skills/fleet-guard
-# then manually add Stop/PreCompact/SessionStart entries to ~/.claude/settings.json
+fleet skills link            # symlink <skill-home>/skills/fleet-guard -> this checkout
+fleet -codex skills link     # same, for the codex skill home
 ```

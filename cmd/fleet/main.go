@@ -5,11 +5,14 @@ package main
 import (
 	"errors"
 	"fmt"
+	"io"
 	"os"
 
 	"github.com/spf13/cobra"
 
 	"github.com/edisonshen/fleet/internal/enginecfg"
+	"github.com/edisonshen/fleet/internal/projects"
+	"github.com/edisonshen/fleet/internal/state"
 	"github.com/edisonshen/fleet/internal/tui"
 )
 
@@ -35,6 +38,37 @@ var Version = "dev"
 // directly to exercise the propagation.
 const FleetEngineEnv = "FLEET_ENGINE"
 
+// FleetEngineExplicitEnv is "1" when the operator chose the engine on
+// THIS `fleet` invocation (--engine / -codex / -claude), unset otherwise.
+// The TUI's [a] and `fleet attach`'s Tier 3 coord spawns re-exec `fleet
+// dispatch --coord-spawn`; they pass `--engine $FLEET_ENGINE` only when
+// this is set, so "operator said -codex" wins at dispatch while a
+// flag-less `fleet` lets the project's stamped coord-config.json::engine
+// win over the FLEET_ENGINE default. Read in-process only (tui,
+// attach); dispatch keys off its root flags.
+const FleetEngineExplicitEnv = "FLEET_ENGINE_EXPLICIT"
+
+// engineFlagChanged reports whether any root engine flag was passed on
+// this invocation.
+func engineFlagChanged(root *cobra.Command) bool {
+	pf := root.PersistentFlags()
+	return pf.Changed("engine") || pf.Changed("codex") || pf.Changed("claude")
+}
+
+// persistEngineChoice remembers an explicit -codex / -claude / --engine
+// in ~/.fleet/coord-config.json::engine. Best-effort: a write failure is
+// a stderr warning, never a fatal — this invocation still runs on the
+// resolved engine, it just won't be remembered.
+func persistEngineChoice(stderr io.Writer, engine string) {
+	root, err := state.Root()
+	if err == nil {
+		err = projects.WriteGlobalCoordConfigEngine(root, engine)
+	}
+	if err != nil {
+		_, _ = fmt.Fprintf(stderr, "warning: could not persist engine choice %s: %v\n", engine, err)
+	}
+}
+
 func newRootCmd() *cobra.Command {
 	// rootEngine captures the persistent --engine value plus the
 	// -codex / -claude shorthand flags. cobra exposes the shorthand as
@@ -55,12 +89,13 @@ productive.
 ` + "`fleet`" + ` (no args) launches the interactive dashboard.
 Subcommands below cover dispatch / attach / status from the shell.
 
-Engine selection:
-  fleet                      # default engine (claude-code)
-  fleet -codex               # codex engine for this whole session
-                             # (coord + workers + finisher all run codex;
-                             #  reviewer subagent runs claude for second opinion)
-  fleet -claude              # explicit claude-code (same as default)
+Engine selection (dominant engine; the other one is an optional review helper):
+  fleet                      # default engine (claude-code), or the engine
+                             # the project's coord was last spawned with
+  fleet -codex               # codex runs coord + workers + finisher;
+                             # claude, if installed, adds a second review
+  fleet -claude              # claude-code runs coord + workers + finisher;
+                             # codex, if installed, adds a second review
   fleet --engine <name>      # spelled-out form`,
 		SilenceUsage:  true,
 		SilenceErrors: true,
@@ -69,12 +104,30 @@ Engine selection:
 		// root and stamps FLEET_ENGINE so every subcommand (dispatch,
 		// handoff, the TUI's startCoordSpawn) reads a single source of
 		// truth. Precedence: -codex > -claude > --engine > existing env.
+		//
+		// The persisted choice: an explicit flag is remembered in
+		// ~/.fleet/coord-config.json::engine so a later flag-less
+		// `fleet` (and every coord start / recovery / handoff it
+		// triggers) keeps using it. Running coords are never touched.
 		PersistentPreRunE: func(cmd *cobra.Command, _ []string) error {
+			envEngine := os.Getenv(FleetEngineEnv)
+			if envEngine == "" {
+				if root, rerr := state.Root(); rerr == nil {
+					envEngine = projects.ReadGlobalCoordConfigEngine(root)
+				}
+			}
 			resolved, err := resolveEngineFlags(
-				rootEngine, flagCodex, flagClaude,
-				os.Getenv(FleetEngineEnv),
+				rootEngine, flagCodex, flagClaude, envEngine,
 			)
 			if err != nil {
+				return err
+			}
+			if engineFlagChanged(cmd.Root()) {
+				if err := os.Setenv(FleetEngineExplicitEnv, "1"); err != nil {
+					return err
+				}
+				persistEngineChoice(cmd.ErrOrStderr(), resolved)
+			} else if err := os.Unsetenv(FleetEngineExplicitEnv); err != nil {
 				return err
 			}
 			return os.Setenv(FleetEngineEnv, resolved)
@@ -94,9 +147,9 @@ Engine selection:
 	root.PersistentFlags().StringVar(&rootEngine, "engine", "",
 		"engine for new agents spawned this session (claude-code | codex; default: claude-code)")
 	root.PersistentFlags().BoolVar(&flagCodex, "codex", false,
-		"shorthand for --engine codex (coord + workers + finisher run codex; reviewer runs claude)")
+		"shorthand for --engine codex (coord + workers + finisher run codex; claude is an optional review helper)")
 	root.PersistentFlags().BoolVar(&flagClaude, "claude", false,
-		"shorthand for --engine claude-code (the default; explicit form)")
+		"shorthand for --engine claude-code (the default; codex is an optional review helper)")
 
 	root.AddCommand(newDispatchCmd())
 	root.AddCommand(newAttachCmd())

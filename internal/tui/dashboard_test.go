@@ -31,7 +31,11 @@ func seedTasks(t *testing.T, projectsRoot, project string, counts TaskCounts) {
 	now := time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC)
 	add := func(status tasks.Status, n int) {
 		for i := 0; i < n; i++ {
-			slug := tasks.GenerateSlug(string(status), "", nil)
+			existing := make([]string, 0, len(f.Tasks))
+			for _, seeded := range f.Tasks {
+				existing = append(existing, seeded.Slug)
+			}
+			slug := tasks.GenerateSlug(string(status), "", existing)
 			tk := &tasks.Task{
 				Slug:       slug,
 				Status:     status,

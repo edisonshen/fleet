@@ -39,6 +39,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/edisonshen/fleet/internal/enginecfg"
 	"github.com/edisonshen/fleet/internal/state"
 )
 
@@ -477,14 +478,16 @@ func locateViaSymlinkSibling(claudeHome, name string) (string, bool) {
 	return "", false
 }
 
-// defaultClaudeHome resolves ~/.claude. Split out so LocateRepoSkillDir can
-// fall back gracefully when the home dir is unresolvable.
+// defaultClaudeHome resolves the skill home of the engine named by
+// FLEET_ENGINE (~/.claude for claude-code, ~/.agents for codex). Split out
+// so LocateRepoSkillDir can fall back gracefully when the home dir is
+// unresolvable.
 func defaultClaudeHome() (string, error) {
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return "", err
 	}
-	return filepath.Join(home, ".claude"), nil
+	return enginecfg.SkillHome(home, os.Getenv("FLEET_ENGINE")), nil
 }
 
 // WarnIfStale writes a one-line-per-skill diagnostic to w for every COPY
