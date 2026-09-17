@@ -1039,7 +1039,10 @@ func TestScanDashboard_LightScansHiddenProjects(t *testing.T) {
 	pdir := withFleetHome(t)
 	seedTasks(t, pdir, "hidden", TaskCounts{Todo: 2})
 	seedTasks(t, pdir, "visible", TaskCounts{Todo: 2})
-	seedWorker(t, pdir, "hidden", "hidden-worker", workers.State{Phase: workers.PhaseVerify})
+	seedWorker(t, pdir, "hidden", "hidden-worker", workers.State{
+		Phase:         workers.PhaseBlocked,
+		BlockedReason: "need operator input",
+	})
 	seedWorker(t, pdir, "visible", "visible-worker", workers.State{Phase: workers.PhaseVerify})
 
 	snap := scanDashboard(time.Now())
@@ -1059,6 +1062,15 @@ func TestScanDashboard_LightScansHiddenProjects(t *testing.T) {
 	}
 	if hidden.Tasks != nil {
 		t.Errorf("hidden project tasks = %+v, want nil", hidden.Tasks)
+	}
+	if hidden.Attention != 1 {
+		t.Errorf("hidden project attention = %d, want 1", hidden.Attention)
+	}
+	if hidden.BlockedID != "hidden-worker" {
+		t.Errorf("hidden project BlockedID = %q, want hidden-worker", hidden.BlockedID)
+	}
+	if hidden.BlockedQ != "need operator input" {
+		t.Errorf("hidden project BlockedQ = %q, want need operator input", hidden.BlockedQ)
 	}
 	if visible := find("visible"); visible.Counts.Todo != 2 {
 		t.Errorf("visible todo count = %d, want 2", visible.Counts.Todo)

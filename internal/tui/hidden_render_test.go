@@ -112,6 +112,37 @@ func TestDashboardRows_NoHiddenMoreSeparatorAtCap(t *testing.T) {
 	}
 }
 
+func TestDashboardRows_SearchRendersAllExpandedHiddenProjects(t *testing.T) {
+	defer resetHiddenStubs()()
+	names := make([]string, 12)
+	projects := make([]*ProjectRow, len(names))
+	for i := range names {
+		names[i] = fmt.Sprintf("hidden-%02d", i)
+		projects[i] = &ProjectRow{Name: names[i], RepoSlug: names[i]}
+	}
+	stubHidden(names...)
+	m := New("test")
+	m.showHidden = true
+	m.hiddenExpanded = true
+	m.searchFilter = names[len(names)-1]
+	m.dashboard = &Snapshot{Projects: projects}
+
+	rows := m.dashboardRows()
+	found := false
+	for _, row := range rows {
+		if row.kind == rowProject && row.project != nil && row.project.Name == names[len(names)-1] {
+			found = true
+		}
+		if row.kind == rowSeparator && row.separator != nil &&
+			row.separator.kind == separatorHiddenMore {
+			t.Fatal("search should bypass hidden render cap")
+		}
+	}
+	if !found {
+		t.Fatalf("search result %q missing from rows: %+v", names[len(names)-1], rows)
+	}
+}
+
 func TestSeparatorBlockLine_SelectedRendersCursorGlyph(t *testing.T) {
 	sep := &separatorRow{kind: separatorIdle, count: 2}
 	line := separatorBlockLine(sep, 80, true)

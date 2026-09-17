@@ -379,7 +379,7 @@ func scanProject(projectsRoot, name string, now time.Time, incidentCount int) (*
 	// not when something needs answering. Rolling task-blocked into
 	// row.Attention overcounted "1 need attention" on projects whose only
 	// "blocked" was the planning signal, training the operator to ignore
-	// the chip. Worker phase=blocked (the loop below) is the load-bearing
+	// the chip. Worker phase=blocked (the helper below) is the load-bearing
 	// signal — that's the path a worker raises a question through, and
 	// v0.2 Agent-tool subagents share the same code path.
 	//
@@ -388,6 +388,16 @@ func scanProject(projectsRoot, name string, now time.Time, incidentCount int) (*
 	// dropped. The visual signal for a planning-blocked task is the
 	// distinct ‖ glyph in the per-task expansion (taskStatusStyles), not
 	// the row-level attention chip.
+	applyWorkerAttention(row, wrows)
+
+	// CI running — best-effort. v0.2.0 doesn't cache pr_check yet, so we
+	// approximate by counting workers in PhaseReviewClaude /
+	// PhaseReviewCodex / PhasePush — those are the phases where the
+	// worker is waiting on CI/review feedback.
+	return row, wrows
+}
+
+func applyWorkerAttention(row *ProjectRow, wrows []*WorkerRow) {
 	var firstBlocked *WorkerRow
 	for _, w := range wrows {
 		if w.Blocked {
@@ -401,12 +411,6 @@ func scanProject(projectsRoot, name string, now time.Time, incidentCount int) (*
 		row.BlockedID = firstBlocked.ID
 		row.BlockedQ = firstBlocked.Reason
 	}
-
-	// CI running — best-effort. v0.2.0 doesn't cache pr_check yet, so we
-	// approximate by counting workers in PhaseReviewClaude /
-	// PhaseReviewCodex / PhasePush — those are the phases where the
-	// worker is waiting on CI/review feedback.
-	return row, wrows
 }
 
 // scanProjectLight reads the fields needed to keep a hidden project in the
@@ -418,7 +422,9 @@ func scanProjectLight(projectsRoot, name string, now time.Time) (*ProjectRow, []
 		RepoSlug: deriveRepoSlug(dir, name),
 	}
 	applyCoordFreshness(row, dir, now)
-	return row, scanWorkers(dir, name, now, nil)
+	wrows := scanWorkers(dir, name, now, nil)
+	applyWorkerAttention(row, wrows)
+	return row, wrows
 }
 
 func applyCoordFreshness(row *ProjectRow, dir string, now time.Time) {

@@ -566,19 +566,23 @@ func (m Model) dashboardRows() []dashRow {
 				},
 			})
 			if m.hiddenExpanded {
-				hiddenRenderCount := len(hidden)
-				if hiddenRenderCount > hiddenRenderCap {
-					hiddenRenderCount = hiddenRenderCap
-				}
-				rows = m.appendProjectRows(rows, hidden[:hiddenRenderCount])
-				if len(hidden) > hiddenRenderCap {
-					rows = append(rows, dashRow{
-						kind: rowSeparator,
-						separator: &separatorRow{
-							kind:  separatorHiddenMore,
-							count: len(hidden) - hiddenRenderCap,
-						},
-					})
+				if searchActive {
+					rows = m.appendProjectRows(rows, hidden)
+				} else {
+					hiddenRenderCount := len(hidden)
+					if hiddenRenderCount > hiddenRenderCap {
+						hiddenRenderCount = hiddenRenderCap
+					}
+					rows = m.appendProjectRows(rows, hidden[:hiddenRenderCount])
+					if len(hidden) > hiddenRenderCap {
+						rows = append(rows, dashRow{
+							kind: rowSeparator,
+							separator: &separatorRow{
+								kind:  separatorHiddenMore,
+								count: len(hidden) - hiddenRenderCap,
+							},
+						})
+					}
 				}
 			}
 		}
