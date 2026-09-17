@@ -88,7 +88,7 @@ def _transcript(tmp_path: Path, *, input_tokens: int = 10_000) -> Path:
     path.write_text(json.dumps({
         "type": "assistant",
         "message": {
-            "model": "claude-sonnet-4-6",
+            "model": "claude-haiku-4-5",
             "usage": {"input_tokens": input_tokens},
         },
     }) + "\n", encoding="utf-8")

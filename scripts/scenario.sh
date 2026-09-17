@@ -161,11 +161,11 @@ cmd_up() {
 }
 
 # stop_payload <pct> — a Stop-hook payload whose transcript puts the agent at
-# <pct>% of a 200k model (claude-sonnet-4-5): input_tokens = pct * 2000.
+# <pct>% of a 200k model (claude-haiku-4-5): input_tokens = pct * 2000.
 write_stop_payload() {
     local pct="$1" dir="$FLEET_HOME/.scenario"
     local tokens=$((pct * 2000))
-    printf '{"type":"assistant","message":{"model":"claude-sonnet-4-5","usage":{"input_tokens":%d}}}\n' \
+    printf '{"type":"assistant","message":{"model":"claude-haiku-4-5","usage":{"input_tokens":%d}}}\n' \
         "$tokens" > "$dir/transcript.jsonl"
     printf '{"hook_event_name":"Stop","session_id":"scenario","transcript_path":"%s"}\n' \
         "$dir/transcript.jsonl" > "$dir/stop.json"

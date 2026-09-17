@@ -71,7 +71,7 @@ def _seed_record(home: Path, agent_id: str, **overrides: Any) -> Path:
     return path
 
 
-def _transcript(tmp_path: Path, *, model: str = "claude-sonnet-4-6",
+def _transcript(tmp_path: Path, *, model: str = "claude-haiku-4-5",
                 input_tokens: int = 50_000) -> Path:
     """Minimal transcript producing a known context_pct."""
     path = tmp_path / "transcript.jsonl"
@@ -520,6 +520,43 @@ class TestMaybeTrigger:
         # No queue file written yet — Yellow waits for MILESTONE.
         queue_dir = fleet_home_tmp / "queue"
         assert not queue_dir.exists() or list(queue_dir.iterdir()) == []
+
+    def test_codex_yellow_first_fire_uses_1m_policy(
+        self, fleet_home_tmp: Path, fake_tmux: _FakeTmux, tmp_path: Path,
+    ) -> None:
+        record_path = _seed_record(fleet_home_tmp, "codex01")
+        transcript = tmp_path / "rollout.jsonl"
+        transcript.write_text("\n".join([
+            json.dumps({"type": "session_meta", "payload": {
+                "session_id": "codex-session",
+                "model_provider": "openai",
+            }}),
+            json.dumps({"type": "event_msg", "payload": {
+                "type": "token_count",
+                "info": {
+                    "last_token_usage": {
+                        "input_tokens": 450_000,
+                        "cached_input_tokens": 0,
+                        "output_tokens": 0,
+                    },
+                    "model_context_window": 258_400,
+                },
+            }}),
+        ]) + "\n", encoding="utf-8")
+
+        result = handoff.maybe_trigger(
+            {"transcript_path": str(transcript), "model": "gpt-6"},
+            agent_id="codex01", session="fleet-codex01",
+        )
+
+        assert result is not None
+        assert handoff.HANDOFF_REQUESTED in result
+        record = json.loads(record_path.read_text(encoding="utf-8"))
+        assert record["handoff_type"] == "auto-yellow"
+        assert not (fleet_home_tmp / "handoffs").exists() or \
+            list((fleet_home_tmp / "handoffs").iterdir()) == []
+        assert not (fleet_home_tmp / "queue").exists() or \
+            list((fleet_home_tmp / "queue").iterdir()) == []
 
     def test_yellow_pending_with_milestone_writes_doc_and_queue(
         self, fleet_home_tmp: Path, fake_tmux: _FakeTmux, tmp_path: Path,

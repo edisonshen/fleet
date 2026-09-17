@@ -48,7 +48,7 @@ def fleet_home_tmp(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
 @pytest.fixture
 def transcript_with_usage(tmp_path: Path) -> Path:
     """A two-line transcript: one assistant turn with usage, one user line.
-    Models claude-sonnet-4-6 (200k context). Total context tokens = 50k → 25%."""
+    Models claude-sonnet-4-6 (1M context). Total context tokens = 50k → 5%."""
     path = tmp_path / "transcript.jsonl"
     lines = [
         json.dumps({
@@ -132,13 +132,13 @@ class TestReadContextPct:
     def test_known_model(self, transcript_with_usage: Path) -> None:
         payload = {"transcript_path": str(transcript_with_usage)}
         pct, model = health.read_context_pct(payload)
-        # 50_000 / 200_000 = 25.0% (output_tokens excluded)
-        assert pct == 25.0
+        # 50_000 / 1_000_000 = 5.0% (output_tokens excluded)
+        assert pct == 5.0
         assert model == "claude-sonnet-4-6"
 
     def test_output_tokens_excluded(self, tmp_path: Path) -> None:
-        """If output_tokens were summed into context, this would be 50%; with
-        them correctly excluded it should be 25%."""
+        """If output_tokens were summed into context, this would be 10%; with
+        them correctly excluded it should be 5%."""
         path = tmp_path / "t.jsonl"
         path.write_text(json.dumps({
             "type": "assistant",
@@ -151,7 +151,7 @@ class TestReadContextPct:
             },
         }) + "\n", encoding="utf-8")
         pct, _ = health.read_context_pct({"transcript_path": str(path)})
-        assert pct == 25.0
+        assert pct == 5.0
 
     def test_last_usage_wins(self, tmp_path: Path) -> None:
         """When the transcript has multiple usage objects (multi-turn session),
@@ -176,7 +176,7 @@ class TestReadContextPct:
         ]
         path.write_text("\n".join(lines) + "\n", encoding="utf-8")
         pct, _ = health.read_context_pct({"transcript_path": str(path)})
-        assert pct == 50.0
+        assert pct == 10.0
 
     def test_unknown_model_defaults_to_1m(
         self, tmp_path: Path, capsys: pytest.CaptureFixture,
@@ -246,7 +246,7 @@ class TestReadContextPct:
             encoding="utf-8",
         )
         pct, model = health.read_context_pct({"transcript_path": str(path)})
-        assert pct == 25.0
+        assert pct == 5.0
         assert model == "claude-sonnet-4-6"
 
 
@@ -286,30 +286,58 @@ class TestReadContextPctCodex:
         path.write_text("\n".join([meta, turn, *records]) + "\n", encoding="utf-8")
         return path
 
-    def test_uses_in_band_window_and_hook_model(self, tmp_path: Path) -> None:
+    def test_ignores_in_band_window_uses_1m(self, tmp_path: Path) -> None:
         path = self._rollout(tmp_path, self._token_count(129_200, 100_000, 5_000))
         pct, model = health.read_context_pct(
             {"transcript_path": str(path), "model": "gpt-6-astra"})
-        # 129_200 / 258_400 = 50.0%; cached tokens are a subset of input,
-        # output tokens excluded — exactly the red threshold.
-        assert pct == 50.0
+        # 129_200 / 1_000_000 = 12.92%; the rollout window is metadata only.
+        assert pct == 12.92
         assert model == "gpt-6-astra"
-        assert health.threshold(pct) == "red"
+        assert health.threshold(pct) == "green"
 
     def test_last_token_count_wins(self, tmp_path: Path) -> None:
         path = self._rollout(tmp_path,
                              self._token_count(15_571, 0, 73),
                              self._token_count(25_840, 15_360, 29))
-        pct, _ = health.read_context_pct({"transcript_path": str(path), "model": "m"})
-        assert pct == 10.0
+        pct, _ = health.read_context_pct({"transcript_path": str(path), "model": "gpt-6"})
+        assert pct == 2.58
 
     def test_no_window_falls_back_to_default_with_flag(self, tmp_path: Path, capsys) -> None:
         path = self._rollout(tmp_path, self._token_count(100_000, 0, 0, window=None))
         pct, model = health.read_context_pct(
-            {"transcript_path": str(path), "model": "gpt-future"})
+            {"transcript_path": str(path), "model": "future-model"})
         assert pct == 10.0  # 100k / 1M default
-        assert model == "gpt-future"
-        assert "gpt-future" in capsys.readouterr().err
+        assert model == "future-model"
+        assert "future-model" in capsys.readouterr().err
+
+    @pytest.mark.parametrize("model", [
+        "gpt-6",
+        "gpt-6-astra",
+        "gpt-5.5-codex",
+        "codex-mini-latest",
+    ])
+    def test_codex_model_ids_resolve_to_1m_without_warning(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture, model: str,
+    ) -> None:
+        path = self._rollout(tmp_path, self._token_count(129_200, 0, 0))
+        pct, actual_model = health.read_context_pct(
+            {"transcript_path": str(path), "model": model})
+        assert pct == 12.92
+        assert actual_model == model
+        assert capsys.readouterr().err == ""
+
+    @pytest.mark.parametrize("input_tokens,expected,level", [
+        (450_000, 45.0, "yellow"),
+        (500_000, 50.0, "red"),
+    ])
+    def test_codex_thresholds_use_1m(
+        self, tmp_path: Path, input_tokens: int, expected: float, level: str,
+    ) -> None:
+        path = self._rollout(tmp_path, self._token_count(input_tokens, 0, 0))
+        pct, _ = health.read_context_pct(
+            {"transcript_path": str(path), "model": "gpt-6"})
+        assert pct == expected
+        assert health.threshold(pct) == level
 
     def test_rollout_without_token_count_is_loud_none(self, tmp_path: Path, capsys) -> None:
         path = self._rollout(tmp_path)
@@ -320,7 +348,7 @@ class TestReadContextPctCodex:
     def test_claude_transcript_unaffected(self, transcript_with_usage: Path) -> None:
         pct, model = health.read_context_pct(
             {"transcript_path": str(transcript_with_usage), "model": "gpt-6-astra"})
-        assert pct == 25.0
+        assert pct == 5.0
         assert model == "claude-sonnet-4-6"
 
 
@@ -387,9 +415,7 @@ class TestNormalizeModel:
         assert health._normalize_model(raw) == expected
 
     def test_unknown_model_passes_through_unchanged(self) -> None:
-        # No family/prefix guessing — an unknown id (after stripping) stays
-        # unknown so the table comment's intent holds.
-        assert health._normalize_model("claude-future-99") == "claude-future-99"
+        assert health._normalize_model("future-model-99") == "future-model-99"
 
     def test_dated_and_bracketed_variants_resolve_to_1m_limit(
         self, tmp_path: Path,
@@ -436,36 +462,36 @@ class TestResolveLimit:
 
     def test_exact_table_hit(self) -> None:
         assert health._resolve_limit("claude-opus-4-8") == 1_000_000
-        assert health._resolve_limit("claude-sonnet-4-6") == 200_000
+        assert health._resolve_limit("claude-haiku-4-5") == 200_000
 
     def test_one_m_bracket_on_200k_base_resolves_to_1m(self) -> None:
-        # claude-sonnet-4-6 base is 200k; the [1m] variant is 1M, NOT 200k.
-        assert health._resolve_limit("claude-sonnet-4-6[1m]") == 1_000_000
+        # claude-haiku-4-5 base is 200k; the [1m] variant is 1M, NOT 200k.
+        assert health._resolve_limit("claude-haiku-4-5[1m]") == 1_000_000
 
     def test_one_m_bracket_on_1m_base_resolves_to_1m(self) -> None:
         assert health._resolve_limit("claude-opus-4-8[1m]") == 1_000_000
 
     def test_non_1m_bracket_strips_to_base(self) -> None:
         # A non-[1m] bracket decoration falls back to the stripped base limit.
-        assert health._resolve_limit("claude-sonnet-4-6[beta]") == 200_000
+        assert health._resolve_limit("claude-haiku-4-5[beta]") == 200_000
 
     def test_dated_variant_strips_to_base(self) -> None:
-        assert health._resolve_limit("claude-sonnet-4-6-20251101") == 200_000
+        assert health._resolve_limit("claude-haiku-4-5-20251101") == 200_000
 
     def test_substring_1m_in_bracket_does_not_match(self) -> None:
         """codex iter-2 (2026-06-03): the bracket token must equal "1m"
         EXACTLY. A token that merely CONTAINS "1m" ("[v1m]", "[not-1m]") is a
         different variant and must fall back to the stripped base limit, not
         the 1M window."""
-        assert health._resolve_limit("claude-sonnet-4-6[v1m]") == 200_000
-        assert health._resolve_limit("claude-sonnet-4-6[not-1m]") == 200_000
+        assert health._resolve_limit("claude-haiku-4-5[v1m]") == 200_000
+        assert health._resolve_limit("claude-haiku-4-5[not-1m]") == 200_000
         # An unknown base with a non-exact-1m bracket falls to the 1M
         # default (bug D policy) — same number as the [1m] tag but via the
         # unknown-model flag path, not the bracket fast path.
         assert health._resolve_limit("claude-future-99[v1m]") == 1_000_000
 
     def test_one_m_bracket_is_case_insensitive(self) -> None:
-        assert health._resolve_limit("claude-sonnet-4-6[1M]") == 1_000_000
+        assert health._resolve_limit("claude-haiku-4-5[1M]") == 1_000_000
 
     def test_unknown_defaults_to_1m_with_flag(
         self, capsys: pytest.CaptureFixture,
@@ -502,25 +528,25 @@ class TestResolveLimit:
         assert health._resolve_limit("claude-fable-5") == 1_000_000
         assert capsys.readouterr().err == ""
 
-    def test_sonnet_1m_over_70_fires_red(self, tmp_path: Path) -> None:
+    def test_haiku_1m_over_70_fires_red(self, tmp_path: Path) -> None:
         """End-to-end through read_context_pct: a 750k context on
-        claude-sonnet-4-6[1m] is 75% of 1M -> red. Under the buggy strip it
+        claude-haiku-4-5[1m] is 75% of 1M -> red. Under the buggy strip it
         would be 375% of 200k (still red but for the wrong reason); the
         meaningful assertion is the EXACT pct, proving the 1M denominator."""
         path = tmp_path / "t.jsonl"
         path.write_text(json.dumps({
             "type": "assistant",
             "message": {
-                "model": "claude-sonnet-4-6[1m]",
+                "model": "claude-haiku-4-5[1m]",
                 "usage": {"input_tokens": 750_000},
             },
         }) + "\n", encoding="utf-8")
         pct, model = health.read_context_pct({"transcript_path": str(path)})
         assert pct == 75.0  # 750k / 1M, NOT 750k / 200k = 375.0
-        assert model == "claude-sonnet-4-6[1m]"
+        assert model == "claude-haiku-4-5[1m]"
         assert health.threshold(pct) == "red"
 
-    def test_sonnet_1m_under_40_is_green(self, tmp_path: Path) -> None:
+    def test_haiku_1m_under_40_is_green(self, tmp_path: Path) -> None:
         """The bug's user-visible symptom: a [1m]-base-200k model at 30% of 1M
         (300k tokens) must read green, not the 150% the strip-to-base bug
         would produce (which would spuriously trigger handoff)."""
@@ -528,7 +554,7 @@ class TestResolveLimit:
         path.write_text(json.dumps({
             "type": "assistant",
             "message": {
-                "model": "claude-sonnet-4-6[1m]",
+                "model": "claude-haiku-4-5[1m]",
                 "usage": {"input_tokens": 300_000},
             },
         }) + "\n", encoding="utf-8")
@@ -583,6 +609,19 @@ class TestContextLimitsParity:
                     "claude-future-99[v1m]",
                     ""):
             assert health._resolve_limit(mid) == stop_hook._resolve_limit(mid), mid
+
+    def test_lookup_limit_agrees_for_model_families(self) -> None:
+        stop_hook = _load_stop_hook()
+        for mid in (
+            "gpt-6",
+            "gpt-5.5-codex",
+            "claude-sonnet-4-6",
+            "claude-opus-4-6",
+            "claude-haiku-4-5",
+            "claude-sonnet-9-9",
+        ):
+            assert health._lookup_limit(mid) == stop_hook._lookup_limit(mid), mid
+        assert health.ONE_M_FAMILIES == stop_hook.ONE_M_FAMILIES
 
 
 # -- update_record -----------------------------------------------------------

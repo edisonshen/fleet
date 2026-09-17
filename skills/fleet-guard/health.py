@@ -37,10 +37,10 @@ CONTEXT_LIMITS: dict[str, int] = {
     "claude-fable-5":    1_000_000,
     "claude-opus-4-8":   1_000_000,
     "claude-opus-4-7":   1_000_000,
-    "claude-opus-4-6":     200_000,
-    "claude-opus-4-5":     200_000,
-    "claude-sonnet-4-6":   200_000,
-    "claude-sonnet-4-5":   200_000,
+    "claude-opus-4-6":   1_000_000,
+    "claude-opus-4-5":   1_000_000,
+    "claude-sonnet-4-6": 1_000_000,
+    "claude-sonnet-4-5": 1_000_000,
     "claude-haiku-4-5":    200_000,
 }
 
@@ -58,6 +58,8 @@ ONE_M_BRACKET_TOKENS = 1_000_000
 # warning — current frontier models all carry 1M windows, so 1M is also the
 # most-likely-correct guess.
 DEFAULT_CONTEXT_LIMIT = 1_000_000
+
+ONE_M_FAMILIES = ("gpt-", "claude-opus-", "claude-sonnet-")
 
 
 def _normalize_model(raw: str) -> str:
@@ -97,11 +99,12 @@ def _lookup_limit(raw: str | None) -> int | None:
          verbatim, including a decorated one).
       2. A "[1m]" bracket tag denotes the 1M-context variant -> 1,000,000,
          regardless of the base model's default limit. Checked BEFORE the
-         base-strip so e.g. "claude-sonnet-4-6[1m]" does NOT collapse to the
-         200k sonnet entry.
-      3. Otherwise, look up the decoration-stripped form (date pin, non-[1m]
+         base-strip so e.g. "claude-haiku-4-5[1m]" does NOT collapse to the
+         200k haiku entry.
+      3. Known 1M families and Codex ids use the 1M operator policy.
+      4. Otherwise, look up the decoration-stripped form (date pin, non-[1m]
          bracket) against the table.
-      4. No match -> None. Callers that need a usable number go through
+      5. No match -> None. Callers that need a usable number go through
          _resolve_limit, which applies the flag-and-default policy.
     """
     if not raw:
@@ -116,7 +119,10 @@ def _lookup_limit(raw: str | None) -> int | None:
         close_b = raw.find("]", open_b)
         if close_b > open_b and raw[open_b + 1:close_b].strip().lower() == "1m":
             return ONE_M_BRACKET_TOKENS
-    return CONTEXT_LIMITS.get(_normalize_model(raw))
+    normalized = _normalize_model(raw)
+    if normalized.startswith(ONE_M_FAMILIES) or "codex" in normalized:
+        return DEFAULT_CONTEXT_LIMIT
+    return CONTEXT_LIMITS.get(normalized)
 
 
 def _resolve_limit(raw: str | None) -> int | None:
@@ -197,9 +203,10 @@ def read_context_pct(payload: dict[str, Any]) -> tuple[float | None, str | None]
       codex        ~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl
                    `event_msg` records with payload.type == "token_count"
                    carrying `info.last_token_usage` AND
-                   `info.model_context_window` — the window is in-band, so
-                   no per-model table is needed (model id from the hook
-                   payload, for diagnostics only).
+                   `info.model_context_window` — Codex context uses the
+                   operator policy of a 1M-token window; the in-band value is
+                   rollout metadata only (model id from the hook payload, for
+                   diagnostics).
 
     Returns (context_pct, model_name). pct is None only when the transcript
     yields no usage/model data at all (missing path, unreadable file, no
@@ -309,15 +316,12 @@ def _codex_pct(usage: dict[str, Any], window: int | None,
     """Codex context_pct: last_token_usage.input_tokens is the full prompt
     of the most recent turn (cached_input_tokens is a SUBSET of it in the
     OpenAI usage shape, so it is not added again); output tokens are
-    excluded to match the Claude path. The window comes from the rollout;
-    a rollout that omits it falls back to the model table / 1M default so
-    the 40/50 handoff never goes blind."""
+    excluded to match the Claude path. Codex uses the operator policy of a
+    1M-token window; the rollout's in-band window is metadata only."""
     model_raw = payload.get("model")
     model = model_raw if isinstance(model_raw, str) and model_raw else None
     in_t = int(usage.get("input_tokens", 0) or 0)
-    limit = window
-    if limit is None:
-        limit = _resolve_limit(model) if model else DEFAULT_CONTEXT_LIMIT
+    limit = _resolve_limit(model) if model else DEFAULT_CONTEXT_LIMIT
     if not limit:
         return (None, model)
     return (round(in_t * 100.0 / limit, 2), model)
