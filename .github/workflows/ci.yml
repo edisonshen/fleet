@@ -6,64 +6,24 @@ on:
   pull_request:
     branches: [main]
 
+# Four independent jobs run in parallel; `build-test-lint` fans them back
+# in. Branch protection requires the status check named `build-test-lint`,
+# so that gate job name must stay stable.
+#
+#   lint ────────┐
+#   unit ────────┼──> build-test-lint (gate)
+#   integration ─┤
+#   python ──────┘
 jobs:
-  # Single job (build + format + lint + go test + python test) keeps the
-  # CI surface simple and shares one checkout. Branch protection requires
-  # the status check named `build-test-lint`; keep this job name stable so
-  # no admin update is needed when adding steps.
-  build-test-lint:
+  lint:
     runs-on: ubuntu-latest
-    # ci-perf-pr1 (P0): hard wall-clock backstop. `go test -timeout=5m` (below)
-    # aborts a wedged test at the process level and kills any wedged tmux exec;
-    # this job-level cap is the OUTER belt to that suspenders so a hang OUTSIDE
-    # the test process (build/lint) still bounds the run instead of burning the
-    # runner's 24-min default as PR #232 did.
-    #
-    # The cap MUST exceed the SUM of every process-level `-timeout` plus the
-    # always() cleanup/leak steps, or the job cap would fire BEFORE a wedged
-    # test's own `-timeout` gets to abort it — and a GitHub job timeout CANCELS
-    # the job (it does NOT flow through the failure path), skipping the always()
-    # cleanup/leak steps this cap exists to preserve (codex iter-1 [P2]).
-    #
-    # Process-level timeouts now in play (each step gets its OWN budget; the
-    # PR-A integration lane is `-run`-scoped per-package to the integration-only
-    # tests, discovered by scripts/integration-lane.sh — see the steps below —
-    # so it no longer re-runs each package's full default suite):
-    #   - default `go test -race ./...`     : 5m
-    #   - integration internal/spawn        : 5m  (2 discovered tests at time of writing)
-    #   - integration cmd/fleet             : 5m  (17 discovered tests at time of writing)
-    #   - integration internal/tui          : 5m  (3 discovered tests at time of writing)
-    #   (internal/handoffop has no integration-only tests → no step)
-    # Worst-case sum if every step burns its full timeout = 20m, plus the
-    # UNBUDGETED steps that sit between/after the timed lanes and the always()
-    # cleanup: ~2m setup/build/lint, the two test-isolation lints + leak
-    # sentinel (~1m), the Python `pytest skills/ scripts/` step (~1m), and ~2m
-    # always() cleanup/leak headroom = ~26m. The cap MUST sit above that so the
-    # per-step `-timeout` reliably fires first and the cleanup steps survive — a
-    # GitHub job timeout CANCELS the job and skips always(). EXPECTED (green) run
-    # is far smaller — default lane ~3m + each scoped integration step well under
-    # a minute ≈ 8m wall — the caps are a backstop, not the normal run. 35 =
-    # ~26m worst-case + ~9m margin; still far below the GitHub-hosted runner's
-    # multi-hour default, so a true hang OUTSIDE a test process (e.g. a wedged
-    # lint) is still bounded instead of running away as PR #232 did.
-    timeout-minutes: 35
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
-
       - uses: actions/setup-go@v5
         with:
           go-version: "1.25"
           cache: true
-
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-
-      - name: Install pytest
-        # markdown: required by scripts/render-design-doc.py and its tests
-        # (scripts/tests/). Tests skip gracefully if it's missing, but CI
-        # installs it so the hub-style render path is actually exercised.
-        run: python3 -m pip install --upgrade pip pytest markdown
 
       - name: Build
         run: go build ./...
@@ -83,87 +43,83 @@ jobs:
           version: v2.11.4
 
       - name: Test isolation lint
-        # Postmortem 2026-05-14 (orphan tmux leak): every *_test.go that
-        # calls tmux.Spawn / spawn.Spawn must isolate FLEET_TMUX_SOCKET
-        # or it leaks tmux sessions onto the operator's default server.
-        # This guard fails CI when a future PR forgets the isolation.
+        # Every *_test.go that reaches tmux.Spawn must isolate
+        # FLEET_TMUX_SOCKET or it leaks sessions onto the operator's server.
         run: bash scripts/lint-test-isolation.sh
 
       - name: Test isolation lint — regression fixtures
-        # Codex review iter-2 [P2] (2026-06-04, fleet#165 PR-A): the
-        # shell-fixture regression suite for scripts/lint-test-isolation.sh
-        # was not exercised by CI before this step. Python pytest skips
-        # *.sh files, so the lint scanner could silently regress as long
-        # as the current repo happens to lint clean. This step pins both
-        # the test-isolation marker contract AND the empty-command
-        # dispatchOpts guard against future awk/regex drift.
         run: bash scripts/tests/test_lint_test_isolation.sh
 
       - name: Integration lane script — regression fixtures
-        # Exercises scripts/integration-lane.sh (used by the lane steps below)
-        # against scripts/tests/fixtures/lane: runs only //go:build integration
-        # tests, exits 0 on an empty set, propagates a tagged failure.
         run: bash scripts/tests/test_integration_lane.sh
 
-      - name: Pre-test leak sentinel
-        # fleet#165 PR-B (per feedback_fleet_owns_its_resources.md): a
-        # green CI run with /tmp/fleet-test-* debris left over is NOT a
-        # green run. We touch a sentinel here so the post-test assertion
-        # can scope its leak check to files created during THIS run only,
-        # ignoring any pre-existing /tmp/fleet-test-* on dev machines
-        # (CI runners are clean, but the same workflow file is also
-        # exercised by act / local-runner emulators).
-        run: touch /tmp/fleet-test-ci-sentinel
+  unit:
+    runs-on: ubuntu-latest
+    # Must exceed `go test -timeout=5m` plus the always() cleanup steps: a
+    # job-level timeout CANCELS the job and skips always(), so the
+    # process-level timeout has to fire first.
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.25"
+          cache: true
+      - uses: actions/setup-python@v5
+        # Tests exec skills/fleet-guard/main.py via `python3`.
+        with:
+          python-version: "3.12"
 
-      - name: Scenario harness — scripts/scenario.sh contract
-        # Drives scripts/scenario.sh (up / seed-coord / seed-worker / run /
-        # capture / down) against the built binary, real tmux on an isolated
-        # socket and the real fleet-guard Stop hook. Sits AFTER the leak
-        # sentinel on purpose: a `down` that leaves /tmp/fleet-test-* debris
-        # must fail the post-test leak assertion, not slip in before it.
-        run: bash scripts/tests/test_scenario_sh.sh
+      - name: Pre-test leak sentinel
+        run: bash scripts/ci-fleet-test-leak.sh sentinel
 
       - name: Test
-        # -timeout=5m (ci-perf-pr1, P0): a single wedged test (e.g. the /tmp
-        # socket-scan grinding N tmux subprocesses) aborts at 5m at the process
-        # level — Go's timeout kills the wedged tmux execs — instead of running
-        # until the runner's own 24-min ceiling (the PR #232 hang).
+        # -timeout=5m aborts a single wedged test (and its tmux execs) at
+        # the process level instead of burning the runner's default ceiling.
         run: go test -race -count=1 -timeout=5m ./...
 
-      # Integration test lane (lease-failover standby) — PR-A fork-bomb fix
-      # (DESIGN-spawn-test-fork-bomb-root-fix): the genuine `coord-run --standby`
-      # spawning tests are fenced out of the default `go test ./...` lane (they
-      # fork-bomb a loaded box). They live behind //go:build integration and run
-      # HERE so they still gate — as steps inside build-test-lint (the required
-      # check), NOT a separate job that branch protection wouldn't enforce.
+      - name: Reap /tmp/fleet-test-* sockets
+        if: always()
+        run: bash scripts/ci-fleet-test-leak.sh reap
+
+      - name: Assert no /tmp/fleet-test-* leak
+        if: always()
+        run: bash scripts/ci-fleet-test-leak.sh assert
+
+  integration:
+    runs-on: ubuntu-latest
+    # Three lanes at -timeout=5m each plus the scenario harness and the
+    # always() cleanup steps; see the note on `unit`.
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.25"
+          cache: true
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Pre-test leak sentinel
+        run: bash scripts/ci-fleet-test-leak.sh sentinel
+
+      - name: Scenario harness — scripts/scenario.sh contract
+        # Drives scripts/scenario.sh against the built binary, real tmux on
+        # an isolated socket and the real fleet-guard Stop hook. Runs after
+        # the sentinel so a `down` that leaves debris fails the leak gate.
+        run: bash scripts/tests/test_scenario_sh.sh
+
+      # The `coord-run --standby` spawning tests are fenced behind
+      # //go:build integration (they fork-bomb a loaded box under the default
+      # lane). scripts/integration-lane.sh runs only the tests that exist in
+      # the tagged build and not the default one, so the default suite
+      # (already covered by `unit`) is not re-run here. A new package with
+      # integration-only tests needs its own lane step.
       #
-      # WHY -run SCOPED PER PACKAGE (not a bare `-tags=integration ./pkg`): the
-      # `integration` build tag only ADDS files — it does NOT subtract the default
-      # ones. So `go test -tags=integration ./cmd/fleet` recompiles the package
-      # WITH the standby tests AND re-runs the ENTIRE default suite that already
-      # ran (and passed) in the `go test -race ./...` step above — including the
-      # heavy `TestCoordIntegration_*` cases (build the real binary, install
-      # skills, drive loop.tick). That redundant re-run, not any single hang, is
-      # what blew the 5m/7m budgets (panics in runs 27597394005, 27601497061):
-      # the package is just slow on a 2-core runner. Scoping each step to `-run`
-      # the integration-ONLY test functions (those present in the integration
-      # build but absent from the default build) runs each standby test exactly
-      # ONCE, in the lane that needs it, and skips the already-covered default
-      # suite. internal/handoffop has ZERO integration-only tests (its standby
-      # cases are stubbed and stay default-lane), so it needs no integration
-      # step at all.
-      #
-      # Each lane calls scripts/integration-lane.sh <pkg>, which derives the
-      # -run set at run time (`comm -13 <(go test -list) <(go test
-      # -tags=integration -list)`) and exits 0 when it is empty. A new package
-      # with integration-only tests still needs its own lane step.
-      #
-      # FLEET_STANDBY_TIMEOUT=3s caps each standby at 3s (vs the 10m production
-      # default), so even an aborted run self-reaps in seconds. No -race here:
-      # these tests exec real tmux-pane subprocesses (the race detector
-      # instruments only in-process goroutines, and -race would roughly double
-      # each lane's wall time for no added coverage of the subprocess paths this
-      # lane exists to exercise).
+      # FLEET_STANDBY_TIMEOUT=3s caps each standby (vs the 10m production
+      # default). No -race: these exec real tmux subprocesses, which the race
+      # detector cannot see, and it would roughly double the wall time.
       - name: Integration lane — internal/spawn
         run: FLEET_STANDBY_TIMEOUT=3s bash scripts/integration-lane.sh ./internal/spawn
 
@@ -171,168 +127,45 @@ jobs:
         run: FLEET_STANDBY_TIMEOUT=3s bash scripts/integration-lane.sh ./cmd/fleet
 
       - name: Integration lane — internal/tui
-        # [a] dead-coord recovery driven through the real Bubble Tea model
-        # against the built fleet binary + real coord-run/tmux subprocesses.
         run: FLEET_STANDBY_TIMEOUT=3s bash scripts/integration-lane.sh ./internal/tui
+
+      - name: Reap /tmp/fleet-test-* sockets
+        if: always()
+        run: bash scripts/ci-fleet-test-leak.sh reap
+
+      - name: Assert no /tmp/fleet-test-* leak
+        if: always()
+        run: bash scripts/ci-fleet-test-leak.sh assert
+
+  python:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install pytest
+        # markdown: required by scripts/render-design-doc.py and its tests.
+        run: python3 -m pip install --upgrade pip pytest markdown
 
       - name: Python tests
         run: python3 -m pytest skills/ scripts/ -q
 
-      - name: Reap /tmp/fleet-test-* sockets
-        # Linux hosted runners can retain tmux socket inodes after the
-        # race-enabled test binaries exit cleanly. This cleanup keeps the
-        # job's final state leak-free; the following assertion remains the
-        # gate for any socket that cannot be reaped.
-        #
-        # ci-perf PR-2 (2026-06-14): two self-defeating reap forms preceded
-        # this. (1) `tmux -S <sock> kill-server` per socket re-created the
-        # inode by invoking the tmux CLIENT against a dead socket. (2) A
-        # graceful `pkill -TERM` on the tmux SERVER triggers the server's own
-        # shutdown, and a dying tmux server RE-CREATES its socket file as it
-        # exits (Linux only) — so the reaped set and the leaked set had zero
-        # overlap; every leaked socket was freshly re-touched DURING the reap.
-        #
-        # Bulletproof form: SIGKILL the server processes outright (a -9'd
-        # process runs no shutdown code, so it cannot re-touch the socket),
-        # WAIT until pgrep confirms zero fleet-test tmux processes remain (so
-        # nothing can re-create an inode), add a short settle for the kernel
-        # to finish its own async socket teardown, THEN rm — and re-rm in a
-        # bounded loop in case a straggler inode lingers. If a process truly
-        # cannot be killed, the loop ends and the assert below fails loudly.
-        if: always()
+  build-test-lint:
+    # Required status check. `if: always()` so a failed or cancelled
+    # upstream job produces a red check here rather than a skipped one
+    # (branch protection treats skipped as passing).
+    needs: [lint, unit, integration, python]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Gate
+        env:
+          RESULTS: ${{ toJSON(needs) }}
         run: |
-          # SCOPING (codex PR-2 iter-5 [P1]): every kill is scoped to THIS
-          # run's own sockets — files newer than /tmp/fleet-test-ci-sentinel.
-          # A blanket `pkill -f 'tmux.*/tmp/fleet-test-'` would SIGKILL a
-          # CONCURRENT Fleet job's tmux server on a shared / reused runner
-          # (sibling matrix job, another user). We kill ONLY the tmux process
-          # bound to a socket path THIS run created, so a sibling job's
-          # `/tmp/fleet-test-<other>.sock` is never touched. GitHub-hosted
-          # runners are ephemeral (one job each), but this stays correct on
-          # self-hosted / reused runners too.
-          #
-          # For each such socket we SIGKILL the bound server directly (a -9'd
-          # process runs no shutdown code, so it cannot re-touch the socket —
-          # the Linux re-create race), wait for it to exit, settle, then rm.
-          # Match the server proctitle `tmux: server (<sock>)` AND a client
-          # `tmux -S <sock>`, anchored on the literal socket path.
-          # to wraps a command in a hard wall-clock timeout so a stalled
-          # process scan (an unhealthy /proc on a busy Linux runner) can't
-          # block this "bounded ~10s" step indefinitely and hang the whole
-          # job in teardown (codex PR-2 iter-7 [P2]). GNU coreutils `timeout`
-          # is present on GitHub-hosted runners; if it is somehow missing
-          # (a minimal local emulator), fall back to running the command
-          # bare — no worse than before this guard.
-          if command -v timeout >/dev/null 2>&1; then
-            to() { timeout "$@"; }
-          else
-            to() { shift; "$@"; }   # drop the duration arg, run bare
-          fi
-          reap_round() {
-            to 10 find /tmp -maxdepth 1 -name 'fleet-test-*' \
-              -newer /tmp/fleet-test-ci-sentinel \
-              ! -name 'fleet-test-ci-sentinel' 2>/dev/null || true
-          }
-          # sock_path maps an artifact to the socket path to scope the kill on,
-          # or empty if the artifact is too short to scope safely (/review P3):
-          # `find -name 'fleet-test-*'` can in theory return a bare
-          # `/tmp/fleet-test-` (POSIX fnmatch lets `*` match the empty string).
-          # A bare prefix would make `tmux.*${sock}` match a SIBLING job's
-          # `/tmp/fleet-test-<other>.sock`, reopening the iter-5 P1. Requiring a
-          # non-empty suffix after the prefix keeps every kill scoped.
-          sock_path() {
-            s="${1%.lock}"           # `<sock>.sock.lock` → `<sock>.sock`
-            case "$s" in
-              /tmp/fleet-test-?*) printf '%s' "$s" ;;  # has a suffix → scoped
-              *) printf '' ;;                          # bare prefix → skip
-            esac
-          }
-          leaked=$(reap_round)
-          if [ -z "$leaked" ]; then
-            echo "no /tmp/fleet-test-* cleanup needed"
-            exit 0
-          fi
-          echo "reaping /tmp/fleet-test-* artifacts from this CI run:"
-          echo "$leaked"
-          # Kill the tmux process bound to EACH of this run's sockets, scoped
-          # by the literal socket path so sibling jobs are untouched.
-          for art in $leaked; do
-            sock=$(sock_path "$art")
-            [ -n "$sock" ] || continue
-            to 5 pkill -KILL -f "tmux.*${sock}" 2>/dev/null || true
-          done
-          # Wait until none of THIS run's sockets has a bound tmux process
-          # (bounded ~10s). Re-kill each round in case one raced startup.
-          # Each pgrep/pkill is timeout-guarded so a stalled scan can't hang.
-          for _ in $(seq 1 100); do
-            still=""
-            for art in $(reap_round); do
-              sock=$(sock_path "$art")
-              [ -n "$sock" ] || continue
-              if to 5 pgrep -f "tmux.*${sock}" >/dev/null 2>&1; then
-                still=1
-                to 5 pkill -KILL -f "tmux.*${sock}" 2>/dev/null || true
-              fi
-            done
-            [ -z "$still" ] && break
-            sleep 0.1
-          done
-          # Settle: let the kernel finish unlinking sockets of the killed
-          # processes before we sweep, so our rm is not racing a teardown.
-          sleep 1
-          # Sweep leftover FILES from THIS run. Match the SAME glob the assert
-          # below uses (`fleet-test-*`, NOT just `*.sock`): tmux 3.x writes a
-          # companion LOCK file `<socket>.sock.lock` and a SIGKILL'd server
-          # leaves it behind — the `*.sock`-only sweep missed those and 22 of
-          # them tripped the assert in run 27515608918.
-          for _ in $(seq 1 10); do
-            remaining=$(reap_round)
-            [ -z "$remaining" ] && break
-            # rm -rf, NOT rm -f (codex PR-2 iter-3 [P2]): a crashed/timed-out
-            # test can leave a top-level DIRECTORY (e.g. os.MkdirTemp("/tmp",
-            # "fleet-test-fgc-")) under the same fleet-test-* glob the assert
-            # below matches. `rm -f` is a no-op on a non-empty directory, so
-            # the leftover dir would survive the reap and still red the assert.
-            for art in $remaining; do
-              rm -rf "$art" || true
-            done
-            sleep 0.2
-          done
-          echo "reap loop exhausted 10 rounds; remaining sockets (if any) fall through to the assert gate"
-
-      - name: Assert no /tmp/fleet-test-* leak
-        # fleet#165 PR-B gate. The test-suite Sweep (internal/testutil)
-        # reaps stale fleet-test-*.sock files at every package's TestMain
-        # boundary; this step catches any leak that bypasses the sweeper
-        # (e.g., a future test that creates a leak with a different
-        # naming pattern, or a panic that wedges before the post-test
-        # sweep). Scoped to files NEWER than the pre-test sentinel so a
-        # local dev machine running `act` doesn't fail on pre-existing
-        # /tmp/fleet-test-* from before this PR landed.
-        #
-        # `if: always()` (codex iter-1 [P2]): the leak gate must run on
-        # the failure/panic path too — that's the exact case the comment
-        # above promises to catch. Without `if: always()`, GitHub Actions
-        # defaults to `if: success()` and silently skips this step when
-        # `go test` fails, defeating the gate. We still want the overall
-        # job to fail on leak detection (exit 1 below), so `always()`
-        # only re-enables the step; it does not mask test failures.
-        #
-        # Step order (codex iter-5 [P2]): placed AFTER both `go test`
-        # AND `python3 -m pytest skills/` so any pytest that touches
-        # /tmp/fleet-test-* is also covered. Today's pytest suite only
-        # exercises the Python skill scaffold (no Go tmux paths), but
-        # defense-in-depth keeps the gate honest if a future skill test
-        # ever shells out to tmux.
-        if: always()
-        run: |
-          leaked=$(find /tmp -maxdepth 1 -name 'fleet-test-*' \
-            -newer /tmp/fleet-test-ci-sentinel \
-            ! -name 'fleet-test-ci-sentinel' 2>/dev/null || true)
-          if [ -n "$leaked" ]; then
-            echo "::error::leaked /tmp/fleet-test-* files from this CI run:"
-            echo "$leaked"
-            ls -la $leaked 2>/dev/null || true
-            exit 1
-          fi
-          echo "no /tmp/fleet-test-* leak detected"
+          echo "$RESULTS"
+          echo "$RESULTS" | jq -e 'all(.[]; .result == "success")' >/dev/null \
+            || { echo "::error::an upstream job did not succeed"; exit 1; }
