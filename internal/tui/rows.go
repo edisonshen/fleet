@@ -513,7 +513,7 @@ func (m Model) dashboardRows() []dashRow {
 			activeShown = projectRenderCap
 		}
 		rows = m.appendProjectRows(rows, active[:activeShown])
-		rows = appendMoreRow(rows, len(active)-activeShown)
+		rows = appendMoreRow(rows, len(active)-activeShown, "active")
 		projectBudget -= activeShown
 	}
 
@@ -561,7 +561,7 @@ func (m Model) dashboardRows() []dashRow {
 				idleShown = projectBudget
 			}
 			rows = m.appendProjectRows(rows, idle[:idleShown])
-			rows = appendMoreRow(rows, len(idle)-idleShown)
+			rows = appendMoreRow(rows, len(idle)-idleShown, "idle")
 		}
 	}
 
@@ -595,7 +595,7 @@ func (m Model) dashboardRows() []dashRow {
 						hiddenRenderCount = projectRenderCap
 					}
 					rows = m.appendProjectRows(rows, hidden[:hiddenRenderCount])
-					rows = appendMoreRow(rows, len(hidden)-hiddenRenderCount)
+					rows = appendMoreRow(rows, len(hidden)-hiddenRenderCount, "hidden")
 				}
 			}
 		}
@@ -706,15 +706,16 @@ func classifyAgentActivity(
 
 const projectRenderCap = 10
 
-func appendMoreRow(rows []dashRow, n int) []dashRow {
+func appendMoreRow(rows []dashRow, n int, group string) []dashRow {
 	if n <= 0 {
 		return rows
 	}
 	return append(rows, dashRow{
 		kind: rowSeparator,
 		separator: &separatorRow{
-			kind:  separatorMore,
-			count: n,
+			kind:    separatorMore,
+			count:   n,
+			project: group,
 		},
 	})
 }
@@ -955,7 +956,7 @@ func rowIdentity(r dashRow) string {
 			case separatorHidden:
 				return "S:hidden"
 			case separatorMore:
-				return "S:more"
+				return "S:more:" + r.separator.project
 			case separatorHistory:
 				return "S:history:" + r.separator.project
 			case separatorAgentIdle:

@@ -202,6 +202,54 @@ func TestDashboardRows_SearchBypassesProjectCaps(t *testing.T) {
 	}
 }
 
+func TestDashboardRows_MoreSeparatorsHaveDistinctIdentity(t *testing.T) {
+	defer resetHiddenStubs()()
+	hidden := renderCapProjects("hidden", 12, true)
+	hiddenNames := make([]string, len(hidden))
+	for i, p := range hidden {
+		hiddenNames[i] = p.Name
+	}
+	stubHidden(hiddenNames...)
+	m := New("test")
+	m.showHidden = true
+	m.hiddenExpanded = true
+	m.dashboard = &Snapshot{
+		Projects: append(renderCapProjects("active", 12, true), hidden...),
+	}
+
+	rows := m.dashboardRows()
+	var moreIndices []int
+	for i, row := range rows {
+		if row.kind == rowSeparator && row.separator != nil &&
+			row.separator.kind == separatorMore {
+			moreIndices = append(moreIndices, i)
+		}
+	}
+	if len(moreIndices) != 2 {
+		t.Fatalf("more separator count = %d, want 2: %+v", len(moreIndices), rows)
+	}
+	firstID := rowIdentity(rows[moreIndices[0]])
+	secondID := rowIdentity(rows[moreIndices[1]])
+	if firstID == secondID {
+		t.Fatalf("more separator identities must differ: %q", firstID)
+	}
+	if firstID != "S:more:active" || secondID != "S:more:hidden" {
+		t.Fatalf("more separator identities = %q, %q", firstID, secondID)
+	}
+
+	m.dashCursor = moreIndices[1]
+	selectedID := rowIdentity(rows[m.dashCursor])
+	m.dashCursor = 0
+	m.refreshCursor(selectedID)
+	refreshed := m.dashboardRows()
+	if got := rowIdentity(refreshed[m.dashCursor]); got != selectedID {
+		t.Fatalf("cursor identity after refresh = %q, want %q", got, selectedID)
+	}
+	if refreshed[m.dashCursor].separator.project != "hidden" {
+		t.Fatalf("cursor restored to group %q, want hidden", refreshed[m.dashCursor].separator.project)
+	}
+}
+
 func TestProjectLastActivity(t *testing.T) {
 	now := time.Now()
 	tests := []struct {
