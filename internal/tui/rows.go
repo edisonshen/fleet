@@ -544,8 +544,7 @@ func (m Model) dashboardRows() []dashRow {
 		// separator visible.
 		autoSuppress := !m.idleCollapseExplicit && !m.idleExpanded && len(active) == 0
 		renderIdle := autoSuppress
-		if autoSuppress {
-		} else {
+		if !autoSuppress {
 			rows = append(rows, dashRow{
 				kind: rowSeparator,
 				separator: &separatorRow{
