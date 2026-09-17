@@ -229,6 +229,8 @@ func scanDashboard(now time.Time) *Snapshot {
 	}
 
 	snap := &Snapshot{LoadedAt: now}
+	hiddenSet := hiddenProjectsSet()
+	incidentCounts := scanIncidentCounts()
 	for _, e := range entries {
 		if !e.IsDir() {
 			continue
@@ -250,7 +252,13 @@ func scanDashboard(now time.Time) *Snapshot {
 			snap.SkippedMalformed = append(snap.SkippedMalformed, name)
 			continue
 		}
-		row, wrows := scanProject(projDir, name, now)
+		var row *ProjectRow
+		var wrows []*WorkerRow
+		if hiddenSet[name] {
+			row, wrows = scanProjectLight(projDir, name, now)
+		} else {
+			row, wrows = scanProject(projDir, name, now, incidentCounts[name])
+		}
 		if row != nil {
 			snap.Projects = append(snap.Projects, row)
 		}
@@ -280,7 +288,7 @@ func scanDashboard(now time.Time) *Snapshot {
 // the assembled ProjectRow plus all worker rows under it. nil row +
 // empty slice when the project dir is malformed (e.g. missing tasks.md
 // AND no workers/ — nothing to show).
-func scanProject(projectsRoot, name string, now time.Time) (*ProjectRow, []*WorkerRow) {
+func scanProject(projectsRoot, name string, now time.Time, incidentCount int) (*ProjectRow, []*WorkerRow) {
 	dir := filepath.Join(projectsRoot, name)
 	row := &ProjectRow{
 		Name:     name,
@@ -329,21 +337,7 @@ func scanProject(projectsRoot, name string, now time.Time) (*ProjectRow, []*Work
 	// "○ idle · auto-stopped" so the operator knows the coord has run
 	// here previously even though it isn't ticking now.
 	stateJSON := filepath.Join(dir, "coord-state.json")
-	lockFile := filepath.Join(dir, ".locks", "coordinator.lock")
-	if info, err := os.Stat(stateJSON); err == nil {
-		mt := info.ModTime()
-		row.LastTick = mt
-		if now.Sub(mt) <= coordActiveWindow {
-			row.Active = true
-		} else if _, lerr := os.Stat(lockFile); lerr == nil {
-			row.IdleStop = true
-		}
-	} else if _, lerr := os.Stat(lockFile); lerr == nil {
-		// Lock exists but no coord-state.json yet — coord has run here
-		// at some point but never reached the first state-write. Treat
-		// as auto-stopped so the operator sees the project at all.
-		row.IdleStop = true
-	}
+	applyCoordFreshness(row, dir, now)
 	// Holder ID is only trusted when the coord is fresh (Active). flock
 	// doesn't truncate on release, so a stale lock body would otherwise
 	// promote a dead coord to LEFT-column rendering. The freshness gate
@@ -371,9 +365,9 @@ func scanProject(projectsRoot, name string, now time.Time) (*ProjectRow, []*Work
 	// PART 3 jetsam observer wire-up — count incidents whose project
 	// field matches this row. The fleet-guard skill writes one JSON
 	// per memorystatus / jetsam kill to ~/.fleet/incidents/; the badge
-	// renders when count > 0. One ReadDir per project per scan; the
-	// directory is empty in steady state.
-	row.IncidentCount = scanProjectIncidentCount(name)
+	// renders when count > 0. The dashboard indexes the directory once
+	// per scan; it is empty in steady state.
+	row.IncidentCount = incidentCount
 
 	// Workers under workers/<slug>/state.json.
 	wrows := scanWorkers(dir, name, now, subagentMap)
@@ -385,7 +379,7 @@ func scanProject(projectsRoot, name string, now time.Time) (*ProjectRow, []*Work
 	// not when something needs answering. Rolling task-blocked into
 	// row.Attention overcounted "1 need attention" on projects whose only
 	// "blocked" was the planning signal, training the operator to ignore
-	// the chip. Worker phase=blocked (the loop below) is the load-bearing
+	// the chip. Worker phase=blocked (the helper below) is the load-bearing
 	// signal — that's the path a worker raises a question through, and
 	// v0.2 Agent-tool subagents share the same code path.
 	//
@@ -394,6 +388,16 @@ func scanProject(projectsRoot, name string, now time.Time) (*ProjectRow, []*Work
 	// dropped. The visual signal for a planning-blocked task is the
 	// distinct ‖ glyph in the per-task expansion (taskStatusStyles), not
 	// the row-level attention chip.
+	applyWorkerAttention(row, wrows)
+
+	// CI running — best-effort. v0.2.0 doesn't cache pr_check yet, so we
+	// approximate by counting workers in PhaseReviewClaude /
+	// PhaseReviewCodex / PhasePush — those are the phases where the
+	// worker is waiting on CI/review feedback.
+	return row, wrows
+}
+
+func applyWorkerAttention(row *ProjectRow, wrows []*WorkerRow) {
 	var firstBlocked *WorkerRow
 	for _, w := range wrows {
 		if w.Blocked {
@@ -407,12 +411,36 @@ func scanProject(projectsRoot, name string, now time.Time) (*ProjectRow, []*Work
 		row.BlockedID = firstBlocked.ID
 		row.BlockedQ = firstBlocked.Reason
 	}
+}
 
-	// CI running — best-effort. v0.2.0 doesn't cache pr_check yet, so we
-	// approximate by counting workers in PhaseReviewClaude /
-	// PhaseReviewCodex / PhasePush — those are the phases where the
-	// worker is waiting on CI/review feedback.
+// scanProjectLight reads the fields needed to keep a hidden project in the
+// snapshot without paying for task, coord-state, subagent, or incident data.
+func scanProjectLight(projectsRoot, name string, now time.Time) (*ProjectRow, []*WorkerRow) {
+	dir := filepath.Join(projectsRoot, name)
+	row := &ProjectRow{
+		Name:     name,
+		RepoSlug: deriveRepoSlug(dir, name),
+	}
+	applyCoordFreshness(row, dir, now)
+	wrows := scanWorkers(dir, name, now, nil)
+	applyWorkerAttention(row, wrows)
 	return row, wrows
+}
+
+func applyCoordFreshness(row *ProjectRow, dir string, now time.Time) {
+	stateJSON := filepath.Join(dir, "coord-state.json")
+	lockFile := filepath.Join(dir, ".locks", "coordinator.lock")
+	if info, err := os.Stat(stateJSON); err == nil {
+		mt := info.ModTime()
+		row.LastTick = mt
+		if now.Sub(mt) <= coordActiveWindow {
+			row.Active = true
+		} else if _, lerr := os.Stat(lockFile); lerr == nil {
+			row.IdleStop = true
+		}
+	} else if _, lerr := os.Stat(lockFile); lerr == nil {
+		row.IdleStop = true
+	}
 }
 
 // scanWorkers reads <project>/workers/<slug>/state.json for every
@@ -781,10 +809,9 @@ func scanProjectPostArchiveActivity(projectDir string) bool {
 	return false
 }
 
-// scanProjectIncidentCount returns the number of incident JSON files
-// under ~/.fleet/incidents/ whose top-level `project` field equals
-// projectName. The macOS memorystatus / jetsam observer in
-// skills/fleet-guard/jetsam.py writes these files; the schema is
+// scanIncidentCounts indexes incident JSON files under ~/.fleet/incidents/
+// by their top-level `project` field. The macOS memorystatus / jetsam
+// observer in skills/fleet-guard/jetsam.py writes these files; the schema is
 //
 //	{
 //	  "schema_version": 1,
@@ -796,22 +823,21 @@ func scanProjectPostArchiveActivity(projectDir string) bool {
 //	  ...
 //	}
 //
-// Returns 0 when the dir is missing, when no files match, or on read
-// errors. Malformed JSON entries are skipped silently (mirrors
+// Malformed JSON entries are skipped silently (mirrors
 // scanProjectPostArchiveActivity's tolerance for partial writes /
 // hand-edits). Best-effort: a directory-listing race during a
 // concurrent incident write doesn't crash the TUI scan; worst case
 // the count is one off for one frame.
-func scanProjectIncidentCount(projectName string) int {
+func scanIncidentCounts() map[string]int {
+	counts := make(map[string]int)
 	dir, err := state.IncidentsDir()
 	if err != nil {
-		return 0
+		return counts
 	}
 	entries, err := os.ReadDir(dir)
 	if err != nil {
-		return 0
+		return counts
 	}
-	count := 0
 	for _, e := range entries {
 		if e.IsDir() || !strings.HasSuffix(e.Name(), ".json") {
 			continue
@@ -826,11 +852,11 @@ func scanProjectIncidentCount(projectName string) int {
 		if err := json.Unmarshal(data, &rec); err != nil {
 			continue
 		}
-		if rec.Project == projectName {
-			count++
+		if rec.Project != "" {
+			counts[rec.Project]++
 		}
 	}
-	return count
+	return counts
 }
 
 // readWorkerSubagentMap parses coord-state.json's `worker_subagent_ids`

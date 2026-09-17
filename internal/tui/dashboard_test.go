@@ -1033,6 +1033,98 @@ func TestScanProject_SkipsMalformedIncidentJSON(t *testing.T) {
 	}
 }
 
+func TestScanDashboard_LightScansHiddenProjects(t *testing.T) {
+	defer resetHiddenStubs()()
+	stubHidden("hidden")
+	pdir := withFleetHome(t)
+	seedTasks(t, pdir, "hidden", TaskCounts{Todo: 2})
+	seedTasks(t, pdir, "visible", TaskCounts{Todo: 2})
+	seedWorker(t, pdir, "hidden", "hidden-worker", workers.State{
+		Phase:         workers.PhaseBlocked,
+		BlockedReason: "need operator input",
+	})
+	seedWorker(t, pdir, "visible", "visible-worker", workers.State{Phase: workers.PhaseVerify})
+
+	snap := scanDashboard(time.Now())
+	find := func(name string) *ProjectRow {
+		t.Helper()
+		for _, p := range snap.Projects {
+			if p.Name == name {
+				return p
+			}
+		}
+		t.Fatalf("project %q missing from snapshot", name)
+		return nil
+	}
+	hidden := find("hidden")
+	if hidden.Counts != (TaskCounts{}) {
+		t.Errorf("hidden project counts = %+v, want zero", hidden.Counts)
+	}
+	if hidden.Tasks != nil {
+		t.Errorf("hidden project tasks = %+v, want nil", hidden.Tasks)
+	}
+	if hidden.Attention != 1 {
+		t.Errorf("hidden project attention = %d, want 1", hidden.Attention)
+	}
+	if hidden.BlockedID != "hidden-worker" {
+		t.Errorf("hidden project BlockedID = %q, want hidden-worker", hidden.BlockedID)
+	}
+	if hidden.BlockedQ != "need operator input" {
+		t.Errorf("hidden project BlockedQ = %q, want need operator input", hidden.BlockedQ)
+	}
+	if visible := find("visible"); visible.Counts.Todo != 2 {
+		t.Errorf("visible todo count = %d, want 2", visible.Counts.Todo)
+	}
+	if len(snap.Workers) != 2 {
+		t.Fatalf("snapshot workers = %d, want 2", len(snap.Workers))
+	}
+	projects := map[string]bool{}
+	for _, w := range snap.Workers {
+		projects[w.Project] = true
+	}
+	if !projects["hidden"] || !projects["visible"] {
+		t.Errorf("snapshot workers missing project coverage: %v", projects)
+	}
+}
+
+func TestScanIncidentCounts_IndexesProjectsOnce(t *testing.T) {
+	pdir := withFleetHome(t)
+	seedTasks(t, pdir, "a", TaskCounts{Todo: 1})
+	seedTasks(t, pdir, "b", TaskCounts{Todo: 1})
+	incidentsDir := filepath.Join(filepath.Dir(pdir), "incidents")
+	if err := os.MkdirAll(incidentsDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	write := func(name, project string) {
+		t.Helper()
+		body, err := json.Marshal(map[string]string{"project": project})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(incidentsDir, name), body, 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write("a-1.json", "a")
+	write("a-2.json", "a")
+	write("b-1.json", "b")
+	if err := os.WriteFile(filepath.Join(incidentsDir, "bad.json"), []byte("{"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	counts := scanIncidentCounts()
+	if counts["a"] != 2 || counts["b"] != 1 {
+		t.Errorf("incident counts = %#v, want a=2,b=1", counts)
+	}
+	snap := scanDashboard(time.Now())
+	for _, p := range snap.Projects {
+		want := counts[p.Name]
+		if p.IncidentCount != want {
+			t.Errorf("%s IncidentCount = %d, want %d", p.Name, p.IncidentCount, want)
+		}
+	}
+}
+
 // TestProjectBlock_RendersMemorystatusBadgeOnIncident pins PART 3
 // of the bundled liveness-correctness fix: when ProjectRow.IncidentCount
 // > 0, the project block header renders an attention-chip badge
@@ -2170,7 +2262,7 @@ func TestScanProject_PlumbsSubagentMap(t *testing.T) {
 	writeCoordStateWithSubagentMap(t, pdir, "fleet", map[string]string{
 		"alpha-aaaa": "claude-sub-1",
 	}, false, "")
-	_, wrows := scanProject(pdir, "fleet", time.Now())
+	_, wrows := scanProject(pdir, "fleet", time.Now(), 0)
 	if len(wrows) != 1 {
 		t.Fatalf("expected 1 worker row, got %d", len(wrows))
 	}

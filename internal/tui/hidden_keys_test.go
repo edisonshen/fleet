@@ -2,6 +2,7 @@ package tui
 
 import (
 	"errors"
+	"fmt"
 	"reflect"
 	"sort"
 	"testing"
@@ -237,6 +238,47 @@ func TestKeyEnter_OnHiddenSeparator_TogglesHiddenExpansion(t *testing.T) {
 	got := mm.(Model)
 	if !got.hiddenExpanded {
 		t.Errorf("[enter] on hidden separator should expand")
+	}
+}
+
+func TestKeyEnter_OnHiddenMoreSeparatorIsNoop(t *testing.T) {
+	defer resetHiddenStubs()()
+	names := make([]string, 12)
+	projects := make([]*ProjectRow, len(names))
+	for i := range names {
+		names[i] = fmt.Sprintf("hidden-%02d", i)
+		projects[i] = &ProjectRow{Name: names[i]}
+	}
+	stubHidden(names...)
+	m := New("test")
+	m.showHidden = true
+	m.hiddenExpanded = true
+	m.idleExpanded = true
+	m.dashboard = &Snapshot{Projects: projects}
+	rows := m.dashboardRows()
+	moreIdx := -1
+	for i, row := range rows {
+		if row.kind == rowSeparator && row.separator != nil &&
+			row.separator.kind == separatorHiddenMore {
+			moreIdx = i
+			break
+		}
+	}
+	if moreIdx < 0 {
+		t.Fatalf("hidden-more separator missing: %+v", rows)
+	}
+	m.dashCursor = moreIdx
+	mm, _ := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	got := mm.(Model)
+	if !got.hiddenExpanded || !got.idleExpanded {
+		t.Errorf("[enter] changed expansion state: hidden=%v idle=%v",
+			got.hiddenExpanded, got.idleExpanded)
+	}
+	mm, _ = got.Update(keyMsg("c"))
+	got = mm.(Model)
+	if !got.hiddenExpanded || !got.idleExpanded {
+		t.Errorf("[c] changed expansion state: hidden=%v idle=%v",
+			got.hiddenExpanded, got.idleExpanded)
 	}
 }
 
