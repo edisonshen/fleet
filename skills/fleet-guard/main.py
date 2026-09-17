@@ -90,11 +90,17 @@ def main(stdin: TextIO | None = None) -> int:
         # this format the agent never sees HANDOFF REQUESTED, never
         # emits MILESTONE, and stays stuck in auto-yellow forever.
         #
-        # Other hooks (SessionStart) keep plain-stdout for now — they
-        # don't have a documented "block" semantic, and the inbox-on-
-        # resume path is less load-bearing than auto-handoff.
+        # SessionStart context goes through hookSpecificOutput.
+        # additionalContext: both CLIs accept it, and Codex rejects
+        # plain stdout ("hook returned invalid session start JSON
+        # output"), which would drop the role reminder / inbox delivery.
         if hook_name == "Stop":
             print(json.dumps({"decision": "block", "reason": body}))
+        elif hook_name == "SessionStart":
+            print(json.dumps({"hookSpecificOutput": {
+                "hookEventName": "SessionStart",
+                "additionalContext": body,
+            }}))
         else:
             sys.stdout.write(body)
     return 0

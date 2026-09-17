@@ -1235,6 +1235,10 @@ func Spawn(opts Options) (*agent.Record, error) {
 	}
 	execArgv = coordRCArgv(execArgv, rec.Project, id, rec.IsCoord)
 
+	if realTmuxBackend {
+		ensureEngineProjectTrust(rec.Engine, cwd)
+	}
+
 	// Coordinator lease supervisor wrap (DESIGN-handoff-drain-storm-leak
 	// PR1 spawn-collapse: every coord spawn runs under
 	// `fleet coord-run --standby --standby-timeout T` on lease-capable

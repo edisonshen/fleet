@@ -369,7 +369,12 @@ class TestSessionStartHook:
                                                 encoding="utf-8")
         rc, out, _ = _run({"hook_event_name": "SessionStart"}, capsys)
         assert rc == 0
-        assert out == "[OPERATOR] welcome back"
+        # Both CLIs accept hookSpecificOutput.additionalContext; codex
+        # rejects plain stdout ("invalid session start JSON output").
+        assert json.loads(out) == {"hookSpecificOutput": {
+            "hookEventName": "SessionStart",
+            "additionalContext": "[OPERATOR] welcome back",
+        }}
         assert not (inbox_dir / "agent7777.md").exists()
 
     def test_no_inbox_silent(

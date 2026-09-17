@@ -64,7 +64,7 @@ Stdin is the same JSON shape minus token deltas. Stdout is ignored (the compacti
 
 ### `SessionStart`
 
-Stdin contains `session_id` and resumption metadata. The skill checks for a pending inbox message and emits it via stdout (same `[OPERATOR] <body>` shape). No threshold evaluation on this hook — context is fresh.
+Stdin contains `session_id` and resumption metadata. The skill checks for a pending inbox message and emits it as `{"hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext": "[OPERATOR] <body>"}}` — the JSON shape both Claude Code and Codex inject as context (Codex rejects plain stdout here). No threshold evaluation on this hook — context is fresh.
 
 ### `UserPromptSubmit`
 

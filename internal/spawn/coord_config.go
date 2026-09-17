@@ -197,3 +197,23 @@ func fleetHomeForSpawn() string {
 	}
 	return ""
 }
+
+// ensureEngineProjectTrust pre-trusts cwd in the engine's user config so
+// the unattended CLI does not stop at a first-run "trust this directory?"
+// prompt inside the tmux pane. Only Codex has such a prompt today; the
+// entry lands in $CODEX_HOME/config.toml (default ~/.codex/config.toml),
+// mirroring where Codex itself records the answer. Best-effort: a failed
+// write warns and the spawn proceeds.
+func ensureEngineProjectTrust(engine, cwd string) {
+	if engine != enginecfg.EngineCodex || cwd == "" {
+		return
+	}
+	home, err := os.UserHomeDir()
+	if err != nil || home == "" {
+		return
+	}
+	cfgDir := enginecfg.CodexConfigDir(home)
+	if _, err := enginecfg.EnsureCodexProjectTrust(cfgDir, cwd); err != nil {
+		_, _ = fmt.Fprintf(os.Stderr, "warning: could not pre-trust %s for codex: %v\n", cwd, err)
+	}
+}

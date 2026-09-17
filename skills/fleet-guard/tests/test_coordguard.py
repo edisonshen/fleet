@@ -41,7 +41,7 @@ def home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
 
 def hook(event: str, tool: str = "", capsys=None, **tool_input: object) -> str:
     """Run one hook event through main.py the way Claude Code does; return
-    stdout (PreToolUse/Stop emit JSON, SessionStart emits plain text)."""
+    stdout (PreToolUse/Stop/SessionStart all emit JSON when non-empty)."""
     payload: dict = {"hook_event_name": event}
     if tool:
         payload |= {"tool_name": tool, "tool_input": tool_input}
