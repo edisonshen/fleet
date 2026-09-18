@@ -260,7 +260,7 @@ func (m Model) unifiedProjectsFiltered(hiddenSet map[string]bool) []*ProjectRow 
 		if p == nil || p.CoordID != "" {
 			continue
 		}
-		rec := findCoordByTaskID(m.records, p.Name)
+		rec := findCoordByTaskID(m.records, p.Name, m.coordProbeFor)
 		if rec == nil {
 			continue
 		}
@@ -294,14 +294,17 @@ func (m Model) unifiedProjectsFiltered(hiddenSet map[string]bool) []*ProjectRow 
 // the dashboard's binding signal (does this agent represent the
 // project's coord visually?); the keys.go counterpart is the [a]
 // idempotency signal. Both read the same lease identity.
-func findCoordByTaskID(records []*agent.Record, projectName string) *agent.Record {
+//
+// probe supplies the project's lease identity + session liveness (the
+// scan-time cache via Model.coordProbeFor); ok=false means the project
+// state tree does not exist.
+func findCoordByTaskID(records []*agent.Record, projectName string, probe func(string) (coordProbe, bool)) *agent.Record {
 	want := coordTaskID(projectName)
-	// Project-tree existence is 1 stat per call, fast enough to run inline in
-	// unifiedProjects on every render.
-	if !projectTreeExistsFn(projectName) {
+	c, ok := probe(projectName)
+	if !ok {
 		return nil
 	}
-	wantID := coordSpawnIdentityFn(projectName)
+	wantID := c.identity
 	if wantID == "" {
 		return nil
 	}
@@ -323,22 +326,35 @@ func findCoordByTaskID(records []*agent.Record, projectName string) *agent.Recor
 		if r.TmuxSession == "" {
 			continue
 		}
-		if !sessionAliveFn(r.TmuxSession) {
-			// codex iter-3 P2: tmux.HasSession returns false for both
-			// "session does not exist" AND transport errors (bad
-			// FLEET_TMUX_SOCKET, restarting server). Both cases are
-			// handled by sessionAliveFn (which is HasSession in
-			// production); a probe failure shouldn't refuse to bind a
-			// known coord. Use sessionProbeFn for the tristate read so
-			// errors fall through to "treat as alive" (don't drop the
-			// claim) rather than "definitively dead".
-			if !sessionProbeOrAliveFn(r.TmuxSession) {
-				continue
-			}
+		// Tristate liveness: a probe transport error reads as alive so a
+		// tmux hiccup never drops a known coord's binding. The cached
+		// probe covers the lease-named session; a record naming a
+		// different session falls back to a live probe.
+		alive := c.alive
+		if r.TmuxSession != c.session {
+			alive = sessionProbeOrAliveFn(r.TmuxSession)
+		}
+		if !alive {
+			continue
 		}
 		return r
 	}
 	return nil
+}
+
+// coordProbeFor returns the project's coordinator lease identity and
+// session liveness from the last dashboard scan. ok=false when the
+// project's state tree does not exist. Before the first scan lands (or
+// when a Snapshot was built without a Coord map) it probes live.
+func (m Model) coordProbeFor(name string) (coordProbe, bool) {
+	if m.dashboard != nil && m.dashboard.Coord != nil {
+		c, ok := m.dashboard.Coord[name]
+		return c, ok
+	}
+	if !projectTreeExistsFn(name) {
+		return coordProbe{}, false
+	}
+	return probeCoord(name), true
 }
 
 // projectTreeExistsFn returns true when ~/.fleet/projects/<name>/ is
