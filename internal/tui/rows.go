@@ -42,11 +42,11 @@ const (
 type separatorKind int
 
 const (
-	separatorIdle       separatorKind = iota // "─── N idle ───"
-	separatorHidden                          // "─── N hidden ───" (only when show-hidden mode is on)
-	separatorHiddenMore                      // "─── N more hidden ───"
-	separatorHistory                         // "─── N done ───" inside an expanded project block (issue #101)
-	separatorAgentIdle                       // "─── N idle ───" inside the RIGHT-column v0.1 agent list (dashboard-accumulation-f-4421)
+	separatorIdle      separatorKind = iota // "─── N idle ───"
+	separatorHidden                         // "─── N hidden ───" (only when show-hidden mode is on)
+	separatorMore                           // "─── N more ───"
+	separatorHistory                        // "─── N done ───" inside an expanded project block (issue #101)
+	separatorAgentIdle                      // "─── N idle ───" inside the RIGHT-column v0.1 agent list (dashboard-accumulation-f-4421)
 )
 
 // separatorRow carries the per-group state for rowSeparator.
@@ -489,17 +489,33 @@ func (m Model) dashboardRows() []dashRow {
 		window = activeWindowDefault
 	}
 	var active, idle []*ProjectRow
+	idleActivity := map[string]time.Time{}
 	for _, p := range projects {
 		addedAt := projectAddedAtFn(p.Name)
 		if classifyProjectActivity(p, workers, m.records, addedAt, now, window) == projectActive {
 			active = append(active, p)
 		} else {
 			idle = append(idle, p)
+			idleActivity[p.Name] = projectLastActivity(p, m.records, addedAt)
 		}
 	}
+	sort.SliceStable(idle, func(i, j int) bool {
+		return idleActivity[idle[i].Name].After(idleActivity[idle[j].Name])
+	})
 
 	// ACTIVE bucket — render normally.
-	rows = m.appendProjectRows(rows, active)
+	projectBudget := projectRenderCap
+	if searchActive {
+		rows = m.appendProjectRows(rows, active)
+	} else {
+		activeShown := len(active)
+		if activeShown > projectRenderCap {
+			activeShown = projectRenderCap
+		}
+		rows = m.appendProjectRows(rows, active[:activeShown])
+		rows = appendMoreRow(rows, len(active)-activeShown, "active")
+		projectBudget -= activeShown
+	}
 
 	// IDLE bucket — collapse under separator unless search is active.
 	//
@@ -527,9 +543,8 @@ func (m Model) dashboardRows() []dashRow {
 		// Otherwise honor the operator's expansion state with the
 		// separator visible.
 		autoSuppress := !m.idleCollapseExplicit && !m.idleExpanded && len(active) == 0
-		if autoSuppress {
-			rows = m.appendProjectRows(rows, idle)
-		} else {
+		renderIdle := autoSuppress
+		if !autoSuppress {
 			rows = append(rows, dashRow{
 				kind: rowSeparator,
 				separator: &separatorRow{
@@ -538,9 +553,15 @@ func (m Model) dashboardRows() []dashRow {
 					expanded: m.idleExpanded,
 				},
 			})
-			if m.idleExpanded {
-				rows = m.appendProjectRows(rows, idle)
+			renderIdle = m.idleExpanded
+		}
+		if renderIdle {
+			idleShown := len(idle)
+			if idleShown > projectBudget {
+				idleShown = projectBudget
 			}
+			rows = m.appendProjectRows(rows, idle[:idleShown])
+			rows = appendMoreRow(rows, len(idle)-idleShown, "idle")
 		}
 	}
 
@@ -570,19 +591,11 @@ func (m Model) dashboardRows() []dashRow {
 					rows = m.appendProjectRows(rows, hidden)
 				} else {
 					hiddenRenderCount := len(hidden)
-					if hiddenRenderCount > hiddenRenderCap {
-						hiddenRenderCount = hiddenRenderCap
+					if hiddenRenderCount > projectRenderCap {
+						hiddenRenderCount = projectRenderCap
 					}
 					rows = m.appendProjectRows(rows, hidden[:hiddenRenderCount])
-					if len(hidden) > hiddenRenderCap {
-						rows = append(rows, dashRow{
-							kind: rowSeparator,
-							separator: &separatorRow{
-								kind:  separatorHiddenMore,
-								count: len(hidden) - hiddenRenderCap,
-							},
-						})
-					}
+					rows = appendMoreRow(rows, len(hidden)-hiddenRenderCount, "hidden")
 				}
 			}
 		}
@@ -691,7 +704,21 @@ func classifyAgentActivity(
 	return projectIdle
 }
 
-const hiddenRenderCap = 10
+const projectRenderCap = 10
+
+func appendMoreRow(rows []dashRow, n int, group string) []dashRow {
+	if n <= 0 {
+		return rows
+	}
+	return append(rows, dashRow{
+		kind: rowSeparator,
+		separator: &separatorRow{
+			kind:    separatorMore,
+			count:   n,
+			project: group,
+		},
+	})
+}
 
 // appendProjectRows adds project + (optionally expanded) task rows for
 // each entry in projects. Encapsulates the per-project filter +
@@ -928,8 +955,8 @@ func rowIdentity(r dashRow) string {
 				return "S:idle"
 			case separatorHidden:
 				return "S:hidden"
-			case separatorHiddenMore:
-				return "S:hidden-more"
+			case separatorMore:
+				return "S:more:" + r.separator.project
 			case separatorHistory:
 				return "S:history:" + r.separator.project
 			case separatorAgentIdle:

@@ -155,6 +155,25 @@ func classifyProjectActivity(
 	return projectIdle
 }
 
+func projectLastActivity(p *ProjectRow, records []*agent.Record, addedAt time.Time) time.Time {
+	var latest time.Time
+	if p != nil {
+		latest = p.LastTick
+		for _, r := range records {
+			if r == nil || r.Project != p.Name {
+				continue
+			}
+			if r.LastActivityTS.After(latest) {
+				latest = r.LastActivityTS
+			}
+		}
+	}
+	if addedAt.After(latest) {
+		latest = addedAt
+	}
+	return latest
+}
+
 // hiddenWithActivity returns the count of hidden projects that DO have
 // fresh activity. Used by the footer chip to render the
 // " · M with activity" nudge so operators know the hidden list isn't

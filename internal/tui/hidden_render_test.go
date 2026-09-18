@@ -34,14 +34,14 @@ func TestSeparatorBlockLine_HiddenRendersHiddenLabel(t *testing.T) {
 	}
 }
 
-func TestSeparatorBlockLine_HiddenMoreRendersUnhideHint(t *testing.T) {
-	sep := &separatorRow{kind: separatorHiddenMore, count: 2}
+func TestSeparatorBlockLine_MoreRendersSearchHint(t *testing.T) {
+	sep := &separatorRow{kind: separatorMore, count: 2}
 	line := separatorBlockLine(sep, 80, false)
-	if !strings.Contains(line, "2 more hidden") {
-		t.Errorf("hidden-more separator should mention count: got %q", line)
+	if !strings.Contains(line, "2 more") {
+		t.Errorf("more separator should mention count: got %q", line)
 	}
-	if strings.Contains(line, "[enter]") {
-		t.Errorf("hidden-more separator should not hint [enter]: got %q", line)
+	if !strings.Contains(line, "[/] search to find") {
+		t.Errorf("more separator should hint search: got %q", line)
 	}
 }
 
@@ -76,13 +76,13 @@ func TestDashboardRows_CapsExpandedHiddenProjects(t *testing.T) {
 			projectCount++
 		}
 	}
-	if projectCount != hiddenRenderCap {
-		t.Fatalf("hidden project rows = %d, want %d", projectCount, hiddenRenderCap)
+	if projectCount != projectRenderCap {
+		t.Fatalf("hidden project rows = %d, want %d", projectCount, projectRenderCap)
 	}
 	moreIdx := hiddenIdx + 1 + projectCount
 	if moreIdx >= len(rows) || rows[moreIdx].kind != rowSeparator ||
-		rows[moreIdx].separator.kind != separatorHiddenMore {
-		t.Fatalf("hidden-more separator missing after capped projects: %+v", rows)
+		rows[moreIdx].separator.kind != separatorMore {
+		t.Fatalf("more separator missing after capped projects: %+v", rows)
 	}
 	if rows[hiddenIdx].separator.count != 12 || rows[moreIdx].separator.count != 2 {
 		t.Errorf("separator counts = %d and %d, want 12 and 2",
@@ -92,7 +92,7 @@ func TestDashboardRows_CapsExpandedHiddenProjects(t *testing.T) {
 
 func TestDashboardRows_NoHiddenMoreSeparatorAtCap(t *testing.T) {
 	defer resetHiddenStubs()()
-	names := make([]string, hiddenRenderCap)
+	names := make([]string, projectRenderCap)
 	projects := make([]*ProjectRow, len(names))
 	for i := range names {
 		names[i] = fmt.Sprintf("hidden-%02d", i)
@@ -106,8 +106,8 @@ func TestDashboardRows_NoHiddenMoreSeparatorAtCap(t *testing.T) {
 
 	for _, row := range m.dashboardRows() {
 		if row.kind == rowSeparator && row.separator != nil &&
-			row.separator.kind == separatorHiddenMore {
-			t.Fatal("hidden-more separator should not render at the cap")
+			row.separator.kind == separatorMore {
+			t.Fatal("more separator should not render at the cap")
 		}
 	}
 }
@@ -134,7 +134,7 @@ func TestDashboardRows_SearchRendersAllExpandedHiddenProjects(t *testing.T) {
 			found = true
 		}
 		if row.kind == rowSeparator && row.separator != nil &&
-			row.separator.kind == separatorHiddenMore {
+			row.separator.kind == separatorMore {
 			t.Fatal("search should bypass hidden render cap")
 		}
 	}

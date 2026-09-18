@@ -46,8 +46,8 @@ func TestRenderTwoColumnBody_LeftPanelBounded_LongProjectsList(t *testing.T) {
 	withFleetHome(t)
 	m := New("test")
 	m.width = 140
-	m.height = 20 // short terminal — 12 projects * 3 lines >> usable left rows
-	m.dashboard = buildManyProjectsSnapshot(12)
+	m.height = 20 // short terminal — 10 projects * 3 lines >> usable left rows
+	m.dashboard = buildManyProjectsSnapshot(10)
 
 	// The visible window at offset 0 must surface overflow via the
 	// harmonized footer, NOT silently drop the off-screen projects.
@@ -63,13 +63,13 @@ func TestRenderTwoColumnBody_LeftPanelBounded_LongProjectsList(t *testing.T) {
 	for off := 0; off <= maxOff; off++ {
 		m.projectsScrollOffset = off
 		frame := renderTwoColumnBody(m, 90, 40)
-		for i := 0; i < 12; i++ {
+		for i := 0; i < 10; i++ {
 			if strings.Contains(frame, projectDisplayWant(i)) {
 				seen[projectDisplayWant(i)] = true
 			}
 		}
 	}
-	for i := 0; i < 12; i++ {
+	for i := 0; i < 10; i++ {
 		if !seen[projectDisplayWant(i)] {
 			t.Errorf("project %q never visible across any scroll offset — silently truncated", projectDisplayWant(i))
 		}
@@ -89,7 +89,7 @@ func TestRenderTwoColumnBody_LeftPanel_OverflowSurfacesFooter(t *testing.T) {
 	m := New("test")
 	m.width = 140
 	m.height = 20
-	m.dashboard = buildManyProjectsSnapshot(12)
+	m.dashboard = buildManyProjectsSnapshot(10)
 
 	body := renderTwoColumnBody(m, 90, 40)
 	if !strings.Contains(body, "hidden — [↓/↑] scroll") {
@@ -131,7 +131,7 @@ func TestArrowDown_ScrollsLeftProjectsPanel(t *testing.T) {
 	m := New("test")
 	m.width = 140
 	m.height = 20
-	m.dashboard = buildManyProjectsSnapshot(12)
+	m.dashboard = buildManyProjectsSnapshot(10)
 	// Cursor starts at row 0 (first project, a LEFT-column row).
 	if got := m.selectedRow(); got == nil || got.kind != rowProject {
 		t.Fatalf("expected cursor on a project row to start; got %+v", got)
@@ -141,20 +141,20 @@ func TestArrowDown_ScrollsLeftProjectsPanel(t *testing.T) {
 	// somewhere along the way (the bottom projects don't fit at offset 0).
 	cur := tea.Model(m)
 	maxSeen := 0
-	for i := 0; i < 11; i++ {
+	for i := 0; i < 9; i++ {
 		cur, _ = cur.(Model).Update(keyMsg("down"))
 		if off := cur.(Model).projectsScrollOffset; off > maxSeen {
 			maxSeen = off
 		}
 	}
 	if maxSeen == 0 {
-		t.Errorf("walking ↓ through 12 projects must advance projectsScrollOffset past 0; stayed 0")
+		t.Errorf("walking ↓ through 10 projects must advance projectsScrollOffset past 0; stayed 0")
 	}
 	mDown := cur.(Model)
 
 	// ↑ must reduce the offset back toward 0 and never go negative.
 	cur2 := tea.Model(mDown)
-	for i := 0; i < 11; i++ {
+	for i := 0; i < 9; i++ {
 		cur2, _ = cur2.(Model).Update(keyMsg("up"))
 		if off := cur2.(Model).projectsScrollOffset; off < 0 {
 			t.Fatalf("projectsScrollOffset must never go negative; got %d", off)
@@ -178,10 +178,10 @@ func TestArrowDown_KeepsSelectedRowVisible(t *testing.T) {
 	m := New("test")
 	m.width = 140
 	m.height = 20
-	m.dashboard = buildManyProjectsSnapshot(12)
+	m.dashboard = buildManyProjectsSnapshot(10)
 
 	cur := tea.Model(m)
-	for i := 0; i < 11; i++ {
+	for i := 0; i < 9; i++ {
 		cur, _ = cur.(Model).Update(keyMsg("down"))
 		mm := cur.(Model)
 		sel := mm.selectedRow()
@@ -207,11 +207,11 @@ func TestJK_KeepsSelectedRowVisible(t *testing.T) {
 	m := New("test")
 	m.width = 140
 	m.height = 20
-	m.dashboard = buildManyProjectsSnapshot(12)
+	m.dashboard = buildManyProjectsSnapshot(10)
 
 	cur := tea.Model(m)
 	advanced := false
-	for i := 0; i < 11; i++ {
+	for i := 0; i < 9; i++ {
 		cur, _ = cur.(Model).Update(keyMsg("j"))
 		mm := cur.(Model)
 		if mm.projectsScrollOffset > 0 {
@@ -229,7 +229,7 @@ func TestJK_KeepsSelectedRowVisible(t *testing.T) {
 		}
 	}
 	if !advanced {
-		t.Errorf("walking j through 12 projects must advance projectsScrollOffset past 0")
+		t.Errorf("walking j through 10 projects must advance projectsScrollOffset past 0")
 	}
 }
 
@@ -244,7 +244,7 @@ func TestArrowWrap_FromRightPaneAlignsLeftScroll(t *testing.T) {
 	m := New("test")
 	m.width = 140
 	m.height = 20
-	m.dashboard = buildManyProjectsSnapshot(12)
+	m.dashboard = buildManyProjectsSnapshot(10)
 	m.records = []*agent.Record{sampleAgent("agent01")}
 	// Pre-scroll the left pane so a wrap onto project 0 would be hidden.
 	m.projectsScrollOffset = m.panelMaxOffset(rowProject)
@@ -282,7 +282,7 @@ func TestJumpToLeftPanel_AlignsScroll(t *testing.T) {
 	m := New("test")
 	m.width = 140
 	m.height = 20
-	m.dashboard = buildManyProjectsSnapshot(12)
+	m.dashboard = buildManyProjectsSnapshot(10)
 	m.records = []*agent.Record{sampleAgent("agent01")}
 	// Park cursor on the trailing right-column row and scroll left to max.
 	rows := m.dashboardRows()
@@ -317,7 +317,7 @@ func TestDashboardRefresh_AlignsLeftScroll(t *testing.T) {
 	m := New("test")
 	m.width = 140
 	m.height = 20
-	m.dashboard = buildManyProjectsSnapshot(12)
+	m.dashboard = buildManyProjectsSnapshot(10)
 	// Select a deep project and scroll the left pane to the bottom.
 	rows := m.dashboardRows()
 	last := 0
@@ -363,7 +363,7 @@ func TestLastProject_TrailingLinesReachable(t *testing.T) {
 	m := New("test")
 	m.width = 140
 	m.height = 20
-	m.dashboard = buildManyProjectsSnapshot(12)
+	m.dashboard = buildManyProjectsSnapshot(10)
 
 	maxOff := m.panelMaxOffset(rowProject)
 	if maxOff == 0 {
@@ -512,7 +512,7 @@ func TestTallBlocks_MiddleTailsReachableWalkingDown(t *testing.T) {
 func TestWindowResize_ResetsProjectsScrollOffset(t *testing.T) {
 	withFleetHome(t)
 	m := New("test")
-	m.dashboard = buildManyProjectsSnapshot(12)
+	m.dashboard = buildManyProjectsSnapshot(10)
 	m.projectsScrollOffset = 5
 
 	updated, _ := m.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
