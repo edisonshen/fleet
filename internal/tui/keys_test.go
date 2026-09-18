@@ -1182,7 +1182,12 @@ func (s *stubSessionProbe) install(t *testing.T) {
 		}
 		return !s.dead[session], nil
 	}
-	t.Cleanup(func() { sessionProbeFn = prev })
+	prevList := listSessionsFn
+	listSessionsFn = func() ([]string, error) { return nil, errors.New("stub: no session listing") }
+	t.Cleanup(func() {
+		sessionProbeFn = prev
+		listSessionsFn = prevList
+	})
 }
 
 func TestKey_AttachSetsPendingAndQuits(t *testing.T) {

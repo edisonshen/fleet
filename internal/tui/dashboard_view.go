@@ -697,6 +697,7 @@ func buildBodyLinesCore(m Model, leftW, rightW int) ([]string, []string, []strin
 		// render "creating…" / "handing off…" while its spawn/handoff
 		// goroutine runs (visible feedback that stops the double-tap).
 		opInFlight: m.coordOpInFlight,
+		coord:      m.coordProbeFor,
 	}
 	// Activity-grouping helper — when a project block follows the
 	// hidden separator AND that separator is expanded, render the
@@ -1236,7 +1237,13 @@ func projectFooterLines(p *ProjectRow, w int, prefix string, ctx coordSpawnCtx) 
 	// in-flight handoff successor. The boot-window "spawning coord... Xs"
 	// timing that used the marker's mtime now uses the coord record's
 	// SpawnedAt (a more accurate spawn start).
-	markerAgentID := coordSpawnIdentityFn(p.Name)
+	var probe coordProbe
+	if ctx.coord != nil {
+		probe, _ = ctx.coord(p.Name)
+	} else {
+		probe = probeCoord(p.Name)
+	}
+	markerAgentID := probe.identity
 	markerOK := markerAgentID != ""
 	markerMtime := time.Time{}
 	if markerOK {
@@ -1267,10 +1274,7 @@ func projectFooterLines(p *ProjectRow, w int, prefix string, ctx coordSpawnCtx) 
 	// conflates "dead session" with "couldn't probe," and Path A's
 	// marker removal is irreversible at the next render. The tristate
 	// probe falls back to "treat as alive" on transport errors.
-	sessAlive := false
-	if markerAgentID != "" {
-		sessAlive = sessionProbeOrAliveFn(tmuxSessionName(markerAgentID))
-	}
+	sessAlive := probe.alive
 
 	// neverTicked is the central gate: when true (no coord-state.json
 	// publication under this spawn), the marker MUST be preserved —

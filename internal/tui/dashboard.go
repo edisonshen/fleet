@@ -135,10 +135,34 @@ type WorkerRow struct {
 	SubagentID string
 }
 
+// coordProbe is the per-project coordinator lease identity plus the
+// liveness of its tmux session, sampled once per dashboard scan so the
+// render and key paths never read the lease or fork tmux themselves.
+type coordProbe struct {
+	identity string // lease-named coord agent ID; "" when no coord
+	session  string // tmuxSessionName(identity); "" when no coord
+	alive    bool   // sessionProbeOrAliveFn(session); false when no coord
+}
+
+// probeCoord reads the coordinator lease for one project and probes the
+// named coord's tmux session.
+func probeCoord(name string) coordProbe {
+	id := coordSpawnIdentityFn(name)
+	if id == "" {
+		return coordProbe{}
+	}
+	sess := tmuxSessionName(id)
+	return coordProbe{identity: id, session: sess, alive: sessionProbeOrAliveFn(sess)}
+}
+
 // Snapshot is the dashboard's read-only render input.
 type Snapshot struct {
 	Projects []*ProjectRow
 	Workers  []*WorkerRow
+	// Coord holds one coordProbe per project dir that exists under
+	// ~/.fleet/projects/ (valid name), keyed by project name. A missing
+	// key means the project's state tree does not exist on disk.
+	Coord    map[string]coordProbe
 	CIRuns   int       // count of in-progress CI / PR check runs (best effort)
 	LoadedAt time.Time // wall time the snapshot was assembled
 	Err      error     // best-effort: collection errors don't block render
@@ -228,7 +252,7 @@ func scanDashboard(now time.Time) *Snapshot {
 		return &Snapshot{Err: err, LoadedAt: now}
 	}
 
-	snap := &Snapshot{LoadedAt: now}
+	snap := &Snapshot{LoadedAt: now, Coord: map[string]coordProbe{}}
 	hiddenSet := hiddenProjectsSet()
 	incidentCounts := scanIncidentCounts()
 	for _, e := range entries {
@@ -263,6 +287,7 @@ func scanDashboard(now time.Time) *Snapshot {
 			snap.Projects = append(snap.Projects, row)
 		}
 		snap.Workers = append(snap.Workers, wrows...)
+		snap.Coord[name] = probeCoord(name)
 	}
 	// Stable order: projects with attention first, then alpha. Workers
 	// alpha by project then slug. Matches the mockup's "needs attention"
