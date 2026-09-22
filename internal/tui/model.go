@@ -36,6 +36,7 @@ import (
 	"github.com/edisonshen/fleet/internal/agent"
 	"github.com/edisonshen/fleet/internal/gc"
 	"github.com/edisonshen/fleet/internal/state"
+	"github.com/edisonshen/fleet/internal/tmux"
 	"github.com/edisonshen/fleet/internal/version"
 )
 
@@ -264,6 +265,12 @@ type Model struct {
 	// so the 1 Hz tick doesn't stack overlapping reaps (single-flight).
 	// Cleared when tuiReapMsg lands.
 	reapInFlight bool
+	// refreshInFlight is set while a tick/fsEvent-driven refresh (agents +
+	// dashboard scan) runs so bursts of events don't stack overlapping
+	// loads. refreshDirty records that a refresh was requested during the
+	// in-flight one; exactly one more runs when it lands.
+	refreshInFlight bool
+	refreshDirty    bool
 
 	// coordSpawnTimeout is the age past which a coord-spawn marker is
 	// declared "stuck" and the project row flips from the spawning
@@ -450,6 +457,7 @@ func New(version string) Model {
 		version:           version,
 		userName:          currentUserName(),
 		startedAt:         time.Now(),
+		refreshInFlight:   true,
 		coordSpawnTimeout: resolveCoordSpawnTimeout(),
 		activeWindow:      resolveActiveWindow(),
 	}
@@ -466,9 +474,11 @@ func currentUserName() string {
 	return os.Getenv("USER")
 }
 
-// Init is the bubbletea entry point. We kick off the first agent load,
+// Init is the bubbletea entry point. We kick off the first refresh,
 // start the 1s polling tick, and run the upgrade-check probe. fsnotify
-// is wired in tui.go's Run.
+// is wired in tui.go's Run. New already marks the first refresh in
+// flight so a tick or fs event landing before it completes coalesces
+// instead of starting a second scan.
 //
 // versionCheckCmd both kicks off the async network fetch (background
 // goroutine, never blocks) AND reads the existing on-disk cache so
@@ -476,7 +486,7 @@ func currentUserName() string {
 // about a newer release. Both happen async to keep render
 // non-blocking — see the cmd's docstring.
 func (m Model) Init() tea.Cmd {
-	return tea.Batch(loadAgentsCmd(), loadDashboardCmd(), tickCmd(), versionCheckCmd(m.version))
+	return tea.Batch(refreshCmd(), tickCmd(), versionCheckCmd(m.version))
 }
 
 // agentsMsg carries a refreshed list of agent records (or an error)
@@ -613,6 +623,45 @@ func tickCmd() tea.Cmd {
 	return tea.Tick(pollInterval, func(t time.Time) tea.Msg { return tickMsg(t) })
 }
 
+// refreshMsg carries the results of one coalesced background refresh.
+type refreshMsg struct {
+	agents agentsMsg
+	dash   dashboardMsg
+}
+
+// refreshCmd runs the agents load and the dashboard scan concurrently
+// and returns both as a single refreshMsg.
+func refreshCmd() tea.Cmd {
+	agentsFn := loadAgentsCmd()
+	dashFn := loadDashboardCmd()
+	return func() tea.Msg {
+		var out refreshMsg
+		done := make(chan struct{})
+		go func() {
+			out.dash = dashFn().(dashboardMsg)
+			close(done)
+		}()
+		out.agents = agentsFn().(agentsMsg)
+		<-done
+		return out
+	}
+}
+
+// requestRefresh starts a coalesced refresh, or marks one pending when a
+// refresh is already in flight. Returns nil when nothing was started.
+//
+//	idle      → start refreshCmd, inFlight=true
+//	in flight → dirty=true (one more refresh runs when the current lands)
+func (m *Model) requestRefresh() tea.Cmd {
+	if m.refreshInFlight {
+		m.refreshDirty = true
+		return nil
+	}
+	m.refreshInFlight = true
+	m.refreshDirty = false
+	return refreshCmd()
+}
+
 // versionCheckCmd kicks off the background upgrade probe AND reads the
 // existing on-disk cache. Two-step pattern:
 //
@@ -648,14 +697,25 @@ func versionCheckCmd(current string) tea.Cmd {
 // readings — those records are simply omitted from the alive map,
 // and deriveStatus's nil-safe fallback renders them as "live"
 // rather than mislabeling a healthy agent (codex review iter-5 P2).
+//
+// Liveness comes from one `tmux ls` per load (listSessionsFn); only
+// when that listing fails does it fall back to a has-session probe
+// per record.
 func loadAgentsCmd() tea.Cmd {
 	return func() tea.Msg {
 		records, err := agent.List()
 		alive := make(map[string]bool, len(records))
 		groupKeys := make(map[string]string, len(records))
+		sessions, listErr := listSessionsFn()
+		live := make(map[string]bool, len(sessions))
+		for _, s := range sessions {
+			live[s] = true
+		}
 		for _, r := range records {
 			if r.TmuxSession != "" {
-				if ok, probeErr := sessionProbeFn(r.TmuxSession); probeErr == nil {
+				if listErr == nil {
+					alive[r.ID] = live[r.TmuxSession]
+				} else if ok, probeErr := sessionProbeFn(r.TmuxSession); probeErr == nil {
 					alive[r.ID] = ok
 				}
 				// Transport failure → leave entry missing so the
@@ -666,6 +726,10 @@ func loadAgentsCmd() tea.Cmd {
 		return agentsMsg{records: records, err: err, alive: alive, groupKeys: groupKeys}
 	}
 }
+
+// listSessionsFn lists every live tmux session in one call. var so
+// tests can stub the listing (or force the per-record fallback).
+var listSessionsFn = tmux.ListSessions
 
 // Update handles every tea.Msg the program receives.
 func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -729,7 +793,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// via coordSpawnSpinnerGlyph's modulo arithmetic — no need to
 		// reset here.
 		m.tickCount++
-		cmds := []tea.Cmd{loadAgentsCmd(), loadDashboardCmd(), tickCmd()}
+		cmds := []tea.Cmd{tickCmd()}
+		if c := m.requestRefresh(); c != nil {
+			cmds = append(cmds, c)
+		}
 		if m.shouldReapNow() {
 			m.reapInFlight = true
 			cmds = append(cmds, reapCmd())
@@ -748,10 +815,21 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case fsEventMsg:
 		// fsnotify saw a change — refresh agents AND the dashboard
-		// snapshot now (don't wait for the next tick). Dashboard scan
-		// is cheap (a handful of stat + small JSON reads) so we don't
-		// gate on which subtree fired the event.
-		return m, tea.Batch(loadAgentsCmd(), loadDashboardCmd())
+		// snapshot now (don't wait for the next tick). Coalesced with
+		// any refresh already running so an event burst yields at most
+		// one in-flight refresh plus one follow-up.
+		return m, m.requestRefresh()
+
+	case refreshMsg:
+		m.refreshInFlight = false
+		next, _ := m.Update(msg.agents)
+		m = next.(Model)
+		next, _ = m.Update(msg.dash)
+		m = next.(Model)
+		if m.refreshDirty {
+			return m, m.requestRefresh()
+		}
+		return m, nil
 
 	case dashboardMsg:
 		// Capture cursor identity BEFORE swapping the snapshot, then
@@ -1496,6 +1574,11 @@ func (m *Model) scrollWithinTallBlock(delta int) bool {
 // No-op on the unbounded-fallback render path (ok=false) or when the
 // left column fits (maxOff==0): there is no scrolling to align.
 func (m *Model) alignLeftScrollToCursor() {
+	// Only a left-column cursor can need alignment; skip the body build
+	// entirely otherwise (this runs on every key press).
+	if !isLeftColumnRow(m.selectedRow()) {
+		return
+	}
 	leftW, rightW := splitColumns(usableWidth(m.width))
 	// Build the body ONCE (buildBodyLinesCore has tmux/marker side effects
 	// via projectFooterLines — do not rebuild for the budget or the max

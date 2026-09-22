@@ -64,6 +64,10 @@ type coordSpawnCtx struct {
 	// into a duplicate coord at the source. Nil/absent → no token; the
 	// normal marker-driven coord-status logic runs unchanged.
 	opInFlight map[string]string
+
+	// coord returns the project's scan-time lease identity + tmux
+	// liveness (Model.coordProbeFor). nil → probe live per row.
+	coord func(string) (coordProbe, bool)
 }
 
 // coordSpawnState enumerates the indicator states the project row can

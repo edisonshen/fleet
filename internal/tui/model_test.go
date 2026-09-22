@@ -181,6 +181,8 @@ func TestUpdate_TickReturnsRefreshAndNextTick(t *testing.T) {
 
 func TestUpdate_FsEventReturnsRefreshCmd(t *testing.T) {
 	m := New("test")
+	updated, _ := m.Update(refreshMsg{dash: dashboardMsg{snap: &Snapshot{}}})
+	m = updated.(Model)
 	_, cmd := m.Update(fsEventMsg{})
 	if cmd == nil {
 		t.Fatal("fsEventMsg should produce a load command")

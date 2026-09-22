@@ -13,6 +13,7 @@ package tmux
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"os"
@@ -26,6 +27,22 @@ import (
 // ErrNoSession is returned when an operation references a session that
 // doesn't exist (e.g., Attach on a dead agent).
 var ErrNoSession = errors.New("tmux session not found")
+
+// probeTimeout bounds the read-only liveness probes (has-session, ls)
+// so a wedged tmux server stalls a caller for at most this long. A
+// timed-out probe surfaces as an error, never as "dead". var so tests
+// can shorten it.
+var probeTimeout = 3 * time.Second
+
+// probeCommand builds a tmux command that is killed after probeTimeout.
+// Callers check ctx.Err() after Run to tell a deadline kill from a tmux
+// verdict; cancel must be called once the command has finished.
+func probeCommand(args ...string) (*exec.Cmd, context.Context, context.CancelFunc) {
+	ctx, cancel := context.WithTimeout(context.Background(), probeTimeout)
+	cmd := exec.CommandContext(ctx, "tmux", tmuxArgs(args...)...)
+	cmd.WaitDelay = 500 * time.Millisecond
+	return cmd, ctx, cancel
+}
 
 // tmuxArgs prepends `-S <FLEET_TMUX_SOCKET>` if the env var is set.
 // Centralizes the socket selection so every tmux subprocess in this
@@ -152,7 +169,8 @@ func parseInt(s string) (int, error) {
 func HasSession(session string) bool { return hasSessionFn(session) }
 
 func realHasSession(session string) bool {
-	cmd := exec.Command("tmux", tmuxArgs("has-session", "-t", session)...)
+	cmd, _, cancel := probeCommand("has-session", "-t", session)
+	defer cancel()
 	return cmd.Run() == nil
 }
 
@@ -181,12 +199,16 @@ func realHasSession(session string) bool {
 func SessionAlive(session string) (bool, error) { return sessionAliveFn(session) }
 
 func realSessionAlive(session string) (bool, error) {
-	cmd := exec.Command("tmux", tmuxArgs("has-session", "-t", session)...)
+	cmd, ctx, cancel := probeCommand("has-session", "-t", session)
+	defer cancel()
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 	runErr := cmd.Run()
 	if runErr == nil {
 		return true, nil
+	}
+	if ctx.Err() != nil {
+		return false, fmt.Errorf("probe session %s: tmux timed out after %s (treating as ambiguous, not dead)", session, probeTimeout)
 	}
 	if exitErr, ok := runErr.(*exec.ExitError); ok && exitErr.ExitCode() == 1 {
 		msg := strings.ToLower(stderr.String())
@@ -502,11 +524,15 @@ func SessionName(agentID string) string {
 func ListSessions() ([]string, error) { return listSessionsFn() }
 
 func realListSessions() ([]string, error) {
-	cmd := exec.Command("tmux", tmuxArgs("ls", "-F", "#{session_name}")...)
+	cmd, ctx, cancel := probeCommand("ls", "-F", "#{session_name}")
+	defer cancel()
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
 	if err := cmd.Run(); err != nil {
+		if ctx.Err() != nil {
+			return nil, fmt.Errorf("tmux ls: timed out after %s", probeTimeout)
+		}
 		if exitErr, ok := err.(*exec.ExitError); ok && exitErr.ExitCode() == 1 {
 			msg := strings.ToLower(stderr.String())
 			switch {
