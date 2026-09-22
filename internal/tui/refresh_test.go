@@ -14,6 +14,10 @@ import (
 // refresh is running must not start another one, only mark it dirty.
 func TestRefresh_CoalescesWhileInFlight(t *testing.T) {
 	m := New("test")
+	if !m.refreshInFlight {
+		t.Fatal("New must mark the Init refresh in flight")
+	}
+	m.refreshInFlight = false
 
 	updated, cmd := m.Update(fsEventMsg{})
 	m = updated.(Model)
@@ -55,6 +59,33 @@ func TestRefresh_CoalescesWhileInFlight(t *testing.T) {
 	m = updated.(Model)
 	if cmd != nil || m.refreshInFlight {
 		t.Fatalf("clean refresh landing must go idle; cmd=%v inFlight=%v", cmd != nil, m.refreshInFlight)
+	}
+}
+
+// TestRefresh_StartupTickCoalesces: a tick or fs event arriving before
+// the Init refresh lands must not start a second scan.
+func TestRefresh_StartupTickCoalesces(t *testing.T) {
+	m := New("test")
+	updated, _ := m.Update(tickMsg(time.Now()))
+	m = updated.(Model)
+	updated, cmd := m.Update(fsEventMsg{})
+	m = updated.(Model)
+	if cmd != nil || !m.refreshDirty {
+		t.Fatalf("startup events must coalesce; cmd=%v dirty=%v", cmd != nil, m.refreshDirty)
+	}
+}
+
+// TestScanDashboard_MissingProjectsDirHasCoordCache: a completed scan
+// always yields a non-nil Coord map so renders never fall back to live
+// project-tree checks.
+func TestScanDashboard_MissingProjectsDirHasCoordCache(t *testing.T) {
+	home := withFleetHome(t)
+	if err := os.RemoveAll(home); err != nil {
+		t.Fatal(err)
+	}
+	snap := scanDashboard(time.Now())
+	if snap.Err != nil || snap.Coord == nil {
+		t.Fatalf("want nil err and non-nil Coord; got err=%v coord=%v", snap.Err, snap.Coord)
 	}
 }
 

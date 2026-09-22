@@ -457,6 +457,7 @@ func New(version string) Model {
 		version:           version,
 		userName:          currentUserName(),
 		startedAt:         time.Now(),
+		refreshInFlight:   true,
 		coordSpawnTimeout: resolveCoordSpawnTimeout(),
 		activeWindow:      resolveActiveWindow(),
 	}
@@ -473,9 +474,11 @@ func currentUserName() string {
 	return os.Getenv("USER")
 }
 
-// Init is the bubbletea entry point. We kick off the first agent load,
+// Init is the bubbletea entry point. We kick off the first refresh,
 // start the 1s polling tick, and run the upgrade-check probe. fsnotify
-// is wired in tui.go's Run.
+// is wired in tui.go's Run. New already marks the first refresh in
+// flight so a tick or fs event landing before it completes coalesces
+// instead of starting a second scan.
 //
 // versionCheckCmd both kicks off the async network fetch (background
 // goroutine, never blocks) AND reads the existing on-disk cache so
@@ -483,7 +486,7 @@ func currentUserName() string {
 // about a newer release. Both happen async to keep render
 // non-blocking — see the cmd's docstring.
 func (m Model) Init() tea.Cmd {
-	return tea.Batch(loadAgentsCmd(), loadDashboardCmd(), tickCmd(), versionCheckCmd(m.version))
+	return tea.Batch(refreshCmd(), tickCmd(), versionCheckCmd(m.version))
 }
 
 // agentsMsg carries a refreshed list of agent records (or an error)

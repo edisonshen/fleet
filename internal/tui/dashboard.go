@@ -239,20 +239,21 @@ func surfaceMalformedProjects(names []string) {
 //
 // now is injected so tests can assert age math deterministically.
 func scanDashboard(now time.Time) *Snapshot {
+	snap := &Snapshot{LoadedAt: now, Coord: map[string]coordProbe{}}
 	root, err := state.Root()
 	if err != nil {
-		return &Snapshot{Err: err, LoadedAt: now}
+		snap.Err = err
+		return snap
 	}
 	projDir := filepath.Join(root, "projects")
 	entries, err := os.ReadDir(projDir)
 	if err != nil {
-		if os.IsNotExist(err) {
-			return &Snapshot{LoadedAt: now}
+		if !os.IsNotExist(err) {
+			snap.Err = err
 		}
-		return &Snapshot{Err: err, LoadedAt: now}
+		return snap
 	}
 
-	snap := &Snapshot{LoadedAt: now, Coord: map[string]coordProbe{}}
 	hiddenSet := hiddenProjectsSet()
 	incidentCounts := scanIncidentCounts()
 	for _, e := range entries {
