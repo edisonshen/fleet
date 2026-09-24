@@ -73,20 +73,37 @@ func existingQueuePath(t *testing.T) string {
 // full stub set, fillDrainLeaseDeps would fill the gaps with PRODUCTION seams.
 func stubDrainDeps() drainLeaseDeps {
 	return drainLeaseDeps{
-		LeaderPresent:   func(string) bool { return false },
-		LiveOwner:       func(string) (coordlock.Owner, bool) { return coordlock.Owner{}, false },
-		ActiveOwnerPID:  func(string) (int, bool) { return 0, false },
-		BarrierExists:   func(string) bool { return false },
-		LoadAgent:       func(string) (*agent.Record, error) { return oldCoordRec(), nil },
-		KillCoord:       func(coord.KillTarget) error { return nil },
-		SupervisorAlive: func(int, int64) bool { return false }, // OLD provably dead by default
-		Resume:          func(queue.SpawnFresh, string, int, io.Writer, io.Writer) error { return nil },
-		LockAgent:       func(string) (func(), error) { return func() {}, nil },
-		RecoverSpawn:    func(*agent.Record, string, string, bool, io.Writer, io.Writer) error { return nil },
-		DeliverPending:  func(queue.SpawnFresh, *agent.Record, io.Writer, io.Writer) error { return nil },
-		BarrierPoll:     time.Millisecond,
-		Self:            func() int { return 999999 },
+		LeaderPresent:          func(string) bool { return false },
+		LiveOwner:              func(string) (coordlock.Owner, bool) { return coordlock.Owner{}, false },
+		ActiveOwnerPID:         func(string) (int, bool) { return 0, false },
+		BarrierExists:          func(string) bool { return false },
+		JournaledSuccessorDead: func(string, string) bool { return false },
+		LoadAgent:              func(string) (*agent.Record, error) { return oldCoordRec(), nil },
+		KillCoord:              func(coord.KillTarget) error { return nil },
+		SupervisorAlive:        func(int, int64) bool { return false }, // OLD provably dead by default
+		Resume:                 func(queue.SpawnFresh, string, int, io.Writer, io.Writer) error { return nil },
+		LockAgent:              func(string) (func(), error) { return func() {}, nil },
+		RecoverSpawn:           func(*agent.Record, string, string, bool, io.Writer, io.Writer) error { return nil },
+		DeliverPending:         func(queue.SpawnFresh, *agent.Record, io.Writer, io.Writer) error { return nil },
+		BarrierPoll:            time.Millisecond,
+		Self:                   func() int { return 999999 },
 	}
+}
+
+// oldHoldsFlockDeps shapes the deps as a barrier ALREADY written by OLD while
+// OLD's own supervisor still holds the flock (its body names OLD, not the
+// expected successor) and OLD is alive.
+func oldHoldsFlockDeps() drainLeaseDeps {
+	d := stubDrainDeps()
+	old := oldCoordRec()
+	d.BarrierExists = func(string) bool { return true }
+	d.LeaderPresent = func(string) bool { return true }
+	d.ActiveOwnerPID = func(string) (int, bool) { return old.SupervisorPID, true }
+	d.LiveOwner = func(string) (coordlock.Owner, bool) {
+		return coordlock.Owner{AgentID: old.ID, PID: old.SupervisorPID, PidStart: old.SupervisorPidStart}, true
+	}
+	d.SupervisorAlive = func(int, int64) bool { return true }
+	return d
 }
 
 func queueGone(t *testing.T, path string) bool {
@@ -411,5 +428,250 @@ func TestDrainLease_ConcurrentRecovery_NoDuplicate(t *testing.T) {
 	}
 	if atomic.LoadInt32(&recovers) != 0 {
 		t.Errorf("RecoverSpawn ran %d times, want 0 (peer already recovered)", recovers)
+	}
+}
+
+// Barrier up, OLD still holds the flock, and the journaled successor is
+// provably DEAD (a standby that exited on standby-timeout). Waiting for that
+// successor to acquire can never succeed, so drain resumes the pending handoff
+// through Resume at once — no kill, no cold-spawn, no `fleet rm` advice — and
+// leaves the queue to Resume.
+func TestDrainLease_GracefulOldHoldsFlock_DeadSuccessor_ResumesImmediately(t *testing.T) {
+	req := leaseDrainReq()
+	var kills, recovers, resumes int32
+	d := oldHoldsFlockDeps()
+	d.JournaledSuccessorDead = func(project, successorID string) bool {
+		return project == req.Project && successorID == req.NewAgentID
+	}
+	d.KillCoord = func(coord.KillTarget) error { kills++; return nil }
+	d.RecoverSpawn = func(*agent.Record, string, string, bool, io.Writer, io.Writer) error { recovers++; return nil }
+	d.Resume = func(got queue.SpawnFresh, _ string, _ int, _, _ io.Writer) error {
+		if got.NewAgentID != req.NewAgentID {
+			t.Errorf("Resume got NewAgentID %q, want the queue's pre-allocated %q", got.NewAgentID, req.NewAgentID)
+		}
+		atomic.AddInt32(&resumes, 1)
+		return nil
+	}
+
+	path := existingQueuePath(t)
+	out := &bytes.Buffer{}
+	start := time.Now()
+	// A generous budget: the dead-successor branch must NOT spend it waiting.
+	if err := drainOneLeaseAwareWith(req, path, 0, 5000, out, out, d); err != nil {
+		t.Fatalf("dead-successor resume want nil err, got %v", err)
+	}
+	if elapsed := time.Since(start); elapsed > 2*time.Second {
+		t.Errorf("resume took %v; must not wait out the successor budget when the journaled successor is dead", elapsed)
+	}
+	if atomic.LoadInt32(&resumes) != 1 {
+		t.Errorf("Resume ran %d times, want 1", resumes)
+	}
+	if atomic.LoadInt32(&kills) != 0 || atomic.LoadInt32(&recovers) != 0 {
+		t.Errorf("live OLD must never be killed or cold-replaced: kills=%d recovers=%d", kills, recovers)
+	}
+	if !strings.Contains(out.String(), "resuming the pending handoff") {
+		t.Errorf("output must name the resume transition; got %q", out.String())
+	}
+	if strings.Contains(out.String(), "fleet rm") || strings.Contains(out.String(), "fleet handoff") {
+		t.Errorf("a resumable handoff must not surface operator recovery commands; got %q", out.String())
+	}
+	if queueGone(t, path) {
+		t.Error("drain must not delete the queue itself; Resume owns it")
+	}
+}
+
+// Barrier up, OLD still holds the flock, the journaled successor is not provably
+// dead, and the wait budget expires without the expected successor acquiring.
+// OLD is a live, authorized predecessor: drain resumes the pending handoff
+// instead of escalating to the no-kill takeover (which would quarantine on the
+// live OLD and point the operator at `fleet rm`).
+func TestDrainLease_GracefulOldHoldsFlock_BudgetExhausted_Resumes(t *testing.T) {
+	req := leaseDrainReq()
+	var kills, recovers, resumes int32
+	d := oldHoldsFlockDeps()
+	d.KillCoord = func(coord.KillTarget) error { kills++; return nil }
+	d.RecoverSpawn = func(*agent.Record, string, string, bool, io.Writer, io.Writer) error { recovers++; return nil }
+	d.Resume = func(queue.SpawnFresh, string, int, io.Writer, io.Writer) error {
+		atomic.AddInt32(&resumes, 1)
+		return nil
+	}
+
+	path := existingQueuePath(t)
+	out := &bytes.Buffer{}
+	if err := drainOneLeaseAwareWith(req, path, 0, 0, out, out, d); err != nil {
+		t.Fatalf("budget-exhausted resume want nil err, got %v", err)
+	}
+	if atomic.LoadInt32(&resumes) != 1 {
+		t.Errorf("Resume ran %d times, want 1", resumes)
+	}
+	if atomic.LoadInt32(&kills) != 0 || atomic.LoadInt32(&recovers) != 0 {
+		t.Errorf("live OLD must never be killed or cold-replaced: kills=%d recovers=%d", kills, recovers)
+	}
+	if !strings.Contains(out.String(), "did not acquire within the budget; resuming the pending handoff") {
+		t.Errorf("output must name the timed-out wait and the resume; got %q", out.String())
+	}
+	if strings.Contains(out.String(), "fleet rm") {
+		t.Errorf("a live flock-holding OLD is not a `fleet rm` case; got %q", out.String())
+	}
+	if queueGone(t, path) {
+		t.Error("drain must not delete the queue itself; Resume owns it")
+	}
+}
+
+// Barrier up, OLD holds the flock, Resume FAILS: the error is surfaced, OLD is
+// not killed, and the queue is preserved for the next retry.
+func TestDrainLease_GracefulOldHoldsFlock_ResumeFailurePreservesQueue(t *testing.T) {
+	req := leaseDrainReq()
+	var kills int32
+	boom := errors.New("resume: spawn failed")
+	d := oldHoldsFlockDeps()
+	d.JournaledSuccessorDead = func(string, string) bool { return true }
+	d.KillCoord = func(coord.KillTarget) error { kills++; return nil }
+	d.Resume = func(queue.SpawnFresh, string, int, io.Writer, io.Writer) error { return boom }
+
+	path := existingQueuePath(t)
+	out := &bytes.Buffer{}
+	if err := drainOneLeaseAwareWith(req, path, 0, 0, out, out, d); !errors.Is(err, boom) {
+		t.Fatalf("want the Resume error surfaced, got %v", err)
+	}
+	if atomic.LoadInt32(&kills) != 0 {
+		t.Errorf("KillCoord ran %d times, want 0", kills)
+	}
+	if queueGone(t, path) {
+		t.Error("queue must be PRESERVED when the resume fails")
+	}
+}
+
+// Concurrent retries: a peer drain already holds OLD's per-agent lock, so this
+// pass stands down without running Resume (one successor spawn at most) and
+// leaves the queue for the lock holder.
+func TestDrainLease_GracefulOldHoldsFlock_ConcurrentResume_StandsDown(t *testing.T) {
+	req := leaseDrainReq()
+	var resumes int32
+	busy := errors.New("agent lock held by a concurrent drain")
+	d := oldHoldsFlockDeps()
+	d.JournaledSuccessorDead = func(string, string) bool { return true }
+	d.LockAgent = func(string) (func(), error) { return nil, busy }
+	d.Resume = func(queue.SpawnFresh, string, int, io.Writer, io.Writer) error {
+		atomic.AddInt32(&resumes, 1)
+		return nil
+	}
+
+	path := existingQueuePath(t)
+	out := &bytes.Buffer{}
+	if err := drainOneLeaseAwareWith(req, path, 0, 0, out, out, d); !errors.Is(err, busy) {
+		t.Fatalf("want the lock contention surfaced, got %v", err)
+	}
+	if atomic.LoadInt32(&resumes) != 0 {
+		t.Errorf("Resume ran %d times, want 0 (peer holds the lock)", resumes)
+	}
+	if queueGone(t, path) {
+		t.Error("queue must be PRESERVED for the peer that holds the lock")
+	}
+}
+
+// Barrier up but OLD RELEASED the flock (no holder) and is provably dead: the
+// timeout still falls to the no-kill takeover, which cold-spawns the successor.
+// The resume branch is only for an OLD that still holds the flock.
+func TestDrainLease_GracefulOldReleased_DeadOld_TakeoverRecovers(t *testing.T) {
+	req := leaseDrainReq()
+	var kills, recovers, resumes int32
+	d := stubDrainDeps()
+	d.BarrierExists = func(string) bool { return true }
+	d.KillCoord = func(coord.KillTarget) error { kills++; return nil }
+	d.RecoverSpawn = func(*agent.Record, string, string, bool, io.Writer, io.Writer) error { recovers++; return nil }
+	d.Resume = func(queue.SpawnFresh, string, int, io.Writer, io.Writer) error {
+		atomic.AddInt32(&resumes, 1)
+		return nil
+	}
+
+	path := existingQueuePath(t)
+	out := &bytes.Buffer{}
+	if err := drainOneLeaseAwareWith(req, path, 0, 0, out, out, d); !errors.Is(err, ErrEscalatedToTakeOver) {
+		t.Fatalf("released+dead OLD want ErrEscalatedToTakeOver, got %v", err)
+	}
+	if atomic.LoadInt32(&recovers) != 1 || atomic.LoadInt32(&resumes) != 0 || atomic.LoadInt32(&kills) != 0 {
+		t.Errorf("want one cold-spawn and nothing else: recovers=%d resumes=%d kills=%d", recovers, resumes, kills)
+	}
+}
+
+// Barrier up, OLD RELEASED the flock but its supervisor is still alive (hung
+// without holding). The no-kill gate refuses and the advice names `fleet rm`
+// only — never `fleet handoff`, which would bounce off the same pending
+// journal.
+func TestDrainLease_GracefulHungAliveOld_AdviceNotCircular(t *testing.T) {
+	req := leaseDrainReq()
+	var kills, recovers, resumes int32
+	d := stubDrainDeps()
+	d.BarrierExists = func(string) bool { return true }
+	d.SupervisorAlive = func(int, int64) bool { return true }
+	d.KillCoord = func(coord.KillTarget) error { kills++; return nil }
+	d.RecoverSpawn = func(*agent.Record, string, string, bool, io.Writer, io.Writer) error { recovers++; return nil }
+	d.Resume = func(queue.SpawnFresh, string, int, io.Writer, io.Writer) error {
+		atomic.AddInt32(&resumes, 1)
+		return nil
+	}
+
+	path := existingQueuePath(t)
+	out := &bytes.Buffer{}
+	err := drainOneLeaseAwareWith(req, path, 0, 0, out, out, d)
+	if err == nil || errors.Is(err, ErrEscalatedToTakeOver) {
+		t.Fatalf("hung-alive OLD want a preserve-queue abort, got %v", err)
+	}
+	if atomic.LoadInt32(&kills) != 0 || atomic.LoadInt32(&recovers) != 0 || atomic.LoadInt32(&resumes) != 0 {
+		t.Errorf("hung-alive OLD must not be killed/recovered/resumed: kills=%d recovers=%d resumes=%d", kills, recovers, resumes)
+	}
+	if !strings.Contains(out.String(), "fleet rm") {
+		t.Errorf("abort must surface `fleet rm`; got %q", out.String())
+	}
+	if strings.Contains(out.String(), "fleet handoff") {
+		t.Errorf("abort must not send the operator back to `fleet handoff`; got %q", out.String())
+	}
+	if queueGone(t, path) {
+		t.Error("queue must be PRESERVED when OLD is not provably dead")
+	}
+}
+
+// journaledSuccessorDead reads the real journal: true only for a journal that
+// names successorID with a provably dead process; false for no journal, a
+// different successor, or a live successor process.
+func TestJournaledSuccessorDead(t *testing.T) {
+	setupFleetHome(t)
+	const project = "projects-fleet"
+
+	if journaledSuccessorDead(project, "newcoord1") {
+		t.Fatal("no journal must read as not-dead (nothing to reconcile)")
+	}
+	if err := coordlock.CreateHandoffJournal(coordlock.HandoffJournal{
+		Project: project, SuccessorID: "newcoord1", BarrierID: "b-1",
+		SuccessorPID: 999999, SuccessorPidStart: 424242,
+	}); err != nil {
+		t.Fatalf("seed journal: %v", err)
+	}
+	if !journaledSuccessorDead(project, "newcoord1") {
+		t.Error("journal naming a dead successor must read as dead")
+	}
+	if journaledSuccessorDead(project, "othercoord") {
+		t.Error("journal naming a different successor must read as not-dead")
+	}
+	if journaledSuccessorDead(project, "") {
+		t.Error("empty successor id must read as not-dead")
+	}
+
+	if err := coordlock.DeleteHandoffJournal(project); err != nil {
+		t.Fatalf("clear journal: %v", err)
+	}
+	start, ok := coordlock.PidStartNanos(os.Getpid())
+	if !ok {
+		t.Skip("pid start not readable on this platform")
+	}
+	if err := coordlock.CreateHandoffJournal(coordlock.HandoffJournal{
+		Project: project, SuccessorID: "newcoord1", BarrierID: "b-2",
+		SuccessorPID: os.Getpid(), SuccessorPidStart: start,
+	}); err != nil {
+		t.Fatalf("seed live journal: %v", err)
+	}
+	if journaledSuccessorDead(project, "newcoord1") {
+		t.Error("journal naming a live successor process must read as not-dead")
 	}
 }

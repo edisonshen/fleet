@@ -624,12 +624,12 @@ func TestActionHandoff_OnSeparator_FlashUnchanged(t *testing.T) {
 	}
 }
 
-// TestActionHandoff_AutoRedGated_OnProjectCoord pins the moved gate:
-// the auto-red / precompact handoff-already-in-flight check that
-// previously lived on the agent-row path must move to the project-row
-// path so a coord with a committed handoff journal can't be re-handed
-// off via [h] on its project.
-func TestActionHandoff_AutoRedGated_OnProjectCoord(t *testing.T) {
+// TestActionHandoff_AutoRedResumes_OnProjectCoord: a coord with a
+// committed handoff journal (auto-red) is NOT gated — [h] shells out to
+// `fleet handoff <coord>`, whose recovery probe resumes the pending
+// handoff idempotently. The flash names the resume (not an error) so the
+// operator is never told to run `fleet drain` first.
+func TestActionHandoff_AutoRedResumes_OnProjectCoord(t *testing.T) {
 	stub := &stubFleetCmd{}
 	stub.install(t)
 
@@ -641,23 +641,28 @@ func TestActionHandoff_AutoRedGated_OnProjectCoord(t *testing.T) {
 
 	updated, cmd := m.Update(keyMsg("h"))
 	mm := updated.(Model)
-	if cmd != nil {
-		t.Errorf("[h] on project with auto-red coord must NOT shell out; got cmd")
+	if cmd == nil {
+		t.Fatal("[h] on project with auto-red coord must shell out to resume the pending handoff; got nil cmd")
 	}
-	if len(stub.calls) != 0 {
-		t.Errorf("expected zero fleet calls; got %v", stub.calls)
+	_ = cmd()
+	if len(stub.calls) != 1 || len(stub.calls[0]) != 2 ||
+		stub.calls[0][0] != "handoff" || stub.calls[0][1] != "coord001" {
+		t.Errorf("expected ['handoff', 'coord001'], got %v", stub.calls)
 	}
-	if mm.flash == nil || !mm.flash.isErr {
-		t.Fatalf("expected error flash on auto-red gate, got %+v", mm.flash)
+	if _, ok := mm.inFlightOp("demo"); !ok {
+		t.Error("resume must arm the in-flight guard like a fresh handoff")
 	}
-	if !strings.Contains(mm.flash.text, "drain") {
-		t.Errorf("flash should mention `fleet drain`; got %q", mm.flash.text)
+	if mm.flash == nil || mm.flash.isErr {
+		t.Fatalf("expected a non-error resume flash, got %+v", mm.flash)
+	}
+	if strings.Contains(mm.flash.text, "drain") || !strings.Contains(mm.flash.text, "resuming") {
+		t.Errorf("flash must describe the resume, never `fleet drain` first; got %q", mm.flash.text)
 	}
 }
 
-// TestActionHandoff_PrecompactGated_OnProjectCoord same as the auto-red
-// gate but for the precompact handoff state.
-func TestActionHandoff_PrecompactGated_OnProjectCoord(t *testing.T) {
+// TestActionHandoff_PrecompactResumes_OnProjectCoord same as the auto-red
+// resume but for the precompact handoff state.
+func TestActionHandoff_PrecompactResumes_OnProjectCoord(t *testing.T) {
 	stub := &stubFleetCmd{}
 	stub.install(t)
 
@@ -668,11 +673,12 @@ func TestActionHandoff_PrecompactGated_OnProjectCoord(t *testing.T) {
 	m := projectRowModelWithCoord(t, "demo", "coord001", []*agent.Record{coord}, nil)
 
 	_, cmd := m.Update(keyMsg("h"))
-	if cmd != nil {
-		t.Errorf("[h] on project with precompact coord must NOT shell out; got cmd")
+	if cmd == nil {
+		t.Fatal("[h] on project with precompact coord must shell out to resume the pending handoff; got nil cmd")
 	}
-	if len(stub.calls) != 0 {
-		t.Errorf("expected zero fleet calls; got %v", stub.calls)
+	_ = cmd()
+	if len(stub.calls) != 1 || stub.calls[0][0] != "handoff" || stub.calls[0][1] != "coord001" {
+		t.Errorf("expected ['handoff', 'coord001'], got %v", stub.calls)
 	}
 }
 
@@ -791,12 +797,11 @@ func TestActionHandoffProject_GenuinelyNoCoord_Flashes(t *testing.T) {
 	}
 }
 
-// TestActionHandoffProject_AutoRedGated: a coord resolved via the
-// fallback that's in auto-red (committed handoff journal) is still
-// gated — [h] flashes "drain first" rather than racing the in-flight
-// handoff. Confirms the gate runs on the resolved record regardless of
-// which resolution path found it.
-func TestActionHandoffProject_AutoRedGated(t *testing.T) {
+// TestActionHandoffProject_AutoRedResumes: a coord resolved via the
+// records-scan fallback that's in auto-red (committed handoff journal)
+// resumes through `fleet handoff <coord>` exactly like a CoordID-linked
+// one — the resolution path never changes the resume decision.
+func TestActionHandoffProject_AutoRedResumes(t *testing.T) {
 	(&stubSessionAlive{}).install(t)
 	(&stubProjectTreeExists{}).install(t)
 	(&stubCoordLeaseIdentity{markers: map[string]string{"demo": "129c9824"}}).install(t)
@@ -814,14 +819,15 @@ func TestActionHandoffProject_AutoRedGated(t *testing.T) {
 
 	updated, cmd := m.Update(keyMsg("h"))
 	mm := updated.(Model)
-	if cmd != nil {
-		t.Errorf("[h] on auto-red coord (resolved via fallback) must NOT shell out; got cmd")
+	if cmd == nil {
+		t.Fatal("[h] on auto-red coord (resolved via fallback) must shell out to resume; got nil cmd")
 	}
-	if len(stub.calls) != 0 {
-		t.Errorf("expected zero fleet calls, got %v", stub.calls)
+	_ = cmd()
+	if len(stub.calls) != 1 || stub.calls[0][0] != "handoff" || stub.calls[0][1] != "129c9824" {
+		t.Errorf("expected ['handoff', '129c9824'], got %v", stub.calls)
 	}
-	if mm.flash == nil || !mm.flash.isErr || !strings.Contains(mm.flash.text, "drain") {
-		t.Fatalf("expected auto-red drain-first flash, got %+v", mm.flash)
+	if mm.flash == nil || mm.flash.isErr || strings.Contains(mm.flash.text, "drain") {
+		t.Fatalf("expected a non-error resume flash without `fleet drain`, got %+v", mm.flash)
 	}
 }
 

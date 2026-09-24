@@ -605,13 +605,13 @@ func (m Model) actionHandoff() (Model, tea.Cmd, bool) {
 // resolveCoordRecord keeps [h] on a read-only record lookup path, while
 // [a] now uses coordreconcile.Resolve for lease-authoritative attach.
 //
-// The gate logic mirrors what used to live on the rowAgent branch:
+// Status only shapes the flash, never blocks:
 //
-//   - auto-red / precompact: handoff journal is already committed on
-//     disk, manual handoff would race the in-flight one. Suggest
-//     `fleet drain` as the operator's next step.
-//   - auto-yellow / live / asking / idle / blocked / review: gate
-//     allows; [h] is the operator's escape hatch.
+//   - auto-red / precompact: a handoff journal is already committed on
+//     disk; `fleet handoff` resumes it (its recovery probe reconciles a
+//     live, dead, or timed-out standby under the per-agent lock).
+//   - auto-yellow / live / asking / idle / blocked / review: a fresh
+//     handoff; [h] is the operator's escape hatch.
 //
 // "No coord" now means BOTH resolution paths missed: CoordID is empty
 // (or points at an unloaded record) AND no record carries the
@@ -645,20 +645,20 @@ func (m Model) actionHandoffProject(p *ProjectRow) (Model, tea.Cmd, bool) {
 		}
 		return m, nil, true
 	}
-	// Gate [h] only for COMMITTED handoff states (auto-red / precompact)
-	// — those have a queue journal on disk, so a manual handoff would
-	// race against the in-flight one. auto-yellow is NOT gated: the
-	// journal hasn't been written yet (only after MILESTONE), and [h]
-	// is the operator's escape hatch when the auto handoff stalls.
-	// Identical predicate to the previous rowAgent branch, just moved
-	// to the project-row path along with the rest of the keybind.
+	// A COMMITTED handoff state (auto-red / precompact) means a queue
+	// journal is already on disk. [h] still shells out: `fleet handoff`
+	// runs its recovery probe under the per-agent lock and either
+	// completes the in-flight handoff (live standby), reconciles a dead
+	// or timed-out standby and spawns its replacement, or refuses when
+	// the lease already committed — so pressing [h] again is the
+	// idempotent resume, never a second spawn beside a live successor.
+	// The flash distinguishes this from a fresh handoff.
 	status := deriveStatus(coord, m.aliveByID)
 	if status == "auto-red" || status == "precompact" {
 		m.flash = &flashMsg{
-			text:  fmt.Sprintf("coord %s for project %s already has a handoff journal — `fleet drain` first", coord.ID, p.Name),
-			isErr: true,
+			text: fmt.Sprintf("coord %s for project %s has a pending handoff journal — resuming it via `fleet handoff %s`",
+				coord.ID, p.Name, coord.ID),
 		}
-		return m, nil, true
 	}
 	// Arm the unified guard BEFORE shelling out (D1). handoffDoneMsg
 	// clears it (success or error). While set, the project row renders
@@ -704,7 +704,7 @@ func (m Model) actionArchive() (Model, tea.Cmd, bool) {
 		}
 		if status == "auto-red" || status == "precompact" {
 			m.flash = &flashMsg{
-				text:  fmt.Sprintf("agent %s has a pending handoff journal — `fleet drain` first", cur.ID),
+				text:  fmt.Sprintf("agent %s has a pending handoff journal — resume it with `fleet handoff %s` before archiving", cur.ID, cur.ID),
 				isErr: true,
 			}
 			return m, nil, true
