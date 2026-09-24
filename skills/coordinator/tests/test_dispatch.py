@@ -15,6 +15,7 @@ import pytest
 
 import dispatch
 import parse
+import workercfg
 
 
 def _make_task(slug: str = "fix-thing-aaaa") -> parse.Task:
@@ -353,6 +354,56 @@ def test_format_dispatch_instruction_custom_description() -> None:
     assert "  description: custom worker label" in out
     # Default isn't substituted when an explicit description is set.
     assert "fleet worker ready-aaaa" not in out
+
+
+def test_format_dispatch_instruction_carries_worker_model() -> None:
+    """tier/model/effort/fallback_models follow `engine` so the coord can
+    pass a cheaper model to the spawn tool; absent -> legacy 9-line block."""
+    wm = workercfg.WorkerModel(
+        engine="codex", tier="simple", model="gpt-5.6-luna", effort="medium",
+        fallbacks=("gpt-5.5", "gpt-5.4"),
+    )
+    out = dispatch.format_dispatch_instruction(
+        agent_id="abcdef01", slug="ready-aaaa",
+        prompt_file="/tmp/inbox/abcdef01.md", worker_model=wm,
+    )
+    lines = out.splitlines()
+    i = lines.index("  engine: claude-code")
+    assert lines[i + 1:i + 7] == [
+        "  tier: simple",
+        "  model: gpt-5.6-luna",
+        "  effort: medium",
+        "  fallback_models: gpt-5.5, gpt-5.4",
+        "  fallback_effort: medium",
+        "END_DISPATCH",
+    ]
+    # Complex codex: primary high, fallbacks carry their own (medium) effort.
+    out = dispatch.format_dispatch_instruction(
+        agent_id="abcdef01", slug="ready-aaaa",
+        prompt_file="/tmp/inbox/abcdef01.md",
+        worker_model=workercfg.resolve_worker_model("codex", "complex"),
+    )
+    assert "  effort: high\n  fallback_models: gpt-5.5, gpt-5.4\n  fallback_effort: medium\n" in out
+    # No fallbacks -> no fallback_models / fallback_effort lines.
+    out = dispatch.format_dispatch_instruction(
+        agent_id="abcdef01", slug="ready-aaaa",
+        prompt_file="/tmp/inbox/abcdef01.md",
+        worker_model=workercfg.WorkerModel(
+            engine="codex", tier="coding", model="gpt-5.4", effort="medium",
+        ),
+    )
+    assert "fallback_models" not in out and "fallback_effort" not in out
+    assert "  model: gpt-5.4" in out
+    # Exhausted ladder (model="") -> legacy shape, worker inherits.
+    out = dispatch.format_dispatch_instruction(
+        agent_id="abcdef01", slug="ready-aaaa",
+        prompt_file="/tmp/inbox/abcdef01.md",
+        worker_model=workercfg.WorkerModel(
+            engine="codex", tier="coding", model="", effort="",
+        ),
+    )
+    assert len(out.splitlines()) == 9
+    assert "tier:" not in out and "model:" not in out
 
 
 def test_format_dispatch_instruction_rejects_invalid_agent_id() -> None:

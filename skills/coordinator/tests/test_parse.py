@@ -334,3 +334,38 @@ def test_rejects_bad_dispatch_generation() -> None:
         with pytest.raises(parse.ParseError) as exc_info:
             parse.parse(src)
         assert "dispatch_generation" in exc_info.value.msg
+
+
+def test_complexity_round_trip_and_absent() -> None:
+    """`complexity:` is an optional bullet: rendered only when set, parsed
+    to "" when absent, and validated against the three tiers."""
+    f = parse.File(schema=1)
+    f.tasks.append(parse.Task(
+        slug="tier-1234", status="todo", priority="P1",
+        created=_DT(2026, 6, 3, 10, 0, 0), updated=_DT(2026, 6, 3, 10, 0, 0),
+        spawned_by="user", spec="s", acceptance="a", complexity="complex",
+    ))
+    rendered = parse.render(f)
+    assert "- complexity: complex\n" in rendered
+    assert parse.parse(rendered).tasks[0].complexity == "complex"
+
+    f.tasks[0].complexity = ""
+    rendered = parse.render(f)
+    assert "complexity" not in rendered
+    assert parse.parse(rendered).tasks[0].complexity == ""
+
+
+def test_complexity_rejects_unknown_tier() -> None:
+    src = (
+        "---\nschema: v1\n---\n\n"
+        "## task: tier-1234\n\n"
+        "- status: todo\n- priority: P1\n- worker_pid: 0\n"
+        "- worktree:\n- pr_url:\n- branch:\n"
+        "- created: 2026-05-06T10:00:00Z\n- updated: 2026-05-06T10:00:00Z\n"
+        "- complexity: hard\n"
+        "- depends_on: []\n- spawned_by: user\n\n"
+        "### Spec\n\nA.\n\n### Acceptance\n\nA.\n\n### Notes\n\n"
+    ).encode("utf-8")
+    with pytest.raises(parse.ParseError) as exc_info:
+        parse.parse(src)
+    assert "complexity" in exc_info.value.msg

@@ -71,6 +71,25 @@ func validPriority(p Priority) bool {
 	return false
 }
 
+// Complexity is the worker model tier hint: simple | coding | complex.
+// Empty means "not set" — the coord infers a tier from the task text.
+type Complexity string
+
+const (
+	ComplexitySimple  Complexity = "simple"
+	ComplexityCoding  Complexity = "coding"
+	ComplexityComplex Complexity = "complex"
+)
+
+// ValidComplexity reports whether c is a known tier or empty.
+func ValidComplexity(c Complexity) bool {
+	switch c {
+	case "", ComplexitySimple, ComplexityCoding, ComplexityComplex:
+		return true
+	}
+	return false
+}
+
 // requiredTaskBullets enumerates every `- key:` bullet a well-formed
 // task block must carry. Keep in sync with setKV — these are the keys
 // Write emits, so the parser must refuse to accept anything missing
@@ -121,7 +140,10 @@ type Task struct {
 	// dirty worktree is parked, cleared on resolve. Empty = not parked.
 	// Additive in this PR: parsed + rendered only; no writer sets it yet
 	// beyond `fleet tasks set`.
-	Parked     string
+	Parked string
+	// Complexity is the operator/coord-set worker model tier. Empty =
+	// unset (inferred at dispatch). Optional bullet: only rendered when set.
+	Complexity Complexity
 	DependsOn  []string
 	SpawnedBy  string
 	Spec       string
@@ -931,6 +953,12 @@ func setKV(t *Task, k, v string, lineNum int, raw string) error {
 		// Durable dirty-worktree park marker (DESIGN §4.2). Empty / "null"
 		// → not parked. Non-required; old rows parse fine.
 		t.Parked = nullToEmpty(v)
+	case "complexity":
+		c := Complexity(nullToEmpty(v))
+		if !ValidComplexity(c) {
+			return &ParseError{Line: lineNum, Col: 1, Raw: raw, Msg: fmt.Sprintf("invalid complexity: %s", v)}
+		}
+		t.Complexity = c
 	case "depends_on":
 		deps, err := parseDeps(v)
 		if err != nil {
@@ -1097,6 +1125,9 @@ func renderTask(b *strings.Builder, t *Task) error {
 	// old rows pick up the new shape; parked is optional (like worktree).
 	fmt.Fprintf(b, "- dispatch_generation: %d\n", t.DispatchGeneration)
 	writeOptional(b, "parked", t.Parked)
+	if t.Complexity != "" {
+		fmt.Fprintf(b, "- complexity: %s\n", t.Complexity)
+	}
 	fmt.Fprintf(b, "- depends_on: %s\n", formatDeps(t.DependsOn))
 	writeOptional(b, "spawned_by", t.SpawnedBy)
 	b.WriteByte('\n')

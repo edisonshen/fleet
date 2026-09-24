@@ -405,3 +405,26 @@ def test_s7_skill_md_step6_names_evidence_duties():
     for legacy in ("tdd-red", "tdd-green", "tdd-refactor", "TDD ladder",
                    "ci.yml", "built product", "go test", "pytest"):
         assert legacy not in step6, f"S7: Step 6 still carries {legacy!r}"
+
+
+def test_skill_md_documents_worker_model_routing():
+    """The DISPATCH block's tier/model/effort lines are only useful if the
+    coord knows to forward them to the spawn tool and how to record a
+    rejected model."""
+    body = _read_skill_md()
+    for needle in (
+        "  tier: simple|coding|complex",
+        "  model: <model id>",
+        "  effort: low|medium|high",
+        "  fallback_models: <id>, <id>",
+        "  fallback_effort: low|medium|high",
+        "at `fallback_effort`",
+        "gpt-5.6-luna",
+        "gpt-5.6-terra",
+        "gpt-5.6-sol",
+        "claude-opus-5-5",
+        "unavailable_models",
+        "--complexity",
+        "complexity=<tier>",
+    ):
+        assert needle in body, f"SKILL.md missing worker-model routing text {needle!r}"

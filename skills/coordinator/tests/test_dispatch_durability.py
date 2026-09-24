@@ -533,6 +533,35 @@ def test_replay_ignores_other_projects(fleet_bin: str, home: Path) -> None:
     assert actions == []
 
 
+def test_replay_escalates_from_task_row_not_journal_gen(
+    fleet_bin: str, home: Path, monkeypatch,
+) -> None:
+    """The journal `generation` is a per-agent launch token that starts at
+    0 for every fresh journal; the task row's dispatch_generation is the
+    attempt count. A replayed SECOND attempt of a simple task must carry
+    the escalated (coding) model, same as the block that was lost."""
+    import parse
+
+    monkeypatch.setenv("FLEET_ENGINE", "codex")
+    _acquire(fleet_bin, home, "aac00e5c", "retry-foo")
+    assert _journal(home, "aac00e5c")["generation"] == 0
+    task = parse.Task(
+        slug="retry-foo", status="in-progress", complexity="simple",
+        dispatch_generation=2, spec="Fix the typo.",
+    )
+    actions = loop._replay_pending_dispatches(
+        project="myproj", home=home, fleet_bin=fleet_bin,
+        fleet_home=str(home),
+        coord_state={"worker_agent_ids": {"retry-foo": "aac00e5c"}},
+        now_unix=time.time(), tasks=[task],
+    )
+    blocks = [a for a in actions if a.dispatch_instruction]
+    assert len(blocks) == 1
+    block = blocks[0].dispatch_instruction
+    assert "  generation: 0\n" in block
+    assert "  tier: coding\n  model: gpt-5.6-terra\n" in block
+
+
 # ---------------------------------------------------------------------------
 # Integration: broken-stdout incident → next healthy tick re-emits the
 # ExecPending dispatch ONCE, coord launches once (gate), no phantom, no

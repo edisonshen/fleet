@@ -43,6 +43,7 @@ from datetime import datetime, timezone
 
 import parse
 import reviewcfg
+import workercfg
 
 
 # Hard cap on rendered prompt size. The worker prompt is ~6KB of
@@ -1311,6 +1312,7 @@ def format_dispatch_instruction(
     description: str | None = None,
     generation: int = 0,
     register: bool = True,
+    worker_model: workercfg.WorkerModel | None = None,
 ) -> str:
     """Render the DISPATCH block the coord agent will act on.
 
@@ -1332,7 +1334,16 @@ def format_dispatch_instruction(
           run_in_background: true
           subagent_type: general-purpose
           engine: claude-code|codex
+          tier: simple|coding|complex        (only with worker_model)
+          model: <model id>
+          effort: low|medium|high
+          fallback_models: <id>, <id>        (omitted when empty)
+          fallback_effort: low|medium|high   (with fallback_models)
         END_DISPATCH
+
+    `worker_model` (workercfg.resolve_for_task) selects the budget tier
+    the coord passes to the Agent / spawn_agent call. Absent, the block
+    carries no model lines and the subagent inherits the coord's model.
 
     `generation` is the launch token (dispatch-durability #184). Before
     invoking the Agent the coord runs `fleet claims mark-launch-attempted
@@ -1370,6 +1381,15 @@ def format_dispatch_instruction(
         "  subagent_type: general-purpose",
         f"  engine: {coord_engine_from_env()}",
     ]
+    if worker_model is not None and worker_model.model:
+        lines.append(f"  tier: {worker_model.tier}")
+        lines.append(f"  model: {worker_model.model}")
+        lines.append(f"  effort: {worker_model.effort}")
+        if worker_model.fallbacks:
+            lines.append(
+                f"  fallback_models: {', '.join(worker_model.fallbacks)}",
+            )
+            lines.append(f"  fallback_effort: {worker_model.fallback_effort}")
     # `register: false` marks a dispatch whose agent_id is NOT a tasks.md
     # worker slug (PR-watch auto-fix/rebase — slug is a synthetic
     # `pr-fix-<n>`/`pr-rebase-<n>` label). The coord MUST skip the
