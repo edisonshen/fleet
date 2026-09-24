@@ -461,18 +461,20 @@ DISPATCH: <slug>
   model: <model id>
   effort: low|medium|high
   fallback_models: <id>, <id>
+  fallback_effort: low|medium|high
 END_DISPATCH
 ```
 
 `engine` is the dominant engine (same as your `FLEET_ENGINE`). It selects the
 spawn tool in step 3; the worker inherits it through its environment.
 
-`tier`/`model`/`effort`/`fallback_models` are optional (see "Worker model
-routing" above). When present, pass `model` + `effort` to the spawn call in
-step 3. If the spawn rejects the model as unknown/unavailable, retry ONCE per
-entry in `fallback_models` (left to right, same `effort`), then add the
-rejected ids to `coord-config.json:unavailable_models` so the next tick skips
-them. When absent, spawn with no model override — the worker inherits yours.
+`tier`/`model`/`effort`/`fallback_models`/`fallback_effort` are optional (see
+"Worker model routing" above). When present, pass `model` + `effort` to the
+spawn call in step 3. If the spawn rejects the model as unknown/unavailable,
+retry ONCE per entry in `fallback_models` (left to right) at `fallback_effort`
+— NOT the primary's `effort` — then add the rejected ids to
+`coord-config.json:unavailable_models` so the next tick skips them. When
+absent, spawn with no model override — the worker inherits yours.
 
 For each block:
 1. Read `prompt_file`. Note the block's `agent_id` and `generation` (the

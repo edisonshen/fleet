@@ -44,6 +44,7 @@ def test_codex_tier_ladder(tier: str, model: str, effort: str) -> None:
     wm = workercfg.resolve_worker_model("codex", tier)
     assert (wm.engine, wm.tier, wm.model, wm.effort) == ("codex", tier, model, effort)
     assert wm.fallbacks == ("gpt-5.5", "gpt-5.4")
+    assert wm.fallback_effort == "medium"
 
 
 def test_codex_unavailable_skips_to_fallback_at_medium() -> None:
@@ -57,7 +58,7 @@ def test_codex_unavailable_skips_to_fallback_at_medium() -> None:
 def test_claude_every_tier_is_opus_medium(tier: str) -> None:
     wm = workercfg.resolve_worker_model("claude-code", tier)
     assert (wm.model, wm.effort) == ("claude-opus-5-5", "medium")
-    assert wm.fallbacks == ("claude-opus-5",)
+    assert (wm.fallbacks, wm.fallback_effort) == (("claude-opus-5",), "medium")
     assert wm.tier == tier
 
 

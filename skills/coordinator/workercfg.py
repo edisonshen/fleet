@@ -57,9 +57,10 @@ class WorkerModel:
     tier: str
     model: str
     effort: str
-    # Models to try, in order, if `model` is rejected at spawn time. All
-    # run at FALLBACK_EFFORT.
+    # Models to try, in order, if `model` is rejected at spawn time; all
+    # run at fallback_effort.
     fallbacks: tuple[str, ...] = ()
+    fallback_effort: str = FALLBACK_EFFORT
 
 
 def is_tier(value: str) -> bool:
@@ -98,12 +99,14 @@ def resolve_worker_model(
     if not live:
         return WorkerModel(engine=coord_engine, tier=tier, model="", effort="")
     model, effort = live[0]
+    rest = live[1:]
     return WorkerModel(
         engine=coord_engine,
         tier=tier,
         model=model,
         effort=effort,
-        fallbacks=tuple(m for m, _ in live[1:]),
+        fallbacks=tuple(m for m, _ in rest),
+        fallback_effort=rest[0][1] if rest else FALLBACK_EFFORT,
     )
 
 

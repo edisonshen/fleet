@@ -417,6 +417,8 @@ def test_skill_md_documents_worker_model_routing():
         "  model: <model id>",
         "  effort: low|medium|high",
         "  fallback_models: <id>, <id>",
+        "  fallback_effort: low|medium|high",
+        "at `fallback_effort`",
         "gpt-5.6-luna",
         "gpt-5.6-terra",
         "gpt-5.6-sol",

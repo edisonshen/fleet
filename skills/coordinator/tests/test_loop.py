@@ -5236,10 +5236,11 @@ def test_tick_dispatch_block_carries_routed_worker_model(
     assert result.dispatched == 1
     lines = result.dispatch_instructions[0].splitlines()
     i = lines.index("  engine: codex")
-    assert lines[i + 1:i + 5] == [
+    assert lines[i + 1:i + 6] == [
         "  tier: simple",
         "  model: gpt-5.5",
         "  effort: medium",
         "  fallback_models: gpt-5.4",
+        "  fallback_effort: medium",
     ]
 

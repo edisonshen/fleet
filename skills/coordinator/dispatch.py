@@ -1338,6 +1338,7 @@ def format_dispatch_instruction(
           model: <model id>
           effort: low|medium|high
           fallback_models: <id>, <id>        (omitted when empty)
+          fallback_effort: low|medium|high   (with fallback_models)
         END_DISPATCH
 
     `worker_model` (workercfg.resolve_for_task) selects the budget tier
@@ -1388,6 +1389,7 @@ def format_dispatch_instruction(
             lines.append(
                 f"  fallback_models: {', '.join(worker_model.fallbacks)}",
             )
+            lines.append(f"  fallback_effort: {worker_model.fallback_effort}")
     # `register: false` marks a dispatch whose agent_id is NOT a tasks.md
     # worker slug (PR-watch auto-fix/rebase — slug is a synthetic
     # `pr-fix-<n>`/`pr-rebase-<n>` label). The coord MUST skip the

@@ -7175,11 +7175,13 @@ def _replay_pending_dispatches(
                 inbox = str(home / "inbox" / f"{agent_id}.md")
                 gen = int(res.get("generation") or 0)
                 task = tasks_by_slug.get(slug)
-                # A replay re-emits the SAME attempt: gen already counts it.
+                # A replay re-emits the SAME attempt the task row already
+                # adopted, so its dispatch_generation counts this attempt
+                # (the journal gen is only the launch CAS token).
                 worker_model = (
                     workercfg.resolve_for_task(
                         coord_engine, task, unavailable=unavailable_models,
-                        prior_attempts=max(0, gen - 1),
+                        prior_attempts=max(0, int(task.dispatch_generation) - 1),
                     )
                     if task is not None else None
                 )

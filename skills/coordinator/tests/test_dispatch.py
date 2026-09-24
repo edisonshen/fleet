@@ -369,14 +369,22 @@ def test_format_dispatch_instruction_carries_worker_model() -> None:
     )
     lines = out.splitlines()
     i = lines.index("  engine: claude-code")
-    assert lines[i + 1:i + 6] == [
+    assert lines[i + 1:i + 7] == [
         "  tier: simple",
         "  model: gpt-5.6-luna",
         "  effort: medium",
         "  fallback_models: gpt-5.5, gpt-5.4",
+        "  fallback_effort: medium",
         "END_DISPATCH",
     ]
-    # No fallbacks -> no fallback_models line.
+    # Complex codex: primary high, fallbacks carry their own (medium) effort.
+    out = dispatch.format_dispatch_instruction(
+        agent_id="abcdef01", slug="ready-aaaa",
+        prompt_file="/tmp/inbox/abcdef01.md",
+        worker_model=workercfg.resolve_worker_model("codex", "complex"),
+    )
+    assert "  effort: high\n  fallback_models: gpt-5.5, gpt-5.4\n  fallback_effort: medium\n" in out
+    # No fallbacks -> no fallback_models / fallback_effort lines.
     out = dispatch.format_dispatch_instruction(
         agent_id="abcdef01", slug="ready-aaaa",
         prompt_file="/tmp/inbox/abcdef01.md",
@@ -384,7 +392,7 @@ def test_format_dispatch_instruction_carries_worker_model() -> None:
             engine="codex", tier="coding", model="gpt-5.4", effort="medium",
         ),
     )
-    assert "fallback_models" not in out
+    assert "fallback_models" not in out and "fallback_effort" not in out
     assert "  model: gpt-5.4" in out
     # Exhausted ladder (model="") -> legacy shape, worker inherits.
     out = dispatch.format_dispatch_instruction(
