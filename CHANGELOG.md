@@ -6,6 +6,57 @@ follows [SemVer](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.23.0] - 2026-09-24
+
+Workers no longer inherit the coordinator's strongest model by default:
+the coordinator routes each dispatch to a budget tier, escalating only
+when a task actually struggles. The dashboard also stops lagging under
+many projects.
+
+### Added
+
+- coord: worker model routing. Each dispatch resolves a tier —
+  `simple` / `coding` / `complex` — from the task's explicit
+  `complexity:` bullet, else a heuristic over spec/acceptance size, e2e
+  rows, linked plan/design docs, `depends_on` count and priority. Codex
+  coordinators map tiers to `gpt-5.6-luna` / `gpt-5.6-terra` (medium) /
+  `gpt-5.6-sol` (high) with `gpt-5.5` → `gpt-5.4` (medium) fallbacks;
+  Claude coordinators use `claude-opus-5-5` → `claude-opus-5` (medium).
+  Every re-dispatch (worker failure, review rejection) bumps the tier one
+  step, capped at `complex`; reviewer handoffs and replays keep the
+  attempt's tier. PR-watch rebases run `simple`, fixes `coding`.
+  `DISPATCH` blocks carry `tier` / `model` / `effort` /
+  `fallback_models` / `fallback_effort`; the coord passes model + effort
+  to the Agent / `spawn_agent` call and walks the fallbacks on a
+  rejected model. An exhausted ladder omits the fields and the worker
+  inherits the coord's model as before (#328).
+- `fleet tasks add --complexity <simple|coding|complex>` and
+  `fleet tasks set <slug> complexity=<tier>|null`; tasks without the
+  bullet keep parsing (#328).
+- `coord-config.json:unavailable_models` (project and global, unioned)
+  lists model ids the resolver must skip (#328).
+- tui: the dashboard renders at most 10 non-hidden project rows — active
+  projects first, then idle projects by most recent activity — with the
+  rest collapsed into one `─── N more · [/] search to find ───` row.
+  Search bypasses the cap (#325).
+
+### Changed
+
+- tui: render and key paths no longer touch tmux or the filesystem.
+  Coordinator lease identity and session liveness are sampled once per
+  refresh (`Snapshot.Coord`), one `tmux ls` replaces per-record
+  `has-session` probes, tick/fs-event refreshes are single-flight and
+  coalesced, and probes run under a 3s deadline reported as an error —
+  never as "dead" (#326, #327).
+- ci: `build-test-lint` gates parallel `lint` / `unit` / `integration` /
+  `python` jobs (#321).
+
+### Fixed
+
+- scenario: `down` terminates the sandbox's fleet processes before
+  killing the tmux server so a drain caught mid-spawn cannot re-create
+  the socket and leave `/tmp/fleet-test-*` debris (#321).
+
 ## [0.22.0] - 2026-09-17
 
 Codex coordinators now handoff on the same 1M-window schedule as Claude
