@@ -1387,3 +1387,43 @@ func TestTasksSet_AutoRecordsDecision_CoordShellOnly(t *testing.T) {
 		t.Fatalf("non-coord shells recorded decisions: %q", got)
 	}
 }
+
+// TestTasksAddSet_Complexity — --complexity on add, complexity=<tier> on
+// set, "null" clears, unknown tiers are rejected on both paths.
+func TestTasksAddSet_Complexity(t *testing.T) {
+	_, project := setupTasksHome(t)
+	if err := runTasksAdd(&tasksAddOpts{
+		project: project, slug: "tier-bad", priority: "P1",
+		spec: "x", spawnedBy: "user", status: "todo", complexity: "hard",
+	}, "", &bytes.Buffer{}); err == nil {
+		t.Fatal("add --complexity hard accepted; want error")
+	}
+
+	addOut := &bytes.Buffer{}
+	if err := runTasksAdd(&tasksAddOpts{
+		project: project, slug: "tier-set", priority: "P1",
+		spec: "x", spawnedBy: "user", status: "todo", complexity: "simple",
+	}, "", addOut); err != nil {
+		t.Fatalf("add: %v", err)
+	}
+	slug := strings.Fields(addOut.String())[1]
+	if row := listTaskRow(t, project, slug); row.Complexity != tasks.ComplexitySimple {
+		t.Fatalf("Complexity=%q after add; want simple", row.Complexity)
+	}
+
+	if err := runTasksSet(&tasksSetOpts{project: project}, slug, "complexity=complex", &bytes.Buffer{}); err != nil {
+		t.Fatalf("set complexity: %v", err)
+	}
+	if row := listTaskRow(t, project, slug); row.Complexity != tasks.ComplexityComplex {
+		t.Errorf("Complexity=%q; want complex", row.Complexity)
+	}
+	if err := runTasksSet(&tasksSetOpts{project: project}, slug, "complexity=hard", &bytes.Buffer{}); err == nil {
+		t.Error("set complexity=hard accepted; want error")
+	}
+	if err := runTasksSet(&tasksSetOpts{project: project}, slug, "complexity=null", &bytes.Buffer{}); err != nil {
+		t.Fatalf("clear complexity: %v", err)
+	}
+	if row := listTaskRow(t, project, slug); row.Complexity != "" {
+		t.Errorf("Complexity=%q after clear; want empty", row.Complexity)
+	}
+}

@@ -306,13 +306,14 @@ func validateDependencySlugs(deps []string) error {
 // ---------- fleet tasks add ----------
 
 type tasksAddOpts struct {
-	project   string
-	slug      string
-	priority  string
-	dependsOn []string
-	spec      string
-	spawnedBy string
-	status    string
+	project    string
+	slug       string
+	priority   string
+	dependsOn  []string
+	spec       string
+	spawnedBy  string
+	status     string
+	complexity string
 }
 
 func newTasksAddCmd() *cobra.Command {
@@ -344,6 +345,7 @@ are stamped to time.Now().UTC().`,
 	cmd.Flags().StringVar(&opts.spec, "spec", "", "spec body (markdown; defaults to positional arg if positional isn't a slug)")
 	cmd.Flags().StringVar(&opts.spawnedBy, "spawned-by", "user", "who spawned this task: user | <agent-slug>")
 	cmd.Flags().StringVar(&opts.status, "status", string(tasks.StatusTodo), "initial status: todo|ready|in-progress|in-review|done|blocked|abandoned")
+	cmd.Flags().StringVar(&opts.complexity, "complexity", "", "worker model tier: simple|coding|complex (default: inferred at dispatch)")
 	return cmd
 }
 
@@ -386,6 +388,10 @@ func runTasksAdd(opts *tasksAddOpts, positional string, stdout io.Writer) error 
 	if err := validateScalarBullet("--spawned-by", opts.spawnedBy); err != nil {
 		return fmt.Errorf("tasks add: %w", err)
 	}
+	complexity := tasks.Complexity(opts.complexity)
+	if !tasks.ValidComplexity(complexity) {
+		return fmt.Errorf("tasks add: invalid --complexity %q (allowed: simple, coding, complex)", opts.complexity)
+	}
 
 	now := time.Now().UTC()
 	st := tasks.Status(opts.status)
@@ -418,12 +424,13 @@ func runTasksAdd(opts *tasksAddOpts, positional string, stdout io.Writer) error 
 		all := append(existingSlugs(f), archiveSlugs...)
 		finalSlug := tasks.GenerateSlug(slug, spec, all)
 		t := &tasks.Task{
-			Slug:      finalSlug,
-			Status:    st,
-			Priority:  pri,
-			DependsOn: deps,
-			SpawnedBy: opts.spawnedBy,
-			Spec:      spec,
+			Slug:       finalSlug,
+			Status:     st,
+			Priority:   pri,
+			Complexity: complexity,
+			DependsOn:  deps,
+			SpawnedBy:  opts.spawnedBy,
+			Spec:       spec,
 			// Acceptance/Notes left empty — operator/worker fills via
 			// `fleet tasks note --section=acceptance ...` later.
 			Created: now,
@@ -811,6 +818,9 @@ func renderTaskMarkdown(w io.Writer, t *tasks.Task) error {
 	// always emitted, parked optional.
 	fmt.Fprintf(&b, "- dispatch_generation: %d\n", t.DispatchGeneration)
 	writeOptionalBullet(&b, "parked", t.Parked)
+	if t.Complexity != "" {
+		fmt.Fprintf(&b, "- complexity: %s\n", t.Complexity)
+	}
 	fmt.Fprintf(&b, "- depends_on: %s\n", formatDepsList(t.DependsOn))
 	writeOptionalBullet(&b, "spawned_by", t.SpawnedBy)
 	b.WriteByte('\n')
@@ -869,8 +879,8 @@ func newTasksSetCmd() *cobra.Command {
 on-disk grammar:
 
   status, priority, worker_pid, worktree, pr_url, branch,
-  dispatch_generation (int), parked, depends_on (comma-separated),
-  spawned_by
+  dispatch_generation (int), parked, complexity (simple|coding|complex),
+  depends_on (comma-separated), spawned_by
 
 Examples:
   fleet tasks set <slug> status=in-progress
@@ -988,6 +998,8 @@ func decisionFieldValue(t *tasks.Task, key string) string {
 		return string(t.Priority)
 	case "parked":
 		return t.Parked
+	case "complexity":
+		return string(t.Complexity)
 	}
 	return ""
 }
@@ -1107,10 +1119,19 @@ func setTaskField(t *tasks.Task, key, value string) error {
 			return err
 		}
 		t.SpawnedBy = value
+	case "complexity":
+		c := tasks.Complexity(value)
+		if value == "null" {
+			c = ""
+		}
+		if !tasks.ValidComplexity(c) {
+			return fmt.Errorf("tasks set: invalid complexity %q (allowed: simple, coding, complex)", value)
+		}
+		t.Complexity = c
 	case "created", "updated":
 		return fmt.Errorf("tasks set: %s is not settable (parser owns created; updated bumps automatically)", key)
 	default:
-		return fmt.Errorf("tasks set: unknown key %q (allowed: status, priority, worker_pid, worktree, pr_url, branch, dispatch_generation, parked, depends_on, spawned_by)", key)
+		return fmt.Errorf("tasks set: unknown key %q (allowed: status, priority, worker_pid, worktree, pr_url, branch, dispatch_generation, parked, complexity, depends_on, spawned_by)", key)
 	}
 	// Round-trip the file through the writer to catch invalid enum
 	// values (Status / Priority) at the same point Add would. We can't

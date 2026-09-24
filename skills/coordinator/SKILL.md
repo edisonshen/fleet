@@ -329,6 +329,25 @@ Rules:
   project file, then `~/.fleet/coord-config.json`) sets the reasoning effort
   passed to both review slots. Lower it on projects with small diffs where
   review wall-time matters more than depth.
+- Worker model routing: workers/reviewers/PR-watch fixers run on a cheaper
+  model than the coord. The tick picks a tier per task and stamps
+  `tier/model/effort/fallback_models` on the DISPATCH block:
+  - `simple` (typo, rename, docs-only, lint, help text) → codex
+    `gpt-5.6-luna` medium; `coding` (default) → `gpt-5.6-terra` medium;
+    `complex` (migration, protocol, schema, concurrency, cross-cutting, P0,
+    many deps / e2e rows, plan-doc linked) → `gpt-5.6-sol` high.
+  - Claude coords route every tier to `claude-opus-5-5` medium (fallback
+    `claude-opus-5`). Codex falls back to `gpt-5.5` then `gpt-5.4`, medium.
+  - Explicit beats inferred: set `complexity:` when you file the task
+    (`fleet tasks add --complexity simple|coding|complex`, or
+    `fleet tasks set <slug> complexity=<tier>`); unset → inferred from the
+    spec/acceptance text. Each re-dispatch of a slug (worker-failed, review
+    rejection) escalates one tier, capped at `complex`. PR-watch rebase is
+    always `simple`; PR-watch fix/rederive is `coding`.
+  - `coord-config.json:unavailable_models` (array of model ids; project file
+    unioned with `~/.fleet/coord-config.json`) skips models your account
+    can't use; when the whole ladder is unavailable the block carries no
+    `model:` line and the worker inherits the coord's model.
 - `coord-config.json:worktree_timeout_s` bounds `git worktree add` (default
   300s, clamped to 5..3600). Raise it on repos whose full checkout takes longer
   than that — a timeout kills the add mid-checkout.
@@ -438,11 +457,22 @@ DISPATCH: <slug>
   run_in_background: true
   subagent_type: general-purpose
   engine: claude-code|codex
+  tier: simple|coding|complex
+  model: <model id>
+  effort: low|medium|high
+  fallback_models: <id>, <id>
 END_DISPATCH
 ```
 
 `engine` is the dominant engine (same as your `FLEET_ENGINE`). It selects the
 spawn tool in step 3; the worker inherits it through its environment.
+
+`tier`/`model`/`effort`/`fallback_models` are optional (see "Worker model
+routing" above). When present, pass `model` + `effort` to the spawn call in
+step 3. If the spawn rejects the model as unknown/unavailable, retry ONCE per
+entry in `fallback_models` (left to right, same `effort`), then add the
+rejected ids to `coord-config.json:unavailable_models` so the next tick skips
+them. When absent, spawn with no model override — the worker inherits yours.
 
 For each block:
 1. Read `prompt_file`. Note the block's `agent_id` and `generation` (the
@@ -467,10 +497,12 @@ For each block:
      tick re-emits the same block. NEVER treat contention as a skip.**
 3. Spawn the subagent ONCE, with the tool for the block's `engine`:
    - `engine: claude-code` — invoke the Agent tool. Use `description`, full
-     prompt body, `subagent_type=general-purpose`, and
-     `run_in_background=true`.
+     prompt body, `subagent_type=general-purpose`, `run_in_background=true`,
+     and the tool's model parameter set to `model` when the block carries one.
    - `engine: codex` — invoke `spawn_agent` with `task_name=<slug>` and
-     `message=<full prompt body>`. It is non-blocking and returns a task
+     `message=<full prompt body>`; when the block carries `model`/`effort`,
+     pass them through the tool's model and reasoning-effort parameters. It
+     is non-blocking and returns a task
      handle (`{"task_name": "/root/<slug>"}`); do NOT `wait_agent` on it in
      the same turn — the supervisor loop tracks the worker through its
      Fleet agent record. `send_message` is for follow-ups only.

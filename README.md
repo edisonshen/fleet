@@ -218,8 +218,12 @@ TASK-PLAN-DOC → IMPLEMENT → PR-TRACK → DONE).
   `peek`, `project`, `rc`, `skills`, `gc`, `maintenance`).
 - `~/.fleet/coord-config.json` / `<project>/coord-config.json` —
   `parallelism`, `worktree_timeout_s` (default 300s, for monorepos
-  where `git worktree add` is slow), and `review_effort`
-  (`low|medium|high`, default `high`, for the reviewer slots).
+  where `git worktree add` is slow), `review_effort`
+  (`low|medium|high`, default `high`, for the reviewer slots), and
+  `unavailable_models` (model ids the worker-model router must skip).
+  Workers run on a cheaper model than the coord, picked per task from a
+  `simple|coding|complex` tier (`fleet tasks add --complexity`, else
+  inferred; escalates one tier per retry) — see the coordinator SKILL.md.
 - [CHANGELOG.md](CHANGELOG.md) — release history.
 - [skills/fleet-guard/SKILL.md](skills/fleet-guard/SKILL.md) — agent-side
   context watcher and handoff trigger.

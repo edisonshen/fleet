@@ -1370,3 +1370,60 @@ func stringFromInt(i int) string {
 	}
 	return string(digits)
 }
+
+// TestSchema_ComplexityRoundTrip: the optional complexity bullet
+// survives Write/Read, is omitted when unset, and rejects unknown tiers.
+func TestSchema_ComplexityRoundTrip(t *testing.T) {
+	now := time.Date(2026, 6, 3, 10, 0, 0, 0, time.UTC)
+	tk := &Task{
+		Slug: "tier-1234", Status: StatusTodo, Priority: PriorityP1,
+		Created: now, Updated: now, Complexity: ComplexityComplex,
+		SpawnedBy: "user", Spec: "s", Acceptance: "a",
+	}
+	f := &File{Schema: 1}
+	if err := f.Add(tk); err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+	tmp := filepath.Join(t.TempDir(), "tier.md")
+	if err := Write(tmp, f); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	raw, err := os.ReadFile(tmp)
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if !strings.Contains(string(raw), "- complexity: complex\n") {
+		t.Errorf("rendered file missing complexity bullet:\n%s", raw)
+	}
+	got, err := Read(tmp)
+	if err != nil {
+		t.Fatalf("Read: %v", err)
+	}
+	if got.Tasks[0].Complexity != ComplexityComplex {
+		t.Errorf("Complexity=%q; want complex", got.Tasks[0].Complexity)
+	}
+
+	got.Tasks[0].Complexity = ""
+	if err := Write(tmp, got); err != nil {
+		t.Fatalf("Write unset: %v", err)
+	}
+	raw, _ = os.ReadFile(tmp)
+	if strings.Contains(string(raw), "complexity") {
+		t.Errorf("unset complexity must not render:\n%s", raw)
+	}
+	back, err := Read(tmp)
+	if err != nil {
+		t.Fatalf("Read unset: %v", err)
+	}
+	if back.Tasks[0].Complexity != "" {
+		t.Errorf("Complexity=%q; want empty", back.Tasks[0].Complexity)
+	}
+
+	bad := strings.Replace(string(raw), "- depends_on:", "- complexity: hard\n- depends_on:", 1)
+	if err := os.WriteFile(tmp, []byte(bad), 0o644); err != nil {
+		t.Fatalf("write bad: %v", err)
+	}
+	if _, err := Read(tmp); err == nil || !strings.Contains(err.Error(), "complexity") {
+		t.Errorf("Read with complexity=hard: err=%v; want complexity parse error", err)
+	}
+}

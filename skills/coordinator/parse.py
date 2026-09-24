@@ -28,6 +28,7 @@ VALID_STATUSES = {
     "abandoned",
 }
 VALID_PRIORITIES = {"P0", "P1", "P2", "P3"}
+VALID_COMPLEXITIES = {"simple", "coding", "complex"}
 
 REQUIRED_TASK_BULLETS = (
     "status", "priority", "worker_pid", "worktree", "pr_url", "branch",
@@ -114,6 +115,8 @@ class Task:
     # `<UTC ts + reason>` string set when a dirty worktree is parked,
     # cleared on resolve. Empty == not parked. Additive in PR1.
     parked: str = ""
+    # Worker model tier hint: simple | coding | complex. Empty == infer.
+    complexity: str = ""
     depends_on: list[str] = field(default_factory=list)
     spawned_by: str = ""
     spec: str = ""
@@ -492,6 +495,13 @@ def _set_kv(t: Task, k: str, v: str, lineno: int, raw: str) -> None:
         # Durable dirty-worktree park marker (DESIGN §4.2). Empty /
         # "null" → not parked. Non-required; old rows parse fine.
         t.parked = "" if v == "null" else v
+    elif k == "complexity":
+        if v in ("", "null"):
+            t.complexity = ""
+            return
+        if v not in VALID_COMPLEXITIES:
+            raise ParseError(lineno, 1, raw, f"invalid complexity: {v}")
+        t.complexity = v
     elif k == "depends_on":
         t.depends_on = _parse_deps(v, lineno, raw)
     elif k == "spawned_by":
@@ -616,6 +626,8 @@ def _render_task(t: Task) -> str:
     # ALWAYS emitted (like worker_pid); parked is optional (like worktree).
     parts.append(f"- dispatch_generation: {t.dispatch_generation}\n")
     parts.append(_optional("parked", t.parked))
+    if t.complexity:
+        parts.append(f"- complexity: {t.complexity}\n")
     parts.append(f"- depends_on: {_format_deps(t.depends_on)}\n")
     parts.append(_optional("spawned_by", t.spawned_by))
     parts.append("\n")

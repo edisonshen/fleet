@@ -55,6 +55,7 @@ import pr_watch as pr_watch_mod
 import reaper as reaper_mod
 import reviewcfg
 import supervisor as supervisor_mod
+import workercfg
 import worktree as worktree_mod
 
 
@@ -1215,6 +1216,7 @@ def _tick_locked(
             fleet_home=str(home),
             coord_state=state,
             now_unix=now_unix,
+            tasks=f.tasks,
         )
     except Exception as exc:  # noqa: BLE001 — replay must never wedge a tick
         replays = []
@@ -3467,6 +3469,30 @@ def _review_effort_from_file(cfg_path: Path) -> str:
     if not isinstance(raw, str) or raw.lower() not in _REVIEW_EFFORTS:
         return ""
     return raw.lower()
+
+
+def _load_unavailable_models(project_dir: Path, home: Path | None = None) -> set[str]:
+    """Union of `unavailable_models` (list of model ids) from the project's
+    coord-config.json and ~/.fleet/coord-config.json. Fed to
+    workercfg.resolve_for_task so a retired / rate-limited model is
+    skipped in favor of the next rung on the ladder."""
+    out: set[str] = set()
+    paths = [project_dir / COORD_CONFIG_FILE]
+    if home is not None:
+        paths.append(home / COORD_CONFIG_FILE)
+    for cfg_path in paths:
+        try:
+            with open(cfg_path, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+        except (FileNotFoundError, json.JSONDecodeError, OSError):
+            continue
+        if not isinstance(data, dict):
+            continue
+        raw = data.get("unavailable_models")
+        if not isinstance(raw, list):
+            continue
+        out.update(m.strip() for m in raw if isinstance(m, str) and m.strip())
+    return out
 
 
 def _load_worktree_timeout(project_dir: Path) -> float:
@@ -6637,10 +6663,21 @@ def _reconcile_pr_watches(
                 dispatch_kind=f"pr-{action.kind}",
                 fleet_bin=fleet_bin, fleet_home=fhome,
             )
+            tier = (
+                workercfg.TIER_SIMPLE
+                if action.kind == pr_watch_mod.ACTION_REBASE
+                else workercfg.TIER_CODING
+            )
             block = dispatch_mod.format_dispatch_instruction(
                 agent_id=agent_id, slug=label, prompt_file=prompt_file,
                 description=f"fleet PR-watch {action.kind} for #{action.pr_number}",
                 generation=0, register=False,
+                worker_model=workercfg.resolve_worker_model(
+                    dispatch_mod.coord_engine_from_env(), tier,
+                    _load_unavailable_models(
+                        Path(fhome) / "projects" / project, Path(fhome),
+                    ) if fhome else set(),
+                ),
             )
             staged_blocks.append(block)
             return agent_id
@@ -7057,6 +7094,7 @@ def _replay_pending_dispatches(
     fleet_home: str,
     coord_state: dict,
     now_unix: float,
+    tasks: list[parse.Task] | None = None,
 ) -> list[_ReplayAction]:
     """Tick-entry replay reconcile (dispatch-durability #184).
 
@@ -7107,6 +7145,9 @@ def _replay_pending_dispatches(
         )
     except Exception:  # noqa: BLE001
         pending_acquire_ids = set()
+    tasks_by_slug = {t.slug: t for t in (tasks or [])}
+    coord_engine = dispatch_mod.coord_engine_from_env()
+    unavailable_models = _load_unavailable_models(home / "projects" / project, home)
     for agent_id, slug, j in _iter_project_journals(home, project):
         state = j.get("exec_state", "")
         if state == "pending":
@@ -7132,12 +7173,23 @@ def _replay_pending_dispatches(
             outcome = res.get("outcome")
             if outcome == "reserved":
                 inbox = str(home / "inbox" / f"{agent_id}.md")
+                gen = int(res.get("generation") or 0)
+                task = tasks_by_slug.get(slug)
+                # A replay re-emits the SAME attempt: gen already counts it.
+                worker_model = (
+                    workercfg.resolve_for_task(
+                        coord_engine, task, unavailable=unavailable_models,
+                        prior_attempts=max(0, gen - 1),
+                    )
+                    if task is not None else None
+                )
                 try:
                     block = dispatch_mod.format_dispatch_instruction(
                         agent_id=agent_id, slug=slug or agent_id,
                         prompt_file=inbox,
                         description=f"fleet worker {slug or agent_id} (replay)",
-                        generation=int(res.get("generation") or 0),
+                        generation=gen,
+                        worker_model=worker_model,
                     )
                 except ValueError as exc:
                     actions.append(_ReplayAction(
@@ -7293,6 +7345,10 @@ def _dispatch_ready(
     # the conservative branch keeps existing behavior intact.
     is_git = dispatch_mod.project_is_git(project, fleet_home=fleet_home)
     in_flight_after_dispatch: list[parse.Task] = list(in_progress)
+    coord_engine = dispatch_mod.coord_engine_from_env()
+    unavailable_models = _load_unavailable_models(
+        Path(fleet_home) / "projects" / project, Path(fleet_home),
+    )
 
     for t in candidates:
         if active >= cap:
@@ -7603,6 +7659,9 @@ def _dispatch_ready(
             instruction = dispatch_mod.format_dispatch_instruction(
                 agent_id=agent_id, slug=t.slug,
                 prompt_file=inbox_path,
+                worker_model=workercfg.resolve_for_task(
+                    coord_engine, t, unavailable=unavailable_models,
+                ),
             )
         except ValueError as exc:
             actions.append(_DispatchAction(
@@ -7729,6 +7788,7 @@ def _dispatch_review_handoffs(
         unavailable=set(),
     )
     review_effort = _load_review_effort(home / "projects" / project, home)
+    unavailable_models = _load_unavailable_models(home / "projects" / project, home)
     for t in tasks:
         if t.status != "in-progress":
             continue
@@ -7953,9 +8013,15 @@ def _dispatch_review_handoffs(
                 handoff_generation, this_kind,
             )
         try:
+            # Same tier as the worker attempt this handoff follows: the
+            # row's gen already counts that attempt, so back it out.
             instruction = dispatch_mod.format_dispatch_instruction(
                 agent_id=agent_id, slug=t.slug,
                 prompt_file=inbox_path, description=description,
+                worker_model=workercfg.resolve_for_task(
+                    coord_engine, t, unavailable=unavailable_models,
+                    prior_attempts=max(0, handoff_generation - 1),
+                ),
             )
         except ValueError as exc:
             actions.append(_DispatchAction(

@@ -5181,3 +5181,65 @@ def test_load_review_effort_resolution(
         (home / loop.COORD_CONFIG_FILE).write_text(json.dumps(home_cfg))
     assert loop._load_review_effort(project_dir, home) == want
 
+
+# ---------- unavailable_models resolution ----------
+
+
+@pytest.mark.parametrize(
+    ("project_cfg", "home_cfg", "want"),
+    [
+        (None, None, set()),
+        ({"unavailable_models": ["gpt-5.6-sol"]}, None, {"gpt-5.6-sol"}),
+        (None, {"unavailable_models": [" gpt-5.5 ", ""]}, {"gpt-5.5"}),
+        (
+            {"unavailable_models": ["gpt-5.6-sol"]},
+            {"unavailable_models": ["gpt-5.6-luna", 3]},
+            {"gpt-5.6-sol", "gpt-5.6-luna"},
+        ),
+        ({"unavailable_models": "gpt-5.5"}, None, set()),
+    ],
+)
+def test_load_unavailable_models_union(
+    tmp_path: Path, project_cfg, home_cfg, want: set
+) -> None:
+    home = tmp_path / ".fleet"
+    project_dir = home / "projects" / "proj"
+    project_dir.mkdir(parents=True)
+    if project_cfg is not None:
+        (project_dir / loop.COORD_CONFIG_FILE).write_text(json.dumps(project_cfg))
+    if home_cfg is not None:
+        (home / loop.COORD_CONFIG_FILE).write_text(json.dumps(home_cfg))
+    assert loop._load_unavailable_models(project_dir, home) == want
+
+
+def test_tick_dispatch_block_carries_routed_worker_model(
+    fleet_home: Path, project_dir: Path,
+    fleet_run_recorder, dispatch_subprocess, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A codex coord dispatching an explicit `complexity: simple` task
+    emits luna; with luna listed unavailable the block falls to gpt-5.5
+    at medium and the fallback ladder shrinks accordingly."""
+    monkeypatch.setenv("FLEET_ENGINE", "codex")
+    t = _make_task("ready-aaaa", status="ready")
+    t.complexity = "simple"
+    _write_tasks(project_dir, [t])
+    (project_dir / loop.COORD_CONFIG_FILE).write_text(
+        json.dumps({"unavailable_models": ["gpt-5.6-luna"]}),
+    )
+    dispatch_subprocess.append("abcdef01")
+
+    result = loop.tick(
+        "fleet", coord_id="cccccc01", cwd="/repo",
+        fleet_home=str(fleet_home), cap=1,
+    )
+
+    assert result.dispatched == 1
+    lines = result.dispatch_instructions[0].splitlines()
+    i = lines.index("  engine: codex")
+    assert lines[i + 1:i + 5] == [
+        "  tier: simple",
+        "  model: gpt-5.5",
+        "  effort: medium",
+        "  fallback_models: gpt-5.4",
+    ]
+
