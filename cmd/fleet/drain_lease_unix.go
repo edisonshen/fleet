@@ -88,6 +88,15 @@ type drainLeaseDeps struct {
 	// D3/D9b′ — no longer keyed on the deleted epoch). Production: a journal read
 	// + stat through coordlock.HandoffBarrierPath.
 	BarrierExists func(project string) bool
+	// JournaledSuccessorDead reports whether the handoff journal names
+	// successorID AND that successor's recorded process is gone (pid +
+	// pid_start + boot id). A standby that exited on standby-timeout leaves
+	// exactly this shape behind a barrier OLD wrote: the graceful cycle can
+	// never complete, so drain must resume the pending handoff instead of
+	// waiting for a successor that will never acquire. Production:
+	// journaledSuccessorDead (coordlock.ReadHandoffJournal +
+	// !coordlock.HandoffSuccessorAlive).
+	JournaledSuccessorDead func(project, successorID string) bool
 	// LoadAgent loads an agent record (for OLD's supervisor identity).
 	// Production: agent.Load.
 	LoadAgent func(id string) (*agent.Record, error)
@@ -175,16 +184,33 @@ func defaultDrainLeaseDeps() drainLeaseDeps {
 			_, statErr := os.Stat(p)
 			return statErr == nil
 		},
-		LoadAgent:       agent.Load,
-		KillCoord:       coord.KillCoordIfIdentityMatches,
-		SupervisorAlive: supervisorAliveByStart,
-		Resume:          handoffop.Resume,
-		LockAgent:       state.LockAgent,
-		RecoverSpawn:    productionRecoverSpawn,
-		DeliverPending:  drainGracefulDeliverPending,
-		BarrierPoll:     defaultBarrierPoll,
-		Self:            os.Getpid,
+		JournaledSuccessorDead: journaledSuccessorDead,
+		LoadAgent:              agent.Load,
+		KillCoord:              coord.KillCoordIfIdentityMatches,
+		SupervisorAlive:        supervisorAliveByStart,
+		Resume:                 handoffop.Resume,
+		LockAgent:              state.LockAgent,
+		RecoverSpawn:           productionRecoverSpawn,
+		DeliverPending:         drainGracefulDeliverPending,
+		BarrierPoll:            defaultBarrierPoll,
+		Self:                   os.Getpid,
 	}
+}
+
+// journaledSuccessorDead reports whether the project's handoff journal names
+// successorID and that successor's recorded process is provably gone. False
+// when there is no journal, the journal names a different successor, or the
+// process is alive (or unprovable) — every case where waiting is still the
+// right move.
+func journaledSuccessorDead(project, successorID string) bool {
+	if successorID == "" {
+		return false
+	}
+	j, ok, err := coordlock.ReadHandoffJournal(project)
+	if err != nil || !ok || j.SuccessorID != successorID {
+		return false
+	}
+	return !coordlock.HandoffSuccessorAlive(j)
 }
 
 // productionRecoverSpawn brings up a FRESH lease-wrapped successor after a
@@ -521,7 +547,7 @@ func drainOneLeaseAwareWith(req queue.SpawnFresh, path string, graceMillis, resu
 		// (benign) + clean. If OLD is a hung-alive flock holder that never
 		// yields, drainGraceful escalates to the no-kill recovery (surface
 		// `fleet rm`).
-		return drainGraceful(req, path, deadline, stdout, stderr, d)
+		return drainGraceful(req, path, deadline, graceMillis, resumeTimeoutMillis, stdout, stderr, d)
 
 	case leaderBusy:
 		// A live process HOLDS the flock and no completion barrier exists yet.
@@ -553,11 +579,26 @@ func drainOneLeaseAwareWith(req queue.SpawnFresh, path string, graceMillis, resu
 // flock body's agent_id == the queue's pre-allocated successor id
 // (req.NewAgentID) — holds the flock. A bare/booting/foreign busy flock is NOT
 // a healthy successor (the R4/B hazard). Until the expected successor acquires,
-// wait bounded (OLD may still be finishing its exit); on timeout dead-recover
-// via takeoverAndRecover (no kill — D8: it cold-spawns a dead OLD's successor,
-// or surfaces `fleet rm` for a hung-alive OLD). Holds NO lock.
+// wait bounded (OLD may still be finishing its exit).
+//
+// A barrier with OLD still HOLDING the flock is a graceful cycle that stalled
+// before OLD's retire. OLD is a live predecessor that authorized this handoff
+// (the queue exists), so the pending handoff is resumed through coldResume
+// (handoffop.Resume reuses a live standby or reconciles a dead one under the
+// same pre-allocated id, then retires OLD via the normal /exit) — at once when
+// the journaled successor is provably dead, else after the wait budget. Only
+// when OLD does NOT hold the flock does the timeout fall to takeoverAndRecover
+// (no kill: cold-spawn for a dead OLD, surface `fleet rm` for a hung-alive
+// one). Holds NO lock itself.
+//
+//	barrier up
+//	  ├─ expected successor holds flock ──────────── deliver + reap OLD + clean
+//	  ├─ OLD holds flock, journaled successor dead ─ coldResume
+//	  └─ wait budget ─┬─ successor acquired ───────── deliver + reap OLD + clean
+//	                  ├─ OLD still holds flock ────── coldResume
+//	                  └─ OLD not holding ──────────── takeoverAndRecover (no kill)
 func drainGraceful(req queue.SpawnFresh, path string, deadline time.Time,
-	stdout, stderr io.Writer, d drainLeaseDeps) error {
+	graceMillis, resumeTimeoutMillis int, stdout, stderr io.Writer, d drainLeaseDeps) error {
 
 	oldRec, err := d.LoadAgent(req.OldAgentID)
 	switch {
@@ -605,9 +646,21 @@ func drainGraceful(req queue.SpawnFresh, path string, deadline time.Time,
 	}
 
 	// The expected successor has NOT taken over yet. If OLD still holds the flock
-	// it is finishing its exit (surface that for diagnostics). Wait bounded for
-	// the expected successor either way.
-	if ownerPid, ownerOK := d.ActiveOwnerPID(req.Project); ownerOK && ownerPid == oldRec.SupervisorPID {
+	// it is either finishing its exit or the cycle was interrupted before its
+	// retire. A journaled successor that is provably dead can never acquire, so
+	// resume the pending handoff now; otherwise wait bounded for the expected
+	// successor.
+	oldHoldsFlock := func() bool {
+		ownerPid, ownerOK := d.ActiveOwnerPID(req.Project)
+		return ownerOK && oldRec.SupervisorPID > 0 && ownerPid == oldRec.SupervisorPID
+	}
+	if oldHoldsFlock() {
+		if d.JournaledSuccessorDead(req.Project, req.NewAgentID) {
+			_, _ = fmt.Fprintf(stdout,
+				"fleet drain: %s wrote the barrier and still holds the flock, but the journaled successor %s exited (standby timed out or died); resuming the pending handoff\n",
+				oldRec.ID, req.NewAgentID)
+			return coldResume(req, path, graceMillis, resumeTimeoutMillis, stdout, stderr, d)
+		}
 		_, _ = fmt.Fprintf(stdout,
 			"fleet drain: %s wrote the barrier and still holds the flock; waiting for its self-release and the successor's acquire\n",
 			oldRec.ID)
@@ -626,9 +679,18 @@ func drainGraceful(req queue.SpawnFresh, path string, deadline time.Time,
 			req.Project)
 		return drainReapOld(oldRec, req, path, stdout, stderr, d)
 	}
-	// Timeout: the expected successor never acquired. Dead-recover WITHOUT a kill
-	// (D8): takeoverAndRecover cold-spawns if OLD is provably dead, or surfaces
-	// `fleet rm` if OLD is a hung-alive flock holder. Never fences a live coord.
+	// Timeout: the expected successor never acquired. OLD still holding the
+	// flock is a live, authorized predecessor whose graceful cycle stalled —
+	// resume the pending handoff (reuse the live standby or replace a dead one,
+	// then the normal retire). Otherwise dead-recover WITHOUT a kill (D8):
+	// takeoverAndRecover cold-spawns if OLD is provably dead, or surfaces
+	// `fleet rm` if OLD is hung-alive without the flock. Never fences a live coord.
+	if oldHoldsFlock() {
+		_, _ = fmt.Fprintf(stderr,
+			"fleet drain: %s still holds the flock and the expected successor %s did not acquire within the budget; resuming the pending handoff\n",
+			oldRec.ID, req.NewAgentID)
+		return coldResume(req, path, graceMillis, resumeTimeoutMillis, stdout, stderr, d)
+	}
 	_, _ = fmt.Fprintf(stderr,
 		"fleet drain: %s did not yield to the expected successor within the budget; attempting no-kill recovery\n",
 		oldRec.ID)
@@ -791,7 +853,7 @@ func drainFreeFlockRecover(req queue.SpawnFresh, path string, deadline time.Time
 		if d.BarrierExists(project) {
 			// A graceful barrier appeared while we waited — finish the graceful
 			// path (positive-identity successor completion).
-			return drainGraceful(req, path, deadline, stdout, stderr, d)
+			return drainGraceful(req, path, deadline, graceMillis, resumeTimeoutMillis, stdout, stderr, d)
 		}
 		// The expected successor may have already acquired the freed flock.
 		if _, ok := d.healthySuccessorPresent(project, req.NewAgentID); ok {
@@ -868,11 +930,15 @@ func takeoverAndRecover(req queue.SpawnFresh, path string, cachedOld *agent.Reco
 	//   - SupervisorAlive(pid, pid_start) true   -> LIVE               -> abort.
 	// Abort = loud diagnostic + fleetlog event + drain failure through the
 	// existing "did not confirm the old coord is gone" path: the queue is
-	// preserved for retry, everyone stays alive, and the operator recourse
-	// is `fleet handoff <id>` / `fleet rm <id>`.
+	// preserved and the next drain pass retries. A live OLD that HOLDS the
+	// flock never reaches here (drainGraceful / drainLiveLeaderFallback resume
+	// the handoff through it), so "alive" means a supervisor that released
+	// the flock without exiting; `fleet rm` is the only recourse once it is
+	// confirmed wedged. `fleet handoff` is not suggested — it would land
+	// back on this same pending journal.
 	abortEscalation := func(why string) error {
 		msg := fmt.Sprintf(
-			"fleet drain: NOT escalating takeover for %s: %s; refusing to fence/kill (queue %s preserved for retry; if the old coord is truly wedged run `fleet handoff %s` or `fleet rm %s`)",
+			"fleet drain: NOT escalating takeover for %s: %s; refusing to fence/kill (queue %s preserved; the next drain pass retries automatically — if %s stays alive without holding the project flock, confirm it is wedged and run `fleet rm %s`)",
 			project, why, path, req.OldAgentID, req.OldAgentID)
 		_, _ = fmt.Fprintln(stderr, msg)
 		fleetlog.Log(fleetlog.CompCLI, "coord.quarantine", "warn", fleetlog.Fields{
@@ -1008,7 +1074,7 @@ func drainLiveLeaderFallback(req queue.SpawnFresh, path string, deadline time.Ti
 	// Only on timeout do we fall back to legacy Resume.
 	for time.Now().Before(deadline) {
 		if d.BarrierExists(req.Project) {
-			return drainGraceful(req, path, deadline, stdout, stderr, d)
+			return drainGraceful(req, path, deadline, graceMillis, resumeTimeoutMillis, stdout, stderr, d)
 		}
 		// Also bail early if the EXPECTED successor already took over the flock.
 		if _, ok := d.healthySuccessorPresent(req.Project, req.NewAgentID); ok {
@@ -1155,6 +1221,9 @@ func fillDrainLeaseDeps(d drainLeaseDeps) drainLeaseDeps {
 	}
 	if d.BarrierExists == nil {
 		d.BarrierExists = def.BarrierExists
+	}
+	if d.JournaledSuccessorDead == nil {
+		d.JournaledSuccessorDead = def.JournaledSuccessorDead
 	}
 	if d.LoadAgent == nil {
 		d.LoadAgent = def.LoadAgent

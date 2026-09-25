@@ -310,6 +310,48 @@ func TestCreateHandoffJournalResolving_DeadSuccessor_ClearsAndRetries(t *testing
 	assertHandoffJournalNames(t, project, "nextsucc2")
 }
 
+// TestCreateHandoffJournalResolving_SameSuccessorReentry_ReplacesBarrier
+// covers a retry of the SAME handoff: the leftover journal names the very
+// successor id being re-journaled (the queue's pre-allocated id, respawned
+// after the first standby died) behind a stale barrier. The dead-successor
+// arm clears journal + old barrier and the new cycle's barrier id lands.
+func TestCreateHandoffJournalResolving_SameSuccessorReentry_ReplacesBarrier(t *testing.T) {
+	setupFleetHome(t)
+	const project = "chjr-same-successor"
+	if _, err := state.EnsureProjectInitialized(project); err != nil {
+		t.Fatalf("EnsureProjectInitialized: %v", err)
+	}
+
+	if err := coordlock.CreateHandoffJournal(coordlock.HandoffJournal{
+		Project: project, SuccessorID: "succ", BarrierID: "b-old",
+		SuccessorPID: 999999, SuccessorPidStart: 424242,
+	}); err != nil {
+		t.Fatalf("seed leftover journal: %v", err)
+	}
+	oldBarrier, err := coordlock.HandoffBarrierPath(project, "b-old")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(oldBarrier, []byte("{}\n"), 0o644); err != nil {
+		t.Fatalf("seed stale barrier: %v", err)
+	}
+
+	next := coordlock.HandoffJournal{Project: project, SuccessorID: "succ", BarrierID: "b-new"}
+	if err := createHandoffJournalResolving(next); err != nil {
+		t.Fatalf("same-successor re-entry must replace the dead leftover; got %v", err)
+	}
+	j, ok, err := coordlock.ReadHandoffJournal(project)
+	if err != nil || !ok {
+		t.Fatalf("read journal: ok=%v err=%v", ok, err)
+	}
+	if j.SuccessorID != "succ" || j.BarrierID != "b-new" {
+		t.Errorf("journal = successor %q barrier %q; want succ / b-new", j.SuccessorID, j.BarrierID)
+	}
+	if _, serr := os.Stat(oldBarrier); !errors.Is(serr, os.ErrNotExist) {
+		t.Errorf("stale barrier %s must be removed with the leftover journal; stat err=%v", oldBarrier, serr)
+	}
+}
+
 // TestAtomicCoordSwap_HappyPath_DeadOld covers case 4 — operator
 // invoked dead-coord resume via TUI [a]. oldIsDead=true: kill + archive
 // are SKIPPED; OLD record stays on disk for operator [x] cleanup.
