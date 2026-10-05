@@ -1,21 +1,20 @@
-# Plan review gate
+# Plan review
 
 ## Problem
 
 The task-plan review SOP in `skills/coordinator/SKILL.md` asks the coord to
-get every `docs/TASK-PLAN-<slug>.md` dual-reviewed before promote, and to
-promote only with operator approval. Nothing enforces either step:
+get every `docs/TASK-PLAN-<slug>.md` dual-reviewed before promote, but
+there was no tool for it:
 
 - `review_slot.py` can only review a diff / working tree, so a plan review
   is an ad-hoc prompt with no stable output.
 - Results are not persisted, so nobody can tell whether the plan that is
   about to be promoted is the plan that was reviewed.
-- `fleet tasks promote` only checks `status=todo`.
-- The TUI shows nothing about plan reviews.
 
 Target: the same shape as Devin's Plan mode + Devin Review — a Markdown
-plan, a structured review of that plan (Bugs / Flags / Security), and an
-explicit approval before any implementation starts.
+plan and a structured review of that plan (Bugs / Flags / Security). Like
+Devin, the review is advisory: promote is not gated on it, and the
+operator's approval stays the SOP step it already is.
 
 ## Flow
 
@@ -25,15 +24,12 @@ explicit approval before any implementation starts.
    `review_slot.py --plan <doc> --project <p> --slug <slug> --both ...`.
    The record lands at `~/.fleet/projects/<p>/plan-reviews/<slug>.json`
    with the sha256 of the reviewed bytes.
-3. Operator runs `fleet tasks approve <slug>`; it only succeeds when the
-   latest review is clean and its sha256 matches the doc on disk, and it
-   records the approval against that same sha256.
-4. `fleet tasks promote <slug>` refuses unless doc, review and approval
-   all agree on the current sha256. `--force <reason>` overrides and is
-   recorded.
-5. The TUI shows a per-task plan badge and the findings grouped by
-   severity and category in the task detail overlay.
-6. Reviewers also read scoped `REVIEW.md` / `AGENTS.md` instruction files.
+   The prompt includes `REVIEW.md` / `AGENTS.md` files whose directory
+   covers the repo root, the plan's dir, or any path the plan names
+   (files under `.agents/`, `.devin/`, `.cursor/`, `.github/` scope to
+   the parent), root-most first so deeper rules read as more specific.
+3. The coord applies fixes and re-runs reviews until neither slot reports
+   a P0/P1; an edit after review shows as a `doc_sha256` mismatch.
 
 ## Review record (`plan-reviews/<slug>.json`)
 
@@ -56,17 +52,12 @@ explicit approval before any implementation starts.
 }
 ```
 
-`clean` is `exit == 0` from `review_slot.py`, so the existing gate rules
+`clean` is `exit == 0` from `review_slot.py`, so the existing review rules
 apply unchanged: a P0/P1 in either slot, a blocked slot, or a skipped beta
 anchor makes the record not clean. A skipped alpha helper does not.
-
-## Approval record (`plan-reviews/<slug>.approval.json`)
-
-`{doc, doc_sha256, approved_by, approved_at, forced, reason}`. Written by
-`fleet tasks approve` (refused from a coord shell, `FLEET_ROLE=coord`) or
-by `fleet tasks promote --force <reason>` (`forced: true`).
 
 ## Non-goals
 
 - Auto-running reviews on doc save; the coord still dispatches reviewers.
-- Reviewing embedded (unlinked) plans: the gate needs a doc file to hash.
+- Gating `fleet tasks promote` on the review or a recorded approval.
+- Reviewing embedded (unlinked) plans: the record needs a doc file to hash.
