@@ -15,16 +15,31 @@ import (
 	"github.com/edisonshen/fleet/internal/tasks"
 )
 
-// linkPlanDoc writes docs/TASK-PLAN-<slug>.md under cwd (unregistered
-// projects resolve relative links against cwd) and links it from the
-// task spec. Returns the doc path.
+// decidedBrief is a DISCOVER brief the operator has decided on.
+const decidedBrief = "# Brief\n\n## Relevant files\n\n- a.go\n\n## Current behavior\n\nx\n\n" +
+	"## Options\n\n### A. one\n\n### B. two\n\n## Open questions\n\nNone.\n\n## Decision\n\nOption A.\n"
+
+// planBody wraps title in a structurally complete plan linked to
+// docs/BRIEF-<slug>.md.
+func planBody(slug, title string) string {
+	return title + "\nBrief: `docs/BRIEF-" + slug + ".md`\n\n## Goal\n\ng\n\n## Files\n\n- a.go\n\n" +
+		"## Steps\n\n1. do\n\n## Verification\n\ntest\n\n## Open questions\n\nNone.\n"
+}
+
+// linkPlanDoc writes docs/TASK-PLAN-<slug>.md (structurally complete,
+// wrapping body) plus a decided docs/BRIEF-<slug>.md under cwd
+// (unregistered projects resolve relative links against cwd) and links
+// the plan from the task spec. Returns the doc path.
 func linkPlanDoc(t *testing.T, project, slug, body string) string {
 	t.Helper()
 	rel := filepath.Join("docs", "TASK-PLAN-"+slug+".md")
 	if err := os.MkdirAll("docs", 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(rel, []byte(body), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join("docs", "BRIEF-"+slug+".md"), []byte(decidedBrief), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(rel, []byte(planBody(slug, body)), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	f, path, err := readTasks(project)
@@ -148,7 +163,7 @@ func TestPlanGate_ReviewApprovePromoteLifecycle(t *testing.T) {
 	}
 
 	// Editing the doc after approval invalidates review and approval.
-	if err := os.WriteFile(doc, []byte("# plan v2\n"), 0o644); err != nil {
+	if err := os.WriteFile(doc, []byte(planBody(slug, "# plan v2")), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	assertBlocked(planreview.StateStale, "changed since its review")
@@ -195,5 +210,62 @@ func TestPlanGate_ForceIsOperatorOnlyAndRecorded(t *testing.T) {
 	}
 	if !a.Forced || a.Reason != "prod hotfix, no plan (gate was no-plan)" {
 		t.Errorf("forced approval: %+v", a)
+	}
+}
+
+// Scenario: DISCOVER → plan. A clean review of a plan with a missing
+// section, an open question, or an undecided brief is still not
+// approvable; `fleet tasks brief --plan` scaffolds both docs.
+func TestPlanGate_StructureAndBrief(t *testing.T) {
+	_, project := setupTasksHome(t)
+	t.Setenv("FLEET_ROLE", "")
+	slug := addTodoSlug(t, project, "gate-brief")
+
+	out := &bytes.Buffer{}
+	if err := runTasksBrief(&tasksBriefOpts{project: project, plan: true}, slug, out); err != nil {
+		t.Fatalf("brief: %v", err)
+	}
+	brief, _ := filepath.Abs(filepath.Join("docs", "BRIEF-"+slug+".md"))
+	doc, _ := filepath.Abs(filepath.Join("docs", "TASK-PLAN-"+slug+".md"))
+	if !strings.Contains(out.String(), "wrote "+brief) || !strings.Contains(out.String(), "linked docs/TASK-PLAN-"+slug+".md") {
+		t.Fatalf("brief output: %q", out.String())
+	}
+	if again := (&bytes.Buffer{}); runTasksBrief(&tasksBriefOpts{project: project, plan: true}, slug, again) != nil ||
+		!strings.Contains(again.String(), "kept "+brief) || strings.Contains(again.String(), "linked") {
+		t.Fatalf("second brief run should keep files and not relink: %q", again.String())
+	}
+
+	approveErr := func() error {
+		return runTasksApprove(&tasksApproveOpts{project: project}, slug, &bytes.Buffer{})
+	}
+	writePlanReview(t, project, slug, doc, 0)
+	if err := approveErr(); err == nil || !strings.Contains(err.Error(), "(incomplete)") || !strings.Contains(err.Error(), "no Decision") {
+		t.Fatalf("undecided brief: want incomplete refusal, got %v", err)
+	}
+	if err := promoteErr(project, slug, ""); err == nil || !strings.Contains(err.Error(), "(incomplete)") {
+		t.Fatalf("promote undecided brief: %v", err)
+	}
+
+	if err := os.WriteFile(brief, []byte(decidedBrief), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := approveErr(); err != nil {
+		t.Fatalf("approve after decision: %v", err)
+	}
+
+	open := strings.Replace(planBody(slug, "# plan"), "## Open questions\n\nNone.", "## Open questions\n\n- which table?", 1)
+	if err := os.WriteFile(doc, []byte(open), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	writePlanReview(t, project, slug, doc, 0)
+	if err := approveErr(); err == nil || !strings.Contains(err.Error(), "unresolved open questions") {
+		t.Fatalf("open plan question: want refusal, got %v", err)
+	}
+	if err := os.WriteFile(doc, []byte("# plan\nBrief: `docs/BRIEF-"+slug+".md`\n## Steps\n1. x\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	writePlanReview(t, project, slug, doc, 0)
+	if err := approveErr(); err == nil || !strings.Contains(err.Error(), "missing section: Verification") {
+		t.Fatalf("missing sections: want refusal, got %v", err)
 	}
 }

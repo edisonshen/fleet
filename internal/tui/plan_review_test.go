@@ -15,14 +15,18 @@ import (
 
 // seedPlanTask registers project "fleet" with a repo holding a linked
 // task plan and returns the plan's sha256.
-func seedPlanTask(t *testing.T, pdir string) string {
+func seedPlanTask(t *testing.T, pdir string) (string, string) {
 	t.Helper()
 	repo := t.TempDir()
 	doc := filepath.Join(repo, "docs", "TASK-PLAN-plan-aaaa.md")
 	if err := os.MkdirAll(filepath.Dir(doc), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(doc, []byte("# plan\n"), 0o644); err != nil {
+	plan := "# plan\nBrief: `docs/BRIEF-plan-aaaa.md`\n## Goal\ng\n## Files\nf\n## Steps\n1.\n## Verification\nv\n## Open questions\nNone.\n"
+	if err := os.WriteFile(doc, []byte(plan), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(repo, "docs", "BRIEF-plan-aaaa.md"), []byte(planreview.BriefTemplate("plan-aaaa")), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	seedBlockedTask(t, pdir, "fleet", "plan-aaaa", tasks.StatusTodo, "Task plan: docs/TASK-PLAN-plan-aaaa.md")
@@ -34,7 +38,7 @@ func seedPlanTask(t *testing.T, pdir string) string {
 	if err != nil {
 		t.Fatal(err)
 	}
-	return sha
+	return sha, repo
 }
 
 func writePlanReviewRecord(t *testing.T, pdir string, r planreview.Review) {
@@ -64,7 +68,7 @@ func planRow(t *testing.T, pdir string) *taskRow {
 func TestPlanReview_BadgeAndFindingsPane(t *testing.T) {
 	pdir := withFleetHome(t)
 	stubReadTaskWorker(t, func(string, string) (*workers.State, error) { return nil, nil })
-	sha := seedPlanTask(t, pdir)
+	sha, repo := seedPlanTask(t, pdir)
 
 	if got := planRow(t, pdir).Plan; got != string(planreview.StateUnreviewed) {
 		t.Fatalf("unreviewed plan: badge state = %q", got)
@@ -103,6 +107,25 @@ func TestPlanReview_BadgeAndFindingsPane(t *testing.T) {
 		Schema: 1, Project: "fleet", Slug: "plan-aaaa", DocSHA256: sha,
 		ReviewedAt: "2026-10-05T19:00:00Z", Clean: true,
 	})
+	tr = planRow(t, pdir)
+	if tr.Plan != string(planreview.StateIncomplete) || tr.Brief != "brief" {
+		t.Fatalf("clean review, undecided brief: plan=%q brief=%q", tr.Plan, tr.Brief)
+	}
+	if line := taskBlockLine(tr, 80, false); !strings.Contains(line, "· brief · plan incomplete") {
+		t.Errorf("row should carry brief + plan badges, got %q", line)
+	}
+	body, _, _ = readTaskDetail("fleet", "plan-aaaa")
+	if !strings.Contains(body, "(undecided)") || !strings.Contains(body, "missing: brief has no Decision") {
+		t.Errorf("incomplete detail:\n%s", body)
+	}
+	decided := strings.Replace(strings.Replace(planreview.BriefTemplate("plan-aaaa"), "TBD", "Option A.", 1),
+		"- <question for the operator>", "None.", 1)
+	if err := os.WriteFile(filepath.Join(repo, "docs", "BRIEF-plan-aaaa.md"), []byte(decided), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if got := planRow(t, pdir).Brief; got != "brief decided" {
+		t.Fatalf("decided brief badge = %q", got)
+	}
 	if err := planreview.WriteApproval("fleet", "plan-aaaa", planreview.Approval{
 		DocSHA256: sha, ApprovedBy: "op", ApprovedAt: time.Now().UTC(),
 	}); err != nil {

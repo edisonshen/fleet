@@ -53,8 +53,12 @@ binary for anything but that slot, and never assume it exists.
    `docs/DESIGN-<kebab-topic>.html` when the project has a renderer.
 3. File tasks via `fleet tasks add --project <project> --spec <body>`; keep
    them unpromoted.
-4. TASK-PLAN-DOC: save `docs/TASK-PLAN-<slug>.md`; render `.html` when
-   supported.
+4. DISCOVER + TASK-PLAN-DOC: `fleet tasks brief <slug> --plan` scaffolds
+   `docs/BRIEF-<slug>.md` and `docs/TASK-PLAN-<slug>.md`; a read-only research
+   subagent fills the brief (Relevant files, Current behavior, 2–3 Options);
+   the operator answers its Open questions and records the Decision; then save
+   the plan (Goal, Files, Steps, Verification, Open questions); render `.html`
+   when supported.
 5. Add the doc path to worker-visible task Spec/Acceptance, e.g.
    `fleet tasks note --project <project> <slug> --section spec "Task plan: docs/TASK-PLAN-<slug>.md"`.
 6. `fleet tasks promote <slug>` happens only after the task plan doc exists,
@@ -69,7 +73,7 @@ binary for anything but that slot, and never assume it exists.
 - Write/render approved implementation plan docs and per-task plan docs under
   the active project's approved docs folder only (`docs/` when present; ask
   only if the project has no clear docs location).
-- Run `fleet tasks {add,list,show,set,note,promote}`, `fleet workers list`,
+- Run `fleet tasks {add,list,show,set,note,brief,promote}`, `fleet workers list`,
   `fleet peek`, `fleet learnings`, and `fleet standards show`.
 - Run read-only `gh` status commands.
 - Talk to the operator about scope, priority, blockers, and decisions.
@@ -91,7 +95,7 @@ Every engagement follows this eight-step order:
 2. PLAN-DOC       save docs/DESIGN-<topic>.md (+ render & open .html)
 3. SPLIT          approved plan -> tasks.md, inline <=10 or planner >10
 4. TASK LIST      one-line goal per task; structured state remains in fields
-5. TASK-PLAN-DOC  save docs/TASK-PLAN-<slug>.md (+ render & open .html), link, promote
+5. TASK-PLAN-DOC  DISCOVER brief -> operator Decision -> docs/TASK-PLAN-<slug>.md, review, approve, promote
 6. IMPLEMENT      worker -> reviewer -> tick finisher; cap=1 by default
 7. PR-TRACK       async PR/CI shepherding; fix/rebase subagents when needed
 8. DONE           set pr_url + status=done; advance or raise hand when empty
@@ -145,7 +149,16 @@ fields managed by `fleet tasks`.
 
 Before any task is promoted to ready, save its worker-ready task plan doc.
 
-- Filename: `docs/TASK-PLAN-<slug>.md`.
+- DISCOVER first: `fleet tasks brief <slug> --plan`, then dispatch a
+  read-only research subagent (no edits) to fill `docs/BRIEF-<slug>.md`:
+  Relevant files (path + function, why), Current behavior, 2–3 Options with
+  trade-offs, Open questions. Bring it to the operator; record their answers
+  and the chosen option under `## Decision` (workflow phase `discover`).
+- Filename: `docs/TASK-PLAN-<slug>.md`; it links the brief
+  (`Brief: docs/BRIEF-<slug>.md`) and has `## Goal`, `## Files`, `## Steps`,
+  `## Verification`, `## Open questions` (must be empty / "None."). Approve
+  refuses (`incomplete`) on a missing section, an open question, or an
+  undecided brief; plan reviewers flag drift from the Decision as P1.
 - Render: `docs/TASK-PLAN-<slug>.html` when supported.
 - Open: after rendering, run `open docs/TASK-PLAN-<slug>.html` so the human
   reviewer sees it immediately.

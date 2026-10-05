@@ -22,6 +22,7 @@ def test_phases_constant_locked() -> None:
     # reference these exact strings. Adding a phase MUST also update
     # both docs and bump the schema version.
     assert ws.PHASES == (
+        "discover",
         "discussing",
         "plan-review",
         "approved",

@@ -1533,6 +1533,13 @@ func taskBlockLine(t *taskRow, w int, selected bool) string {
 		glyph = "✗"
 		glyphStyle = dimStyle
 	}
+	if t.Brief != "" {
+		st := dimStyle
+		if t.Brief == "brief decided" {
+			st = statusReviewStyle
+		}
+		tail += " " + st.Render("· "+t.Brief)
+	}
 	if t.Plan != "" {
 		tail += " " + planBadgeStyle(t.Plan).Render("· plan "+t.Plan)
 	}

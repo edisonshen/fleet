@@ -357,7 +357,14 @@ func scanProject(projectsRoot, name string, now time.Time, incidentCount int) (*
 				if !repoRead {
 					repoPath, repoRead = metaRepoPath(dir), true
 				}
-				tr.Plan = string(planreview.EvaluateIn(dir, repoPath, t).State)
+				st := planreview.EvaluateIn(dir, repoPath, t)
+				tr.Plan = string(st.State)
+				if st.Brief != "" {
+					tr.Brief = "brief"
+					if st.BriefDecided {
+						tr.Brief = "brief decided"
+					}
+				}
 			}
 			row.Tasks = append(row.Tasks, tr)
 		}

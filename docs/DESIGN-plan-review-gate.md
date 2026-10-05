@@ -19,8 +19,16 @@ explicit approval before any implementation starts.
 
 ## Flow
 
-1. Coord writes `docs/TASK-PLAN-<slug>.md` and links it from the task
-   (`Task plan: docs/TASK-PLAN-<slug>.md`).
+0. DISCOVER (Devin's Interactive Planner / Ask Devin step):
+   `fleet tasks brief <slug> [--plan]` scaffolds `docs/BRIEF-<slug>.md`
+   (Relevant files, Current behavior, Options, Open questions, Decision).
+   A read-only research subagent fills it; the operator answers the
+   questions and records the chosen option under Decision.
+1. Coord writes `docs/TASK-PLAN-<slug>.md` (Goal, Files, Steps,
+   Verification, Open questions; links `docs/BRIEF-<slug>.md`) and links it
+   from the task (`Task plan: docs/TASK-PLAN-<slug>.md`). A clean review of
+   a plan with a missing section, a non-empty Open questions, or an
+   undecided brief is gate state `incomplete`, which approve refuses.
 2. Reviewer subagents run
    `review_slot.py --plan <doc> --project <p> --slug <slug> --both ...`.
    The record lands at `~/.fleet/projects/<p>/plan-reviews/<slug>.json`
@@ -29,13 +37,14 @@ explicit approval before any implementation starts.
    covers the repo root, the plan's dir, or any path the plan names
    (files under `.agents/`, `.devin/`, `.cursor/`, `.github/` scope to
    the parent), root-most first so deeper rules read as more specific.
+   It also carries the linked brief; drifting from its Decision is a P1.
 3. Operator runs `fleet tasks approve <slug>`; it only succeeds when the
    latest review is clean and its sha256 matches the doc on disk, and it
    records the approval against that same sha256.
 4. `fleet tasks promote <slug>` refuses unless doc, review and approval
    all agree on the current sha256. `--force <reason>` overrides and is
    recorded.
-5. The TUI shows a per-task plan badge and the findings grouped by
+5. The TUI shows a `brief` / `brief decided` badge, a per-task plan badge and the findings grouped by
    severity and category in the task detail overlay.
 6. Reviewers also read scoped `REVIEW.md` / `AGENTS.md` instruction files.
 

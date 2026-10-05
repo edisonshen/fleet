@@ -59,6 +59,7 @@ from typing import Iterable
 #
 
 PHASES: tuple[str, ...] = (
+    "discover",
     "discussing",
     "plan-review",
     "approved",

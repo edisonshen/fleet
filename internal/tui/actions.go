@@ -773,7 +773,17 @@ func writePlanReview(b *strings.Builder, project string, t *tasks.Task) {
 	if st.Doc != "" {
 		fmt.Fprintf(b, "doc:       %s\n", st.Doc)
 	}
+	if st.Brief != "" {
+		decided := "undecided"
+		if st.BriefDecided {
+			decided = "decided"
+		}
+		fmt.Fprintf(b, "brief:     %s (%s)\n", st.Brief, decided)
+	}
 	fmt.Fprintf(b, "next:      %s\n", st.Explain(project, t.Slug))
+	for _, p := range st.Problems {
+		fmt.Fprintf(b, "  missing: %s\n", p)
+	}
 	if a := st.Approval; a != nil && a.DocSHA256 == st.SHA {
 		fmt.Fprintf(b, "approved:  %s by %s\n", a.ApprovedAt.UTC().Format(time.RFC3339), a.ApprovedBy)
 	}

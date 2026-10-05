@@ -101,6 +101,9 @@ def plan_review_prompt(doc_path: str, sha: str, instructions: str = "") -> str:
         "project's sandbox tier allows (`fleet standards show --merged`).",
         "5. Security and data safety: secrets, auth, destructive operations, "
         "injection, races, irreversible migrations.",
+        "6. Brief fidelity: when a DISCOVER brief is included below, the plan "
+        "implements the option its Decision section picked; drifting to "
+        "another approach or reopening a decided question is a P1 bug.",
         "",
         "Classify every finding with a category: \"bug\" (the plan is wrong "
         "and would produce broken code), \"flag\" (ambiguity, missing case, or "
@@ -202,6 +205,39 @@ def instructions_block(plan_path: str | os.PathLike[str], repo: Path | None = No
         body = f.read_bytes()[:_INSTRUCTION_MAX_BYTES].decode("utf-8", errors="replace")
         parts += ["", f"--- {f.relative_to(repo).as_posix()} (applies to {rel_scope}) ---", body.rstrip()]
     return "\n".join(parts)
+
+
+_BRIEF_LINK_RE = re.compile(r"(?:^|[\s\"'(`\[])((?:[^\s\"'()`\[\]]*/)?BRIEF-[A-Za-z0-9._-]+\.md)")
+
+
+def linked_brief(plan_path: str | os.PathLike[str], repo: Path | None = None) -> Path | None:
+    """The DISCOVER brief the plan links, resolved repo-first like Go does."""
+    plan = Path(plan_path).resolve()
+    m = _BRIEF_LINK_RE.search(plan.read_text(encoding="utf-8", errors="replace"))
+    if not m:
+        return None
+    link = Path(m.group(1))
+    if link.is_absolute():
+        return link if link.is_file() else None
+    repo = (repo or repo_root_for(plan)).resolve()
+    for cand in (repo / link, plan.parent / link, plan.parent / link.name):
+        if cand.is_file():
+            return cand
+    return None
+
+
+def brief_block(plan_path: str | os.PathLike[str], repo: Path | None = None) -> str:
+    """Prompt section carrying the linked DISCOVER brief, if any."""
+    brief = linked_brief(plan_path, repo)
+    if brief is None:
+        return ""
+    body = brief.read_bytes()[:_INSTRUCTION_MAX_BYTES].decode("utf-8", errors="replace")
+    return "\n".join([
+        f"DISCOVER brief the operator decided on ({brief}). The plan must "
+        "implement its Decision:",
+        "",
+        body.rstrip(),
+    ])
 
 
 def utc_now() -> str:

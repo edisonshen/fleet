@@ -96,6 +96,8 @@ type taskRow struct {
 	// Plan is the plan-review gate state (planreview.State) for todo
 	// tasks; "" for every other status.
 	Plan string
+	// Brief is the DISCOVER badge ("brief" / "brief decided"), "" when none.
+	Brief string
 	// Synthetic markers — set when the row is not a real task entry
 	// but a hint line shown under an expanded project (issue #59):
 	//

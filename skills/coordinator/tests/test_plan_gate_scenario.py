@@ -55,7 +55,18 @@ def test_plan_gate_review_approve_promote(fleet_sandbox, tmp_path: Path) -> None
 
     doc = Path(sb.home) / "repo" / "docs" / f"TASK-PLAN-{SLUG}.md"
     doc.parent.mkdir(parents=True, exist_ok=True)
-    doc.write_text("# Task plan\n\n## Steps\n1. build it\n", encoding="utf-8")
+    brief = doc.parent / f"BRIEF-{SLUG}.md"
+    brief.write_text(
+        "# Brief\n\n## Relevant files\n\n- a.go\n\n## Current behavior\n\nx\n\n"
+        "## Options\n\n### A. one\n\n### B. two\n\n## Open questions\n\n- which?\n\n"
+        "## Decision\n\nTBD\n",
+        encoding="utf-8",
+    )
+    doc.write_text(
+        f"# Task plan\n\nBrief: `docs/BRIEF-{SLUG}.md`\n\n## Goal\n\ng\n\n## Files\n\n- a.go\n\n"
+        "## Steps\n1. build it\n\n## Verification\n\nscenario\n\n## Open questions\n\nNone.\n",
+        encoding="utf-8",
+    )
     noted = fleet("tasks", "note", "--project", sb.project, SLUG, "--section", "spec",
                   f"Task plan: docs/TASK-PLAN-{SLUG}.md")
     assert noted.returncode == 0, noted.stderr
@@ -77,10 +88,18 @@ def test_plan_gate_review_approve_promote(fleet_sandbox, tmp_path: Path) -> None
     self_approve = fleet("tasks", "approve", "--project", sb.project, SLUG, env=coord_env)
     assert self_approve.returncode != 0 and "operator-only" in self_approve.stderr
 
+    undecided = fleet("tasks", "approve", "--project", sb.project, SLUG)
+    assert undecided.returncode != 0 and "(incomplete)" in undecided.stderr, undecided.stderr
+    assert "unanswered open questions" in undecided.stderr, undecided.stderr
+    brief.write_text(
+        brief.read_text().replace("- which?", "None.").replace("TBD", "Option A."),
+        encoding="utf-8",
+    )
+
     approved = fleet("tasks", "approve", "--project", sb.project, SLUG)
     assert approved.returncode == 0, approved.stderr
 
-    doc.write_text(doc.read_text() + "2. and one more thing\n", encoding="utf-8")
+    doc.write_text(doc.read_text().replace("1. build it", "1. build it\n2. and one more thing"), encoding="utf-8")
     blocked = fleet("tasks", "promote", "--project", sb.project, SLUG)
     assert "(stale)" in blocked.stderr, blocked.stderr
 

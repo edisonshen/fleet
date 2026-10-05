@@ -15,6 +15,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"strings"
 	"time"
 
 	"github.com/edisonshen/fleet/internal/projects"
@@ -72,6 +73,7 @@ const (
 	StateUnreviewed State = "unreviewed"
 	StateStale      State = "stale"
 	StateFindings   State = "findings"
+	StateIncomplete State = "incomplete"
 	StateReviewed   State = "reviewed"
 	StateApproved   State = "approved"
 	StateForced     State = "forced"
@@ -85,6 +87,13 @@ type Status struct {
 	Review   *Review
 	Approval *Approval
 	Err      error
+	// Brief is the DISCOVER brief path (linked from the plan, else the
+	// conventional <repo>/docs/BRIEF-<slug>.md when it exists).
+	Brief        string
+	BriefDecided bool
+	// Problems are structural gaps (CheckStructure) that keep a clean
+	// review from being approvable.
+	Problems []string
 }
 
 // ErrNoDoc means the task text links no TASK-PLAN doc.
@@ -247,13 +256,22 @@ func Evaluate(project string, t *tasks.Task) Status {
 func EvaluateIn(projectDir, repoPath string, t *tasks.Task) Status {
 	doc, err := resolveDoc(repoPath, t)
 	if err != nil {
-		return Status{State: StateNoDoc, Err: err}
+		st := Status{State: StateNoDoc, Err: err}
+		st.Brief, st.BriefDecided = conventionalBrief(repoPath, t.Slug)
+		return st
 	}
-	sha, err := HashFile(doc)
+	data, err := os.ReadFile(doc)
 	if err != nil {
 		return Status{State: StateNoDoc, Doc: doc, Err: err}
 	}
+	sum := sha256.Sum256(data)
+	sha := hex.EncodeToString(sum[:])
 	st := Status{Doc: doc, SHA: sha}
+	st.Brief, st.Problems = CheckStructure(doc, repoPath, data)
+	if st.Brief == "" {
+		st.Brief, _ = conventionalBrief(repoPath, t.Slug)
+	}
+	st.BriefDecided = st.Brief != "" && !hasBriefProblem(st.Problems)
 	reviewPath, err := recordPathIn(projectDir, t.Slug, ".json")
 	if err == nil {
 		st.Review, err = readReview(reviewPath)
@@ -274,6 +292,8 @@ func EvaluateIn(projectDir, repoPath string, t *tasks.Task) Status {
 		st.State = StateStale
 	case !st.Review.Clean:
 		st.State = StateFindings
+	case len(st.Problems) > 0:
+		st.State = StateIncomplete
 	case st.Approval == nil || st.Approval.DocSHA256 != sha:
 		st.State = StateReviewed
 	case st.Approval.Forced:
@@ -314,6 +334,9 @@ func (s Status) Explain(project, slug string) string {
 	case StateFindings:
 		return fmt.Sprintf("plan review not clean (%d P0/P1 finding(s), exit %d) — fix the doc and re-run %s",
 			s.Review.Blocking(), s.Review.Exit, review)
+	case StateIncomplete:
+		return "plan/brief incomplete: " + strings.Join(s.Problems, "; ") +
+			" — fix the docs (see `fleet tasks brief " + slug + " --project " + project + "`) and re-run " + review
 	case StateReviewed:
 		if s.Approval != nil {
 			return fmt.Sprintf("approval is for an older revision of the plan — `fleet tasks approve %s --project %s`", slug, project)
@@ -324,4 +347,27 @@ func (s Status) Explain(project, slug string) string {
 	default:
 		return "plan reviewed clean and approved"
 	}
+}
+
+// conventionalBrief reports <repo>/docs/BRIEF-<slug>.md when it exists,
+// so the DISCOVER phase is visible before any plan links it.
+func conventionalBrief(repoPath, slug string) (string, bool) {
+	if repoPath == "" || slug == "" || slug != filepath.Base(slug) || slug == "." || slug == ".." {
+		return "", false
+	}
+	p := filepath.Join(repoPath, "docs", "BRIEF-"+slug+".md")
+	data, err := os.ReadFile(p)
+	if err != nil {
+		return "", false
+	}
+	return p, len(CheckBrief(data)) == 0
+}
+
+func hasBriefProblem(probs []string) bool {
+	for _, p := range probs {
+		if strings.HasPrefix(p, "brief ") || strings.Contains(p, "DISCOVER brief") {
+			return true
+		}
+	}
+	return false
 }

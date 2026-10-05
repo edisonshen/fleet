@@ -8,6 +8,16 @@ follows [SemVer](https://semver.org/).
 
 ### Added
 
+- cli: `fleet tasks brief <slug> [--plan]` starts a DISCOVER phase before
+  the task plan (like Devin's Interactive Planner): it scaffolds
+  `docs/BRIEF-<slug>.md` (Relevant files, Current behavior, Options, Open
+  questions, Decision) for a read-only research subagent and the operator's
+  decision, and with `--plan` a linked `docs/TASK-PLAN-<slug>.md` template.
+  `fleet tasks approve` / `promote` now report `incomplete` for a plan
+  missing Goal / Files / Steps / Verification / Open questions, with open
+  questions, or whose brief is undecided. Plan reviewers receive the brief
+  and flag drift from its Decision. The TUI shows a `brief` /
+  `brief decided` badge and `workflow.md` gains a `discover` phase.
 - coord: plan-review runner. `review_slot.py --plan docs/TASK-PLAN-<slug>.md
   --project <p> --slug <slug>` reviews a task-plan Markdown doc instead of
   a diff (design fidelity, code reality, implementability, scenario

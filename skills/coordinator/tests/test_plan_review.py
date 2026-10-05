@@ -263,3 +263,23 @@ def test_prompt_carries_instructions(tmp_path):
     prompt = plan_review.plan_review_prompt(str(plan), "abc", plan_review.instructions_block(plan))
     assert "tui review rules" in prompt
     assert prompt.rstrip().endswith("no prose, markdown, or code fences.")
+
+
+def test_brief_block_includes_linked_decided_brief(tmp_path):
+    repo = tmp_path / "repo"
+    (repo / ".git").mkdir(parents=True)
+    (repo / "docs").mkdir()
+    (repo / "docs" / "BRIEF-x.md").write_text("## Decision\n\nOption B: cache it\n", encoding="utf-8")
+    plan = repo / "docs" / "TASK-PLAN-x.md"
+    plan.write_text("# plan\nBrief: `docs/BRIEF-x.md`\n", encoding="utf-8")
+    block = plan_review.brief_block(plan)
+    assert "DISCOVER brief" in block and "Option B: cache it" in block
+    plan.write_text("# plan, no brief\n", encoding="utf-8")
+    assert plan_review.brief_block(plan) == ""
+    plan.write_text("# plan\nBrief: docs/BRIEF-missing.md\n", encoding="utf-8")
+    assert plan_review.brief_block(plan) == ""
+
+
+def test_plan_prompt_checks_brief_fidelity():
+    prompt = plan_review.plan_review_prompt("/r/docs/TASK-PLAN-x.md", "abc")
+    assert "Brief fidelity" in prompt and "Decision" in prompt

@@ -56,6 +56,7 @@ per-project state-lock, so concurrent invocations are safe.`,
 		newTasksArchiveCmd(),
 		newTasksPromoteCmd(),
 		newTasksApproveCmd(),
+		newTasksBriefCmd(),
 	)
 	return cmd
 }

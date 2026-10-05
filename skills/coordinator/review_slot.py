@@ -488,7 +488,13 @@ def main() -> int:
     args = parse_args()
     plan = os.path.abspath(args.plan) if args.plan else None
     sha = plan_review.doc_sha256(plan) if plan else None
-    instructions = plan_review.instructions_block(plan) if plan else ""
+    instructions = (
+        "\n\n".join(
+            x for x in (plan_review.brief_block(plan), plan_review.instructions_block(plan)) if x
+        )
+        if plan
+        else ""
+    )
 
     def spec(engine: str, model: str, name: str = "slot") -> SlotSpec:
         return SlotSpec(
