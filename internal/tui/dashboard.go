@@ -31,6 +31,7 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 
+	"github.com/edisonshen/fleet/internal/planreview"
 	"github.com/edisonshen/fleet/internal/state"
 	"github.com/edisonshen/fleet/internal/tasks"
 	"github.com/edisonshen/fleet/internal/workers"
@@ -333,6 +334,7 @@ func scanProject(projectsRoot, name string, now time.Time, incidentCount int) (*
 	// source of truth for task history while the TUI surface stays
 	// uncluttered by default.
 	if f, err := tasks.Read(filepath.Join(dir, "tasks.md")); err == nil {
+		repoPath, repoRead := "", false
 		for _, t := range f.Tasks {
 			switch t.Status {
 			case tasks.StatusTodo, tasks.StatusReady:
@@ -346,11 +348,18 @@ func scanProject(projectsRoot, name string, now time.Time, incidentCount int) (*
 			case tasks.StatusDone:
 				row.Counts.Done++
 			}
-			row.Tasks = append(row.Tasks, &taskRow{
+			tr := &taskRow{
 				Slug:   t.Slug,
 				Status: string(t.Status),
 				PRURL:  t.PRURL,
-			})
+			}
+			if t.Status == tasks.StatusTodo {
+				if !repoRead {
+					repoPath, repoRead = metaRepoPath(dir), true
+				}
+				tr.Plan = string(planreview.EvaluateIn(dir, repoPath, t).State)
+			}
+			row.Tasks = append(row.Tasks, tr)
 		}
 	}
 
@@ -1003,4 +1012,20 @@ func (s *Snapshot) AttentionProjects() int {
 		}
 	}
 	return n
+}
+
+// metaRepoPath reads repo_path from <projectDir>/meta.json; "" when absent
+// or unreadable (plan links then resolve against cwd).
+func metaRepoPath(projectDir string) string {
+	data, err := os.ReadFile(filepath.Join(projectDir, "meta.json"))
+	if err != nil {
+		return ""
+	}
+	var m struct {
+		RepoPath string `json:"repo_path"`
+	}
+	if json.Unmarshal(data, &m) != nil {
+		return ""
+	}
+	return m.RepoPath
 }

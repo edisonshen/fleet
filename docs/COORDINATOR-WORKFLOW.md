@@ -124,7 +124,7 @@ Three kinds of doc, three owners:
 | Doc | Path | Owner | What it's for |
 |-----|------|-------|---------------|
 | Subagent doc | `~/.fleet/subagent-wip/<task-tag>.md` | worker / reviewer / finisher / fix / rebase subagent | Phase log per the global Subagent Dispatch Contract. Coord reads on BLOCKED to recover. |
-| Progress doc | `~/.fleet/projects/<project>/workflow.md` | **coord** | Operator-readable phase log. One section per task with `phase = discussing \| approved \| dispatched \| reviewing \| pr-open \| merged \| blocked`. |
+| Progress doc | `~/.fleet/projects/<project>/workflow.md` | **coord** | Operator-readable phase log. One section per task with `phase = discussing \| plan-review \| approved \| dispatched \| reviewing \| pr-open \| merged \| blocked`. |
 | Coord doc | `~/.fleet/agents/<coord-id>.json` | fleet-guard | Live-state heartbeat the TUI renders. No coord-side change. |
 
 The **progress doc** has a stable schema:
@@ -139,7 +139,7 @@ updated_at: <RFC3339 UTC>
 # workflow
 
 ## <slug-1>
-- phase: <discussing | approved | dispatched | reviewing | pr-open | merged | blocked>
+- phase: <discussing | plan-review | approved | dispatched | reviewing | pr-open | merged | blocked>
 - updated_at: <RFC3339 UTC>
 - pr_url: <url or empty>
 - note: <optional one-line context>

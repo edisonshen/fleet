@@ -23,6 +23,7 @@ def test_phases_constant_locked() -> None:
     # both docs and bump the schema version.
     assert ws.PHASES == (
         "discussing",
+        "plan-review",
         "approved",
         "dispatched",
         "reviewing",

@@ -107,16 +107,20 @@ func LinkedDoc(t *tasks.Task) string {
 // Relative links resolve against the project's repo_path (meta.json),
 // falling back to the current directory for unregistered projects.
 func ResolveDoc(project string, t *tasks.Task) (string, error) {
+	base := ""
+	if m, err := projects.Read(project); err == nil {
+		base = m.RepoPath
+	}
+	return resolveDoc(base, t)
+}
+
+func resolveDoc(base string, t *tasks.Task) (string, error) {
 	rel := LinkedDoc(t)
 	if rel == "" {
 		return "", ErrNoDoc
 	}
 	path := rel
 	if !filepath.IsAbs(path) {
-		base := ""
-		if m, err := projects.Read(project); err == nil {
-			base = m.RepoPath
-		}
 		if base == "" {
 			cwd, err := os.Getwd()
 			if err != nil {
@@ -142,19 +146,16 @@ func HashFile(path string) (string, error) {
 	return hex.EncodeToString(sum[:]), nil
 }
 
-func dir(project string) (string, error) {
+func recordPath(project, slug, suffix string) (string, error) {
 	d, err := state.ProjectDir(project)
 	if err != nil {
 		return "", err
 	}
-	return filepath.Join(d, "plan-reviews"), nil
+	return recordPathIn(d, slug, suffix)
 }
 
-func recordPath(project, slug, suffix string) (string, error) {
-	d, err := dir(project)
-	if err != nil {
-		return "", err
-	}
+func recordPathIn(projectDir, slug, suffix string) (string, error) {
+	d := filepath.Join(projectDir, "plan-reviews")
 	if slug == "" || slug != filepath.Base(slug) || slug == "." || slug == ".." {
 		return "", fmt.Errorf("planreview: invalid slug %q", slug)
 	}
@@ -181,6 +182,10 @@ func ReadReview(project, slug string) (*Review, error) {
 	if err != nil {
 		return nil, err
 	}
+	return readReview(path)
+}
+
+func readReview(path string) (*Review, error) {
 	var r Review
 	ok, err := readJSON(path, &r)
 	if !ok || err != nil {
@@ -195,6 +200,10 @@ func ReadApproval(project, slug string) (*Approval, error) {
 	if err != nil {
 		return nil, err
 	}
+	return readApproval(path)
+}
+
+func readApproval(path string) (*Approval, error) {
 	var a Approval
 	ok, err := readJSON(path, &a)
 	if !ok || err != nil {
@@ -222,7 +231,21 @@ func WriteApproval(project, slug string, a Approval) error {
 // Evaluate resolves the task's plan doc, hashes it, and compares it with
 // the stored review and approval.
 func Evaluate(project string, t *tasks.Task) Status {
-	doc, err := ResolveDoc(project, t)
+	d, err := state.ProjectDir(project)
+	if err != nil {
+		return Status{State: StateNoDoc, Err: err}
+	}
+	base := ""
+	if m, err := projects.Read(project); err == nil {
+		base = m.RepoPath
+	}
+	return EvaluateIn(d, base, t)
+}
+
+// EvaluateIn is Evaluate for a caller that already holds the project's
+// state dir and repo path (the TUI scanner walks its own projects root).
+func EvaluateIn(projectDir, repoPath string, t *tasks.Task) Status {
+	doc, err := resolveDoc(repoPath, t)
 	if err != nil {
 		return Status{State: StateNoDoc, Err: err}
 	}
@@ -231,12 +254,18 @@ func Evaluate(project string, t *tasks.Task) Status {
 		return Status{State: StateNoDoc, Doc: doc, Err: err}
 	}
 	st := Status{Doc: doc, SHA: sha}
-	if st.Review, err = ReadReview(project, t.Slug); err != nil {
+	reviewPath, err := recordPathIn(projectDir, t.Slug, ".json")
+	if err == nil {
+		st.Review, err = readReview(reviewPath)
+	}
+	if err != nil {
 		st.State, st.Err = StateUnreviewed, err
 		return st
 	}
-	if st.Approval, err = ReadApproval(project, t.Slug); err != nil {
-		st.Err = err
+	if approvalPath, err := recordPathIn(projectDir, t.Slug, ".approval.json"); err == nil {
+		if st.Approval, err = readApproval(approvalPath); err != nil {
+			st.Err = err
+		}
 	}
 	switch {
 	case st.Review == nil:

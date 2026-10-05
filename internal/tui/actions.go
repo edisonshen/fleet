@@ -13,12 +13,14 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 
 	"github.com/edisonshen/fleet/internal/agent"
+	"github.com/edisonshen/fleet/internal/planreview"
 	"github.com/edisonshen/fleet/internal/state"
 	"github.com/edisonshen/fleet/internal/tasks"
 	"github.com/edisonshen/fleet/internal/workers"
@@ -397,6 +399,9 @@ func readTaskDetail(project, slug string) (body, title string, loaded bool) {
 	if len(t.DependsOn) > 0 {
 		fmt.Fprintf(&b, "depends:   %s\n", strings.Join(t.DependsOn, ", "))
 	}
+	if t.Status == tasks.StatusTodo || t.Status == tasks.StatusReady {
+		writePlanReview(&b, project, t)
+	}
 
 	// Worker context (issue #75). Branches:
 	//   1. active worker present — render slug/phase/PID +
@@ -748,4 +753,74 @@ func readLastLines(path string, n int) (string, error) {
 		lines = lines[len(lines)-n:]
 	}
 	return strings.Join(lines, "\n") + "\n", nil
+}
+
+// planSeverities / planCategories fix the findings-pane order: most severe
+// first, then Devin-Review-style Bugs / Flags / Security buckets.
+var (
+	planSeverities = []string{"P0", "P1", "P2", "P3"}
+	planCategories = []struct{ key, label string }{
+		{"bug", "Bugs"}, {"flag", "Flags"}, {"security", "Security"},
+	}
+)
+
+// writePlanReview renders the task's plan-gate state and the latest plan
+// review's findings, grouped by severity then category.
+func writePlanReview(b *strings.Builder, project string, t *tasks.Task) {
+	st := planreview.Evaluate(project, t)
+	b.WriteString("\n### Plan review\n")
+	fmt.Fprintf(b, "gate:      %s\n", st.State)
+	if st.Doc != "" {
+		fmt.Fprintf(b, "doc:       %s\n", st.Doc)
+	}
+	fmt.Fprintf(b, "next:      %s\n", st.Explain(project, t.Slug))
+	if a := st.Approval; a != nil && a.DocSHA256 == st.SHA {
+		fmt.Fprintf(b, "approved:  %s by %s\n", a.ApprovedAt.UTC().Format(time.RFC3339), a.ApprovedBy)
+	}
+	r := st.Review
+	if r == nil {
+		return
+	}
+	fmt.Fprintf(b, "reviewed:  %s (exit %d)\n", r.ReviewedAt, r.Exit)
+	slots := make([]string, 0, len(r.Slots))
+	for name := range r.Slots {
+		slots = append(slots, name)
+	}
+	sort.Strings(slots)
+	for _, name := range slots {
+		s := r.Slots[name]
+		line := fmt.Sprintf("  %-6s %s/%s exit %d", name, s.Engine, s.Model, s.Exit)
+		if s.SkipReason != nil {
+			line += " skipped: " + *s.SkipReason
+		}
+		if s.Error != nil {
+			line += " error: " + *s.Error
+		}
+		b.WriteString(line + "\n")
+	}
+	if len(r.Findings) == 0 {
+		b.WriteString("findings:  none\n")
+		return
+	}
+	for _, sev := range planSeverities {
+		for _, cat := range planCategories {
+			var hits []planreview.Finding
+			for _, f := range r.Findings {
+				if strings.EqualFold(f.Severity, sev) && strings.EqualFold(f.Category, cat.key) {
+					hits = append(hits, f)
+				}
+			}
+			if len(hits) == 0 {
+				continue
+			}
+			fmt.Fprintf(b, "%s %s (%d)\n", sev, cat.label, len(hits))
+			for _, f := range hits {
+				where := f.Section
+				if where == "" {
+					where = "-"
+				}
+				fmt.Fprintf(b, "  - [%s] %s (%s)\n", where, f.Summary, f.Slot)
+			}
+		}
+	}
 }

@@ -14,6 +14,10 @@ follows [SemVer](https://semver.org/).
   contract, security). Findings carry P0–P3 severity plus a bug / flag /
   security category, and the result is saved with the doc's sha256 to
   `~/.fleet/projects/<p>/plan-reviews/<slug>.json`.
+- tui: todo task rows carry a `plan <state>` badge (unreviewed / findings /
+  stale / reviewed / approved) and the task detail panel shows a Plan review
+  pane with slot results and findings grouped by severity then
+  Bugs / Flags / Security. `workflow.md` gains a `plan-review` phase.
 - cli: `fleet tasks approve <slug>` records operator approval of a task's
   plan doc, pinned to its sha256. Refused from coord/worker shells and
   unless the latest plan review is clean and current.

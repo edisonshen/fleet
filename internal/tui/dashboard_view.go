@@ -27,6 +27,7 @@ import (
 	"github.com/charmbracelet/lipgloss"
 
 	"github.com/edisonshen/fleet/internal/agent"
+	"github.com/edisonshen/fleet/internal/planreview"
 	"github.com/edisonshen/fleet/internal/tmux"
 )
 
@@ -1532,7 +1533,26 @@ func taskBlockLine(t *taskRow, w int, selected bool) string {
 		glyph = "✗"
 		glyphStyle = dimStyle
 	}
+	if t.Plan != "" {
+		tail += " " + planBadgeStyle(t.Plan).Render("· plan "+t.Plan)
+	}
 	return prefix + glyphStyle.Render(glyph) + " " + slug + tail
+}
+
+// planBadgeStyle colors the todo-row plan-gate badge: green when promote
+// would pass, orange when the review found problems or went stale, dim
+// while the plan is still waiting on a step.
+func planBadgeStyle(state string) lipgloss.Style {
+	switch planreview.State(state) {
+	case planreview.StateApproved, planreview.StateForced:
+		return statusLiveStyle
+	case planreview.StateFindings, planreview.StateStale:
+		return statusBlockedStyle
+	case planreview.StateReviewed:
+		return statusReviewStyle
+	default:
+		return dimStyle
+	}
 }
 
 // prNumberFromURL extracts the trailing /pull/<N> number from a PR

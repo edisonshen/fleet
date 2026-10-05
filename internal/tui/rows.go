@@ -93,6 +93,9 @@ type taskRow struct {
 	// can see the link without opening the detail panel. Empty for
 	// non-history rows + history rows whose task never opened a PR.
 	PRURL string
+	// Plan is the plan-review gate state (planreview.State) for todo
+	// tasks; "" for every other status.
+	Plan string
 	// Synthetic markers — set when the row is not a real task entry
 	// but a hint line shown under an expanded project (issue #59):
 	//
