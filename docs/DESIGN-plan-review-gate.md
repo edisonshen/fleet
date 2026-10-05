@@ -25,6 +25,10 @@ explicit approval before any implementation starts.
    `review_slot.py --plan <doc> --project <p> --slug <slug> --both ...`.
    The record lands at `~/.fleet/projects/<p>/plan-reviews/<slug>.json`
    with the sha256 of the reviewed bytes.
+   The prompt includes `REVIEW.md` / `AGENTS.md` files whose directory
+   covers the repo root, the plan's dir, or any path the plan names
+   (files under `.agents/`, `.devin/`, `.cursor/`, `.github/` scope to
+   the parent), root-most first so deeper rules read as more specific.
 3. Operator runs `fleet tasks approve <slug>`; it only succeeds when the
    latest review is clean and its sha256 matches the doc on disk, and it
    records the approval against that same sha256.

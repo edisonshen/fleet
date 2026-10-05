@@ -14,6 +14,10 @@ follows [SemVer](https://semver.org/).
   contract, security). Findings carry P0–P3 severity plus a bug / flag /
   security category, and the result is saved with the doc's sha256 to
   `~/.fleet/projects/<p>/plan-reviews/<slug>.json`.
+- coord: `review_slot.py --plan` feeds reviewers the repo's `REVIEW.md` /
+  `AGENTS.md` files scoped by directory like Devin Review: the repo root,
+  the plan's dir, and every ancestor of a path the plan references
+  (`.agents/`, `.devin/`, `.cursor/`, `.github/` count as the parent).
 - tui: todo task rows carry a `plan <state>` badge (unreviewed / findings /
   stale / reviewed / approved) and the task detail panel shows a Plan review
   pane with slot results and findings grouped by severity then

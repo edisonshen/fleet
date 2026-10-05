@@ -130,6 +130,7 @@ class SlotSpec:
     name: str = "slot"
     plan: str | None = None
     plan_sha: str | None = None
+    plan_instructions: str = ""
 
 
 def slot_schema(spec: SlotSpec) -> dict[str, Any]:
@@ -138,7 +139,9 @@ def slot_schema(spec: SlotSpec) -> dict[str, Any]:
 
 def slot_prompt(spec: SlotSpec) -> str:
     if spec.plan:
-        return plan_review.plan_review_prompt(spec.plan, spec.plan_sha or "")
+        return plan_review.plan_review_prompt(
+            spec.plan, spec.plan_sha or "", spec.plan_instructions
+        )
     return structured_review_prompt(spec.task_context)
 
 
@@ -485,10 +488,12 @@ def main() -> int:
     args = parse_args()
     plan = os.path.abspath(args.plan) if args.plan else None
     sha = plan_review.doc_sha256(plan) if plan else None
+    instructions = plan_review.instructions_block(plan) if plan else ""
 
     def spec(engine: str, model: str, name: str = "slot") -> SlotSpec:
         return SlotSpec(
-            engine, model, args.effort, args.base, args.task_context, name, plan, sha
+            engine, model, args.effort, args.base, args.task_context, name, plan, sha,
+            instructions,
         )
 
     if not args.both:

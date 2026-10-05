@@ -229,6 +229,9 @@ Rules:
   into bug / flag / security with P0–P3 severity, and records the result
   with the doc's sha256 at `~/.fleet/projects/<p>/plan-reviews/<slug>.json`.
   Any later edit to the doc makes that record stale; re-run after fixes.
+  Reviewers also get the repo's `REVIEW.md` / `AGENTS.md` scoped by
+  directory (root, the plan's dir, and ancestors of every path the plan
+  references); put per-area review rules there, not in the prompt.
 - Fan-out: with many task plans, per-plan reviewers also dispatch in parallel;
   only the cross-task-seam pass needs the full plan set in one reviewer's
   context.
