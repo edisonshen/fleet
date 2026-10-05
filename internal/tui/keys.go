@@ -995,8 +995,8 @@ func (m Model) actionAttach() (Model, tea.Cmd, bool) {
 // paste the command without tripping over cross-project context.
 func noWorkerHintTodo(project, slug string) string {
 	return fmt.Sprintf(
-		"task %s/%s is todo — `fleet tasks promote %s --project %s` to make it eligible for the coord",
-		project, slug, slug, project)
+		"task %s/%s is todo — review its plan, `fleet tasks approve %s --project %s`, then `fleet tasks promote %s --project %s` to make it eligible for the coord",
+		project, slug, slug, project, slug, project)
 }
 
 func noWorkerHintReady(project, slug string) string {

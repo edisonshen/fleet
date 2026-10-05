@@ -3120,7 +3120,9 @@ func TestCoordSpawnPrompt_IncludesPlanDocGate(t *testing.T) {
 		"docs/TASK-PLAN-<slug>.md",
 		"docs/TASK-PLAN-<slug>.html",
 		"fleet tasks note --project demo <slug> --section spec",
-		"linked or embedded",
+		"linked (not just embedded)",
+		"fleet tasks approve <slug>",
+		"review_slot.py --plan docs/TASK-PLAN-<slug>.md --project demo",
 		"approved implementation plan",
 	} {
 		if !strings.Contains(prompt, marker) {

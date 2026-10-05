@@ -25,6 +25,7 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"github.com/edisonshen/fleet/internal/planreview"
 	"github.com/edisonshen/fleet/internal/state"
 	"github.com/edisonshen/fleet/internal/tasks"
 	"github.com/edisonshen/fleet/internal/tui"
@@ -54,6 +55,7 @@ per-project state-lock, so concurrent invocations are safe.`,
 		newTasksNoteCmd(),
 		newTasksArchiveCmd(),
 		newTasksPromoteCmd(),
+		newTasksApproveCmd(),
 	)
 	return cmd
 }
@@ -1352,6 +1354,7 @@ func runTasksArchive(opts *tasksArchiveOpts, slugs []string, stdout io.Writer) e
 
 type tasksPromoteOpts struct {
 	project string
+	force   string
 }
 
 func newTasksPromoteCmd() *cobra.Command {
@@ -1364,6 +1367,12 @@ todo + spawned_by=<agent-slug> precisely so the coordinator skips them
 until an operator promotes (PLAN failure-mode "worker fires recursive
 bug-files"). This is the operator-side gate.
 
+Plan gate: the task must link a TASK-PLAN doc (` + "`Task plan: docs/TASK-PLAN-<slug>.md`" + `)
+whose current sha256 matches a clean ` + "`review_slot.py --plan`" + ` record AND an
+operator ` + "`fleet tasks approve`" + `. Editing the doc after review/approval
+re-blocks promote. ` + "`--force <reason>`" + ` bypasses the gate (operator shells
+only); the override is recorded in the approval file.
+
 Any other status is rejected with a non-zero exit — including an already-ready
 task, since a repeat promote means the caller's view is stale. Use
 ` + "`fleet tasks set <slug> status=...`" + ` to override explicitly.`,
@@ -1373,7 +1382,27 @@ task, since a repeat promote means the caller's view is stale. Use
 		},
 	}
 	cmd.Flags().StringVar(&opts.project, "project", "", "project name (default: cwd basename)")
+	cmd.Flags().StringVar(&opts.force, "force", "", "bypass the plan-review gate; the reason is recorded")
 	return cmd
+}
+
+// agentShellRole reports the FLEET_ROLE of an agent shell (coord / worker),
+// or "" for an operator shell. Approvals and gate overrides are operator-only.
+func agentShellRole() string {
+	role := strings.ToLower(strings.TrimSpace(os.Getenv("FLEET_ROLE")))
+	if role == "coord" || role == "worker" {
+		return role
+	}
+	return ""
+}
+
+func operatorName() string {
+	for _, k := range []string{"FLEET_OPERATOR", "USER", "LOGNAME"} {
+		if v := strings.TrimSpace(os.Getenv(k)); v != "" {
+			return v
+		}
+	}
+	return "operator"
 }
 
 func runTasksPromote(opts *tasksPromoteOpts, slug string, stdout io.Writer) error {
@@ -1405,6 +1434,9 @@ func runTasksPromote(opts *tasksPromoteOpts, slug string, stdout io.Writer) erro
 		}
 		switch t.Status {
 		case tasks.StatusTodo:
+			if err := checkPlanGate(project, t, opts.force); err != nil {
+				return err
+			}
 			t.Status = tasks.StatusReady
 			t.Updated = time.Now().UTC()
 			if err := tasks.Write(path, f); err != nil {
@@ -1423,7 +1455,97 @@ func runTasksPromote(opts *tasksPromoteOpts, slug string, stdout io.Writer) erro
 		return err
 	}
 	if promoted {
-		recordAutoDecision(project, fmt.Sprintf("promoted %s todo → ready", slug), os.Stderr)
+		msg := fmt.Sprintf("promoted %s todo → ready", slug)
+		if opts.force != "" {
+			msg += fmt.Sprintf(" (plan gate forced: %s)", strings.Join(strings.Fields(opts.force), " "))
+		}
+		recordAutoDecision(project, msg, os.Stderr)
 	}
+	return nil
+}
+
+// checkPlanGate refuses promote unless the task's plan doc is reviewed
+// clean and approved at its current sha256. force (operator shells only)
+// bypasses the gate and is recorded as a forced approval.
+func checkPlanGate(project string, t *tasks.Task, force string) error {
+	st := planreview.Evaluate(project, t)
+	if st.State == planreview.StateApproved || st.State == planreview.StateForced {
+		return nil
+	}
+	if strings.TrimSpace(force) == "" {
+		return fmt.Errorf("tasks promote: %s blocked by plan gate (%s): %s — or `--force <reason>`",
+			t.Slug, st.State, st.Explain(project, t.Slug))
+	}
+	if role := agentShellRole(); role != "" {
+		return fmt.Errorf("tasks promote: --force is operator-only (FLEET_ROLE=%s)", role)
+	}
+	flat := strings.Join(strings.Fields(force), " ")
+	if err := planreview.WriteApproval(project, t.Slug, planreview.Approval{
+		Doc: st.Doc, DocSHA256: st.SHA, ApprovedBy: operatorName(),
+		ApprovedAt: time.Now().UTC(), Forced: true,
+		Reason: fmt.Sprintf("%s (gate was %s)", flat, st.State),
+	}); err != nil {
+		return fmt.Errorf("tasks promote: record forced approval: %w", err)
+	}
+	return nil
+}
+
+// ---------- fleet tasks approve ----------
+
+type tasksApproveOpts struct {
+	project string
+}
+
+func newTasksApproveCmd() *cobra.Command {
+	opts := &tasksApproveOpts{}
+	cmd := &cobra.Command{
+		Use:   "approve <slug>",
+		Short: "Approve a task's reviewed plan doc (operator gate before promote)",
+		Long: `approve records operator approval of the task's linked TASK-PLAN doc,
+pinned to the doc's current sha256. It refuses unless the latest
+` + "`review_slot.py --plan`" + ` record is clean and matches the doc as it is now,
+and it refuses from coord/worker shells (FLEET_ROLE) so an agent cannot
+approve its own plan. Editing the doc afterwards invalidates the approval.`,
+		Args: cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return runTasksApprove(opts, args[0], cmd.OutOrStdout())
+		},
+	}
+	cmd.Flags().StringVar(&opts.project, "project", "", "project name (default: cwd basename)")
+	return cmd
+}
+
+func runTasksApprove(opts *tasksApproveOpts, slug string, stdout io.Writer) error {
+	if role := agentShellRole(); role != "" {
+		return fmt.Errorf("tasks approve: operator-only (FLEET_ROLE=%s); ask the operator to approve", role)
+	}
+	if _, err := state.Bootstrap(); err != nil {
+		return fmt.Errorf("bootstrap: %w", err)
+	}
+	project, err := resolveProject(opts.project)
+	if err != nil {
+		return err
+	}
+	f, _, err := readTasks(project)
+	if err != nil {
+		return err
+	}
+	t, err := f.Get(slug)
+	if err != nil {
+		return err
+	}
+	st := planreview.Evaluate(project, t)
+	switch st.State {
+	case planreview.StateReviewed, planreview.StateApproved, planreview.StateForced:
+	default:
+		return fmt.Errorf("tasks approve: %s cannot be approved (%s): %s",
+			slug, st.State, st.Explain(project, slug))
+	}
+	if err := planreview.WriteApproval(project, slug, planreview.Approval{
+		Doc: st.Doc, DocSHA256: st.SHA, ApprovedBy: operatorName(), ApprovedAt: time.Now().UTC(),
+	}); err != nil {
+		return fmt.Errorf("tasks approve: %w", err)
+	}
+	_, _ = fmt.Fprintf(stdout, "approved %s plan %s (sha256 %s)\n", slug, st.Doc, st.SHA[:12])
 	return nil
 }

@@ -14,6 +14,17 @@ follows [SemVer](https://semver.org/).
   contract, security). Findings carry P0–P3 severity plus a bug / flag /
   security category, and the result is saved with the doc's sha256 to
   `~/.fleet/projects/<p>/plan-reviews/<slug>.json`.
+- cli: `fleet tasks approve <slug>` records operator approval of a task's
+  plan doc, pinned to its sha256. Refused from coord/worker shells and
+  unless the latest plan review is clean and current.
+
+### Changed
+
+- cli: `fleet tasks promote` now enforces the plan gate: the task must link
+  a `TASK-PLAN-*.md` doc whose current sha256 matches a clean plan review
+  and an operator approval. Editing the doc re-blocks promote.
+  `--force <reason>` overrides (operator shells only) and is recorded as a
+  forced approval. Embedded-only plans no longer pass.
 
 ## [0.23.0] - 2026-09-24
 

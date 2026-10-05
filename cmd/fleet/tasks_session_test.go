@@ -58,6 +58,7 @@ func TestTasksAdd_DoesNotWriteCoordState(t *testing.T) {
 func TestTasksPromote_DoesNotWriteCoordState(t *testing.T) {
 	home, project := setupTasksHome(t)
 	slug := addTodoSlug(t, project, "promote-idle")
+	seedApprovedPlan(t, project, slug)
 	if err := runTasksPromote(&tasksPromoteOpts{project: project}, slug, &bytes.Buffer{}); err != nil {
 		t.Fatalf("promote: %v", err)
 	}
@@ -71,6 +72,7 @@ func TestTasksPromote_DoesNotWriteCoordState(t *testing.T) {
 func TestTasksPromote_StillFlipsStatus(t *testing.T) {
 	_, project := setupTasksHome(t)
 	slug := addTodoSlug(t, project, "promote-flips")
+	seedApprovedPlan(t, project, slug)
 	if err := runTasksPromote(&tasksPromoteOpts{project: project}, slug, &bytes.Buffer{}); err != nil {
 		t.Fatalf("promote: %v", err)
 	}

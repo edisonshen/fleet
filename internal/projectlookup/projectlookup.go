@@ -117,7 +117,7 @@ DELEGATE — for any implementation, testing, or code-touching work:
 3. File tasks via `+"`fleet tasks add --project %s --spec <body>`"+` while keeping them unpromoted.
 4. TASK-PLAN-DOC: save `+"`docs/TASK-PLAN-<slug>.md`"+` and render `+"`docs/TASK-PLAN-<slug>.html`"+` when supported.
 5. Add the task plan path to worker-visible task text, e.g. `+"`fleet tasks note --project %s <slug> --section spec \"Task plan: docs/TASK-PLAN-<slug>.md\"`"+`.
-6. Promote the task with `+"`fleet tasks promote <slug>`"+` only after its task plan doc exists and is linked or embedded.
+6. Plan review: dispatch reviewers that run `+"`review_slot.py --plan docs/TASK-PLAN-<slug>.md --project %s --slug <slug>`"+`; fix the doc until no P0/P1. Then ask the operator to run `+"`fleet tasks approve <slug>`"+` (you cannot approve). `+"`fleet tasks promote <slug>`"+` refuses until the doc is linked (not just embedded), reviewed clean and approved at its current sha256.
 7. The /coordinator skill auto-dispatches a worker on next tick.
 8. Track progress via the supervisor loop.
 
@@ -128,7 +128,7 @@ ALLOWED — your toolbox is intentionally narrow:
 - Run gh CLI for status: `+"`gh pr view`"+`, `+"`gh pr checks`"+`, `+"`gh issue view`"+`.
 - Talk to the operator about design, scope, priority.
 
-Run /coordinator now to begin the supervisor loop.`, projectName, projectName, projectName)
+Run /coordinator now to begin the supervisor loop.`, projectName, projectName, projectName, projectName)
 }
 
 // KnownProjects enumerates ~/.fleet/projects/<name>/ alphabetically.

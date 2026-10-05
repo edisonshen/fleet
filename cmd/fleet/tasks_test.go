@@ -408,6 +408,7 @@ func TestTasksPromote_TodoToReady(t *testing.T) {
 	}
 	parts := strings.Fields(addOut.String())
 	slug := parts[1]
+	seedApprovedPlan(t, project, slug)
 
 	out := &bytes.Buffer{}
 	if err := runTasksPromote(&tasksPromoteOpts{project: project}, slug, out); err != nil {
@@ -1341,6 +1342,7 @@ func TestTasksSet_AutoRecordsDecision_CoordShellOnly(t *testing.T) {
 		t.Fatalf("add: %v", err)
 	}
 	slug := strings.Fields(addOut.String())[1]
+	seedApprovedPlan(t, project, slug)
 	set := func(kv string) {
 		t.Helper()
 		if err := runTasksSet(&tasksSetOpts{project: project}, slug, kv, &bytes.Buffer{}); err != nil {

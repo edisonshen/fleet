@@ -32,13 +32,17 @@ def test_fleet_sandbox_tick_dispatches_ready_task(fleet_sandbox):
         cwd=repo, check=True,
     )
 
-    # Operator flow: file the task (todo), then promote it (ready).
+    # Operator flow: file the task (todo), then promote it (ready). The plan
+    # gate is exercised in test_plan_gate_scenario.py; --force here.
     added = sb.run([
         sb.bin, "tasks", "add", "--project", sb.project, "--slug", "smoke-0001",
         "--priority", "P1", "--spec", "S5 smoke task",
     ])
     assert added.returncode == 0, added.stderr
-    promoted = sb.run([sb.bin, "tasks", "promote", "--project", sb.project, "smoke-0001"])
+    promoted = sb.run([
+        sb.bin, "tasks", "promote", "--project", sb.project, "smoke-0001",
+        "--force", "dispatch smoke: no plan doc",
+    ])
     assert promoted.returncode == 0, promoted.stderr
 
     res = sb.tick()

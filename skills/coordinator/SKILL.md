@@ -57,8 +57,10 @@ binary for anything but that slot, and never assume it exists.
    supported.
 5. Add the doc path to worker-visible task Spec/Acceptance, e.g.
    `fleet tasks note --project <project> <slug> --section spec "Task plan: docs/TASK-PLAN-<slug>.md"`.
-6. `fleet tasks promote <slug>` happens only after the task plan doc exists
-   and is linked or embedded in the task.
+6. `fleet tasks promote <slug>` happens only after the task plan doc exists,
+   is linked in the task, has a clean `review_slot.py --plan` record, and the
+   operator ran `fleet tasks approve <slug>`. The CLI enforces this gate;
+   editing the doc re-blocks it.
 7. Run `/coordinator`; the tick dispatches the next ready worker.
 8. Track workers and PRs through the supervisor loop.
 
@@ -150,14 +152,19 @@ Before any task is promoted to ready, save its worker-ready task plan doc.
 - Contents: parent design doc link, task goal, acceptance criteria,
   expected files/surfaces, a `## Scenario contract` (below), tests removed /
   KEEP, non-goals, dependencies, and approval timestamp.
-- Worker visibility: before promotion, either embed the task plan in Spec or
-  append its path to Spec/Acceptance, for example:
+- Worker visibility: before promotion, append the doc path to
+  worker-visible task text, Spec/Acceptance (the promote gate hashes the linked file, so an embedded
+  plan alone no longer passes), for example:
   `fleet tasks note --project <project> <slug> --section spec "Task plan: docs/TASK-PLAN-<slug>.md"`.
 - Record: after the save, run
   `fleet checkpoint doc --role authored docs/TASK-PLAN-<slug>.md` ("Docs
   (this session)" in the handoff).
-- Promotion: run `fleet tasks promote <slug>` only after the doc exists and is
-  linked or embedded in worker-visible task text.
+- Promotion: run `fleet tasks promote <slug>` only after the doc is linked,
+  reviewed clean (`review_slot.py --plan`), and the operator ran
+  `fleet tasks approve <slug>` — approval is operator-only (refused when
+  `FLEET_ROLE=coord`), pinned to the doc's sha256, and promote refuses
+  otherwise. `fleet tasks promote --force <reason>` is an operator-only
+  override and is recorded.
 
 **Scenario contract (replaces the per-test "test plan" list):**
 
