@@ -309,6 +309,10 @@ def test_skill_md_step5_documents_task_plan_review_sop():
         "the coord applies doc-level fixes (plan docs are its only allowed "
         "write surface) and re-dispatches confirm reviews until BOTH "
         "return no P0/P1",
+        # The plan-review runner persists a sha256-keyed record.
+        "review_slot.py --plan docs/TASK-PLAN-<slug>.md --project <p> "
+        "--slug <slug> --both <slots>",
+        "Any later edit to the doc makes that record stale",
         # Clean reviews never bypass the operator promote gate.
         "Reviews-clean never auto-promotes — the operator promote gate "
         "remains separate",
