@@ -1044,9 +1044,10 @@ func Spawn(opts Options) (*agent.Record, error) {
 	// `fleet -codex` / `-claude` choice → the outgoing coord's engine),
 	// not blindly the predecessor's. The running coord is never touched
 	// by a choice change; it takes effect on exactly this next handoff /
-	// recovery. When the engine flips and the caller handed us a stock
-	// engine wrapper we swap in the new engine's wrapper; a custom
-	// command can't be re-targeted, so the successor keeps its
+	// recovery. When the caller handed us a stock engine wrapper (current
+	// or legacy) we swap in the wanted engine's current wrapper, so the
+	// successor also picks up updated default flags; a custom command
+	// can't be re-targeted, so on an engine flip the successor keeps its
 	// predecessor's engine and we say so on stderr.
 	handoffEngine := ""
 	if opts.OldRecord != nil {
@@ -1056,21 +1057,20 @@ func Spawn(opts Options) (*agent.Record, error) {
 		}
 		if spawnIsCoord {
 			want := resolveCoordHandoffEngine(spawnProject, handoffEngine)
-			if want != handoffEngine {
-				switch _, stock := enginecfg.EngineForWrapperCommand(opts.Command); {
-				case stock && len(opts.ExecCommand) == 0:
-					argv, err := enginecfg.BuildWrapperCommand(want)
-					if err != nil {
-						return nil, fmt.Errorf("handoff engine %q: %w", want, err)
-					}
-					opts.Command = argv
-					rec.Command = append([]string(nil), argv...)
-					handoffEngine = want
-				default:
-					_, _ = fmt.Fprintf(os.Stderr,
-						"warning: coord %s handoff: engine choice is %s but the coord runs a custom command; successor keeps engine %s (re-dispatch with --command to switch)\n",
-						opts.OldRecord.ID, want, handoffEngine)
+			_, stock := enginecfg.EngineForWrapperCommand(opts.Command)
+			switch {
+			case stock && len(opts.ExecCommand) == 0:
+				argv, err := enginecfg.BuildWrapperCommand(want)
+				if err != nil {
+					return nil, fmt.Errorf("handoff engine %q: %w", want, err)
 				}
+				opts.Command = argv
+				rec.Command = append([]string(nil), argv...)
+				handoffEngine = want
+			case want != handoffEngine:
+				_, _ = fmt.Fprintf(os.Stderr,
+					"warning: coord %s handoff: engine choice is %s but the coord runs a custom command; successor keeps engine %s (re-dispatch with --command to switch)\n",
+					opts.OldRecord.ID, want, handoffEngine)
 			}
 		}
 	}

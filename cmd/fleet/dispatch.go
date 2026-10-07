@@ -212,7 +212,7 @@ the record. A full project manifest model lands later (see docs/DESIGN.md
 	// pipelines or alternate engines.
 	cmd.Flags().StringSliceVar(&opts.command, "command",
 		defaultClaudeCommand,
-		"command to run inside the tmux session (default: shell-wrapped claude --dangerously-skip-permissions)")
+		"command to run inside the tmux session (default: shell-wrapped claude --dangerously-skip-permissions --model claude-opus-5-5 --effort medium)")
 	// Auto-resume types "Read your handoff doc at <path> and continue"
 	// into the replacement on handoff. Disable for custom --command
 	// argvs running shells / REPLs / non-claude engines where the

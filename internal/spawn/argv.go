@@ -7,7 +7,7 @@ import "strings"
 // other call sites grep for it. The relaxed matcher in
 // InjectRemoteControlFlag no longer requires byte-equality on the full
 // wrapper, so this constant is now informational rather than load-bearing.
-const DefaultClaudeInvocation = "claude --dangerously-skip-permissions"
+const DefaultClaudeInvocation = "claude --dangerously-skip-permissions --model claude-opus-5-5 --effort medium"
 
 // DefaultClaudeWrapperScript is the EXACT literal of the default
 // --command's third element (the shell script body). The dispatch
@@ -24,7 +24,7 @@ const DefaultClaudeInvocation = "claude --dangerously-skip-permissions"
 // `["sh", "-c", "claude ..."]` shape is rewritten. The constant is
 // still consumed by the dispatch flag default and by tests that pin the
 // default --command's exact bytes.
-const DefaultClaudeWrapperScript = `claude --dangerously-skip-permissions; RC=$?; if [ "$RC" -ne 0 ]; then echo; echo "[fleet] claude exited code $RC — session terminating"; exit "$RC"; fi; echo; echo "[fleet] claude exited cleanly — rerun claude --dangerously-skip-permissions or Ctrl-b then & to kill this session"; exec ${SHELL:-bash} -i`
+const DefaultClaudeWrapperScript = `claude --dangerously-skip-permissions --model claude-opus-5-5 --effort medium; RC=$?; if [ "$RC" -ne 0 ]; then echo; echo "[fleet] claude exited code $RC — session terminating"; exit "$RC"; fi; echo; echo "[fleet] claude exited cleanly — rerun claude --dangerously-skip-permissions --model claude-opus-5-5 --effort medium or Ctrl-b then & to kill this session"; exec ${SHELL:-bash} -i`
 
 // claudeToken is the binary-name-plus-space prefix the relaxed wrapper
 // matcher requires. The trailing space is load-bearing: it prevents

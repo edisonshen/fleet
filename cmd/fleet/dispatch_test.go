@@ -466,7 +466,7 @@ func TestInjectRemoteControlFlag_AnchoredInsertion(t *testing.T) {
 	}
 	// The banner literal is preserved verbatim (anchored insertion does
 	// not touch later occurrences of `claude `).
-	bannerLiteral := `rerun claude --dangerously-skip-permissions or`
+	bannerLiteral := "rerun " + spawn.DefaultClaudeInvocation + " or"
 	if !strings.Contains(got[2], bannerLiteral) {
 		t.Errorf("rewritten wrapper should preserve the banner literal "+
 			"%q; anchored insertion only rewrites the leading claude token; got %q",

@@ -16,8 +16,8 @@ func TestResolveDefaults(t *testing.T) {
 		wantBin string
 		wantCmd string
 	}{
-		{"", "claude", "claude --dangerously-skip-permissions"},
-		{enginecfg.EngineClaudeCode, "claude", "claude --dangerously-skip-permissions"},
+		{"", "claude", "claude --dangerously-skip-permissions --model claude-opus-5-5 --effort medium"},
+		{enginecfg.EngineClaudeCode, "claude", "claude --dangerously-skip-permissions --model claude-opus-5-5 --effort medium"},
 		{enginecfg.EngineCodex, "codex", "codex --dangerously-bypass-approvals-and-sandbox --dangerously-bypass-hook-trust"},
 	}
 	for _, tc := range tests {
@@ -184,6 +184,12 @@ func TestEngineForWrapperCommand(t *testing.T) {
 		if !ok || got != name {
 			t.Errorf("EngineForWrapperCommand(wrapper(%s)) = %q,%v want %q,true", name, got, ok, name)
 		}
+	}
+	legacyClaude := []string{"sh", "-c", enginecfg.WrapperScript(enginecfg.Invocation{
+		Name: enginecfg.EngineClaudeCode, Cmd: "claude --dangerously-skip-permissions", Binary: "claude",
+	})}
+	if got, ok := enginecfg.EngineForWrapperCommand(legacyClaude); !ok || got != enginecfg.EngineClaudeCode {
+		t.Errorf("EngineForWrapperCommand(legacy claude wrapper) = %q,%v want claude-code,true", got, ok)
 	}
 	custom := [][]string{
 		nil,
