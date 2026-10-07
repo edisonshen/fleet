@@ -303,3 +303,30 @@ def test_prompt_carries_instructions(tmp_path):
     prompt = plan_review.plan_review_prompt(str(plan), "abc", plan_review.instructions_block(plan))
     assert "tui review rules" in prompt
     assert prompt.rstrip().endswith("no prose, markdown, or code fences.")
+
+
+def test_new_file_in_existing_dir_picks_up_dir_rules(tmp_path):
+    repo = _scoped_repo(tmp_path)
+    plan = repo / "docs" / "TASK-PLAN-p-0001.md"
+    plan.write_text("## Files\n- `internal/tui/badge.go` (new): render badge.\n")
+    assert "tui review rules" in plan_review.instructions_block(plan)
+
+
+def test_absolute_repo_path_picks_up_dir_rules(tmp_path):
+    repo = _scoped_repo(tmp_path)
+    plan = repo / "docs" / "TASK-PLAN-p-0001.md"
+    plan.write_text(f"edit {repo.resolve()}/internal/store/db.go\n")
+    assert "store-only rules" in plan_review.instructions_block(plan)
+
+
+def test_non_git_project_uses_cwd_as_root(tmp_path, monkeypatch):
+    proj = tmp_path / "proj"
+    (proj / "docs").mkdir(parents=True)
+    (proj / "REVIEW.md").write_text("project rules\n")
+    (proj / "src").mkdir()
+    (proj / "src" / "AGENTS.md").write_text("src rules\n")
+    plan = proj / "docs" / "TASK-PLAN-p-0001.md"
+    plan.write_text("touch src/app.py\n")
+    monkeypatch.chdir(proj)
+    block = plan_review.instructions_block(plan)
+    assert "project rules" in block and "src rules" in block

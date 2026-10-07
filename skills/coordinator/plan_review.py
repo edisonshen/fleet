@@ -123,30 +123,38 @@ INSTRUCTION_FILES = ("REVIEW.md", "AGENTS.md")
 # Devin Review treats files under these dirs as belonging to the parent.
 _META_DIRS = ("", ".agents", ".devin", ".cursor", ".github")
 _INSTRUCTION_MAX_BYTES = 16_000
-_PATH_TOKEN_RE = re.compile(r"[A-Za-z0-9_.][A-Za-z0-9_./-]*")
+_PATH_TOKEN_RE = re.compile(r"/?[A-Za-z0-9_.][A-Za-z0-9_./-]*")
 
 
 def repo_root_for(path: str | os.PathLike[str]) -> Path:
-    """Nearest ancestor of ``path`` holding ``.git``; its own dir otherwise."""
-    start = Path(path).resolve().parent
+    """Nearest ancestor of ``path`` holding ``.git``; else the cwd (the
+    reviewer runs from the project root) when it contains ``path``; else
+    the path's own dir."""
+    resolved = Path(path).resolve()
+    start = resolved.parent
     for d in (start, *start.parents):
         if (d / ".git").exists():
             return d
-    return start
+    cwd = Path.cwd().resolve()
+    return cwd if resolved.is_relative_to(cwd) else start
 
 
 def referenced_dirs(plan_text: str, repo: Path) -> set[Path]:
-    """Repo dirs the plan touches: every token naming an existing repo path."""
+    """Repo dirs the plan touches: for every path-like token (relative to the
+    repo, or absolute inside it), its nearest existing directory, so files
+    the plan adds still pick up their directory's rules."""
     repo = repo.resolve()
     out: set[Path] = set()
     for tok in _PATH_TOKEN_RE.findall(plan_text):
         tok = tok.rstrip(".")
-        if "/" not in tok or tok.startswith("/"):
+        if "/" not in tok.lstrip("/"):
             continue
         cand = (repo / tok).resolve()
-        if not cand.is_relative_to(repo) or not cand.exists():
+        if not cand.is_relative_to(repo):
             continue
-        out.add(cand if cand.is_dir() else cand.parent)
+        while not cand.is_dir():
+            cand = cand.parent
+        out.add(cand)
     return out
 
 
