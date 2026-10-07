@@ -12,8 +12,10 @@
 // semantics) is shared.
 //
 // Default invocations:
-//   - claude-code: `claude --dangerously-skip-permissions` (matches
-//     spawn.DefaultClaudeInvocation; v0 default).
+//   - claude-code: `claude --dangerously-skip-permissions --model
+//     claude-opus-5-5 --effort medium` (matches
+//     spawn.DefaultClaudeInvocation). The explicit model keeps the coord
+//     off whatever the user's Claude default is (e.g. Opus Plan Mode).
 //   - codex:       `codex --dangerously-bypass-approvals-and-sandbox
 //     --dangerously-bypass-hook-trust` — the unattended shape. Fleet
 //     agents run detached in tmux with nobody to answer an approval
@@ -89,7 +91,7 @@ var engineDefaults = map[string]Invocation{
 		// Binary intentionally drops the flag so the wrapper banner
 		// reads "[fleet] claude exited code …" (matches the legacy
 		// DefaultClaudeWrapperScript byte-for-byte).
-		Cmd:    "claude --dangerously-skip-permissions",
+		Cmd:    "claude --dangerously-skip-permissions --model claude-opus-5-5 --effort medium",
 		Binary: "claude",
 	},
 	EngineCodex: {
@@ -97,6 +99,13 @@ var engineDefaults = map[string]Invocation{
 		Cmd:    "codex --dangerously-bypass-approvals-and-sandbox --dangerously-bypass-hook-trust",
 		Binary: "codex",
 	},
+}
+
+// legacyCmds lists earlier default Cmd strings per engine. Records
+// persisted with a wrapper around one of these still count as stock, so
+// a handoff upgrades them to the current default.
+var legacyCmds = map[string][]string{
+	EngineClaudeCode: {"claude --dangerously-skip-permissions"},
 }
 
 // Helper returns the engine that acts as the optional second reviewer
@@ -210,7 +219,8 @@ func BuildWrapperCommand(name string) ([]string, error) {
 }
 
 // EngineForWrapperCommand reports which registered engine's default
-// wrapper (BuildWrapperCommand) argv is, byte-for-byte. ok=false means
+// wrapper (BuildWrapperCommand, or a wrapper around one of the engine's
+// legacyCmds) argv is, byte-for-byte. ok=false means
 // argv is a custom/operator-supplied command whose engine cannot be
 // inferred — callers must not rewrite it.
 func EngineForWrapperCommand(argv []string) (name string, ok bool) {
@@ -220,6 +230,11 @@ func EngineForWrapperCommand(argv []string) (name string, ok bool) {
 	for n, inv := range engineDefaults {
 		if argv[2] == WrapperScript(inv) {
 			return n, true
+		}
+		for _, cmd := range legacyCmds[n] {
+			if argv[2] == WrapperScript(Invocation{Name: n, Cmd: cmd, Binary: inv.Binary}) {
+				return n, true
+			}
 		}
 	}
 	return "", false

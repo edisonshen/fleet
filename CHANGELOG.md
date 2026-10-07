@@ -19,6 +19,12 @@ follows [SemVer](https://semver.org/).
   the plan's dir, and every ancestor of a path the plan references
   (`.agents/`, `.devin/`, `.cursor/`, `.github/` count as the parent).
 
+### Changed
+
+- coord: a Claude coord now launches with `--model claude-opus-5-5 --effort
+  medium` instead of the user's Claude default (e.g. Opus Plan Mode). Coords
+  running the previous stock wrapper pick it up at their next handoff.
+
 ## [0.23.0] - 2026-09-24
 
 Workers no longer inherit the coordinator's strongest model by default:

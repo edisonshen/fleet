@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"slices"
+	"strings"
 	"testing"
 
 	"github.com/edisonshen/fleet/internal/agent"
@@ -206,5 +207,26 @@ func TestSpawn_WorkerHandoffIgnoresPersistedChoice(t *testing.T) {
 	}
 	if got := f.SessionCommand(rec.TmuxSession); !reflect.DeepEqual(got, wrapper(t, enginecfg.EngineClaudeCode)) {
 		t.Errorf("tmux ran %q want claude-code wrapper", got)
+	}
+}
+
+func TestSpawn_CoordHandoffUpgradesLegacyClaudeWrapper(t *testing.T) {
+	setupHandoffHome(t)
+	f := tmuxfake.InstallFake(t)
+	legacy := []string{"sh", "-c", enginecfg.WrapperScript(enginecfg.Invocation{
+		Name: enginecfg.EngineClaudeCode, Cmd: "claude --dangerously-skip-permissions", Binary: "claude",
+	})}
+	old := oldCoord(t, enginecfg.EngineClaudeCode)
+	rec := handoffCoord(t, old, legacy)
+
+	want := wrapper(t, enginecfg.EngineClaudeCode)
+	if !strings.HasPrefix(want[2], "claude --dangerously-skip-permissions --model claude-opus-5-5 --effort medium;") {
+		t.Fatalf("claude coord wrapper lacks opus 5.5 / medium effort: %q", want[2])
+	}
+	if !reflect.DeepEqual(rec.Command, want) {
+		t.Errorf("successor rec.Command = %q want current claude wrapper", rec.Command)
+	}
+	if got := f.SessionCommand(rec.TmuxSession); !reflect.DeepEqual(got, want) {
+		t.Errorf("tmux ran %q want current claude wrapper", got)
 	}
 }
