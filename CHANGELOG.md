@@ -6,6 +6,15 @@ follows [SemVer](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- coord: plan-review runner. `review_slot.py --plan docs/TASK-PLAN-<slug>.md
+  --project <p> --slug <slug>` reviews a task-plan Markdown doc instead of
+  a diff (design fidelity, code reality, implementability, scenario
+  contract, security). Findings carry P0–P3 severity plus a bug / flag /
+  security category, and the result is saved with the doc's sha256 to
+  `~/.fleet/projects/<p>/plan-reviews/<slug>.json`.
+
 ## [0.23.0] - 2026-09-24
 
 Workers no longer inherit the coordinator's strongest model by default:

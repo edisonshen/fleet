@@ -22,6 +22,13 @@ Engines:
           has no diff to work from, so run `codex exec --output-schema`
           for a raw structured review instead.
 
+Plan mode (`--plan docs/TASK-PLAN-<slug>.md --project P --slug S`) reviews
+a Markdown task plan instead of a diff: both engines get the plan-review
+prompt + schema (codex always via `codex exec`), findings carry a
+bug|flag|security category, and the result is persisted with the doc's
+sha256 to $FLEET_HOME/projects/<P>/plan-reviews/<S>.json for the
+`fleet tasks promote` gate (see plan_review.py). Exit codes are unchanged.
+
 Either engine may be the dominant anchor (beta) or the optional helper
 (alpha); a slot only ever execs the ONE binary named by its engine. Exit 2
 is reported for a missing/rate-limited binary regardless of engine — the
@@ -42,6 +49,8 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Any
+
+import plan_review
 
 
 MAX_ATTEMPTS = 2
@@ -119,6 +128,18 @@ class SlotSpec:
     base: str | None
     task_context: str | None
     name: str = "slot"
+    plan: str | None = None
+    plan_sha: str | None = None
+
+
+def slot_schema(spec: SlotSpec) -> dict[str, Any]:
+    return plan_review.build_plan_schema() if spec.plan else build_inner_schema()
+
+
+def slot_prompt(spec: SlotSpec) -> str:
+    if spec.plan:
+        return plan_review.plan_review_prompt(spec.plan, spec.plan_sha or "")
+    return structured_review_prompt(spec.task_context)
 
 
 @dataclass
@@ -142,7 +163,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--effort", default="high")
     parser.add_argument("--base")
     parser.add_argument("--task-context")
+    parser.add_argument("--plan", help="review this task-plan Markdown doc instead of a diff")
+    parser.add_argument("--project", help="plan mode: project the record is filed under")
+    parser.add_argument("--slug", help="plan mode: task slug the record is filed under")
     args = parser.parse_args()
+    if args.plan:
+        if not args.project or not args.slug:
+            parser.error("--plan requires --project and --slug")
+        if args.base:
+            parser.error("--plan reviews a document, not a diff; drop --base")
+        if not os.path.isfile(args.plan):
+            parser.error(f"--plan {args.plan}: no such file")
+        try:
+            plan_review.record_path(args.project, args.slug)
+        except ValueError as exc:
+            parser.error(str(exc))
     if args.both:
         missing = [
             flag
@@ -164,10 +199,10 @@ def parse_args() -> argparse.Namespace:
 def run_claude(args: SlotSpec) -> subprocess.CompletedProcess[str]:
     if shutil.which("claude") is None:
         raise FileNotFoundError("claude binary not found")
-    if args.base:
+    if args.base and not args.plan:
         prompt = f"/review the diff against {args.base}"
     else:
-        prompt = structured_review_prompt(args.task_context)
+        prompt = slot_prompt(args)
 
     return subprocess.run(
         [
@@ -180,7 +215,7 @@ def run_claude(args: SlotSpec) -> subprocess.CompletedProcess[str]:
             "--output-format",
             "json",
             "--json-schema",
-            json.dumps(build_inner_schema()),
+            json.dumps(slot_schema(args)),
             prompt,
         ],
         capture_output=True,
@@ -189,7 +224,7 @@ def run_claude(args: SlotSpec) -> subprocess.CompletedProcess[str]:
     )
 
 
-def validate_inner(inner: Any) -> list[dict[str, Any]]:
+def validate_inner(inner: Any, plan: bool = False) -> list[dict[str, Any]]:
     if not isinstance(inner, dict):
         raise ValueError("inner result is not an object")
     if not isinstance(inner.get("clean"), bool):
@@ -210,13 +245,20 @@ def validate_inner(inner: Any) -> list[dict[str, Any]]:
             raise ValueError("finding severity is not P0, P1, P2, or P3")
         normalized_finding = dict(finding)
         normalized_finding["severity"] = severity
+        if plan:
+            category = finding.get("category")
+            if not isinstance(category, str) or category.lower() not in plan_review.CATEGORIES:
+                raise ValueError("plan finding category is not bug, flag, or security")
+            normalized_finding["category"] = category.lower()
         normalized.append(normalized_finding)
     if inner["clean"] is False and not normalized:
         raise ValueError("inner result is inconsistent: clean=false with no findings")
     return normalized
 
 
-def parse_claude(stdout: str, returncode: int) -> tuple[list[dict[str, Any]], str | None]:
+def parse_claude(
+    stdout: str, returncode: int, plan: bool = False
+) -> tuple[list[dict[str, Any]], str | None]:
     del returncode
     try:
         envelope = json.loads(stdout)
@@ -225,14 +267,14 @@ def parse_claude(stdout: str, returncode: int) -> tuple[list[dict[str, Any]], st
         result = envelope["result"]
         if not isinstance(result, str):
             raise ValueError("envelope result is not a string")
-        return validate_inner(json.loads(result)), None
+        return validate_inner(json.loads(result), plan), None
     except Exception as exc:
         return [], str(exc)
 
 
 def codex_uses_exec(args: SlotSpec) -> bool:
-    """Non-git slot: `codex review` needs a diff base, so use `codex exec`."""
-    return not args.base and bool(args.task_context)
+    """`codex review` only reviews diffs: plan mode and non-git slots use exec."""
+    return bool(args.plan) or (not args.base and bool(args.task_context))
 
 
 def run_codex(args: SlotSpec) -> subprocess.CompletedProcess[str]:
@@ -247,14 +289,14 @@ def run_codex(args: SlotSpec) -> subprocess.CompletedProcess[str]:
         with tempfile.TemporaryDirectory(prefix="fleet-review-") as tmp:
             schema_path = os.path.join(tmp, "schema.json")
             with open(schema_path, "w", encoding="utf-8") as fh:
-                json.dump(build_inner_schema(), fh)
+                json.dump(slot_schema(args), fh)
             command = [
                 "codex", "exec",
                 "--skip-git-repo-check",
                 "--sandbox", "read-only",
                 "--output-schema", schema_path,
                 *effort_cfg,
-                structured_review_prompt(args.task_context),
+                slot_prompt(args),
             ]
             return subprocess.run(
                 command, capture_output=True, stdin=subprocess.DEVNULL, text=True,
@@ -266,15 +308,18 @@ def run_codex(args: SlotSpec) -> subprocess.CompletedProcess[str]:
     return subprocess.run(command, capture_output=True, stdin=subprocess.DEVNULL, text=True)
 
 
-def parse_codex_exec(stdout: str, returncode: int) -> tuple[list[dict[str, Any]], str | None]:
+def parse_codex_exec(
+    stdout: str, returncode: int, plan: bool = False
+) -> tuple[list[dict[str, Any]], str | None]:
     """`codex exec --output-schema` prints the final JSON message on stdout."""
-    del returncode
+    if plan and returncode != 0:
+        return [], f"codex exec exited {returncode}"
     text = stdout.strip()
     start = text.find("{")
     if start < 0:
         return [], "codex exec produced no JSON object"
     try:
-        return validate_inner(json.loads(text[start:])), None
+        return validate_inner(json.loads(text[start:]), plan), None
     except Exception as exc:
         return [], str(exc)
 
@@ -306,7 +351,9 @@ def run_once(args: SlotSpec) -> tuple[list[dict[str, Any]], str | None, str, str
     try:
         if args.engine == "claude":
             completed = run_claude(args)
-            findings, error = parse_claude(completed.stdout, completed.returncode)
+            findings, error = parse_claude(
+                completed.stdout, completed.returncode, bool(args.plan)
+            )
             # claude's stdout is a JSON envelope; only a failed run (parse
             # error / nonzero exit) can carry a rate-limit or missing-binary
             # signal worth turning into a skip.
@@ -317,7 +364,9 @@ def run_once(args: SlotSpec) -> tuple[list[dict[str, Any]], str | None, str, str
         else:
             completed = run_codex(args)
             if codex_uses_exec(args):
-                findings, error = parse_codex_exec(completed.stdout, completed.returncode)
+                findings, error = parse_codex_exec(
+                    completed.stdout, completed.returncode, bool(args.plan)
+                )
             else:
                 findings, error = parse_codex(completed.stdout, completed.returncode)
             if findings:
@@ -404,22 +453,81 @@ def finish_both(alpha: SlotOutcome, beta: SlotOutcome) -> int:
     return 0
 
 
+def slot_summary(spec: SlotSpec, outcome: SlotOutcome) -> dict[str, Any]:
+    return {
+        "engine": spec.engine,
+        "model": spec.model,
+        "exit": outcome.exit_code,
+        "skip_reason": outcome.skip_reason,
+        "error": outcome.error,
+        "findings": outcome.findings,
+    }
+
+
+def persist_plan_record(
+    args: argparse.Namespace,
+    sha: str,
+    code: int,
+    slots: dict[str, dict[str, Any]],
+) -> None:
+    record = plan_review.build_record(
+        project=args.project,
+        slug=args.slug,
+        doc=os.path.abspath(args.plan),
+        sha=sha,
+        exit_code=code,
+        slots=slots,
+    )
+    path = plan_review.write_record(record)
+    print(f"[review_slot] plan review recorded: {path} (exit {code})", file=sys.stderr)
+
+
+def plan_changed(plan: str, sha: str) -> bool:
+    """True (and logged) when the doc changed while reviewers were reading it."""
+    if plan_review.doc_sha256(plan) == sha:
+        return False
+    print(
+        f"[review_slot] {plan} changed during the review; not recording it — re-run",
+        file=sys.stderr,
+    )
+    return True
+
+
 def main() -> int:
     args = parse_args()
-    if not args.both:
-        spec = SlotSpec(args.engine, args.model, args.effort, args.base, args.task_context)
-        return finish_single(run_slot(spec))
+    plan = os.path.abspath(args.plan) if args.plan else None
+    sha = plan_review.doc_sha256(plan) if plan else None
 
-    alpha_spec = SlotSpec(
-        args.alpha_engine, args.alpha_model, args.effort, args.base, args.task_context, "alpha"
-    )
-    beta_spec = SlotSpec(
-        args.beta_engine, args.beta_model, args.effort, args.base, args.task_context, "beta"
-    )
+    def spec(engine: str, model: str, name: str = "slot") -> SlotSpec:
+        return SlotSpec(
+            engine, model, args.effort, args.base, args.task_context, name, plan, sha
+        )
+
+    if not args.both:
+        single = spec(args.engine, args.model)
+        outcome = run_slot(single)
+        code = finish_single(outcome)
+        if plan and sha:
+            if plan_changed(plan, sha):
+                return 3
+            persist_plan_record(args, sha, code, {"slot": slot_summary(single, outcome)})
+        return code
+
+    alpha_spec = spec(args.alpha_engine, args.alpha_model, "alpha")
+    beta_spec = spec(args.beta_engine, args.beta_model, "beta")
     with ThreadPoolExecutor(max_workers=2) as pool:
         alpha_future = pool.submit(run_slot, alpha_spec)
         beta_future = pool.submit(run_slot, beta_spec)
-        return finish_both(alpha_future.result(), beta_future.result())
+        alpha, beta = alpha_future.result(), beta_future.result()
+    code = finish_both(alpha, beta)
+    if plan and sha:
+        if plan_changed(plan, sha):
+            return 3
+        persist_plan_record(args, sha, code, {
+            "alpha": slot_summary(alpha_spec, alpha),
+            "beta": slot_summary(beta_spec, beta),
+        })
+    return code
 
 
 if __name__ == "__main__":
