@@ -6,6 +6,12 @@ follows [SemVer](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.24.0] - 2026-10-07
+
+Coordinators can now review a task plan before implementation starts, and
+a Claude coord runs on Opus 5.5 at medium effort instead of whatever the
+user's Claude default is.
+
 ### Added
 
 - coord: plan-review runner. `review_slot.py --plan docs/TASK-PLAN-<slug>.md
@@ -24,6 +30,13 @@ follows [SemVer](https://semver.org/).
 - coord: a Claude coord now launches with `--model claude-opus-5-5 --effort
   medium` instead of the user's Claude default (e.g. Opus Plan Mode). Coords
   running the previous stock wrapper pick it up at their next handoff.
+
+### Fixed
+
+- handoff: a graceful handoff whose standby died while the old coord still
+  holds the lease flock is resumed by `fleet drain` (`handoffop.Resume`,
+  reusing the queued successor id) instead of waiting out the budget or
+  quarantining with advice that pointed back at `fleet handoff` (#331).
 
 ## [0.23.0] - 2026-09-24
 
@@ -1702,7 +1715,9 @@ Initial public release.
 - Filesystem packages: `internal/state`, `internal/handoff`,
   `internal/queue`, `internal/spawn`, `internal/tmux`.
 
-[Unreleased]: https://github.com/edisonshen/fleet/compare/v0.22.0...HEAD
+[Unreleased]: https://github.com/edisonshen/fleet/compare/v0.24.0...HEAD
+[0.24.0]: https://github.com/edisonshen/fleet/compare/v0.23.0...v0.24.0
+[0.23.0]: https://github.com/edisonshen/fleet/compare/v0.22.0...v0.23.0
 [0.22.0]: https://github.com/edisonshen/fleet/compare/v0.21.0...v0.22.0
 [0.21.0]: https://github.com/edisonshen/fleet/compare/v0.20.0...v0.21.0
 [0.20.0]: https://github.com/edisonshen/fleet/compare/v0.19.1...v0.20.0
