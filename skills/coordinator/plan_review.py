@@ -5,11 +5,9 @@ writes one record per task to
 
     $FLEET_HOME/projects/<project>/plan-reviews/<slug>.json
 
-keyed by the sha256 of the exact doc bytes that were reviewed. The Go side
-(internal/planreview) reads the same file: `fleet tasks approve` and the
-`fleet tasks promote` gate compare `doc_sha256` against the doc on disk, so
-any edit after review makes the record stale. See
-docs/DESIGN-plan-review-gate.md.
+keyed by the sha256 of the exact doc bytes that were reviewed, so a reader
+can tell whether the doc changed after review (`doc_sha256` vs the doc on
+disk). See docs/DESIGN-plan-review-gate.md.
 """
 from __future__ import annotations
 
@@ -118,6 +116,97 @@ def plan_review_prompt(doc_path: str, sha: str, instructions: str = "") -> str:
         '{"clean": bool, "findings": [{"severity", "category", "section", '
         '"summary"}]} — no prose, markdown, or code fences.',
     ]
+    return "\n".join(parts)
+
+
+INSTRUCTION_FILES = ("REVIEW.md", "AGENTS.md")
+# Devin Review treats files under these dirs as belonging to the parent.
+_META_DIRS = ("", ".agents", ".devin", ".cursor", ".github")
+_INSTRUCTION_MAX_BYTES = 16_000
+_PATH_TOKEN_RE = re.compile(r"/?[A-Za-z0-9_.][A-Za-z0-9_./-]*")
+
+
+def repo_root_for(path: str | os.PathLike[str]) -> Path:
+    """Nearest ancestor of ``path`` holding ``.git``; else the cwd (the
+    reviewer runs from the project root) when it contains ``path``; else
+    the path's own dir."""
+    resolved = Path(path).resolve()
+    start = resolved.parent
+    for d in (start, *start.parents):
+        if (d / ".git").exists():
+            return d
+    cwd = Path.cwd().resolve()
+    return cwd if resolved.is_relative_to(cwd) else start
+
+
+def referenced_dirs(plan_text: str, repo: Path) -> set[Path]:
+    """Repo dirs the plan touches: for every path-like token (relative to the
+    repo, or absolute inside it), its nearest existing directory, so files
+    the plan adds still pick up their directory's rules."""
+    repo = repo.resolve()
+    out: set[Path] = set()
+    for tok in _PATH_TOKEN_RE.findall(plan_text):
+        tok = tok.rstrip(".")
+        if "/" not in tok.lstrip("/"):
+            continue
+        cand = (repo / tok).resolve()
+        if not cand.is_relative_to(repo):
+            continue
+        while not cand.is_dir():
+            cand = cand.parent
+        out.add(cand)
+    return out
+
+
+def scoped_instruction_files(plan_path: str | os.PathLike[str], repo: Path | None = None) -> list[Path]:
+    """REVIEW.md / AGENTS.md files whose directory scope covers the plan.
+
+    A file applies to everything under its directory (``.agents/``,
+    ``.devin/``, ``.cursor/``, ``.github/`` count as the parent), so the
+    plan picks up the repo root, the plan's own dir, and every ancestor of
+    a path the plan references. Root-most first, so deeper (more specific)
+    instructions come last.
+    """
+    plan = Path(plan_path).resolve()
+    repo = (repo or repo_root_for(plan)).resolve()
+    dirs = {repo}
+    seeds = referenced_dirs(plan.read_text(encoding="utf-8", errors="replace"), repo)
+    if plan.is_relative_to(repo):
+        seeds.add(plan.parent)
+    for d in seeds:
+        while d.is_relative_to(repo):
+            dirs.add(d)
+            if d == repo:
+                break
+            d = d.parent
+    found: list[Path] = []
+    for d in sorted(dirs, key=lambda x: (len(x.parts), str(x))):
+        for meta in _META_DIRS:
+            for name in INSTRUCTION_FILES:
+                f = d / meta / name if meta else d / name
+                if f.is_file():
+                    found.append(f)
+    return found
+
+
+def instructions_block(plan_path: str | os.PathLike[str], repo: Path | None = None) -> str:
+    """Prompt section carrying the scoped instruction files' contents."""
+    plan = Path(plan_path).resolve()
+    repo = (repo or repo_root_for(plan)).resolve()
+    files = scoped_instruction_files(plan, repo)
+    if not files:
+        return ""
+    parts = [
+        "Repository review instructions (REVIEW.md / AGENTS.md, scoped by "
+        "directory like Devin Review; later files are more specific and win "
+        "on conflict). Apply them when judging the plan:",
+    ]
+    for f in files:
+        scope = f.parent.parent if f.parent.name in _META_DIRS[1:] else f.parent
+        rel_scope = scope.relative_to(repo).as_posix()
+        rel_scope = "repo root" if rel_scope == "." else rel_scope + "/"
+        body = f.read_bytes()[:_INSTRUCTION_MAX_BYTES].decode("utf-8", errors="replace")
+        parts += ["", f"--- {f.relative_to(repo).as_posix()} (applies to {rel_scope}) ---", body.rstrip()]
     return "\n".join(parts)
 
 

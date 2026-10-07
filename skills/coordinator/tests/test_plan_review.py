@@ -239,3 +239,94 @@ def test_plan_edited_during_review_is_not_recorded(
     assert result.returncode == 3
     assert "changed during the review" in result.stderr
     assert not (home / "projects" / "demo" / "plan-reviews" / "demo-0001.json").exists()
+
+
+# --- scoped REVIEW.md / AGENTS.md ------------------------------------------
+
+
+def _scoped_repo(tmp_path):
+    repo = tmp_path / "repo"
+    (repo / ".git").mkdir(parents=True)
+    (repo / "REVIEW.md").write_text("root review rules\n")
+    (repo / ".github").mkdir()
+    (repo / ".github" / "AGENTS.md").write_text("root agents via .github\n")
+    (repo / "internal" / "tui").mkdir(parents=True)
+    (repo / "internal" / "tui" / "view.go").write_text("package tui\n")
+    (repo / "internal" / "tui" / "REVIEW.md").write_text("tui review rules\n")
+    (repo / "internal" / "store").mkdir(parents=True)
+    (repo / "internal" / "store" / "AGENTS.md").write_text("store-only rules\n")
+    (repo / "docs").mkdir()
+    return repo
+
+
+def test_scoped_instructions_follow_referenced_dirs(tmp_path):
+    repo = _scoped_repo(tmp_path)
+    plan = repo / "docs" / "TASK-PLAN-p-0001.md"
+    plan.write_text("## Files\n- `internal/tui/view.go`: add badge.\n")
+    found = [f.relative_to(repo).as_posix() for f in plan_review.scoped_instruction_files(plan)]
+    assert found == ["REVIEW.md", ".github/AGENTS.md", "internal/tui/REVIEW.md"]
+
+
+def test_unreferenced_dir_instructions_do_not_apply(tmp_path):
+    repo = _scoped_repo(tmp_path)
+    plan = repo / "docs" / "TASK-PLAN-p-0001.md"
+    plan.write_text("touches internal/tui/view.go and a missing internal/nope/x.go\n")
+    block = plan_review.instructions_block(plan)
+    assert "tui review rules" in block
+    assert "store-only rules" not in block
+    assert "(applies to repo root)" in block
+    assert "--- internal/tui/REVIEW.md (applies to internal/tui/) ---" in block
+    assert block.index("root review rules") < block.index("tui review rules")
+
+
+def test_paths_escaping_repo_are_ignored(tmp_path):
+    repo = _scoped_repo(tmp_path)
+    (tmp_path / "outside").mkdir()
+    (tmp_path / "outside" / "REVIEW.md").write_text("outside rules\n")
+    plan = repo / "docs" / "TASK-PLAN-p-0001.md"
+    plan.write_text("see ../outside/REVIEW.md\n")
+    assert "outside rules" not in plan_review.instructions_block(plan)
+
+
+def test_no_instruction_files_yields_empty_block(tmp_path):
+    repo = tmp_path / "bare"
+    (repo / ".git").mkdir(parents=True)
+    plan = repo / "TASK-PLAN-p-0001.md"
+    plan.write_text("plan\n")
+    assert plan_review.instructions_block(plan) == ""
+
+
+def test_prompt_carries_instructions(tmp_path):
+    repo = _scoped_repo(tmp_path)
+    plan = repo / "docs" / "TASK-PLAN-p-0001.md"
+    plan.write_text("internal/tui/view.go\n")
+    prompt = plan_review.plan_review_prompt(str(plan), "abc", plan_review.instructions_block(plan))
+    assert "tui review rules" in prompt
+    assert prompt.rstrip().endswith("no prose, markdown, or code fences.")
+
+
+def test_new_file_in_existing_dir_picks_up_dir_rules(tmp_path):
+    repo = _scoped_repo(tmp_path)
+    plan = repo / "docs" / "TASK-PLAN-p-0001.md"
+    plan.write_text("## Files\n- `internal/tui/badge.go` (new): render badge.\n")
+    assert "tui review rules" in plan_review.instructions_block(plan)
+
+
+def test_absolute_repo_path_picks_up_dir_rules(tmp_path):
+    repo = _scoped_repo(tmp_path)
+    plan = repo / "docs" / "TASK-PLAN-p-0001.md"
+    plan.write_text(f"edit {repo.resolve()}/internal/store/db.go\n")
+    assert "store-only rules" in plan_review.instructions_block(plan)
+
+
+def test_non_git_project_uses_cwd_as_root(tmp_path, monkeypatch):
+    proj = tmp_path / "proj"
+    (proj / "docs").mkdir(parents=True)
+    (proj / "REVIEW.md").write_text("project rules\n")
+    (proj / "src").mkdir()
+    (proj / "src" / "AGENTS.md").write_text("src rules\n")
+    plan = proj / "docs" / "TASK-PLAN-p-0001.md"
+    plan.write_text("touch src/app.py\n")
+    monkeypatch.chdir(proj)
+    block = plan_review.instructions_block(plan)
+    assert "project rules" in block and "src rules" in block

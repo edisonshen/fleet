@@ -26,8 +26,8 @@ Plan mode (`--plan docs/TASK-PLAN-<slug>.md --project P --slug S`) reviews
 a Markdown task plan instead of a diff: both engines get the plan-review
 prompt + schema (codex always via `codex exec`), findings carry a
 bug|flag|security category, and the result is persisted with the doc's
-sha256 to $FLEET_HOME/projects/<P>/plan-reviews/<S>.json for the
-`fleet tasks promote` gate (see plan_review.py). Exit codes are unchanged.
+sha256 to $FLEET_HOME/projects/<P>/plan-reviews/<S>.json (see
+plan_review.py). Exit codes are unchanged.
 
 Either engine may be the dominant anchor (beta) or the optional helper
 (alpha); a slot only ever execs the ONE binary named by its engine. Exit 2
@@ -130,6 +130,7 @@ class SlotSpec:
     name: str = "slot"
     plan: str | None = None
     plan_sha: str | None = None
+    plan_instructions: str = ""
 
 
 def slot_schema(spec: SlotSpec) -> dict[str, Any]:
@@ -138,7 +139,9 @@ def slot_schema(spec: SlotSpec) -> dict[str, Any]:
 
 def slot_prompt(spec: SlotSpec) -> str:
     if spec.plan:
-        return plan_review.plan_review_prompt(spec.plan, spec.plan_sha or "")
+        return plan_review.plan_review_prompt(
+            spec.plan, spec.plan_sha or "", spec.plan_instructions
+        )
     return structured_review_prompt(spec.task_context)
 
 
@@ -497,10 +500,12 @@ def main() -> int:
     args = parse_args()
     plan = os.path.abspath(args.plan) if args.plan else None
     sha = plan_review.doc_sha256(plan) if plan else None
+    instructions = plan_review.instructions_block(plan) if plan else ""
 
     def spec(engine: str, model: str, name: str = "slot") -> SlotSpec:
         return SlotSpec(
-            engine, model, args.effort, args.base, args.task_context, name, plan, sha
+            engine, model, args.effort, args.base, args.task_context, name, plan, sha,
+            instructions,
         )
 
     if not args.both:
