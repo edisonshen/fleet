@@ -216,9 +216,9 @@ Rules:
   2. an independent dominant-engine reviewer — cross-task seams between the
      plans, testability, plus the same lenses.
 - Plan-review runner: each reviewer subagent runs
-  `python3 ~/.fleet/skills/coordinator/review_slot.py --plan
+  `python3 ~/.claude/skills/coordinator/review_slot.py --plan
   docs/TASK-PLAN-<slug>.md --project <p> --slug <slug> --both <slots>` from
-  the repo root. It reviews the Markdown plan (not a diff), sorts findings
+  the repo root (Codex coord: `~/.agents/skills/coordinator/review_slot.py`). It reviews the Markdown plan (not a diff), sorts findings
   into bug / flag / security with P0–P3 severity, and records the result
   with the doc's sha256 at `~/.fleet/projects/<p>/plan-reviews/<slug>.json`.
   Any later edit to the doc makes that record stale; re-run after fixes.

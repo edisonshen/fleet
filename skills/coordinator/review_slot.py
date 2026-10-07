@@ -312,7 +312,8 @@ def parse_codex_exec(
     stdout: str, returncode: int, plan: bool = False
 ) -> tuple[list[dict[str, Any]], str | None]:
     """`codex exec --output-schema` prints the final JSON message on stdout."""
-    del returncode
+    if plan and returncode != 0:
+        return [], f"codex exec exited {returncode}"
     text = stdout.strip()
     start = text.find("{")
     if start < 0:
@@ -481,6 +482,17 @@ def persist_plan_record(
     print(f"[review_slot] plan review recorded: {path} (exit {code})", file=sys.stderr)
 
 
+def plan_changed(plan: str, sha: str) -> bool:
+    """True (and logged) when the doc changed while reviewers were reading it."""
+    if plan_review.doc_sha256(plan) == sha:
+        return False
+    print(
+        f"[review_slot] {plan} changed during the review; not recording it — re-run",
+        file=sys.stderr,
+    )
+    return True
+
+
 def main() -> int:
     args = parse_args()
     plan = os.path.abspath(args.plan) if args.plan else None
@@ -496,6 +508,8 @@ def main() -> int:
         outcome = run_slot(single)
         code = finish_single(outcome)
         if plan and sha:
+            if plan_changed(plan, sha):
+                return 3
             persist_plan_record(args, sha, code, {"slot": slot_summary(single, outcome)})
         return code
 
@@ -507,6 +521,8 @@ def main() -> int:
         alpha, beta = alpha_future.result(), beta_future.result()
     code = finish_both(alpha, beta)
     if plan and sha:
+        if plan_changed(plan, sha):
+            return 3
         persist_plan_record(args, sha, code, {
             "alpha": slot_summary(alpha_spec, alpha),
             "beta": slot_summary(beta_spec, beta),

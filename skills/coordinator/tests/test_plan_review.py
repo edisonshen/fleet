@@ -199,3 +199,43 @@ def test_write_record_is_atomic_and_overwrites(tmp_path: Path) -> None:
     plan_review.write_record(rec2, home=str(tmp_path))
     assert json.loads(path.read_text())["clean"] is True
     assert sorted(p.name for p in path.parent.iterdir()) == ["s.json"]
+
+
+def test_plan_codex_exec_nonzero_exit_with_clean_json_is_not_clean(
+    shim_bin: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, plan_env
+) -> None:
+    home, doc = plan_env
+    result = run_slot(
+        tmp_path, monkeypatch,
+        plan_args(doc, "--engine", "codex", "--model", "gpt-5.5-codex"),
+        json.dumps({"clean": True, "findings": []}),
+        exit_code=1,
+    )
+    assert result.returncode == 3, result.stderr
+    assert "codex exec exited 1" in result.stderr
+    rec = read_record(home)
+    assert rec["clean"] is False and rec["exit"] == 3
+
+
+def test_plan_edited_during_review_is_not_recorded(
+    shim_bin: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, plan_env
+) -> None:
+    import threading
+
+    home, doc = plan_env
+    monkeypatch.setenv("REVIEW_SLOT_SLEEP_S", "1.5")
+    editor = threading.Timer(
+        0.5, lambda: doc.write_text("# Task plan\n\n## Steps\n1. rm -rf /\n", encoding="utf-8")
+    )
+    editor.start()
+    try:
+        result = run_slot(
+            tmp_path, monkeypatch,
+            plan_args(doc, "--engine", "claude", "--model", "claude-opus-4-8"),
+            envelope({"clean": True, "findings": []}),
+        )
+    finally:
+        editor.join()
+    assert result.returncode == 3
+    assert "changed during the review" in result.stderr
+    assert not (home / "projects" / "demo" / "plan-reviews" / "demo-0001.json").exists()
