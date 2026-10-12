@@ -6,6 +6,14 @@ follows [SemVer](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed
+
+- review: budget reviewer models. Claude slots run `claude-sonnet-5-5`
+  (fallback / second claude seat `claude-sonnet-5`) instead of Opus; codex
+  code review runs `gpt-6.1-terra` and plan review `gpt-6.1-sol`.
+  `review_slot.py` now passes the slot model to codex via
+  `--config model=...` (it was previously left to `config.toml`).
+
 ## [0.24.0] - 2026-10-07
 
 Coordinators can now review a task plan before implementation starts, and

@@ -718,6 +718,8 @@ def test_effort_is_threaded_to_both_engines(
     argvs = {Path(a[0]).name: a for a in map(json.loads, argv_log.read_text().splitlines())}
     assert argvs["claude"][argvs["claude"].index("--effort") + 1] == "medium"
     assert 'model_reasoning_effort="medium"' in argvs["codex"]
+    assert argvs["codex"][1] == "review"
+    assert 'model="gpt-5.5-codex"' in argvs["codex"]
 
 
 def test_both_requires_all_slot_flags(
@@ -835,7 +837,7 @@ def test_codex_non_git_uses_exec_with_strict_schema(
     assert argv[1:3] == ["exec", "--skip-git-repo-check"]
     assert "review" not in argv
     assert argv[argv.index("--sandbox") + 1] == "read-only"
-    assert "-m" not in argv and "--model" not in argv
+    assert 'model="gpt-5.5-codex"' in argv
     assert "Spec: add a guard" in argv[-1]
     assert "Return ONLY structured JSON" in argv[-1]
     assert_strict_schema(json.loads(schema_copy.read_text()))

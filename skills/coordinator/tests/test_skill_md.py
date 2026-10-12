@@ -18,6 +18,8 @@ from __future__ import annotations
 
 import os
 
+import reviewcfg
+
 
 _SKILL_MD = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
@@ -432,3 +434,16 @@ def test_skill_md_documents_worker_model_routing():
         "complexity=<tier>",
     ):
         assert needle in body, f"SKILL.md missing worker-model routing text {needle!r}"
+
+
+def test_skill_md_names_review_models_from_reviewcfg():
+    """Plan-review subagents are dispatched from SKILL.md text, so the
+    model ids it names must match reviewcfg (the reviewer stage reads
+    reviewcfg directly)."""
+    body = _read_skill_md()
+    for model in (
+        reviewcfg.CODEX_PLAN_REVIEW_MODEL,
+        reviewcfg.CODEX_REVIEW_MODEL,
+        *reviewcfg.CLAUDE_REVIEW_MODELS,
+    ):
+        assert f"`{model}`" in body, f"SKILL.md missing review model {model!r}"
