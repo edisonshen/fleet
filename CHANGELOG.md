@@ -13,6 +13,10 @@ follows [SemVer](https://semver.org/).
   code review runs `gpt-6.1-terra` and plan review `gpt-6.1-sol`.
   `review_slot.py` now passes the slot model to codex via
   `--config model=...` (it was previously left to `config.toml`).
+- review: a model set in the user's own engine config wins over Fleet's
+  review defaults — codex `model` in `$CODEX_HOME/config.toml` (active
+  profile first), claude `ANTHROPIC_MODEL` or `model` in
+  `$CLAUDE_CONFIG_DIR/settings.json` (default `~/.claude`).
 
 ## [0.24.0] - 2026-10-07
 

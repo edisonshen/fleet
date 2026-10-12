@@ -46,6 +46,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import tomllib
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Any
@@ -199,6 +200,42 @@ def parse_args() -> argparse.Namespace:
     return args
 
 
+def codex_config_model() -> str | None:
+    """Model set in the user's codex config.toml (active profile first)."""
+    cfg_dir = os.environ.get("CODEX_HOME") or os.path.join(os.path.expanduser("~"), ".codex")
+    try:
+        with open(os.path.join(cfg_dir, "config.toml"), "rb") as fh:
+            data = tomllib.load(fh)
+    except (OSError, tomllib.TOMLDecodeError):
+        return None
+    profile = data.get("profile")
+    profiles = data.get("profiles")
+    if isinstance(profile, str) and isinstance(profiles, dict):
+        table = profiles.get(profile)
+        if isinstance(table, dict) and isinstance(table.get("model"), str) and table["model"]:
+            return table["model"]
+    model = data.get("model")
+    return model if isinstance(model, str) and model else None
+
+
+def claude_config_model() -> str | None:
+    """Model set via ANTHROPIC_MODEL or the user's claude settings.json."""
+    if os.environ.get("ANTHROPIC_MODEL"):
+        return os.environ["ANTHROPIC_MODEL"]
+    cfg_dir = os.environ.get("CLAUDE_CONFIG_DIR") or os.path.join(os.path.expanduser("~"), ".claude")
+    try:
+        with open(os.path.join(cfg_dir, "settings.json"), encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, ValueError):
+        return None
+    model = data.get("model") if isinstance(data, dict) else None
+    return model if isinstance(model, str) and model else None
+
+
+def local_config_model(engine: str) -> str | None:
+    return codex_config_model() if engine == "codex" else claude_config_model()
+
+
 def run_claude(args: SlotSpec) -> subprocess.CompletedProcess[str]:
     if shutil.which("claude") is None:
         raise FileNotFoundError("claude binary not found")
@@ -284,7 +321,8 @@ def run_codex(args: SlotSpec) -> subprocess.CompletedProcess[str]:
     if shutil.which("codex") is None:
         raise FileNotFoundError("codex binary not found")
     # `codex review` has no --model flag, so the slot model goes through a
-    # config override for both review and exec.
+    # config override for both review and exec. A model the user set in
+    # config.toml has already replaced args.model (see main).
     codex_cfg = [
         "--config", f'model="{args.model}"',
         "--config", f'model_reasoning_effort="{args.effort}"',
@@ -506,8 +544,9 @@ def main() -> int:
     instructions = plan_review.instructions_block(plan) if plan else ""
 
     def spec(engine: str, model: str, name: str = "slot") -> SlotSpec:
+        # A model in the user's own engine config wins over Fleet's default.
         return SlotSpec(
-            engine, model, args.effort, args.base, args.task_context, name, plan, sha,
+            engine, local_config_model(engine) or model, args.effort, args.base, args.task_context, name, plan, sha,
             instructions,
         )
 
