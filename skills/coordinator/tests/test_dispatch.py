@@ -563,8 +563,8 @@ def test_build_reviewer_prompt_git_with_codex_threads_slots() -> None:
     assert "--effort high" in out
     assert "--base origin/main" in out
     assert "--task-context" not in out
-    assert dispatch.reviewcfg.CODEX_DEFAULT_MODEL in out
-    assert dispatch.reviewcfg.OPUS_FALLBACK[0] in out
+    assert dispatch.reviewcfg.CODEX_REVIEW_MODEL in out
+    assert dispatch.reviewcfg.CLAUDE_REVIEW_MODELS[0] in out
     assert "--review-alpha-status" in out
     assert "--review-beta-status passed" in out
     assert "exit 0 => record that slot passed" in out
@@ -593,8 +593,8 @@ def test_build_reviewer_prompt_git_without_codex_uses_two_claude_slots() -> None
     assert "--alpha-engine codex" not in out
     assert "--alpha-engine claude" in out
     assert "--beta-engine claude" in out
-    assert dispatch.reviewcfg.SONNET_FALLBACK[0] in out
-    assert dispatch.reviewcfg.OPUS_FALLBACK[0] in out
+    assert dispatch.reviewcfg.CLAUDE_REVIEW_MODELS[1] in out
+    assert dispatch.reviewcfg.CLAUDE_REVIEW_MODELS[0] in out
     assert "Loop until BOTH slots exit 0." in out
     assert "Loop until BOTH slots are RESOLVED" not in out
     assert "OR the codex alpha exits 2 (skipped)" not in out
@@ -614,8 +614,8 @@ def test_build_reviewer_prompt_codex_dominant_with_claude_helper() -> None:
     assert "~/.agents/skills/coordinator/review_slot.py" in out
     assert "~/.claude/" not in out
     assert "review_slot.py --both" in out
-    assert f"--beta-engine codex --beta-model {dispatch.reviewcfg.CODEX_DEFAULT_MODEL}" in out
-    assert f"--alpha-engine claude --alpha-model {dispatch.reviewcfg.OPUS_FALLBACK[0]}" in out
+    assert f"--beta-engine codex --beta-model {dispatch.reviewcfg.CODEX_REVIEW_MODEL}" in out
+    assert f"--alpha-engine claude --alpha-model {dispatch.reviewcfg.CLAUDE_REVIEW_MODELS[0]}" in out
     assert "exit 2 => claude slot skipped" in out
     assert "--review-beta-status passed --review-beta-engine codex" in out
     assert "--review-alpha-status skipped --review-alpha-engine claude" in out

@@ -51,10 +51,12 @@ manager. The agents do the work.
   workers' hard-won lessons without operator re-onboarding. Project
   intelligence compounds.
 - **Two reviewers on every task.** The reviewer stage always resolves
-  two slots at high effort: **alpha** (diverse — `codex` on a git tree
-  when it is installed, else Claude Sonnet) and **beta** (a Claude Opus
-  anchor that never skips). At least one genuine review lands even when
-  codex is rate-limited or absent.
+  two slots at high effort: **alpha** (diverse — `codex` on
+  `gpt-6.1-terra` on a git tree when it is installed, else a second
+  Claude Sonnet) and **beta** (a Claude Sonnet 5.5 anchor that never
+  skips). Plan review uses the same Claude models with codex on
+  `gpt-6.1-sol`. At least one genuine review lands even when codex is
+  rate-limited or absent.
 - **PR autopilot.** Each worker watches its own PR. CI fails →
   retry-fix subagent. PR goes BEHIND or DIRTY → rebase subagent on an
   isolated worktree. Trivial review comments addressed inline.

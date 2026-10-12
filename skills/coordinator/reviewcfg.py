@@ -24,9 +24,13 @@ ENGINE_CODEX = "codex"
 SLOT_CLAUDE = "claude"
 SLOT_CODEX = "codex"
 
-CODEX_DEFAULT_MODEL = "gpt-5.5-codex"
-OPUS_FALLBACK = ["claude-opus-4-8", "claude-opus-4-7", "claude-opus-4-5"]
-SONNET_FALLBACK = ["claude-sonnet-5", "claude-sonnet-4-5"]
+# Budget tier: code review runs on codex terra; plan review (rarer, and
+# catches design errors before code exists) runs on codex sol. Claude
+# reviews on Sonnet; the second entry is the distinct alpha model on a
+# claude-only host and the anchor fallback when the first is unavailable.
+CODEX_REVIEW_MODEL = "gpt-6.1-terra"
+CODEX_PLAN_REVIEW_MODEL = "gpt-6.1-sol"
+CLAUDE_REVIEW_MODELS = ["claude-sonnet-5-5", "claude-sonnet-5"]
 
 
 @dataclass(frozen=True)
@@ -66,7 +70,7 @@ def _first_available(models: list[str], unavailable: set[str]) -> str | None:
 
 
 def _claude_anchor(unavailable: set[str]) -> Slot:
-    model = _first_available(OPUS_FALLBACK, unavailable) or OPUS_FALLBACK[-1]
+    model = _first_available(CLAUDE_REVIEW_MODELS, unavailable) or CLAUDE_REVIEW_MODELS[-1]
     return Slot(SLOT_CLAUDE, model, "high")
 
 
@@ -89,7 +93,7 @@ def resolve_slots(
     unavailable = set(unavailable or ())
 
     if dominant == ENGINE_CODEX:
-        beta = Slot(SLOT_CODEX, CODEX_DEFAULT_MODEL, "high")
+        beta = Slot(SLOT_CODEX, CODEX_REVIEW_MODEL, "high")
         if has_helper:
             claude = _claude_anchor(unavailable)
             if claude.model not in unavailable:
@@ -104,19 +108,21 @@ def resolve_slots(
         )
 
     beta = _claude_anchor(unavailable)
-    use_codex = has_helper and is_git and CODEX_DEFAULT_MODEL not in unavailable
+    use_codex = has_helper and is_git and CODEX_REVIEW_MODEL not in unavailable
     if use_codex:
         return Resolution(
-            alpha=Slot(SLOT_CODEX, CODEX_DEFAULT_MODEL, "high"),
+            alpha=Slot(SLOT_CODEX, CODEX_REVIEW_MODEL, "high"),
             beta=beta,
             single_engine_only=False,
             alpha_is_helper=True,
         )
 
-    sonnet_model = _first_available(SONNET_FALLBACK, unavailable)
-    if sonnet_model is not None and sonnet_model != beta.model:
+    second_model = _first_available(
+        [m for m in CLAUDE_REVIEW_MODELS if m != beta.model], unavailable,
+    )
+    if second_model is not None:
         return Resolution(
-            alpha=Slot(SLOT_CLAUDE, sonnet_model, "high"),
+            alpha=Slot(SLOT_CLAUDE, second_model, "high"),
             beta=beta,
             single_engine_only=False,
             alpha_is_helper=False,

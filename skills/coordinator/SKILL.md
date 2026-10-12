@@ -222,6 +222,11 @@ Rules:
   into bug / flag / security with P0–P3 severity, and records the result
   with the doc's sha256 at `~/.fleet/projects/<p>/plan-reviews/<slug>.json`.
   Any later edit to the doc makes that record stale; re-run after fixes.
+- Plan-review models: codex slots use `gpt-6.1-sol`, claude slots use
+  `claude-sonnet-5-5` (second claude seat on a claude-only host:
+  `claude-sonnet-5`), at the `review_effort` level. Code review (the
+  reviewer stage) runs codex on the cheaper `gpt-6.1-terra` with the same
+  claude models; `reviewcfg.py` holds these ids.
   Reviewers also get the repo's `REVIEW.md` / `AGENTS.md` scoped by
   directory (root, the plan's dir, and ancestors of every path the plan
   references); put per-area review rules there, not in the prompt.
@@ -700,7 +705,7 @@ writes `phase=done` directly with a diff summary.
 - `register_subagent.py` — records the host engine's subagent handle
   (Claude `subagent_id` / Codex `spawn_agent` task path).
 - `reviewcfg.py` — resolves alpha/beta slots from the dominant engine +
-  helper availability.
+  helper availability; holds the code-review and plan-review model ids.
 - `remote_control.py`, `supervisor.py`, `reaper.py`, `worktree.py` — runtime
   helpers.
 

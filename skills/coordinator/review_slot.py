@@ -283,12 +283,15 @@ def codex_uses_exec(args: SlotSpec) -> bool:
 def run_codex(args: SlotSpec) -> subprocess.CompletedProcess[str]:
     if shutil.which("codex") is None:
         raise FileNotFoundError("codex binary not found")
-    effort_cfg = ["--config", f'model_reasoning_effort="{args.effort}"']
+    # `codex review` has no --model flag, so the slot model goes through a
+    # config override for both review and exec.
+    codex_cfg = [
+        "--config", f'model="{args.model}"',
+        "--config", f'model_reasoning_effort="{args.effort}"',
+    ]
     if codex_uses_exec(args):
         # The schema must be a file for codex; keep it next to nothing
-        # persistent (tmp dir, removed after the run). No -m: `codex review`
-        # also ignores --model and lets config.toml pick the model, and a
-        # ChatGPT-plan account rejects explicit model ids it does not own.
+        # persistent (tmp dir, removed after the run).
         with tempfile.TemporaryDirectory(prefix="fleet-review-") as tmp:
             schema_path = os.path.join(tmp, "schema.json")
             with open(schema_path, "w", encoding="utf-8") as fh:
@@ -298,7 +301,7 @@ def run_codex(args: SlotSpec) -> subprocess.CompletedProcess[str]:
                 "--skip-git-repo-check",
                 "--sandbox", "read-only",
                 "--output-schema", schema_path,
-                *effort_cfg,
+                *codex_cfg,
                 slot_prompt(args),
             ]
             return subprocess.run(
@@ -307,7 +310,7 @@ def run_codex(args: SlotSpec) -> subprocess.CompletedProcess[str]:
     command = ["codex", "review"]
     if args.base:
         command.extend(["--base", args.base])
-    command.extend(effort_cfg)
+    command.extend(codex_cfg)
     return subprocess.run(command, capture_output=True, stdin=subprocess.DEVNULL, text=True)
 
 
