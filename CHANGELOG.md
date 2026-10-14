@@ -6,13 +6,18 @@ follows [SemVer](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.25.0] - 2026-10-14
+
+Review slots move to budget models: Claude reviewers run Sonnet instead of
+Opus, and codex code / plan review run the cheaper gpt-6.1 tiers.
+
 ### Changed
 
 - review: budget reviewer models. Claude slots run `claude-sonnet-5-5`
   (fallback / second claude seat `claude-sonnet-5`) instead of Opus; codex
   code review runs `gpt-6.1-terra` and plan review `gpt-6.1-sol`.
   `review_slot.py` now passes the slot model to codex via
-  `--config model=...` (it was previously left to `config.toml`).
+  `--config model=...` (it was previously left to `config.toml`) (#342).
 
 ## [0.24.0] - 2026-10-07
 
@@ -1723,7 +1728,8 @@ Initial public release.
 - Filesystem packages: `internal/state`, `internal/handoff`,
   `internal/queue`, `internal/spawn`, `internal/tmux`.
 
-[Unreleased]: https://github.com/edisonshen/fleet/compare/v0.24.0...HEAD
+[Unreleased]: https://github.com/edisonshen/fleet/compare/v0.25.0...HEAD
+[0.25.0]: https://github.com/edisonshen/fleet/compare/v0.24.0...v0.25.0
 [0.24.0]: https://github.com/edisonshen/fleet/compare/v0.23.0...v0.24.0
 [0.23.0]: https://github.com/edisonshen/fleet/compare/v0.22.0...v0.23.0
 [0.22.0]: https://github.com/edisonshen/fleet/compare/v0.21.0...v0.22.0
