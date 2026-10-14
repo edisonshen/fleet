@@ -16,7 +16,10 @@ follows [SemVer](https://semver.org/).
 - review: a model set in the user's own engine config wins over Fleet's
   review defaults — codex `model` in `$CODEX_HOME/config.toml` (active
   profile first), claude `ANTHROPIC_MODEL` or `model` in
-  `$CLAUDE_CONFIG_DIR/settings.json` (default `~/.claude`).
+  `$CLAUDE_CONFIG_DIR/settings.json` (default `~/.claude`). The reviewer
+  prompt and recorded review status name the model that runs; claude-only
+  slots that collapse onto one configured model record alpha as
+  `single-engine-degraded`.
 
 ## [0.24.0] - 2026-10-07
 

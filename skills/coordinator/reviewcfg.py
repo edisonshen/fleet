@@ -14,7 +14,7 @@ Slots mirror the dominant engine (the one the coord was launched with):
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 
 ENGINE_CLAUDE_CODE = "claude-code"
@@ -133,4 +133,18 @@ def resolve_slots(
         beta=beta,
         single_engine_only=True,
         alpha_is_helper=False,
+    )
+
+
+def with_local_models(resolution: Resolution, local: dict[str, str]) -> Resolution:
+    """Replace each slot's model with the user's configured model for its
+    engine (keyed by slot engine). Slots that collapse onto the same
+    engine+model are single-engine-degraded."""
+    alpha = replace(resolution.alpha, model=local.get(resolution.alpha.engine, resolution.alpha.model))
+    beta = replace(resolution.beta, model=local.get(resolution.beta.engine, resolution.beta.model))
+    return Resolution(
+        alpha=alpha,
+        beta=beta,
+        single_engine_only=resolution.single_engine_only or alpha == beta,
+        alpha_is_helper=resolution.alpha_is_helper,
     )

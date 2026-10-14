@@ -187,3 +187,19 @@ def test_reviewcfg_source_has_no_subprocess_or_env_reads() -> None:
 
     assert "import subprocess" not in source
     assert "os.environ" not in source
+
+
+def test_with_local_models_overrides_each_engine() -> None:
+    base = reviewcfg.resolve_slots("claude-code", True, True, set())
+    out = reviewcfg.with_local_models(base, {"codex": "gpt-mine", "claude": "claude-mine"})
+    assert (out.alpha.engine, out.alpha.model) == ("codex", "gpt-mine")
+    assert (out.beta.engine, out.beta.model) == ("claude", "claude-mine")
+    assert out.alpha_is_helper and not out.single_engine_only
+
+
+def test_with_local_models_collapsing_claude_only_slots_is_single_engine() -> None:
+    base = reviewcfg.resolve_slots("claude-code", False, True, set())
+    assert not base.single_engine_only
+    out = reviewcfg.with_local_models(base, {"claude": "claude-mine"})
+    assert out.alpha.model == out.beta.model == "claude-mine"
+    assert out.single_engine_only
