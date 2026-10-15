@@ -274,3 +274,14 @@ def _default_engine(monkeypatch):
     themselves; a codex-dominant developer shell must not leak in."""
     monkeypatch.delenv("FLEET_ENGINE", raising=False)
     monkeypatch.delenv("FLEET_ENGINE_EXPLICIT", raising=False)
+
+
+@pytest.fixture(autouse=True)
+def _no_local_engine_model(monkeypatch, tmp_path_factory):
+    """review_slot.py honors a model set in the user's claude/codex config;
+    point both config dirs at an empty dir so the developer's own config
+    does not leak in."""
+    empty = tmp_path_factory.mktemp("engine-config")
+    monkeypatch.setenv("CODEX_HOME", str(empty))
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(empty))
+    monkeypatch.delenv("ANTHROPIC_MODEL", raising=False)

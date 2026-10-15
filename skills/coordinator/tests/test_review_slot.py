@@ -962,3 +962,51 @@ def test_claude_parse_failure_without_limit_signal_still_blocks(
 
     assert result.returncode == 3
     assert counter.read_text() == "2"
+
+
+def test_local_config_model_wins_over_fleet_default(
+    shim_bin: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    codex_home = tmp_path / "codex-home"
+    codex_home.mkdir()
+    (codex_home / "config.toml").write_text(
+        'model = "gpt-top"\nprofile = "work"\n\n[profiles.work]\nmodel = "gpt-mine"\n',
+        encoding="utf-8",
+    )
+    claude_home = tmp_path / "claude-home"
+    claude_home.mkdir()
+    (claude_home / "settings.json").write_text(json.dumps({"model": "claude-mine"}))
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(claude_home))
+    argv_log = tmp_path / "argv.jsonl"
+    monkeypatch.setenv(
+        "REVIEW_SLOT_STDOUT_FILE_CODEX", str(write_output(tmp_path, "", "codex.txt"))
+    )
+
+    result = run_slot(tmp_path, monkeypatch, BOTH_ARGS, CLEAN_ENVELOPE, argv_log=argv_log)
+
+    assert result.returncode == 0
+    argvs = {Path(a[0]).name: a for a in map(json.loads, argv_log.read_text().splitlines())}
+    assert 'model="gpt-mine"' in argvs["codex"]
+    assert argvs["claude"][argvs["claude"].index("--model") + 1] == "claude-mine"
+
+
+def test_local_config_without_model_keeps_fleet_default(
+    shim_bin: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    codex_home = tmp_path / "codex-home"
+    codex_home.mkdir()
+    (codex_home / "config.toml").write_text('approval_policy = "never"\n', encoding="utf-8")
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+    monkeypatch.setenv("ANTHROPIC_MODEL", "claude-env")
+    argv_log = tmp_path / "argv.jsonl"
+    monkeypatch.setenv(
+        "REVIEW_SLOT_STDOUT_FILE_CODEX", str(write_output(tmp_path, "", "codex.txt"))
+    )
+
+    result = run_slot(tmp_path, monkeypatch, BOTH_ARGS, CLEAN_ENVELOPE, argv_log=argv_log)
+
+    assert result.returncode == 0
+    argvs = {Path(a[0]).name: a for a in map(json.loads, argv_log.read_text().splitlines())}
+    assert 'model="gpt-5.5-codex"' in argvs["codex"]
+    assert argvs["claude"][argvs["claude"].index("--model") + 1] == "claude-env"

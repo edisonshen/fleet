@@ -166,6 +166,8 @@ writes `phase=done` directly with a diff summary.
   (Claude `subagent_id` / Codex `spawn_agent` task path).
 - `reviewcfg.py` — resolves alpha/beta slots from the dominant engine +
   helper availability; holds the code-review and plan-review model ids.
+- `localmodel.py` — reads the review model the user set in their own
+  codex / claude config; it overrides the `reviewcfg.py` defaults.
 - `remote_control.py`, `supervisor.py`, `reaper.py`, `worktree.py` — runtime
   helpers.
 
