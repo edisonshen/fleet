@@ -5237,7 +5237,7 @@ def test_load_unavailable_models_union(
      ["  tier: coding", "  model: claude-opus-5-5", "  effort: medium",
       "  fallback_models: claude-opus-5", "  fallback_effort: medium"]),
     ("claude-code", None, "complex",
-     ["  tier: complex", "  model: claude-opus-5-5", "  effort: high",
+     ["  tier: complex", "  model: claude-opus-5-5", "  effort: medium",
       "  fallback_models: claude-opus-5", "  fallback_effort: medium"]),
     ("claude-code", "quality", "simple",
      ["  tier: simple", "  model: claude-opus-5-5", "  effort: medium",

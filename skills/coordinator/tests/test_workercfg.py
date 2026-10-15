@@ -65,7 +65,7 @@ def test_claude_quality_every_tier_is_opus_medium(tier: str) -> None:
 @pytest.mark.parametrize(("tier", "model", "effort", "fallbacks"), [
     ("simple", "claude-haiku-5-5", "medium", ("claude-sonnet-5-5",)),
     ("coding", "claude-opus-5-5", "medium", ("claude-opus-5",)),
-    ("complex", "claude-opus-5-5", "high", ("claude-opus-5",)),
+    ("complex", "claude-opus-5-5", "medium", ("claude-opus-5",)),
 ])
 def test_claude_budget_tiering(tier: str, model: str, effort: str,
                                fallbacks: tuple[str, ...]) -> None:
