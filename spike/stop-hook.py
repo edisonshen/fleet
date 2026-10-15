@@ -39,6 +39,7 @@ CONTEXT_LIMITS = {
     "claude-opus-4-5":   1_000_000,
     "claude-sonnet-4-6": 1_000_000,
     "claude-sonnet-4-5": 1_000_000,
+    "claude-haiku-5-5":  1_000_000,
     "claude-haiku-4-5":    200_000,
 }
 

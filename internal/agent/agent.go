@@ -63,17 +63,22 @@ const DefaultEngine = "claude-code"
 // Week-4; the fleet binary today). Readers tolerate missing optional
 // fields by treating them as null — never crash on absence.
 type Record struct {
-	SchemaVersion  int        `json:"schema_version"`
-	ID             string     `json:"id"`
-	PID            int        `json:"pid"`
-	TmuxSession    string     `json:"tmux_session"`
-	Engine         string     `json:"engine"`
-	Role           string     `json:"role"`           // "executor" | "planner"
-	Mode           string     `json:"mode,omitempty"` // "execute" | "plan" | "fix" | "review"
-	TaskID         string     `json:"task_id,omitempty"`
-	Project        string     `json:"project,omitempty"`
-	ReviewRound    *int       `json:"review_round"`
-	ContextPct     *float64   `json:"context_pct"`
+	SchemaVersion int      `json:"schema_version"`
+	ID            string   `json:"id"`
+	PID           int      `json:"pid"`
+	TmuxSession   string   `json:"tmux_session"`
+	Engine        string   `json:"engine"`
+	Role          string   `json:"role"`           // "executor" | "planner"
+	Mode          string   `json:"mode,omitempty"` // "execute" | "plan" | "fix" | "review"
+	TaskID        string   `json:"task_id,omitempty"`
+	Project       string   `json:"project,omitempty"`
+	ReviewRound   *int     `json:"review_round"`
+	ContextPct    *float64 `json:"context_pct"`
+	// ContextTokens is the raw context size behind ContextPct; ContextState
+	// is fleet-guard's handoff classification ("green" | "yellow" | "red")
+	// of it, which for a coordinator may come from absolute token thresholds.
+	ContextTokens  *int64     `json:"context_tokens,omitempty"`
+	ContextState   string     `json:"context_state,omitempty"`
 	ContextSource  string     `json:"context_source,omitempty"` // "hook" | "proxy" (per DESIGN.md)
 	LastActivityTS time.Time  `json:"last_activity_ts"`
 	Blocked        bool       `json:"blocked"`

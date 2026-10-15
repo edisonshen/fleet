@@ -1204,7 +1204,7 @@ func projectFooterLines(p *ProjectRow, w int, prefix string, ctx coordSpawnCtx) 
 	if p.CoordID != "" {
 		coordLabel := dimStyle.Render("coord ") + workerIDStyle.Render(p.CoordID)
 		if rec := findRecordByID(ctx.records, p.CoordID); rec != nil {
-			if bar := renderContextBar(rec.ContextPct); bar != "" {
+			if bar := renderRecordContextBar(rec); bar != "" {
 				coordLabel += " " + bar
 			}
 		}
@@ -1689,7 +1689,7 @@ func workerBlockLines(w *WorkerRow, records []*agent.Record, width int, selected
 	// stay empty.
 	var bar, tag string
 	if rec := workerContextRecord(records, w); rec != nil {
-		bar = renderContextBar(rec.ContextPct)
+		bar = renderRecordContextBar(rec)
 		tag = renderHandoffTag(rec.HandoffType)
 	}
 	chips := joinChips(bar, tag)
@@ -1763,7 +1763,7 @@ func agentBlockLinesWithFlash(r *agent.Record, alive map[string]bool, width int,
 	// when the record has nil values, so non-fleet-guarded agents
 	// (legacy v0.1 records or pre-bootstrap dispatches) render the
 	// row exactly as before.
-	bar := renderContextBar(r.ContextPct)
+	bar := renderRecordContextBar(r)
 	tag := renderHandoffTag(r.HandoffType)
 	chips := joinChips(bar, tag)
 	// Coord tag — distinguishes a coord row from a loose agent in the

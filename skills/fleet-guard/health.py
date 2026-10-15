@@ -41,6 +41,7 @@ CONTEXT_LIMITS: dict[str, int] = {
     "claude-opus-4-5":   1_000_000,
     "claude-sonnet-4-6": 1_000_000,
     "claude-sonnet-4-5": 1_000_000,
+    "claude-haiku-5-5":  1_000_000,
     "claude-haiku-4-5":    200_000,
 }
 
@@ -159,6 +160,8 @@ SCHEMA_VERSION = 1
 # Keep this set narrow — adding here requires a paired SKILL.md update.
 OWNED_FIELDS: frozenset[str] = frozenset({
     "context_pct",
+    "context_tokens",
+    "context_state",
     "context_source",
     "last_activity_ts",
     "blocked",
@@ -172,10 +175,27 @@ OWNED_FIELDS: frozenset[str] = frozenset({
 })
 
 # Yellow = graceful handoff (inject HANDOFF REQUESTED, wait for MILESTONE);
-# Red = hard forced handoff (doc + queue immediately). Mirrored by
-# internal/tui/context_bar.go so the dashboard colors match the trigger.
+# Red = hard forced handoff (doc + queue immediately). A coordinator with
+# coord-config handoff_soft_tokens / handoff_hard_tokens triggers on those
+# absolute token counts instead of these percents. The record carries the
+# classified `context_state` so internal/tui/context_bar.go colors match
+# the trigger; its percent constants mirror these for older records.
 YELLOW_THRESHOLD = 40.0
 RED_THRESHOLD = 50.0
+
+_COORD_TASK_ID_PREFIX = "coord-"
+
+# coord_config lives in the sibling coordinator skill dir; both skills
+# install side by side under <skill home>/skills/.
+_COORDINATOR_SKILL_DIR = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "coordinator",
+)
+if _COORDINATOR_SKILL_DIR not in sys.path:
+    sys.path.append(_COORDINATOR_SKILL_DIR)
+try:
+    import coord_config  # noqa: E402
+except ImportError:  # pragma: no cover — coordinator skill not installed
+    coord_config = None  # type: ignore[assignment]
 
 
 def fleet_home() -> Path:
@@ -191,6 +211,14 @@ def agent_record_path(agent_id: str) -> Path:
 
 
 def read_context_pct(payload: dict[str, Any]) -> tuple[float | None, str | None]:
+    """(context_pct, model) from read_context."""
+    pct, model, _tokens = read_context(payload)
+    return (pct, model)
+
+
+def read_context(
+    payload: dict[str, Any],
+) -> tuple[float | None, str | None, int | None]:
     """Walk the transcript JSONL referenced by payload['transcript_path'] and
     compute context_pct from the most-recent usage record.
 
@@ -208,7 +236,7 @@ def read_context_pct(payload: dict[str, Any]) -> tuple[float | None, str | None]
                    rollout metadata only (model id from the hook payload, for
                    diagnostics).
 
-    Returns (context_pct, model_name). pct is None only when the transcript
+    Returns (context_pct, model_name, context_tokens). pct is None only when the transcript
     yields no usage/model data at all (missing path, unreadable file, no
     usage blocks) — and the no-usage case flags loudly to stderr, because a
     persistent (None, None) is the frozen-health-writer fingerprint (bug D).
@@ -221,10 +249,10 @@ def read_context_pct(payload: dict[str, Any]) -> tuple[float | None, str | None]
     """
     transcript_path = payload.get("transcript_path") or ""
     if not transcript_path:
-        return (None, None)
+        return (None, None, None)
     tp = Path(transcript_path)
     if not tp.exists():
-        return (None, None)
+        return (None, None, None)
 
     last_usage: dict[str, Any] | None = None
     last_model = ""
@@ -255,7 +283,7 @@ def read_context_pct(payload: dict[str, Any]) -> tuple[float | None, str | None]
                 if isinstance(u, dict):
                     last_usage = u
     except Exception:
-        return (None, None)
+        return (None, None, None)
 
     if codex_usage is not None:
         return _codex_pct(codex_usage, codex_window, payload)
@@ -272,7 +300,7 @@ def read_context_pct(payload: dict[str, Any]) -> tuple[float | None, str | None]
             f"message.usage block; check the hook's transcript_path wiring).",
             file=sys.stderr,
         )
-        return (None, last_model or None)
+        return (None, last_model or None, None)
 
     in_t = int(last_usage.get("input_tokens", 0) or 0)
     cr_t = int(last_usage.get("cache_read_input_tokens", 0) or 0)
@@ -281,16 +309,16 @@ def read_context_pct(payload: dict[str, Any]) -> tuple[float | None, str | None]
 
     model = last_model or None
     if model is None:
-        return (None, None)
+        return (None, None, None)
     # Return the RAW model id either way so an unknown model still surfaces its
     # real name for diagnostics / a future config-driven table entry.
     # _resolve_limit never returns None for a non-empty id (unknown -> 1M
     # default + stderr flag); the guard below is belt-and-suspenders only.
     limit = _resolve_limit(model)
     if limit is None:
-        return (None, model)
+        return (None, model, total)
     pct = round(total * 100.0 / limit, 2)
-    return (pct, model)
+    return (pct, model, total)
 
 
 def _codex_token_count(obj: dict[str, Any]) -> tuple[dict[str, Any], int | None] | None:
@@ -311,8 +339,9 @@ def _codex_token_count(obj: dict[str, Any]) -> tuple[dict[str, Any], int | None]
     return (usage, window if isinstance(window, int) and window > 0 else None)
 
 
-def _codex_pct(usage: dict[str, Any], window: int | None,
-               payload: dict[str, Any]) -> tuple[float | None, str | None]:
+def _codex_pct(
+    usage: dict[str, Any], window: int | None, payload: dict[str, Any],
+) -> tuple[float | None, str | None, int | None]:
     """Codex context_pct: last_token_usage.input_tokens is the full prompt
     of the most recent turn (cached_input_tokens is a SUBSET of it in the
     OpenAI usage shape, so it is not added again); output tokens are
@@ -323,19 +352,71 @@ def _codex_pct(usage: dict[str, Any], window: int | None,
     in_t = int(usage.get("input_tokens", 0) or 0)
     limit = _resolve_limit(model) if model else DEFAULT_CONTEXT_LIMIT
     if not limit:
-        return (None, model)
-    return (round(in_t * 100.0 / limit, 2), model)
+        return (None, model, in_t)
+    return (round(in_t * 100.0 / limit, 2), model, in_t)
 
 
-def threshold(context_pct: float | None) -> str:
-    """Classify a context_pct into 'green' | 'yellow' | 'red' | 'unknown'."""
+def threshold(
+    context_pct: float | None,
+    context_tokens: int | None = None,
+    soft_tokens: int | None = None,
+    hard_tokens: int | None = None,
+) -> str:
+    """Classify context into 'green' | 'yellow' | 'red' | 'unknown'.
+
+    Each side triggers on its token threshold when one is given (and the
+    token count is known), else on YELLOW_THRESHOLD / RED_THRESHOLD
+    percent of the window.
+    """
     if context_pct is None:
         return "unknown"
-    if context_pct >= RED_THRESHOLD:
+
+    def crossed(tokens_at: int | None, pct_at: float) -> bool:
+        if tokens_at is not None and context_tokens is not None:
+            return context_tokens >= tokens_at
+        return context_pct >= pct_at
+
+    if crossed(hard_tokens, RED_THRESHOLD):
         return "red"
-    if context_pct >= YELLOW_THRESHOLD:
+    if crossed(soft_tokens, YELLOW_THRESHOLD):
         return "yellow"
     return "green"
+
+
+def is_coord_record(record: dict[str, Any] | None) -> bool:
+    """True for the coordinator's own record: task_id == "coord-<project>"
+    EXACTLY (mirrors internal/spawn.IsCoordSpawn), so a worker whose slug
+    merely starts with "coord-" is not a coord."""
+    if not record:
+        return False
+    project = record.get("project", "")
+    return bool(project) and (
+        record.get("task_id", "") == _COORD_TASK_ID_PREFIX + project
+    )
+
+
+def handoff_token_thresholds(
+    record: dict[str, Any] | None,
+) -> tuple[int | None, int | None]:
+    """(soft, hard) token thresholds for this agent: coord-config's
+    handoff_soft_tokens / handoff_hard_tokens (profile defaults) for a
+    coordinator; (None, None) — percent of window — for workers."""
+    if coord_config is None or not is_coord_record(record):
+        return (None, None)
+    home = fleet_home()
+    return coord_config.load_handoff_tokens(
+        home / "projects" / str(record.get("project", "")), home,
+    )
+
+
+def context_state(
+    record: dict[str, Any] | None,
+    context_pct: float | None,
+    context_tokens: int | None,
+) -> str:
+    """`threshold` with the agent's own handoff token thresholds."""
+    soft, hard = handoff_token_thresholds(record)
+    return threshold(context_pct, context_tokens, soft, hard)
 
 
 def now_rfc3339() -> str:

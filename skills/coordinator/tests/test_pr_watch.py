@@ -3271,6 +3271,43 @@ def _agent_record(it_home: Path, agent_id: str, **fields) -> None:
     (it_home / "agents" / f"{agent_id}.json").write_text(json.dumps(rec))
 
 
+@pytest.mark.parametrize(("engine", "profile", "model"), [
+    ("claude-code", None, "claude-sonnet-5-5"),
+    ("claude-code", "quality", "claude-opus-5-5"),
+    ("codex", None, "gpt-5.6-luna"),
+])
+def test_e2e_rebase_dispatch_routes_non_code_model(
+    it_home: Path, it_project_dir: Path, monkeypatch,
+    engine: str, profile: str | None, model: str,
+) -> None:
+    """A DIRTY PR's REBASE DISPATCH block runs on Sonnet for a budget
+    Claude coord, Opus under the quality profile, and the simple tier
+    (luna) on Codex."""
+    monkeypatch.setenv("FLEET_ENGINE", engine)
+    if profile is not None:
+        (it_home / "coord-config.json").write_text(json.dumps({"profile": profile}))
+    _write_tasks(it_project_dir, [_it_task("foo", pr_url=_pr_url(195), branch="worker/foo")])
+    snaps = {195: pw.PRSnapshot(number=195, pr_state="OPEN",
+                                merge_state_status="DIRTY", checks="SUCCESS",
+                                review_decision="", head_ref_oid="H195",
+                                base_ref_name="main", human_approved=False)}
+    monkeypatch.setattr(loop, "_pr_watch_prober",
+                        FakeProber(snaps=snaps, fresh_base="B", ancestors=set()))
+    monkeypatch.setattr(loop.pr_watch_mod, "derive_owner_repo", lambda *a, **k: OWNER_REPO)
+    monkeypatch.setattr(loop.dispatch_mod, "fetch_standards", lambda *a, **k: "S")
+    monkeypatch.setattr(loop.dispatch_mod, "acquire_coord_prompt_inbox",
+                        _fake_acquire_factory(it_home))
+
+    with patch.object(loop, "_run_fleet", side_effect=lambda cmd, timeout_s=30.0: None):
+        r = loop.tick("fleet", coord_id="cccccc01", cwd="/repo", fleet_home=str(it_home))
+
+    blocks = [b for b in r.dispatch_instructions if "pr-rebase-195" in b]
+    assert len(blocks) == 1
+    lines = blocks[0].splitlines()
+    assert "  tier: simple" in lines
+    assert f"  model: {model}" in lines
+
+
 def test_e2e_dirty_rebase_conflict_advances_to_rederive(
     it_home: Path, it_project_dir: Path, monkeypatch,
 ) -> None:

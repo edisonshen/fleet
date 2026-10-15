@@ -188,15 +188,23 @@ func CapturePane(t *testing.T, session string) string {
 	return string(pane)
 }
 
-// yellowPct mirrors skills/fleet-guard/health.py YELLOW_THRESHOLD: the
-// context_pct at which the Stop hook requests a soft handoff.
-const yellowPct = 40.0
+// Coordinator handoff thresholds in context tokens, mirroring the budget
+// profile defaults in skills/coordinator/coord_config.py PROFILE_DEFAULTS
+// (handoff_soft_tokens / handoff_hard_tokens).
+const (
+	yellowTokens = 250_000
+	redTokens    = 300_000
+)
+
+// coordWindowTokens is the 1M-token window a seeded coord's context_pct
+// is computed against.
+const coordWindowTokens = 1_000_000
 
 // YellowPaneBanner is the shell command that prints what a coord's pane
-// shows once the 40% soft handoff has been requested and the coord
-// answered with its MILESTONE turn (fleet-guard's find_milestone looks
-// for exactly this HANDOFF REQUESTED → ⏺ MILESTONE sequence).
-const YellowPaneBanner = `printf '> HANDOFF REQUESTED: context window is over 40%% — SOFT\n\n⏺ MILESTONE\n\n'`
+// shows once the soft handoff has been requested and the coord answered
+// with its MILESTONE turn (fleet-guard's find_milestone looks for exactly
+// this HANDOFF REQUESTED → ⏺ MILESTONE sequence).
+const YellowPaneBanner = `printf '> HANDOFF REQUESTED: context is past the soft handoff threshold — SOFT\n\n⏺ MILESTONE\n\n'`
 
 // SeedCoordOpts shapes the coordinator record SeedCoord writes.
 type SeedCoordOpts struct {
@@ -207,13 +215,14 @@ type SeedCoordOpts struct {
 	// archived it. Live (the default) also spawns the coord's fleet-<id>
 	// session on the isolated socket, running Command.
 	Dead bool
-	// Pct stamps context_pct (source "hook") as the Stop hook would after
-	// the coord's last turn; 0 leaves it unset. At or above the 40% yellow
-	// threshold the record also carries handoff_type=auto-yellow (the
-	// pending soft handoff) and a live coord's pane already shows the
+	// Tokens stamps context_tokens, context_pct (of a 1M window),
+	// context_state and source "hook" as the Stop hook would after the
+	// coord's last turn; 0 leaves them unset. At or above the soft
+	// threshold (250k) the record also carries handoff_type=auto-yellow
+	// (the pending soft handoff) and a live coord's pane already shows the
 	// `HANDOFF REQUESTED:` line followed by a `⏺ MILESTONE` turn — the
 	// exact state fleet-guard evaluates the in-flight hold in.
-	Pct int
+	Tokens int
 	// Command runs inside a live coord's pane; default `claude` (the fake
 	// shim callers put first on PATH).
 	Command []string
@@ -222,7 +231,7 @@ type SeedCoordOpts struct {
 // SeedCoord writes a coordinator record for project (and, unless Dead,
 // its tmux session) without going through `fleet dispatch`: the state a
 // coord leaves behind, planted directly so a scenario can start from
-// "coord at 41% with a worker in flight" or "coord dead for days" in one
+// "coord at 260k tokens with a worker in flight" or "coord dead for days" in one
 // call. Returns the record as written.
 func SeedCoord(t *testing.T, project string, opts SeedCoordOpts) *agent.Record {
 	t.Helper()
@@ -243,11 +252,21 @@ func SeedCoord(t *testing.T, project string, opts SeedCoordOpts) *agent.Record {
 		rec.SpawnedAt = now.Add(-72 * time.Hour)
 	}
 	yellow := false
-	if opts.Pct > 0 {
-		pct := float64(opts.Pct)
+	if opts.Tokens > 0 {
+		tokens := int64(opts.Tokens)
+		pct := float64(opts.Tokens) * 100 / coordWindowTokens
+		rec.ContextTokens = &tokens
 		rec.ContextPct = &pct
 		rec.ContextSource = "hook"
-		if pct >= yellowPct {
+		switch {
+		case tokens >= redTokens:
+			rec.ContextState = "red"
+		case tokens >= yellowTokens:
+			rec.ContextState = "yellow"
+		default:
+			rec.ContextState = "green"
+		}
+		if tokens >= yellowTokens {
 			yellow = true
 			ht := handoff.TypeAutoYellow
 			at := now.Format(time.RFC3339)
@@ -261,7 +280,7 @@ func SeedCoord(t *testing.T, project string, opts SeedCoordOpts) *agent.Record {
 			cmd = []string{"claude"}
 		}
 		if yellow {
-			// Same pane text the 40% soft handoff leaves on screen: the
+			// Same pane text the soft handoff leaves on screen: the
 			// hook's request line, then the coord's MILESTONE turn.
 			cmd = append([]string{"sh", "-c", YellowPaneBanner + `; exec "$@"`, "coord-pane"}, cmd...)
 		}

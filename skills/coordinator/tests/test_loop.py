@@ -5160,13 +5160,18 @@ def test_tick_keeps_claim_when_parse_error_save_fails(
 @pytest.mark.parametrize(
     ("project_cfg", "home_cfg", "want"),
     [
-        (None, None, "high"),
+        (None, None, "medium"),
         ({"review_effort": "medium"}, None, "medium"),
         (None, {"review_effort": "LOW"}, "low"),
         ({"review_effort": "medium"}, {"review_effort": "low"}, "medium"),
-        ({"review_effort": "turbo"}, None, "high"),
-        ({"review_effort": 3}, None, "high"),
-        ({"parallelism": 2}, {"review_effort": "medium"}, "medium"),
+        ({"review_effort": "turbo"}, None, "medium"),
+        ({"review_effort": 3}, None, "medium"),
+        ({"parallelism": 2}, {"review_effort": "high"}, "high"),
+        ({"profile": "quality"}, None, "high"),
+        (None, {"profile": "quality"}, "high"),
+        ({"profile": "budget"}, {"profile": "quality"}, "medium"),
+        ({"profile": "quality", "review_effort": "low"}, None, "low"),
+        ({"profile": "bogus"}, None, "medium"),
     ],
 )
 def test_load_review_effort_resolution(
@@ -5210,6 +5215,58 @@ def test_load_unavailable_models_union(
     if home_cfg is not None:
         (home / loop.COORD_CONFIG_FILE).write_text(json.dumps(home_cfg))
     assert loop._load_unavailable_models(project_dir, home) == want
+
+
+@pytest.mark.parametrize(("engine", "profile", "complexity", "want"), [
+    ("claude-code", None, "simple",
+     ["  tier: simple", "  model: claude-haiku-5-5", "  effort: medium",
+      "  fallback_models: claude-sonnet-5-5", "  fallback_effort: medium"]),
+    ("claude-code", None, "coding",
+     ["  tier: coding", "  model: claude-opus-5-5", "  effort: medium",
+      "  fallback_models: claude-opus-5", "  fallback_effort: medium"]),
+    ("claude-code", None, "complex",
+     ["  tier: complex", "  model: claude-opus-5-5", "  effort: high",
+      "  fallback_models: claude-opus-5", "  fallback_effort: medium"]),
+    ("claude-code", "quality", "simple",
+     ["  tier: simple", "  model: claude-opus-5-5", "  effort: medium",
+      "  fallback_models: claude-opus-5", "  fallback_effort: medium"]),
+    ("claude-code", "quality", "complex",
+     ["  tier: complex", "  model: claude-opus-5-5", "  effort: medium",
+      "  fallback_models: claude-opus-5", "  fallback_effort: medium"]),
+    ("codex", None, "simple",
+     ["  tier: simple", "  model: gpt-5.6-luna", "  effort: medium",
+      "  fallback_models: gpt-5.5, gpt-5.4", "  fallback_effort: medium"]),
+    ("codex", "quality", "complex",
+     ["  tier: complex", "  model: gpt-5.6-sol", "  effort: high",
+      "  fallback_models: gpt-5.5, gpt-5.4", "  fallback_effort: medium"]),
+])
+def test_tick_dispatch_block_routes_by_profile(
+    fleet_home: Path, project_dir: Path,
+    fleet_run_recorder, dispatch_subprocess, monkeypatch: pytest.MonkeyPatch,
+    engine: str, profile: str | None, complexity: str, want: list[str],
+) -> None:
+    """The tick's DISPATCH block carries the coord-config `profile`'s
+    worker model: budget (default) Claude tiers Haiku/Opus/Opus-high,
+    quality Claude all Opus, Codex the same in both."""
+    monkeypatch.setenv("FLEET_ENGINE", engine)
+    t = _make_task("ready-aaaa", status="ready")
+    t.complexity = complexity
+    _write_tasks(project_dir, [t])
+    if profile is not None:
+        (fleet_home / loop.COORD_CONFIG_FILE).write_text(
+            json.dumps({"profile": profile}),
+        )
+    dispatch_subprocess.append("abcdef01")
+
+    result = loop.tick(
+        "fleet", coord_id="cccccc01", cwd="/repo",
+        fleet_home=str(fleet_home), cap=1,
+    )
+
+    assert result.dispatched == 1
+    lines = result.dispatch_instructions[0].splitlines()
+    i = lines.index(f"  engine: {engine}")
+    assert lines[i + 1:i + 6] == want
 
 
 def test_tick_dispatch_block_carries_routed_worker_model(

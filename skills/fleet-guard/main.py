@@ -64,6 +64,10 @@ def main(stdin: TextIO | None = None) -> int:
             if out is not None:
                 print(json.dumps(out))
             return 0
+        if hook_name == "Stop" and payload.get("agent_id"):
+            # A subagent's own Stop: its transcript and turn end are not
+            # the parent session's, so it must not drive the parent record.
+            return 0
         if hook_name == "Stop":
             _on_stop(payload, agent_id, session, injections)
         elif hook_name == "PreCompact":
@@ -123,7 +127,7 @@ def _on_stop(payload: dict, agent_id: str, session: str,
     processing the injected content (caught by codex review iter-2 P2
     on inbox-driven Stops).
     """
-    pct, model = health.read_context_pct(payload)
+    pct, model, tokens = health.read_context(payload)
     if pct is None:
         # Bug D part-4 instrumentation (RC-freeze root-cause, 2026-06-10):
         # never write a null context_pct silently. Name the hook event +
@@ -144,6 +148,10 @@ def _on_stop(payload: dict, agent_id: str, session: str,
     health.update_record(
         agent_id,
         context_pct=pct,
+        context_tokens=tokens,
+        context_state=health.context_state(
+            health.read_record(agent_id), pct, tokens,
+        ),
         context_source="hook",
     )
     # Drift recovery for the P0 spawn-pid bug (2026-05-13). The Go-side

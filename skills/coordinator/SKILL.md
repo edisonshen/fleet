@@ -116,7 +116,8 @@ Turn the approved plan doc into tasks.
 
 - `<=10` tasks: add inline via `fleet tasks add`.
 - `>10` tasks: dispatch one planner subagent whose only job is to create the
-  task list and return the slugs.
+  task list and return the slugs. On a Claude coord under the budget profile
+  spawn it with model `claude-sonnet-5-5` (fallback `claude-sonnet-5`).
 - Do not promote tasks yet; promotion waits for TASK-PLAN-DOC.
 
 ### Step 4 — TASK LIST
@@ -329,8 +330,12 @@ Rules:
   (what `fleet init` prompts for / `fleet init --parallelism N` writes), then 3.
   Parallelism above 1 uses worktrees and conflict checks; set `parallelism: 1`
   for serialized in-place dispatch.
-- `coord-config.json:review_effort` (`low|medium|high`, default `high`;
-  project file, then `~/.fleet/coord-config.json`) sets the reasoning effort
+- `coord-config.json:profile` (`budget` default | `quality`; project file,
+  then `~/.fleet/coord-config.json`) picks the defaults below; any explicit
+  key beats its profile default.
+- `coord-config.json:review_effort` (`low|medium|high`, default `medium`
+  under budget, `high` under quality; project file, then
+  `~/.fleet/coord-config.json`) sets the reasoning effort
   passed to both review slots. Lower it on projects with small diffs where
   review wall-time matters more than depth.
 - Worker model routing: workers/reviewers/PR-watch fixers run on a cheaper
@@ -340,14 +345,18 @@ Rules:
     `gpt-5.6-luna` medium; `coding` (default) → `gpt-5.6-terra` medium;
     `complex` (migration, protocol, schema, concurrency, cross-cutting, P0,
     many deps / e2e rows, plan-doc linked) → `gpt-5.6-sol` high.
-  - Claude coords route every tier to `claude-opus-5-5` medium (fallback
-    `claude-opus-5`). Codex falls back to `gpt-5.5` then `gpt-5.4`, medium.
+  - Claude coords, `budget` profile (default): `simple` → `claude-haiku-5-5`
+    (fallback `claude-sonnet-5-5`); `coding` → `claude-opus-5-5` medium;
+    `complex` → `claude-opus-5-5` high (fallback `claude-opus-5`). `quality`
+    profile: every tier `claude-opus-5-5` medium. Codex is the same in both
+    and falls back to `gpt-5.5` then `gpt-5.4`, medium.
   - Explicit beats inferred: set `complexity:` when you file the task
     (`fleet tasks add --complexity simple|coding|complex`, or
     `fleet tasks set <slug> complexity=<tier>`); unset → inferred from the
     spec/acceptance text. Each re-dispatch of a slug (worker-failed, review
     rejection) escalates one tier, capped at `complex`. PR-watch rebase is
-    always `simple`; PR-watch fix/rederive is `coding`.
+    `simple` (on a budget Claude coord: `claude-sonnet-5-5`); PR-watch
+    fix/rederive is `coding`.
   - `coord-config.json:unavailable_models` (array of model ids; project file
     unioned with `~/.fleet/coord-config.json`) skips models your account
     can't use; when the whole ladder is unavailable the block carries no
@@ -372,15 +381,17 @@ so the handoff's `## Status` block is accurate. Details: `REFERENCE.md`.
 
 ### Context-window handoff (fleet-guard)
 
-At 40% context fleet-guard injects `HANDOFF REQUESTED … SOFT coordinator
-handoff`. From that turn the tick emits **no new worker or PR-watch fixer
+At the soft threshold fleet-guard injects `HANDOFF REQUESTED … SOFT
+coordinator handoff` — `coord-config.json:handoff_soft_tokens` /
+`handoff_hard_tokens`, default 250k / 300k context tokens under the budget
+profile, 40% / 50% of the window under quality. From that turn the tick emits **no new worker or PR-watch fixer
 DISPATCH blocks** (`result.errors` says `handoff pending`); reviewer/finisher
 handoffs, reconcile, and PR-watch tracking keep running so in-flight work
 lands. Do not start anything new — keep ticking as subagents return, record
 what a successor needs (`fleet checkpoint next-step` / `decision`), then emit
 `MILESTONE` on its own line. The doc is written and this coord retired only
-once `worker_agent_ids` and the PR-watch running leases are empty; at 50% the
-handoff is forced with whatever is still in flight listed for the successor.
+once `worker_agent_ids` and the PR-watch running leases are empty; at the hard
+threshold the handoff is forced with whatever is still in flight listed for the successor.
 
 ### Step 7 — PR-TRACK
 

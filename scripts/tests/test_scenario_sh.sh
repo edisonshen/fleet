@@ -96,8 +96,8 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-CASE="S3 seed-coord --pct 41 + seed-worker: real Stop hook holds, no spawn-fresh"
-eval "$(scripts/scenario.sh seed-coord --pct 41 2>/dev/null)"
+CASE="S3 seed-coord --tokens 260000 + seed-worker: real Stop hook holds, no spawn-fresh"
+eval "$(scripts/scenario.sh seed-coord --tokens 260000 2>/dev/null)"
 scripts/scenario.sh seed-worker x --phase verify 2>/dev/null
 pane="$(scripts/scenario.sh capture)"
 hook_rc=0
@@ -206,7 +206,7 @@ CASE="up reuses FLEET_DEV_BIN; fake claude honours FLEET_FAKE_CLAUDE_MODE=hang"
 export FLEET_DEV_BIN="$KEPT_BIN"
 eval "$(scripts/scenario.sh up --slug "$SLUG" 2>/dev/null)"
 if [[ "$FLEET_DEV_BIN" == "$KEPT_BIN" ]] && [[ "$(readlink "$FLEET_HOME/bin/fleet")" == "$KEPT_BIN" ]]; then
-    FLEET_FAKE_CLAUDE_MODE=hang scripts/scenario.sh seed-coord --pct 12 >/dev/null 2>&1
+    FLEET_FAKE_CLAUDE_MODE=hang scripts/scenario.sh seed-coord --tokens 120000 >/dev/null 2>&1
     sleep 1
     pane="$(scripts/scenario.sh capture)"
     if grep -q 'fake claude: hanging pid' <<<"$pane" && ! grep -q 'fake claude: ready' <<<"$pane"; then

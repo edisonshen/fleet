@@ -19,6 +19,7 @@ from __future__ import annotations
 import os
 
 import reviewcfg
+import workercfg
 
 
 _SKILL_MD = os.path.join(
@@ -429,6 +430,10 @@ def test_skill_md_documents_worker_model_routing():
         "gpt-5.6-terra",
         "gpt-5.6-sol",
         "claude-opus-5-5",
+        workercfg.CLAUDE_HAIKU_MODEL,
+        workercfg.CLAUDE_NONCODE_MODELS[0],
+        "`budget` profile",
+        "`quality`",
         "unavailable_models",
         "--complexity",
         "complexity=<tier>",

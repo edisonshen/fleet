@@ -2467,7 +2467,7 @@ func groupKeyFor(r *agent.Record, cache map[string]string) string {
 //
 // Glyphs and colors:
 //   - ▌ orange   blocked
-//   - △ red      hot context (≥ contextRedThreshold on any record)
+//   - △ red      hot context (red context zone on any record)
 //   - ● cyan     asking (agent ended its last turn on a question)
 //   - ● cyan     in review (Mode=="review")
 //   - ○ dim      idle (stopped, work done, no question)
@@ -2498,7 +2498,7 @@ func renderAlertBanner(records []*agent.Record, alive map[string]bool) string {
 		case "dead":
 			dead++
 		}
-		if status != "dead" && r.ContextPct != nil && *r.ContextPct >= contextRedThreshold {
+		if status != "dead" && r.ContextPct != nil && recordContextZone(r) == "red" {
 			hot++
 		}
 	}

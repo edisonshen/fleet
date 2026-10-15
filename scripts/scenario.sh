@@ -34,15 +34,16 @@ SUBCOMMANDS
                            Fails (and removes the sandbox) on a bad binary
                          - puts $FLEET_HOME/bin first on PATH: `fleet` is the
                            dev binary, `claude` is scripts/fake-claude.sh
-  seed-coord [--pct N] [--dead]
+  seed-coord [--tokens N] [--dead]
                          plant a coordinator record for the project. Live
                          (default) also spawns its fleet-<id> tmux session on
-                         the sandbox socket running `claude`. --pct N stamps
-                         context_pct=N; at N >= 40 the record carries
+                         the sandbox socket running `claude`. --tokens N stamps
+                         context_tokens=N (context_pct on a 1M window); at
+                         N >= 250000 (budget soft handoff) the record carries
                          handoff_type=auto-yellow and the pane already shows
                          `HANDOFF REQUESTED:` -> `⏺ MILESTONE` (the soft-
                          handoff state). Also writes a Stop-hook payload at
-                         N% to $FLEET_HOME/.scenario/stop.json. --dead writes
+                         N tokens to $FLEET_HOME/.scenario/stop.json. --dead writes
                          the record only, spawned_at 72h ago, no session.
   seed-worker <slug> --phase <p>
                          record a worker the coord has in flight: coord-
@@ -74,7 +75,7 @@ ENVIRONMENT
 
 WORKED EXAMPLE — coord at 41% holds its soft handoff while a worker is out
   eval "$(scripts/scenario.sh up)"
-  scripts/scenario.sh seed-coord --pct 41
+  scripts/scenario.sh seed-coord --tokens 260000
   scripts/scenario.sh seed-worker x --phase verify
   scripts/scenario.sh run -- python3 skills/fleet-guard/main.py < "$FLEET_HOME/.scenario/stop.json"
   # stderr: fleet-guard: soft handoff for coord <id> holding — 1 subagent(s) still in flight: x=<worker-id>
@@ -162,12 +163,11 @@ cmd_up() {
     printf 'export PATH=%q:"$PATH"\n' "$home/bin"
 }
 
-# stop_payload <pct> — a Stop-hook payload whose transcript puts the agent at
-# <pct>% of a 200k model (claude-haiku-4-5): input_tokens = pct * 2000.
+# write_stop_payload <tokens> — a Stop-hook payload whose transcript puts the
+# agent at <tokens> input tokens on a 1M model (claude-opus-5-5).
 write_stop_payload() {
-    local pct="$1" dir="$FLEET_HOME/.scenario"
-    local tokens=$((pct * 2000))
-    printf '{"type":"assistant","message":{"model":"claude-haiku-4-5","usage":{"input_tokens":%d}}}\n' \
+    local tokens="$1" dir="$FLEET_HOME/.scenario"
+    printf '{"type":"assistant","message":{"model":"claude-opus-5-5","usage":{"input_tokens":%d}}}\n' \
         "$tokens" > "$dir/transcript.jsonl"
     printf '{"hook_event_name":"Stop","session_id":"scenario","transcript_path":"%s"}\n' \
         "$dir/transcript.jsonl" > "$dir/stop.json"
@@ -175,15 +175,15 @@ write_stop_payload() {
 
 cmd_seed_coord() {
     need_sandbox
-    local pct=0 dead=0
+    local tokens=0 dead=0
     while [[ $# -gt 0 ]]; do
         case "$1" in
-            --pct) pct="${2:?--pct needs a value}"; shift 2 ;;
+            --tokens) tokens="${2:?--tokens needs a value}"; shift 2 ;;
             --dead) dead=1; shift ;;
             *) die "seed-coord: unknown argument $1" ;;
         esac
     done
-    [[ "$pct" =~ ^[0-9]+$ ]] || die "seed-coord: --pct must be an integer"
+    [[ "$tokens" =~ ^[0-9]+$ ]] || die "seed-coord: --tokens must be an integer"
     local id
     id=$(od -An -N4 -tx1 /dev/urandom | tr -d ' \n')
     local session="fleet-$id" now spawned
@@ -198,8 +198,8 @@ cmd_seed_coord() {
         local pane="$FLEET_HOME/.scenario/coord-pane.sh"
         {
             echo '#!/bin/sh'
-            if [[ $pct -ge 40 ]]; then
-                # What the pane shows once the 40% soft handoff was requested
+            if [[ $tokens -ge 250000 ]]; then
+                # What the pane shows once the soft handoff was requested
                 # and the coord answered with its MILESTONE turn.
                 echo "printf '> HANDOFF REQUESTED: context window is over 40%% — SOFT\\n\\n⏺ MILESTONE\\n\\n'"
             fi
@@ -211,9 +211,9 @@ cmd_seed_coord() {
     fi
 
     python3 - "$FLEET_HOME/agents/$id.json" "$id" "$FLEET_SCENARIO_PROJECT" "$session" \
-        "$now" "$spawned" "$pct" "$dead" "$FLEET_HOME/repo" <<'PY'
+        "$now" "$spawned" "$tokens" "$dead" "$FLEET_HOME/repo" <<'PY'
 import json, os, sys
-path, aid, project, session, now, spawned, pct, dead, cwd = sys.argv[1:]
+path, aid, project, session, now, spawned, tokens, dead, cwd = sys.argv[1:]
 rec = {
     "schema_version": 2,
     "id": aid,
@@ -232,10 +232,15 @@ rec = {
 if dead == "0":
     rec["cwd"] = cwd
     rec["command"] = ["claude"]
-if int(pct) > 0:
-    rec["context_pct"] = float(pct)
+tokens = int(tokens)
+if tokens > 0:
+    rec["context_tokens"] = tokens
+    rec["context_pct"] = tokens / 10_000
+    rec["context_state"] = (
+        "red" if tokens >= 300_000 else "yellow" if tokens >= 250_000 else "green"
+    )
     rec["context_source"] = "hook"
-    if int(pct) >= 40:
+    if tokens >= 250_000:
         rec["handoff_type"] = "auto-yellow"
         rec["handoff_type_at"] = now
 tmp = path + ".tmp"
@@ -245,8 +250,8 @@ with open(tmp, "w", encoding="utf-8") as fh:
 os.replace(tmp, path)
 PY
     echo "$id" > "$FLEET_HOME/.scenario/coord-id"
-    write_stop_payload "$pct"
-    echo "seeded coord $id (project=$FLEET_SCENARIO_PROJECT pct=$pct dead=$dead session=$session)" >&2
+    write_stop_payload "$tokens"
+    echo "seeded coord $id (project=$FLEET_SCENARIO_PROJECT tokens=$tokens dead=$dead session=$session)" >&2
     echo "export FLEET_AGENT_ID=$id"
 }
 

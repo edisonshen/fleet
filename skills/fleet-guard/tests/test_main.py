@@ -83,12 +83,13 @@ def _seed_record(home: Path, **overrides: Any) -> Path:
     return path
 
 
-def _transcript(tmp_path: Path, *, input_tokens: int = 10_000) -> Path:
+def _transcript(tmp_path: Path, *, input_tokens: int = 10_000,
+                model: str = "claude-haiku-4-5") -> Path:
     path = tmp_path / "transcript.jsonl"
     path.write_text(json.dumps({
         "type": "assistant",
         "message": {
-            "model": "claude-haiku-4-5",
+            "model": model,
             "usage": {"input_tokens": input_tokens},
         },
     }) + "\n", encoding="utf-8")
@@ -616,3 +617,107 @@ class TestRCCoordHealthAdvances:
         assert rc == 0
         assert "context_pct unresolved" in err
         assert "/nonexistent/rc-transcript.jsonl" in err
+
+
+# -- coordinator token-based handoff ------------------------------------------
+
+class TestCoordTokenHandoff:
+    """Stop hook on a coordinator (task_id coord-<project>) on a 1M-window
+    model: the coord-config profile / handoff_*_tokens pick the trigger."""
+
+    def _stop(self, home: Path, tmp_path: Path, capsys: pytest.CaptureFixture,
+              tokens: int, *, task_id: str = "coord-myproj",
+              global_cfg: dict | None = None,
+              project_cfg: dict | None = None,
+              payload_extra: dict | None = None) -> tuple[str, dict]:
+        record_path = _seed_record(home, task_id=task_id, role="coordinator")
+        if global_cfg is not None:
+            (home / "coord-config.json").write_text(json.dumps(global_cfg))
+        if project_cfg is not None:
+            pdir = home / "projects" / "myproj"
+            pdir.mkdir(parents=True, exist_ok=True)
+            (pdir / "coord-config.json").write_text(json.dumps(project_cfg))
+        rc, out, _ = _run({
+            "hook_event_name": "Stop",
+            "transcript_path": str(_transcript(
+                tmp_path, input_tokens=tokens, model="claude-opus-5-5")),
+            **(payload_extra or {}),
+        }, capsys)
+        assert rc == 0
+        return out, json.loads(record_path.read_text(encoding="utf-8"))
+
+    def test_budget_default_soft_at_260k(
+        self, fleet_home_tmp: Path, tmp_path: Path,
+        capsys: pytest.CaptureFixture,
+    ) -> None:
+        out, rec = self._stop(fleet_home_tmp, tmp_path, capsys, 260_000)
+        assert "HANDOFF REQUESTED" in out and "SOFT coordinator handoff" in out
+        assert rec["handoff_type"] == "auto-yellow"
+        assert (rec["context_pct"], rec["context_tokens"]) == (26.0, 260_000)
+        assert rec["context_state"] == "yellow"
+        assert not (fleet_home_tmp / "queue" / "spawn-fresh-agent7777.json").exists()
+
+    def test_subagent_stop_does_not_drive_coord_record(
+        self, fleet_home_tmp: Path, tmp_path: Path,
+        capsys: pytest.CaptureFixture,
+    ) -> None:
+        """A subagent inherits the coord's FLEET_AGENT_ID; its Stop payload
+        (carrying agent_id) at 310k must not hand off the coord."""
+        out, rec = self._stop(fleet_home_tmp, tmp_path, capsys, 310_000,
+                              payload_extra={"agent_id": "sub-1"})
+        assert out == ""
+        assert rec["handoff_type"] is None
+        assert "context_tokens" not in rec
+        assert not (fleet_home_tmp / "queue" / "spawn-fresh-agent7777.json").exists()
+
+    def test_budget_default_hard_at_310k(
+        self, fleet_home_tmp: Path, tmp_path: Path,
+        capsys: pytest.CaptureFixture,
+    ) -> None:
+        out, rec = self._stop(fleet_home_tmp, tmp_path, capsys, 310_000)
+        assert "HANDOFF REQUESTED" not in out
+        assert rec["handoff_type"] == "auto-red"
+        assert rec["context_state"] == "red"
+        assert (fleet_home_tmp / "queue" / "spawn-fresh-agent7777.json").exists()
+        assert list((fleet_home_tmp / "handoffs").glob("agent7777-*.md"))
+
+    def test_quality_profile_keeps_percent_trigger(
+        self, fleet_home_tmp: Path, tmp_path: Path,
+        capsys: pytest.CaptureFixture,
+    ) -> None:
+        out, rec = self._stop(fleet_home_tmp, tmp_path, capsys, 260_000,
+                              global_cfg={"profile": "quality"})
+        assert "HANDOFF REQUESTED" not in out
+        assert rec["handoff_type"] is None
+        assert rec["context_state"] == "green"
+
+    def test_explicit_soft_tokens_override_profile(
+        self, fleet_home_tmp: Path, tmp_path: Path,
+        capsys: pytest.CaptureFixture,
+    ) -> None:
+        """Project handoff_soft_tokens beats both the global quality
+        profile and the budget default."""
+        out, rec = self._stop(fleet_home_tmp, tmp_path, capsys, 210_000,
+                              global_cfg={"profile": "quality"},
+                              project_cfg={"handoff_soft_tokens": 200_000})
+        assert "SOFT coordinator handoff" in out
+        assert rec["context_state"] == "yellow"
+
+    def test_explicit_soft_tokens_raise_trigger(
+        self, fleet_home_tmp: Path, tmp_path: Path,
+        capsys: pytest.CaptureFixture,
+    ) -> None:
+        out, rec = self._stop(fleet_home_tmp, tmp_path, capsys, 260_000,
+                              project_cfg={"handoff_soft_tokens": 280_000})
+        assert "HANDOFF REQUESTED" not in out
+        assert rec["context_state"] == "green"
+
+    def test_worker_keeps_percent_trigger(
+        self, fleet_home_tmp: Path, tmp_path: Path,
+        capsys: pytest.CaptureFixture,
+    ) -> None:
+        out, rec = self._stop(fleet_home_tmp, tmp_path, capsys, 310_000,
+                              task_id="demo-task")
+        assert "HANDOFF REQUESTED" not in out
+        assert rec["handoff_type"] is None
+        assert (rec["context_tokens"], rec["context_state"]) == (310_000, "green")

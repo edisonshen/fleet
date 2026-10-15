@@ -535,3 +535,32 @@ func TestDashboard_TopStatusHidesHotCountsAtZero(t *testing.T) {
 		t.Errorf("all-green should hide hot counts, got:\n%s", out)
 	}
 }
+
+// A coord record's context_state (token-based handoff) wins over the
+// percent zones: 26% / 310k tokens is red because the handoff fired.
+func TestContextState_OverridesPercentZone(t *testing.T) {
+	coord := agent.New("ccc00001")
+	coord.ContextPct = floatPtr(31)
+	coord.ContextState = "red"
+	soft := agent.New("ccc00002")
+	soft.ContextPct = floatPtr(26)
+	soft.ContextState = "yellow"
+	worker := agent.New("www00001")
+	worker.ContextPct = floatPtr(45)
+	for _, tc := range []struct {
+		rec  *agent.Record
+		want string
+	}{{coord, "red"}, {soft, "amber"}, {worker, "amber"}} {
+		if got := recordContextZone(tc.rec); got != tc.want {
+			t.Errorf("%s: zone %q, want %q", tc.rec.ID, got, tc.want)
+		}
+	}
+	y, r := hotCounts(
+		[]*agent.Record{coord, soft, worker},
+		map[string]bool{coord.ID: true, soft.ID: true, worker.ID: true},
+		nil,
+	)
+	if y != 2 || r != 1 {
+		t.Errorf("hotCounts = (%d,%d), want (2,1)", y, r)
+	}
+}
