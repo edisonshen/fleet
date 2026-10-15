@@ -429,6 +429,7 @@ DISPATCH: <slug>
   generation: <int>
   description: <short>
   prompt_file: <abs path>
+  prompt: You are a Fleet subagent. Read <prompt_file> in full and follow it exactly; it is your complete task.
   run_in_background: true
   subagent_type: general-purpose
   engine: claude-code|codex
@@ -452,8 +453,9 @@ retry ONCE per entry in `fallback_models` (left to right) at `fallback_effort`
 absent, spawn with no model override — the worker inherits yours.
 
 For each block:
-1. Read `prompt_file`. Note the block's `agent_id` and `generation` (the
-   launch token).
+1. Do NOT Read `prompt_file` — the subagent reads it itself, so the full
+   prompt never enters your context. Note the block's `agent_id`,
+   `generation` (the launch token) and `prompt` line.
 2. **Durably record the launch attempt BEFORE invoking the Agent** — the
    tri-state CAS that closes the broken-stdout phantom (dispatch-durability
    #184). Run:
@@ -473,11 +475,12 @@ For each block:
      time. **TRANSIENT** → **do NOT launch, do NOT mark it done; the next
      tick re-emits the same block. NEVER treat contention as a skip.**
 3. Spawn the subagent ONCE, with the tool for the block's `engine`:
-   - `engine: claude-code` — invoke the Agent tool. Use `description`, full
-     prompt body, `subagent_type=general-purpose`, `run_in_background=true`,
-     and the tool's model parameter set to `model` when the block carries one.
+   - `engine: claude-code` — invoke the Agent tool. Use `description`, the
+     block's `prompt` line verbatim as the prompt,
+     `subagent_type=general-purpose`, `run_in_background=true`, and the
+     tool's model parameter set to `model` when the block carries one.
    - `engine: codex` — invoke `spawn_agent` with `task_name=<slug>` and
-     `message=<full prompt body>`; when the block carries `model`/`effort`,
+     `message=<the block's prompt line verbatim>`; when the block carries `model`/`effort`,
      pass them through the tool's model and reasoning-effort parameters. It
      is non-blocking and returns a task
      handle (`{"task_name": "/root/<slug>"}`); do NOT `wait_agent` on it in

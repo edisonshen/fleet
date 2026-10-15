@@ -23,6 +23,7 @@ import pytest
 
 import dispatch as dispatch_mod
 import handoff_resume
+from _pointer_dispatch import assert_pointer_dispatch
 
 
 @pytest.fixture(scope="session")
@@ -302,6 +303,7 @@ def test_build_resume_dispatches_emits_block_when_wip_and_inbox_present(
     assert "(resume)" in block
     rewritten = inbox.read_text(encoding="utf-8")
     assert "RESUMING after coord handoff" in rewritten
+    assert assert_pointer_dispatch(block) == rewritten
     assert str(wip_dir / "fix-foo.md") in rewritten
     assert "You are a Fleet worker for task: fix-foo" in rewritten
 
