@@ -41,6 +41,7 @@ import tempfile
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
+import localmodel
 import parse
 import reviewcfg
 import workercfg
@@ -532,6 +533,18 @@ def helper_installed(coord_engine: str) -> bool:
     return shutil.which(_ENGINE_BINARY[helper]) is not None
 
 
+def resolve_review_slots(
+    coord_engine: str, has_helper: bool, is_git: bool,
+) -> reviewcfg.Resolution:
+    """Reviewer slots with the user's locally configured models applied."""
+    return reviewcfg.with_local_models(
+        reviewcfg.resolve_slots(
+            dominant=coord_engine, has_helper=has_helper, is_git=is_git, unavailable=set(),
+        ),
+        localmodel.configured_models(),
+    )
+
+
 def build_reviewer_prompt(
     task: parse.Task,
     project: str,
@@ -601,12 +614,7 @@ def build_reviewer_prompt(
     if coord_engine is None:
         coord_engine = coord_engine_from_env()
     if resolution is None:
-        resolution = reviewcfg.resolve_slots(
-            dominant=coord_engine,
-            has_helper=has_helper,
-            is_git=is_git,
-            unavailable=set(),
-        )
+        resolution = resolve_review_slots(coord_engine, has_helper, is_git)
     alpha = resolution.alpha
     beta = resolution.beta
     label = engine_label(coord_engine)

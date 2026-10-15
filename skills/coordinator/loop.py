@@ -7783,12 +7783,7 @@ def _dispatch_review_handoffs(
         has_helper = dispatch_mod.helper_installed(coord_engine)
         if isinstance(coord_state, dict):
             coord_state["has_helper"] = has_helper
-    resolution = reviewcfg.resolve_slots(
-        dominant=coord_engine,
-        has_helper=has_helper,
-        is_git=is_git,
-        unavailable=set(),
-    )
+    resolution = dispatch_mod.resolve_review_slots(coord_engine, has_helper, is_git)
     review_effort = _load_review_effort(home / "projects" / project, home)
     unavailable_models = _load_unavailable_models(home / "projects" / project, home)
     for t in tasks:

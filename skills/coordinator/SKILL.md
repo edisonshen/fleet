@@ -226,7 +226,9 @@ Rules:
   `claude-sonnet-5-5` (second claude seat on a claude-only host:
   `claude-sonnet-5`), at the `review_effort` level. Code review (the
   reviewer stage) runs codex on the cheaper `gpt-6.1-terra` with the same
-  claude models; `reviewcfg.py` holds these ids.
+  claude models; `reviewcfg.py` holds these ids. A model the user set
+  locally (`model` in `$CODEX_HOME/config.toml`; `ANTHROPIC_MODEL` or
+  `model` in `~/.claude/settings.json`) overrides these defaults.
   Reviewers also get the repo's `REVIEW.md` / `AGENTS.md` scoped by
   directory (root, the plan's dir, and ancestors of every path the plan
   references); put per-area review rules there, not in the prompt.
@@ -706,6 +708,8 @@ writes `phase=done` directly with a diff summary.
   (Claude `subagent_id` / Codex `spawn_agent` task path).
 - `reviewcfg.py` — resolves alpha/beta slots from the dominant engine +
   helper availability; holds the code-review and plan-review model ids.
+- `localmodel.py` — reads the review model the user set in their own
+  codex / claude config; it overrides the `reviewcfg.py` defaults.
 - `remote_control.py`, `supervisor.py`, `reaper.py`, `worktree.py` — runtime
   helpers.
 
