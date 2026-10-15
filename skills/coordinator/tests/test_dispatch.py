@@ -1480,3 +1480,17 @@ def test_s10_built_binary_project_sandbox_wins_over_global(tmp_path) -> None:
     assert "- npm test" in merged.stdout
     assert merged.stdout.count("\n## Sandbox\n") == 1
     assert merged.stdout.count("\n## Gates\n") == 1
+
+
+def test_build_reviewer_prompt_uses_locally_configured_claude_model(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    (tmp_path / "settings.json").write_text('{"model": "claude-mine"}')
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path))
+    out = dispatch.build_reviewer_prompt(_make_task(), project="fleet", has_helper=False)
+    assert "--alpha-model claude-mine" in out
+    assert "--beta-model claude-mine" in out
+    assert "--review-alpha-model claude-mine" in out
+    assert "--review-beta-model claude-mine" in out
+    assert "--review-alpha-status single-engine-degraded" in out
+    assert "two distinct models" not in out

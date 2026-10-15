@@ -50,6 +50,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Any
 
+import localmodel
 import plan_review
 
 
@@ -284,7 +285,8 @@ def run_codex(args: SlotSpec) -> subprocess.CompletedProcess[str]:
     if shutil.which("codex") is None:
         raise FileNotFoundError("codex binary not found")
     # `codex review` has no --model flag, so the slot model goes through a
-    # config override for both review and exec.
+    # config override for both review and exec. A model the user set in
+    # config.toml has already replaced args.model (see main).
     codex_cfg = [
         "--config", f'model="{args.model}"',
         "--config", f'model_reasoning_effort="{args.effort}"',
@@ -506,8 +508,9 @@ def main() -> int:
     instructions = plan_review.instructions_block(plan) if plan else ""
 
     def spec(engine: str, model: str, name: str = "slot") -> SlotSpec:
+        # A model in the user's own engine config wins over Fleet's default.
         return SlotSpec(
-            engine, model, args.effort, args.base, args.task_context, name, plan, sha,
+            engine, localmodel.local_config_model(engine) or model, args.effort, args.base, args.task_context, name, plan, sha,
             instructions,
         )
 
