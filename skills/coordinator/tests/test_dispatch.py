@@ -16,6 +16,7 @@ import pytest
 import dispatch
 import parse
 import workercfg
+from _pointer_dispatch import assert_one_line_final_report
 
 
 def _make_task(slug: str = "fix-thing-aaaa") -> parse.Task:
@@ -310,11 +311,64 @@ def test_format_dispatch_instruction_shape() -> None:
     assert lines[2] == "  generation: 0"
     assert lines[3] == "  description: fleet worker ready-aaaa"
     assert lines[4] == "  prompt_file: /tmp/inbox/abcdef01.md"
-    assert lines[5] == "  run_in_background: true"
-    assert lines[6] == "  subagent_type: general-purpose"
-    assert lines[7] == "  engine: claude-code"
-    assert lines[8] == "END_DISPATCH"
-    assert len(lines) == 9
+    assert lines[5] == (
+        "  prompt: You are a Fleet subagent. Read /tmp/inbox/abcdef01.md in "
+        "full and follow it exactly; it is your complete task."
+    )
+    assert lines[6] == "  run_in_background: true"
+    assert lines[7] == "  subagent_type: general-purpose"
+    assert lines[8] == "  engine: claude-code"
+    assert lines[9] == "END_DISPATCH"
+    assert len(lines) == 10
+
+
+def test_format_dispatch_instruction_absolutizes_prompt_file(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("HOME", "/home/op")
+    out = dispatch.format_dispatch_instruction(
+        agent_id="abcdef01", slug="ready-aaaa",
+        prompt_file="~/.fleet/inbox/abcdef01.md",
+    )
+    assert "  prompt_file: /home/op/.fleet/inbox/abcdef01.md" in out
+    assert "Read /home/op/.fleet/inbox/abcdef01.md in full" in out
+    assert "~" not in out
+
+
+def test_every_subagent_prompt_builder_ends_with_one_line_final_report() -> None:
+    import pr_watch as pw
+
+    t = _make_task()
+    assert_one_line_final_report(
+        dispatch.build_worker_prompt(t, project="fleet", standards_md="S", learnings_text=""),
+        t.slug,
+    )
+    assert_one_line_final_report(
+        dispatch.build_worker_prompt(
+            t, project="fleet", standards_md="S", learnings_text="", is_git=False,
+        ),
+        t.slug,
+    )
+    assert_one_line_final_report(
+        dispatch.build_reviewer_prompt(t, project="fleet"), t.slug,
+    )
+    assert_one_line_final_report(
+        dispatch.build_reviewer_prompt(t, project="fleet", is_git=False), t.slug,
+    )
+    for kind, event, build in (
+        (pw.ACTION_REBASE, pw.EVENT_STALE, dispatch.build_rebase_prompt),
+        (pw.ACTION_FIX, pw.EVENT_CI_FAILED, dispatch.build_fix_prompt),
+        (pw.ACTION_FIX, pw.EVENT_CHANGES_REQUESTED, dispatch.build_fix_prompt),
+        (pw.ACTION_REDERIVE, pw.EVENT_DIRTY, dispatch.build_rederive_prompt),
+    ):
+        act = pw.ActionDispatch(
+            kind=kind, event=event, pr_number=195,
+            pr_url="https://github.com/o/r/pull/195", branch="worker/a",
+            base="main", head_sha="H1", base_sha="B", key="k",
+        )
+        assert_one_line_final_report(
+            build(act, standards_md="S", agent_id="abcdef01"), f"pr-{kind}-195",
+        )
 
 
 def test_format_dispatch_instruction_engine_follows_fleet_engine(
@@ -358,7 +412,7 @@ def test_format_dispatch_instruction_custom_description() -> None:
 
 def test_format_dispatch_instruction_carries_worker_model() -> None:
     """tier/model/effort/fallback_models follow `engine` so the coord can
-    pass a cheaper model to the spawn tool; absent -> legacy 9-line block."""
+    pass a cheaper model to the spawn tool; absent -> legacy 10-line block."""
     wm = workercfg.WorkerModel(
         engine="codex", tier="simple", model="gpt-5.6-luna", effort="medium",
         fallbacks=("gpt-5.5", "gpt-5.4"),
@@ -402,7 +456,7 @@ def test_format_dispatch_instruction_carries_worker_model() -> None:
             engine="codex", tier="coding", model="", effort="",
         ),
     )
-    assert len(out.splitlines()) == 9
+    assert len(out.splitlines()) == 10
     assert "tier:" not in out and "model:" not in out
 
 

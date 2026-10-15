@@ -29,6 +29,7 @@ from unittest.mock import patch
 import pytest
 
 import loop
+from _pointer_dispatch import assert_one_line_final_report, assert_pointer_dispatch
 import parse
 import pr_watch as pw
 from test_single_shot_tick import dispatch_subprocess  # noqa: F401 — fixture
@@ -2518,6 +2519,9 @@ def test_tick_dispatches_fix_subagent_e2e(
     inbox = it_home / "inbox" / f"{agent_id}.md"
     assert inbox.exists()
     assert "FIX subagent for PR #195" in inbox.read_text()
+    body = assert_pointer_dispatch(blocks[0])
+    assert body == inbox.read_text()
+    assert_one_line_final_report(body, "pr-fix-195")
 
 
 def test_tick_idempotent_no_duplicate_dispatch_e2e(

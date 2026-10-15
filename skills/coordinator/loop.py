@@ -6617,7 +6617,7 @@ def _reconcile_pr_watches(
             return ""
         try:
             agent_id = dispatch_mod.mint_agent_id()
-            label = f"pr-{action.kind}-{action.pr_number}"
+            label = dispatch_mod.pr_watch_label(action)
             # Pass the minted agent_id into the prompt so the subagent knows
             # WHICH agent record to write its remediation outcome /
             # conflicted_paths into — the coord reads ~/.fleet/agents/<id>.json

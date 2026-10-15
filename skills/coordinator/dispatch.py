@@ -16,9 +16,9 @@ the mechanics of HOW to dispatch:
      Agent tool with the listed parameters. SKILL.md's "Worker
      dispatch protocol" section pins this contract for Claude.
   4. write_worker_inbox(agent_id, prompt) — drop the prompt into the
-     worker's inbox so the coord can pass it via Agent's `prompt`
-     parameter (the coord Reads the file then hands the body to
-     Agent). The file path lives in the DISPATCH block.
+     worker's inbox. The DISPATCH block names the file and carries a
+     short `prompt:` line pointing at it; the coord passes that line to
+     the spawn tool and the subagent reads the full prompt itself.
 
 All mutations route through the fleet CLI — Go remains the
 authoritative writer for tasks.md and agent records. parse.py is
@@ -478,6 +478,7 @@ def build_worker_prompt(
             "NO interactive chat — operator can't reply mid-flight. Communicate via",
             "`fleet workers update`, which mutates state.json atomically.",
         ])
+    lines.extend(final_report_lines(task.slug))
     out = "\n".join(lines)
     if len(out.encode("utf-8")) > _PROMPT_HARD_CAP_BYTES:
         # Fail fast rather than truncate silently — silent truncation
@@ -874,12 +875,9 @@ def build_reviewer_prompt(
         "- Do NOT alter the worker's commits except via review-iter fix commits",
         "  on top in git mode.",
         "",
-        "## §7 return contract (terse)",
-        "",
-        "When done, return: `review iterations: alpha=N beta=M; final alpha=<status>; final beta=passed`.",
-        "",
         "You have: review_slot.py, gh/git when this is a git project, and the full project at cwd.",
         "NO interactive chat — operator can't reply mid-flight.",
+        *final_report_lines(task.slug),
     ])
     out = "\n".join(lines)
     if len(out.encode("utf-8")) > _PROMPT_HARD_CAP_BYTES:
@@ -1029,6 +1027,7 @@ def build_rebase_prompt(action, *, standards_md: str = "", agent_id: str = "") -
         "",
         "Do NOT open or merge PRs. Do NOT change the PR base. Do NOT touch any",
         "PR other than this one. Rebase + force-with-lease push only.",
+        *final_report_lines(pr_watch_label(action)),
     ]
     out = "\n".join(lines)
     if len(out.encode("utf-8")) > _PROMPT_HARD_CAP_BYTES:
@@ -1125,6 +1124,7 @@ def build_fix_prompt(action, *, standards_md: str = "", agent_id: str = "") -> s
         "",
         "Do NOT open new PRs. Do NOT change the PR base. Do NOT touch any PR",
         "other than this one.",
+        *final_report_lines(pr_watch_label(action)),
     ]
     out = "\n".join(lines)
     if len(out.encode("utf-8")) > _PROMPT_HARD_CAP_BYTES:
@@ -1246,6 +1246,7 @@ def build_rederive_prompt(action, *, standards_md: str = "", agent_id: str = "")
         "",
         "Do NOT open or merge PRs. Do NOT change the PR base. Do NOT touch any",
         "PR other than this one. Re-derive + force-with-lease push only.",
+        *final_report_lines(pr_watch_label(action)),
     ]
     out = "\n".join(lines)
     if len(out.encode("utf-8")) > _PROMPT_HARD_CAP_BYTES:
@@ -1312,6 +1313,39 @@ def mint_agent_id() -> str:
 _AGENT_ID_FULL_RE = re.compile(r"^[0-9a-f]{8}$")
 
 
+def launch_prompt(prompt_file: str) -> str:
+    """The spawn prompt the coord passes verbatim to Agent / spawn_agent.
+
+    The full prompt stays on disk at prompt_file; the subagent reads it
+    on its first turn, so it never enters the coord's context."""
+    return (
+        f"You are a Fleet subagent. Read {prompt_file} in full and follow "
+        "it exactly; it is your complete task."
+    )
+
+
+def final_report_lines(slug: str) -> list[str]:
+    """Closing section of every subagent prompt: a one-line final reply.
+
+    The reply lands in the coord's context; details stay in the files the
+    prompt names."""
+    return [
+        "",
+        "## Final message (one line)",
+        "",
+        "Your FINAL reply goes into the coordinator's context. It must be",
+        "exactly one line, nothing before or after it:",
+        f"  {slug} phase=<final phase or outcome> pr=<PR url or -> <note, at most 15 words>",
+        "Details belong in the state, verification and agent-record files and",
+        "task notes this prompt names, never in the reply.",
+    ]
+
+
+def pr_watch_label(action) -> str:
+    """Synthetic slug for a PR-watch dispatch: pr-<kind>-<number>."""
+    return f"pr-{action.kind}-{action.pr_number}"
+
+
 def format_dispatch_instruction(
     *,
     agent_id: str,
@@ -1339,6 +1373,7 @@ def format_dispatch_instruction(
           generation: <int>
           description: <short>
           prompt_file: <abs path>
+          prompt: <launch_prompt(prompt_file)>
           run_in_background: true
           subagent_type: general-purpose
           engine: claude-code|codex
@@ -1362,8 +1397,9 @@ def format_dispatch_instruction(
     protocol" step 2.
 
     description defaults to "fleet worker <slug>". prompt_file is
-    the path the coord must Read; the body is then passed verbatim
-    as Agent's `prompt` parameter. agent_id MUST be 8 hex chars
+    normalized to an absolute path; the coord does NOT read it, it
+    passes the `prompt:` line verbatim as the spawn prompt and the
+    subagent reads the file. agent_id MUST be 8 hex chars
     (validated here so a malformed token can't make it into the
     stream the coord parses).
 
@@ -1379,12 +1415,14 @@ def format_dispatch_instruction(
     if not prompt_file:
         raise ValueError("prompt_file must be non-empty")
     desc = (description or f"fleet worker {slug}").strip()
+    prompt_file = os.path.abspath(os.path.expanduser(prompt_file))
     lines = [
         f"DISPATCH: {slug}",
         f"  agent_id: {agent_id}",
         f"  generation: {int(generation)}",
         f"  description: {desc}",
         f"  prompt_file: {prompt_file}",
+        f"  prompt: {launch_prompt(prompt_file)}",
         "  run_in_background: true",
         "  subagent_type: general-purpose",
         f"  engine: {coord_engine_from_env()}",

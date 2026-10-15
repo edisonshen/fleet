@@ -28,6 +28,7 @@ import pytest
 import dispatch
 import finisher
 import loop
+from _pointer_dispatch import assert_one_line_final_report, assert_pointer_dispatch
 import parse
 import pr_watch as pw
 import supervisor
@@ -249,6 +250,11 @@ def test_tick_dispatches_ready_task(
     assert "subagent_type: general-purpose" in block
     assert str(inbox_file) in block
     assert block.rstrip().endswith("END_DISPATCH")
+    # The block carries a short launch prompt pointing at the inbox; the
+    # full worker prompt lives only in the file the subagent reads.
+    assert assert_pointer_dispatch(block) == body
+    assert body not in block
+    assert_one_line_final_report(body, "ready-aaaa")
     # Issue #84 Phase A regression guard: status flip is durable
     # BEFORE the DISPATCH block is surfaced. Without this ordering,
     # a coord that reads the block, calls Agent tool, and the worker
@@ -4017,6 +4023,12 @@ def test_loop_dispatches_reviewer_on_phase_review_pending(
     assert inbox.exists(), "reviewer inbox file not written"
     body = inbox.read_text()
     assert "FLEET REVIEWER" in body.upper()
+    block = next(
+        b for b in result.dispatch_instructions
+        if b.startswith("DISPATCH: review-pending-aaaa")
+    )
+    assert assert_pointer_dispatch(block) == body
+    assert_one_line_final_report(body, "review-pending-aaaa")
     # Note recorded under the task: "review-pending: dispatched as agent <id>".
     note_calls = [c for c in fleet_run_recorder if c[1:3] == ["tasks", "note"]]
     review_notes = [c for c in note_calls if "review-pending" in (c[-1] if c else "")]
