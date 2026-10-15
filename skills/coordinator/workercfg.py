@@ -19,9 +19,9 @@ Tier comes from, in order:
 
 Claude model per tier depends on the coord-config `profile`:
 
-    profile   simple            coding          complex
-    budget    haiku -> sonnet   opus medium     opus high
-    quality   opus medium       opus medium     opus medium
+    profile   simple            coding / complex
+    budget    haiku -> sonnet   opus medium
+    quality   opus medium       opus medium
 
 Non-code roles (`ROLE_REBASE`) run on Sonnet under budget. Codex routing
 is the same in both profiles.
@@ -101,9 +101,6 @@ def _claude_ladder(tier: str, profile: str) -> list[tuple[str, str]]:
     if tier == TIER_SIMPLE:
         return [(CLAUDE_HAIKU_MODEL, CLAUDE_EFFORT),
                 (CLAUDE_NONCODE_MODELS[0], FALLBACK_EFFORT)]
-    if tier == TIER_COMPLEX:
-        return [(CLAUDE_MODELS[0], "high")] + [
-            (m, FALLBACK_EFFORT) for m in CLAUDE_MODELS[1:]]
     return [(m, CLAUDE_EFFORT) for m in CLAUDE_MODELS]
 
 

@@ -346,8 +346,8 @@ Rules:
     `complex` (migration, protocol, schema, concurrency, cross-cutting, P0,
     many deps / e2e rows, plan-doc linked) → `gpt-5.6-sol` high.
   - Claude coords, `budget` profile (default): `simple` → `claude-haiku-5-5`
-    (fallback `claude-sonnet-5-5`); `coding` → `claude-opus-5-5` medium;
-    `complex` → `claude-opus-5-5` high (fallback `claude-opus-5`). `quality`
+    (fallback `claude-sonnet-5-5`); `coding` and `complex` →
+    `claude-opus-5-5` medium (fallback `claude-opus-5`). `quality`
     profile: every tier `claude-opus-5-5` medium. Codex is the same in both
     and falls back to `gpt-5.5` then `gpt-5.4`, medium.
   - Explicit beats inferred: set `complexity:` when you file the task
