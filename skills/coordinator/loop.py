@@ -3444,31 +3444,9 @@ def _parallelism_from_file(cfg_path: Path) -> int:
     return raw
 
 
-_REVIEW_EFFORTS = ("low", "medium", "high")
-
-
 def _load_review_effort(project_dir: Path, home: Path | None = None) -> str:
-    """Resolve `review_effort` (low|medium|high) for the reviewer slots:
-    the project's coord-config.json wins, then ~/.fleet/coord-config.json,
-    else "high". Unknown values are ignored."""
-    configured = _review_effort_from_file(project_dir / COORD_CONFIG_FILE)
-    if configured or home is None:
-        return configured or "high"
-    return _review_effort_from_file(home / COORD_CONFIG_FILE) or "high"
-
-
-def _review_effort_from_file(cfg_path: Path) -> str:
-    try:
-        with open(cfg_path, "r", encoding="utf-8") as fh:
-            data = json.load(fh)
-    except (FileNotFoundError, json.JSONDecodeError, OSError):
-        return ""
-    if not isinstance(data, dict):
-        return ""
-    raw = data.get("review_effort")
-    if not isinstance(raw, str) or raw.lower() not in _REVIEW_EFFORTS:
-        return ""
-    return raw.lower()
+    """`review_effort` for the reviewer slots (coord_config.load_review_effort)."""
+    return coord_config.load_review_effort(project_dir, home)
 
 
 def _load_unavailable_models(project_dir: Path, home: Path | None = None) -> set[str]:
@@ -6663,21 +6641,26 @@ def _reconcile_pr_watches(
                 dispatch_kind=f"pr-{action.kind}",
                 fleet_bin=fleet_bin, fleet_home=fhome,
             )
-            tier = (
-                workercfg.TIER_SIMPLE
-                if action.kind == pr_watch_mod.ACTION_REBASE
-                else workercfg.TIER_CODING
+            engine = dispatch_mod.coord_engine_from_env()
+            cfg_dirs = (
+                (Path(fhome) / "projects" / project, Path(fhome))
+                if fhome else (None, None)
             )
+            unavailable = (
+                _load_unavailable_models(*cfg_dirs) if fhome else set()
+            )
+            profile = coord_config.load_profile(*cfg_dirs)
+            if action.kind == pr_watch_mod.ACTION_REBASE:
+                worker_model = workercfg.resolve_role_model(
+                    engine, workercfg.ROLE_REBASE, unavailable, profile)
+            else:
+                worker_model = workercfg.resolve_worker_model(
+                    engine, workercfg.TIER_CODING, unavailable, profile)
             block = dispatch_mod.format_dispatch_instruction(
                 agent_id=agent_id, slug=label, prompt_file=prompt_file,
                 description=f"fleet PR-watch {action.kind} for #{action.pr_number}",
                 generation=0, register=False,
-                worker_model=workercfg.resolve_worker_model(
-                    dispatch_mod.coord_engine_from_env(), tier,
-                    _load_unavailable_models(
-                        Path(fhome) / "projects" / project, Path(fhome),
-                    ) if fhome else set(),
-                ),
+                worker_model=worker_model,
             )
             staged_blocks.append(block)
             return agent_id
@@ -7148,6 +7131,7 @@ def _replay_pending_dispatches(
     tasks_by_slug = {t.slug: t for t in (tasks or [])}
     coord_engine = dispatch_mod.coord_engine_from_env()
     unavailable_models = _load_unavailable_models(home / "projects" / project, home)
+    worker_profile = coord_config.load_profile(home / "projects" / project, home)
     for agent_id, slug, j in _iter_project_journals(home, project):
         state = j.get("exec_state", "")
         if state == "pending":
@@ -7181,6 +7165,7 @@ def _replay_pending_dispatches(
                 worker_model = (
                     workercfg.resolve_for_task(
                         coord_engine, task, unavailable=unavailable_models,
+                        profile=worker_profile,
                         prior_attempts=max(0, int(task.dispatch_generation) - 1),
                     )
                     if task is not None else None
@@ -7349,6 +7334,9 @@ def _dispatch_ready(
     in_flight_after_dispatch: list[parse.Task] = list(in_progress)
     coord_engine = dispatch_mod.coord_engine_from_env()
     unavailable_models = _load_unavailable_models(
+        Path(fleet_home) / "projects" / project, Path(fleet_home),
+    )
+    worker_profile = coord_config.load_profile(
         Path(fleet_home) / "projects" / project, Path(fleet_home),
     )
 
@@ -7663,6 +7651,7 @@ def _dispatch_ready(
                 prompt_file=inbox_path,
                 worker_model=workercfg.resolve_for_task(
                     coord_engine, t, unavailable=unavailable_models,
+                    profile=worker_profile,
                 ),
             )
         except ValueError as exc:
@@ -7791,6 +7780,7 @@ def _dispatch_review_handoffs(
     )
     review_effort = _load_review_effort(home / "projects" / project, home)
     unavailable_models = _load_unavailable_models(home / "projects" / project, home)
+    worker_profile = coord_config.load_profile(home / "projects" / project, home)
     for t in tasks:
         if t.status != "in-progress":
             continue
@@ -8022,6 +8012,7 @@ def _dispatch_review_handoffs(
                 prompt_file=inbox_path, description=description,
                 worker_model=workercfg.resolve_for_task(
                     coord_engine, t, unavailable=unavailable_models,
+                    profile=worker_profile,
                     prior_attempts=max(0, handoff_generation - 1),
                 ),
             )

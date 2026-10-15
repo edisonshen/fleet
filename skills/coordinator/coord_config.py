@@ -5,13 +5,26 @@ Schema (additive — new fields land alongside without breaking the loader):
     {
         "parallelism":        <int>,    # _load_parallelism (loop.py)
         "worktree_timeout_s": <number>, # _load_worktree_timeout (loop.py)
-        "review_effort":      <str>,    # _load_review_effort (loop.py): low|medium|high
+        "profile":            <str>,    # budget (default) | quality — load_profile
+        "review_effort":      <str>,    # load_review_effort: low|medium|high
+                                        # (profile default: budget medium, quality high)
+        "handoff_soft_tokens": <int>,   # load_handoff_tokens: coord soft handoff at
+        "handoff_hard_tokens": <int>,   # this many context tokens (budget 250000 /
+                                        # 300000; quality unset -> 40% / 50% of window)
+        "unavailable_models": [<str>],  # _load_unavailable_models (loop.py)
         "engine":             <str>,    # claude-code|codex — Go-owned (internal/spawn,
                                         # internal/projects); project file = last coord's
                                         # engine, ~/.fleet/coord-config.json = operator's
                                         # explicit `fleet -codex` / `-claude` choice
         "repo":               <str>     # absolute path to project's git checkout
     }
+
+Every key resolves the same way: the project's
+~/.fleet/projects/<p>/coord-config.json, then ~/.fleet/coord-config.json,
+then the default. An explicit key beats the `profile` default for it.
+`read_value` / `load_profile` / `load_review_effort` /
+`load_handoff_tokens` are the single resolver for the profile-driven keys;
+the coordinator tick and fleet-guard (sibling skill dir) both import them.
 
 Repo binding is owned by Go (Design 3,
 DESIGN-coord-repo-binding-from-project.md). The single binder —
@@ -22,7 +35,7 @@ longer reads meta.json or coord-config.json::repo as a resolution
 authority. coord-config.json::repo is now a write-only breadcrumb the Go
 binder stamps at coord spawn/handoff (the launch cwd is never a tier).
 
-This module therefore keeps only:
+For repo binding this module keeps only:
 
   - `write_repo_idempotent` — the Python mirror of Spawn's coord-config
     writer, exercised by tests of the merge/atomic-write logic.
@@ -44,6 +57,113 @@ import os
 import subprocess
 import tempfile
 from pathlib import Path
+from typing import Any, Callable
+
+CONFIG_FILE = "coord-config.json"
+
+PROFILE_BUDGET = "budget"
+PROFILE_QUALITY = "quality"
+PROFILES: tuple[str, ...] = (PROFILE_BUDGET, PROFILE_QUALITY)
+DEFAULT_PROFILE = PROFILE_BUDGET
+
+REVIEW_EFFORTS: tuple[str, ...] = ("low", "medium", "high")
+
+# Per-profile defaults for keys the operator did not set explicitly. A
+# None handoff token threshold means "use the percent-of-window trigger".
+PROFILE_DEFAULTS: dict[str, dict[str, Any]] = {
+    PROFILE_BUDGET: {
+        "review_effort": "medium",
+        "handoff_soft_tokens": 250_000,
+        "handoff_hard_tokens": 300_000,
+    },
+    PROFILE_QUALITY: {
+        "review_effort": "high",
+        "handoff_soft_tokens": None,
+        "handoff_hard_tokens": None,
+    },
+}
+
+
+def _read_file(cfg_path: Path) -> dict:
+    try:
+        with open(cfg_path, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def read_value(
+    project_dir: Path | None,
+    home: Path | None,
+    key: str,
+    parse: Callable[[Any], Any],
+) -> Any:
+    """First valid `key` from the project file, then the home file.
+
+    `parse` maps a raw JSON value to the normalized value, or None when
+    it is invalid (an invalid project value falls through to home).
+    Returns None when neither file carries a valid value.
+    """
+    for base in (project_dir, home):
+        if base is None:
+            continue
+        data = _read_file(Path(base) / CONFIG_FILE)
+        if key not in data:
+            continue
+        value = parse(data[key])
+        if value is not None:
+            return value
+    return None
+
+
+def _parse_choice(choices: tuple[str, ...]) -> Callable[[Any], str | None]:
+    def parse(raw: Any) -> str | None:
+        if isinstance(raw, str) and raw.strip().lower() in choices:
+            return raw.strip().lower()
+        return None
+    return parse
+
+
+def _parse_positive_int(raw: Any) -> int | None:
+    if isinstance(raw, bool) or not isinstance(raw, int) or raw <= 0:
+        return None
+    return raw
+
+
+def load_profile(project_dir: Path | None, home: Path | None) -> str:
+    """`profile`: budget | quality, default budget."""
+    return (
+        read_value(project_dir, home, "profile", _parse_choice(PROFILES))
+        or DEFAULT_PROFILE
+    )
+
+
+def load_review_effort(project_dir: Path | None, home: Path | None) -> str:
+    """`review_effort` (low|medium|high); unset -> the profile default."""
+    explicit = read_value(
+        project_dir, home, "review_effort", _parse_choice(REVIEW_EFFORTS),
+    )
+    if explicit:
+        return explicit
+    return PROFILE_DEFAULTS[load_profile(project_dir, home)]["review_effort"]
+
+
+def load_handoff_tokens(
+    project_dir: Path | None, home: Path | None,
+) -> tuple[int | None, int | None]:
+    """(soft, hard) coordinator handoff thresholds in context tokens.
+
+    Each side is the explicit `handoff_soft_tokens` / `handoff_hard_tokens`
+    when set, else the profile default; None means that side triggers on
+    percent of the model window instead.
+    """
+    defaults = PROFILE_DEFAULTS[load_profile(project_dir, home)]
+    out: list[int | None] = []
+    for key in ("handoff_soft_tokens", "handoff_hard_tokens"):
+        explicit = read_value(project_dir, home, key, _parse_positive_int)
+        out.append(explicit if explicit is not None else defaults[key])
+    return out[0], out[1]
 
 
 def write_repo_idempotent(config_path: Path | str, repo: str) -> None:

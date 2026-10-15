@@ -147,8 +147,8 @@ def inject_handoff_requested(*, coord: bool = False) -> str:
     """
     if coord:
         return (
-            f"{HANDOFF_REQUESTED}: context window is over 40% — SOFT "
-            f"coordinator handoff. Start no new work: the tick emits no "
+            f"{HANDOFF_REQUESTED}: context is past the soft handoff "
+            f"threshold — SOFT coordinator handoff. Start no new work: the tick emits no "
             f"new worker DISPATCH blocks while this handoff is pending "
             f"(reviewer/finisher handoffs and PR-watch keep running). Let "
             f"every in-flight subagent return; after each return run the "
@@ -159,8 +159,8 @@ def inject_handoff_requested(*, coord: bool = False) -> str:
             f"{MILESTONE}\n\n"
             f"fleet-guard writes your handoff doc only once {MILESTONE} is "
             f"present AND no subagent is still in flight, then spawns a "
-            f"fresh coord and retires this one. At 50% the handoff is "
-            f"forced regardless. Do not write MILESTONE mid-paragraph; it "
+            f"fresh coord and retires this one. At the hard threshold the "
+            f"handoff is forced regardless. Do not write MILESTONE mid-paragraph; it "
             f"must be the only thing on its line."
         )
     return (
@@ -391,11 +391,11 @@ def maybe_trigger(payload: dict[str, Any], *, agent_id: str,
         if record.get("mode") in THINKING_MODES:
             return None
 
-        pct, _model = health.read_context_pct(payload)
-        state = health.threshold(pct)
+        pct, _model, tokens = health.read_context(payload)
+        state = health.context_state(record, pct, tokens)
         committed = _is_handoff_committed(record)
         yellow_pending = record.get("handoff_type") == TYPE_AUTO_YELLOW
-        is_coord = _is_coord_record(record)
+        is_coord = health.is_coord_record(record)
 
         if state == "red":
             # Bail only if the doc + queue already exist (drain owns it
@@ -537,7 +537,7 @@ def _do_handoff(record: dict[str, Any], session: str,
     # identity is the EXACT task_id "coord-<project>" (mirrors
     # internal/tui.coordTaskID); a prefix match would misclassify a worker
     # whose slug merely starts with "coord-" (codex PR4 [P2]).
-    is_coord = _is_coord_record(record)
+    is_coord = health.is_coord_record(record)
     if is_coord and _producer_fenced(project):
         print(
             f"fleet-guard: handoff producer for coord agent {agent_id} "
@@ -714,19 +714,6 @@ def _fleet_binary() -> str | None:
 
 
 # -- doc + queue write (delegated to Go) ------------------------------------
-
-# Coord identity convention: task_id == "coord-<project>" EXACTLY (mirrors
-# internal/spawn.IsCoordSpawn). A prefix match would misclassify a worker
-# whose slug merely starts with "coord-".
-_COORD_TASK_ID_PREFIX = "coord-"
-
-
-def _is_coord_record(record: dict[str, Any]) -> bool:
-    project = record.get("project", "")
-    return bool(project) and (
-        record.get("task_id", "") == _COORD_TASK_ID_PREFIX + project
-    )
-
 
 def _coord_subagents_inflight(project: str) -> list[str]:
     """Labels of the subagents this coord still has out, from the two

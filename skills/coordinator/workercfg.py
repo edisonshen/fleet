@@ -16,6 +16,15 @@ Tier comes from, in order:
   2. a heuristic over spec/acceptance/deps/priority (`classify_task`),
   3. one step up per prior dispatch attempt (`escalate`), so a task that
      failed or was rejected in review retries on a stronger model.
+
+Claude model per tier depends on the coord-config `profile`:
+
+    profile   simple            coding          complex
+    budget    haiku -> sonnet   opus medium     opus high
+    quality   opus medium       opus medium     opus medium
+
+Non-code roles (`ROLE_REBASE`) run on Sonnet under budget. Codex routing
+is the same in both profiles.
 """
 from __future__ import annotations
 
@@ -47,8 +56,18 @@ CODEX_TIER_EFFORT: dict[str, str] = {
 CODEX_FALLBACK: tuple[str, ...] = ("gpt-5.5", "gpt-5.4")
 
 CLAUDE_MODELS: tuple[str, ...] = ("claude-opus-5-5", "claude-opus-5")
+CLAUDE_HAIKU_MODEL = "claude-haiku-5-5"
+CLAUDE_NONCODE_MODELS: tuple[str, ...] = ("claude-sonnet-5-5", "claude-sonnet-5")
 CLAUDE_EFFORT = "medium"
 FALLBACK_EFFORT = "medium"
+
+PROFILE_BUDGET = "budget"
+PROFILE_QUALITY = "quality"
+DEFAULT_PROFILE = PROFILE_BUDGET
+
+# Dispatches that are not task implementation. A rebase keeps the simple
+# tier on Codex; on a budget Claude coord it runs on CLAUDE_NONCODE_MODELS.
+ROLE_REBASE = "rebase"
 
 
 @dataclass(frozen=True)
@@ -76,25 +95,26 @@ def escalate(tier: str, prior_attempts: int) -> str:
     return TIERS[idx]
 
 
-def resolve_worker_model(
-    coord_engine: str,
-    tier: str,
-    unavailable: Iterable[str] = (),
-) -> WorkerModel:
-    """Map (engine, tier) to model/effort plus the fallback ladder.
+def _claude_ladder(tier: str, profile: str) -> list[tuple[str, str]]:
+    if profile == PROFILE_QUALITY:
+        return [(m, CLAUDE_EFFORT) for m in CLAUDE_MODELS]
+    if tier == TIER_SIMPLE:
+        return [(CLAUDE_HAIKU_MODEL, CLAUDE_EFFORT),
+                (CLAUDE_NONCODE_MODELS[0], FALLBACK_EFFORT)]
+    if tier == TIER_COMPLEX:
+        return [(CLAUDE_MODELS[0], "high")] + [
+            (m, FALLBACK_EFFORT) for m in CLAUDE_MODELS[1:]]
+    return [(m, CLAUDE_EFFORT) for m in CLAUDE_MODELS]
 
-    `unavailable` removes models from consideration; the first survivor
-    of tier-model -> fallbacks becomes `model`. An exhausted ladder
-    returns model="" (the coord inherits its own model).
-    """
-    if tier not in TIERS:
-        tier = DEFAULT_TIER
+
+def _codex_ladder(tier: str) -> list[tuple[str, str]]:
+    return [(CODEX_TIER_MODELS[tier], CODEX_TIER_EFFORT[tier])] + [
+        (m, FALLBACK_EFFORT) for m in CODEX_FALLBACK]
+
+
+def _pick(coord_engine: str, tier: str, ladder: list[tuple[str, str]],
+          unavailable: Iterable[str]) -> WorkerModel:
     gone = set(unavailable)
-    if coord_engine == ENGINE_CODEX:
-        ladder = [(CODEX_TIER_MODELS[tier], CODEX_TIER_EFFORT[tier])]
-        ladder += [(m, FALLBACK_EFFORT) for m in CODEX_FALLBACK]
-    else:
-        ladder = [(m, CLAUDE_EFFORT) for m in CLAUDE_MODELS]
     live = [(m, e) for m, e in ladder if m not in gone]
     if not live:
         return WorkerModel(engine=coord_engine, tier=tier, model="", effort="")
@@ -108,6 +128,43 @@ def resolve_worker_model(
         fallbacks=tuple(m for m, _ in rest),
         fallback_effort=rest[0][1] if rest else FALLBACK_EFFORT,
     )
+
+
+def resolve_worker_model(
+    coord_engine: str,
+    tier: str,
+    unavailable: Iterable[str] = (),
+    profile: str = DEFAULT_PROFILE,
+) -> WorkerModel:
+    """Map (engine, tier, profile) to model/effort plus the fallback ladder.
+
+    `unavailable` removes models from consideration; the first survivor
+    of tier-model -> fallbacks becomes `model`. An exhausted ladder
+    returns model="" (the coord inherits its own model).
+    """
+    if tier not in TIERS:
+        tier = DEFAULT_TIER
+    if coord_engine == ENGINE_CODEX:
+        ladder = _codex_ladder(tier)
+    else:
+        ladder = _claude_ladder(tier, profile)
+    return _pick(coord_engine, tier, ladder, unavailable)
+
+
+def resolve_role_model(
+    coord_engine: str,
+    role: str,
+    unavailable: Iterable[str] = (),
+    profile: str = DEFAULT_PROFILE,
+) -> WorkerModel:
+    """Model for a non-code dispatch role (`ROLE_REBASE`): the simple
+    tier, except a budget Claude coord runs it on Sonnet."""
+    if role != ROLE_REBASE:
+        raise ValueError(f"unknown worker role {role!r}")
+    if coord_engine == ENGINE_CODEX or profile == PROFILE_QUALITY:
+        return resolve_worker_model(coord_engine, TIER_SIMPLE, unavailable, profile)
+    ladder = [(m, CLAUDE_EFFORT) for m in CLAUDE_NONCODE_MODELS]
+    return _pick(coord_engine, TIER_SIMPLE, ladder, unavailable)
 
 
 # ---------- heuristic tiering ----------
@@ -171,6 +228,7 @@ def resolve_for_task(
     *,
     unavailable: Iterable[str] = (),
     prior_attempts: int | None = None,
+    profile: str = DEFAULT_PROFILE,
 ) -> WorkerModel:
     """classify -> escalate by prior dispatches -> resolve.
 
@@ -179,4 +237,4 @@ def resolve_for_task(
     """
     attempts = task.dispatch_generation if prior_attempts is None else prior_attempts
     tier = escalate(classify_task(task), attempts)
-    return resolve_worker_model(coord_engine, tier, unavailable)
+    return resolve_worker_model(coord_engine, tier, unavailable, profile)

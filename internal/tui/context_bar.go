@@ -20,9 +20,12 @@
 // Layer 3 (renderHandoffTag): small handoff tag right of the percent.
 // Layer 4 (worker coverage):  workerContextRecord lookup heuristic.
 //
-// Color thresholds match fleet-guard's Yellow (40%) / Red (50%) zones
-// (skills/fleet-guard/health.py:YELLOW_THRESHOLD/RED_THRESHOLD) so the
-// dashboard reads the same colors fleet-guard uses to trigger handoffs.
+// Zones come from the record's context_state (fleet-guard's own
+// classification, which for a coordinator may use absolute token
+// thresholds) so the dashboard turns yellow/red exactly when the handoff
+// fires. Records without context_state fall back to fleet-guard's
+// Yellow (40%) / Red (50%) percent zones
+// (skills/fleet-guard/health.py:YELLOW_THRESHOLD/RED_THRESHOLD).
 package tui
 
 import (
@@ -35,8 +38,8 @@ import (
 	"github.com/edisonshen/fleet/internal/handoff"
 )
 
-// Context-pct thresholds. Mirror fleet-guard so what the dashboard
-// shows is the same gradient that triggers auto-handoffs in the agent.
+// Context-pct thresholds for records without context_state. Mirror
+// fleet-guard's percent trigger.
 const (
 	contextYellowThreshold = 40.0
 	contextRedThreshold    = 50.0
@@ -85,6 +88,16 @@ var (
 // noise — operators read the gradient color at glance distance and
 // the exact integer when they want detail.
 func renderContextBar(pct *float64) string {
+	return renderContextChip(pct, "")
+}
+
+// renderRecordContextBar is renderContextBar colored by the record's
+// context_state when fleet-guard wrote one.
+func renderRecordContextBar(r *agent.Record) string {
+	return renderContextChip(r.ContextPct, r.ContextState)
+}
+
+func renderContextChip(pct *float64, state string) string {
 	if pct == nil {
 		return ""
 	}
@@ -98,7 +111,7 @@ func renderContextBar(pct *float64) string {
 	if v > 100 {
 		v = 100
 	}
-	style := contextBarStyleFor(v)
+	style := contextBarStyleFor(contextZoneFor(v, state))
 	return style.Render(fmt.Sprintf("%d%%", int(v)))
 }
 
@@ -123,10 +136,29 @@ func contextZone(pct float64) string {
 	}
 }
 
-// contextBarStyleFor picks the percent-label color based on threshold
-// zone. Mirrors fleet-guard's Yellow (40%) / Red (50%) zones exactly.
-func contextBarStyleFor(pct float64) lipgloss.Style {
-	switch contextZone(pct) {
+// contextZoneFor maps fleet-guard's context_state to a zone, falling back
+// to contextZone(pct) when the state is empty or unrecognized.
+func contextZoneFor(pct float64, state string) string {
+	switch state {
+	case "red":
+		return "red"
+	case "yellow":
+		return "amber"
+	case "green":
+		return "green"
+	}
+	return contextZone(pct)
+}
+
+// recordContextZone is contextZoneFor for an agent record with a
+// context_pct.
+func recordContextZone(r *agent.Record) string {
+	return contextZoneFor(*r.ContextPct, r.ContextState)
+}
+
+// contextBarStyleFor picks the percent-label color for a zone.
+func contextBarStyleFor(zone string) lipgloss.Style {
+	switch zone {
 	case "red":
 		return contextBarRedStyle
 	case "amber":
@@ -185,7 +217,7 @@ func renderHandoffTag(handoffType *string) string {
 
 // hotCounts walks every alive agent + worker on the dashboard and
 // returns (yellow, red) counters: agents/workers whose effective
-// context_pct sits in the 40%-49% zone or the ≥50% zone respectively.
+// context sits in the amber or red zone (recordContextZone).
 //
 // "Effective" means: for agent rows, the agent record's own
 // ContextPct; for worker rows, the context_pct of the agent record
@@ -214,11 +246,10 @@ func hotCounts(records []*agent.Record, alive map[string]bool, workers []*Worker
 			return
 		}
 		seen[r.ID] = true
-		v := *r.ContextPct
-		switch {
-		case v >= contextRedThreshold:
+		switch recordContextZone(r) {
+		case "red":
 			red++
-		case v >= contextYellowThreshold:
+		case "amber":
 			yellow++
 		}
 	}

@@ -123,7 +123,7 @@ def _on_stop(payload: dict, agent_id: str, session: str,
     processing the injected content (caught by codex review iter-2 P2
     on inbox-driven Stops).
     """
-    pct, model = health.read_context_pct(payload)
+    pct, model, tokens = health.read_context(payload)
     if pct is None:
         # Bug D part-4 instrumentation (RC-freeze root-cause, 2026-06-10):
         # never write a null context_pct silently. Name the hook event +
@@ -144,6 +144,10 @@ def _on_stop(payload: dict, agent_id: str, session: str,
     health.update_record(
         agent_id,
         context_pct=pct,
+        context_tokens=tokens,
+        context_state=health.context_state(
+            health.read_record(agent_id), pct, tokens,
+        ),
         context_source="hook",
     )
     # Drift recovery for the P0 spawn-pid bug (2026-05-13). The Go-side

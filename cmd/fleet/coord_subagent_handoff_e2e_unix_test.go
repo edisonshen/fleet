@@ -103,7 +103,7 @@ func TestE2E_CoordAutoHandoffWhileSubagentWorking(t *testing.T) {
 		`agent_id: "` + coordID + `"`,
 		`task_id: "coord-` + project + `"`,
 		`handoff_type: "auto-red"`,
-		`context_pct_at_handoff: 75`,
+		`context_pct_at_handoff: 31`,
 		"- dispatched worker " + slug,
 		"- [explicit] " + nextStep,
 		paneLine,
@@ -231,13 +231,13 @@ func readWorkerAgentID(t *testing.T, fleetHome, project, slug string) string {
 }
 
 // fireStopHookRed runs the installed fleet-guard Stop hook for the coord
-// with a transcript at 75% context, exactly as Claude Code would: same
+// with a transcript past the 300k-token hard threshold, exactly as Claude Code would: same
 // stdin payload, spawn-stamped FLEET_BIN, and TMUX pointing at the pane's
 // server so `tmux capture-pane` reaches the isolated per-test socket.
 // Returns the handoff doc path fleet-guard wrote.
 func fireStopHookRed(t *testing.T, env *integrationEnv, coordID string) string {
 	t.Helper()
-	transcript := writeFakeTranscript(t, "claude-haiku-4-5", 150_000)
+	transcript := writeFakeTranscript(t, "claude-opus-5-5", 310_000)
 	payload, _ := json.Marshal(map[string]any{
 		"hook_event_name": "Stop",
 		"transcript_path": transcript,

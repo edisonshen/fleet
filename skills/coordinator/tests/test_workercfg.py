@@ -55,16 +55,45 @@ def test_codex_unavailable_skips_to_fallback_at_medium() -> None:
 
 
 @pytest.mark.parametrize("tier", workercfg.TIERS)
-def test_claude_every_tier_is_opus_medium(tier: str) -> None:
-    wm = workercfg.resolve_worker_model("claude-code", tier)
+def test_claude_quality_every_tier_is_opus_medium(tier: str) -> None:
+    wm = workercfg.resolve_worker_model("claude-code", tier, profile="quality")
     assert (wm.model, wm.effort) == ("claude-opus-5-5", "medium")
     assert (wm.fallbacks, wm.fallback_effort) == (("claude-opus-5",), "medium")
     assert wm.tier == tier
 
 
+@pytest.mark.parametrize(("tier", "model", "effort", "fallbacks"), [
+    ("simple", "claude-haiku-5-5", "medium", ("claude-sonnet-5-5",)),
+    ("coding", "claude-opus-5-5", "medium", ("claude-opus-5",)),
+    ("complex", "claude-opus-5-5", "high", ("claude-opus-5",)),
+])
+def test_claude_budget_tiering(tier: str, model: str, effort: str,
+                               fallbacks: tuple[str, ...]) -> None:
+    wm = workercfg.resolve_worker_model("claude-code", tier)
+    assert (wm.model, wm.effort, wm.fallbacks, wm.fallback_effort) == (
+        model, effort, fallbacks, "medium")
+
+
 def test_claude_unavailable_falls_to_opus_5() -> None:
     wm = workercfg.resolve_worker_model("claude-code", "coding", ["claude-opus-5-5"])
     assert (wm.model, wm.effort, wm.fallbacks) == ("claude-opus-5", "medium", ())
+
+
+@pytest.mark.parametrize(("engine", "profile", "model"), [
+    ("claude-code", "budget", "claude-sonnet-5-5"),
+    ("claude-code", "quality", "claude-opus-5-5"),
+    ("codex", "budget", "gpt-5.6-luna"),
+    ("codex", "quality", "gpt-5.6-luna"),
+])
+def test_rebase_role_model(engine: str, profile: str, model: str) -> None:
+    wm = workercfg.resolve_role_model(engine, workercfg.ROLE_REBASE, profile=profile)
+    assert (wm.model, wm.tier) == (model, "simple")
+
+
+def test_budget_simple_retry_escalates_to_opus() -> None:
+    t = parse.Task(slug="s", status="ready", complexity="simple")
+    wm = workercfg.resolve_for_task("claude-code", t, prior_attempts=1)
+    assert (wm.tier, wm.model) == ("coding", "claude-opus-5-5")
 
 
 def test_exhausted_ladder_returns_no_model() -> None:

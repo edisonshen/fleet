@@ -85,6 +85,11 @@ def _transcript(tmp_path: Path, *, model: str = "claude-haiku-4-5",
     return path
 
 
+# Coordinator context under the default (budget) profile: soft handoff at
+# 250k tokens, hard at 300k.
+_COORD_YELLOW = {"model": "claude-opus-5-5", "input_tokens": 260_000}
+_COORD_RED = {"model": "claude-opus-5-5", "input_tokens": 310_000}
+
 _REAL_SUBPROCESS_RUN = subprocess.run
 
 
@@ -756,7 +761,7 @@ class TestMaybeTrigger:
         fake_tmux.output = "⏺ Waiting for e2e-login-1234's browser run…\n"
 
         handoff.maybe_trigger(
-            {"transcript_path": str(_transcript(tmp_path, input_tokens=145_000))},
+            {"transcript_path": str(_transcript(tmp_path, **_COORD_RED))},
             agent_id="c0ffee11", session="fleet-c0ffee11",
         )
         docs = list((fleet_home_tmp / "handoffs").glob("c0ffee11-*.md"))
@@ -818,7 +823,7 @@ class TestCoordSoftHandoff:
         record_path = _seed_coord(fleet_home_tmp, "c0ffee01",
                                   worker_agent_ids={"t1": "aaaa0001"})
         result = handoff.maybe_trigger(
-            {"transcript_path": str(_transcript(tmp_path, input_tokens=90_000))},
+            {"transcript_path": str(_transcript(tmp_path, **_COORD_YELLOW))},
             agent_id="c0ffee01", session="fleet-c0ffee01",
         )
         assert result is not None
@@ -835,7 +840,7 @@ class TestCoordSoftHandoff:
         self, fleet_home_tmp: Path, fake_tmux: _FakeTmux, tmp_path: Path,
         capsys: pytest.CaptureFixture,
     ) -> None:
-        """40% soft handoff: MILESTONE alone is not enough for a coord —
+        """Soft handoff: MILESTONE alone is not enough for a coord —
         a worker still mapped in worker_agent_ids means its result has
         not landed yet, so no doc, no queue, and the auto-yellow mark
         stays armed for the next Stop."""
@@ -847,7 +852,7 @@ class TestCoordSoftHandoff:
         )
         fake_tmux.output = _COORD_PANE_WITH_MILESTONE
         result = handoff.maybe_trigger(
-            {"transcript_path": str(_transcript(tmp_path, input_tokens=90_000))},
+            {"transcript_path": str(_transcript(tmp_path, **_COORD_YELLOW))},
             agent_id="c0ffee02", session="fleet-c0ffee02",
         )
         assert result is None
@@ -879,7 +884,7 @@ class TestCoordSoftHandoff:
         assert handoff._coord_subagents_inflight("myproj") == ["pr#42:fix"]
         fake_tmux.output = _COORD_PANE_WITH_MILESTONE
         assert handoff.maybe_trigger(
-            {"transcript_path": str(_transcript(tmp_path, input_tokens=90_000))},
+            {"transcript_path": str(_transcript(tmp_path, **_COORD_YELLOW))},
             agent_id="c0ffee03", session="fleet-c0ffee03",
         ) is None
         assert _no_files(fleet_home_tmp / "handoffs")
@@ -899,7 +904,7 @@ class TestCoordSoftHandoff:
                     handoff_type_at=health.now_rfc3339())
         fake_tmux.output = _COORD_PANE_WITH_MILESTONE
         result = handoff.maybe_trigger(
-            {"transcript_path": str(_transcript(tmp_path, input_tokens=90_000))},
+            {"transcript_path": str(_transcript(tmp_path, **_COORD_YELLOW))},
             agent_id="c0ffee04", session="fleet-c0ffee04",
         )
         assert result is None
@@ -918,7 +923,7 @@ class TestCoordSoftHandoff:
         self, fleet_home_tmp: Path, fake_tmux: _FakeTmux, tmp_path: Path,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """50% hard handoff: the soft wait is abandoned — a coord armed
+        """Hard handoff: the soft wait is abandoned — a coord armed
         auto-yellow with workers still out gets its doc written NOW
         (auto-red), the in-flight worker recorded for the successor."""
         monkeypatch.setenv("PATH", str(tmp_path / "empty-path"))
@@ -930,7 +935,7 @@ class TestCoordSoftHandoff:
         )
         fake_tmux.output = "⏺ still waiting on e2e-login-1234\n"
         assert handoff.maybe_trigger(
-            {"transcript_path": str(_transcript(tmp_path, input_tokens=105_000))},
+            {"transcript_path": str(_transcript(tmp_path, **_COORD_RED))},
             agent_id="c0ffee05", session="fleet-c0ffee05",
         ) is None
         docs = list((fleet_home_tmp / "handoffs").glob("c0ffee05-*.md"))

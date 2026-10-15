@@ -72,11 +72,13 @@ Stdin contains the operator-submitted prompt and metadata. Stdout is ignored (th
 
 ## Handoff thresholds
 
-| context_pct | State | Action |
-|-------------|-------|--------|
-| < 40% | Green | Update health JSON only. |
-| ≥ 40% | Yellow (soft) | Inject `HANDOFF REQUESTED` once. Mark `handoff_type: "auto-yellow"` and `handoff_type_at: <RFC3339>` in agent record. On subsequent fires, grep tmux pane for `MILESTONE` on its own line; when found, write doc + queue with `handoff_type: "auto-yellow"`. If MILESTONE never lands and `handoff_type_at` is older than 30 min (or missing — legacy migration), re-inject `HANDOFF REQUESTED` and bump the timestamp. **Coordinator** (`task_id == "coord-<project>"`): the injection is the soft-handoff variant (no new work, let subagents return, tick, checkpoint, then MILESTONE), and the write is additionally HELD while any subagent is still in flight — `coord-state.json:worker_agent_ids` non-empty or a `pr-watches.json` watch with `inflight_action.outcome == "running"`. The coord tick refuses new worker `DISPATCH` blocks while its record carries an auto-* `handoff_type` (reviewer/finisher handoffs and PR-watch keep running), so the in-flight set only shrinks; each hold logs the outstanding subagents to stderr. A missing/malformed ledger contributes nothing (degrades to the MILESTONE-only gate). |
-| ≥ 50% | Red (hard) | Force: write doc + queue immediately with `handoff_type: "auto-red"`. No MILESTONE wait, no subagent wait — in-flight workers land in the doc's Active Subagents for the successor to pick up. |
+Workers trigger on `context_pct`. A **coordinator** (`task_id == "coord-<project>"`) triggers on `context_tokens` against `coord-config.json` `handoff_soft_tokens` / `handoff_hard_tokens` (project file, then `~/.fleet/coord-config.json`; default 250,000 / 300,000 under the `budget` profile). Under `profile: "quality"` with no explicit token keys the coord uses the percent column like a worker. The classification is written as `context_state` so the TUI colors match.
+
+| Worker context_pct | Coord context_tokens (budget) | State | Action |
+|--------------------|-------------------------------|-------|--------|
+| < 40% | < soft (250k) | Green | Update health JSON only. |
+| ≥ 40% | ≥ soft (250k) | Yellow (soft) | Inject `HANDOFF REQUESTED` once. Mark `handoff_type: "auto-yellow"` and `handoff_type_at: <RFC3339>` in agent record. On subsequent fires, grep tmux pane for `MILESTONE` on its own line; when found, write doc + queue with `handoff_type: "auto-yellow"`. If MILESTONE never lands and `handoff_type_at` is older than 30 min (or missing — legacy migration), re-inject `HANDOFF REQUESTED` and bump the timestamp. **Coordinator** (`task_id == "coord-<project>"`): the injection is the soft-handoff variant (no new work, let subagents return, tick, checkpoint, then MILESTONE), and the write is additionally HELD while any subagent is still in flight — `coord-state.json:worker_agent_ids` non-empty or a `pr-watches.json` watch with `inflight_action.outcome == "running"`. The coord tick refuses new worker `DISPATCH` blocks while its record carries an auto-* `handoff_type` (reviewer/finisher handoffs and PR-watch keep running), so the in-flight set only shrinks; each hold logs the outstanding subagents to stderr. A missing/malformed ledger contributes nothing (degrades to the MILESTONE-only gate). |
+| ≥ 50% | ≥ hard (300k) | Red (hard) | Force: write doc + queue immediately with `handoff_type: "auto-red"`. No MILESTONE wait, no subagent wait — in-flight workers land in the doc's Active Subagents for the successor to pick up. |
 
 Both paths end the same way: the queue file is the commit point, `fleet drain` spawns the successor from it and retires (`/exit` + kill + archive) the old agent — the soft path only differs in *when* the doc is written.
 
@@ -94,7 +96,7 @@ Schema matches `internal/agent.Record` (SchemaVersion=1). Atomic write via `.tmp
 
 The skill ONLY owns these fields and may overwrite them on every fire:
 
-- `context_pct`, `context_source`
+- `context_pct`, `context_tokens`, `context_state`, `context_source`
 - `last_activity_ts`
 - `blocked`, `blocked_reason`, `blocked_since`
 - `needs_input`

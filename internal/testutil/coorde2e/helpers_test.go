@@ -32,13 +32,14 @@ func TestSeedCoord_LiveYellow_PaneShowsMilestone(t *testing.T) {
 	isolatedHome(t)
 	coorde2e.SeedProject(t, "p")
 
-	rec := coorde2e.SeedCoord(t, "p", coorde2e.SeedCoordOpts{Pct: 41, Command: []string{"sleep", "60"}})
+	rec := coorde2e.SeedCoord(t, "p", coorde2e.SeedCoordOpts{Tokens: 260_000, Command: []string{"sleep", "60"}})
 
 	got, err := agent.Load(rec.ID)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !got.IsCoord || got.Project != "p" || got.ContextPct == nil || *got.ContextPct != 41 || got.ContextSource != "hook" {
+	if !got.IsCoord || got.Project != "p" || got.ContextPct == nil || *got.ContextPct != 26 || got.ContextSource != "hook" ||
+		got.ContextTokens == nil || *got.ContextTokens != 260_000 || got.ContextState != "yellow" {
 		t.Fatalf("record: %+v", got)
 	}
 	if got.HandoffType == nil || *got.HandoffType != "auto-yellow" {
@@ -52,7 +53,7 @@ func TestSeedCoord_LiveYellow_PaneShowsMilestone(t *testing.T) {
 		return err == nil && strings.Contains(string(pane), "⏺ MILESTONE")
 	})
 	pane := coorde2e.CapturePane(t, rec.TmuxSession)
-	if !strings.Contains(pane, "HANDOFF REQUESTED: context window is over 40%") {
+	if !strings.Contains(pane, "HANDOFF REQUESTED: context is past the soft handoff threshold") {
 		t.Fatalf("pane missing HANDOFF REQUESTED line:\n%s", pane)
 	}
 }
