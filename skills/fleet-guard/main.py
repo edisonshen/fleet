@@ -64,6 +64,10 @@ def main(stdin: TextIO | None = None) -> int:
             if out is not None:
                 print(json.dumps(out))
             return 0
+        if hook_name == "Stop" and payload.get("agent_id"):
+            # A subagent's own Stop: its transcript and turn end are not
+            # the parent session's, so it must not drive the parent record.
+            return 0
         if hook_name == "Stop":
             _on_stop(payload, agent_id, session, injections)
         elif hook_name == "PreCompact":

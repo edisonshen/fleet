@@ -628,7 +628,8 @@ class TestCoordTokenHandoff:
     def _stop(self, home: Path, tmp_path: Path, capsys: pytest.CaptureFixture,
               tokens: int, *, task_id: str = "coord-myproj",
               global_cfg: dict | None = None,
-              project_cfg: dict | None = None) -> tuple[str, dict]:
+              project_cfg: dict | None = None,
+              payload_extra: dict | None = None) -> tuple[str, dict]:
         record_path = _seed_record(home, task_id=task_id, role="coordinator")
         if global_cfg is not None:
             (home / "coord-config.json").write_text(json.dumps(global_cfg))
@@ -640,6 +641,7 @@ class TestCoordTokenHandoff:
             "hook_event_name": "Stop",
             "transcript_path": str(_transcript(
                 tmp_path, input_tokens=tokens, model="claude-opus-5-5")),
+            **(payload_extra or {}),
         }, capsys)
         assert rc == 0
         return out, json.loads(record_path.read_text(encoding="utf-8"))
@@ -653,6 +655,19 @@ class TestCoordTokenHandoff:
         assert rec["handoff_type"] == "auto-yellow"
         assert (rec["context_pct"], rec["context_tokens"]) == (26.0, 260_000)
         assert rec["context_state"] == "yellow"
+        assert not (fleet_home_tmp / "queue" / "spawn-fresh-agent7777.json").exists()
+
+    def test_subagent_stop_does_not_drive_coord_record(
+        self, fleet_home_tmp: Path, tmp_path: Path,
+        capsys: pytest.CaptureFixture,
+    ) -> None:
+        """A subagent inherits the coord's FLEET_AGENT_ID; its Stop payload
+        (carrying agent_id) at 310k must not hand off the coord."""
+        out, rec = self._stop(fleet_home_tmp, tmp_path, capsys, 310_000,
+                              payload_extra={"agent_id": "sub-1"})
+        assert out == ""
+        assert rec["handoff_type"] is None
+        assert "context_tokens" not in rec
         assert not (fleet_home_tmp / "queue" / "spawn-fresh-agent7777.json").exists()
 
     def test_budget_default_hard_at_310k(
