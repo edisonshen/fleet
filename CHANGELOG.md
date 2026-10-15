@@ -6,15 +6,47 @@ follows [SemVer](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.26.0] - 2026-10-15
+
+Budget-first coordinators. A new `profile` setting in `coord-config.json`
+defaults to `budget`: the coord hands off at 250k / 300k context tokens
+instead of 40% / 50% of the window, Claude workers are routed by tier, and
+dispatches stop pasting full prompts into the coord's context.
+
+### Added
+
+- coord: `coord-config.json:profile` (`budget` default | `quality`). Any
+  explicit key beats its profile default; project file first, then
+  `~/.fleet/coord-config.json` (#347).
+- coord: `handoff_soft_tokens` / `handoff_hard_tokens` (budget defaults
+  250000 / 300000). fleet-guard, the TUI context bar and the scenario
+  harness (`scenario.sh seed-coord --tokens N`) classify by these token
+  counts; `quality` keeps the 40% / 50% thresholds (#347).
+
 ### Changed
 
+- coord: Claude worker tiering under `budget`: `simple` → `claude-haiku-5-5`
+  (fallback `claude-sonnet-5-5`); `coding` and `complex` →
+  `claude-opus-5-5` medium; PR-watch rebase and plan / task-split helpers →
+  `claude-sonnet-5-5`. `quality` keeps every tier on Opus. Codex routing is
+  unchanged (#347, #348).
+- coord: `review_effort` defaults to `medium` under `budget`, `high` under
+  `quality` (#347).
+- dispatch: each DISPATCH block carries a one-line `prompt:` that tells the
+  subagent to read its absolute `prompt_file`, so the full prompt never
+  enters the coord's context. Every worker, reviewer, rebase, fix and
+  rederive prompt ends with a one-line final report:
+  `<slug> phase=… pr=… <note>` (#346).
+- coord: SKILL.md slimmed from 38 KB to ~30 KB; remote control, files,
+  sentinels, failure modes, module map, tests and hooks moved to the shipped
+  `skills/coordinator/REFERENCE.md` (#345).
 - review: a model set in the user's own engine config wins over Fleet's
   review defaults — codex `model` in `$CODEX_HOME/config.toml` (active
   profile first), claude `ANTHROPIC_MODEL` or `model` in
   `$CLAUDE_CONFIG_DIR/settings.json` (default `~/.claude`). The reviewer
   prompt and recorded review status name the model that runs; claude-only
   slots that collapse onto one configured model record alpha as
-  `single-engine-degraded`.
+  `single-engine-degraded` (#343).
 
 ## [0.25.0] - 2026-10-14
 
@@ -1738,7 +1770,8 @@ Initial public release.
 - Filesystem packages: `internal/state`, `internal/handoff`,
   `internal/queue`, `internal/spawn`, `internal/tmux`.
 
-[Unreleased]: https://github.com/edisonshen/fleet/compare/v0.25.0...HEAD
+[Unreleased]: https://github.com/edisonshen/fleet/compare/v0.26.0...HEAD
+[0.26.0]: https://github.com/edisonshen/fleet/compare/v0.25.0...v0.26.0
 [0.25.0]: https://github.com/edisonshen/fleet/compare/v0.24.0...v0.25.0
 [0.24.0]: https://github.com/edisonshen/fleet/compare/v0.23.0...v0.24.0
 [0.23.0]: https://github.com/edisonshen/fleet/compare/v0.22.0...v0.23.0
